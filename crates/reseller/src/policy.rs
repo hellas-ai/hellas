@@ -1,12 +1,11 @@
 use hellas_auth::authority::{ResourceId, Revision};
-use {
-    hellas_authority::model::grant::records::GrantError,
-    hellas_authority::model::grant::records::GrantPolicy,
-    hellas_channel::model::fetch::FetchPolicyV2, hellas_channel::model::fetch::FetchRoutePolicy,
-    hellas_channel::model::fetch::fetch_route_commitment,
-    hellas_channel::model::profile::WorkPolicy,
+use hellas_authority::model::grant::records::{GrantError, GrantPolicy};
+use hellas_rpc::protocol::invocation::{
+    Admission, InvocationPolicy, Limits,
+    fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn responses_policy(
     resource: ResourceId,
     account: ResourceId,
@@ -15,6 +14,7 @@ pub fn responses_policy(
     method: &str,
     responses: hellas_authority::model::grant::responses::ResponsesResource,
     pricing: hellas_authority::model::grant::pricing::Pricing,
+    max_job_millis: std::num::NonZeroU64,
 ) -> Result<GrantPolicy, GrantError> {
     let route =
         FetchRoutePolicy::sealed_route(service, method).map_err(|_| GrantError::Malformed)?;
@@ -24,21 +24,26 @@ pub fn responses_policy(
         account,
         revision,
         name: "responses".into(),
-        work: WorkPolicy::Fetch {
-            policy: FetchPolicyV2 {
-                allowed_environment: contract.manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes())
-                    .map_err(|_| GrantError::Malformed)?,
-                max_request_body_bytes: 64 << 10,
-                max_output_events: 4096,
-                max_output_bytes: 1 << 20,
-                max_spool_bytes: 4 << 20,
-                max_encoded_result_frame: 4 << 20,
-                max_encoded_prepared_input: 128 << 10,
+        invocation_policy: InvocationPolicy {
+            admissions: vec![Admission::Fetch {
+                admission: FetchAdmission {
+                    contract,
+                    route,
+                    limits: FetchLimits {
+                        max_request_body_bytes: 64 << 10,
+                        max_output_events: 4096,
+                        max_spool_bytes: 4 << 20,
+                        max_encoded_result_frame: 4 << 20,
+                        max_encoded_prepared_input: 128 << 10,
+                    },
+                },
+            }],
+            limits: Limits {
                 max_upload_bytes: 128 << 10,
+                max_output_bytes: 1 << 20,
+                max_steps: 1,
+                execution_timeout_ms: max_job_millis.get(),
             },
-            route,
-            contract,
         },
         https: None,
         responses: Some(responses),

@@ -29,7 +29,7 @@ impl Assurance {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
-    Evaluate,
+    Invoke,
     Fetch,
 }
 
@@ -43,9 +43,9 @@ impl SchemeId {
 
     pub fn from_byte(byte: u8) -> Result<Self, TagError> {
         match byte {
-            tags::SCHEME_EVALUATE_PRODUCER_SIGNED
+            tags::SCHEME_INVOKE_PRODUCER_SIGNED
             | tags::SCHEME_FETCH_PRODUCER_SIGNED
-            | tags::SCHEME_EVALUATE_APPLE_APP_ATTEST
+            | tags::SCHEME_INVOKE_APPLE_APP_ATTEST
             | tags::SCHEME_FETCH_APPLE_APP_ATTEST => Ok(Self(byte)),
             _ => Err(TagError::UnknownScheme(byte)),
         }
@@ -54,9 +54,9 @@ impl SchemeId {
 
 pub const fn scheme_id(operation: Operation, assurance: Assurance) -> SchemeId {
     let tag = match (operation, assurance) {
-        (Operation::Evaluate, Assurance::ProducerSigned) => tags::SCHEME_EVALUATE_PRODUCER_SIGNED,
+        (Operation::Invoke, Assurance::ProducerSigned) => tags::SCHEME_INVOKE_PRODUCER_SIGNED,
         (Operation::Fetch, Assurance::ProducerSigned) => tags::SCHEME_FETCH_PRODUCER_SIGNED,
-        (Operation::Evaluate, Assurance::AppleAppAttest) => tags::SCHEME_EVALUATE_APPLE_APP_ATTEST,
+        (Operation::Invoke, Assurance::AppleAppAttest) => tags::SCHEME_INVOKE_APPLE_APP_ATTEST,
         (Operation::Fetch, Assurance::AppleAppAttest) => tags::SCHEME_FETCH_APPLE_APP_ATTEST,
     };
     SchemeId(tag)
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(Assurance::ProducerSigned.to_byte(), 0x00);
         assert_eq!(Assurance::AppleAppAttest.to_byte(), 0x01);
         assert_eq!(
-            scheme_id(Operation::Evaluate, Assurance::ProducerSigned).to_byte(),
+            scheme_id(Operation::Invoke, Assurance::ProducerSigned).to_byte(),
             0x00
         );
         assert_eq!(
@@ -176,7 +176,7 @@ mod tests {
             0x01
         );
         assert_eq!(
-            scheme_id(Operation::Evaluate, Assurance::AppleAppAttest).to_byte(),
+            scheme_id(Operation::Invoke, Assurance::AppleAppAttest).to_byte(),
             0x02
         );
         assert_eq!(

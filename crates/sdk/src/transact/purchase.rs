@@ -163,31 +163,15 @@ impl Purchase {
             .ok_or_else(|| self.unfinished("channel origin is missing"))?;
         let channel = descriptor.channel().clone();
         let settlement = descriptor.expected_settlement()?;
-        let metadata_only = matches!(
-            descriptor.work_policy(),
-            hellas_channel::model::profile::WorkPolicy::Fetch { .. }
-        );
-        let store = if metadata_only {
-            ChannelStore::open_metadata_only(
-                &options.journal_root,
-                channel,
-                settlement,
-                Role::Client,
-                origin,
-                &Secp256k1Verifier::new(),
-            )
-            .await?
-        } else {
-            ChannelStore::open(
-                &options.journal_root,
-                channel,
-                settlement,
-                Role::Client,
-                origin,
-                &Secp256k1Verifier::new(),
-            )
-            .await?
-        };
+        let store = ChannelStore::open(
+            &options.journal_root,
+            channel,
+            settlement,
+            Role::Client,
+            origin,
+            &Secp256k1Verifier::new(),
+        )
+        .await?;
         if let Some(work) = record.work.map(Digest::from_bytes)
             && store.state().terminal_by_id(work).is_some_and(|terminal| {
                 matches!(terminal.outcome, TerminalOutcome::Certified { .. })

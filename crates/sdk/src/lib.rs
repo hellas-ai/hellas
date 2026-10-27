@@ -62,7 +62,6 @@ pub mod grant_config;
 pub mod node_control;
 
 mod gateway_work;
-pub use gateway_work::prepare_evaluate;
 pub mod grant_gateway;
 
 mod resource_config;

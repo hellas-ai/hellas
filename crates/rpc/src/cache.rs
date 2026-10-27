@@ -46,16 +46,16 @@ impl<E, P> Transcript<E, P> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EvaluateEvent {
+pub enum TextEvent {
     Chunk { position: u64, tokens: Vec<u8> },
-    Done(EvaluateOutcome),
+    Done(TextOutcome),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EvaluateOutcome {
+pub enum TextOutcome {
     Completed {
         total_tokens: u64,
-        stop_reason: EvaluateStop,
+        stop_reason: TextStop,
         text_artifact: Digest,
         output_events: Vec<crate::OutputEventEnvelope>,
     },
@@ -66,17 +66,17 @@ pub enum EvaluateOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EvaluateStop {
+pub enum TextStop {
     StopToken(u32),
     MaxNewTokens,
 }
 
-impl EvaluateEvent {
+impl TextEvent {
     pub fn terminal(&self) -> Option<bool> {
         match self {
             Self::Chunk { .. } => None,
-            Self::Done(EvaluateOutcome::Completed { .. }) => Some(true),
-            Self::Done(EvaluateOutcome::Failed { .. }) => Some(false),
+            Self::Done(TextOutcome::Completed { .. }) => Some(true),
+            Self::Done(TextOutcome::Failed { .. }) => Some(false),
         }
     }
 }
@@ -142,17 +142,17 @@ impl CacheRecording {
 #[serde(rename_all = "lowercase")]
 pub enum CacheKind {
     // Preserve the original lexicographic order for listing and prune ties.
-    Evaluate,
+    Text,
     Fetch,
     Proxy,
 }
 
 impl CacheKind {
-    pub const ALL: [Self; 3] = [Self::Evaluate, Self::Fetch, Self::Proxy];
+    pub const ALL: [Self; 3] = [Self::Text, Self::Fetch, Self::Proxy];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Evaluate => "evaluate",
+            Self::Text => "text",
             Self::Fetch => "fetch",
             Self::Proxy => "proxy",
         }
@@ -202,8 +202,8 @@ impl CacheKey {
         })
     }
 
-    pub fn evaluate(execution: Digest) -> Self {
-        Self::new(CacheKind::Evaluate, &execution.to_string()).expect("digest identity")
+    pub fn text(execution: Digest) -> Self {
+        Self::new(CacheKind::Text, &execution.to_string()).expect("digest identity")
     }
 
     /// Only sealed inference adaptors are reusable. General Fetch operations
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn closed_kinds_preserve_stored_bytes_hash_domains_and_sort_order() {
-        let names = ["evaluate", "fetch", "proxy"];
+        let names = ["text", "fetch", "proxy"];
         for (kind, name) in CacheKind::ALL.into_iter().zip(names) {
             assert_eq!(kind.to_string(), name);
             assert_eq!(name.parse::<CacheKind>().unwrap(), kind);

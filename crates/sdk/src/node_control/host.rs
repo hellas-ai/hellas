@@ -757,8 +757,8 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
                 root: config.journal_root,
             },
         };
-        let resources = if provider.executor.supports_evaluate() {
-            crate::grant_provider::ProviderResources::EvaluateAndFetch(
+        let resources = if provider.executor.supports_compute() {
+            crate::grant_provider::ProviderResources::ComputeAndFetch(
                 &provider.executor.fetch_routes,
             )
         } else {

@@ -1,6 +1,6 @@
 //! Local resource configuration shares exactly the paid WorkPolicy parser.
 //! Grants and their counters remain runtime state in the provider journal.
-use crate::resource_config::{ExecutionPolicyFile, FetchPolicyFile, ResourceConfigError};
+use crate::resource_config::ResourceConfigError;
 use hellas_auth::authority::{ResourceId, Revision};
 use hellas_authority::model::grant::{
     records::{GrantError, GrantPolicy},
@@ -33,8 +33,7 @@ struct ResourceFile {
     account: ResourceId,
     revision: Revision,
     name: String,
-    execution: Option<ExecutionPolicyFile>,
-    fetch: Option<FetchPolicyFile>,
+    invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
     https: Option<HttpsResource>,
     responses: Option<ResponsesResource>,
     pricing: hellas_authority::model::grant::pricing::Pricing,
@@ -119,17 +118,12 @@ impl GrantConfig {
             .resources
             .into_iter()
             .map(|p| {
-                let work = match (p.execution, p.fetch) {
-                    (Some(execution), None) => execution.into_policy()?.into(),
-                    (None, Some(fetch)) => fetch.into_policy()?,
-                    _ => return Err(GrantConfigError::Grant(GrantError::Malformed)),
-                };
                 let policy = GrantPolicy {
                     resource: p.resource,
                     account: p.account,
                     revision: p.revision,
                     name: p.name,
-                    work,
+                    invocation_policy: p.invocation_policy,
                     https: p.https,
                     responses: p.responses,
                     pricing: p.pricing,

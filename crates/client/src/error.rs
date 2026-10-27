@@ -26,12 +26,6 @@ pub enum ClientError {
     },
     #[error(transparent)]
     External(Box<dyn StdError + Send + Sync + 'static>),
-    #[cfg(feature = "evaluate")]
-    #[error("evaluate transcript verification failed: {source}")]
-    EvaluateTranscript {
-        #[source]
-        source: hellas_rpc::evaluate::EvaluateProtocolError,
-    },
     #[error("fetch stream envelope decode failed: {source}")]
     FetchStreamEnvelope {
         #[source]

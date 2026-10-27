@@ -1,13 +1,12 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
-use crate::execution::CausalLmExecutionEnvironment;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hellas_adaptors::ExecutionRequest as WireExecutionRequest;
 use hellas_presentation::TextPresentation;
 use hellas_rpc::Retention;
 use hellas_rpc::provenance::ExecutionProvenance;
-use std::{error::Error as StdError, sync::Arc};
+use std::sync::Arc;
 use tokio::time::Duration;
 /// End-to-end deadline applied while consuming a prepared generation.
 /// Covers paid proposal, execution and the entire decode stream.
@@ -15,20 +14,13 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(3600)
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
-    pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     pub(super) output_cache: Option<Arc<super::cache::OutputCache>>,
+    pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
     pub(super) model_name: String,
-    pub(super) causal_lm: Option<CausalLmExecutionEnvironment>,
     pub(super) inference_timeout: Duration,
     presentation: Option<Arc<TextPresentation>>,
-    stop_token_ids: Vec<u32>,
     pub(super) responses_proxy: Option<Arc<ResponsesProxy>>,
-    /// The one strategy every request runs, settled at startup by
-    /// [`configured_strategy`]. The dial targets it was built from are
-    /// deliberately not kept: there is no second place a route could be
-    /// assembled, and so no place one could be assembled without an anchor.
-    paid_work: Option<Arc<dyn super::WorkExecutionBackend>>,
 }
 
 pub(super) struct PreparedGeneration {
@@ -53,31 +45,9 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> crate::GatewayResult<Self> {
-        let output_cache = super::cache::OutputCache::open(&options.output_cache)?;
-        let replay_only = options.output_cache.policy == super::cache::CachePolicy::ReplayOnly;
         if options.default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
-        if options.causal_lm.is_some() != options.tokenizer.is_some() {
-            return Err(crate::GatewayConfigError::TokenizerPair.into());
-        }
-        if !(options.responses_backend != ResponsesBackend::Hellas || options.causal_lm.is_some()) {
-            return Err(crate::GatewayConfigError::MissingEnvironment.into());
-        }
-        let chat_template = options.chat_template;
-        let presentation = if let Some(tokenizer) = options.tokenizer.clone() {
-            Some(Arc::new(
-                tokio::task::spawn_blocking(move || {
-                    TextPresentation::load(&tokenizer)
-                        .map(|presentation| presentation.with_chat_template(chat_template))
-                })
-                .await
-                .map_err(crate::GatewayError::Task)?
-                .map_err(|error| crate::GatewayError::Presentation(error.into()))?,
-            ))
-        } else {
-            None
-        };
         let responses_proxy = match options.responses_backend {
             ResponsesBackend::Hellas => None,
             ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
@@ -87,32 +57,18 @@ impl GatewayState {
             ResponsesBackend::Fetch => None,
         };
 
-        if options.responses_backend == ResponsesBackend::Fetch
-            || (!replay_only
-                && options.paid_work.is_none()
-                && (options.causal_lm.is_some()
-                    || options.responses_backend == ResponsesBackend::Hellas))
-        {
-            return Err(hellas_client::ClientError::FundingRequired.into());
-        }
+        let output_cache = super::cache::OutputCache::open(&options.output_cache)?;
         Ok(Self {
-            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             output_cache,
+            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
-            causal_lm: options.causal_lm.clone(),
             inference_timeout: options
                 .paid_work
                 .as_ref()
                 .map_or(DEFAULT_INFERENCE_TIMEOUT, |backend| backend.timeout()),
-            presentation,
-            stop_token_ids: options.stop_token_ids.clone(),
+            presentation: None,
             responses_proxy,
-            paid_work: if replay_only {
-                None
-            } else {
-                options.paid_work.clone()
-            },
         })
     }
 
@@ -124,70 +80,10 @@ impl GatewayState {
         prepare_error: &str,
         _retention: Retention,
     ) -> Result<PreparedGeneration, HttpError> {
-        let prompt_tokens = input_ids.len() as u32;
-        let causal_lm = self.causal_lm.clone().ok_or_else(|| HttpError {
+        let _ = (input_ids, max_tokens, prepare_error);
+        Err(HttpError {
             status: StatusCode::NOT_FOUND,
-            message: "this gateway exposes only the Fetch-backed Responses route".to_string(),
-        })?;
-        use futures::StreamExt;
-        use hellas_client::execution::{genesis_text_execution_id, prepare_evaluate_stream};
-        let identity = genesis_text_execution_id(
-            causal_lm.manifest_id(),
-            &input_ids,
-            max_tokens,
-            &self.stop_token_ids,
-        );
-        let prepared = prepare_evaluate_stream(identity, self.output_cache.clone(), async {
-            let backend = self
-                .paid_work
-                .as_ref()
-                .ok_or(hellas_client::ClientError::FundingRequired)?;
-            let payment = backend
-                .execute(super::WorkExecutionRequest {
-                    environment: causal_lm.environment().clone(),
-                    input_ids,
-                    max_new_tokens: max_tokens,
-                    stop_token_ids: self.stop_token_ids.clone(),
-                })
-                .map_err(|error| hellas_client::ClientError::External(Box::new(error)))?;
-            Ok((
-                None,
-                payment
-                    .map(|result| {
-                        result
-                            .map_err(|error| hellas_client::ClientError::External(Box::new(error)))
-                    })
-                    .boxed(),
-            ))
-        })
-        .await
-        .map_err(|error| match error {
-            hellas_client::ClientError::External(error) => HttpError {
-                status: match error.downcast_ref::<super::WorkGatewayError>() {
-                    Some(super::WorkGatewayError::Busy(_)) => StatusCode::SERVICE_UNAVAILABLE,
-                    Some(super::WorkGatewayError::Denied(_)) => StatusCode::FORBIDDEN,
-                    Some(super::WorkGatewayError::Quota(_)) => StatusCode::TOO_MANY_REQUESTS,
-                    Some(super::WorkGatewayError::Rejected(_)) => StatusCode::BAD_REQUEST,
-                    _ => StatusCode::BAD_GATEWAY,
-                },
-                message: error.to_string(),
-            },
-            error => HttpError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("{prepare_error}: {}", format_error_causes(&error)),
-            },
-        })?;
-        let provenance = prepared.provenance().cloned();
-        Ok(PreparedGeneration {
-            chat: None,
-            prepared: prepared.stream(),
-            provenance,
-            prompt_tokens,
-            presentation: self
-                .presentation
-                .clone()
-                .expect("causal-LM presentation is loaded"),
-            inference_timeout: self.inference_timeout,
+            message: "this gateway exposes only Fetch".into(),
         })
     }
 
@@ -238,17 +134,6 @@ impl PreparedGeneration {
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         tokio::time::Instant::now() + self.inference_timeout
     }
-}
-
-fn format_error_causes(err: &(dyn StdError + 'static)) -> String {
-    let mut parts = Vec::new();
-    let mut current = err.source().unwrap_or(err);
-    parts.push(current.to_string());
-    while let Some(source) = current.source() {
-        parts.push(source.to_string());
-        current = source;
-    }
-    parts.join(": ")
 }
 
 impl IntoResponse for HttpError {

@@ -16,12 +16,6 @@ default = []
 test-support = ["hellas-cloud/test-support"]
 
 # Local model execution additionally compiles Catena and the native evaluator.
-evaluate = [
-    "dep:catena-lang",
-    "dep:commonware-runtime",
-    "hellas-gateway/evaluate",
-    "hellas-executor/evaluate",
-]
 indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
 
@@ -61,7 +55,7 @@ hellas-chain = { workspace = true, default-features = false, features = [
     "work-watcher",
 ] }
 hellas-channel = { workspace = true }
-hellas-client = { workspace = true, features = ["iroh", "work", "evaluate"] }
+hellas-client = { workspace = true, features = ["iroh", "work"] }
 hellas-executor = { workspace = true, default-features = false }
 hellas-gateway.workspace = true
 hellas-kernel = { workspace = true, default-features = false, features = [

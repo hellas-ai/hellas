@@ -480,6 +480,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -695,21 +704,20 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+https://github.com/georgewhewell/catena-lang?rev=4d90b4b0b53f68352ff2890203d4de00e1214f93#4d90b4b0b53f68352ff2890203d4de00e1214f93"
+source = "git+https://github.com/hellas-ai/catena-lang.git?branch=master#9ec3f625170ee4115dbd8a544ba055d2da436143"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "hexpr",
  "libc",
  "libffi",
  "libloading",
- "memmap2",
  "metacat",
  "open-hypergraphs",
- "open-hypergraphs-dot",
- "postcard",
- "rustix",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -2025,21 +2033,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dot-generator"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aaac7ada45f71873ebce336491d1c1bc4a7c8042c7cea978168ad59e805b871"
-dependencies = [
- "dot-structures",
-]
-
-[[package]]
-name = "dot-structures"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cfcded997a93eb31edd639361fa33fd229a8784e953b37d71035fe3890b7b"
-
-[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2605,21 +2598,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graphviz-rust"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d50c23bbf5cea2a6d93e3602d3cd6688dc97dbb882a3d18a5f74ba0970d43ad"
-dependencies = [
- "dot-generator",
- "dot-structures",
- "into-attr",
- "into-attr-derive",
- "pest",
- "pest_derive",
- "tempfile",
-]
-
-[[package]]
 name = "group"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2993,8 +2971,8 @@ name = "hellas-executor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "catena-lang",
- "commonware-runtime",
  "futures-core",
  "futures-util",
  "hellas-auth",
@@ -3005,6 +2983,8 @@ dependencies = [
  "hellas-store",
  "hellas-wire",
  "libc",
+ "libloading",
+ "metacat",
  "opentelemetry",
  "opentelemetry_sdk",
  "prometheus-client",
@@ -3012,6 +2992,8 @@ dependencies = [
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -3036,11 +3018,9 @@ dependencies = [
  "hellas-authority",
  "hellas-channel",
  "hellas-client",
- "hellas-executor",
  "hellas-presentation",
  "hellas-private",
  "hellas-rpc",
- "hellas-store",
  "hellas-wire",
  "httpdate",
  "iroh",
@@ -3734,28 +3714,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "into-attr"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b48c537e49a709e678caec3753a7dba6854661a1eaa27675024283b3f8b376"
-dependencies = [
- "dot-structures",
-]
-
-[[package]]
-name = "into-attr-derive"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecac7c1ae6cd2c6a3a64d1061a8bdc7f52ff62c26a831a2301e54c1b5d70d5b1"
-dependencies = [
- "dot-generator",
- "dot-structures",
- "into-attr",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4445,15 +4403,6 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
-
-[[package]]
-name = "memmap2"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "metacat"
@@ -5240,17 +5189,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02448e1c0ce5b58ace5f18579dcfb1a03016f6e6976d3158297311b3d8ae4ed3"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "open-hypergraphs-dot"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf800a0036834718dcd70c606745afdaa93e8fb80828806341bbf8454cc76c0f"
-dependencies = [
- "dot-structures",
- "graphviz-rust",
- "open-hypergraphs",
 ]
 
 [[package]]
@@ -7226,17 +7164,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
 ]
 
 [[package]]

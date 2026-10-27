@@ -57,20 +57,11 @@ mod cd_hashes {
 pub struct TrustPolicy {
     pub provider_genesis: ContentId,
     pub assurance: Assurance,
-    pub environments: Vec<ContentId>,
     pub apple: Option<AppleApproval>,
 }
 
 impl TrustPolicy {
     pub fn check(&self) -> io::Result<()> {
-        if self.environments.is_empty()
-            || self.environments.len() > 32
-            || !all_distinct(&self.environments)
-        {
-            return Err(invalid(
-                "trust policy requires 1..=32 distinct environments",
-            ));
-        }
         if self.assurance == Assurance::AppleAppAttest && self.apple.is_none() {
             return Err(invalid(
                 "Apple assurance requires independent software approval",
@@ -254,26 +245,10 @@ impl TrustPolicyStore {
         Ok(ProviderTrustAnchor {
             expected_genesis: policy.provider_genesis,
             required_assurance: policy.assurance,
-            allowed_environments: policy.environments,
             apple_app_attest: policy
                 .apple
                 .map(|apple| AppleAppAttestTrust::new(apple.app_id, apple.cd_hashes, counters)),
         })
-    }
-
-    /// Resolve independently approved pins and require the selected execution environment.
-    pub fn resolve_environment(
-        &self,
-        id: &str,
-        assurance: Assurance,
-        environment: ContentId,
-        counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
-    ) -> Result<ProviderTrustAnchor, hellas_client::ClientError> {
-        let trust = self
-            .resolve(id, assurance, counters)
-            .map_err(hellas_client::ClientError::external)?;
-        trust.verify_environment(environment)?;
-        Ok(trust)
     }
 
     fn path(&self, id: &str, suffix: &str) -> io::Result<PathBuf> {

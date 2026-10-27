@@ -10,23 +10,25 @@ use hellas_auth::{
 use hellas_authority::model::grant::records::{
     check_grant_provider, grant_producer, grant_transport,
 };
+use hellas_channel::content::InvocationContent;
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
+use hellas_rpc::protocol::invocation::{
+    InvocationPolicy, PreparedInvocation, output::StreamVerifier,
+};
 use hellas_rpc::{
     ContentId, ContentRef,
     protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
 };
 use hellas_rpc::{
-    EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProviderEnrollmentBundle,
-    RequestCommitment, SchemeId, StreamId, output_genesis,
+    OutputEventEnvelope, ProviderEnrollmentBundle,
     pb::work::{
         AcceptWorkRequest, AcceptWorkResponse, GetStandingRequest, GetStandingResponse,
         GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState, StreamResultRequest,
         WorkRefusalCode, WorkRefused, WorkRoute, WorkStreamEvent, accept_work_response,
         get_standing_response, work_stream_event,
     },
-    scheme_id, verify_output_event_continuation,
 };
 use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
@@ -52,10 +54,9 @@ use {
     hellas_authority::model::grant::records::SignedOffer,
     hellas_authority::model::grant::standing::Standing,
     hellas_authority::model::grant::standing::StandingLocator,
-    hellas_channel::model::profile::PreparedWorkInput, hellas_channel::model::profile::WorkPolicy,
     hellas_channel::model::work::PaidJobResultV1, hellas_channel::model::work::PrivateRecord,
     hellas_channel::model::work::bound_result_digest,
-    hellas_channel::model::work::decode_transcript, hellas_channel::model::work::encode_transcript,
+    hellas_channel::model::work::decode_transcript,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -89,11 +90,13 @@ pub enum GrantClientError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
+    Encode(#[from] hellas_rpc::DagCborEncodeError),
+    #[error(transparent)]
     TransportKey(#[from] iroh::KeyParsingError),
     #[error(transparent)]
     Stream(#[from] hellas_rpc::StreamVerifyError),
     #[error(transparent)]
-    Evaluate(#[from] hellas_rpc::evaluate::EvaluateProtocolError),
+    Content(#[from] hellas_channel::content::ContentError),
     #[error("grant operation timed out; proposal recovery may be required")]
     Timeout,
     #[error("grant refused: {code:?} (current revision {current_revision})")]
@@ -335,11 +338,28 @@ impl Link {
         &self,
         request: AcceptWorkRequest,
         work: Digest,
-        input: Option<&[u8]>,
+        input: Option<(&PreparedInvocation, &InvocationContent)>,
         signer: &ProducerSigningKey,
     ) -> Result<AcceptWorkResponse> {
-        if let Some(bytes) = input {
-            let reference = ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
+        if let Some((input, content)) = input {
+            let bytes = input.canonical_bytes()?;
+            let reference = ContentRef::for_bytes(&bytes);
+            let manifest = input.manifest()?;
+            let policy =
+                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
+            let root = if policy.content_closure(&manifest, &[]).is_ok() {
+                Vec::new()
+            } else {
+                content
+                    .read_bounded(
+                        manifest.root(),
+                        hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64,
+                    )?
+                    .as_ref()
+                    .clone()
+            };
+            let objects =
+                hellas_channel::job::content_closure(&policy, &manifest, &root, reference)?;
             let exporter = match self {
                 Self::Remote(transport, _) => transport
                     .context()
@@ -348,69 +368,76 @@ impl Link {
                 Self::Local(_, exporter) => *exporter,
             };
             let authorization = GrantJobAuthorizationV1::decode(&request.authorization)?;
-            let mut offset = 0_u64;
-            let mut probing = true;
-            loop {
-                let chunk = if probing {
-                    Vec::new()
-                } else {
-                    bytes[offset as usize..(offset as usize + CONTENT_CHUNK_BYTES).min(bytes.len())]
-                        .to_vec()
-                };
-                let end = offset + chunk.len() as u64;
-                let signature = signer.sign_digest(chunk_digest(
-                    authorization.channel_id.0,
-                    work,
-                    reference,
-                    offset,
-                    &chunk,
-                    &exporter,
-                ))?;
-                let upload = hellas_rpc::pb::work::UploadContentRequest {
-                    route: request.route.clone(),
-                    authorization: request.authorization.clone(),
-                    client_signature: request.client_signature.clone(),
-                    content_id: reference.id().as_bytes().to_vec(),
-                    total_bytes: reference.bytes(),
-                    offset,
-                    chunk,
-                    chunk_signature: signature.bytes().to_vec(),
-                };
-                let response = match self {
-                    Self::Remote(transport, _) => {
-                        hellas_rpc::services::work::WorkClientImpl::new(IrohTransport::new(
-                            transport.connection().clone(),
-                        ))
-                        .upload_content(upload)
-                        .await?
-                    }
-                    Self::Local(service, _) => {
-                        service
-                            .upload(
-                                &upload,
-                                &hellas_wire::TransportContext {
-                                    open_exporter: Some(exporter),
-                                    ..Default::default()
-                                },
-                            )
+            for object in objects {
+                let mut offset = 0_u64;
+                let mut probing = true;
+                loop {
+                    let chunk = if probing {
+                        Vec::new()
+                    } else if object == reference {
+                        bytes[offset as usize
+                            ..(offset as usize + CONTENT_CHUNK_BYTES).min(bytes.len())]
+                            .to_vec()
+                    } else {
+                        content.read_chunk(object, offset, CONTENT_CHUNK_BYTES)?
+                    };
+                    let end = offset + chunk.len() as u64;
+                    let signature = signer.sign_digest(chunk_digest(
+                        authorization.channel_id.0,
+                        work,
+                        object,
+                        offset,
+                        &chunk,
+                        &exporter,
+                    ))?;
+                    let upload = hellas_rpc::pb::work::UploadContentRequest {
+                        route: request.route.clone(),
+                        authorization: request.authorization.clone(),
+                        client_signature: request.client_signature.clone(),
+                        program_manifest: manifest.canonical_bytes(),
+                        program_root: root.clone(),
+                        content_id: object.id().as_bytes().to_vec(),
+                        total_bytes: object.bytes(),
+                        offset,
+                        chunk,
+                        chunk_signature: signature.bytes().to_vec(),
+                    };
+                    let response = match self {
+                        Self::Remote(transport, _) => {
+                            hellas_rpc::services::work::WorkClientImpl::new(IrohTransport::new(
+                                transport.connection().clone(),
+                            ))
+                            .upload_content(upload)
                             .await?
+                        }
+                        Self::Local(service, _) => {
+                            service
+                                .upload(
+                                    &upload,
+                                    &hellas_wire::TransportContext {
+                                        open_exporter: Some(exporter),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?
+                        }
+                    };
+                    if let Some(refusal) = response.refused {
+                        return Ok(AcceptWorkResponse {
+                            outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+                        });
                     }
-                };
-                if let Some(refusal) = response.refused {
-                    return Ok(AcceptWorkResponse {
-                        outcome: Some(accept_work_response::Outcome::Refused(refusal)),
-                    });
+                    if response.next_offset > object.bytes()
+                        || (!probing && response.next_offset < end)
+                    {
+                        return Err(GrantError::Malformed.into());
+                    }
+                    if response.next_offset == object.bytes() {
+                        break;
+                    }
+                    offset = response.next_offset;
+                    probing = false;
                 }
-                if response.next_offset > reference.bytes()
-                    || (!probing && response.next_offset < end)
-                {
-                    return Err(GrantError::Malformed.into());
-                }
-                if response.next_offset == reference.bytes() {
-                    break;
-                }
-                offset = response.next_offset;
-                probing = false;
             }
         }
         match self {
@@ -451,6 +478,8 @@ pub struct GrantWorkResult {
     pub work_id: Digest,
     pub result: PaidJobResultV1,
     pub events: Vec<OutputEventEnvelope>,
+    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
+    pub provider_key: PublicKey,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
@@ -467,7 +496,7 @@ pub struct GrantSession {
     store: GrantClientStore,
     observed: UnixMillis,
     observed_at: Instant,
-    pending_body: Option<(Digest, PreparedWorkInput)>,
+    pending_body: Option<(Digest, PreparedInvocation, InvocationContent)>,
 }
 impl GrantSession {
     pub async fn open(options: GrantSessionOptions, transport: GrantTransport) -> Result<Self> {
@@ -614,9 +643,8 @@ impl GrantSession {
         let prepared = self
             .pending_body
             .as_ref()
-            .filter(|(work, _)| *work == id)
-            .map(|(_, body)| body.encode().map_err(GrantClientError::from))
-            .transpose()?;
+            .filter(|(work, _, _)| *work == id)
+            .map(|(_, body, content)| (body.clone(), content.clone()));
         let probe = prepared.is_none();
         if probe {
             self.refresh().await?;
@@ -630,15 +658,18 @@ impl GrantSession {
             client_signature: signature.bytes().to_vec(),
             prepared_input: prepared
                 .as_ref()
-                .map(|bytes| {
-                    encode_reference(ContentRef::new(ContentId::hash(bytes), bytes.len() as u64))
-                })
+                .map(|_| encode_reference(a.input_content))
                 .unwrap_or_default(),
         };
         let link = self.link().await?;
         let response = tokio::time::timeout(
             self.options.timeout,
-            link.accept(request, id, prepared.as_deref(), &self.options.signer),
+            link.accept(
+                request,
+                id,
+                prepared.as_ref().map(|(input, content)| (input, content)),
+                &self.options.signer,
+            ),
         )
         .await
         .map_err(|_| GrantClientError::Timeout)??;
@@ -704,12 +735,14 @@ impl GrantSession {
     pub async fn run(
         &mut self,
         policy_name: &str,
-        input: PreparedWorkInput,
+        input: PreparedInvocation,
+        content: &InvocationContent,
         progress: Option<PaidProgress>,
     ) -> Result<GrantWorkResult> {
         self.run_before(
             policy_name,
             input,
+            content,
             progress,
             tokio::time::Instant::now() + self.options.timeout,
         )
@@ -724,7 +757,8 @@ impl GrantSession {
     pub async fn run_before(
         &mut self,
         policy_name: &str,
-        input: PreparedWorkInput,
+        input: PreparedInvocation,
+        content: &InvocationContent,
         progress: Option<PaidProgress>,
         deadline: tokio::time::Instant,
     ) -> Result<GrantWorkResult> {
@@ -732,14 +766,24 @@ impl GrantSession {
             return Err(GrantClientError::Timeout);
         }
         let (policy, id, mut stream, finish_by) =
-            tokio::time::timeout_at(deadline, self.admit(policy_name, &input))
+            tokio::time::timeout_at(deadline, self.admit(policy_name, &input, content))
                 .await
                 .map_err(|_| GrantClientError::Timeout)??;
         let channel = self.store.channel().id;
         let idle = self.options.timeout;
-        let mut prefixes =
-            Prefixes::new(&policy.work, &input, grant_producer(&self.target.provider)?)?;
-        let signed = tokio::time::timeout_at(finish_by, async {
+        let facts = policy
+            .invocation_policy
+            .admit(&input, &self.options.signer.public_key())?;
+        let producer = PublicKey::Secp256k1(grant_producer(&self.target.provider)?.to_bytes());
+        let mut verifier = StreamVerifier::new(
+            input.request.clone(),
+            producer,
+            facts.max_transcript_payload_bytes as usize,
+        )?;
+        let mut seen = 0u64;
+        let mut captured_bytes = 9u64;
+        let mut captured_heap = 0u64;
+        let (signed, events, output) = tokio::time::timeout_at(finish_by, async {
             let mut next_by = deadline;
             while let Some(event) = tokio::time::timeout_at(next_by, stream.next())
                 .await
@@ -748,7 +792,7 @@ impl GrantSession {
                 next_by = tokio::time::Instant::now() + idle;
                 let event = event?;
                 use prost::Message;
-                if event.encoded_len() as u64 > u64::from(policy.work.max_encoded_result_frame()) {
+                if event.encoded_len() as u64 > u64::from(facts.max_encoded_result_frame) {
                     return Err(GrantProtocolError::FrameBound.into());
                 }
                 match event.outcome {
@@ -759,7 +803,31 @@ impl GrantSession {
                         )
                         .map_err(GrantClientError::from)?
                         {
-                            prefixes.push(event.clone())?;
+                            seen += 1;
+                            captured_bytes = captured_bytes.saturating_add(
+                                hellas_rpc::canonical_dag_cbor(&event)?.len() as u64,
+                            );
+                            captured_heap = captured_heap.saturating_add(
+                                event
+                                    .retained_heap_bytes()
+                                    .and_then(|n| {
+                                        n.checked_add(
+                                            4 * std::mem::size_of::<OutputEventEnvelope>(),
+                                        )
+                                    })
+                                    .map(|n| n as u64)
+                                    .unwrap_or(u64::MAX),
+                            );
+                            if seen >= facts.max_output_events
+                                || captured_bytes > facts.max_spool_bytes
+                                || captured_heap > facts.max_spool_bytes
+                            {
+                                return Err(GrantProtocolError::OutputBound.into());
+                            }
+                            verifier.push(event.clone())?;
+                            if verifier.terminal_seen() {
+                                return Err(GrantProtocolError::PrefixKind.into());
+                            }
                             if let Some(progress) = &progress {
                                 progress(event).map_err(GrantClientError::from)?;
                             }
@@ -774,13 +842,8 @@ impl GrantSession {
                         if tail.len() != 1 {
                             return Err(GrantProtocolError::TerminalCount.into());
                         }
-                        prefixes.events.extend(tail);
-                        if encode_transcript(&prefixes.events)
-                            .map_err(GrantClientError::from)?
-                            .len() as u64
-                            > policy.work.max_spool_bytes()
-                        {
-                            return Err(GrantProtocolError::SpoolBound.into());
+                        for event in tail {
+                            verifier.push(event)?;
                         }
                         let signed = SignedResult {
                             result: PaidJobResultV1::decode(&terminal.result)
@@ -801,7 +864,16 @@ impl GrantSession {
                         {
                             return Err(GrantProtocolError::AfterTerminal.into());
                         }
-                        return Ok(signed);
+                        let (_, events) = verifier.finish()?;
+                        let output = input
+                            .verify_output(
+                                &policy.invocation_policy,
+                                &self.options.signer.public_key(),
+                                &producer,
+                                &events,
+                            )?
+                            .output;
+                        return Ok((signed, events, output));
                     }
                     Some(work_stream_event::Outcome::Refused(refusal)) => {
                         return Err(refusal_error(&refusal, Some((&self.target, channel, id)))?);
@@ -816,9 +888,9 @@ impl GrantSession {
         self.store
             .complete(
                 id,
-                &policy.work,
+                &policy.invocation_policy,
                 &input,
-                &prefixes.events,
+                &events,
                 signed.clone(),
                 self.now(),
             )
@@ -826,7 +898,9 @@ impl GrantSession {
         Ok(GrantWorkResult {
             work_id: id,
             result: signed.result,
-            events: prefixes.events,
+            events,
+            output,
+            provider_key: producer,
         })
     }
 
@@ -836,7 +910,8 @@ impl GrantSession {
     async fn admit(
         &mut self,
         policy_name: &str,
-        input: &PreparedWorkInput,
+        input: &PreparedInvocation,
+        content: &InvocationContent,
     ) -> Result<(
         GrantPolicy,
         Digest,
@@ -846,9 +921,7 @@ impl GrantSession {
         if self.store.book().pending_proposal().is_some() {
             return Err(GrantClientError::RecoveryRequired);
         }
-        if input.assurance().map_err(GrantClientError::from)?
-            != self.options.target.trust().required_assurance
-        {
+        if input.request.assurance != self.options.target.trust().required_assurance {
             return Err(GrantProtocolError::Assurance.into());
         }
         let standing = self.refresh().await?;
@@ -861,10 +934,9 @@ impl GrantSession {
             .find(|p| p.name == policy_name)
             .ok_or(GrantError::OutOfScope)?
             .clone();
-        self.options
-            .target
-            .trust()
-            .verify_environment(policy.work.allowed_environment())?;
+        policy
+            .invocation_policy
+            .admit(input, &self.options.signer.public_key())?;
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so
         // measuring the signed limit from it never exceeds the allowance.
@@ -898,7 +970,7 @@ impl GrantSession {
         let finish_by =
             tokio::time::Instant::now() + Duration::from_millis(span) + self.options.timeout;
         let channel = self.store.channel().id;
-        let prepared = input.encode().map_err(GrantClientError::from)?;
+        let prepared = input.canonical_bytes()?;
         let a = GrantJobAuthorizationV1 {
             channel_id: channel,
             generation: self.store.channel().generation,
@@ -907,20 +979,21 @@ impl GrantSession {
             resource_id: policy.resource,
             resource_revision: policy.revision,
             pricing_revision: policy.pricing.revision,
-            work_policy_digest: policy.work.digest(self.target.network, channel.0),
+            work_policy_digest: hellas_channel::job::policy_digest(
+                self.target.network,
+                channel.0,
+                &policy.invocation_policy,
+            )?,
             input_content: hellas_rpc::ContentRef::for_bytes(&prepared),
-            prepared_input_digest: input
-                .bound_digest(self.target.network, channel.0)
-                .map_err(GrantClientError::from)?,
+            prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
+                self.target.network,
+                channel.0,
+                input,
+            )?,
             proposal_nonce: self.store.next_nonce()?,
             acceptance_deadline_ms: UnixMillis(now.0 + (span / 2).min(30_000)),
-            request_commitment: RequestCommitment::from_digest(
-                input
-                    .input_commitment()
-                    .map_err(GrantClientError::from)?
-                    .digest(),
-            ),
-            environment_commitment: policy.work.allowed_environment(),
+            request_commitment: input.request.commitment()?,
+            environment_commitment: input.request.execution_environment,
             terminal_deadline_ms: UnixMillis(terminal),
             delivery_deadline_ms: UnixMillis(
                 terminal.checked_add(300_000).ok_or(GrantError::Malformed)?,
@@ -931,7 +1004,7 @@ impl GrantSession {
             .propose(&self.offer, a, input, &self.options.signer, now)
             .await?;
         let id = grant_work_id(self.target.network, &a);
-        self.pending_body = Some((id, input.clone()));
+        self.pending_body = Some((id, input.clone(), content.clone()));
 
         let request = AcceptWorkRequest {
             route: Some(WorkRoute::grant(channel.0)),
@@ -944,7 +1017,7 @@ impl GrantSession {
         };
         let response = tokio::time::timeout(
             self.options.timeout,
-            link.accept(request, id, Some(&prepared), &self.options.signer),
+            link.accept(request, id, Some((input, content)), &self.options.signer),
         )
         .await
         .map_err(|_| GrantClientError::Timeout)??;
@@ -1036,109 +1109,5 @@ fn refusal_error(
         terminal: detail.terminal.clone(),
     })
 }
-struct Prefixes {
-    events: Vec<OutputEventEnvelope>,
-    input: InputCommitment,
-    key: PublicKey,
-    scheme: SchemeId,
-    previous: EventCommitment,
-    kind: &'static str,
-    tokens: u64,
-    bytes: usize,
-    payload: u64,
-    max_tokens: u64,
-    max_events: u64,
-    max_payload: u64,
-    max_spool: u64,
-}
-impl Prefixes {
-    fn new(
-        policy: &WorkPolicy,
-        input: &PreparedWorkInput,
-        producer: hellas_kernel::Key,
-    ) -> Result<Self> {
-        let (operation, kind, max_tokens, max_events, max_payload) = match (policy, input) {
-            (WorkPolicy::Evaluate(_), PreparedWorkInput::Evaluate(input)) => (
-                Operation::Evaluate,
-                hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
-                u64::from(
-                    input
-                        .parts()
-                        .map_err(GrantClientError::from)?
-                        .text_policy
-                        .max_new_tokens(),
-                ),
-                u64::MAX,
-                u64::MAX,
-            ),
-            (WorkPolicy::Fetch { policy, .. }, PreparedWorkInput::Fetch(_)) => (
-                Operation::Fetch,
-                hellas_rpc::fetch::OUTPUT_EVENT_KIND,
-                0,
-                u64::from(policy.max_output_events),
-                u64::from(policy.max_output_bytes),
-            ),
-            _ => return Err(GrantError::OutOfScope.into()),
-        };
-        let commitment = input.input_commitment().map_err(GrantClientError::from)?;
-        Ok(Self {
-            events: vec![],
-            input: commitment,
-            key: PublicKey::Secp256k1(producer.to_bytes()),
-            scheme: scheme_id(
-                operation,
-                input.assurance().map_err(GrantClientError::from)?,
-            ),
-            previous: output_genesis(commitment, StreamId::from_input_commitment(commitment)),
-            kind,
-            tokens: 0,
-            bytes: 0,
-            payload: 0,
-            max_tokens,
-            max_events,
-            max_payload,
-            max_spool: policy.max_spool_bytes(),
-        })
-    }
-    fn push(&mut self, event: OutputEventEnvelope) -> Result<()> {
-        self.previous = verify_output_event_continuation(
-            self.scheme,
-            self.input,
-            &self.key,
-            self.events.len() as u64,
-            self.previous,
-            &event,
-        )
-        .map_err(GrantClientError::from)?;
-        if event.event().body().kind() != self.kind {
-            return Err(GrantProtocolError::PrefixKind.into());
-        }
-        if self.kind == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
-            self.tokens = self.tokens.saturating_add(
-                hellas_rpc::evaluate::decode_token_delta_payload(event.payload())
-                    .map_err(GrantClientError::from)?
-                    .token_ids
-                    .len() as u64,
-            );
-        } else {
-            hellas_rpc::fetch::decode_fetch_event_payload(event.payload())
-                .map_err(GrantClientError::from)?;
-        }
-        self.bytes = self
-            .bytes
-            .saturating_add(event.payload().len().saturating_mul(2).saturating_add(1024));
-        self.payload = self.payload.saturating_add(event.payload().len() as u64);
-        if self.tokens > self.max_tokens
-            || self.events.len() as u64 + 1 >= self.max_events
-            || self.payload > self.max_payload
-            || self.bytes as u64 > self.max_spool
-        {
-            return Err(GrantProtocolError::OutputBound.into());
-        }
-        self.events.push(event);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests;

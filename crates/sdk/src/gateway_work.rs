@@ -1,11 +1,5 @@
 //! Funding-independent gateway input preparation and bounded output delivery.
 use futures::stream::BoxStream;
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
-use hellas_gateway::{ExecutionEvent, Outcome, StopReason, WorkExecutionRequest, WorkGatewayError};
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
-    TextPolicy, TokenIds,
-};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -13,78 +7,52 @@ pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_channel::work_store::journal::
 pub const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 pub const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
 pub type BufferedEvent<E, X> = (Result<E, X>, OwnedSemaphorePermit);
-fn error(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
-    WorkGatewayError::Execution(Box::new(e))
+fn output_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> hellas_gateway::WorkGatewayError {
+    hellas_gateway::WorkGatewayError::Execution(Box::new(error))
 }
-
-pub fn prepare_evaluate(
-    request: WorkExecutionRequest,
-    runner: hellas_auth::PublicKey,
-) -> Result<PreparedPaidInputV1, WorkGatewayError> {
-    prepare_evaluate_with_nonce(request, runner, rand::random())
+pub(crate) fn fetch_prefix(
+    chunk: hellas_rpc::protocol::invocation::output::ArtifactChunk,
+    pending: &mut Vec<u8>,
+) -> Result<Vec<hellas_rpc::output::OutputEvent>, hellas_gateway::WorkGatewayError> {
+    use hellas_rpc::protocol::invocation::fetch;
+    if chunk.name != fetch::RESPONSE_EVENTS || chunk.format != fetch::RESPONSE_EVENTS_FORMAT {
+        return Err(output_error(std::io::Error::other(
+            "Fetch artifact identity",
+        )));
+    }
+    pending.extend_from_slice(chunk.bytes.as_bytes());
+    let mut events = Vec::new();
+    while let Some(header) = pending.get(..4) {
+        let length = u32::from_be_bytes(header.try_into().map_err(output_error)?) as usize;
+        if length > hellas_rpc::fetch::MAX_FETCH_OUTPUT_PAYLOAD_BYTES {
+            return Err(output_error(std::io::Error::other(
+                "Fetch frame exceeds payload bound",
+            )));
+        }
+        let end = 4 + length;
+        if pending.len() < end {
+            break;
+        }
+        events.push(
+            hellas_rpc::fetch::decode_fetch_event_payload(&pending[4..end])
+                .map_err(output_error)?,
+        );
+        pending.drain(..end);
+    }
+    Ok(events)
 }
-
-pub(crate) fn prepare_evaluate_with_nonce(
-    request: WorkExecutionRequest,
-    runner: hellas_auth::PublicKey,
-    nonce: [u8; 32],
-) -> Result<PreparedPaidInputV1, WorkGatewayError> {
-    hellas_client::execution::validate_causal_lm_invocation(
-        &request.environment,
-        &request.input_ids,
-        request.max_new_tokens,
-        &request.stop_token_ids,
-    )
-    .map_err(|e| WorkGatewayError::Rejected(Box::new(e)))?;
-    let manifest = request.environment.manifest();
-    let tokens = TokenIds::from_u32s(request.input_ids);
-    let policy = TextPolicy::from_u32_stop_tokens(request.max_new_tokens, request.stop_token_ids);
-    let identity = TextArtifact::identity(BoundTermId::from_digest(manifest.content_id().digest()));
-    let execution = TextExecution::new(
-        SourceRef::output(identity.output_id()),
-        tokens.output_id(),
-        policy.output_id(),
-    );
-    let evaluate = hellas_rpc::EvaluateRequest {
-        text_execution: execution.input_id().digest(),
-        runner_public_key: runner,
-        execution_environment: manifest.content_id(),
-        nonce,
-        assurance: hellas_rpc::Assurance::ProducerSigned,
-        retain: true,
-    };
-    Ok(PreparedPaidInputV1::new(
-        &evaluate, &manifest, &execution, &tokens, &policy, &identity,
-    ))
-}
-
-/// Called only after the funding session has verified the complete transcript.
-pub fn evaluate_terminal(
-    events: Vec<hellas_rpc::OutputEventEnvelope>,
-) -> Result<ExecutionEvent, WorkGatewayError> {
-    let envelope = events
-        .last()
-        .ok_or(hellas_rpc::evaluate::EvaluateProtocolError::EmptyOutputTranscript)
-        .map_err(error)?;
-    let terminal =
-        hellas_rpc::evaluate::decode_terminal_payload(envelope.payload()).map_err(error)?;
-    let stop_reason =
-        if terminal.stop_reason == hellas_rpc::evaluate::EvaluateStopReason::STOP_TOKEN {
-            // The canonical terminal decoder checks the stop witness.
-            StopReason::StopToken(
-                terminal
-                    .matched_stop_token_id
-                    .expect("validated stop witness"),
-            )
-        } else {
-            StopReason::MaxNewTokens
-        };
-    Ok(ExecutionEvent::Done(Outcome::Completed {
-        total_tokens: terminal.usage.billable_units().map_err(error)?,
-        stop_reason,
-        text_artifact: terminal.text_artifact,
-        output_events: events,
-    }))
+pub(crate) fn fetch_terminal(
+    output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
+    provider: &hellas_auth::PublicKey,
+) -> Result<hellas_rpc::output::OutputEvent, hellas_gateway::WorkGatewayError> {
+    let response = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider)
+        .map_err(output_error)?;
+    let (_, terminal) = response.output_event_payloads();
+    Ok(hellas_rpc::fetch::decode_fetch_terminal_payload(terminal)
+        .map_err(output_error)?
+        .to_output_event())
 }
 
 pub fn emit<E, X>(

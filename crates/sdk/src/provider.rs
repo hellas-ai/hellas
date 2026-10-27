@@ -127,7 +127,7 @@ impl<R> FetchProviderOptions<R> {
             .transpose()?;
         let producer_key = Arc::new(options.identity.node_key().clone());
         let mut executor_config =
-            ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
+            ExecutorSpawnConfig::new(producer_key.clone(), assurance, options.routes);
         executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
         executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
         Ok(ProviderOptions {
@@ -427,8 +427,8 @@ where
     }
     let prepared_grants = match config.grants {
         Some(grants) => {
-            let resources = if config.executor.supports_evaluate() {
-                crate::grant_provider::ProviderResources::EvaluateAndFetch(
+            let resources = if config.executor.supports_compute() {
+                crate::grant_provider::ProviderResources::ComputeAndFetch(
                     &config.executor.fetch_routes,
                 )
             } else {

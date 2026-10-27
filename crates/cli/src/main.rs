@@ -7,8 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "evaluate")]
-mod evaluate;
+mod compute;
 
 mod commands;
 mod identity;
@@ -59,9 +58,6 @@ fn load_command_identity(
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
     );
-    #[cfg(feature = "evaluate")]
-    let grant_identity = grant_identity
-        || matches!(command, Commands::Gateway { evaluation, .. } if evaluation.local);
     let read_only = grant_identity
         || settles_paid_work
         || matches!(
@@ -140,39 +136,6 @@ impl RemoteTrustArgs {
             )?,
         )
     }
-}
-
-/// One canonical causal-LM route and its untrusted text-presentation boundary.
-#[derive(Args)]
-struct CausalLmArgs {
-    /// Canonical causal-LM environment root. Without --manifest-id, these
-    /// local file bytes are the trust anchor and determine the exact manifest.
-    #[arg(long = "environment", value_name = "FILE")]
-    environment: PathBuf,
-
-    /// Optional caller-selected manifest ContentId for --environment. When
-    /// supplied, the file must derive exactly this ID before any route starts.
-    #[arg(
-        long = "manifest-id",
-        value_name = "CONTENT_ID",
-        value_parser = parse_content_id_hex
-    )]
-    manifest_id: Option<hellas_rpc::ContentId>,
-
-    /// Presentation-only model label. It defaults to the derived manifest ID
-    /// and never enters the manifest, quote, or trusted executor input.
-    #[arg(long = "model", value_name = "NAME")]
-    model: Option<String>,
-
-    /// Tokenizer JSON used only for local text presentation. It is not part of
-    /// the Hellas execution guarantee.
-    #[arg(long = "tokenizer", value_name = "PATH")]
-    tokenizer: PathBuf,
-
-    /// Caller-selected stop token ID. Repeat or comma-separate. No stop tokens
-    /// are inferred from the tokenizer or causal-LM environment.
-    #[arg(long = "stop-token", value_delimiter = ',')]
-    stop_token_ids: Vec<u32>,
 }
 
 #[derive(Parser)]
@@ -268,10 +231,7 @@ enum Commands {
     /// Run the RPC server
     Serve {
         #[command(flatten)]
-        faucet_policy: commands::serve::faucet::PolicyArgs,
-        #[cfg(feature = "evaluate")]
-        #[command(flatten)]
-        evaluation: evaluate::ServeArgs,
+        native: compute::ServeArgs,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -289,7 +249,7 @@ enum Commands {
         queue_size: usize,
         /// Paid-work configuration. Its presence serves WorkSetup and Work;
         /// Work remains retryably not ready until the configured state mounts.
-        #[arg(long = "work-config")]
+        #[arg(long = "paid-work-config")]
         work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
@@ -378,13 +338,8 @@ enum Commands {
         /// Allow a non-loopback listener using the provisioned gateway authority.
         #[arg(long)]
         allow_remote: bool,
-        /// Explicit local text-chat template.
-        #[arg(long = "chat-template", value_name = "TEMPLATE")]
-        chat_template: Option<hellas_presentation::ChatTemplate>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
-        #[command(flatten)]
-        causal_lm: Option<CausalLmArgs>,
         /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -398,9 +353,6 @@ enum Commands {
         #[arg(long = "address", value_delimiter = ',')]
         #[arg(requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        #[cfg(feature = "evaluate")]
-        #[command(flatten)]
-        evaluation: evaluate::GatewayArgs,
         /// Max execution retries on failure (discovery mode)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
@@ -470,11 +422,6 @@ enum Commands {
         #[command(subcommand)]
         command: commands::store::StoreCommand,
     },
-    /// Build or inspect canonical causal-LM environments.
-    Environment {
-        #[command(subcommand)]
-        command: commands::environment::EnvironmentCommand,
-    },
     /// Query or run Hellas chain components
     Chain {
         #[command(subcommand)]
@@ -519,7 +466,6 @@ fn validate_identity_options(
             command: commands::contributions::OfferCommand::Import { .. },
         } => Some("offer import"),
         Commands::Store { .. } => Some("store"),
-        Commands::Environment { .. } => Some("environment"),
         Commands::Serve {
             check_config: true, ..
         } => Some("serve --check-config"),
@@ -573,12 +519,11 @@ fn main() {
     // must run before Tokio creates worker threads and before clap, tracing,
     // or any stdout-producing command so the child speaks only Catena's worker
     // protocol on stdout.
-    #[cfg(feature = "evaluate")]
-    match catena_lang::safe_gpu::run_worker_if_requested() {
+    match hellas_executor::child_main() {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
-            eprintln!("error: failed to start Catena GPU worker: {error}");
+            eprintln!("error: failed to start Catena worker: {error}");
             std::process::exit(1);
         }
     }
@@ -603,13 +548,6 @@ async fn async_main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
-    if let Commands::Serve { faucet_policy, .. } = &cli.command
-        && faucet_policy.any()
-        && !cli.owner.is_faucet()
-    {
-        eprintln!("error: paid policy overrides require --faucet or --faucet-account");
-        std::process::exit(2);
-    }
     if let Err(error) =
         validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root)
     {
@@ -658,13 +596,6 @@ async fn async_main() {
     }
 
     let faucet_provider = cli.owner.is_faucet() && matches!(&cli.command, Commands::Serve { .. });
-    let faucet_root = faucet_provider
-        .then(|| owner::OwnerArgs::provider_root(cli.identity.as_deref()))
-        .transpose()
-        .unwrap_or_else(|error| {
-            eprintln!("error: {error:#}");
-            std::process::exit(1)
-        });
     let faucet_requester = cli.owner.is_faucet()
         && matches!(
             &cli.command,
@@ -774,15 +705,6 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Environment { command } => {
-            let result = commands::environment::run(command).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         command => command,
     };
 
@@ -834,9 +756,7 @@ async fn async_main() {
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
         Commands::Serve {
-            faucet_policy,
-            #[cfg(feature = "evaluate")]
-            evaluation,
+            native,
             assurance,
             port,
             no_discovery,
@@ -863,9 +783,6 @@ async fn async_main() {
                 Err(error) => Err(error.into()),
                 Ok(work_config) => {
                     async {
-                        let work_config = match (work_config, faucet_root.as_ref()) { (None, Some(root)) => Some(commands::serve::faucet::chain_defaults(root)?), (configured, _) => configured };
-                        anyhow::ensure!(!faucet_provider || await_owner.is_none(), "--faucet performs local owner bootstrap; omit --await-owner");
-                        anyhow::ensure!(faucet_provider || !faucet_policy.any(), "paid policy overrides require --faucet or --faucet-account");
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
@@ -901,13 +818,11 @@ async fn async_main() {
                             (None, None) => None,
                         };
                         commands::serve::run(commands::serve::ServeOptions {
-                            faucet: match faucet_root { Some(root) => Some(commands::serve::faucet::Startup::new(root, owner.as_ref().context("faucet owner was not loaded")?.clone(), faucet_policy)?), None => None },
                             transport,
                             port,
                             discovery: !no_discovery,
                             queue_size,
-                            #[cfg(feature = "evaluate")]
-                            evaluation,
+                            native,
                             work_config,
                             chain_node,
                             grants,
@@ -940,15 +855,11 @@ async fn async_main() {
             paid_work_config,
             gateway_profile,
             allow_remote,
-            chat_template,
             remote_trust,
-            causal_lm,
             host,
             port,
             node_id,
             node_addrs,
-            #[cfg(feature = "evaluate")]
-            evaluation,
             retries,
             default_max_tokens,
             metrics_port,
@@ -963,37 +874,9 @@ async fn async_main() {
             wrap_args,
         } => {
             async {
-                #[cfg(feature = "evaluate")]
-                let local_content = causal_lm.as_ref().map(|args| evaluation.content(args, store_dir.as_deref()));
                 let cache_options =
                     commands::gateway_cache::options(output_cache, store_dir.clone())?;
-                let (
-                    loaded_environment,
-                    model_name,
-                    tokenizer,
-                    stop_token_ids,
-                ) = if let Some(CausalLmArgs {
-                    environment,
-                    manifest_id,
-                    model,
-                    tokenizer,
-                    stop_token_ids,
-                }) = causal_lm
-                {
-                    let loaded_environment =
-                        commands::llm::load_environment(&environment, manifest_id)?;
-                    let model_name = model.unwrap_or_else(|| {
-                        loaded_environment.execution().manifest_id().to_string()
-                    });
-                    (
-                        Some(loaded_environment.into_execution()),
-                        model_name,
-                        Some(tokenizer),
-                        stop_token_ids,
-                    )
-                } else {
-                    (None, String::new(), None, Vec::new())
-                };
+                let model_name = String::new();
                 let assurance = remote_trust.assurance;
                 let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
                     .transpose()?.map(std::sync::Arc::new);
@@ -1011,20 +894,10 @@ async fn async_main() {
                     Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
                         hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
                 } else { None };
-                #[cfg(feature = "evaluate")]
-                let (grant_source, grant_policy) = if evaluation.local && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    anyhow::ensure!(responses_backend == GatewayResponsesBackend::Hellas, "--local requires the Hellas execution backend");
-                    anyhow::ensure!(grant_policy.as_deref().is_none_or(|name| name == "local"), "the local resource is named local");
-                    anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
-                    (Some(commands::grant_gateway::local::prepare(
-                        local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
-                        &local_identity, commands::contributions::require_principal(passkey)?, work_application()?, remote_trust.load()?,
-                    ).await?), Some("local".into()))
-                } else { (grant_source, grant_policy) };
                 if let Some((session, _)) = grant_source.as_ref()
                     && hellas_sdk::grant_gateway::responses::selected_policy(&session.target, grant_policy.as_deref())?.is_some()
                 {
-                    anyhow::ensure!(paid_work_config.is_none() && loaded_environment.is_none(), "Responses grants require their own Fetch gateway");
+                    anyhow::ensure!(paid_work_config.is_none(), "Responses grants require their own Fetch gateway");
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
                     anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
                     let hellas_sdk::node_control::profile::GatewayHost { access, control, .. } = hellas_sdk::node_control::profile::GatewayProfile::load(
@@ -1087,13 +960,7 @@ async fn async_main() {
                 let paid_work = grant_gateway.as_ref().map(|backend| backend.clone() as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>).or(paid_work);
                 let shutdown = paid_work.clone();
                 let result = async {
-                let provider_trust = if paid_work.is_some()
-                    || output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly
-                {
-                    None
-                } else {
-                    gateway_provider_trust(responses_backend)?
-                };
+                let provider_trust = None;
                 let archive = hellas_gateway::ArchiveOptions {
                     directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
                     zdr,
@@ -1121,17 +988,13 @@ async fn async_main() {
                     paid_work,
                     access: gateway_access,
             allow_remote,
-                    chat_template,
-                    host,
+                            host,
                     port,
                     node_id,
                     node_addrs,
                     retries,
                     default_max_tokens,
                     model_name,
-                    causal_lm: loaded_environment,
-                    tokenizer,
-                    stop_token_ids,
                     metrics_port,
                     responses_backend: responses_backend.into(),
                     responses_proxy_url,
@@ -1179,9 +1042,6 @@ async fn async_main() {
         #[cfg(unix)]
         Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
-        }
-        Commands::Environment { .. } => {
-            unreachable!("environment commands handled before identity load")
         }
         Commands::Identity { command } => match command {
             IdentityCommand::Init => Ok(()),

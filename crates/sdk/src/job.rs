@@ -1,14 +1,18 @@
-//! Caller-owned job folders. Purchase nonces are derived from durable channel
-//! state rather than stored with the reusable application input.
+//! Caller-owned job folders. Purchase nonces derive from durable channel state.
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, hash_tuple};
-use hellas_channel::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
-use hellas_rpc::{Assurance, CausalLmEnvironment, FetchContract, ProgramManifest};
+use hellas_channel::content::{EphemeralContent, InvocationContent};
+use hellas_rpc::{
+    Assurance, ContentRef, FetchContract, JsonBytes, ProgramManifest,
+    protocol::invocation::{
+        Artifact, InvocationInput, InvocationPolicy, InvocationRequest, PreparedInvocation,
+        compute, fetch,
+    },
+};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 pub const FORMAT: &str = "hellas.job.v1";
 const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     #[error("invalid job: {0}")]
@@ -26,9 +30,7 @@ pub enum JobError {
     #[error(transparent)]
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]
-    Work(#[from] hellas_channel::model::work::PaidWorkError),
-    #[error(transparent)]
-    Gateway(#[from] hellas_gateway::WorkGatewayError),
+    Content(#[from] hellas_channel::content::ContentError),
 }
 type Result<T> = std::result::Result<T, JobError>;
 fn invalid(message: impl Into<String>) -> JobError {
@@ -39,8 +41,8 @@ fn invalid(message: impl Into<String>) -> JobError {
 pub struct Job {
     price: u64,
     input: JobInput,
+    manifest: ProgramManifest,
 }
-
 #[derive(Clone, Debug)]
 pub enum JobInput {
     Fetch {
@@ -50,14 +52,13 @@ pub enum JobInput {
         request: Vec<u8>,
         assurance: Assurance,
     },
-    CausalLm {
-        environment: CausalLmEnvironment,
-        input_ids: Vec<u32>,
-        max_new_tokens: u32,
-        stop_token_ids: Vec<u32>,
+    Compute {
+        environment: compute::Environment,
+        plan: compute::Plan,
+        inputs: Vec<Artifact>,
+        content: InvocationContent,
     },
 }
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
@@ -67,7 +68,7 @@ struct Document {
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch: Option<FetchFiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    causal_lm: Option<CausalLmFiles>,
+    compute: Option<ComputeFiles>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,37 +92,88 @@ struct FetchFiles {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CausalLmFiles {
+struct ComputeFiles {
     environment: String,
-    tokens: String,
-    max_new_tokens: u32,
-    #[serde(default)]
-    stop_token_ids: Vec<u32>,
+    plan: compute::Plan,
+    inputs: Vec<FileArtifact>,
+    objects: Vec<ContentFile>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileArtifact {
+    name: String,
+    format: String,
+    path: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentFile {
+    object: ContentRef,
+    path: String,
 }
 
 impl Job {
     pub fn from_input(price: u64, input: JobInput) -> Result<Self> {
-        match input {
+        if price == 0 || price > i64::MAX as u64 {
+            return Err(invalid("payment price must be a positive TOML integer"));
+        }
+        let manifest = match &input {
             JobInput::Fetch {
                 contract,
                 service,
                 method,
                 request,
-                assurance,
-            } => Self::fetch(price, contract, service, method, request, assurance),
-            JobInput::CausalLm {
+                ..
+            } => {
+                if service.is_empty()
+                    || method.is_empty()
+                    || service.len() > hellas_rpc::fetch::MAX_FETCH_ROUTE_COMPONENT_BYTES
+                    || method.len() > hellas_rpc::fetch::MAX_FETCH_ROUTE_COMPONENT_BYTES
+                {
+                    return Err(invalid(
+                        "Fetch route components must be nonempty and bounded",
+                    ));
+                }
+                if request.len() > hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES {
+                    return Err(invalid("Fetch request exceeds byte limit"));
+                }
+                serde_json::from_slice::<serde_json::Value>(request)?;
+                if contract.schema() == hellas_rpc::FetchSchema::HttpV1 {
+                    hellas_rpc::http_fetch::HttpFetchRequest::decode(request)
+                        .map_err(|e| invalid(e.to_string()))?;
+                }
+                contract.manifest()
+            }
+            JobInput::Compute {
                 environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
-            } => Self::causal_lm(
-                price,
-                environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
-            ),
-        }
+                plan,
+                inputs,
+                content,
+            } => {
+                let root = environment.canonical_bytes()?;
+                let manifest = environment.manifest()?;
+                if content
+                    .read_bounded(manifest.root(), compute::MAX_ENVIRONMENT_BYTES as u64)?
+                    .as_slice()
+                    != root
+                {
+                    return Err(invalid(
+                        "compute content does not open the environment root",
+                    ));
+                }
+                InvocationInput {
+                    parameters: JsonBytes(plan.canonical_bytes()?),
+                    artifacts: inputs.clone(),
+                }
+                .validate()?;
+                manifest
+            }
+        };
+        Ok(Self {
+            price,
+            input,
+            manifest,
+        })
     }
     pub fn fetch(
         price: u64,
@@ -131,24 +183,7 @@ impl Job {
         request: Vec<u8>,
         assurance: Assurance,
     ) -> Result<Self> {
-        if service.is_empty()
-            || method.is_empty()
-            || service.len() > hellas_rpc::fetch::MAX_FETCH_ROUTE_COMPONENT_BYTES
-            || method.len() > hellas_rpc::fetch::MAX_FETCH_ROUTE_COMPONENT_BYTES
-        {
-            return Err(invalid(
-                "Fetch service and method must be nonempty bounded route components",
-            ));
-        }
-        if request.len() > hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES {
-            return Err(invalid("Fetch request exceeds byte limit"));
-        }
-        serde_json::from_slice::<serde_json::Value>(&request)?;
-        if contract.schema() == hellas_rpc::FetchSchema::HttpV1 {
-            hellas_rpc::http_fetch::HttpFetchRequest::decode(&request)
-                .map_err(|e| invalid(e.to_string()))?;
-        }
-        Self::new(
+        Self::from_input(
             price,
             JobInput::Fetch {
                 contract,
@@ -159,37 +194,22 @@ impl Job {
             },
         )
     }
-
-    pub fn causal_lm(
+    pub fn compute(
         price: u64,
-        environment: CausalLmEnvironment,
-        input_ids: Vec<u32>,
-        max_new_tokens: u32,
-        stop_token_ids: Vec<u32>,
+        environment: compute::Environment,
+        plan: compute::Plan,
+        inputs: Vec<Artifact>,
+        content: InvocationContent,
     ) -> Result<Self> {
-        hellas_client::execution::validate_causal_lm_invocation(
-            &environment,
-            &input_ids,
-            max_new_tokens,
-            &stop_token_ids,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
-        Self::new(
+        Self::from_input(
             price,
-            JobInput::CausalLm {
+            JobInput::Compute {
                 environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
+                plan,
+                inputs,
+                content,
             },
         )
-    }
-
-    fn new(price: u64, input: JobInput) -> Result<Self> {
-        if price == 0 || price > i64::MAX as u64 {
-            return Err(invalid("payment price must be a positive TOML integer"));
-        }
-        Ok(Self { price, input })
     }
     pub fn price(&self) -> u64 {
         self.price
@@ -200,165 +220,33 @@ impl Job {
     pub fn assurance(&self) -> Assurance {
         match &self.input {
             JobInput::Fetch { assurance, .. } => *assurance,
-            JobInput::CausalLm { .. } => Assurance::ProducerSigned,
+            JobInput::Compute { .. } => Assurance::ProducerSigned,
         }
     }
     pub fn manifest(&self) -> ProgramManifest {
+        self.manifest.clone()
+    }
+    pub fn content(&self) -> InvocationContent {
         match &self.input {
-            JobInput::Fetch { contract, .. } => contract.manifest(),
-            JobInput::CausalLm { environment, .. } => environment.manifest(),
+            JobInput::Compute { content, .. } => content.clone(),
+            JobInput::Fetch { .. } => InvocationContent::Ephemeral(EphemeralContent::default()),
         }
     }
-
-    /// Check unsigned application constraints before asking the owner to fund.
+    /// Check the quoted application before asking the owner to fund anything.
     pub fn check_policy(
         &self,
         policy: &hellas_channel::model::setup::ProviderChannelPolicy,
     ) -> Result<()> {
-        use hellas_channel::model::{fetch::FetchRoutePolicy, profile::WorkPolicy};
         if self.price != policy.payment_policy.fixed_price {
             return Err(invalid(format!(
                 "provider charges {} per job; this job says {}. Nothing was signed or paid.",
                 policy.payment_policy.fixed_price, self.price
             )));
         }
-        if self.manifest().content_id() != policy.work_policy.allowed_environment() {
-            return Err(invalid(
-                "application is not admitted by this provider. Nothing was signed or paid.",
-            ));
-        }
-        if !matches!(
-            (&self.input, &policy.work_policy),
-            (JobInput::Fetch { .. }, WorkPolicy::Fetch { .. })
-                | (JobInput::CausalLm { .. }, WorkPolicy::Evaluate(_))
-        ) {
-            return Err(invalid(
-                "application profile is not admitted. Nothing was signed or paid.",
-            ));
-        }
-        if let (
-            JobInput::CausalLm {
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
-                ..
-            },
-            WorkPolicy::Evaluate(expected),
-        ) = (&self.input, &policy.work_policy)
-        {
-            use hellas_rpc::protocol::artifacts::{
-                BoundTermId, Canonical as _, TextArtifact, TextPolicy,
-            };
-            let generation =
-                TextPolicy::from_u32_stop_tokens(*max_new_tokens, stop_token_ids.clone());
-            let identity = TextArtifact::identity(BoundTermId::from_digest(
-                self.manifest().content_id().digest(),
-            ));
-            if !hellas_channel::model::work::matches_generation_policy(expected, &generation)?
-                || hellas_channel::model::work::identity_source_digest(&identity.canonical_bytes())?
-                    != expected.identity_source_digest
-            {
-                return Err(invalid(
-                    "generation or identity policy is not admitted. Nothing was signed or paid.",
-                ));
-            }
-            if input_ids.len() > expected.max_prompt_tokens as usize
-                || generation.stop_token_ids().len() > usize::from(expected.max_stop_token_ids)
-            {
-                return Err(invalid(
-                    "prompt or stop-token count exceeds the provider's limit. Nothing was paid.",
-                ));
-            }
-        }
-        if let (
-            JobInput::Fetch {
-                contract,
-                service,
-                method,
-                request,
-                ..
-            },
-            WorkPolicy::Fetch { policy, route, .. },
-        ) = (&self.input, &policy.work_policy)
-        {
-            if request.len() > policy.max_request_body_bytes as usize {
-                return Err(invalid(
-                    "request exceeds the provider's byte limit. Nothing was paid.",
-                ));
-            }
-            match route {
-                FetchRoutePolicy::SealedRoute {
-                    service: expected_service,
-                    method: expected_method,
-                } if service != expected_service || method != expected_method => {
-                    return Err(invalid(
-                        "route is not admitted. Nothing was signed or paid.",
-                    ));
-                }
-                FetchRoutePolicy::OpenFetch {
-                    require_spki_pin,
-                    allowed_hosts,
-                } => {
-                    let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    let url = request
-                        .parsed_url()
-                        .map_err(|error| invalid(error.to_string()))?;
-                    if (*require_spki_pin && request.tls.spki_sha256.is_empty())
-                        || (!allowed_hosts.is_empty()
-                            && !allowed_hosts
-                                .iter()
-                                .any(|h| Some(h.as_str()) == url.host_str()))
-                    {
-                        return Err(invalid(
-                            "host or SPKI pin is not admitted. Nothing was signed or paid.",
-                        ));
-                    }
-                    if u64::from(request.max_response_bytes)
-                        > u64::from(policy.max_output_bytes) / 4 * 3
-                    {
-                        return Err(invalid(
-                            "response cap exceeds the provider's output limit. Nothing was paid.",
-                        ));
-                    }
-                }
-                _ => {}
-            }
-            if let hellas_rpc::FetchEgress::FixedHttps(url) = contract.egress() {
-                let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)
-                    .map_err(|error| invalid(error.to_string()))?;
-                if &request.url != url {
-                    return Err(invalid(
-                        "URL differs from the contract endpoint. Nothing was signed or paid.",
-                    ));
-                }
-            }
-        }
-        // Keys and compact signatures have fixed encoded widths. Fetch's nonce
-        // payload is an integer array, so all-255 measures its largest encoding
-        // (at most 32 bytes above a particular purchase). The throwaway key
-        // authorizes nothing with the requester's identity.
-        let encoded = self
-            .prepare(&ProducerSigningKey::generate(), [255; 32])?
-            .encode()?;
-        let limit = match &policy.work_policy {
-            WorkPolicy::Evaluate(policy) => {
-                u64::from(policy.max_encoded_prepared_input).min(policy.max_upload_bytes)
-            }
-            WorkPolicy::Fetch { policy, .. } => {
-                u64::from(policy.max_encoded_prepared_input).min(policy.max_upload_bytes)
-            }
-        };
-        if encoded.len() as u64 > limit {
-            return Err(invalid(
-                "prepared input exceeds the provider's byte limit. Nothing was paid.",
-            ));
-        }
+        let key = ProducerSigningKey::generate();
+        self.prepare(&key, [255; 32], key.public_key(), &policy.invocation_policy)?;
         Ok(())
     }
-
-    /// Canonical semantic content: neither filenames nor purchase randomness
-    /// can change a reusable job's identity.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let bytes = match &self.input {
             JobInput::Fetch {
@@ -377,22 +265,21 @@ impl Job {
                 assurance.to_byte(),
                 serde_bytes::Bytes::new(request),
             )),
-            JobInput::CausalLm {
+            JobInput::Compute {
                 environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
+                plan,
+                inputs,
+                ..
             } => hellas_rpc::canonical_dag_cbor(&(
                 FORMAT,
                 self.price,
-                "causal_lm",
-                serde_bytes::Bytes::new(&environment.canonical_bytes()),
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
+                "compute",
+                environment,
+                plan,
+                inputs,
             )),
         };
-        bytes.expect("job contains only supported canonical strings, integers and bytes")
+        bytes.expect("job contains only canonical strings, integers and bytes")
     }
     pub fn digest(&self) -> Digest {
         hash_tuple(FORMAT, &[&self.canonical_bytes()])
@@ -408,8 +295,14 @@ impl Job {
         )
         .as_bytes()
     }
-    pub fn prepare(&self, key: &ProducerSigningKey, nonce: [u8; 32]) -> Result<PreparedWorkInput> {
-        match &self.input {
+    pub fn prepare(
+        &self,
+        key: &ProducerSigningKey,
+        nonce: [u8; 32],
+        runner: PublicKey,
+        policy: &InvocationPolicy,
+    ) -> Result<PreparedInvocation> {
+        let prepared = match &self.input {
             JobInput::Fetch {
                 contract,
                 service,
@@ -427,43 +320,38 @@ impl Job {
                     hellas_rpc::Retention::Ephemeral,
                     nonce,
                 )?;
-                Ok(PreparedWorkInput::Fetch(PreparedPaidFetchInputV1::new(
-                    &events, contract,
-                )?))
+                fetch::prepare(&events, contract, runner, policy.canonical_bytes()?, nonce)?
             }
-            JobInput::CausalLm {
-                environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
-            } => Ok(PreparedWorkInput::Evaluate(
-                crate::gateway_work::prepare_evaluate_with_nonce(
-                    hellas_gateway::WorkExecutionRequest {
-                        environment: environment.clone(),
-                        input_ids: input_ids.clone(),
-                        max_new_tokens: *max_new_tokens,
-                        stop_token_ids: stop_token_ids.clone(),
-                    },
-                    match key.public_key() {
-                        public @ PublicKey::Secp256k1(_) => public,
-                        _ => return Err(invalid("job signer must be secp256k1")),
-                    },
+            JobInput::Compute { plan, inputs, .. } => {
+                let input = InvocationInput {
+                    parameters: JsonBytes(plan.canonical_bytes()?),
+                    artifacts: inputs.clone(),
+                };
+                let request = InvocationRequest {
+                    execution_environment: self.manifest.content_id(),
+                    input: input.content_id()?,
+                    runner_public_key: runner,
                     nonce,
-                )?,
-            )),
-        }
+                    assurance: self.assurance(),
+                    retain: true,
+                };
+                PreparedInvocation::new(request, &self.manifest, input, policy.canonical_bytes()?)?
+            }
+        };
+        policy.admit(&prepared, &key.public_key())?;
+        Ok(prepared)
     }
-
     pub fn load(root: &Path) -> Result<Self> {
         let directory = hellas_private::ReadDirectory::open(root)?;
         let read = |name: &str, limit| directory.read(Path::new(name), limit);
         let bytes = read("job.toml", MAX_DOCUMENT_BYTES)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("job.toml must be UTF-8"))?;
-        let doc: Document = toml::from_str(text)?;
+        let doc: Document = toml::from_str(
+            std::str::from_utf8(&bytes).map_err(|_| invalid("job.toml must be UTF-8"))?,
+        )?;
         if doc.format != FORMAT {
             return Err(invalid("unsupported job format"));
         }
-        let job = match (doc.fetch, doc.causal_lm) {
+        let job = match (doc.fetch, doc.compute) {
             (Some(fetch), None) => {
                 let contract = serde_json::from_slice(&read(
                     &fetch.contract,
@@ -486,28 +374,46 @@ impl Job {
                     assurance,
                 )?
             }
-            (None, Some(causal)) => {
-                let environment = CausalLmEnvironment::from_canonical_bytes(&read(
-                    &causal.environment,
-                    hellas_rpc::MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
-                )?)
-                .map_err(|e| invalid(e.to_string()))?;
-                let tokens = serde_json::from_slice(&read(
-                    &causal.tokens,
-                    hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
-                )?)?;
-                Self::causal_lm(
+            (None, Some(compute)) => {
+                let bytes = read(&compute.environment, compute::MAX_ENVIRONMENT_BYTES)?;
+                let environment = compute::Environment::from_canonical_bytes(&bytes)?;
+                let mut content = EphemeralContent::default();
+                content.insert(bytes);
+                for file in compute.objects {
+                    let bytes = read(
+                        &file.path,
+                        usize::try_from(file.object.bytes())
+                            .map_err(|_| invalid("content length overflow"))?,
+                    )?;
+                    if content.insert(bytes) != file.object {
+                        return Err(invalid("job content identity or length mismatch"));
+                    }
+                }
+                let inputs = compute
+                    .inputs
+                    .into_iter()
+                    .map(|file| {
+                        Ok(Artifact::new(
+                            file.name,
+                            file.format,
+                            read(
+                                &file.path,
+                                hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::compute(
                     doc.payment.price,
                     environment,
-                    tokens,
-                    causal.max_new_tokens,
-                    causal.stop_token_ids,
+                    compute.plan,
+                    inputs,
+                    InvocationContent::Ephemeral(content),
                 )?
             }
             _ => return Err(invalid("job must contain exactly one application input")),
         };
-        let manifest = job.manifest();
-        let app = manifest.application();
+        let app = job.manifest.application();
         if doc.application.evaluator != app.evaluator() || doc.application.adaptor != app.adaptor()
         {
             return Err(invalid(
@@ -516,9 +422,7 @@ impl Job {
         }
         Ok(job)
     }
-
-    /// Writes caller-owned input, with the manifest published last. Existing
-    /// folders are reused only when they already describe this exact job.
+    /// Publish job.toml after its caller-owned inputs. Reuse only an exact job.
     pub fn save(&self, root: &Path) -> Result<()> {
         if root.exists() && std::fs::read_dir(root)?.next().is_some() {
             if Self::load(root)?.canonical_bytes() == self.canonical_bytes() {
@@ -530,8 +434,7 @@ impl Job {
         let write = |name: &str, bytes: &[u8]| {
             hellas_private::write_atomically(&root.join(name), ".writing", bytes)
         };
-        let manifest = self.manifest();
-        let app = manifest.application();
+        let app = self.manifest.application();
         let mut doc = Document {
             format: FORMAT.into(),
             application: Application {
@@ -540,7 +443,7 @@ impl Job {
             },
             payment: Payment { price: self.price },
             fetch: None,
-            causal_lm: None,
+            compute: None,
         };
         match &self.input {
             JobInput::Fetch {
@@ -564,19 +467,43 @@ impl Job {
                     .into(),
                 });
             }
-            JobInput::CausalLm {
+            JobInput::Compute {
                 environment,
-                input_ids,
-                max_new_tokens,
-                stop_token_ids,
+                plan,
+                inputs,
+                content,
             } => {
-                write("model.environment", &environment.canonical_bytes())?;
-                write("tokens.json", &serde_json::to_vec(input_ids)?)?;
-                doc.causal_lm = Some(CausalLmFiles {
-                    environment: "model.environment".into(),
-                    tokens: "tokens.json".into(),
-                    max_new_tokens: *max_new_tokens,
-                    stop_token_ids: stop_token_ids.clone(),
+                write("environment.cbor", &environment.canonical_bytes()?)?;
+                let mut files = Vec::new();
+                for (i, artifact) in inputs.iter().enumerate() {
+                    let path = format!("input-{i}.bin");
+                    write(&path, artifact.bytes.as_bytes())?;
+                    files.push(FileArtifact {
+                        name: artifact.name.clone(),
+                        format: artifact.format.clone(),
+                        path,
+                    });
+                }
+                let mut objects = BTreeMap::new();
+                for object in environment
+                    .sources
+                    .iter()
+                    .copied()
+                    .chain(environment.assets.iter().map(|a| a.object))
+                {
+                    objects.insert(object.id(), object);
+                }
+                let mut object_files = Vec::new();
+                for (i, object) in objects.into_values().enumerate() {
+                    let path = format!("object-{i}.bin");
+                    write(&path, &content.read(object)?)?;
+                    object_files.push(ContentFile { object, path });
+                }
+                doc.compute = Some(ComputeFiles {
+                    environment: "environment.cbor".into(),
+                    plan: plan.clone(),
+                    inputs: files,
+                    objects: object_files,
                 });
             }
         }
@@ -584,6 +511,5 @@ impl Job {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests;

@@ -9,11 +9,9 @@ pub mod chain_node;
 pub(crate) mod codex_auth;
 pub mod contributions;
 
-pub mod environment;
 pub mod gateway_cache;
 pub mod grant_gateway;
 pub mod identity;
-pub mod llm;
 pub mod monitor;
 pub mod rpc;
 pub mod serve;

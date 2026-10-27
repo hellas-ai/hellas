@@ -4,15 +4,15 @@ use std::{collections::BTreeSet, num::NonZeroU64};
 use {
     hellas_authority::model::grant::records::GrantError,
     hellas_authority::model::grant::records::GrantPolicy,
-    hellas_channel::model::fetch::FetchRoutePolicy, hellas_channel::model::profile::WorkPolicy,
+    hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy},
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrantProviderError {
     #[error(transparent)]
     Grant(#[from] GrantError),
-    #[error("resource {0} requires an Evaluate backend")]
-    EvaluateUnavailable(String),
+    #[error("resource {0} requires a Compute backend")]
+    ComputeUnavailable(String),
     #[error("resource {0} names an unavailable Fetch route or environment")]
     MissingRoute(String),
     #[error("resource {0} requires a named Fetch route")]
@@ -22,7 +22,7 @@ pub enum GrantProviderError {
 /// Resources available in the executor the host will start.
 pub enum ProviderResources<'a> {
     Fetch(&'a FetchRouteRegistry),
-    EvaluateAndFetch(&'a FetchRouteRegistry),
+    ComputeAndFetch(&'a FetchRouteRegistry),
 }
 impl ProviderResources<'_> {
     pub fn validate(&self, policies: &[GrantPolicy]) -> Result<(), GrantProviderError> {
@@ -32,37 +32,38 @@ impl ProviderResources<'_> {
         let mut names = BTreeSet::new();
         let mut ids = BTreeSet::new();
         let routes = match self {
-            Self::Fetch(routes) | Self::EvaluateAndFetch(routes) => routes,
+            Self::Fetch(routes) | Self::ComputeAndFetch(routes) => routes,
         };
         for resource in policies {
             resource.validate()?;
             if !names.insert(&resource.name) || !ids.insert(resource.resource) {
                 return Err(GrantError::Malformed.into());
             }
-            match &resource.work {
-                WorkPolicy::Evaluate(_) => {
-                    if matches!(self, Self::Fetch(_)) {
-                        return Err(GrantProviderError::EvaluateUnavailable(
-                            resource.name.clone(),
-                        ));
+            for admission in &resource.invocation_policy.admissions {
+                match admission {
+                    Admission::Compute { .. } => {
+                        if matches!(self, Self::Fetch(_)) {
+                            return Err(GrantProviderError::ComputeUnavailable(
+                                resource.name.clone(),
+                            ));
+                        }
                     }
-                }
-                WorkPolicy::Fetch {
-                    policy,
-                    route: FetchRoutePolicy::SealedRoute { service, method },
-                    ..
-                } => {
-                    if routes
-                        .entry(&FetchRoute::new(service, method))
-                        .is_none_or(|entry| {
-                            entry.execution_environment() != policy.allowed_environment
-                        })
-                    {
-                        return Err(GrantProviderError::MissingRoute(resource.name.clone()));
-                    }
-                }
-                WorkPolicy::Fetch { .. } => {
-                    return Err(GrantProviderError::UnsealedRoute(resource.name.clone()));
+                    Admission::Fetch { admission } => match &admission.route {
+                        FetchRoutePolicy::SealedRoute { service, method } => {
+                            if routes
+                                .entry(&FetchRoute::new(service, method))
+                                .is_none_or(|entry| {
+                                    entry.execution_environment()
+                                        != admission.contract.manifest_id()
+                                })
+                            {
+                                return Err(GrantProviderError::MissingRoute(
+                                    resource.name.clone(),
+                                ));
+                            }
+                        }
+                        _ => return Err(GrantProviderError::UnsealedRoute(resource.name.clone())),
+                    },
                 }
             }
         }

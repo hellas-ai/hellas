@@ -12,7 +12,7 @@ pub enum PoolError {
     Invalid(&'static str),
     #[error("paid gateway repeats provider {0}")]
     DuplicateProvider(iroh::EndpointId),
-    #[error("no provider policy matches this environment, token limit, and stop token list")]
+    #[error("no provider policy admits this application")]
     NoMatchingPolicy,
     #[error("no eligible paid provider could start this request: {0:?}")]
     ProvidersUnavailable(Vec<String>),
@@ -59,8 +59,6 @@ pub enum PoolError {
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]
     FetchPayload(#[from] hellas_rpc::fetch::FetchPayloadError),
-    #[error(transparent)]
-    Evaluate(#[from] hellas_rpc::evaluate::EvaluateProtocolError),
     #[error(transparent)]
     Remote(#[from] hellas_client::ClientError),
 }

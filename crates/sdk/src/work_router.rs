@@ -6,9 +6,8 @@ use hellas_authority::grant_service::{GrantService, GrantWork};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse, FundingKind,
-    GetStandingRequest, GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
-    WorkRoute,
+    ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
+    GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -135,14 +134,6 @@ impl WorkHandler for UnmountedWork {
             "work channel is not mounted",
         ))
     }
-    async fn deliver_result(
-        &self,
-        _request: StreamResultRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        Ok(DeliverResultResponse::refused(not_ready()))
-    }
-
     async fn stream_result(
         &self,
         _request: StreamResultRequest,
@@ -198,17 +189,6 @@ impl WorkHandler for ConnectionWork {
             Handler::Grants(service) => wt(service.upload_content(request, context)).await,
             Handler::Payment(service) => wt(service.upload_content(request, context)).await,
             Handler::Unavailable => wt(UnmountedWork.upload_content(request, context)).await,
-        }
-    }
-    async fn deliver_result(
-        &self,
-        request: StreamResultRequest,
-        context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => wt(service.deliver_result(request, context)).await,
-            Handler::Payment(service) => wt(service.deliver_result(request, context)).await,
-            Handler::Unavailable => wt(UnmountedWork.deliver_result(request, context)).await,
         }
     }
     async fn admit_certificate(

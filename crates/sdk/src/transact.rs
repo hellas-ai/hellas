@@ -5,8 +5,9 @@ use crate::{
     paid_client::{PaidClientError, PaidWorkResult, PaidWorkSession},
 };
 use hellas_auth::ProducerSigningKey;
-use hellas_channel::{model::profile::PreparedWorkInput, work::PaidProgress};
+use hellas_channel::work::PaidProgress;
 use hellas_rpc::ContentRef;
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 pub use purchase::{Purchase, PurchaseError};
 use std::sync::atomic::AtomicBool;
 
@@ -51,9 +52,11 @@ async fn prepare(
     key: &ProducerSigningKey,
     resume: bool,
     purchase: Option<&Purchase>,
-) -> Result<(u64, PreparedWorkInput)> {
+) -> Result<(u64, PreparedInvocation)> {
     let descriptor = session.descriptor();
     let channel = descriptor.channel().id();
+    let runner = hellas_auth::PublicKey::Secp256k1(descriptor.channel().provider_key().to_bytes());
+    let policy = descriptor.invocation_policy();
     let (next, retained) = session
         .with_state(|state| {
             (
@@ -75,8 +78,8 @@ async fn prepare(
         .transpose()?
         .flatten()
     {
-        let prepared = job.prepare(key, job.purchase_nonce(channel, nonce))?;
-        let content = ContentRef::for_bytes(&prepared.encode()?);
+        let prepared = job.prepare(key, job.purchase_nonce(channel, nonce), runner, policy)?;
+        let content = ContentRef::for_bytes(&prepared.canonical_bytes()?);
         if retained
             .iter()
             .any(|auth| auth.proposal_nonce == nonce && auth.input_content == content)
@@ -96,8 +99,10 @@ async fn prepare(
             let prepared = job.prepare(
                 key,
                 job.purchase_nonce(channel, authorization.proposal_nonce),
+                runner,
+                policy,
             )?;
-            if ContentRef::for_bytes(&prepared.encode()?) == authorization.input_content {
+            if ContentRef::for_bytes(&prepared.canonical_bytes()?) == authorization.input_content {
                 if found.is_some() {
                     return Err(PaidClientError::AmbiguousRecovery.into());
                 }
@@ -109,7 +114,10 @@ async fn prepare(
         }
     }
     let nonce = next.ok_or(TransactError::NonceOverflow)?;
-    Ok((nonce, job.prepare(key, job.purchase_nonce(channel, nonce))?))
+    Ok((
+        nonce,
+        job.prepare(key, job.purchase_nonce(channel, nonce), runner, policy)?,
+    ))
 }
 
 pub async fn transact(
@@ -125,9 +133,6 @@ pub async fn transact(
             requested: job.price(),
         });
     }
-    if session.descriptor().work_policy().allowed_environment() != job.manifest().content_id() {
-        return Err(TransactError::Application);
-    }
     let resume = !options.new_purchase
         && !options
             .purchase
@@ -141,9 +146,11 @@ pub async fn transact(
             nonce,
         )?;
     }
+    let content = job.content();
     let mut result = session
         .run_prepared(
             Some(prepared),
+            &content,
             false,
             options.progress,
             options.proposed,

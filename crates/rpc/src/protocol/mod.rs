@@ -1,7 +1,5 @@
 //! Protocol primitives for Hellas commitments and signed streams.
 
-pub mod artifacts;
-pub mod causal_lm;
 pub mod commitment;
 pub mod content;
 pub mod content_upload;
@@ -14,16 +12,10 @@ pub mod job;
 pub mod manifest;
 pub mod open;
 pub mod retention;
-pub mod schemes;
 pub mod stream;
 pub mod tags;
 pub mod value;
 
-pub use causal_lm::{
-    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CausalLmEnvironment, CausalLmEnvironmentError,
-    CausalLmGenerationSchedule, MAX_CAUSAL_LM_ENVIRONMENT_BYTES, MAX_CAUSAL_LM_STATIC_BYTES,
-    StaticSlice,
-};
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
 pub use content::ContentRef;
 pub use digest::ContentId;
@@ -38,7 +30,6 @@ pub use open::{
     OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, open_proof_binding,
 };
 pub use retention::Retention;
-pub use schemes::evaluate::{Evaluate, EvaluateRequest};
 pub use stream::{
     CanonicalizationId, EventCommitment, InputCommitment, InputEventBody, InputEventBodyParts,
     InputEventEnvelope, InputTranscriptBuilder, OutputEventBody, OutputEventBodyParts,

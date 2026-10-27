@@ -16,15 +16,12 @@ use crate::work_link::WorkLink as ProviderDialer;
 use futures::StreamExt as _;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
-use hellas_channel::model::profile::{PreparedWorkInput, WorkPolicy};
+use hellas_channel::content::InvocationContent;
 use hellas_channel::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
-use hellas_channel::model::work::{
-    JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
-};
+use hellas_channel::model::work::{JobDeadlines, private_policy_commitment};
 use hellas_channel::work::{
-    ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, fetch_result,
-    propose_work, resume_work_proposal,
+    ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, propose_work,
+    resume_work_proposal,
 };
 use hellas_channel::work_close::FinalizedBlocks as _;
 use hellas_channel::work_handshake::{
@@ -38,7 +35,7 @@ use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
     WorkPaymentTerms,
 };
-use hellas_rpc::protocol::artifacts::Canonical as _;
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
@@ -125,44 +122,13 @@ pub struct PaidWorkResult {
     pub payment_edge: EdgeId,
     pub channel_id: hellas_auth::Digest,
     pub transcript: Vec<u8>,
+    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub work_id: hellas_auth::Digest,
     pub credited_cumulative: u64,
     pub job_price: u64,
     pub provider_key: hellas_auth::PublicKey,
     pub input: hellas_rpc::InputCommitment,
     pub settled_provider_payout: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InputIdentities {
-    pub allowed_environment: hellas_rpc::ContentId,
-    pub generation_policy_digest: hellas_auth::Digest,
-    pub identity_source_digest: hellas_auth::Digest,
-}
-
-impl InputIdentities {
-    pub fn from_prepared(prepared: &PreparedPaidInputV1) -> Result<Self> {
-        let parts = prepared.parts()?;
-        Self::from_parts(&parts)
-    }
-
-    fn from_parts(
-        parts: &hellas_channel::model::prepared_input::PreparedPaidInputParts,
-    ) -> Result<Self> {
-        let allowed_environment = parts.manifest.content_id();
-        if parts.evaluate_request.execution_environment != allowed_environment {
-            return Err(PaidClientError::InputMismatch("environment manifest"));
-        }
-        Ok(Self {
-            allowed_environment,
-            generation_policy_digest: generation_policy_digest(
-                &parts.text_policy.canonical_bytes(),
-            )?,
-            identity_source_digest: identity_source_digest(
-                &parts.identity_artifact.canonical_bytes(),
-            )?,
-        })
-    }
 }
 
 /// A funded client channel. Keep one session per journal and serialize its jobs.
@@ -588,11 +554,12 @@ impl PaidWorkSession {
     /// performs recovery. Prefixes are authenticated before incremental delivery.
     pub async fn run(
         &mut self,
-        prepared: Option<PreparedWorkInput>,
+        prepared: Option<PreparedInvocation>,
+        content: &InvocationContent,
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
-        self.run_prepared(prepared, recover, progress, None, None)
+        self.run_prepared(prepared, content, recover, progress, None, None)
             .await
     }
 
@@ -600,7 +567,8 @@ impl PaidWorkSession {
     /// A caller using cancellation must continue payment/recovery once it is set.
     pub(crate) async fn run_prepared(
         &mut self,
-        prepared: Option<PreparedWorkInput>,
+        prepared: Option<PreparedInvocation>,
+        content: &InvocationContent,
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
         proposed: Option<&AtomicBool>,
@@ -656,7 +624,7 @@ impl PaidWorkSession {
                 Replay(
                     hellas_auth::Digest,
                     hellas_channel::work_store::JobPhase,
-                    PreparedWorkInput,
+                    PreparedInvocation,
                 ),
             }
             let pending = client
@@ -690,7 +658,7 @@ impl PaidWorkSession {
                                     RecoveredJob::Unrecoverable(job.work_id())
                                 });
                             }
-                            PreparedWorkInput::decode(
+                            PreparedInvocation::from_canonical_bytes(
                                 job.prepared_input(),
                                 hellas_channel::content::MAX_CONTENT_BYTES,
                             )
@@ -726,6 +694,7 @@ impl PaidWorkSession {
                 let result = execute_paid_job(
                     args,
                     pending,
+                    content,
                     dialer,
                     client,
                     &ready,
@@ -768,6 +737,7 @@ impl PaidWorkSession {
                     execute_paid_job(
                         args,
                         prepared,
+                        content,
                         dialer,
                         client,
                         &ready,
@@ -820,6 +790,7 @@ async fn propose_when_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
+    content: &InvocationContent,
     retained: Option<hellas_auth::Digest>,
     poll: Duration,
     timeout: Duration,
@@ -840,8 +811,8 @@ async fn propose_when_ready(
             proposed.store(true, Ordering::Release);
         }
         let result = match retained {
-            Some(work_id) => resume_work_proposal(transport, client, work_id).await,
-            None => propose_work(transport, client, proposal).await,
+            Some(work_id) => resume_work_proposal(transport, client, work_id, content).await,
+            None => propose_work(transport, client, proposal, content).await,
         };
         match result {
             Ok(work_id) => return Ok(work_id),
@@ -899,7 +870,8 @@ enum JobLookup {
 #[allow(clippy::too_many_arguments)]
 async fn execute_paid_job(
     args: &PaidWorkOptions,
-    prepared: PreparedWorkInput,
+    prepared: PreparedInvocation,
+    content: &InvocationContent,
     dialer: &ProviderDialer,
     client: &mut ClientService,
     ready: &hellas_channel::model::setup::ReadyChannel,
@@ -910,7 +882,7 @@ async fn execute_paid_job(
     mut purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
     let readiness_timeout = args.timeout;
-    let prepared_bytes = prepared.encode()?;
+    let prepared_bytes = prepared.canonical_bytes()?;
     let current = client.with_state(|state| state.cursor().0).await?;
     let deadlines = deadlines(
         current,
@@ -961,6 +933,7 @@ async fn execute_paid_job(
                 dialer,
                 client,
                 &proposal,
+                content,
                 Some(work_id),
                 poll,
                 readiness_timeout,
@@ -970,7 +943,7 @@ async fn execute_paid_job(
             false,
         ),
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
-        | Some((work_id, hellas_channel::work_store::JobPhase::Matched, _)) => {
+        | Some((work_id, hellas_channel::work_store::JobPhase::Verified, _)) => {
             let retained = client
                 .with_state(|state| {
                     state
@@ -986,6 +959,7 @@ async fn execute_paid_job(
                 dialer,
                 client,
                 &proposal,
+                content,
                 None,
                 poll,
                 readiness_timeout,
@@ -1009,7 +983,7 @@ async fn execute_paid_job(
             .ok_or(PaidClientError::MissingState(
                 "collected job disappeared from its journal",
             ))?
-    } else if progress.is_some() || matches!(proposal.prepared_input, PreparedWorkInput::Fetch(_)) {
+    } else {
         let mut emitted = false;
         let delivery = loop {
             let result = hellas_channel::work::fetch_result_stream(
@@ -1056,9 +1030,19 @@ async fn execute_paid_job(
         };
         check_payment_window(client, work_id).await?;
         delivery.transcript
-    } else {
-        collect_until_ready(dialer, client, ready, work_id, poll).await?
     };
+    let output = proposal
+        .prepared_input
+        .verify_output(
+            ready.invocation_policy(),
+            &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+            &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+            &hellas_channel::model::work::decode_transcript(
+                &transcript,
+                hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+            )?,
+        )?
+        .output;
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.paying(work_id)?;
     }
@@ -1074,87 +1058,25 @@ async fn execute_paid_job(
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
         transcript,
+        output,
         provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-        input: proposal.prepared_input.input_commitment()?,
+        input: proposal.prepared_input.request.input_commitment()?,
         settled_provider_payout: None,
     })
 }
 
 pub(crate) fn check_request(
     policy: &ProviderChannelPolicy,
-    prepared: &PreparedWorkInput,
+    prepared: &PreparedInvocation,
     trust: &hellas_client::ProviderTrustAnchor,
     caller: hellas_auth::PublicKey,
 ) -> Result<()> {
-    if trust.apple_app_attest.is_some() {
-        trust.verify_environment(policy.work_policy.allowed_environment())?;
-    }
-    let assurance = prepared.assurance()?;
-    if trust.required_assurance != assurance {
+    if trust.required_assurance != prepared.request.assurance {
         return Err(PaidClientError::InputMismatch(
             "assurance differs from provider trust",
         ));
     }
-    match (prepared, &policy.work_policy) {
-        (PreparedWorkInput::Evaluate(input), WorkPolicy::Evaluate(_)) => {
-            check_evaluate_input(policy, input)?;
-        }
-        (
-            PreparedWorkInput::Fetch(input),
-            WorkPolicy::Fetch {
-                policy,
-                route,
-                contract,
-            },
-        ) => {
-            let parts = input.parts()?;
-            if parts.contract != *contract || policy.allowed_environment != contract.manifest_id() {
-                return Err(PaidClientError::InputMismatch("Fetch contract"));
-            }
-            let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)?;
-            if request.caller_key != caller {
-                return Err(PaidClientError::InputMismatch("Fetch caller"));
-            }
-            if !(request.execution_environment == policy.allowed_environment
-                && parts.manifest.content_id() == policy.allowed_environment)
-            {
-                return Err(PaidClientError::InputMismatch("Fetch environment"));
-            }
-            if request.retention != hellas_rpc::Retention::Ephemeral {
-                return Err(PaidClientError::InputMismatch(
-                    "Fetch retention must be ephemeral",
-                ));
-            }
-            if let hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { service, method } =
-                route
-                && (&request.service != service || &request.method != method)
-            {
-                return Err(PaidClientError::InputMismatch("Fetch route"));
-            }
-        }
-        _ => return Err(PaidClientError::InputMismatch("work profile")),
-    }
-    Ok(())
-}
-/// Checks an Evaluate request against the configured execution bounds.
-pub fn check_evaluate_input(
-    policy: &ProviderChannelPolicy,
-    prepared: &PreparedPaidInputV1,
-) -> Result<()> {
-    let parts = prepared.parts()?;
-    let input = InputIdentities::from_parts(&parts)?;
-    let WorkPolicy::Evaluate(expected) = &policy.work_policy else {
-        return Err(PaidClientError::InputMismatch("expected Evaluate profile"));
-    };
-    if expected.allowed_environment != input.allowed_environment {
-        return Err(PaidClientError::InputMismatch("Evaluate environment"));
-    }
-    if !(hellas_channel::model::work::matches_generation_policy(expected, &parts.text_policy)?) {
-        return Err(PaidClientError::InputMismatch("generation policy"));
-    }
-    if expected.identity_source_digest != input.identity_source_digest {
-        return Err(PaidClientError::InputMismatch("identity source"));
-    }
+    policy.invocation_policy.admit(prepared, &caller)?;
     Ok(())
 }
 
@@ -1223,31 +1145,6 @@ async fn ready_channel(
     descriptor
         .check_ready(&snapshot.observed_channel())
         .map_err(PaidClientError::from)
-}
-
-async fn collect_until_ready(
-    dialer: &ProviderDialer,
-    client: &mut ClientService,
-    ready: &hellas_channel::model::setup::ReadyChannel,
-    work_id: hellas_auth::Digest,
-    poll: Duration,
-) -> Result<Vec<u8>> {
-    loop {
-        match fetch_result(dialer.work().await?, client, ready, work_id).await {
-            Ok(delivery) => {
-                check_payment_window(client, work_id).await?;
-                return Ok(delivery.transcript);
-            }
-            Err(hellas_channel::work::DeliverError::Refused { refusal, reason })
-                if refusal.is_retryable() =>
-            {
-                check_payment_window(client, work_id).await?;
-                tracing::debug!(%reason, "waiting for paid result");
-                tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 pub fn deadlines(

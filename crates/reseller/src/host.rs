@@ -55,6 +55,7 @@ where
         &options.method,
         options.responses.clone(),
         options.pricing.clone(),
+        options.max_job_millis,
     )?;
     let upstream = Arc::new(crate::OpenAiResponsesFetchProvider::with_bearer(
         options.bearer_token.clone(),

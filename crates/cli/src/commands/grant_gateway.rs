@@ -1,6 +1,3 @@
-#[cfg(feature = "evaluate")]
-pub mod local;
-
 use super::CliResult;
 use crate::identity::LocalIdentity;
 use hellas_sdk::grant_client::{GrantSessionOptions, PinnedOffer};

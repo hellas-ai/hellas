@@ -120,7 +120,7 @@ pub(super) fn compute_bounds(limits: super::Limits) -> Result<ComputeBounds, Can
     let key = PublicKey::Secp256k1([0; 33]);
     let digest = Digest::from_bytes([0; 32]);
     let body = OutputEventBody::from_parts(OutputEventBodyParts {
-        scheme: scheme_id(Operation::Evaluate, crate::Assurance::ProducerSigned),
+        scheme: scheme_id(Operation::Invoke, crate::Assurance::ProducerSigned),
         input: InputCommitment::from_digest(digest),
         stream_id: StreamId::from_digest(digest),
         sequence: u64::MAX,
@@ -302,7 +302,7 @@ impl<'a> OutputStream<'a> {
             request: request.clone(),
             key,
             inner: OutputTranscriptBuilder::new(
-                scheme_id(Operation::Evaluate, request.assurance),
+                scheme_id(Operation::Invoke, request.assurance),
                 request.input_commitment()?,
                 key,
                 canonicalization(),
@@ -342,7 +342,7 @@ impl<'a> OutputStream<'a> {
         }
         if !events.is_empty() {
             stream.inner = OutputTranscriptBuilder::resume_verified(
-                scheme_id(Operation::Evaluate, request.assurance),
+                scheme_id(Operation::Invoke, request.assurance),
                 request.input_commitment()?,
                 key,
                 canonicalization(),
@@ -684,7 +684,7 @@ impl StreamVerifier {
             return Err(error("invocation result exceeds its byte budget"));
         }
         let previous = crate::verify_output_event_continuation(
-            scheme_id(Operation::Evaluate, self.request.assurance),
+            scheme_id(Operation::Invoke, self.request.assurance),
             self.request.input_commitment()?,
             &self.provider,
             self.events.len() as u64,
@@ -749,7 +749,7 @@ pub fn verify(
         return Err(error("invocation result exceeds its byte budget"));
     }
     verify_output_event_envelopes(
-        scheme_id(Operation::Evaluate, request.assurance),
+        scheme_id(Operation::Invoke, request.assurance),
         request.input_commitment()?,
         provider,
         events,
@@ -939,7 +939,7 @@ mod tests {
         let request = request(&key);
         for offset in [0, 2, u64::MAX] {
             let mut signed = OutputTranscriptBuilder::new(
-                scheme_id(Operation::Evaluate, request.assurance),
+                scheme_id(Operation::Invoke, request.assurance),
                 request.input_commitment().unwrap(),
                 &key,
                 canonicalization(),
@@ -1127,7 +1127,7 @@ mod tests {
         assert!(verify(&request, &key.public_key(), &[forged], 65536).is_err());
         for kind in [TERMINAL, ARTIFACT_CHUNK] {
             let mut builder = OutputTranscriptBuilder::resume_verified(
-                scheme_id(Operation::Evaluate, request.assurance),
+                scheme_id(Operation::Invoke, request.assurance),
                 request.input_commitment().unwrap(),
                 &key,
                 canonicalization(),
@@ -1149,7 +1149,7 @@ mod tests {
         let key = ProducerSigningKey::from_secret_bytes([8; 32]).unwrap();
         let request = request(&key);
         let mut builder = OutputTranscriptBuilder::new(
-            scheme_id(Operation::Evaluate, request.assurance),
+            scheme_id(Operation::Invoke, request.assurance),
             request.input_commitment().unwrap(),
             &key,
             canonicalization(),
@@ -1181,7 +1181,7 @@ mod tests {
             metadata: JsonBytes(vec![]),
         };
         let mut builder = OutputTranscriptBuilder::new(
-            scheme_id(Operation::Evaluate, request.assurance),
+            scheme_id(Operation::Invoke, request.assurance),
             request.input_commitment().unwrap(),
             &key,
             canonicalization(),
@@ -1194,7 +1194,7 @@ mod tests {
             .unwrap();
         let events = builder.finish().unwrap().0;
         verify_output_event_envelopes(
-            scheme_id(Operation::Evaluate, request.assurance),
+            scheme_id(Operation::Invoke, request.assurance),
             request.input_commitment().unwrap(),
             &key.public_key(),
             &events,

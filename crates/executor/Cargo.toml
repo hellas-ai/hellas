@@ -8,8 +8,6 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-default = ["evaluate"]
-evaluate = ["dep:catena-lang", "dep:commonware-runtime", "dep:hellas-store"]
 otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [target.'cfg(unix)'.dependencies]
@@ -17,8 +15,12 @@ libc = "0.2"
 
 [dependencies]
 async-trait = "0.1"
-catena-lang = { workspace = true, optional = true }
-commonware-runtime = { workspace = true, optional = true }
+bincode = "1.3"
+libloading = "0.9"
+metacat = "0.3"
+sha2.workspace = true
+tempfile.workspace = true
+catena-lang.workspace = true
 futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-auth.workspace = true
@@ -27,11 +29,10 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = [
     "execute",
-    "evaluate",
     "fetch",
     "work",
 ] }
-hellas-store = { workspace = true, optional = true }
+hellas-store.workspace = true
 hellas-wire = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 prometheus-client = { workspace = true }

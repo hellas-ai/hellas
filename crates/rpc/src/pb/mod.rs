@@ -33,13 +33,6 @@ pub mod hellas {
         }
     }
 
-    #[cfg(feature = "evaluate")]
-    #[allow(dead_code)]
-    pub mod evaluate {
-        pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/hellas.evaluate.v1.rs"));
-        }
-    }
 
     #[cfg(feature = "chain")]
     #[allow(dead_code)]
@@ -72,11 +65,6 @@ pub mod execute {
     pub use crate::pb::hellas::v1::*;
 }
 
-/// Re-exports of `hellas.evaluate.v1`.
-#[cfg(feature = "evaluate")]
-pub mod evaluate {
-    pub use crate::pb::hellas::evaluate::v1::*;
-}
 
 /// Re-exports of `hellas.fetch.v1`.
 #[cfg(feature = "fetch")]

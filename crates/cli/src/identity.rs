@@ -17,7 +17,6 @@ use std::sync::Arc;
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
 const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
-#[cfg(feature = "evaluate")]
 const CONTENT_INDEX_FILE: &str = "content-index.bin";
 const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
@@ -129,7 +128,6 @@ pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
     default_hellas_path("gateway-archive", "--archive-dir")
 }
 
-#[cfg(feature = "evaluate")]
 pub(crate) fn default_content_index_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(CONTENT_INDEX_FILE, "--content-index")
 }

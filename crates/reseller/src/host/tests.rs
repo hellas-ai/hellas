@@ -232,6 +232,7 @@ impl ResellerBuilder {
                             "responses",
                             responses_resource(),
                             pricing(),
+                            NonZeroU64::new(60_000).unwrap(),
                         )
                         .unwrap(),
                     ],

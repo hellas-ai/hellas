@@ -15,12 +15,6 @@ otel = [
     "dep:opentelemetry",
     "dep:tracing-opentelemetry",
 ]
-evaluate = [
-    "dep:hellas-executor",
-    "hellas-executor/evaluate",
-
-    "dep:hellas-store",
-]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -32,12 +26,10 @@ hellas-adaptors.workspace = true
 hellas-auth.workspace = true
 hellas-authority.workspace = true
 hellas-channel.workspace = true
-hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
-hellas-executor = { workspace = true, optional = true }
+hellas-client = { workspace = true, features = ["iroh"] }
 hellas-presentation.workspace = true
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch"] }
-hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
 httpdate = "1"
 iroh.workspace = true

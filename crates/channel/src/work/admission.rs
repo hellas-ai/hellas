@@ -130,6 +130,26 @@ impl AdmittedWork {
         matches!(self.funding, Funding::Payment)
     }
 
+    /// A queued grant can expire or be revoked before it owns an active worker.
+    pub fn deadline(&self) -> Option<Instant> {
+        match &self.funding {
+            Funding::Payment => None,
+            Funding::Grant { deadline, .. } => Some(*deadline),
+        }
+    }
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        let cancellation = match &self.funding {
+            Funding::Payment => None,
+            Funding::Grant { cancellation, .. } => Some(cancellation.clone()),
+        };
+        async move {
+            match cancellation {
+                None => std::future::pending().await,
+                Some(cancellation) => cancellation.cancelled().await,
+            }
+        }
+    }
+
     /// Durably authorize dispatch before any backend preparation or execution.
     pub async fn dispatch(self) -> Result<RunningWork, BackendFault> {
         let started = Instant::now();

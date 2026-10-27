@@ -24,7 +24,6 @@ iroh = [
     "hellas-wire/discovery-dht",
     "hellas-wire/discovery-mdns",
 ]
-evaluate = ["hellas-rpc/evaluate"]
 # The paid-work half: the acceptance and delivery wire, and the
 # independent reexecution check the client makes before a result is
 # payable. Off by default because it pulls the consensus kernel into a

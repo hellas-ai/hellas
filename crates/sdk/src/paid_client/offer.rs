@@ -128,14 +128,7 @@ fn check_quote(
     )
     .map_err(|_| PaidClientError::InputMismatch("quote encoding"))?;
     check_policy(args, &policy, quote.omission_bond)?;
-    let trust = hellas_client::selected_provider_trust(
-        provider,
-        args.assurance,
-        args.apple_trust.as_ref(),
-    )?;
-    if trust.apple_app_attest.is_some() {
-        trust.verify_environment(policy.work_policy.allowed_environment())?;
-    }
+    hellas_client::selected_provider_trust(provider, args.assurance, args.apple_trust.as_ref())?;
     let required = quote
         .required
         .ok_or(PaidClientError::MissingState("quoted edge values"))?;
@@ -176,7 +169,7 @@ pub(super) fn check_policy(
             requested: args.expected_price,
         });
     }
-    policy.work_policy.check()?;
+    policy.invocation_policy.validate()?;
     policy.payment_policy.check()?;
     let settlement =
         hellas_kernel::work_payment_settlement(policy.expected_payment_values, omission_bond)
