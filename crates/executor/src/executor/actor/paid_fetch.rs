@@ -93,6 +93,7 @@ impl Executor {
         self.active_fetches += 1;
         let completion = self.completion_tx.clone();
         let key = Arc::clone(&self.provider.producer_key);
+        let paid_timeout = self.paid_fetch_timeout;
         let task = async move {
             let _running = running;
             if let Err(error) = _running.check_active() {
@@ -136,7 +137,7 @@ impl Executor {
                 }
                 Ok::<_, ExecutorError>(())
             };
-            let deadline = _running.deadline_or(std::time::Duration::from_secs(90));
+            let deadline = _running.deadline_or(paid_timeout);
             let joined = tokio::select! {
                 biased;
                 () = _running.cancelled() => {
@@ -510,6 +511,42 @@ mod tests {
             1,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn configured_paid_fetch_timeout_stops_a_blocked_provider() {
+        let provider = BlockingFetchProvider::new(environment().manifest_id());
+        let mut config = ExecutorSpawnConfig::fetch_only(
+            Arc::new(signing_key()),
+            Assurance::ProducerSigned,
+            routes(
+                Arc::new(provider.clone()),
+                stub_adaptor(environment().manifest_id()),
+                FetchRoutePolicy::default(),
+            ),
+        );
+        config.paid_fetch_timeout = Duration::from_millis(20);
+        let handle = Executor::spawn_configured(config).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            run_paid_fetch(
+                &handle,
+                prepared_input(input_events(
+                    Retention::Ephemeral,
+                    Assurance::ProducerSigned,
+                )),
+                None,
+            ),
+        )
+        .await
+        .expect("configured payment deadline must stop the provider");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Fetch execution deadline passed")
+        );
+        assert_eq!(provider.started(), 1);
     }
 
     async fn run_paid_fetch(

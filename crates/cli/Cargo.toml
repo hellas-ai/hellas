@@ -110,7 +110,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
-hellas-chain = { workspace = true, features = ["client"] }
+commonware-cryptography.workspace = true
+commonware-runtime.workspace = true
+hellas-chain = { workspace = true, features = ["client", "test-support"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
 hellas-work = { workspace = true, features = ["test-support"] }
 p256.workspace = true

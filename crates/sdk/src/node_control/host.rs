@@ -185,6 +185,19 @@ impl HostHandle {
         self.runtime.endpoint.subscribe()
     }
 
+    /// Checked administration over the running provider's existing writer.
+    pub fn administration(
+        &self,
+    ) -> Result<Option<hellas_work::grant_service::WorkAdministration>, HostError> {
+        Ok(self
+            .runtime
+            .state
+            .lock()
+            .map_err(|_| HostError::Composition)?
+            .work
+            .clone())
+    }
+
     pub async fn shutdown(mut self) -> Result<(), HostError> {
         self.stop.send_replace(true);
         let listener = match self.listener.take() {

@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate tracing;
 
+use anyhow::Context as _;
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
@@ -284,6 +285,8 @@ enum Commands {
     Admin(commands::admin::AdminArgs),
     /// Run the RPC server
     Serve {
+        #[command(flatten)]
+        faucet_policy: commands::serve::faucet::PolicyArgs,
         #[cfg(feature = "evaluate")]
         #[command(flatten)]
         evaluation: evaluate::ServeArgs,
@@ -626,6 +629,13 @@ async fn async_main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
+    if let Commands::Serve { faucet_policy, .. } = &cli.command
+        && faucet_policy.any()
+        && !cli.owner.is_faucet()
+    {
+        eprintln!("error: paid policy overrides require --faucet or --faucet-account");
+        std::process::exit(2);
+    }
     if let Err(error) =
         validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root)
     {
@@ -673,7 +683,19 @@ async fn async_main() {
         return;
     }
 
-    let owner = match cli.owner.load() {
+    let faucet_provider = cli.owner.is_faucet() && matches!(&cli.command, Commands::Serve { .. });
+    let faucet_root = faucet_provider
+        .then(|| owner::OwnerArgs::provider_root(cli.identity.as_deref()))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("error: {error:#}");
+            std::process::exit(1)
+        });
+    let owner = match if faucet_provider {
+        cli.owner.load_provider(cli.identity.as_deref())
+    } else {
+        cli.owner.load()
+    } {
         Ok(owner) => owner,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -795,7 +817,11 @@ async fn async_main() {
 
     // Before anything binds, and before any other startup work: a
     // command that cannot have an identity has nothing further to do.
-    let local_identity = match load_command_identity(&command, cli.identity.as_deref()) {
+    let local_identity = match if faucet_provider {
+        identity::load_or_create(cli.identity.as_deref())
+    } else {
+        load_command_identity(&command, cli.identity.as_deref())
+    } {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -824,6 +850,7 @@ async fn async_main() {
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
         Commands::Serve {
+            faucet_policy,
             #[cfg(feature = "evaluate")]
             evaluation,
             assurance,
@@ -852,6 +879,9 @@ async fn async_main() {
                 Err(error) => Err(error.into()),
                 Ok(work_config) => {
                     async {
+                        let work_config = match (work_config, faucet_root.as_ref()) { (None, Some(root)) => Some(commands::serve::faucet::chain_defaults(root)?), (configured, _) => configured };
+                        anyhow::ensure!(!faucet_provider || await_owner.is_none(), "--faucet performs local owner bootstrap; omit --await-owner");
+                        anyhow::ensure!(faucet_provider || !faucet_policy.any(), "paid policy overrides require --faucet or --faucet-account");
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
@@ -887,6 +917,7 @@ async fn async_main() {
                             (None, None) => None,
                         };
                         commands::serve::run(commands::serve::ServeOptions {
+                            faucet: match faucet_root { Some(root) => Some(commands::serve::faucet::Startup::new(root, owner.as_ref().context("faucet owner was not loaded")?.clone(), faucet_policy)?), None => None },
                             transport,
                             port,
                             discovery: !no_discovery,

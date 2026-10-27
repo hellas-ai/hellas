@@ -45,3 +45,18 @@ fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
         assert!(!home.path().join(".hellas").exists());
     }
 }
+
+#[test]
+fn paid_onboarding_overrides_require_the_explicit_faucet_flow() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+        .env("HOME", home.path())
+        .args(["serve", "--paid-price", "30"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("paid policy overrides require --faucet")
+    );
+    assert!(!home.path().join(".hellas").exists());
+}

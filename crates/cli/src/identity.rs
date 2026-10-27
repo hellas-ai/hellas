@@ -138,7 +138,7 @@ pub(crate) async fn open_authority(
     ))
 }
 
-fn default_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
 }
 

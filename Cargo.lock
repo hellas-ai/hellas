@@ -2816,6 +2816,7 @@ dependencies = [
  "catena-lang",
  "ciborium",
  "clap",
+ "commonware-cryptography",
  "commonware-runtime",
  "futures",
  "hellas-adaptors",

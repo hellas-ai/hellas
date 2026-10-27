@@ -846,6 +846,10 @@ pub struct ProviderOpen<R> {
 }
 
 impl<R> ProviderOpen<R> {
+    pub fn enrollment(&self) -> &ProviderEnrollmentBundle {
+        &self.enrollment
+    }
+
     pub fn new(
         signer: Arc<hellas_auth::ProducerSigningKey>,
         enrollment: ProviderEnrollmentBundle,

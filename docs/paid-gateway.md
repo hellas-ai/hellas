@@ -18,6 +18,40 @@ its channel credit, execution and payment policies, expected payment-edge values
 response window, `jobs_per_channel` (default 10), and offer bounds. A stale revision
 or a daily node-key session cannot change it.
 
+For public devnet onboarding, `hellas-cli serve --faucet` selects and retains one
+published faucet owner with the provider identity. It uses the embedded public devnet genesis
+and offline seed-100 trust export; the six relay URLs are transports and supply no
+trust pins. `--work-config` and `--chain-store-dir` still override chain deployment
+and storage. `--faucet-account N` selects a specific account on its first start.
+An existing provider cannot change its saved account with this flag.
+
+Faucet startup bootstraps the normal authority, approves a real HTTP Fetch policy
+through an owner passkey session, and delegates up to three 12-credit coins with
+undelegated change. It records the exact signed owner transaction before submission
+and confirms its inclusion in finalized history. Restarts retain the original
+policy revision/salt and delegation, including when a bond has consumed its output.
+It never takes coins already delegated to another provider sharing that public owner.
+
+Initial defaults are price 20, ten jobs/channel, stake cap 12/client, three open
+offers, a 256-block bond lifetime, 1 MiB signed upload, 64 KiB request body,
+1 MiB output, 1024 output events and 4 MiB spool. The paid Fetch executor stops
+execution after 90 seconds; grant execution keeps its own signed deadline. HTTP
+uses the built-in contract, public-address egress and a caller-supplied SPKI pin.
+No upstream API credential is installed.
+
+Override onboarding with `--paid-price`, `--paid-jobs-per-channel`,
+`--paid-max-stake-per-client`, `--paid-max-open-offers`,
+`--paid-bond-lifetime-blocks`, `--paid-max-upload-bytes` and
+`--paid-execution-timeout-secs`. Price/jobs changes derive exact payment funding
+and omission collateral together. Explicit policy changes are owner-approved;
+plain restarts preserve existing policies and the saved execution timeout. A lower
+stake cap is refused before changing policy if no already-delegated coin fits it;
+use the explicit owner `chain delegate --split` path to reshape unused stake first.
+The initial delegation is a fixed owner budget and is never topped up on restart.
+The saved `<identity>.faucet/admin.json` profile works with the existing passkey
+administration commands. Without a faucet flag, owner approval and delegation
+remain explicit.
+
 The pool selects providers and expected prices. It obtains each policy with
 `RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 

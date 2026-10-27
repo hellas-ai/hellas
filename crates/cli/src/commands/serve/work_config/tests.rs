@@ -12,7 +12,7 @@ fn hex32(byte: u8) -> String {
 
 fn validators() -> Vec<serde_json::Value> {
     (1..=VALIDATOR_COUNT)
-        .map(|index| serde_json::Value::String(format!("http://127.0.0.1:900{index}")))
+        .map(|index| serde_json::Value::String(format!("ws://127.0.0.1:900{index}")))
         .collect()
 }
 
@@ -136,7 +136,7 @@ fn a_validator_that_is_not_a_url_is_refused() {
 #[test]
 fn a_validator_named_twice_in_two_spellings_is_refused() {
     let mut spelled = validators();
-    spelled[5] = serde_json::Value::String("HTTP://127.0.0.1:9001".to_string());
+    spelled[5] = serde_json::Value::String("WS://127.0.0.1:9001".to_string());
     let error = format!(
         "{:?}",
         load(with(config(), "validators", serde_json::json!(spelled))).unwrap_err(),
@@ -148,7 +148,7 @@ fn a_validator_named_twice_in_two_spellings_is_refused() {
 fn validators_are_loaded_normalised() {
     let loaded = load(config()).expect("the fixture config loads");
     assert_eq!(
-        loaded.validators[0], "http://127.0.0.1:9001/",
+        loaded.validators[0], "ws://127.0.0.1:9001/",
         "the parsed URL, not the string the operator typed",
     );
 }
