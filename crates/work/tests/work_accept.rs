@@ -28,19 +28,17 @@ use hellas_rpc::{ContentId, Evaluate};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::{
-    ReadyChannel, WorkChannelDescriptor, payment_terms_hash,
-};
+use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, payment_terms_hash};
 use hellas_work::model::work::{
     JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
     propose_authorization, signing_hash, work_id, work_policy_digest,
 };
 use hellas_work::test_support::channel::{
-    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle, bundle_bytes, channel_policy, client, deadlines, descriptor,
-    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact,
-    manifest, network, origin, payload_at, payment_edge, payment_policy,
-    payment_terms, prompt_tokens, provider, settlement, signer, text_execution, text_policy,
-    work_policy,
+    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle,
+    bundle_bytes, channel_policy, client, deadlines, descriptor,
+    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, manifest,
+    network, origin, payload_at, payment_edge, payment_policy, payment_terms, prompt_tokens,
+    provider, settlement, signer, text_execution, text_policy, work_policy,
 };
 use hellas_work::test_support::channel::{accept_uploaded, accept_uploaded_service};
 use hellas_work::work::{

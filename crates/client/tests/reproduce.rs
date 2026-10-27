@@ -22,7 +22,8 @@ use hellas_rpc::protocol::artifacts::{
     TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::{
-    Application, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest, ProgramManifest,
+    Application, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    ProgramManifest,
 };
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::work::{

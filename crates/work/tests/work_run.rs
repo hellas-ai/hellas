@@ -15,18 +15,15 @@ use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
-use hellas_work::model::setup::{
-    ReadyChannel, WorkChannelDescriptor, WorkSetupError,
-};
+use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, WorkSetupError};
 use hellas_work::model::work::{
     EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, canonical_output_digest,
     propose_authorization, result_digest, signing_hash, terminal_result, work_id,
 };
 use hellas_work::test_support::channel::{
-    CURSOR, PRICE, PROMPT_TOKENS, advance, bundle, bundle_bytes, client,
-    commit, deadlines, descriptor, descriptor_with, evaluate_request, manifest,
-    network, origin, payment_policy, provider, provider_producer,
-    settlement, work_policy,
+    CURSOR, PRICE, PROMPT_TOKENS, advance, bundle, bundle_bytes, client, commit, deadlines,
+    descriptor, descriptor_with, evaluate_request, manifest, network, origin, payment_policy,
+    provider, provider_producer, settlement, work_policy,
 };
 use hellas_work::work::{
     BackendFault, ProviderEndpoint, RunAdmission, RunError, RunOutcome, WorkBackend, WorkService,
