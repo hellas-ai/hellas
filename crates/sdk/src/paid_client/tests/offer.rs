@@ -55,8 +55,9 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             apple_app_attest: None,
         };
         trust.verify_enrollment(&imported.offer().provider).unwrap();
-        let mount =
-            crate::paid_provider::MountedWork::with_backend(super::recovery::Backend::default());
+        let backend = super::recovery::Backend::default();
+        let backend_calls = backend.0.clone();
+        let mount = crate::paid_provider::MountedWork::with_backend(backend);
         mount
             .mount(
                 hellas_wire::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
@@ -133,9 +134,11 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap();
         let first_upload = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let first_certificate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let interrupt_payment = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let serving = tokio::spawn({
             let first_upload = first_upload.clone();
             let first_certificate = first_certificate.clone();
+            let interrupt_payment = interrupt_payment.clone();
             let server = server.clone();
             async move {
                 let mut tasks = tokio::task::JoinSet::new();
@@ -146,6 +149,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                     let mount = mount.clone();
                     let first_upload = first_upload.clone();
                     let first_certificate = first_certificate.clone();
+                    let interrupt_payment = interrupt_payment.clone();
                     tasks.spawn(async move {
                         let transport = IrohTransport::new(connection);
                         if index == 3 {
@@ -191,6 +195,15 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                                     inbound,
                                 )
                                 .await;
+                            } else if inbound.method_id == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
+                                && interrupt_payment.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                // A crash can leave the client's certificate
+                                // durable while the provider has never seen it.
+                                let _ = hellas_rpc::call::dispatch_unary_with_context::<IrohTransport, hellas_rpc::services::work::AdmitCertificate, _, _, _>(
+                                    inbound, |_, _| async {
+                                        Err::<hellas_rpc::pb::work::AdmitCertificateResponse, _>(WireStatus::new(hellas_wire::WireCode::Cancelled, "interrupted before provider admission"))
+                                    },
+                                ).await;
                             } else {
                                 let _ =
                                     Dispatcher::<IrohTransport>::dispatch(&server, inbound).await;
@@ -239,29 +252,37 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             observer: None,
             needs_recovery: false,
         };
-        let result = session
-            .run(Some(fixture.proposal().prepared_input), false, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let error = session.run(Some(fixture.proposal().prepared_input), false, None).await.err().expect("interrupted before acknowledgement");
+        assert!(matches!(error, PaidClientError::Payment(hellas_work::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
         assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(
-            session
-                .with_state(|state| state.proposal_nonce_high_water())
-                .await
-                .unwrap(),
-            1,
-            "mount retry reuses the original authorization"
-        );
-        assert_eq!(result.credited_cumulative, crate::test_support::PRICE);
-        assert_eq!(
-            service
-                .with_state(|s| s.ledger().credited_cumulative())
-                .await
-                .unwrap(),
-            crate::test_support::PRICE
-        );
+        let first = session.with_state(|state| {
+            assert_eq!(state.proposal_nonce_high_water(), 1);
+            assert_eq!(state.ledger().credited_cumulative(), crate::test_support::PRICE);
+            state.last_payment().unwrap().work_id
+        }).await.unwrap();
+        assert_eq!(service.with_state(|state| state.ledger().credited_cumulative()).await.unwrap(), 0);
+        session.shutdown().await;
+        let args = session.args.clone();
+        let descriptor = session.descriptor.clone();
+        let policy = session.policy.clone();
+        let dialer = std::mem::replace(&mut session.dialer, ProviderDialer::new(server.id(), server.bound_sockets(), client_endpoint.clone(), trust.clone()));
+        drop(session);
+        let client = ClientService::new(ClientEndpoint::recover(fixture.store(Role::Client).await, signer(1)).unwrap());
+        client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
+        let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
+        let job = crate::job::Job::fetch(crate::test_support::PRICE, match &fixture.policy.work_policy { WorkPolicy::Fetch { contract, .. } => contract.clone(), _ => unreachable!() }, "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
+        let result = crate::transact::transact(&mut session, &job, &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(), crate::transact::TransactionOptions {new_purchase: true, ..Default::default()}).await.unwrap();
+        assert_ne!(result.work_id, first);
+        assert_eq!(result.credited_cumulative, 2 * crate::test_support::PRICE);
+        assert_eq!(session.with_state(|state| state.proposal_nonce_high_water()).await.unwrap(), 2);
+        service.with_state(|state| {
+            assert_eq!(state.ledger().credited_cumulative(), 2 * crate::test_support::PRICE);
+            for id in [first, result.work_id] {
+                assert!(matches!(state.terminal_by_id(id).unwrap().outcome, hellas_work::work_store::TerminalOutcome::Certified { .. }));
+            }
+        }).await.unwrap();
+        assert_eq!(backend_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         let mut authorized = crate::grant_client::GrantSession::open(
             GrantSessionOptions {
                 target: grant_target,
@@ -313,7 +334,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 .with_state(|s| s.ledger().credited_cumulative())
                 .await
                 .unwrap(),
-            crate::test_support::PRICE
+            2 * crate::test_support::PRICE
         );
         client_endpoint.close().await;
         server.close().await;

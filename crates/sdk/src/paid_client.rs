@@ -624,8 +624,9 @@ impl PaidWorkSession {
                 hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
         }
-        if recover
-            && *needs_recovery
+        // A fresh job still depends on the provider seeing the preceding
+        // certificate. Repair its acknowledgement even without active-job replay.
+        if *needs_recovery
             && let Some(work_id) = client
                 .with_state(|state| state.last_payment().map(|payment| payment.work_id))
                 .await?
