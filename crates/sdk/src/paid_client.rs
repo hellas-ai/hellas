@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
 mod error;
+pub(crate) mod offer;
 pub use error::PaidClientError;
+pub use offer::{PaidQuote, request_paid_quote};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::work_link::WorkLink as ProviderDialer;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
@@ -51,10 +53,10 @@ pub struct PaidWorkOptions {
     pub journal_root: PathBuf,
     pub provider: EndpointId,
     pub provider_addrs: Vec<SocketAddr>,
-    pub provider_trust: hellas_client::ProviderTrustAnchor,
-    pub bond: EdgeId,
+    pub assurance: hellas_rpc::Assurance,
+    pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
+    pub expected_price: u64,
     pub payment_funding: Funding,
-    pub omission_bond: u64,
     pub acceptance_blocks: u64,
     pub terminal_blocks: u64,
     pub payment_blocks: u64,
@@ -66,8 +68,6 @@ pub struct PaidWorkOptions {
 impl PaidWorkOptions {
     /// Reject impossible deadlines and collateral before starting a node or signing.
     pub fn validate(&self) -> Result<()> {
-        self.provider_trust
-            .verify_environment(self.config.work_policy.allowed_environment())?;
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
             return Err(PaidClientError::InvalidOptions(
                 "deadline spans must be positive",
@@ -77,14 +77,11 @@ impl PaidWorkOptions {
             return Err(PaidClientError::InvalidOptions("timeout must be positive"));
         }
 
-        let config = &self.config;
-        // Reject impossible funding before signing either setup transaction.
-        let settlement = hellas_kernel::work_payment_settlement(
-            config.expected_payment_values,
-            self.omission_bond,
-        )
-        .ok_or(hellas_work::model::setup::WorkSetupError::Unsettleable)?;
-        hellas_work::model::setup::check_collateral(self.omission_bond, settlement.capacity())?;
+        if self.expected_price == 0 || !self.payment_funding.taker().is_empty() {
+            return Err(PaidClientError::InvalidOptions(
+                "price must be positive and only the client funds payment",
+            ));
+        }
         Ok(())
     }
 }
@@ -161,12 +158,6 @@ pub async fn run_paid_work(
             prepared_input,
             settle,
         } = args;
-        check_request(
-            &options.config.provider_policy(),
-            &prepared_input,
-            &options.provider_trust,
-            hellas_auth::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
-        )?;
         let endpoint = bind_paid_endpoint(transport_key).await?;
         let mut session =
             PaidWorkSession::open(options, endpoint.clone(), settlement_key, node, authority)
@@ -224,6 +215,7 @@ impl InputIdentities {
 pub struct PaidWorkSession {
     args: PaidWorkOptions,
     descriptor: WorkChannelDescriptor,
+    policy: ProviderChannelPolicy,
     dialer: ProviderDialer,
     client: ClientService,
     observer: Option<tokio::task::JoinHandle<()>>,
@@ -328,7 +320,23 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
 }
 
 impl PaidWorkSession {
-    pub async fn open(
+    pub fn open(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        node: FullNode,
+        authority: hellas_work::node::NodeCoordinator,
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        Box::pin(Self::open_inner(
+            args,
+            endpoint,
+            settlement_key,
+            node,
+            authority,
+        ))
+    }
+
+    async fn open_inner(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
@@ -337,8 +345,6 @@ impl PaidWorkSession {
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
-        let policy = config.provider_policy();
-        let bond = args.bond;
         let payment_funding = args.payment_funding.clone();
         config.check_node(&node)?;
         let read_timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
@@ -356,28 +362,50 @@ impl PaidWorkSession {
                 source,
             }
         })?;
-        let store = SetupStore::open(
-            &args.journal_root,
-            config.chain.network,
-            bond,
-            Role::Client,
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
+        let (store, signed) = match offer::retained_offer(&args, &chain).await? {
+            Some(retained) => retained,
+            None => {
+                let signed = offer::obtain_offer(
+                    &args,
+                    &endpoint,
+                    &settlement_key,
+                    authority.owner().await?,
+                )
+                .await?;
+                check_client_party(&signed.offer().proposal, &authority, &settlement_key).await?;
+                let store = SetupStore::open(
+                    &args.journal_root,
+                    config.chain.network,
+                    signed.offer().proposal.bond_edge(),
+                    Role::Client,
+                    &Secp256k1Verifier::new(),
+                )
+                .await?;
+                (store, signed)
+            }
+        };
+        signed.check()?;
+        let policy = signed.offer().policy.clone();
+        let omission_bond = signed.offer().omission_bond;
+        offer::check_policy(&args, &policy, omission_bond)?;
+        check_client_party(&signed.offer().proposal, &authority, &settlement_key).await?;
+        let bond = signed.offer().proposal.bond_edge();
+        let trust = hellas_client::selected_provider_trust(
+            &signed.offer().provider,
+            args.assurance,
+            args.apple_trust.as_ref(),
+        )?;
+        let dialer =
+            ProviderDialer::new(args.provider, args.provider_addrs.clone(), endpoint, trust);
         let mut setup = SetupEndpoint::new(
             store,
             settlement_key.clone(),
             PaymentAdmission::Proposes(Box::new(policy.clone())),
         );
-        let dialer = ProviderDialer::new(
-            args.provider,
-            args.provider_addrs.clone(),
-            endpoint,
-            args.provider_trust.clone(),
-        );
-
         if setup.state().revision().is_none() {
-            exchange_setup(&dialer, &mut setup).await?;
+            setup
+                .import_offer(*args.provider.as_bytes(), signed)
+                .await?;
         }
         let bundle = setup
             .state()
@@ -396,7 +424,7 @@ impl PaidWorkSession {
             setup.arm_scan(finalized_floor(&chain).await?).await?;
         }
         if setup.state().revision() == Some(1) {
-            let terms = payment_terms(config, &policy, &bundle, args.omission_bond);
+            let terms = payment_terms(config, &policy, &bundle, omission_bond);
             propose_client_payment(
                 &mut setup,
                 &authority,
@@ -448,6 +476,7 @@ impl PaidWorkSession {
         let session = Self {
             args,
             descriptor,
+            policy,
             dialer,
             client,
             observer: Some(observer),
@@ -553,6 +582,7 @@ impl PaidWorkSession {
         let Self {
             args,
             descriptor,
+            policy,
             dialer,
             client,
             needs_recovery,
@@ -561,7 +591,7 @@ impl PaidWorkSession {
         let config = &args.config;
         if let Some(prepared) = prepared.as_ref() {
             check_request(
-                &config.provider_policy(),
+                policy,
                 prepared,
                 &dialer.trust,
                 hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
@@ -659,7 +689,7 @@ impl PaidWorkSession {
                     RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, input),
                 };
                 check_request(
-                    &config.provider_policy(),
+                    policy,
                     &pending,
                     &dialer.trust,
                     hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
@@ -937,7 +967,7 @@ async fn execute_paid_job(
     };
     let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
     Ok(PaidWorkResult {
-        bond_edge: args.bond,
+        bond_edge: ready.channel().payment_terms().bond_edge,
         payment_edge: ready.channel().payment_edge(),
         channel_id: ready.channel().id(),
         work_id,
@@ -956,7 +986,9 @@ pub(crate) fn check_request(
     trust: &hellas_client::ProviderTrustAnchor,
     caller: hellas_auth::PublicKey,
 ) -> Result<()> {
-    trust.verify_environment(policy.work_policy.allowed_environment())?;
+    if trust.apple_app_attest.is_some() {
+        trust.verify_environment(policy.work_policy.allowed_environment())?;
+    }
     let assurance = prepared.assurance()?;
     if trust.required_assurance != assurance {
         return Err(PaidClientError::InputMismatch(
@@ -1075,7 +1107,7 @@ async fn ready_channel(
 ) -> Result<hellas_work::model::setup::ReadyChannel> {
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
-        payment_edge: descriptor.channel().payment_edge(),
+        payment_edge: Some(descriptor.channel().payment_edge()),
         funding: Default::default(),
     };
     let snapshot =

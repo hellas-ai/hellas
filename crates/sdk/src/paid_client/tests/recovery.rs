@@ -150,7 +150,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![fixture.config.work_policy.allowed_environment()],
+            allowed_environments: vec![fixture.policy.work_policy.allowed_environment()],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -220,19 +220,20 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     journal_root: fixture.root.path().join("client"),
                     provider: server.id(),
                     provider_addrs: server.bound_sockets(),
-                    provider_trust: trust.clone(),
-                    bond: fixture.descriptor.bond_edge(),
+                    apple_trust: None,
+                    assurance: Assurance::ProducerSigned,
+                    expected_price: PRICE,
                     payment_funding: Funding::new(
                         hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
                         hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
                     ),
-                    omission_bond: 601,
                     acceptance_blocks: 50,
                     terminal_blocks: 100,
                     payment_blocks: 200,
                     timeout: Duration::from_secs(5),
                 },
                 descriptor: fixture.descriptor.clone(),
+                policy: fixture.policy.clone(),
                 dialer: ProviderDialer::new(
                     server.id(),
                     server.bound_sockets(),

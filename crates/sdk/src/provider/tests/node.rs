@@ -35,7 +35,7 @@ use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-    Funding, Key, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
+    Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
     MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
     RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
@@ -67,7 +67,6 @@ use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
 
 use super::super::*;
-use crate::work_config::{WorkRoutes, load_work_config};
 use iroh::SecretKey;
 use tokio::task::JoinHandle;
 
@@ -84,6 +83,15 @@ fn assert_retryable_not_ready(refusal: WorkRefused) {
 struct ContextWitness(Arc<Mutex<Option<TransportContext>>>);
 
 impl WorkSetupHandler for ContextWitness {
+    async fn request_offer(
+        &self,
+        request: hellas_rpc::pb::work::RequestOfferRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        UnmountedWork.request_offer(request, context).await
+    }
+
     fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
@@ -110,6 +118,15 @@ struct ConcurrentDispatchWitness {
 }
 
 impl WorkSetupHandler for ConcurrentDispatchWitness {
+    async fn request_offer(
+        &self,
+        request: hellas_rpc::pb::work::RequestOfferRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        UnmountedWork.request_offer(request, context).await
+    }
+
     fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
@@ -442,8 +459,6 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let dir = temp();
     let first = OfferFixture::first();
     let second = OfferFixture::second();
-    first.seed_provider_offer(dir.path(), admits()).await;
-    second.seed_provider_offer(dir.path(), admits()).await;
 
     let first_secret = 0x71;
     let second_secret = 0x72;
@@ -457,21 +472,22 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             .public()
             .as_bytes(),
     );
+    first
+        .seed_provider_offer(dir.path(), admits(), first_peer)
+        .await;
+    second
+        .seed_provider_offer(dir.path(), admits(), second_peer)
+        .await;
     let setup_mount = MountedSetup::default();
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: dir.path().to_path_buf(),
-            routes: configured_routes(&[
-                (first_peer, first.bond_edge(), first.client().party_key()),
-                (second_peer, second.bond_edge(), second.client().party_key()),
-            ]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy: provider_policy(),
         },
         MountedWork::default(),
         setup_mount.clone(),
@@ -592,30 +608,15 @@ async fn discover_two_route_runner(
     work_mount: &MountedWork,
     setup_mount: &MountedSetup,
 ) -> WorkRunner {
-    let first = OfferFixture::first();
-    let second = OfferFixture::second();
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: root.to_path_buf(),
-            routes: configured_routes(&[
-                (
-                    first_route_peer(),
-                    first.bond_edge(),
-                    first.client().party_key(),
-                ),
-                (
-                    second_route_peer(),
-                    second.bond_edge(),
-                    second.client().party_key(),
-                ),
-            ]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy: provider_policy(),
         },
         work_mount.clone(),
         setup_mount.clone(),
@@ -650,7 +651,9 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
     let first = OfferFixture::first();
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
-    second.seed_provider_offer(dir.path(), admits()).await;
+    second
+        .seed_provider_offer(dir.path(), admits(), second_route_peer())
+        .await;
     let source = RoutedChain::new([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
     let work_mount = MountedWork::default();
     let setup_mount = MountedSetup::default();
@@ -1045,14 +1048,6 @@ fn network() -> NetworkId {
 
 /// A threshold identity consensus accepts: the compressed BLS12-381 G1
 /// generator used by the configuration loader's fixture too.
-fn threshold_identity() -> Vec<u8> {
-    vec![
-        0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9, 0xac,
-        0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f, 0x17, 0x1b,
-        0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a, 0xf0, 0x0a, 0xdb,
-        0x22, 0xc6, 0xbb,
-    ]
-}
 
 fn temp() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hellas-cli-tests");
@@ -1091,132 +1086,6 @@ fn vouched_context(peer: PeerId) -> TransportContext {
         peer: Some(PeerIdentity(peer.into_bytes())),
         auth_level: AuthLevel::Vouched,
         ..TransportContext::default()
-    }
-}
-
-fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
-    loaded_routes(routes).expect("the route fixture passes the production loader")
-}
-
-fn loaded_routes(
-    routes: &[(PeerId, EdgeId, Key)],
-) -> Result<WorkRoutes, crate::work_config::WorkConfigError> {
-    let route_values: Vec<_> = routes
-        .iter()
-        .map(|(peer, bond, client)| {
-            serde_json::json!({
-                "peer": hex::encode(peer.as_bytes()),
-                "bond": hex::encode(bond.to_bytes()),
-                "client": hex::encode(client.to_bytes()),
-            })
-        })
-        .collect();
-    let value = serde_json::json!({
-        "chain": {
-            "network_id": network().as_str(),
-            "genesis_payload_digest": hex::encode([0x01; 32]),
-            "threshold_identity": hex::encode(threshold_identity()),
-        },
-        "validators": (1..=6)
-            .map(|index| format!("ws://127.0.0.1:900{index}"))
-            .collect::<Vec<_>>(),
-        "journal": { "root": "/var/lib/hellas/work" },
-        "routes": route_values,
-        "policies": {
-            "policy_salt": hex::encode(SALT),
-            "channel": {
-                "compute_credit_limit": 40,
-                "delivery_credit_limit": 40,
-            },
-            "execution": {
-                "allowed_environment": hex::encode([0x11; 32]),
-                "generation_policy_digest": hex::encode([0x12; 32]),
-                "identity_source_digest": hex::encode([0x13; 32]),
-                "max_prompt_tokens": 512,
-                "max_new_tokens": 128,
-                "max_stop_token_ids": 4,
-                "max_spool_bytes": 1_048_576_u64,
-                "max_encoded_result_frame": 262_144,
-                "max_encoded_prepared_input": 1_048_576_u64,
-            },
-            "payment": {
-                "dispatch_margin_blocks": 4,
-                "delivery_margin_blocks": 2,
-                "oracle_grace_blocks": 6,
-                "fixed_price": 10,
-            },
-        },
-        "poll_ms": 1,
-        "expected_payment_values": {
-            "value": PAYMENT_VALUE,
-            "reserve": PAYMENT_RESERVE,
-            "close_fees": { "base": 0, "slot": 0, "proof": 0, "lifetime": 0 },
-        },
-        "min_omit_response_blocks": MIN_OMIT_RESPONSE_BLOCKS,
-    });
-    let dir = temp();
-    let path = dir.path().join("routes.json");
-    if let Err(error) = std::fs::write(&path, value.to_string()) {
-        panic!("the route fixture is written: {error}");
-    }
-    load_work_config(&path).map(|config| config.routes)
-}
-
-#[test]
-fn typed_work_routes_match_file_loading_and_allow_multiple_bonds_per_peer() {
-    use crate::work_config::WorkRoute;
-    for entries in [
-        vec![],
-        vec![(first_route_peer(), bond_edge(), client().party_key())],
-        vec![
-            (
-                first_route_peer(),
-                EdgeId::from_bytes([9; 32]),
-                client().party_key(),
-            ),
-            (first_route_peer(), bond_edge(), client().party_key()),
-            (
-                second_route_peer(),
-                EdgeId::from_bytes([8; 32]),
-                client().party_key(),
-            ),
-        ],
-    ] {
-        let typed =
-            WorkRoutes::try_from_iter(entries.iter().map(|&(peer, bond, client)| WorkRoute {
-                peer,
-                bond,
-                client,
-            }))
-            .unwrap();
-        let loaded = loaded_routes(&entries).unwrap();
-        assert_eq!(typed, loaded);
-        assert_eq!(typed.len(), entries.len());
-        assert_eq!(
-            typed.iter().copied().collect::<Vec<_>>(),
-            loaded.iter().copied().collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn typed_work_routes_and_file_loading_refuse_duplicate_bonds() {
-    use crate::work_config::{WorkConfigError, WorkRoute};
-    for other_peer in [first_route_peer(), second_route_peer()] {
-        let entries = [
-            (first_route_peer(), bond_edge(), client().party_key()),
-            (other_peer, bond_edge(), provider().party_key()),
-        ];
-        let typed = WorkRoutes::try_from_iter(entries.map(|(peer, bond, client)| WorkRoute {
-            peer,
-            bond,
-            client,
-        }));
-        assert!(matches!(typed, Err(WorkConfigError::DuplicateBond(bond)) if bond == bond_edge()));
-        let Err(WorkConfigError::File { source, .. }) = loaded_routes(&entries) else {
-            panic!("the file loader must refuse duplicate bonds");
-        };
-        assert!(matches!(*source, WorkConfigError::DuplicateBond(bond) if bond == bond_edge()));
     }
 }
 
@@ -1299,6 +1168,36 @@ fn provider_policy() -> ProviderChannelPolicy {
         work_policy: work_policy().into(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
+    }
+}
+
+fn recorded_offer(
+    one: WorkChannelSetupBundleV2,
+    peer: PeerId,
+    payment_funding: Funding,
+    policy: ProviderChannelPolicy,
+) -> SetupRecord {
+    let key = provider_producer();
+    let provider = hellas_work::test_support::enrollment(&key, &key, [0x63; 32], [3; 32]);
+    let offer = hellas_work::model::offer::SignedPaidOffer::sign(
+        hellas_work::model::offer::PaidOffer {
+            provider,
+            proposal: one,
+            policy,
+            omission_bond: OMISSION_BOND,
+            payment_funding,
+            addresses: vec![],
+        },
+        &self::provider(),
+    )
+    .unwrap();
+    SetupRecord::Offer {
+        peer: peer.into_bytes(),
+        floor: Some(SetupScan {
+            height: FLOOR,
+            payload: payload_at(FLOOR),
+        }),
+        offer: Box::new(offer),
     }
 }
 
@@ -1424,9 +1323,12 @@ async fn write_setup_journal(root: &Path) {
             height: FLOOR,
             payload: payload_at(FLOOR),
         },
-        SetupRecord::Bundle {
-            bundle: one.encode(),
-        },
+        recorded_offer(
+            one.clone(),
+            default_route_peer(),
+            payment_funding(),
+            provider_policy(),
+        ),
         SetupRecord::Bundle {
             bundle: two.encode(),
         },
@@ -1756,7 +1658,7 @@ fn channel_snapshot(
     WorkChannelSnapshot::new(
         WorkChannelQuery {
             bond_edge: bond_edge(),
-            payment_edge: payment_edge(),
+            payment_edge: Some(payment_edge()),
             funding: BTreeSet::new(),
         },
         LatestBlock {
@@ -1890,7 +1792,7 @@ fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkCh
     WorkChannelSnapshot::new(
         WorkChannelQuery {
             bond_edge: bond_edge(),
-            payment_edge: payment_edge(),
+            payment_edge: Some(payment_edge()),
             funding: BTreeSet::new(),
         },
         LatestBlock {
@@ -2251,7 +2153,7 @@ impl NodeChain {
             snapshot: WorkChannelSnapshot::new(
                 WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge: payment_edge(),
+                    payment_edge: Some(payment_edge()),
                     funding: BTreeSet::new(),
                 },
                 LatestBlock {
@@ -2322,7 +2224,7 @@ impl SetupView for NodeChain {
         .into_iter()
         .collect();
         if query.bond_edge != bond_edge()
-            || query.payment_edge != payment_edge()
+            || query.payment_edge != Some(payment_edge())
             || query.funding != expected_funding
         {
             return Err(BlockSourceError::new(
@@ -2436,18 +2338,16 @@ impl TxSink for NodeChain {
 
 /// The runner a node starts with: the configured root, the stored
 /// identity, and the policy it was configured with.
-async fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
+async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: root.to_path_buf(),
-            routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy,
         },
         mount.clone(),
         MountedSetup::default(),
@@ -2491,7 +2391,10 @@ fn adjudicated_payment_closes(chain: &TestChain) -> usize {
 }
 
 async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
-    let store = match SetupStore::open(
+    let PaymentAdmission::Admits(policy) = admission else {
+        panic!("admitting fixture policy")
+    };
+    let mut store = SetupStore::open(
         root,
         network(),
         bond_edge(),
@@ -2499,26 +2402,15 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
         &Secp256k1Verifier::new(),
     )
     .await
-    {
-        Ok(store) => store,
-        Err(error) => panic!("the empty provider root opens its first setup: {error}"),
-    };
-    let mut endpoint = SetupEndpoint::new(store, provider(), admission);
-    if let Err(error) = endpoint
-        .arm_scan(SetupScan {
-            height: FLOOR,
-            payload: payload_at(FLOOR),
-        })
+    .unwrap();
+    let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
+    store
+        .commit(
+            recorded_offer(proposed(), peer, payment_funding(), *policy),
+            &Secp256k1Verifier::new(),
+        )
         .await
-    {
-        panic!("the provider arms its finalized floor: {error}");
-    }
-    if let Err(error) = endpoint
-        .propose_bond(network(), bond_funding(), bond_terms())
-        .await
-    {
-        panic!("the provider journals its offer: {error}");
-    }
+        .unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -2673,9 +2565,16 @@ impl OfferFixture {
                 height: FLOOR,
                 payload: payload_at(FLOOR),
             },
-            SetupRecord::Bundle {
-                bundle: one.encode(),
-            },
+            recorded_offer(
+                one.clone(),
+                if self.client_seed == Self::first().client_seed {
+                    first_route_peer()
+                } else {
+                    second_route_peer()
+                },
+                self.payment_funding(),
+                provider_policy(),
+            ),
             SetupRecord::Bundle {
                 bundle: two.encode(),
             },
@@ -2825,7 +2724,7 @@ impl OfferFixture {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: self.bond_edge(),
-                payment_edge: self.payment_edge(),
+                payment_edge: Some(self.payment_edge()),
                 funding: BTreeSet::new(),
             },
             LatestBlock {
@@ -2846,7 +2745,7 @@ impl OfferFixture {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: self.bond_edge(),
-                payment_edge: self.payment_edge(),
+                payment_edge: Some(self.payment_edge()),
                 funding: BTreeSet::new(),
             },
             LatestBlock {
@@ -2863,8 +2762,11 @@ impl OfferFixture {
         )
     }
 
-    async fn seed_provider_offer(self, root: &Path, admission: PaymentAdmission) {
-        let store = match SetupStore::open(
+    async fn seed_provider_offer(self, root: &Path, admission: PaymentAdmission, peer: PeerId) {
+        let PaymentAdmission::Admits(policy) = admission else {
+            panic!("admitting fixture policy")
+        };
+        let mut store = SetupStore::open(
             root,
             network(),
             self.bond_edge(),
@@ -2872,26 +2774,14 @@ impl OfferFixture {
             &Secp256k1Verifier::new(),
         )
         .await
-        {
-            Ok(store) => store,
-            Err(error) => panic!("the provider route opens its setup: {error}"),
-        };
-        let mut endpoint = SetupEndpoint::new(store, provider(), admission);
-        if let Err(error) = endpoint
-            .arm_scan(SetupScan {
-                height: FLOOR,
-                payload: payload_at(FLOOR),
-            })
+        .unwrap();
+        store
+            .commit(
+                recorded_offer(self.proposed(), peer, self.payment_funding(), *policy),
+                &Secp256k1Verifier::new(),
+            )
             .await
-        {
-            panic!("the provider route arms its finalized floor: {error}");
-        }
-        if let Err(error) = endpoint
-            .propose_bond(network(), self.bond_funding(), self.bond_terms())
-            .await
-        {
-            panic!("the provider route journals its offer: {error}");
-        }
+            .unwrap();
     }
 }
 
@@ -2962,12 +2852,10 @@ impl RunningPaidNode {
                 network: network(),
 
                 journal_root: root.to_path_buf(),
-                routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
 
                 poll: Duration::from_millis(1),
                 max_observation_age: TEST_TIMEOUT,
                 settlement_key: provider(),
-                policy,
             },
             work_mount.clone(),
             setup_mount.clone(),

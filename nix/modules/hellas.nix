@@ -481,10 +481,10 @@ rec {
         default = null;
         example = "/var/lib/hellas/work.json";
         description = ''
-          Runtime paid-work configuration passed as --work-config. A paid
-          provider reads an existing identity rather than creating one, so
-          initialize its identity before enabling this option. Keep the file
-          and every journal path it names outside the Nix store.
+          Runtime chain pins, validator URLs, journal root and observation
+          bounds passed as --work-config. Paid policies live in the initialized
+          node authority and client routes are recorded in setup journals.
+          Keep the file and journal paths outside the Nix store.
         '';
       };
       fetchConfigFile = mkOption {

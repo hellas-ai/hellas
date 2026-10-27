@@ -6,27 +6,31 @@ channels. Each provider has its own endpoint identity, bond, payment funding,
 and client journals. The gateway prefers idle matching providers and matching
 prompt prefixes, then serializes requests within each channel.
 
-With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its work
-config must select the HTTP Fetch manifest and a matching Fetch route policy;
+With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its paid
+policy must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
 account, so this path never falls back to a different provider or funding source.
 
-The pool file uses the provider's existing `--work-config` policy and chain
-configuration:
+The provider keeps its paid policy in its node authority. A passkey-authenticated
+owner sets it with `hellas-cli admin work policy-command.json`, using a
+`SetPaidPolicy` command with `expected_revision` and `policy`. The policy contains
+its channel credit, execution and payment policies, expected payment-edge values,
+response window, `jobs_per_channel` (default 10), and offer bounds. A stale revision
+or a daily node-key session cannot change it.
+
+The pool selects providers and expected prices. It obtains each policy with
+`RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 
 ```json
 {
-  "trust_store": "/var/lib/hellas-gateway/trust",
   "providers": [
     {
-      "work_config": "/srv/hellas/provider-a-work.json",
+      "chain_config": "/srv/hellas/chain.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
-      "trust_policy": "provider-a",
       "provider_addrs": ["192.0.2.10:31145"],
-      "bond": "PROVIDER_BOND_EDGE_HEX",
-      "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"],
-      "omission_bond": 10
+      "payment": 20,
+      "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"]
     }
   ],
   "acceptance_blocks": 16,
@@ -37,88 +41,58 @@ configuration:
 }
 ```
 
-Every pool entry selects a previously approved `trust_policy` ID. The caller owns
-`trust_store`; neither an offer nor an execution request can supply replacement pins.
-Optionally include the signed offer emitted by `hellas-cli provision` in `offer`.
-Import checks its network, bond, transport and enrollment against the separately
-approved policy. Empty `provider_addrs` uses the signed offer's address hints.
-An offer by itself does not authorize a provider.
+`chain_config` contains the chain cross-check, six validator URLs, journal root,
+`poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
+client routes. The gateway checks that its entries use its executing chain node.
 
-Approve a locally reviewed policy file before starting the gateway:
+A request without funding coins returns a quote and writes no paid journal. The
+quote states the canonical channel policy, omission collateral and exact funding.
+A funded request proves live coins owned by the client's principal and delegated
+to its settlement key. Their sum must match the quote exactly. The provider
+reserves its own owner-delegated stake within `max_stake_per_client` and
+`max_open_offers`, and creates one live offer per client principal and key.
+The original signed offer, policy and authenticated peer are durable together;
+retries return the same offer and restart requires no route configuration.
+Unanswered offers expire at their bond timeout.
+
+ProducerSigned providers need only the selected endpoint ID. Each live Open
+checks that the enrollment names that transport and verifies the producer proof.
+Apple-attested providers additionally require the existing independent trust store.
+For those entries, add a top-level `trust_store` directory and a per-provider
+`trust_policy` ID. Approve app IDs and release CDHashes independently:
 
 ```sh
 hellas-cli trust --store /var/lib/hellas-gateway/trust approve provider-a \
   --expected-revision 0 --policy /srv/hellas/provider-a-trust.json \
-  --reason 'Reviewed enrollment and execution contract'
-hellas-cli trust --store /var/lib/hellas-gateway/trust show provider-a
+  --reason 'Reviewed Apple application and release hashes'
 ```
 
-The policy JSON has `provider_genesis` (the independently checked enrollment
-ContentId), `assurance` (0 for producer signatures or 1 for Apple App Attest),
-`environments` (1–32 exact approved manifest ContentIds), and `apple`.
-For software assurance, `apple` can be null. For Apple assurance it is
-`{"app_id":"TEAM.bundle.id","cd_hashes":["64_HEX_DIGITS"]}` with release pins
-obtained independently. The assurance must match the gateway's `--assurance`.
-A contract change requires an explicit approval; merely editing Work configuration
-does not approve its new environment. This approval selects trusted software and
-terms; it does not establish the still-required protected-platform guarantees.
+The existing trust JSON contains `provider_genesis`, `assurance`, approved
+`environments`, and `apple` with `app_id` and `cd_hashes`. Missing or mismatched
+Apple approval fails before funding or disclosure. Approval replacement retains
+its revision checks and persistent assertion counters. `paid-work run` accepts
+`--trust-store` and `--trust-policy` for Apple providers; software providers do not
+need them. Grant gateways keep their existing independent approval requirements.
 
-Replacement requires the current `--expected-revision` and an explicit reason.
-The private record stores the revision, approval time and previous policy commitment
-atomically with the pins. It retains the latest approval record, not a full audit
-history. Concurrent stale edits fail. Missing, corrupt, nonprivate or symlinked
-records fail; startup never creates approval. Assertion counters persist independently
-of policy replacement. Restart gateways to load a new approval; existing gateway
-instances retain their startup policy. `paid-work run` uses the same native store
-through required `--trust-store` and `--trust-policy` options. Grant gateways require
-the same selection with `--offer` or `--local`. Approved manifest IDs
-remain in the client anchor and are checked for every new job, including refreshed
-grant policies. Paid options also check them before funding.
-
-Every Work and WorkSetup connection performs Open before disclosing requests, for
-both producer-signed and App Attest policy.
-
-Bond or chain discovery distributes this same signed offer as an off-chain
-artifact. The consumer compares its network and bond to the discovered record;
-the signed proposal and enclosing settlement signature bind the enrollment to
-that bond's maker. Endpoint advertisements alone never establish an enrollment
-pin. Chain validation and finalized funding checks still occur during setup.
-No enrollment data is added to on-chain transactions.
-
-Provision provider bonds with `hellas-cli provision --grant-config grant.json
---client-contact client --client CLIENT_NODE_KEY`; coin values and policy terms
-must agree with the provider work config. The contact alias selects an already
-imported, signature-verified ContactCard in the current authority owner's contact
-directory. Its principal is the client coin owner; `--client` names the separate
-settlement node. The card proves the principal's signature, not that the principal
-controls the selected node. The client checks the bond against its own live
-authority owner and node before countersigning, and chain funding requires that
-owner's coins delegated to that node.
-
-Provider and gateway coin owners come from their current node authority roots.
-The gateway reuses the authority opened by its gateway profile. Standalone
-`provision` and `paid-work run` require `--grant-config` pointing to an explicitly
-bootstrapped authority journal; stop its running writer before opening it offline.
-Payment coins cannot fund two channels. Recovery changes the live owner used for
-new setup; it does not reinterpret existing signed bond terms.
-
-Owners delegate or reclaim coins through the existing global passkey:
+Owners delegate or reclaim coins through the global passkey:
 
 ```sh
 hellas-cli --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
-  --network devnet --node NODE_SETTLEMENT_KEY --coin COIN_ID
+  --trust ./chain-trust.json --network devnet --node NODE_SETTLEMENT_KEY \
+  --coin COIN_ID --split 12
 hellas-cli --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
-  --network devnet --coin COIN_ID
+  --trust ./chain-trust.json --network devnet --coin COIN_ID
 ```
 
-`--node` uses the chain's base58 settlement-key spelling; coin IDs are hex.
-Default payouts remain delegated to each party's node. A provider can choose
-`provision --lock-provider-payout` to return its payout to its owner without a
-delegate. The client accepts only its own default delegated payout. An owner-led
-contested exit locks that owner's refund while preserving the other party's payout
-delegation.
-The omission bond must exceed the remaining payment capacity: with 1,000 units
-and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
+`--split VALUE` creates up to three delegated coins of that value and returns the
+remainder undelegated to the owner. The node cannot authorize that owner action.
+`--node` uses base58 settlement keys; coin IDs are hex. Returned provider stake
+stays delegated by default; `offers.redelegate_payout = false` keeps it with the
+owner without delegation. Client payouts remain delegated to their own node.
+
+The omission bond must exceed the payment capacity. At price 20 and ten jobs,
+a capacity of 200 and omission collateral of 201 require 401 units with zero fees
+and reserve. The client checks
 this before signing setup terms or creating a journal.
 The provider's route table must authorize the gateway transport and settlement
 identities. All participants must use the same compatible chain revision.

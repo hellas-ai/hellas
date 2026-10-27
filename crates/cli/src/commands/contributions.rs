@@ -86,14 +86,6 @@ fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
 }
 
 /// Load an already imported, verified contact from this principal's address book.
-pub(crate) fn load_contact(principal: PrincipalId, name: &str) -> CliResult<ContactCard> {
-    let path = alias(&data_root(&principal)?, "contacts", name)?;
-    Ok(decode_contact_card(&read_bounded_regular_file(
-        &path,
-        "contact card",
-        MAX_CONTACT_CARD_BYTES,
-    )?)?)
-}
 pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     let directory = path
         .parent()

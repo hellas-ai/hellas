@@ -30,7 +30,10 @@ pub use fetch::{
     verify_fetch_work_event,
 };
 #[cfg(feature = "iroh")]
-pub use iroh::{AppleAppAttestTrust, ProviderTrustAnchor, RemoteNodeTarget, confidential_open};
+pub use iroh::{
+    AppleAppAttestTrust, ProviderTrustAnchor, RemoteNodeTarget, confidential_open,
+    confidential_open_selected, selected_provider_trust,
+};
 
 /// Client capabilities shared by local and transport-specific orchestration.
 #[derive(Clone)]

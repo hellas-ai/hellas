@@ -4,6 +4,7 @@ mod node;
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use hellas_executor::FetchRoute;
 use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::pb::work::{DeliverResultRequest, WorkStreamEvent};
 use hellas_rpc::services::work::StreamResult;
@@ -50,20 +51,34 @@ async fn paid_provider_advertises_work_and_chain_services() {
             )
             .unwrap();
         let root = Arc::new(UnusedRoot);
+        let state = fixture.root.path().join("state");
+        drop(
+            crate::test_node::bootstrap_node(
+                &state.join("grants"),
+                hellas_work::model::grant::grant_network(),
+                Some(enrollment.clone()),
+                hellas_auth::authority::UnixMillis::now().unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
         let provider = start_fetch_provider(
             FetchProviderOptions {
                 port: Some(0),
                 identity,
                 enrollment,
                 root: root.clone(),
-                state_directory: fixture.root.path().join("state"),
+                state_directory: state,
                 routes,
                 fetch_max_in_flight: 1,
                 fetch_queue_capacity: 1,
                 paid_work: Some(
                     crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap(),
                 ),
-                grants: None,
+                grants: Some(crate::GrantProviderOptions {
+                    policies: vec![],
+                    max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
+                }),
             }
             .prepare()
             .await

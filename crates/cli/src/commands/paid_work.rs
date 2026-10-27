@@ -9,7 +9,7 @@ use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{ConsensusInfo, FinalizedBlockQuery, FinalizedBlockView, LightClient as _};
-use hellas_kernel::{CoinId, EdgeId, Funding, List, MAX_PARTY_INPUTS, Secp256k1Signer};
+use hellas_kernel::{CoinId, Funding, List, MAX_PARTY_INPUTS, Secp256k1Signer};
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkOptions, PaidWorkRun, run_paid_work};
 use hellas_work::model::fetch::PreparedPaidFetchInputV1;
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::CliResult;
-use super::serve::work_config::load_work_config;
+use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
 
 /// Paid-work commands intended for deployment bring-up and smoke tests.
 #[derive(Debug, Subcommand)]
@@ -116,13 +116,22 @@ pub struct RunArgs {
     chain_node: super::chain_node::ChainNodeArgs,
     /// Caller-owned private trust directory.
     #[arg(long)]
-    trust_store: PathBuf,
+    trust_store: Option<PathBuf>,
     /// Previously approved local policy ID.
     #[arg(long)]
-    trust_policy: String,
-    /// Provider work configuration, including chain identity and policy.
-    #[arg(long = "work-config", value_name = "FILE")]
-    work_config: PathBuf,
+    trust_policy: Option<String>,
+    /// Validator RPC URL. Repeat exactly six times.
+    #[arg(long = "validator")]
+    validators: Vec<String>,
+    /// Independently authenticated chain trust document.
+    #[arg(long)]
+    trust: PathBuf,
+    /// Genesis document; defaults to the shipped devnet.
+    #[arg(long)]
+    genesis: Option<PathBuf>,
+    /// Expected flat price per job.
+    #[arg(long = "payment")]
+    payment: u64,
 
     /// Client-owned directory for durable setup and channel journals.
     #[arg(long = "journal-root", value_name = "DIR")]
@@ -136,17 +145,9 @@ pub struct RunArgs {
     #[arg(long = "address", value_delimiter = ',', value_name = "IP:PORT")]
     provider_addrs: Vec<SocketAddr>,
 
-    /// Provider bond edge advertised for this client.
-    #[arg(long = "bond", value_name = "HEX")]
-    bond: String,
-
     /// Client coin funding the payment edge. Repeat or comma-separate.
     #[arg(long = "payment-coin", value_delimiter = ',', value_name = "HEX")]
     payment_coins: Vec<String>,
-
-    /// Capacity reserved as the understatement-omission penalty.
-    #[arg(long = "omission-bond")]
-    omission_bond: u64,
 
     /// Canonical prepared Evaluate or Fetch input to execute.
     #[arg(long = "prepared-input", value_name = "FILE")]
@@ -201,12 +202,13 @@ pub async fn run(
             );
             let authority = crate::identity::open_authority(&args.grant_config, principal).await?;
             let timeout = Duration::from_secs(args.timeout_secs);
-            let config = load_work_config(&args.work_config)?;
+            let config = client_config(&args).await?;
             let node = args.chain_node.start(&config).await?;
             let result = tokio::time::timeout(
                 timeout,
                 run_one(
                     *args,
+                    config,
                     transport_key,
                     settlement_key,
                     node.clone(),
@@ -344,6 +346,25 @@ async fn inspect_chain(
     trust_path: &std::path::Path,
     genesis_path: Option<&std::path::Path>,
 ) -> CliResult<()> {
+    let (info, genesis) = read_chain(validators, trust_path, genesis_path).await?;
+    let output = serde_json::json!({
+        "chain": {
+            "network_id": info.network_id,
+            "genesis_payload_digest": hex::encode(genesis),
+            "threshold_identity": hex::encode(info.threshold_identity),
+        },
+        "validators": validators,
+        "reported_consensus_validators": info.validators,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+async fn read_chain(
+    validators: &[String],
+    trust_path: &Path,
+    genesis_path: Option<&Path>,
+) -> CliResult<(ConsensusInfo, [u8; 32])> {
     anyhow::ensure!(
         validators.len() == 6,
         "--validator must be passed exactly six times, got {}",
@@ -400,45 +421,63 @@ async fn inspect_chain(
             }
         }
     }
-    let (info, genesis) = observed.expect("six validators produced one observation");
-    let output = serde_json::json!({
-        "chain": {
-            "network_id": info.network_id,
-            "genesis_payload_digest": hex::encode(genesis),
-            "threshold_identity": hex::encode(info.threshold_identity),
-        },
-        "validators": validators,
-        "reported_consensus_validators": info.validators,
-    });
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+    observed.context("validators produced no observation")
 }
 
-fn paid_options(args: &RunArgs, assurance: hellas_rpc::Assurance) -> CliResult<PaidWorkOptions> {
+async fn client_config(args: &RunArgs) -> CliResult<WorkConfig> {
+    let (info, genesis_payload) =
+        read_chain(&args.validators, &args.trust, args.genesis.as_deref()).await?;
+    let genesis = match &args.genesis {
+        Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+        None => serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON)?,
+    };
+    Ok(WorkConfig {
+        chain: ChainCrossCheck {
+            network: hellas_kernel::NetworkId::new(&info.network_id)
+                .context("invalid chain network")?,
+            genesis_payload_digest: genesis_payload.into(),
+            threshold_identity: info.threshold_identity,
+            genesis: Some(genesis),
+        },
+        validators: args.validators.clone(),
+        journal_root: args.journal_root.clone(),
+        poll: Duration::from_millis(100),
+        max_observation_age: Duration::from_secs(60),
+    })
+}
+
+fn paid_options(
+    args: &RunArgs,
+    config: WorkConfig,
+    assurance: hellas_rpc::Assurance,
+) -> CliResult<PaidWorkOptions> {
     anyhow::ensure!(
         !args.payment_coins.is_empty(),
         "at least one --payment-coin is required"
     );
-    let config = load_work_config(&args.work_config)?;
-    let provider_trust = hellas_sdk::trust_policy::TrustPolicyStore::new(&args.trust_store)
-        .resolve_environment(
-            &args.trust_policy,
-            assurance,
-            config.work_policy.allowed_environment(),
-            crate::identity::assertion_counters()?,
-        )?;
+    let apple_trust = match (&args.trust_store, &args.trust_policy) {
+        (Some(directory), Some(id)) => Some(
+            hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
+                id,
+                assurance,
+                crate::identity::assertion_counters()?,
+            )?,
+        ),
+        (None, None) if assurance == hellas_rpc::Assurance::ProducerSigned => None,
+        _ => anyhow::bail!("Apple providers require --trust-store and --trust-policy"),
+    };
     Ok(PaidWorkOptions {
         config,
         journal_root: args.journal_root.clone(),
         provider: args.provider,
         provider_addrs: args.provider_addrs.clone(),
-        provider_trust,
-        bond: edge_id("--bond", &args.bond)?,
+        apple_trust,
+        assurance,
+        expected_price: args.payment,
         payment_funding: Funding::new(
             coins(&args.payment_coins)?,
             List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
         ),
-        omission_bond: args.omission_bond,
         acceptance_blocks: args.acceptance_blocks,
         terminal_blocks: args.terminal_blocks,
         payment_blocks: args.payment_blocks,
@@ -448,6 +487,7 @@ fn paid_options(args: &RunArgs, assurance: hellas_rpc::Assurance) -> CliResult<P
 
 async fn run_one(
     args: RunArgs,
+    config: WorkConfig,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
     node: hellas_sdk::FullNode,
@@ -456,7 +496,7 @@ async fn run_one(
     let prepared = read_prepared_work_input(&args.prepared_input)?;
     let result = run_paid_work(
         PaidWorkRun {
-            options: paid_options(&args, prepared.assurance()?)?,
+            options: paid_options(&args, config, prepared.assurance()?)?,
             prepared_input: prepared,
             settle: args.settle,
         },
@@ -515,10 +555,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> CliResult<()> {
     }
     hellas_private::write_atomically(path, ".tmp", bytes)
         .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn edge_id(flag: &str, value: &str) -> CliResult<EdgeId> {
-    Ok(EdgeId::from_bytes(fixed_hex(flag, value)?))
 }
 
 fn coins(values: &[String]) -> CliResult<List<CoinId, MAX_PARTY_INPUTS>> {

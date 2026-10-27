@@ -1,38 +1,22 @@
-//! Paid-work configuration: chain identity, routes, execution policy and funding.
-//!
-//! The threshold identity authenticates finalized blocks; the network and genesis
-//! digest detect configuration mismatches. Unknown fields are rejected. Call
-//! `validate_work_routes` before serving to check the configuration against journals.
+//! Paid-provider process configuration. Paid terms live in the node authority.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
 mod error;
 #[cfg(test)]
 mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
-use crate::resource_config::{
-    ExecutionPolicyFile, FetchPolicyFile, parse_digest, parse_fixed_hex, parse_hex,
-};
+use crate::resource_config::{parse_digest, parse_hex};
 use hellas_auth::Digest;
-use hellas_kernel::{
-    EdgeId, EdgeValues, Fees, Key, MIN_OMIT_RESPONSE_BLOCKS, NetworkId, Secp256k1Verifier,
-};
-use hellas_wire::peers::PeerId;
-use hellas_work::model::profile::WorkPolicy;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_work::work_store::{Role, SetupStore, discover_setups};
+use hellas_kernel::NetworkId;
 use serde::Deserialize;
 
 /// Number of distinct validator RPC URLs required by this deployment.
 pub const VALIDATOR_COUNT: usize = 6;
 
-/// Paid-work configuration. Call [`WorkConfig::validate`] after typed construction;
-/// [`load_work_config`] runs the same checks and normalization.
-/// `validate_work_routes` checks agreement with provider journals at startup.
+/// Process-owned chain identity, journal location and observation bounds.
+/// [`WorkConfig::validate`] and [`load_work_config`] run the same checks.
 #[derive(Clone, Debug)]
 pub struct WorkConfig {
     /// The chain this node believes it is configured against.
@@ -41,96 +25,17 @@ pub struct WorkConfig {
     pub validators: Vec<String>,
     /// Directory holding the setup and channel journals.
     pub journal_root: PathBuf,
-    /// Bilateral setup routes, keyed by the authenticated transport peer.
-    pub routes: WorkRoutes,
-    /// Salt of the private credit-policy commitment.
-    pub policy_salt: [u8; 32],
-    /// The credit policy this provider will work under.
-    pub channel_policy: PaidChannelPolicyV1,
-    /// The execution policy this provider will run jobs under.
-    pub work_policy: WorkPolicy,
-    /// Required per-job payment price and block margins.
-    pub payment_policy: JobPaymentPolicyV2,
     /// How often the watcher asks the chain for the next block.
     pub poll: Duration,
     /// Maximum time without new verified finalized progress before admission stops.
     /// Renewal requires an advancing finalized height, so this must also fit
     /// the deployment's block interval, not only the polling interval.
     pub max_observation_age: Duration,
-    /// The payment edge's value, reserve, and close fees as this provider
-    /// requires a client to fund them.
-    pub expected_payment_values: EdgeValues,
-    /// The shortest response window this provider signs terms over.
-    pub min_omit_response_blocks: u64,
-}
-
-/// Maps an authenticated peer to a bond and its client settlement key.
-/// Startup checks the client key against the journal before mounting the route.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorkRoute {
-    /// The transport-authenticated peer allowed to reach this bond.
-    pub peer: PeerId,
-    /// The bond whose provider setup journal this route names.
-    pub bond: EdgeId,
-    /// The settlement key the bond terms must name as taker.
-    pub client: Key,
-}
-
-/// Routes indexed by bond; one authenticated peer may own several distinct bonds.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct WorkRoutes {
-    by_bond: BTreeMap<EdgeId, WorkRoute>,
-}
-
-impl WorkRoutes {
-    /// Checks and indexes typed routes, rejecting every duplicate bond.
-    /// One authenticated peer may have several distinct bonds.
-    pub fn try_from_iter(routes: impl IntoIterator<Item = WorkRoute>) -> Result<Self> {
-        let mut by_bond = BTreeMap::new();
-        for route in routes {
-            if by_bond.insert(route.bond, route).is_some() {
-                return Err(WorkConfigError::DuplicateBond(route.bond));
-            }
-        }
-        Ok(Self { by_bond })
-    }
-
-    /// Returns every configured route in bond order.
-    pub fn iter(&self) -> impl Iterator<Item = &WorkRoute> {
-        self.by_bond.values()
-    }
-
-    /// Returns how many bilateral routes were configured.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_bond.len()
-    }
-
-    /// Returns whether no bilateral route was configured.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_bond.is_empty()
-    }
-
-    fn from_files(files: Vec<WorkRouteFile>) -> Result<Self> {
-        let routes = files
-            .into_iter()
-            .map(|file| {
-                Ok(WorkRoute {
-                    peer: PeerId::from_bytes(parse_fixed_hex("routes[].peer", &file.peer)?),
-                    bond: EdgeId::from_bytes(parse_fixed_hex("routes[].bond", &file.bond)?),
-                    client: Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Self::try_from_iter(routes)
-    }
 }
 
 impl WorkConfig {
-    /// Checks chain identity, policy and timing bounds, and normalizes the six
-    /// distinct WebSocket validator URLs. This is the validation used by
-    /// [`load_work_config`]; journal agreement still requires [`validate_work_routes`].
+    /// Checks chain identity and timing bounds and normalizes the six distinct
+    /// WebSocket validator URLs, as [`load_work_config`] does.
     pub fn validate(mut self) -> Result<Self> {
         self.validators = parse_validators(self.validators)?;
         if self.chain.threshold_identity.is_empty() {
@@ -155,10 +60,6 @@ impl WorkConfig {
                 reason: "must be a path",
             });
         }
-        self.payment_policy.check()?;
-        self.work_policy
-            .check()
-            .map_err(crate::ResourceConfigError::from)?;
         if self.poll.is_zero() {
             return Err(WorkConfigError::Invalid {
                 field: "poll_ms",
@@ -169,13 +70,6 @@ impl WorkConfig {
             return Err(WorkConfigError::Invalid {
                 field: "max_observation_age_ms",
                 reason: "must exceed poll_ms",
-            });
-        }
-        // The kernel refuses shorter windows when opening a payment edge.
-        if self.min_omit_response_blocks < MIN_OMIT_RESPONSE_BLOCKS {
-            return Err(WorkConfigError::ResponseWindow {
-                actual: self.min_omit_response_blocks,
-                minimum: MIN_OMIT_RESPONSE_BLOCKS,
             });
         }
         Ok(self)
@@ -224,20 +118,6 @@ impl WorkConfig {
         }
         Ok(())
     }
-
-    /// Builds the policy used by both provisioning and channel admission.
-    #[must_use]
-    pub fn provider_policy(&self) -> ProviderChannelPolicy {
-        ProviderChannelPolicy {
-            network: self.chain.network,
-            policy_salt: self.policy_salt,
-            channel_policy: self.channel_policy,
-            work_policy: self.work_policy.clone(),
-            payment_policy: self.payment_policy,
-            expected_payment_values: self.expected_payment_values,
-            min_omit_response_blocks: self.min_omit_response_blocks,
-        }
-    }
 }
 
 /// The three fields that say which chain this is.
@@ -253,8 +133,7 @@ pub struct ChainCrossCheck {
     pub genesis: Option<hellas_chain::genesis::Genesis>,
 }
 
-/// Loads configuration, checks chain identity and policy bounds, and normalizes
-/// validator URLs. Route-to-journal validation is deferred until serve startup.
+/// Checks the chain identity and observer bounds and normalizes validator URLs.
 pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
@@ -275,70 +154,16 @@ pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
     })
 }
 
-/// Checks each route against a provider journal under the configured root,
-/// including its bond and client key. Run after provisioning and before serving.
-pub async fn validate_work_routes(config: &WorkConfig) -> Result<()> {
-    if config.routes.is_empty() {
-        return Ok(());
-    }
-    let found = discover_setups(&config.journal_root, config.chain.network)
-        .await
-        .map_err(|source| WorkConfigError::Journal {
-            root: config.journal_root.clone(),
-            source,
-        })?;
-    for route in config.routes.iter() {
-        if !found
-            .setups
-            .iter()
-            .any(|setup| setup.role == Role::Provider && setup.bond_edge == route.bond)
-        {
-            return Err(WorkConfigError::MissingRoute {
-                bond: route.bond,
-                root: config.journal_root.clone(),
-            });
-        }
-        let store = SetupStore::open(
-            &config.journal_root,
-            config.chain.network,
-            route.bond,
-            Role::Provider,
-            &Secp256k1Verifier::new(),
-        )
-        .await
-        .map_err(|source| WorkConfigError::Journal {
-            root: config.journal_root.clone(),
-            source,
-        })?;
-        let Some(bundle) = store.state().bundle() else {
-            return Err(WorkConfigError::MissingProposal(route.bond));
-        };
-        let journal_client = bundle.bond_terms().parties.taker().signer();
-        if journal_client != route.client {
-            return Err(WorkConfigError::WrongClient {
-                bond: route.bond,
-                expected: route.client,
-                actual: journal_client,
-            });
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkConfigFile {
     chain: ChainFile,
     validators: Vec<String>,
     journal: JournalFile,
-    routes: Vec<WorkRouteFile>,
-    policies: PoliciesFile,
     /// How often the watcher asks the chain for the next block.
     poll_ms: u64,
     #[serde(default = "default_observation_age_ms")]
     max_observation_age_ms: u64,
-    expected_payment_values: PaymentValuesFile,
-    min_omit_response_blocks: u64,
 }
 
 fn chain_genesis(
@@ -381,7 +206,6 @@ impl WorkConfigFile {
                 reason: "not a network id",
             });
         };
-        let policies = self.policies.into_policies()?;
         WorkConfig {
             chain: ChainCrossCheck {
                 network,
@@ -397,27 +221,11 @@ impl WorkConfigFile {
             },
             validators: self.validators,
             journal_root: self.journal.root,
-            routes: WorkRoutes::from_files(self.routes)?,
-            policy_salt: policies.0,
-            channel_policy: policies.1,
-            work_policy: policies.2,
-            payment_policy: policies.3,
             poll: Duration::from_millis(self.poll_ms),
             max_observation_age: Duration::from_millis(self.max_observation_age_ms),
-            expected_payment_values: self.expected_payment_values.into_values(),
-            min_omit_response_blocks: self.min_omit_response_blocks,
         }
         .validate()
     }
-}
-
-/// Hex-encoded route fields, parsed before duplicate detection.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkRouteFile {
-    peer: String,
-    bond: String,
-    client: String,
 }
 
 /// Normalizes validator URLs and requires distinct addresses with hosts.
@@ -473,108 +281,6 @@ struct ChainFile {
 #[serde(deny_unknown_fields)]
 struct JournalFile {
     root: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PoliciesFile {
-    policy_salt: String,
-    channel: ChannelPolicyFile,
-    payment: PaymentPolicyFile,
-    execution: Option<ExecutionPolicyFile>,
-    fetch: Option<FetchPolicyFile>,
-}
-
-impl PoliciesFile {
-    fn into_policies(
-        self,
-    ) -> Result<(
-        [u8; 32],
-        PaidChannelPolicyV1,
-        WorkPolicy,
-        JobPaymentPolicyV2,
-    )> {
-        let salt = parse_fixed_hex("policies.policy_salt", &self.policy_salt)?;
-        let payment = self.payment.into_policy();
-        Ok((
-            salt,
-            PaidChannelPolicyV1 {
-                compute_credit_limit: self.channel.compute_credit_limit,
-                delivery_credit_limit: self.channel.delivery_credit_limit,
-            },
-            match (self.execution, self.fetch) {
-                (Some(execution), None) => execution.decode()?.into(),
-                (None, Some(fetch)) => fetch.decode()?,
-                _ => {
-                    return Err(WorkConfigError::Invalid {
-                        field: "policies",
-                        reason: "must select exactly one of execution or fetch",
-                    });
-                }
-            },
-            payment,
-        ))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChannelPolicyFile {
-    compute_credit_limit: u64,
-    delivery_credit_limit: u64,
-}
-
-/// Required funding values and close fees.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PaymentValuesFile {
-    value: u64,
-    reserve: u64,
-    close_fees: CloseFeesFile,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloseFeesFile {
-    base: u64,
-    slot: u64,
-    proof: u64,
-    lifetime: u64,
-}
-
-impl PaymentValuesFile {
-    fn into_values(self) -> EdgeValues {
-        EdgeValues::new(
-            self.value,
-            self.reserve,
-            Fees::new(
-                self.close_fees.base,
-                self.close_fees.slot,
-                self.close_fees.proof,
-                self.close_fees.lifetime,
-            ),
-        )
-    }
-}
-
-/// Required payment fields; absent prices or margins are never defaulted.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PaymentPolicyFile {
-    fixed_price: u64,
-    dispatch_margin_blocks: u64,
-    delivery_margin_blocks: u64,
-    oracle_grace_blocks: u64,
-}
-impl PaymentPolicyFile {
-    fn into_policy(self) -> JobPaymentPolicyV2 {
-        JobPaymentPolicyV2 {
-            fixed_price: self.fixed_price,
-            dispatch_margin_blocks: self.dispatch_margin_blocks,
-            delivery_margin_blocks: self.delivery_margin_blocks,
-            oracle_grace_blocks: self.oracle_grace_blocks,
-        }
-    }
 }
 
 /// Packs typed funding coins without imposing a provider/client funding policy.

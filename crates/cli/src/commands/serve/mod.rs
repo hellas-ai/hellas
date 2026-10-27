@@ -16,10 +16,8 @@ use std::sync::Arc;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
-pub mod provision;
 pub mod work_config;
 
-pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
@@ -128,18 +126,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     // configuration makes. There is no second gate in front of that.
     let mut work_runner = None;
     if let Some(work) = options.work_config.as_ref() {
-        // A configured route is a promise about durable state, so verify all
-        // of them before the endpoint binds or advertises WorkSetup. This is
-        // intentionally later than parsing: provisioning shares the parser
-        // and is the command that may create the journal named here.
-        work_config::validate_work_routes(work).await?;
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
             journal_root = %work.journal_root.display(),
-            routes = work.routes.len(),
             poll_ms = work.poll.as_millis(),
-            min_omit_response_blocks = work.min_omit_response_blocks,
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
             // that can settle nothing, and this is where they find out.
@@ -151,11 +142,9 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
             hellas_sdk::paid_provider::WorkRunnerConfig {
                 network: work.chain.network,
                 journal_root: work.journal_root.clone(),
-                routes: work.routes.clone(),
                 poll: work.poll,
                 max_observation_age: work.max_observation_age,
                 settlement_key: options.settlement_key.clone(),
-                policy: work.provider_policy(),
             },
             chain,
         ));

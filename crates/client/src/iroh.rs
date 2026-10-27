@@ -307,6 +307,83 @@ pub async fn confidential_open<M>(
 where
     M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
 {
+    let (exporter, nonce, peer, response) = request_open::<M>(transport).await?;
+    verify_open_response(
+        trust,
+        &exporter,
+        &nonce,
+        <M::Service as ServiceMarker>::ALPN.as_bytes(),
+        peer,
+        response,
+    )
+}
+
+/// A paid caller selects the transport identity. Apple software approval remains
+/// independently pinned; software providers need no separate enrollment pin.
+pub async fn confidential_open_selected<M>(
+    transport: &IrohTransport,
+    assurance: Assurance,
+    apple: Option<&ProviderTrustAnchor>,
+) -> ClientResult<(ProviderEnrollmentBundle, ProviderTrustAnchor)>
+where
+    M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
+{
+    let (exporter, nonce, peer, response) = request_open::<M>(transport).await?;
+    let bundle = ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis)
+        .map_err(|e| ClientError::source("invalid selected provider enrollment", e))?;
+    let trust = selected_provider_trust(&bundle, assurance, apple)?;
+    verify_open_response(
+        &trust,
+        &exporter,
+        &nonce,
+        <M::Service as ServiceMarker>::ALPN.as_bytes(),
+        peer,
+        response,
+    )?;
+    Ok((bundle, trust))
+}
+
+pub fn selected_provider_trust(
+    bundle: &ProviderEnrollmentBundle,
+    assurance: Assurance,
+    apple: Option<&ProviderTrustAnchor>,
+) -> ClientResult<ProviderTrustAnchor> {
+    let trust = match bundle.genesis.statement.root_kind {
+        RootKind::Software if assurance == Assurance::ProducerSigned => ProviderTrustAnchor {
+            expected_genesis: bundle.content_id(),
+            required_assurance: assurance,
+            allowed_environments: vec![],
+            apple_app_attest: None,
+        },
+        RootKind::Software => {
+            return Err(ClientError::protocol(
+                "Apple assurance requires an attested provider",
+            ));
+        }
+        RootKind::SecureEnclave => {
+            let trust = apple
+                .filter(|trust| trust.apple_app_attest.is_some())
+                .ok_or_else(|| {
+                    ClientError::protocol("Apple provider requires independent software approval")
+                })?;
+            if trust.required_assurance != assurance {
+                return Err(ClientError::protocol(
+                    "Apple approval assurance differs from request",
+                ));
+            }
+            trust.clone()
+        }
+    };
+    trust.verify_enrollment(bundle)?;
+    Ok(trust)
+}
+
+async fn request_open<M>(
+    transport: &IrohTransport,
+) -> ClientResult<([u8; 32], [u8; 32], PeerIdentity, OpenResponse)>
+where
+    M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
+{
     let context = transport.context();
     let exporter = context.open_exporter.ok_or_else(|| {
         ClientError::protocol("live QUIC connection did not expose a confidential-open exporter")
@@ -324,14 +401,7 @@ where
     )
     .await
     .map_err(|status| ClientError::wire("provider declined confidential open", status))?;
-    verify_open_response(
-        trust,
-        &exporter,
-        &nonce,
-        <M::Service as ServiceMarker>::ALPN.as_bytes(),
-        peer,
-        response,
-    )
+    Ok((exporter, nonce, peer, response))
 }
 
 fn verify_open_response(
