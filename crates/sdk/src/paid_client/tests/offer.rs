@@ -132,8 +132,10 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .pin(&trust)
             .unwrap();
         let first_upload = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first_certificate = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let serving = tokio::spawn({
             let first_upload = first_upload.clone();
+            let first_certificate = first_certificate.clone();
             let server = server.clone();
             async move {
                 let mut tasks = tokio::task::JoinSet::new();
@@ -143,6 +145,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                     let producer = producer.clone();
                     let mount = mount.clone();
                     let first_upload = first_upload.clone();
+                    let first_certificate = first_certificate.clone();
                     tasks.spawn(async move {
                         let transport = IrohTransport::new(connection);
                         if index == 3 {
@@ -178,6 +181,10 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                             if inbound.method_id
                                 == hellas_rpc::services::work::UploadContent::METHOD_ID
                                 && first_upload.swap(false, std::sync::atomic::Ordering::SeqCst)
+                                || inbound.method_id
+                                    == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
+                                    && first_certificate
+                                        .swap(false, std::sync::atomic::Ordering::SeqCst)
                             {
                                 let _ = Dispatcher::<IrohTransport>::dispatch(
                                     &WorkServer(crate::work_router::UnmountedWork),
@@ -238,6 +245,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap()
             .unwrap();
         assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             session
                 .with_state(|state| state.proposal_nonce_high_water())

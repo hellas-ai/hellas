@@ -632,7 +632,7 @@ impl PaidWorkSession {
         {
             // A lost acknowledgement never requires fresh admission: these
             // exact certificate bytes are already durable on the client.
-            pay_for_result(dialer.work().await?, client, work_id).await?;
+            pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
         }
         if client.with_state(|state| state.is_closing()).await? {
             return if prepared.is_none() {
@@ -702,7 +702,8 @@ impl PaidWorkSession {
             for recovered in pending {
                 let (work_id, phase, pending) = match recovered {
                     RecoveredJob::Delivered(work_id) => {
-                        pay_for_result(dialer.work().await?, client, work_id).await?;
+                        pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout)
+                            .await?;
                         continue;
                     }
                     RecoveredJob::Unrecoverable(work_id) => {
@@ -856,6 +857,36 @@ async fn propose_when_ready(
         tokio::time::sleep(delay.min(remaining)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(10));
     }
+}
+
+/// A committed certificate remains the same payment when the provider's chain
+/// observation is temporarily unavailable. Both endpoints deduplicate it.
+async fn pay_when_ready(
+    dialer: &ProviderDialer,
+    client: &mut ClientService,
+    work_id: hellas_auth::Digest,
+    poll: Duration,
+    timeout: Duration,
+) -> Result<u64> {
+    tokio::time::timeout(timeout, async {
+        let mut delay = poll.max(Duration::from_secs(1));
+        loop {
+            match pay_for_result(dialer.work().await?, client, work_id).await {
+                Ok(credited) => return Ok(credited),
+                Err(hellas_work::work::PaymentError::Refused { refusal, .. })
+                    if refusal.is_retryable() => {}
+                Err(hellas_work::work::PaymentError::Transport(status))
+                    if status.code() == hellas_wire::WireCode::Unavailable => {}
+                Err(error) => return Err(error.into()),
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(Duration::from_secs(10));
+        }
+    })
+    .await
+    .map_err(|_| PaidClientError::Timeout {
+        stage: "payment acknowledgement",
+    })?
 }
 
 enum JobLookup {
@@ -1026,7 +1057,7 @@ async fn execute_paid_job(
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.paying(work_id)?;
     }
-    let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
+    let credited = pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
     if let Some(purchase) = purchase {
         purchase.paid(work_id)?;
     }
