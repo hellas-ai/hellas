@@ -3,6 +3,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use hellas_auth::{Digest, authority::*};
+use hellas_authority::{
+    node::{NodeCoordinator, SessionKey},
+    work_store::grant::NodeStoreError,
+};
 use hellas_rpc::{
     authentication::session_binding,
     pb::host::*,
@@ -13,10 +17,6 @@ use hellas_rpc::{
 };
 use hellas_wire::{
     Dispatcher, ServiceMarker, StreamTransport, WireCode, WireStatus, iroh::IrohTransport,
-};
-use hellas_work::{
-    node::{NodeCoordinator, SessionKey},
-    work_store::grant::NodeStoreError,
 };
 use iroh::endpoint::Connection;
 use std::{
@@ -43,7 +43,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct NodeControl {
     node: NodeCoordinator,
-    work: Option<hellas_work::grant_service::WorkAdministration>,
+    work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
     local_slots: Arc<Semaphore>,
     remote_capacity: Arc<RemoteCapacity>,
@@ -96,7 +96,7 @@ impl NodeControl {
     }
 
     /// Compose Work control and authentication from one writer, never two node handles.
-    pub fn with_work(work: hellas_work::grant_service::WorkAdministration) -> Self {
+    pub fn with_work(work: hellas_authority::grant_service::WorkAdministration) -> Self {
         let mut control = Self::new(work.node());
         control.work = Some(work);
         control
@@ -371,7 +371,7 @@ where
 async fn serve<T>(
     transport: T,
     node: NodeCoordinator,
-    work: Option<hellas_work::grant_service::WorkAdministration>,
+    work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
     session: AuthenticatedSession,
     binding: Digest,
@@ -432,7 +432,7 @@ impl Drop for CloseConnection {
 
 struct ControlSession {
     node: NodeCoordinator,
-    work: Option<hellas_work::grant_service::WorkAdministration>,
+    work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
     session: AuthenticatedSession,
     binding: Digest,
@@ -460,10 +460,13 @@ impl HostControlHandler for ControlSession {
             .await
             .map_err(node_error)?;
         Ok(InspectAuthorityResponse {
-            reply: encode_bounded(&reply, hellas_work::model::grant::admin::MAX_ADMIN_BYTES)
-                .map_err(|_| {
-                    WireStatus::new(WireCode::ResourceExhausted, "authority reply exceeds limit")
-                })?,
+            reply: encode_bounded(
+                &reply,
+                hellas_authority::model::grant::admin::MAX_ADMIN_BYTES,
+            )
+            .map_err(|_| {
+                WireStatus::new(WireCode::ResourceExhausted, "authority reply exceeds limit")
+            })?,
         })
     }
 
@@ -476,7 +479,7 @@ impl HostControlHandler for ControlSession {
             .host_action(
                 caller,
                 grant_id(&request.authorization)?,
-                hellas_work::node::HOST_STATUS,
+                hellas_authority::node::HOST_STATUS,
                 |status| self.status_reply(status),
             )
             .await
@@ -537,13 +540,16 @@ impl HostControlHandler for ControlSession {
             .execute(caller, grant_id(&request.authorization)?, command)
             .await
             .map_err(node_error)?;
-        let reply = encode_bounded(&result, hellas_work::model::grant::admin::MAX_ADMIN_BYTES)
-            .map_err(|error| match error {
-                BoundedCborError::OutputLimit => {
-                    WireStatus::new(WireCode::ResourceExhausted, "Work reply exceeds limit")
-                }
-                _ => unavailable(),
-            })?;
+        let reply = encode_bounded(
+            &result,
+            hellas_authority::model::grant::admin::MAX_ADMIN_BYTES,
+        )
+        .map_err(|error| match error {
+            BoundedCborError::OutputLimit => {
+                WireStatus::new(WireCode::ResourceExhausted, "Work reply exceeds limit")
+            }
+            _ => unavailable(),
+        })?;
         Ok(WorkControlResponse { reply })
     }
 
@@ -600,7 +606,7 @@ impl HostControlHandler for ControlSession {
             .host_action(
                 caller,
                 authorization,
-                hellas_work::node::HOST_PROVIDER_CONFIGURE,
+                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
                 |_| {
                     if configuration::requires_passkey(&update) {
                         caller.session().step_up().map_err(|_| denied())?;
@@ -618,7 +624,7 @@ impl HostControlHandler for ControlSession {
             .host_action(
                 self.caller().await?,
                 authorization,
-                hellas_work::node::HOST_PROVIDER_CONFIGURE,
+                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
                 |status| self.status_reply(status),
             )
             .await
@@ -656,7 +662,7 @@ impl HostControlHandler for ControlSession {
             .host_action(
                 self.caller().await?,
                 authorization,
-                hellas_work::node::HOST_GATEWAY_ACCESS,
+                hellas_authority::node::HOST_GATEWAY_ACCESS,
                 |_| self.host.as_ref().ok_or_else(unsupported)?.access(),
             )
             .await
@@ -671,7 +677,7 @@ impl HostControlHandler for ControlSession {
             .host_action(
                 self.caller().await?,
                 authorization,
-                hellas_work::node::HOST_GATEWAY_ACCESS,
+                hellas_authority::node::HOST_GATEWAY_ACCESS,
                 |_| GatewayAccess {
                     address,
                     bearer: access.bearer(),
@@ -685,7 +691,7 @@ impl HostControlHandler for ControlSession {
         &self,
         request: BindProviderRequest,
     ) -> Result<BindProviderResponse, WireStatus> {
-        use hellas_work::model::grant::records::{GrantError, MAX_ENROLLMENT_BYTES};
+        use hellas_authority::model::grant::records::{GrantError, MAX_ENROLLMENT_BYTES};
         let caller = self.caller().await?;
         if request.enrollment.len() > MAX_ENROLLMENT_BYTES {
             return Err(invalid());
@@ -718,7 +724,7 @@ impl HostControlHandler for ControlSession {
 impl ControlSession {
     fn status_reply(
         &self,
-        status: hellas_work::node::NodeStatus,
+        status: hellas_authority::node::NodeStatus,
     ) -> Result<HostStatus, WireStatus> {
         let mut reply = HostStatus {
             version: env!("CARGO_PKG_VERSION").into(),
@@ -747,8 +753,8 @@ impl ControlSession {
     ) -> Result<HostStatus, WireStatus> {
         let authorization = grant_id(authorization)?;
         let operation = match service {
-            host::Service::Provider => hellas_work::node::HOST_PROVIDER_CONFIGURE,
-            host::Service::Gateway => hellas_work::node::HOST_GATEWAY_CONFIGURE,
+            host::Service::Provider => hellas_authority::node::HOST_PROVIDER_CONFIGURE,
+            host::Service::Gateway => hellas_authority::node::HOST_GATEWAY_CONFIGURE,
         };
         let receiver = self
             .node
@@ -770,7 +776,7 @@ impl ControlSession {
     }
 }
 
-fn capacity(value: hellas_work::node::MachineCapacity) -> Result<MachineCapacity, WireStatus> {
+fn capacity(value: hellas_authority::node::MachineCapacity) -> Result<MachineCapacity, WireStatus> {
     Ok(MachineCapacity {
         revision: value.revision.0,
         max_in_flight: u32::from(value.max_in_flight.get()),
@@ -789,13 +795,15 @@ fn node_error(error: NodeStoreError) -> WireStatus {
             "stale revision; inspect current metadata before retrying",
         ),
         NodeStoreError::Authority(AuthorityError::Invalid) => invalid(),
-        NodeStoreError::Grant(hellas_work::model::grant::records::GrantError::Revision(_)) => {
+        NodeStoreError::Grant(hellas_authority::model::grant::records::GrantError::Revision(_)) => {
             WireStatus::new(
                 WireCode::FailedPrecondition,
                 "stale Work revision; inspect current metadata before retrying",
             )
         }
-        NodeStoreError::Grant(hellas_work::model::grant::records::GrantError::Limits) => invalid(),
+        NodeStoreError::Grant(hellas_authority::model::grant::records::GrantError::Limits) => {
+            invalid()
+        }
         NodeStoreError::Authority(_) => denied(),
         NodeStoreError::MissingMachine => unsupported(),
         _ => unavailable(),

@@ -46,13 +46,13 @@ async fn local_tls_requires_pinned_application_authentication() {
         } else {
             ROOT.passkey()
         };
-        hellas_work::test_support::assert_err!(connect_local(
+        hellas_channel::test_support::assert_err!(connect_local(
                 &socket,
                 client_config.clone(),
                 "localhost".try_into().unwrap(),
                 expected,
                 &f.secret,
-                hellas_work::node::SessionKey::Passkey(&identity),
+                hellas_authority::node::SessionKey::Passkey(&identity),
             )
             .await, status if status.code() == WireCode::PermissionDenied);
         listener.shutdown().await.unwrap();
@@ -74,7 +74,7 @@ async fn local_control_matches_remote_authority_decisions() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -85,7 +85,7 @@ async fn local_control_matches_remote_authority_decisions() {
         cc,
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -152,7 +152,7 @@ async fn local_control_matches_remote_authority_decisions() {
             &f.node
                 .authenticate_session(
                     &secret,
-                    hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+                    hellas_authority::node::SessionKey::Node(&OPERATOR.node_key()),
                 )
                 .await
                 .unwrap(),
@@ -168,21 +168,21 @@ async fn local_control_matches_remote_authority_decisions() {
         })
         .await
         .unwrap();
-    hellas_work::test_support::assert_err!(
+    hellas_channel::test_support::assert_err!(
         f.node.authenticate(&secret).await,
         NodeStoreError::Authority(AuthorityError::Credential)
     );
 
-    tokio::time::timeout(hellas_work::test_support::WAIT, listener.shutdown())
+    tokio::time::timeout(hellas_authority::test_support::WAIT, listener.shutdown())
         .await
         .unwrap()
         .unwrap();
     assert!(!socket.exists());
-    hellas_work::test_support::assert_err!(local
+    hellas_channel::test_support::assert_err!(local
             .get_host_status(read_request(ROOT_GRANT))
             .await, status if matches!(status.code(), WireCode::Unavailable | WireCode::Internal));
     closer.close(0u32.into(), b"test completed");
-    hellas_work::test_support::assert_err!(tokio::time::timeout(hellas_work::test_support::WAIT, remote_task)
+    hellas_channel::test_support::assert_err!(tokio::time::timeout(hellas_authority::test_support::WAIT, remote_task)
             .await
             .unwrap()
             .unwrap(), status if status.code() == WireCode::Unavailable);
@@ -210,7 +210,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     assert!(!socket.exists());
     hellas_private::restrict_directory(&parent).unwrap();
     std::fs::write(&socket, b"existing file").unwrap();
-    hellas_work::test_support::assert_err!(f.service
+    hellas_channel::test_support::assert_err!(f.service
             .bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
     assert_eq!(std::fs::read(&socket).unwrap(), b"existing file");
     std::fs::remove_file(&socket).unwrap();
@@ -223,10 +223,10 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    hellas_work::test_support::assert_err!(f.service
+    hellas_channel::test_support::assert_err!(f.service
             .bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
     let wait_slots = async |expected| {
-        tokio::time::timeout(hellas_work::test_support::WAIT, async {
+        tokio::time::timeout(hellas_authority::test_support::WAIT, async {
             while f.service.local_slots.available_permits() != expected {
                 tokio::task::yield_now().await;
             }
@@ -243,7 +243,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     wait_slots(0).await;
     let mut extra = hellas_wire::local::connect_stream(&socket).await.unwrap();
     assert_eq!(
-        tokio::time::timeout(hellas_work::test_support::WAIT, extra.read_u8())
+        tokio::time::timeout(hellas_authority::test_support::WAIT, extra.read_u8())
             .await
             .unwrap()
             .unwrap_err()
@@ -257,7 +257,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         cc,
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -280,7 +280,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -297,12 +297,12 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     // If someone replaced the socket path, cleanup must preserve their file.
     std::fs::remove_file(&socket).unwrap();
     std::fs::write(&socket, b"replacement").unwrap();
-    tokio::time::timeout(hellas_work::test_support::WAIT, listener.shutdown())
+    tokio::time::timeout(hellas_authority::test_support::WAIT, listener.shutdown())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
-    hellas_work::test_support::assert_err!(local
+    hellas_channel::test_support::assert_err!(local
             .get_host_status(read_request(ROOT_GRANT))
             .await, status if matches!(status.code(), WireCode::Unavailable | WireCode::Internal));
     assert_eq!(std::fs::read(&socket).unwrap(), b"replacement");
@@ -317,7 +317,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     let mut pending = hellas_wire::local::connect_stream(&socket).await.unwrap();
     wait_slots(MAX_CONNECTIONS - 1).await;
     drop(listener);
-    tokio::time::timeout(hellas_work::test_support::WAIT, pending.read_u8())
+    tokio::time::timeout(hellas_authority::test_support::WAIT, pending.read_u8())
         .await
         .unwrap()
         .unwrap_err();
@@ -342,16 +342,16 @@ async fn tls_twelve_is_refused_before_application_authentication() {
     );
     // A TLS-only refusal closes before even allocating an application challenge.
     // Without this read, the authentication timeout could satisfy the same error assertion.
-    let challenge = hellas_work::test_support::within(async {
+    let challenge = hellas_authority::test_support::within(async {
         client.write_all(&[1]).await?;
         client.flush().await?;
         client.read_u8().await
     })
     .await;
-    hellas_work::test_support::assert_err!(challenge,
+    hellas_channel::test_support::assert_err!(challenge,
         error if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe));
     assert_eq!(
-        hellas_work::test_support::within(task)
+        hellas_authority::test_support::within(task)
             .await
             .unwrap()
             .unwrap_err()
@@ -383,7 +383,7 @@ async fn same_uid_with_pinned_tls_but_no_credential_cannot_dispatch_an_operation
         hellas_wire::local::transport(stream, hellas_wire::mux::Role::Client, context).unwrap();
     let client = HostControlClientImpl::new(transport);
     assert!(
-        hellas_work::test_support::within(client.get_host_status(read_request(ROOT_GRANT)))
+        hellas_authority::test_support::within(client.get_host_status(read_request(ROOT_GRANT)))
             .await
             .is_err()
     );

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_reexecution() {
-    use crate::model::profile::{PreparedWorkInput, WorkContext};
+    use hellas_channel::model::profile::{PreparedWorkInput, WorkContext};
     for (step, expected_state, expected_code) in [
         (0, GrantTerminalState::Released, GrantRefusalCode::Released),
         (
@@ -82,10 +82,10 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                         network: network(),
                         channel: a.channel_id.0,
                         client: hellas_kernel::Key::from_bytes(
-                            *crate::test_support::node_key(1).as_bytes(),
+                            *hellas_channel::test_support::node_key(1).as_bytes(),
                         ),
                         provider: hellas_kernel::Key::from_bytes(
-                            *crate::test_support::node_key(2).as_bytes(),
+                            *hellas_channel::test_support::node_key(2).as_bytes(),
                         ),
                     },
                     work,
@@ -122,7 +122,9 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
         let store = NodeStore::open(
             dir.path(),
             network(),
-            Some(crate::test_support::software_enrollment(2, [2; 32])),
+            Some(hellas_channel::test_support::software_enrollment(
+                2, [2; 32],
+            )),
             UnixMillis(1003),
         )
         .await

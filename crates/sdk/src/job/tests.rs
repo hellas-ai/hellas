@@ -165,11 +165,11 @@ fn typed_job_price_must_round_trip_through_toml() {
 
 #[test]
 fn causal_lm_unsigned_preflight_enforces_generation_identity_and_input_limits() {
-    use hellas_rpc::protocol::artifacts::{BoundTermId, Canonical as _, TextArtifact, TextPolicy};
-    use hellas_work::model::{
+    use hellas_channel::model::{
         profile::WorkPolicy,
         work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest},
     };
+    use hellas_rpc::protocol::artifacts::{BoundTermId, Canonical as _, TextArtifact, TextPolicy};
     let environment = CausalLmEnvironment::new(
         hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([9; 32]), 1),
         "main",
@@ -240,7 +240,7 @@ fn causal_lm_unsigned_preflight_enforces_generation_identity_and_input_limits() 
 
 #[test]
 fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
-    use hellas_work::model::{
+    use hellas_channel::model::{
         fetch::{FetchRoutePolicy, fetch_route_commitment},
         profile::WorkPolicy,
     };

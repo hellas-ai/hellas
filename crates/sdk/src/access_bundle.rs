@@ -10,8 +10,8 @@ use crate::node_control::profile::{self, ClientProfile};
 use hellas_auth::authority::{
     AuthorityId, CredentialId, CredentialSecret, GrantId, NodeKey, PrincipalId, UnixMillis,
 };
+use hellas_authority::model::grant::records::{GrantError, MAX_OFFER_BYTES, SignedOffer};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
-use hellas_work::model::grant::records::{GrantError, MAX_OFFER_BYTES, SignedOffer};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};

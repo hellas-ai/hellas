@@ -1,8 +1,10 @@
 use hellas_auth::authority::{ResourceId, Revision};
-use hellas_work::model::{
-    fetch::{FetchPolicyV2, FetchRoutePolicy, fetch_route_commitment},
-    grant::records::{GrantError, GrantPolicy},
-    profile::WorkPolicy,
+use {
+    hellas_authority::model::grant::records::GrantError,
+    hellas_authority::model::grant::records::GrantPolicy,
+    hellas_channel::model::fetch::FetchPolicyV2, hellas_channel::model::fetch::FetchRoutePolicy,
+    hellas_channel::model::fetch::fetch_route_commitment,
+    hellas_channel::model::profile::WorkPolicy,
 };
 
 pub fn responses_policy(
@@ -11,8 +13,8 @@ pub fn responses_policy(
     revision: Revision,
     service: &str,
     method: &str,
-    responses: hellas_work::model::grant::responses::ResponsesResource,
-    pricing: hellas_work::model::grant::pricing::Pricing,
+    responses: hellas_authority::model::grant::responses::ResponsesResource,
+    pricing: hellas_authority::model::grant::pricing::Pricing,
 ) -> Result<GrantPolicy, GrantError> {
     let route =
         FetchRoutePolicy::sealed_route(service, method).map_err(|_| GrantError::Malformed)?;

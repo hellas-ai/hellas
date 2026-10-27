@@ -1,9 +1,9 @@
 use crate::{commands::CliResult, identity::LocalIdentity};
 use anyhow::Context;
+use hellas_authority::model::grant::grant_network;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
 use hellas_rpc::Assurance;
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTarget, GrantTransport};
-use hellas_work::model::grant::grant_network;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub struct LocalContent {
@@ -31,7 +31,7 @@ pub async fn prepare(
         .context("--local-grant is required")?
         .parse()
         .context("--local-grant must be a 16-byte hexadecimal ID")?;
-    let store = hellas_work::work_store::grant::NodeStore::open(
+    let store = hellas_authority::work_store::grant::NodeStore::open(
         &root.join("provider"),
         grant_network(),
         Some(identity.enrollment.clone()),
@@ -56,7 +56,7 @@ pub async fn prepare(
     let backend = Executor::spawn_configured(executor)
         .await
         .context("start local Work executor")?;
-    let service = hellas_work::grant_service::GrantService::new(
+    let service = hellas_authority::grant_service::GrantService::new(
         store,
         signer.clone(),
         backend,

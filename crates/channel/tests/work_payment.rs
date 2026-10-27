@@ -14,10 +14,22 @@
 //! `paid_work_vectors.rs`. These tests are about the two endpoints and
 //! the wire between them.
 
-use hellas_work::test_support::transport::transport_pair;
+use hellas_channel::test_support::transport::transport_pair;
 use support::temp;
 
 use hellas_auth::Digest;
+use hellas_channel::model::work::{
+    PaymentBindingV1, PrivateRecord as _, payment_binding_digest, signing_hash,
+};
+use hellas_channel::test_support::channel::{
+    CURSOR, PRICE, client, deadlines, payload_at, provider, store_at,
+};
+use hellas_channel::work::{
+    ClientEndpoint, PaymentError, ProviderEndpoint, RunError, WorkRefusal, WorkService,
+    admit_payment,
+};
+use hellas_channel::work_close::FinalizedWork;
+use hellas_channel::work_store::{JobPhase, JobState, Role};
 use hellas_kernel::{
     Decode as _, EarnedCertificate, EdgeId, Encode as _, Secp256k1Signer, TermsHash,
 };
@@ -26,22 +38,12 @@ use hellas_rpc::pb::work::{
     admit_certificate_response::Outcome as AdmitOutcome,
 };
 use hellas_rpc::services::work::WorkClientImpl;
-use hellas_work::model::work::{
-    PaymentBindingV1, PrivateRecord as _, payment_binding_digest, signing_hash,
-};
-use hellas_work::test_support::channel::{
-    CURSOR, PRICE, client, deadlines, payload_at, provider, store_at,
-};
-use hellas_work::work::{
-    ClientEndpoint, PaymentError, ProviderEndpoint, RunError, WorkRefusal, WorkService,
-    admit_payment,
-};
-use hellas_work::work_close::FinalizedWork;
-use hellas_work::work_store::{JobPhase, JobState, Role};
 
 mod support;
 
-use hellas_work::test_support::channel::{accept, checked_job, ready, serve_work as serve, stop};
+use hellas_channel::test_support::channel::{
+    accept, checked_job, ready, serve_work as serve, stop,
+};
 
 // ── Driving the call ──────────────────────────────────────────────────
 
@@ -591,7 +593,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
                     state.jobs().next().is_some(),
                     matches!(
                         state.terminals().next().map(|t| &t.outcome),
-                        Some(hellas_work::work_store::TerminalOutcome::Expired { .. })
+                        Some(hellas_channel::work_store::TerminalOutcome::Expired { .. })
                     ),
                 )
             })
@@ -649,7 +651,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
 
 #[tokio::test]
 async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
-    use hellas_work::work::{ClientChannel as _, ClientService, EndpointError};
+    use hellas_channel::work::{ClientChannel as _, ClientService, EndpointError};
     let fixture = checked_job().await;
     let mut client = ClientService::new(fixture.client);
     let id = fixture.id;
@@ -668,7 +670,7 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
         .observer()
         .observe_ready(
             fixture.ready.clone(),
-            hellas_work::work::ObservationTime::now(),
+            hellas_channel::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
         .await
@@ -688,7 +690,7 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
         .service
         .observe_ready(
             fixture.ready,
-            hellas_work::work::ObservationTime::now(),
+            hellas_channel::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
         .await
@@ -728,8 +730,8 @@ async fn client_close_recovery_does_not_require_new_work_readiness() {
 
 #[tokio::test]
 async fn observed_close_and_payment_have_one_journal_order() {
-    use hellas_work::work::{ClientChannel as _, ClientService, ObservationTime};
-    use hellas_work::work_close::close_start;
+    use hellas_channel::work::{ClientChannel as _, ClientService, ObservationTime};
+    use hellas_channel::work_close::close_start;
     for payment_first in [false, true] {
         let fixture = checked_job().await;
         let mut client = ClientService::new(fixture.client);

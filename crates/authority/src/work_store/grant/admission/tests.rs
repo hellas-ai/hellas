@@ -4,23 +4,21 @@ use crate::model::grant::{
     grant_work_id,
 };
 use crate::test_support::*;
-use crate::work_store::{
-    Applied,
-    grant::{
-        GrantOutcome, NodeStore,
-        state::{Change, Frame},
-    },
-};
 use hellas_auth::Digest;
 use hellas_auth::authority::{AdministrationCommand, GrantCommand};
+use {
+    crate::work_store::grant::GrantOutcome, crate::work_store::grant::NodeStore,
+    crate::work_store::grant::state::Change, crate::work_store::grant::state::Frame,
+    hellas_channel::work_store::Applied,
+};
 
 const ROOT: GrantId = GrantId([0; 16]);
 const CHILD: GrantId = GrantId([236; 16]);
 
 #[tokio::test]
 async fn reserved_checkpoint_space_covers_maximum_metadata() {
-    use crate::model::work::PaidJobResultV1;
     use crate::work_store::grant::{GrantTerminal, SignedResult};
+    use hellas_channel::model::work::PaidJobResultV1;
     use hellas_rpc::{EventCommitment, protocol::value::canonical_dag_cbor};
     let dir = tempfile::tempdir().unwrap();
     let (store, application) = setup(dir.path()).await;
@@ -296,7 +294,7 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
         .state()
         .channel_id(
             a.grant_id,
-            crate::test_support::channel_client(principal(1).0),
+            hellas_channel::test_support::channel_client(principal(1).0),
         )
         .unwrap();
     assert!(store.state().admission(other, work).is_none());
@@ -315,7 +313,7 @@ struct Accepted {
 }
 impl Accepted {
     async fn new() -> Self {
-        use crate::test_support::{actors::FRIEND, ids};
+        use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
         let directory = tempfile::tempdir().unwrap();
         let mut node = Node::bootstrap(directory.path())
             .with_grant(
@@ -486,9 +484,10 @@ async fn checkpoints_require_complete_bound_admission_history() {
             change: |s, work| {
                 let record = &mut s.admissions.get_mut(&work).unwrap().accepted;
                 let mut caller = serde_json::to_value(&record.caller).unwrap();
-                caller["actor"] =
-                    serde_json::to_value(crate::test_support::actors::STRANGER.principal())
-                        .unwrap();
+                caller["actor"] = serde_json::to_value(
+                    hellas_channel::test_support::actors::STRANGER.principal(),
+                )
+                .unwrap();
                 record.caller = serde_json::from_value(caller).unwrap();
             },
         },
@@ -512,7 +511,7 @@ async fn a_checkpoint_cannot_omit_dispatch_evidence_for_running_work() {
     fixture
         .node
         .dispatch(
-            crate::test_support::actors::FRIEND,
+            hellas_channel::test_support::actors::FRIEND,
             crate::test_support::ids::FRIEND_GRANT,
             &fixture.request,
         )

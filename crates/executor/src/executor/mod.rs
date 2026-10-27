@@ -27,9 +27,10 @@ pub struct ExecuteOutcome {
 pub(crate) enum ExecutorOwedRequest {
     RunPaidFetch {
         span: tracing::Span,
-        input:
-            Box<hellas_work::work::PreparedFetchInput<hellas_work::work::admission::AdmittedWork>>,
-        progress: Option<hellas_work::work::PaidProgress>,
+        input: Box<
+            hellas_channel::work::PreparedFetchInput<hellas_channel::work::admission::AdmittedWork>,
+        >,
+        progress: Option<hellas_channel::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,
     },
     /// Start one already-authorized paid job.
@@ -40,7 +41,9 @@ pub(crate) enum ExecutorOwedRequest {
     RunPaidEvaluate {
         span: tracing::Span,
         input: Box<
-            hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
+            hellas_channel::work::PreparedEvaluateInput<
+                hellas_channel::work::admission::AdmittedWork,
+            >,
         >,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },

@@ -1,6 +1,6 @@
 [package]
-name = "hellas-work"
-description = "Durable paid-work orchestration for Hellas endpoints"
+name = "hellas-channel"
+description = "Durable channel orchestration, funding and journals"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,12 +14,9 @@ test-support = ["dep:bytes", "hellas-auth/test-support", "hellas-wire/mux"]
 async-stream.workspace = true
 async-trait = "0.1"
 base64.workspace = true
-brotli = "9"
 bytes = { workspace = true, optional = true }
-flate2 = "1"
 futures.workspace = true
 getrandom = "0.4"
-hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }
 hellas-private.workspace = true
@@ -43,6 +40,6 @@ url = "2"
 
 [dev-dependencies]
 bytes.workspace = true
+hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-wire = { workspace = true, features = ["mux"] }
-hellas-work = { workspace = true, features = ["test-support"] }
 proptest = "1.11"

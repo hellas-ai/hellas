@@ -366,7 +366,7 @@ mod tests {
             Digest,
             authority::{AuthorityError, PasskeyAssertion},
         };
-        use hellas_work::authenticator::{Authenticator, PublicKey, kernel_auth};
+        use hellas_authority::authenticator::{Authenticator, PublicKey, kernel_auth};
         struct NativePrompt(hellas_kernel::SoftPasskey);
         #[async_trait::async_trait]
         impl Authenticator for NativePrompt {

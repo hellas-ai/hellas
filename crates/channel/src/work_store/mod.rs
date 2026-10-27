@@ -42,7 +42,7 @@ pub enum WorkStoreError {
 
 /// Whether applying a record changed anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Applied {
+pub enum Applied {
     /// The state moved, so the record must be journaled.
     Changed,
     /// The state already held exactly this. Nothing is written, and the

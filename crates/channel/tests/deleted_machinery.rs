@@ -33,9 +33,11 @@ const DELETED: &[&str] = &[
 #[test]
 fn the_deleted_machinery_is_named_nowhere_in_production_source() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let authority_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../authority/src");
     let rpc_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rpc/src");
     let mut offenders = Vec::new();
     scan(&src, &mut offenders);
+    scan(&authority_src, &mut offenders);
     scan(&rpc_src, &mut offenders);
     assert!(
         offenders.is_empty(),

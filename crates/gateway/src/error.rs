@@ -19,7 +19,7 @@ pub enum GatewayError {
         cleanup: crate::WorkShutdownError,
     },
     #[error(transparent)]
-    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
+    Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("gateway task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error("gateway I/O failed")]

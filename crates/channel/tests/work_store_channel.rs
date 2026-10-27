@@ -6,13 +6,26 @@
 //! assertions are about the second process — never about what the first
 //! one intended.
 
-use hellas_work::test_support::channel::{
+use hellas_channel::test_support::channel::{
     client, identity_artifact, manifest, network, payload_at, prompt_tokens, provider,
     text_execution, text_policy, transcript_for as transcript_of,
 };
 
 use hellas_auth::Digest;
 use hellas_auth::PublicKey;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::work::{
+    PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
+    PaymentBindingV1, PrivateRecord as _, decode_transcript, encode_transcript, next_payment,
+    payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
+    terminal_result, work_id,
+};
+use hellas_channel::work_store::channel::funding::{Clock, FinalizedHeight};
+use hellas_channel::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
+use hellas_channel::work_store::{
+    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
+    TerminalOutcome, WorkStoreError,
+};
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, Parties, Party,
     PartyAuth, PartyKeys, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash,
@@ -20,19 +33,6 @@ use hellas_kernel::{
 };
 use hellas_rpc::protocol::artifacts::InputAddressed as _;
 use hellas_rpc::{Evaluate, EvaluateRequest, OutputEventEnvelope};
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::work::{
-    PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
-    PaymentBindingV1, PrivateRecord as _, decode_transcript, encode_transcript, next_payment,
-    payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
-    terminal_result, work_id,
-};
-use hellas_work::work_store::channel::funding::{Clock, FinalizedHeight};
-use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
-use hellas_work::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome, WorkStoreError,
-};
 
 mod support;
 use support::temp;
@@ -54,11 +54,11 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 }
 
 const fn limits(compute: u64, delivery: u64) -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(compute, delivery)
+    hellas_channel::test_support::channel::credit_policy(compute, delivery)
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
@@ -70,7 +70,7 @@ fn bond_terms() -> WorkStakeBondTerms {
 }
 
 fn terms_for(policy: PaidChannelPolicyV1) -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         EdgeId::from_bytes([0xb0; 32]),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &policy),
@@ -150,7 +150,7 @@ fn payload(digest: Digest) -> PayloadHash {
 fn evaluate_request(nonce: u64) -> EvaluateRequest {
     let mut bytes = [0x77; 32];
     bytes[..8].copy_from_slice(&nonce.to_be_bytes());
-    hellas_work::test_support::channel::evaluate_request_for(
+    hellas_channel::test_support::channel::evaluate_request_for(
         text_execution().input_id().digest(),
         PublicKey::Secp256k1(client().party_key().to_bytes()),
         manifest().content_id(),
@@ -1204,7 +1204,7 @@ async fn every_provider_write_boundary_recovers_to_one_state() {
             state
                 .jobs()
                 .next()
-                .map(hellas_work::work_store::JobState::phase),
+                .map(hellas_channel::work_store::JobState::phase),
             phase,
             "phase after {} records",
             index + 1
@@ -2201,7 +2201,7 @@ async fn a_result_needs_the_marker_that_says_the_backend_was_called() {
             .state()
             .jobs()
             .next()
-            .map(hellas_work::work_store::JobState::phase),
+            .map(hellas_channel::work_store::JobState::phase),
         Some(JobPhase::Accepted)
     );
 }
@@ -2400,7 +2400,7 @@ async fn a_retained_close_start_admits_no_further_work() {
     commit_all(&mut store, &provider_sequence(&channel, &paid).await).await;
     assert_eq!(store.state().max_executable_certificate(), PRICE);
 
-    let Ok(start) = hellas_work::work_close::close_start(
+    let Ok(start) = hellas_channel::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
         RECEIPT_HEIGHT,
@@ -2676,7 +2676,7 @@ async fn one_contest_admits_one_answer() {
     // The one answer those two derive.
     let answer = ChannelRecord::CloseResponded {
         start_id,
-        response_digest: hellas_work::work_close::response_body_digest(
+        response_digest: hellas_channel::work_close::response_body_digest(
             &channel,
             start_id,
             &job.certificate,
@@ -2757,7 +2757,7 @@ async fn one_contest_admits_one_answer() {
             .commit(
                 ChannelRecord::CloseResponded {
                     start_id,
-                    response_digest: hellas_work::work_close::response_body_digest(
+                    response_digest: hellas_channel::work_close::response_body_digest(
                         &channel,
                         start_id,
                         &job.certificate,
@@ -2876,7 +2876,7 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
             },
             ChannelRecord::CloseResponded {
                 start_id,
-                response_digest: hellas_work::work_close::response_body_digest(
+                response_digest: hellas_channel::work_close::response_body_digest(
                     &channel,
                     start_id,
                     &job.certificate,
@@ -3071,7 +3071,7 @@ async fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
 /// the number of blocks read.
 #[tokio::test]
 async fn a_duty_survives_repeated_rotation() {
-    use hellas_work::work_store::journal::{MAX_ACTIVE_FRAMES, MAX_ACTIVE_JOURNAL_BYTES};
+    use hellas_channel::work_store::journal::{MAX_ACTIVE_FRAMES, MAX_ACTIVE_JOURNAL_BYTES};
 
     let dir = temp();
     let expected = {
@@ -3094,7 +3094,7 @@ async fn a_duty_survives_repeated_rotation() {
         store.state().clone()
     };
 
-    let bytes: u64 = hellas_work::test_support::all_files(dir.path())
+    let bytes: u64 = hellas_channel::test_support::all_files(dir.path())
         .iter()
         .map(|path| std::fs::metadata(path).unwrap().len())
         .sum();

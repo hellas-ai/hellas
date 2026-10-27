@@ -1,6 +1,5 @@
 //! Canonical field adapters; journal records contain commitments, never bodies.
 use crate::model::grant::records::check_grant_provider;
-use crate::model::work::PrivateRecord;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 pub(super) mod optional_provider {
     use super::*;
@@ -30,15 +29,7 @@ pub(super) mod optional_provider {
             .transpose()
     }
 }
-pub(super) mod record {
-    use super::*;
-    pub fn serialize<T: PrivateRecord, S: Serializer>(value: &T, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(&value.encode())
-    }
-    pub fn deserialize<'de, T: PrivateRecord, D: Deserializer<'de>>(d: D) -> Result<T, D::Error> {
-        T::decode(&serde_bytes::ByteBuf::deserialize(d)?).map_err(D::Error::custom)
-    }
-}
+
 pub(super) mod entries {
     use super::*;
     use std::collections::BTreeMap;
@@ -63,3 +54,5 @@ pub(super) mod entries {
         Ok(entries.into_iter().collect())
     }
 }
+
+pub(super) use hellas_channel::work_store::grant::codec::record;

@@ -1876,7 +1876,7 @@ pub struct PreparedEvaluateInput<A = WorkAdmission> {
 }
 
 impl PreparedEvaluateInput {
-    pub(crate) fn admitted(parts: PreparedPaidInputParts, admission: WorkAdmission) -> Self {
+    pub fn admitted(parts: PreparedPaidInputParts, admission: WorkAdmission) -> Self {
         Self { parts, admission }
     }
     pub async fn reserve(
@@ -1932,7 +1932,7 @@ impl PreparedFetchInput {
             admission: WorkAdmission::payment(),
         }
     }
-    pub(crate) fn admitted(
+    pub fn admitted(
         parts: PreparedPaidFetchInputParts,
         policy: FetchPolicyV2,
         admission: WorkAdmission,

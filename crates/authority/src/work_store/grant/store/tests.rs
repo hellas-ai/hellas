@@ -36,18 +36,18 @@ async fn a_poisoned_writer_refuses_new_acceptance_until_reopen() {
     let (first, signature, input) = proposal(&store, 1);
     assert_err!(
         accept(&mut store, &caller, (first, signature, &input), 1000).await,
-        NodeStoreError::Journal(crate::work_store::journal::JournalError::Sqlx(_))
+        NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Sqlx(_))
     );
     let (next, signature, input) = proposal(&store, 2);
     assert_err!(
         accept(&mut store, &caller, (next, signature, &input), 1000).await,
-        NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+        NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
     );
     assert_eq!(store.state(), &before);
     drop(store);
     let mut store = NodeStore::open(
         directory.path(),
-        crate::test_support::network(),
+        hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
     )

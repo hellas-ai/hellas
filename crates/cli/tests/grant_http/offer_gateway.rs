@@ -1,6 +1,6 @@
 use super::*;
-use hellas_work::model::grant::records::decode_enrollment;
-use hellas_work::test_support::actors::{FRIEND, ROOT};
+use hellas_authority::model::grant::records::decode_enrollment;
+use hellas_channel::test_support::actors::{FRIEND, ROOT};
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -15,7 +15,7 @@ struct OfferHost {
     reader: hellas_auth::authority::GrantSpec,
     reader_grant: GrantId,
     root_grant: GrantId,
-    signed_offer: hellas_work::model::grant::records::SignedOffer,
+    signed_offer: hellas_authority::model::grant::records::SignedOffer,
     offer: PathBuf,
     id: GrantId,
     work_profile: PathBuf,
@@ -46,7 +46,7 @@ impl OfferHost {
                     hex::encode(provider.principal().as_bytes())
                 ))
                 .join("provider"),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
         )
@@ -75,7 +75,7 @@ impl OfferHost {
         provider
             .run(&["contact", "import", string(&contact), "--name", "client"])
             .await;
-        let grantee = hellas_work::model::grant::records::decode_contact_card(
+        let grantee = hellas_authority::model::grant::records::decode_contact_card(
             &std::fs::read(&contact).unwrap(),
         )
         .unwrap()
@@ -83,20 +83,20 @@ impl OfferHost {
         reader.subject = grantee;
         reader.permissions = [hellas_auth::authority::Permission {
             operation: hellas_auth::authority::OperationId::new(
-                hellas_work::work_store::grant::WORK_ALLOWANCE_READ,
+                hellas_authority::work_store::grant::WORK_ALLOWANCE_READ,
             )
             .unwrap(),
-            resource: hellas_work::node::machine_resource(authority),
+            resource: hellas_authority::node::machine_resource(authority),
         }]
         .into();
         reader.issuance = None;
         let reader_grant = GrantId([4; 16]);
-        let coordinator = hellas_work::node::NodeCoordinator::new(
+        let coordinator = hellas_authority::node::NodeCoordinator::new(
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        let caller = hellas_work::test_support::session(&coordinator, &app_secret).await;
-        let (_, client_secret) = hellas_work::test_support::credentials::issue_one(
+        let caller = hellas_authority::test_support::session(&coordinator, &app_secret).await;
+        let (_, client_secret) = hellas_authority::test_support::credentials::issue_one(
             &coordinator,
             &caller,
             root_grant,
@@ -208,7 +208,7 @@ impl OfferHost {
             ])
             .await;
         assert!(exported_offer.status.success());
-        let signed_offer = hellas_work::model::grant::records::SignedOffer::decode(
+        let signed_offer = hellas_authority::model::grant::records::SignedOffer::decode(
             &std::fs::read(&offer).unwrap(),
             hellas_auth::authority::UnixMillis(0),
         )
@@ -480,7 +480,7 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let mut stream = response.bytes_stream();
-    let first = tokio::time::timeout(hellas_work::test_support::WAIT, stream.next())
+    let first = tokio::time::timeout(hellas_authority::test_support::WAIT, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -504,14 +504,15 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     let authority = AuthorityId(Digest::hash(b"CLI controlled HTTP authority"));
     let now = UnixMillis::now().unwrap_or_default();
     let validity = (now, UnixMillis(now.0 + 600_000));
-    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
-        .unwrap()
-        .permission(authority, None)
-        .unwrap();
+    let permission =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+            .unwrap()
+            .permission(authority, None)
+            .unwrap();
     let administrator = common_node::admin_spec(
         authority,
         subject,
-        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
         validity,
         (600_000, 0),
         &[],
@@ -527,9 +528,9 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     };
     let journal = root.join("controlled-authority");
     let root_grant = GrantId([0; 16]);
-    let (store, admin_secret) = hellas_work::work_store::grant::NodeStore::bootstrap(
+    let (store, admin_secret) = hellas_authority::work_store::grant::NodeStore::bootstrap(
         &journal,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
             Ownership::Bootstrap {
@@ -543,12 +544,12 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     )
     .await
     .unwrap();
-    let coordinator = hellas_work::node::NodeCoordinator::new(
+    let coordinator = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
-    let caller = hellas_work::test_support::session(&coordinator, &admin_secret).await;
-    let (_, own) = hellas_work::test_support::credentials::issue_one(
+    let caller = hellas_authority::test_support::session(&coordinator, &admin_secret).await;
+    let (_, own) = hellas_authority::test_support::credentials::issue_one(
         &coordinator,
         &caller,
         root_grant,
@@ -712,8 +713,9 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         authority,
         subject: host.client.principal(),
         permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(authority, host.id),
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(authority, host.id),
         }]
         .into(),
         not_before: now,

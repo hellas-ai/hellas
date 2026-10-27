@@ -113,7 +113,7 @@ A provider route file contains a `routes` array. Each route has `service`,
 `method`, `destination` and optional `capabilities` (model and output limits).
 The former `callers` field is rejected; the mounted Work channel authorizes jobs.
 Use `serve --fetch-config FILE --work-config FILE` to mount paid execution.
-See [paid Work](crates/work/README.md) for channel configuration and
+See [paid Work](crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
 
 ## HTTP gateway
@@ -270,7 +270,7 @@ Nix expression or in the store. In particular, never interpolate the file as a
 Nix path and never use `builtins.readFile` on it: both operations expose its
 contents during evaluation, before any module assertion or runtime validation
 can protect it. Paid Fetch uses metadata-only journals; see
-[provider retention](crates/work/README.md).
+[provider retention](crates/channel/README.md).
 
 On Darwin, the Home Manager launch agent remains network-only but supports the
 same runtime-secret boundary:

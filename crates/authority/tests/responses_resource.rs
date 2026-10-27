@@ -1,4 +1,4 @@
-use hellas_work::model::grant::{resource::TemplateError, responses::*};
+use hellas_authority::model::grant::{resource::TemplateError, responses::*};
 use serde_json::{Value, json};
 
 fn resource() -> ResponsesResource {

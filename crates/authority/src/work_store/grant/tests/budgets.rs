@@ -183,7 +183,7 @@ struct DeepBudget {
 }
 impl DeepBudget {
     fn new() -> Self {
-        use crate::test_support::actors::*;
+        use hellas_channel::test_support::actors::*;
         let mut ledger = Ledger::default();
         ledger.configure_machine(vec![], 256).unwrap();
         for definition in common_node::budgets(common_node::POOL, ROOT.principal(), vec![], 256) {
@@ -233,7 +233,7 @@ fn a_ninth_subject_exceeds_the_budget_ancestry_limit() {
         tree.ledger.configure_budget(BudgetDef {
             node: BudgetNode::Subject {
                 pool: common_node::POOL,
-                subject: crate::test_support::actors::ATTACKER.principal()
+                subject: hellas_channel::test_support::actors::ATTACKER.principal()
             },
             parent: tree.leaf,
             revision: Revision(1),

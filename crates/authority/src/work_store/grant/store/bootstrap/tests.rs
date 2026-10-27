@@ -337,7 +337,9 @@ async fn the_identity_lock_excludes_another_writer_across_rotation() {
     for _ in 0..2 {
         assert_err!(
             NodeStore::open(directory.path(), network(), None, UnixMillis(1)).await,
-            NodeStoreError::Journal(crate::work_store::journal::JournalError::Locked { .. })
+            NodeStoreError::Journal(
+                hellas_channel::work_store::journal::JournalError::Locked { .. }
+            )
         );
         store.rotate().await.unwrap();
     }
@@ -378,7 +380,8 @@ async fn damaged_initialization_never_opens_as_empty() {
     ] {
         let directory = tempfile::tempdir().unwrap();
         drop(bootstrap(directory.path()).await);
-        let journal = crate::work_store::journal::Journal::path(directory.path(), "grants");
+        let journal =
+            hellas_channel::work_store::journal::Journal::path(directory.path(), "grants");
         match damage {
             Damage::MissingMarker => std::fs::remove_file(directory.path().join(MARKER)).unwrap(),
             Damage::MissingJournal => std::fs::remove_file(&journal).unwrap(),
@@ -391,7 +394,9 @@ async fn damaged_initialization_never_opens_as_empty() {
             Damage::MissingMarker => assert_err!(result, NodeStoreError::Uninitialized),
             Damage::MissingJournal => assert_err!(
                 result,
-                NodeStoreError::Journal(crate::work_store::journal::JournalError::Missing { .. })
+                NodeStoreError::Journal(
+                    hellas_channel::work_store::journal::JournalError::Missing { .. }
+                )
             ),
             Damage::CorruptMarker => assert_err!(result, NodeStoreError::Malformed),
         }
@@ -444,7 +449,7 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
     let (store, _secret) = bootstrap(directory.path()).await;
     assert_err!(
         recover(Revision(1)).await,
-        NodeStoreError::Journal(crate::work_store::journal::JournalError::Locked { .. })
+        NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Locked { .. })
     );
     let before = store.state().clone();
     drop(store);
@@ -641,7 +646,7 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         Ok(())
     );
     // Scanned while held, so the WAL is still beside the database.
-    for path in crate::test_support::all_files(&directory.path().join("journals")) {
+    for path in hellas_channel::test_support::all_files(&directory.path().join("journals")) {
         let bytes = std::fs::read(path).unwrap();
         for secret in [&original, &replacement_secret] {
             assert!(
@@ -669,7 +674,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     {
         let (_lock, _) = read_marker(directory.path(), network()).unwrap();
         let snapshot = inspection_snapshot(directory.path()).unwrap();
-        for path in crate::test_support::all_files(snapshot.path()) {
+        for path in hellas_channel::test_support::all_files(snapshot.path()) {
             assert!(hellas_private::is_private(&std::fs::File::open(path).unwrap()).unwrap());
         }
         #[cfg(unix)]
@@ -684,7 +689,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
                     0o700
                 );
             }
-            for path in crate::test_support::all_files(snapshot.path()) {
+            for path in hellas_channel::test_support::all_files(snapshot.path()) {
                 assert_eq!(
                     std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
                     0o600
@@ -744,7 +749,7 @@ async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt(
 }
 
 fn inspection_files(directory: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    crate::test_support::all_files(directory)
+    hellas_channel::test_support::all_files(directory)
         .into_iter()
         .map(|path| {
             (

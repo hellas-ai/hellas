@@ -67,7 +67,7 @@ impl PaidGatewayOptions {
 pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
-        hellas_work::work_store::journal::MAX_RECORD_BYTES,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
     )
     .map_err(|source| PoolError::Read {
         path: path.into(),

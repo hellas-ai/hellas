@@ -409,7 +409,7 @@ fn read_marker(
 }
 
 fn restore_replay(
-    replay: crate::work_store::journal::Replay,
+    replay: hellas_channel::work_store::journal::Replay,
     network: NetworkId,
     authority_id: AuthorityId,
 ) -> Result<State, NodeStoreError> {
@@ -467,9 +467,9 @@ impl Marker {
 fn lock(file: File, path: &Path) -> Result<IdentityLock, NodeStoreError> {
     match file.try_lock() {
         Ok(()) => Ok(IdentityLock(file)),
-        Err(TryLockError::WouldBlock) => {
-            Err(crate::work_store::journal::JournalError::Locked { path: path.into() }.into())
-        }
+        Err(TryLockError::WouldBlock) => Err(
+            hellas_channel::work_store::journal::JournalError::Locked { path: path.into() }.into(),
+        ),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
 }

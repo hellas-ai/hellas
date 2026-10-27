@@ -1,5 +1,5 @@
+use hellas_authority::model::grant::records::decode_contact_card;
 use hellas_chain::genesis::{FaucetAccount, HELLAS_DEVNET_1_FAUCET_JSON};
-use hellas_work::model::grant::records::decode_contact_card;
 use std::process::Command;
 
 #[test]

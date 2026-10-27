@@ -1,7 +1,9 @@
 //! Canonical native Evaluate input for CPU-only service tests.
 use super::*;
-use crate::model::prepared_input::PreparedPaidInputV1;
-use crate::model::work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest};
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, generation_policy_digest, identity_source_digest,
+};
 use hellas_rpc::protocol::artifacts::*;
 
 pub struct Evaluate {

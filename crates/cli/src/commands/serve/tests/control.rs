@@ -2,12 +2,12 @@ use super::super::*;
 use crate::commands::admin::{AdminArgs, AdminCommand, OfflineArgs};
 use crate::identity::LocalIdentity;
 use hellas_auth::{Digest, authority as auth};
-use hellas_rpc::Assurance;
-use hellas_sdk::{grant_config::GrantConfig, node_control};
-use hellas_work::{
+use hellas_authority::{
     node::{HOST_STATUS, WORK_CAPACITY_CONFIGURE, host_resource, machine_resource},
     test_support::{WAIT, common_node, ids},
 };
+use hellas_rpc::Assurance;
+use hellas_sdk::{grant_config::GrantConfig, node_control};
 use std::path::Path;
 const ROOT_GRANT: auth::GrantId = ids::ROOT_GRANT;
 const READER_GRANT: auth::GrantId = ids::FRIEND_GRANT;
@@ -65,7 +65,7 @@ async fn run(
         identity,
         passkey
             .as_ref()
-            .map(|key| key as &dyn hellas_work::authenticator::Authenticator),
+            .map(|key| key as &dyn hellas_authority::authenticator::Authenticator),
     )
     .await
 }
@@ -273,7 +273,7 @@ impl Daemon {
             name,
             profile.authority,
             &profile.credential,
-            hellas_sdk::work::node::SessionKey::Node(&self.identity.node_key),
+            hellas_authority::node::SessionKey::Node(&self.identity.node_key),
         )
         .await
         .unwrap()
@@ -346,10 +346,10 @@ impl Daemon {
             .unwrap();
         assert!(!self.socket.exists(), "shutdown removes the control socket");
     }
-    async fn store(&self) -> hellas_work::work_store::grant::NodeStore {
-        hellas_work::work_store::grant::NodeStore::open(
+    async fn store(&self) -> hellas_authority::work_store::grant::NodeStore {
+        hellas_authority::work_store::grant::NodeStore::open(
             &self.journal,
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             Some(self.provider_identity.enrollment.clone()),
             auth::UnixMillis::now().unwrap_or_default(),
         )
@@ -392,9 +392,9 @@ async fn online_admin_requires_an_explicit_profile() {
 async fn local_capacity_command_reaches_the_running_host() {
     let mut daemon = Daemon::start().await;
     let limits = daemon.root.path().join("machine-limits.json");
-    let budget = vec![hellas_work::model::grant::budget::Limit {
-        meter: hellas_work::model::grant::budget::Meter::Requests,
-        window: hellas_work::model::grant::budget::Window::Total,
+    let budget = vec![hellas_authority::model::grant::budget::Limit {
+        meter: hellas_authority::model::grant::budget::Meter::Requests,
+        window: hellas_authority::model::grant::budget::Window::Total,
         amount: 7,
     }];
     std::fs::write(&limits, serde_json::to_vec(&budget).unwrap()).unwrap();
@@ -420,7 +420,7 @@ async fn local_capacity_command_reaches_the_running_host() {
     assert_eq!(machine.max_in_flight, 3);
     assert_eq!(
         hellas_rpc::protocol::value::decode_dag_cbor::<
-            Vec<hellas_work::model::grant::budget::Limit>,
+            Vec<hellas_authority::model::grant::budget::Limit>,
         >(&machine.limits)
         .unwrap(),
         budget
@@ -492,7 +492,7 @@ async fn refused_issuance_retains_an_exact_pending_credential_without_granting_a
     let mut invalid: auth::GrantSpec =
         serde_json::from_slice(&std::fs::read(scope).unwrap()).unwrap();
     invalid.permissions = [auth::Permission {
-        operation: auth::OperationId::new(hellas_work::node::HOST_STATUS).unwrap(),
+        operation: auth::OperationId::new(hellas_authority::node::HOST_STATUS).unwrap(),
         resource: auth::ResourceId(hellas_auth::Digest::hash(b"another host")),
     }]
     .into();
@@ -620,14 +620,15 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let (passkey_file, owner) = passkey(root.path(), "operator.passkey", 0x33);
     let authority = auth::AuthorityId(Digest::hash(b"gateway bearer fixture"));
     let now = auth::UnixMillis::now().unwrap_or_default();
-    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
-        .unwrap()
-        .permission(authority, None)
-        .unwrap();
+    let permission =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+            .unwrap()
+            .permission(authority, None)
+            .unwrap();
     let administrator = common_node::admin_spec(
         authority,
         owner,
-        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
         (now, auth::UnixMillis(now.0 + 3_600_000)),
         (3_600_000, 0),
         &[],
@@ -673,9 +674,9 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let admin = node_control::profile::read_credential(&admin_out).unwrap();
     let bearer = node_control::profile::read_credential(&bearer_out).unwrap();
     assert_ne!(admin.id(), bearer.id());
-    let store = hellas_work::work_store::grant::NodeStore::open(
+    let store = hellas_authority::work_store::grant::NodeStore::open(
         &journal,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         None,
         now,
     )
@@ -690,7 +691,7 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
             .holder(),
         auth::CredentialHolder::Bearer
     );
-    let node = hellas_work::node::NodeCoordinator::new(store, Arc::new(move || now));
+    let node = hellas_authority::node::NodeCoordinator::new(store, Arc::new(move || now));
     // The bearer authenticates by its secret alone, for gateway.invoke only;
     // the device-held bootstrap credential does not.
     let caller = node.authenticate(&bearer).await.unwrap();

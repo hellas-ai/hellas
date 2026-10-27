@@ -3,7 +3,9 @@ members = [
     "crates/adaptors",
     "crates/attestation",
     "crates/auth",
+    "crates/authority",
     "crates/chain",
+    "crates/channel",
     "crates/cli",
     "crates/client",
     "crates/cloud",
@@ -20,7 +22,6 @@ members = [
     "crates/store",
     "crates/webauthn",
     "crates/wire",
-    "crates/work",
     "crates/xet",
 ]
 default-members = ["crates/cli"]
@@ -62,7 +63,9 @@ futures-core = "0.3"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
 hellas-auth = { path = "crates/auth", default-features = false }
+hellas-authority = { path = "crates/authority", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
+hellas-channel = { path = "crates/channel", default-features = false }
 hellas-client = { path = "crates/client", default-features = false }
 hellas-cloud = { path = "crates/cloud", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
@@ -78,7 +81,6 @@ hellas-sdk = { path = "crates/sdk", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }
 hellas-webauthn = { path = "crates/webauthn", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
-hellas-work = { path = "crates/work", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 iroh = { version = "1", default-features = false }

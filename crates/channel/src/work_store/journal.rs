@@ -383,7 +383,7 @@ impl Journal {
 
     /// Authority checks cannot use cached state after an ambiguous append
     /// or rotation, including cancellation before an error could be returned.
-    pub(crate) fn check_authority(&self) -> Result<(), JournalError> {
+    pub fn check_authority(&self) -> Result<(), JournalError> {
         if self.poisoned || self.connection.is_none() {
             return Err(JournalError::Poisoned);
         }
@@ -392,7 +392,7 @@ impl Journal {
 
     /// Closes the database and ends ownership, so the host can reopen and
     /// replay it. Every later call is refused like a poisoned handle.
-    pub(crate) async fn close(&mut self) {
+    pub async fn close(&mut self) {
         if let Some(connection) = self.connection.take() {
             let _ = connection.close().await;
         }
@@ -579,3 +579,7 @@ async fn read_records(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod test_support;

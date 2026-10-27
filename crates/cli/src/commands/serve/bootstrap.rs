@@ -21,9 +21,9 @@ pub async fn prepare(
         config.remote_control = RemoteControlAdmission::credential_gated();
     }
     let now = hellas_auth::authority::UnixMillis::now()?;
-    match hellas_work::work_store::grant::NodeStore::open(
+    match hellas_authority::work_store::grant::NodeStore::open(
         &config.journal_root,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         now,
     )
@@ -33,7 +33,7 @@ pub async fn prepare(
             drop(store);
             return Ok((config, None));
         }
-        Err(hellas_work::work_store::grant::NodeStoreError::Uninitialized) => {}
+        Err(hellas_authority::work_store::grant::NodeStoreError::Uninitialized) => {}
         Err(error) => return Err(error.into()),
     }
     hellas_private::create_dir_all_durable(&root)?;
@@ -61,7 +61,7 @@ pub async fn prepare(
         &endpoint,
         &invitation,
         &config.journal_root,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
     )
     .await;

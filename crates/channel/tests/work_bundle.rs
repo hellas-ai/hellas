@@ -5,13 +5,13 @@
 //! bundle is that an endpoint checks the other side's signature before
 //! releasing its own.
 
+use hellas_channel::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
+use hellas_channel::test_support::channel::{client, provider};
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
     NetworkId, Parties, PartyKeys, Payout, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
-use hellas_work::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
-use hellas_work::test_support::channel::{client, provider};
 
 const HORIZON: u64 = 500;
 const STAKE: u64 = 64;
@@ -36,7 +36,7 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
@@ -58,7 +58,7 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge,
         bond_terms(),
         [0x25; 32],

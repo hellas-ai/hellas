@@ -10,12 +10,14 @@ use crate::model::grant::{
     grant_channel_id, grant_work_id,
     records::{GrantDef, GrantError, GrantPolicy},
 };
-use crate::model::work::bound_result_digest;
-use crate::work_store::channel::funding::GrantFunding;
-use crate::work_store::{Applied, Channel, JobBook, JobPhase, JobState, JobTerminal, Role};
 use hellas_auth::authority::{AdministrationRecord, AuthoritySnapshot, AuthorityState};
 use hellas_auth::authority::{ResourceId, Revision, UnixMillis};
 use hellas_auth::{Digest, PublicKey};
+use hellas_channel::model::work::bound_result_digest;
+use hellas_channel::work_store::channel::funding::GrantFunding;
+use hellas_channel::work_store::{
+    Applied, Channel, JobBook, JobPhase, JobState, JobTerminal, Role,
+};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 use std::collections::BTreeMap;
@@ -31,7 +33,7 @@ pub struct State {
     last_administration: Option<AdministrationRecord>,
     pub(crate) last_work_administration: Option<super::WorkRecord>,
     pub(crate) machine_revision: hellas_auth::authority::Revision,
-    paid_policy: Option<crate::model::paid_policy::StoredPaidPolicy>,
+    paid_policy: Option<hellas_channel::model::paid_policy::StoredPaidPolicy>,
     pub(super) provider: Option<ProviderEnrollmentBundle>,
     pub(super) grants: BTreeMap<GrantId, GrantDef>,
     generations: BTreeMap<GrantId, u64>,
@@ -103,7 +105,7 @@ pub(super) enum Change {
     },
 }
 impl State {
-    pub fn paid_policy(&self) -> Option<&crate::model::paid_policy::StoredPaidPolicy> {
+    pub fn paid_policy(&self) -> Option<&hellas_channel::model::paid_policy::StoredPaidPolicy> {
         self.paid_policy.as_ref()
     }
     pub fn network(&self) -> NetworkId {
@@ -383,11 +385,12 @@ impl State {
                             return Err(hellas_auth::authority::AuthorityError::Revision.into());
                         }
                         policy.check()?;
-                        self.paid_policy = Some(crate::model::paid_policy::StoredPaidPolicy {
-                            revision: expected.next().ok_or(NodeStoreError::Malformed)?,
-                            policy_salt: *policy_salt,
-                            policy: policy.as_ref().clone(),
-                        });
+                        self.paid_policy =
+                            Some(hellas_channel::model::paid_policy::StoredPaidPolicy {
+                                revision: expected.next().ok_or(NodeStoreError::Malformed)?,
+                                policy_salt: *policy_salt,
+                                policy: policy.as_ref().clone(),
+                            });
                     }
                     super::WorkMutation::Capacity {
                         expected,
@@ -891,7 +894,7 @@ pub(super) struct Snapshot {
     last_administration: Option<AdministrationRecord>,
     last_work_administration: Option<super::WorkRecord>,
     machine_revision: hellas_auth::authority::Revision,
-    paid_policy: Option<crate::model::paid_policy::StoredPaidPolicy>,
+    paid_policy: Option<hellas_channel::model::paid_policy::StoredPaidPolicy>,
     #[serde(with = "super::codec::optional_provider")]
     provider: Option<ProviderEnrollmentBundle>,
     grants: Vec<GrantDef>,

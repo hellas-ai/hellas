@@ -6,13 +6,15 @@ use crate::model::grant::{
     GrantJobAuthorizationV1, grant_channel_id, grant_work_id,
     records::{GrantError, SignedOffer},
 };
-use crate::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
-use crate::model::work::bound_result_digest;
-use crate::work_store::channel::funding::GrantFunding;
-use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Replay};
-use crate::work_store::{Applied, JobBook, JobPhase, JobState, Role};
 use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
+use hellas_channel::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
+use hellas_channel::model::work::bound_result_digest;
+use hellas_channel::work_store::channel::funding::GrantFunding;
+use hellas_channel::work_store::journal::{
+    Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Replay,
+};
+use hellas_channel::work_store::{Applied, JobBook, JobPhase, JobState, Role};
 use hellas_kernel::NetworkId;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProviderEnrollmentBundle;
@@ -161,7 +163,7 @@ impl GrantClientStore {
     }
     pub fn next_nonce(&self) -> Result<u64, NodeStoreError> {
         if self.book().pending_proposal().is_some() {
-            return Err(crate::work_store::ChannelStateError::Conflict {
+            return Err(hellas_channel::work_store::ChannelStateError::Conflict {
                 what: "unanswered proposal",
             }
             .into());

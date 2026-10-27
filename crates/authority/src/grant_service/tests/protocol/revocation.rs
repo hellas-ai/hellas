@@ -20,7 +20,7 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
                 crate::test_support::accept_grant(
                     &wrong,
                     &request,
-                    &crate::test_support::principal(1).1
+                    &hellas_channel::test_support::principal(1).1
                 )
                 .await
             ),
@@ -30,7 +30,7 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
             crate::test_support::accept_grant(
                 &work_service,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -68,7 +68,7 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -150,7 +150,7 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
                 .job_by_id(id)
                 .unwrap()
                 .phase(),
-            crate::work_store::JobPhase::Running
+            hellas_channel::work_store::JobPhase::Running
         );
         let mut drain = Box::pin(service.drain());
         assert!(futures::poll!(&mut drain).is_pending());
@@ -200,7 +200,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 ..Backend::default()
             };
             let (service, work, credential) = service(store, backend.clone(), &secret).await;
-            let id = accepted_id(crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1).await);
+            let id = accepted_id(crate::test_support::accept_grant(&work, &request, &hellas_channel::test_support::principal(1).1).await);
             within(backend.started.notified()).await;
             let cache = cache::cached(&service, id);
             let node = service.node();
@@ -231,7 +231,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 .expect("an uncertain append must invalidate execution");
             assert_eq!(backend.slots.available_permits(), 0);
             backend.finish.release();
-            assert_err!(service.drain().await, NodeStoreError::Completion(source) if matches!(source.as_ref(), NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)));
+            assert_err!(service.drain().await, NodeStoreError::Completion(source) if matches!(source.as_ref(), NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)));
             assert_eq!(backend.slots.available_permits(), 1);
             node.store.lock().await.unwrap().resume_statements(release).await;
             drop(work);
@@ -240,7 +240,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
             let reopened = NodeStore::open(
                 dir.path(),
                 network(),
-                Some(crate::test_support::software_enrollment(2, [2; 32])),
+                Some(hellas_channel::test_support::software_enrollment(2, [2; 32])),
                 UnixMillis(1000),
             )
             .await
@@ -286,7 +286,7 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             crate::test_support::accept_grant(
                 &work_service,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -324,7 +324,7 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             crate::test_support::accept_grant(
                 &work_service,
                 &request,
-                &crate::test_support::principal(1).1
+                &hellas_channel::test_support::principal(1).1
             )
             .await
             .outcome,

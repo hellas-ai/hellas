@@ -5,8 +5,8 @@ use crate::{
     paid_client::{PaidClientError, PaidWorkResult, PaidWorkSession},
 };
 use hellas_auth::ProducerSigningKey;
+use hellas_channel::{model::profile::PreparedWorkInput, work::PaidProgress};
 use hellas_rpc::ContentRef;
-use hellas_work::{model::profile::PreparedWorkInput, work::PaidProgress};
 pub use purchase::{Purchase, PurchaseError};
 use std::sync::atomic::AtomicBool;
 
@@ -62,7 +62,7 @@ async fn prepare(
                     .jobs()
                     .filter(|entry| {
                         entry.authorization().payment_deadline >= state.cursor().0
-                            && (entry.phase() != hellas_work::work_store::JobPhase::HalfSigned
+                            && (entry.phase() != hellas_channel::work_store::JobPhase::HalfSigned
                                 || entry.authorization().acceptance_deadline >= state.cursor().0)
                     })
                     .map(|entry| *entry.authorization())

@@ -54,9 +54,9 @@ async fn multi_key_lifecycle(declarative: bool) {
     let (host, client, _, remote) = gateway_host(&world).await;
     client.set_gateway_state(gateway_state(true)).await.unwrap();
     let access = client.get_gateway_access(access_request()).await.unwrap();
-    let scope = hellas_work::test_support::Rights::new(authority(), ROOT)
+    let scope = hellas_channel::test_support::Rights::new(authority(), ROOT)
         .allow(
-            hellas_work::node::GATEWAY_INVOKE,
+            hellas_authority::node::GATEWAY_INVOKE,
             host_resource(authority()),
         )
         .valid_from(world.world.clock.now())

@@ -8,7 +8,7 @@ Both profiles use version-3 close descriptors and journal format 7. Older
 journals are refused; close old devnet channels with the old binary first.
 
 Canonical paid-work and grant records, prepared inputs, and usage accounting live in
-`hellas_work::model`. RPC owns generated messages and signed-transcript codecs.
+`hellas_channel::model` and `hellas_authority::model`. RPC owns generated messages and signed-transcript codecs.
 
 ## Provider storage
 
@@ -133,7 +133,7 @@ rejects a weaker output scheme.
 
 The native host SDK composes both funding modes in one build; funding is explicit
 runtime configuration. Consumers needing only the underlying grant protocol or
-ledger can use `hellas-rpc` and `hellas-work` without a chain runtime.
+ledger can use `hellas-rpc` and `hellas-channel` and `hellas-authority` without a chain runtime.
 
 Both funding paths reserve a `WorkPermit` before entering the executor queue.
 `AdmittedWork` carries that permit into `RunningWork`, which owns it until the

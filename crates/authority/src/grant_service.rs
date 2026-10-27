@@ -8,22 +8,16 @@ use crate::model::grant::{
     records::{GrantError, GrantPolicy},
     standing::StandingLocator,
 };
-use crate::model::profile::{PreparedWorkInput, WorkContext};
-use crate::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
-use crate::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
-use crate::work::{
-    BackendFault, PaidProgress, PaidResultStream, PreparedEvaluateInput, PreparedFetchInput,
-    WorkBackend,
-};
-use crate::work_store::{
-    JobPhase,
-    grant::{
-        GrantOutcome, GrantTerminal, NodeStore, NodeStoreError, SignedResult, refusal::refused,
-    },
-};
 use futures::{FutureExt, future::BoxFuture};
 use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
+use hellas_channel::model::profile::{PreparedWorkInput, WorkContext};
+use hellas_channel::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
+use hellas_channel::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
+use hellas_channel::work::{
+    BackendFault, PaidProgress, PaidResultStream, PreparedEvaluateInput, PreparedFetchInput,
+    WorkBackend,
+};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::Refusable;
 use hellas_rpc::pb::work::{
@@ -43,6 +37,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+use {
+    crate::work_store::grant::GrantOutcome, crate::work_store::grant::GrantTerminal,
+    crate::work_store::grant::NodeStore, crate::work_store::grant::NodeStoreError,
+    crate::work_store::grant::SignedResult, crate::work_store::grant::refusal::refused,
+    hellas_channel::work_store::JobPhase,
+};
 mod access;
 mod cache;
 mod delivery;
@@ -81,10 +81,10 @@ pub struct GrantService {
     run: Arc<Run>,
     draining: Arc<tokio::sync::Mutex<()>>,
     addresses: Arc<Vec<String>>,
-    upload_quota: crate::content::UploadQuota,
+    upload_quota: hellas_channel::content::UploadQuota,
 }
 struct Runtime {
-    uploads: BTreeMap<Digest, crate::content::UploadStore>,
+    uploads: BTreeMap<Digest, hellas_channel::content::UploadStore>,
     live: BTreeMap<Digest, Live>,
     status: ServiceStatus,
     tasks: BTreeMap<Digest, tokio::task::JoinHandle<()>>,
@@ -209,13 +209,13 @@ enum CompletionError {
     #[error(transparent)]
     Grant(#[from] GrantError),
     #[error(transparent)]
-    Transcript(#[from] crate::model::work::PaidWorkError),
+    Transcript(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
     Signature(#[from] hellas_auth::signature::SignatureError),
 }
 
 impl GrantService {
-    pub fn with_upload_quota(mut self, quota: crate::content::UploadQuota) -> Self {
+    pub fn with_upload_quota(mut self, quota: hellas_channel::content::UploadQuota) -> Self {
         self.upload_quota = quota;
         self
     }
@@ -281,7 +281,7 @@ impl GrantService {
                     .into(),
                     (
                         PreparedWorkInput::Fetch(input),
-                        crate::model::profile::WorkPolicy::Fetch { policy, .. },
+                        hellas_channel::model::profile::WorkPolicy::Fetch { policy, .. },
                     ) => PreparedFetchInput::admitted(
                         input.parts().map_err(BackendFault::caused_by)?,
                         policy,
@@ -327,9 +327,9 @@ impl GrantService {
             if matches!(
                 &error,
                 NodeStoreError::Journal(
-                    crate::work_store::journal::JournalError::Io(_)
-                        | crate::work_store::journal::JournalError::Sqlx(_)
-                        | crate::work_store::journal::JournalError::Poisoned
+                    hellas_channel::work_store::journal::JournalError::Io(_)
+                        | hellas_channel::work_store::journal::JournalError::Sqlx(_)
+                        | hellas_channel::work_store::journal::JournalError::Poisoned
                 )
             ) {
                 let source = Arc::new(error);
@@ -478,7 +478,7 @@ impl GrantService {
                 (policy, reserve)
             };
             let domain = match policy.work {
-                crate::model::profile::WorkPolicy::Evaluate(_) => CapacityDomain::Gpu,
+                hellas_channel::model::profile::WorkPolicy::Evaluate(_) => CapacityDomain::Gpu,
                 _ => CapacityDomain::Fetch,
             };
             let permit =
@@ -486,9 +486,11 @@ impl GrantService {
             if permit.domain() != domain {
                 return Err(refused(GrantRefusalCode::QueueCapacity));
             }
-            let input =
-                PreparedWorkInput::decode(&prepared_input, crate::content::MAX_CONTENT_BYTES)
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let input = PreparedWorkInput::decode(
+                &prepared_input,
+                hellas_channel::content::MAX_CONTENT_BYTES,
+            )
+            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
             let deadline = observed_at
                 .checked_add(Duration::from_millis(
                     a.terminal_deadline_ms.0.saturating_sub(now.0),
@@ -605,7 +607,7 @@ impl GrantService {
     async fn monitor_execution(
         &self,
         id: Digest,
-        cancellation: crate::work::admission::Cancellation,
+        cancellation: hellas_channel::work::admission::Cancellation,
     ) {
         loop {
             let changed = self.node.changed.notified();
@@ -643,11 +645,11 @@ impl GrantService {
             return Err(BackendFault::caused_by(ExecutionError::Deadline));
         }
         if !live.cache.retained_at((self.node.clock)()) {
-            return Err(crate::work::admission::AdmissionError::Cancelled.into());
+            return Err(hellas_channel::work::admission::AdmissionError::Cancelled.into());
         }
         let mut body = live.cache.lock().map_err(BackendFault::caused_by)?;
         if !body.retained {
-            return Err(crate::work::admission::AdmissionError::Cancelled.into());
+            return Err(hellas_channel::work::admission::AdmissionError::Cancelled.into());
         }
         let charge = event_ram(&event);
         let next = body.bytes.saturating_add(charge);
@@ -1120,8 +1122,8 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
         _context: TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
     {
-        use crate::model::work::decode_transcript;
         use futures::StreamExt;
+        use hellas_channel::model::work::decode_transcript;
         use hellas_rpc::call::WithTrailer;
         let delivery = match self.service.bind_delivery(&self.access, &request).await {
             Ok(delivery) => delivery,
@@ -1129,7 +1131,7 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
                 return Ok(WithTrailer::new(DeliverResultResponse::refused(refusal)));
             }
         };
-        let bound = crate::work_store::journal::MAX_RECORD_BYTES;
+        let bound = hellas_channel::work_store::journal::MAX_RECORD_BYTES;
         let mut stream = self
             .service
             .stream_binding(futures::future::ready(Ok(delivery.clone())));

@@ -1,16 +1,16 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_auth::PublicKey;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
+use hellas_authority::model::grant::records::verify_software_enrollment;
+use hellas_channel::test_support::{channel_client, principal, software_enrollment};
 use hellas_kernel::NetworkId;
 use hellas_rpc::*;
-use hellas_work::model::grant::records::verify_software_enrollment;
-use hellas_work::model::{
-    fetch::*,
-    grant::{records::*, resource::*, *},
-    profile::WorkPolicy,
-};
-use hellas_work::test_support::{channel_client, principal, software_enrollment};
 use std::num::NonZeroU64;
+use {
+    hellas_authority::model::grant::records::*, hellas_authority::model::grant::resource::*,
+    hellas_authority::model::grant::*, hellas_channel::model::fetch::*,
+    hellas_channel::model::profile::WorkPolicy,
+};
 fn resource() -> HttpsResource {
     HttpsResource {
         origin: "https://glm.lan:8443".into(),
@@ -113,7 +113,7 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
             route,
         },
         https: Some(resource()),
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },

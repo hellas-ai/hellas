@@ -98,7 +98,7 @@ Any other enrollment is refused with `FailedPrecondition` (`provider already bou
 and a malformed or unverifiable one with `InvalidArgument`. There is no unbind. The
 command prints the bound enrollment's content ID.
 
-`work` accepts [WorkControlCommand](../crates/work/src/model/grant/admin.rs) JSON. It selects resources from
+`work` accepts [WorkControlCommand](../crates/authority/src/model/grant/admin.rs) JSON. It selects resources from
 the daemon's validated catalogue and uses the profile's authorization grant.
 These operations require distinct rights on this authority's Work machine resource:
 
@@ -130,7 +130,7 @@ table below is checked against the implementation by the Work tests.
 <!-- operations:end -->
 
 Configure machine capacity first, then explicit account, pool and subject budgets
-with `ConfigureBudget`. Its [BudgetDef](../crates/work/src/model/grant/budget.rs)
+with `ConfigureBudget`. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
 names a node, its parent, the new revision, limits and maximum concurrent jobs.
 An account is an Auth resource ID and has the machine as parent. A pool has a stable
 16-byte ID and an account parent. A subject node is the pair `(pool, principal)`;

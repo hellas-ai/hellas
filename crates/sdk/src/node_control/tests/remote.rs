@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::test_support::within;
+use hellas_authority::test_support::within;
 
 struct Remote {
     fixture: Fixture,
@@ -19,7 +19,7 @@ impl Remote {
             outgoing,
             authority(),
             &fixture.secret,
-            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+            hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap();
@@ -32,11 +32,12 @@ impl Remote {
             endpoints: (client_endpoint, server_endpoint),
         }
     }
-    async fn native_status(&self) -> hellas_work::node::NodeStatus {
+    async fn native_status(&self) -> hellas_authority::node::NodeStatus {
         self.fixture
             .node
             .status(
-                &hellas_work::test_support::session(&self.fixture.node, &self.fixture.secret).await,
+                &hellas_authority::test_support::session(&self.fixture.node, &self.fixture.secret)
+                    .await,
                 ROOT_GRANT,
             )
             .await
@@ -149,7 +150,7 @@ async fn client_prepared_credentials_round_trip_without_transmitting_the_secret(
         .node
         .authenticate_session(
             &secret,
-            hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+            hellas_authority::node::SessionKey::Node(&OPERATOR.node_key()),
         )
         .await
         .unwrap();
@@ -223,7 +224,7 @@ async fn lost_credential_reply_is_reconciled_over_host_control() {
         .node
         .authenticate_session(
             &retained,
-            hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+            hellas_authority::node::SessionKey::Node(&OPERATOR.node_key()),
         )
         .await
         .unwrap();
@@ -315,7 +316,11 @@ fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
             next: Some(CredentialId([255; 16])),
         },
     };
-    encode_bounded(&view, hellas_work::model::grant::admin::MAX_ADMIN_BYTES).unwrap();
+    encode_bounded(
+        &view,
+        hellas_authority::model::grant::admin::MAX_ADMIN_BYTES,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -343,6 +348,10 @@ fn maximal_grant_pages_fit_the_bounded_wire_reply() {
                 next: Some(GrantId([255; 16])),
             },
         };
-        encode_bounded(&view, hellas_work::model::grant::admin::MAX_ADMIN_BYTES).unwrap();
+        encode_bounded(
+            &view,
+            hellas_authority::model::grant::admin::MAX_ADMIN_BYTES,
+        )
+        .unwrap();
     }
 }

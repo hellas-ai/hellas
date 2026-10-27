@@ -3,14 +3,30 @@
 //! are fixtures. Providers and clients read their own executed QMDB, fetch
 //! certified history over the network, and submit to validator mempools.
 
-use hellas_work::test_support::channel::serve_work as serve;
-use hellas_work::test_support::channel::{identity_artifact, manifest, text_policy};
+use hellas_channel::test_support::channel::serve_work as serve;
+use hellas_channel::test_support::channel::{identity_artifact, manifest, text_policy};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use commonware_cryptography::Digestible as _;
 use hellas_auth::ProducerSigningKey;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::{
+    ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
+};
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
+    identity_source_digest, private_policy_commitment,
+};
+use hellas_channel::work::{
+    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, RunOutcome,
+    WorkBackend, WorkService, propose_work, run_accepted_work,
+};
+use hellas_channel::work_close::{CloseProgress, TxSink, close_start};
+use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+use hellas_channel::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, plan as reproduction_plan,
@@ -29,22 +45,6 @@ use hellas_rpc::protocol::artifacts::{
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
 use hellas_wire::TransportContext;
 use hellas_wire::mux::MuxTransport;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::{
-    ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
-};
-use hellas_work::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
-    identity_source_digest, private_policy_commitment,
-};
-use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, RunOutcome,
-    WorkBackend, WorkService, propose_work, run_accepted_work,
-};
-use hellas_work::work_close::{CloseProgress, TxSink, close_start};
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-use hellas_work::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 
 use crate::HellasBlock;
 use crate::domain::{SettlementKey, TEST_NETWORK};
@@ -175,7 +175,7 @@ fn no_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms(allocations: &Allocations) -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::new(
                 allocations.provider_key().into_kernel(),
@@ -224,11 +224,11 @@ fn payment_edge(allocations: &Allocations) -> EdgeId {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(CREDIT_LIMIT, CREDIT_LIMIT)
+    hellas_channel::test_support::channel::credit_policy(CREDIT_LIMIT, CREDIT_LIMIT)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         manifest().content_id(),
         match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -242,7 +242,7 @@ fn work_policy() -> EvaluatePolicyV2 {
 }
 
 fn payment_terms(allocations: &Allocations) -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge(allocations),
         bond_terms(allocations),
         private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
@@ -419,7 +419,7 @@ impl WorkDevnet {
 // ── The handshake, and the setup drive ────────────────────────────────
 
 async fn open_setup(root: &std::path::Path, bond: EdgeId, role: Role) -> SetupStore {
-    hellas_work::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role).await
+    hellas_channel::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role).await
 }
 
 fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -475,7 +475,7 @@ async fn shake_hands(
         client(),
         PaymentAdmission::Proposes(Box::new(provider_policy())),
     );
-    hellas_work::test_support::channel::finish_setup(
+    hellas_channel::test_support::channel::finish_setup(
         &service,
         &mut caller,
         bond_edge(allocations),
@@ -568,20 +568,22 @@ struct ProviderBackend {
 impl WorkBackend for ProviderBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
+        prepared: hellas_channel::work::PreparedWorkInput,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -627,7 +629,7 @@ fn transcript_for(
     .artifact
     .output_id()
     .digest();
-    hellas_work::test_support::channel::transcript_chunks(
+    hellas_channel::test_support::channel::transcript_chunks(
         request,
         &[answer],
         &provider_producer(),
@@ -639,7 +641,7 @@ fn transcript_for(
 // ── The job's prepared inputs ─────────────────────────────────────────
 
 fn prepared_input() -> PreparedPaidInputV1 {
-    hellas_work::test_support::channel::bundle(0x9e)
+    hellas_channel::test_support::channel::bundle(0x9e)
 }
 
 const fn deadlines() -> JobDeadlines {
@@ -660,7 +662,7 @@ fn session() -> TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_work::test_support::transport::transport_pair_without_write_authority(
+    hellas_channel::test_support::transport::transport_pair_without_write_authority(
         session(),
         session(),
     )
@@ -1271,8 +1273,10 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 )
                 .expect("the client signs an understated start");
                 let start = if allocations.owner_exit {
-                    let hash =
-                        hellas_work::work_close::start_body_digest(opened.ready.channel(), &start);
+                    let hash = hellas_channel::work_close::start_body_digest(
+                        opened.ready.channel(),
+                        &start,
+                    );
                     hellas_kernel::PaymentCloseStart::new(
                         start.payment_edge(),
                         start.terms().clone(),
@@ -1401,8 +1405,8 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
     }
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

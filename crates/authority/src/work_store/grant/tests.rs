@@ -1,21 +1,22 @@
 //! Grant accounting has no chain fixture. The same signed Fetch input used by
 //! Work is admitted here without constructing financial channel terms.
 
-use crate::model::{
-    grant::{budget::*, records::*, *},
-    profile::*,
-};
 use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
 use hellas_rpc::*;
-use hellas_work::work_store::{
-    grant::{
-        GrantOutcome, NodeStore, NodeStoreError,
-        ledger::{Ledger, LedgerError},
-    },
-    journal::Journal,
-};
 use proptest::prelude::*;
+use {
+    crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*,
+    hellas_channel::model::profile::*,
+};
+use {
+    hellas_authority::work_store::grant::GrantOutcome,
+    hellas_authority::work_store::grant::NodeStore,
+    hellas_authority::work_store::grant::NodeStoreError,
+    hellas_authority::work_store::grant::ledger::Ledger,
+    hellas_authority::work_store::grant::ledger::LedgerError,
+    hellas_channel::work_store::journal::Journal,
+};
 
 use crate::test_support::*;
 mod budgets;
@@ -47,7 +48,7 @@ fn standing_query(store: &NodeStore) -> crate::model::grant::standing::StandingL
     StandingLocator {
         provider: store.state().provider().unwrap().content_id(),
         grant: GrantId([1; 16]),
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
         generation: 0,
     }
 }
@@ -60,7 +61,7 @@ async fn standing(store: &mut NodeStore) -> crate::model::grant::standing::Stand
 #[tokio::test]
 async fn standing_discovers_a_stale_generation_without_resetting_usage() {
     use crate::model::grant::standing::*;
-    use hellas_work::work_store::grant::NodeStoreError;
+    use hellas_authority::work_store::grant::NodeStoreError;
     let dir = tempfile::tempdir().unwrap();
     let (mut store, application) = setup(dir.path()).await;
     let (a, sig, input) = proposal(&store, 1);
@@ -95,11 +96,11 @@ async fn standing_discovers_a_stale_generation_without_resetting_usage() {
         updated
             .offer
             .offer()
-            .channel(crate::test_support::channel_client(principal(1).0)),
+            .channel(hellas_channel::test_support::channel_client(principal(1).0)),
         original
             .offer
             .offer()
-            .channel(crate::test_support::channel_client(principal(1).0))
+            .channel(hellas_channel::test_support::channel_client(principal(1).0))
     );
     assert_eq!(updated.nodes, original.nodes);
     assert_err!(
@@ -123,7 +124,7 @@ async fn standing_discovers_a_stale_generation_without_resetting_usage() {
 }
 #[tokio::test]
 async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
-    use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
+    use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
     let dir = tempfile::tempdir().unwrap();
     let (mut provider, application) = setup(&dir.path().join("provider")).await;
     let offer = standing(&mut provider).await.offer;
@@ -132,13 +133,13 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
     };
     let client_dir = dir.path().join("client");
     let mut client = GrantClientStore::open(
         &client_dir,
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
         UnixMillis(1_000),
     )
@@ -165,7 +166,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         .unwrap();
     assert_err!(
         client.next_nonce(),
-        NodeStoreError::Channel(crate::work_store::ChannelStateError::Conflict {
+        NodeStoreError::Channel(hellas_channel::work_store::ChannelStateError::Conflict {
             what: "unanswered proposal"
         })
     );
@@ -174,7 +175,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     let mut client = GrantClientStore::open(
         &client_dir,
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(3_000),
     )
@@ -183,7 +184,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     assert_eq!(client.book().pending_proposal(), Some(work));
     assert_err!(
         client.next_nonce(),
-        NodeStoreError::Channel(crate::work_store::ChannelStateError::Conflict {
+        NodeStoreError::Channel(hellas_channel::work_store::ChannelStateError::Conflict {
             what: "unanswered proposal"
         })
     );
@@ -205,7 +206,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
             .is_empty()
     );
     client.rotate().await.unwrap();
-    for path in crate::test_support::all_files(&client_dir) {
+    for path in hellas_channel::test_support::all_files(&client_dir) {
         let bytes = std::fs::read(path).unwrap();
         assert!(
             !bytes
@@ -219,7 +220,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
 }
 #[tokio::test]
 async fn client_replays_its_journal_after_a_cancelled_append() {
-    use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
+    use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
     let dir = tempfile::tempdir().unwrap();
     let (mut provider, application) = setup(&dir.path().join("provider")).await;
     let offer = standing(&mut provider).await.offer;
@@ -228,12 +229,12 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
     };
     let mut client = GrantClientStore::open(
         &dir.path().join("client"),
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(1_000),
     )
@@ -275,7 +276,7 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
 }
 #[tokio::test]
 async fn client_refusal_cannot_clear_an_unanswered_proposal() {
-    use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
+    use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
     let dir = tempfile::tempdir().unwrap();
     let (mut provider, _application) = setup(&dir.path().join("provider")).await;
     let offer = standing(&mut provider).await.offer;
@@ -284,13 +285,13 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
     };
     let path = dir.path().join("client");
     let mut client = GrantClientStore::open(
         &path,
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
         UnixMillis(1_000),
     )
@@ -310,7 +311,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
     let mut client = GrantClientStore::open(
         &path,
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(1),
     )
@@ -320,7 +321,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
     assert_eq!(client.book().pending_proposal(), Some(id));
     assert_err!(
         client.next_nonce(),
-        NodeStoreError::Channel(crate::work_store::ChannelStateError::Conflict {
+        NodeStoreError::Channel(hellas_channel::work_store::ChannelStateError::Conflict {
             what: "unanswered proposal"
         })
     );
@@ -330,7 +331,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
 }
 #[tokio::test]
 async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
-    use hellas_work::work_store::grant::NodeStoreError;
+    use hellas_authority::work_store::grant::NodeStoreError;
     for accepted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, application) = setup(dir.path()).await;
@@ -347,7 +348,7 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
         let reply = store
             .precheck_acceptance(
                 &a,
-                crate::test_support::channel_client(principal(1).0),
+                hellas_channel::test_support::channel_client(principal(1).0),
                 &signature,
                 UnixMillis(2_001),
             )
@@ -360,7 +361,7 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
                 store
                     .precheck_acceptance(
                         &a,
-                        crate::test_support::channel_client(principal(1).0),
+                        hellas_channel::test_support::channel_client(principal(1).0),
                         &signature,
                         UnixMillis(1)
                     )
@@ -372,7 +373,7 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
 }
 
 fn work_node(path: &std::path::Path) -> Node {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     Node::bootstrap(path)
         .with_grant(
             ids::FRIEND_GRANT,
@@ -389,7 +390,7 @@ fn work_node(path: &std::path::Path) -> Node {
 
 #[tokio::test]
 async fn acceptance_appends_exactly_one_frame() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let request = node.proposal(FRIEND, ids::ALLOWANCE, 1);
@@ -412,8 +413,8 @@ async fn acceptance_appends_exactly_one_frame() {
 
 #[tokio::test]
 async fn checkpoint_recovery_retains_the_original_cosignature() {
-    use crate::test_support::{actors::FRIEND, ids};
-    use crate::work_store::JobPhase;
+    use hellas_channel::work_store::JobPhase;
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     for phase in [JobPhase::Accepted, JobPhase::Running] {
         let directory = tempfile::tempdir().unwrap();
         let mut node = work_node(directory.path()).build().await;
@@ -476,7 +477,7 @@ async fn checkpoint_recovery_retains_the_original_cosignature() {
 
 #[tokio::test]
 async fn request_bodies_never_enter_provider_journals() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     enum Step {
         Accept,
         Dispatch,
@@ -511,7 +512,7 @@ async fn request_bodies_never_enter_provider_journals() {
             Step::Rotate => node.store.rotate().await.unwrap(),
             Step::Reopen => node = node.reopen().await,
         }
-        for path in crate::test_support::all_files(directory.path()) {
+        for path in hellas_channel::test_support::all_files(directory.path()) {
             let bytes = std::fs::read(path).unwrap();
             assert!(
                 !bytes
@@ -524,7 +525,7 @@ async fn request_bodies_never_enter_provider_journals() {
 
 #[tokio::test]
 async fn paused_terms_release_queued_work_without_reusing_its_nonce() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let first = node.proposal(FRIEND, ids::ALLOWANCE, 1);
@@ -583,7 +584,7 @@ async fn paused_terms_release_queued_work_without_reusing_its_nonce() {
 
 #[tokio::test]
 async fn revising_terms_cannot_reset_spending() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let first = node.proposal(FRIEND, ids::ALLOWANCE, 1);
@@ -663,18 +664,19 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
             def.enabled = false;
         } else {
             def.policies[0].responses = None;
-            def.policies[0].work = WorkPolicy::Evaluate(crate::model::work::EvaluatePolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                generation_policy_digest: Digest::hash(b"native-generation"),
-                identity_source_digest: Digest::hash(b"native-identity"),
-                max_prompt_tokens: 512,
-                max_new_tokens: 128,
-                max_stop_token_ids: 4,
-                max_spool_bytes: 1_048_576,
-                max_encoded_result_frame: 262_144,
-                max_encoded_prepared_input: 1_048_576,
-                max_upload_bytes: 1_048_576,
-            });
+            def.policies[0].work =
+                WorkPolicy::Evaluate(hellas_channel::model::work::EvaluatePolicyV2 {
+                    allowed_environment: test_responses_contract().manifest_id(),
+                    generation_policy_digest: Digest::hash(b"native-generation"),
+                    identity_source_digest: Digest::hash(b"native-identity"),
+                    max_prompt_tokens: 512,
+                    max_new_tokens: 128,
+                    max_stop_token_ids: 4,
+                    max_spool_bytes: 1_048_576,
+                    max_encoded_result_frame: 262_144,
+                    max_encoded_prepared_input: 1_048_576,
+                    max_upload_bytes: 1_048_576,
+                });
         }
         if !revoke {
             def.policies[0].revision.0 += 1;
@@ -693,7 +695,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
             store
                 .configure_machine(limits.clone(), 4, UnixMillis(1003))
                 .await,
-            hellas_work::work_store::grant::NodeStoreError::Grant(GrantError::Limits)
+            hellas_authority::work_store::grant::NodeStoreError::Grant(GrantError::Limits)
         );
         finish(
             &mut store,
@@ -716,7 +718,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
 
 #[tokio::test]
 async fn new_allowances_require_the_initial_revision() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let mut terms = definition(ids::NEW_ALLOWANCE, FRIEND.principal());
@@ -940,4 +942,4 @@ impl NodeStore {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

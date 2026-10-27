@@ -30,9 +30,9 @@ async fn portable_grant_rpc_streams_before_terminal_reserves_once_and_survives_r
     };
     let rpc = WorkClientImpl::new(client.clone());
     let locator = StandingLocator {
-        provider: crate::test_support::software_enrollment(2, [2; 32]).content_id(),
+        provider: hellas_channel::test_support::software_enrollment(2, [2; 32]).content_id(),
         grant: a.grant_id,
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
         generation: 0,
     };
     let response = rpc
@@ -103,7 +103,7 @@ async fn portable_grant_rpc_streams_before_terminal_reserves_once_and_survives_r
         })
         .await
         .unwrap();
-    for file in crate::test_support::all_files(dir.path()) {
+    for file in hellas_channel::test_support::all_files(dir.path()) {
         let bytes = std::fs::read(file).unwrap();
         for secret in [
             b"private-grant-result".as_slice(),

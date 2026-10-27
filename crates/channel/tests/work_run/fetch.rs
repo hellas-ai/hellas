@@ -1,4 +1,11 @@
 use super::*;
+use hellas_channel::model::fetch::{
+    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
+};
+use hellas_channel::model::profile::WorkPolicy;
+use hellas_channel::model::work::PrivateRecord as _;
+use hellas_channel::test_support::channel::accept_uploaded_client;
+use hellas_channel::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
 use hellas_rpc::Retention;
 use hellas_rpc::fetch::{
     FetchOutputTranscriptBuilder, build_input_events_with_retention, encode_fetch_event_payload,
@@ -6,45 +13,41 @@ use hellas_rpc::fetch::{
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::pb::work::WorkDelivered;
-use hellas_work::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_work::model::profile::WorkPolicy;
-use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::test_support::channel::accept_uploaded_client;
-use hellas_work::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
 
 const PROMPT: &[u8] = br#"{"input":"private-customer-prompt-never-on-provider-disk"}"#;
 const RESPONSE: &str = "private-provider-response-never-on-provider-disk";
 
-use hellas_work::test_support::transport;
+use hellas_channel::test_support::transport;
 
 #[tokio::test]
 async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journals() {
+    use hellas_channel::work::{PaidProgress, admit_payment, fetch_result_stream};
     use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
     use hellas_wire::{Dispatcher, StreamTransport, mux::MuxTransport};
-    use hellas_work::work::{PaidProgress, admit_payment, fetch_result_stream};
 
     struct PausedFetch(Arc<tokio::sync::Notify>);
     impl WorkBackend for PausedFetch {
         fn try_admit(
             &self,
-            domain: hellas_work::work::admission::CapacityDomain,
-        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
-            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
         async fn execute_stream(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
+            prepared: hellas_channel::work::PreparedWorkInput,
             progress: PaidProgress,
-        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Gpu,
-                )
-                .into());
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
+        {
+            let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Gpu,
+                    )
+                    .into(),
+                );
             };
             let input = *input;
             let events = FetchBackend::default().execute(input.into()).await?;
@@ -245,28 +248,31 @@ async fn client_endpoint(root: &std::path::Path) -> ClientEndpoint {
 
 #[tokio::test]
 async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_payloads() {
+    use hellas_channel::work::{admit_payment, fetch_result_stream};
     use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
     use hellas_wire::{Dispatcher, StreamTransport, mux::MuxTransport};
-    use hellas_work::work::{admit_payment, fetch_result_stream};
     struct LargeFetch;
     impl WorkBackend for LargeFetch {
         fn try_admit(
             &self,
-            domain: hellas_work::work::admission::CapacityDomain,
-        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
-            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
         async fn execute(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
-        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Gpu,
-                )
-                .into());
+            prepared: hellas_channel::work::PreparedWorkInput,
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
+        {
+            let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Gpu,
+                    )
+                    .into(),
+                );
             };
             let input = *input;
             let request = verify_input_events(&input.into_parts().fetch_input_transcript).unwrap();
@@ -371,11 +377,11 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
 
 #[tokio::test]
 async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
+    use hellas_channel::model::work::{decode_transcript, encode_transcript};
+    use hellas_channel::work::fetch_result_stream;
     use hellas_rpc::pb::work::{WorkStreamEvent, WorkStreamTerminal, work_stream_event::Outcome};
     use hellas_rpc::services::work::StreamResult;
     use hellas_wire::{StreamTransport, WireCode, WireStatus, mux::MuxTransport};
-    use hellas_work::model::work::{decode_transcript, encode_transcript};
-    use hellas_work::work::fetch_result_stream;
     for fault in ["missing-prefix", "signature", "duplicate", "status", "none"] {
         let provider_dir = temp();
         let client_dir = temp();
@@ -460,20 +466,23 @@ struct FetchBackend(AtomicUsize);
 impl WorkBackend for FetchBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Gpu,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Gpu,
+                )
+                .into(),
+            );
         };
         let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -668,7 +677,7 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
 
 #[test]
 fn fetch_close_descriptor_round_trips_and_rejects_profile_version_confusion() {
-    use hellas_work::model::setup::CloseDescriptor;
+    use hellas_channel::model::setup::CloseDescriptor;
     let descriptor = descriptor_with(policy()).close_descriptor();
     let bytes = descriptor.encode();
     assert_eq!(CloseDescriptor::decode(&bytes).unwrap(), descriptor);
@@ -703,10 +712,10 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
         unreachable!()
     };
     policy.max_output_events = u32::try_from(transcript.len() - 1).unwrap();
-    assert!(hellas_work::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
+    assert!(hellas_channel::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
     policy.max_output_events += 1;
     policy.max_output_bytes = 1;
-    assert!(hellas_work::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
+    assert!(hellas_channel::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
     assert!(
         service
             .record_result(id, &transcript[..transcript.len() - 1])
@@ -769,4 +778,4 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
     assert_no_bodies(provider_dir.path());
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

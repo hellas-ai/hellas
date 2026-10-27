@@ -1,7 +1,7 @@
 //! Structured grant refusals. Diagnostics never select client recovery policy.
 use super::{NodeStoreError, ledger::LedgerError};
 use crate::model::grant::{records::GrantError, resource::TemplateError};
-use crate::work_store::ChannelStateError;
+use hellas_channel::work_store::ChannelStateError;
 use hellas_rpc::pb::work::{GrantRefusal, GrantRefusalCode, WorkRefusalCode, WorkRefused};
 
 pub fn refused(code: GrantRefusalCode) -> WorkRefused {

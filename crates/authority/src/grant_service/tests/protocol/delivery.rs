@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
+use hellas_channel::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
 use std::{future::Future, io, task::Poll, time::Duration};
 
 pub(super) fn delivery_request(a: &GrantJobAuthorizationV1, id: Digest) -> DeliverResultRequest {
@@ -30,8 +30,8 @@ async fn revise_and_restore(
             let mut interim = original.clone();
             if remove_right {
                 interim.permissions = [Permission {
-                    operation: OperationId::new(hellas_work::node::HOST_STATUS).unwrap(),
-                    resource: hellas_work::node::host_resource(interim.authority),
+                    operation: OperationId::new(hellas_authority::node::HOST_STATUS).unwrap(),
+                    resource: hellas_authority::node::host_resource(interim.authority),
                 }]
                 .into();
             } else {
@@ -78,7 +78,7 @@ async fn committed_loss_cannot_revive_a_native_stream_or_an_unpolled_carrier_bin
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -150,8 +150,12 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
     .unwrap();
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
     let id = accepted_id(
-        crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1)
-            .await,
+        crate::test_support::accept_grant(
+            &work,
+            &request,
+            &hellas_channel::test_support::principal(1).1,
+        )
+        .await,
     );
     within(backend.started.notified()).await;
     backend.finish.release();
@@ -171,7 +175,7 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
         &admin,
         GrantId([0; 16]),
         scope,
-        crate::test_support::holder(principal(1).0),
+        hellas_channel::test_support::holder(principal(1).0),
     )
     .await
     .unwrap();
@@ -239,7 +243,7 @@ async fn extending_expired_authority_does_not_revive_an_unpolled_response() {
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -294,7 +298,7 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -373,7 +377,7 @@ async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier(
                     crate::test_support::accept_grant(
                         &work,
                         &request,
-                        &crate::test_support::principal(1).1,
+                        &hellas_channel::test_support::principal(1).1,
                     )
                     .await,
                 );
@@ -386,7 +390,9 @@ async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier(
                     let store = NodeStore::open(
                         dir.path(),
                         network(),
-                        Some(crate::test_support::software_enrollment(2, [2; 32])),
+                        Some(hellas_channel::test_support::software_enrollment(
+                            2, [2; 32],
+                        )),
                         UnixMillis(1000),
                     )
                     .await

@@ -1,5 +1,5 @@
 use hellas_auth::authority::Revision;
-use hellas_work::model::grant::{
+use hellas_authority::model::grant::{
     budget::{Charge, Meter},
     pricing::{Pricing, PricingError, UnitPrice},
 };

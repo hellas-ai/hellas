@@ -18,12 +18,20 @@ use std::time::Duration;
 use hellas_auth::authority::{self as auth, UnixMillis};
 use hellas_auth::test_support::actors::{FRIEND, ROOT};
 use hellas_auth::{Digest, ProducerSigningKey};
+use hellas_authority::node::NodeCoordinator;
+use hellas_authority::work_store::grant::NodeStore;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::domain::SettlementKey;
 use hellas_chain::test_support::devnet::{
     Devnet, DevnetConfig, GenesisOwner, OwnerKind, delegate_allocation, run,
 };
 use hellas_chain::{FinalizedWorkView as _, LightClient as _};
+use hellas_channel::model::fetch::{
+    FetchPolicyV2, FetchRoutePolicy as PaidRoute, PreparedPaidFetchInputV1, fetch_route_commitment,
+};
+use hellas_channel::model::profile::WorkPolicy;
+use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
+use hellas_channel::test_support::{enrollment, test_responses_contract};
 use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchRequestView, MockFetchProvider, PreparedFetchRequest, ProjectedFetch,
@@ -37,14 +45,6 @@ use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
 };
-use hellas_work::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy as PaidRoute, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_work::model::profile::WorkPolicy;
-use hellas_work::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_work::node::NodeCoordinator;
-use hellas_work::test_support::{enrollment, test_responses_contract};
-use hellas_work::work_store::grant::NodeStore;
 
 /// The job's flat price.
 const PRICE: u64 = 10;
@@ -133,8 +133,8 @@ fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig 
     }
 }
 
-fn paid_policy() -> hellas_work::model::paid_policy::PaidPolicy {
-    hellas_work::model::paid_policy::PaidPolicy {
+fn paid_policy() -> hellas_channel::model::paid_policy::PaidPolicy {
+    hellas_channel::model::paid_policy::PaidPolicy {
         channel_policy: PaidChannelPolicyV1 {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
@@ -149,7 +149,7 @@ fn paid_policy() -> hellas_work::model::paid_policy::PaidPolicy {
         expected_payment_values: EdgeValues::new(CLIENT_FUNDING, 0, Fees::ZERO),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         jobs_per_channel: 10,
-        offers: hellas_work::model::paid_policy::OfferPolicy {
+        offers: hellas_channel::model::paid_policy::OfferPolicy {
             max_stake_per_client: PROVIDER_STAKE,
             bond_lifetime_blocks: BOND_TIMEOUT,
             max_open_offers: 2,
@@ -206,16 +206,18 @@ fn addresses(provider: &hellas_sdk::ProviderHandle) -> Vec<std::net::SocketAddr>
 #[derive(Default)]
 struct Approvals(std::sync::Mutex<Vec<Digest>>);
 #[async_trait::async_trait]
-impl hellas_work::authenticator::Authenticator for Approvals {
-    fn public_key(&self) -> Result<hellas_work::authenticator::PublicKey, auth::AuthorityError> {
-        hellas_work::authenticator::Authenticator::public_key(&FRIEND.passkey())
+impl hellas_authority::authenticator::Authenticator for Approvals {
+    fn public_key(
+        &self,
+    ) -> Result<hellas_authority::authenticator::PublicKey, auth::AuthorityError> {
+        hellas_authority::authenticator::Authenticator::public_key(&FRIEND.passkey())
     }
     async fn assert(
         &self,
         challenge: Digest,
     ) -> Result<auth::PasskeyAssertion, auth::AuthorityError> {
         self.0.lock().unwrap().push(challenge);
-        hellas_work::authenticator::Authenticator::assert(&FRIEND.passkey(), challenge).await
+        hellas_authority::authenticator::Authenticator::assert(&FRIEND.passkey(), challenge).await
     }
 }
 
@@ -574,14 +576,15 @@ async fn paid_setup(
     devnet.seal().await;
 
     // The owner stores standing policy once; no client route or bond exists.
-    let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
-        &root.path().join("provider-state/grants"),
-        hellas_work::model::grant::grant_network(),
-        Some(provider_enrollment(&identity)),
-        now,
-    )
-    .await
-    .unwrap();
+    let (store, secret) =
+        hellas_authority::test_support::common_node::bootstrap_node_with_credential(
+            &root.path().join("provider-state/grants"),
+            hellas_authority::model::grant::grant_network(),
+            Some(provider_enrollment(&identity)),
+            now,
+        )
+        .await
+        .unwrap();
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let mut relays = remote::Relays::start(&devnet).await;
@@ -593,8 +596,8 @@ async fn paid_setup(
     )
     .await;
     let authority = provider.administration().unwrap().node();
-    let caller = hellas_work::test_support::session(&authority, &secret).await;
-    let command = || hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
+    let caller = hellas_authority::test_support::session(&authority, &secret).await;
+    let command = || hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
         expected_revision: auth::Revision(0),
         policy: Box::new(paid_policy()),
     };
@@ -614,14 +617,16 @@ async fn paid_setup(
             .unwrap()
             .execute(&caller, auth::GrantId([0; 16]), command())
             .await,
-        Err(hellas_work::work_store::grant::NodeStoreError::Authority(
-            auth::AuthorityError::Revision
-        ))
+        Err(
+            hellas_authority::work_store::grant::NodeStoreError::Authority(
+                auth::AuthorityError::Revision
+            )
+        )
     ));
     let daily = authority
         .authenticate_session(
             &secret,
-            hellas_work::node::SessionKey::Node(&ROOT.node_key()),
+            hellas_authority::node::SessionKey::Node(&ROOT.node_key()),
         )
         .await
         .unwrap();
@@ -632,15 +637,17 @@ async fn paid_setup(
             .execute(
                 &daily,
                 auth::GrantId([0; 16]),
-                hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
+                hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
                     expected_revision: auth::Revision(1),
                     policy: Box::new(paid_policy())
                 }
             )
             .await,
-        Err(hellas_work::work_store::grant::NodeStoreError::Authority(
-            auth::AuthorityError::StepUp
-        ))
+        Err(
+            hellas_authority::work_store::grant::NodeStoreError::Authority(
+                auth::AuthorityError::StepUp
+            )
+        )
     ));
     drop(authority);
     let client_transport = iroh::SecretKey::generate();
@@ -1197,7 +1204,7 @@ async fn provider_close_offline(
     session.shutdown().await;
     drop(session);
     let provider_before = holdings(devnet, PROVIDER_OWNER.key()).await;
-    let start = hellas_work::work_close::close_start(
+    let start = hellas_channel::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
         devnet.height(),
@@ -1295,8 +1302,8 @@ fn automatic_offers_fund_and_settle_evaluate_with_bounded_stake() {
 #[test]
 fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
     use hellas_chain::WorkBlocks;
-    use hellas_work::work_close::{BlockSourceError, FinalizedBlocks as _};
-    use hellas_work::work_open::{SetupQuery, SetupView as _};
+    use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
+    use hellas_channel::work_open::{SetupQuery, SetupView as _};
 
     run(|runtime| async move {
         let mut devnet = Devnet::start(

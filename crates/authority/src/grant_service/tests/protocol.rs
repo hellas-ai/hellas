@@ -12,24 +12,24 @@ mod rpc_stream;
 mod sponsorship;
 mod usage;
 
-use crate::model::{
-    grant::{budget::*, standing::*, *},
-    work::*,
-};
 use crate::test_support::*;
+use hellas_authority::{grant_service::GrantService, work_store::grant::*};
+use hellas_channel::test_support::transport;
 use hellas_rpc::{pb::work::*, *};
 use hellas_wire::{
     AuthLevel, Dispatcher, PeerIdentity, StreamTransport, TransportContext, mux::MuxTransport,
 };
-use hellas_work::test_support::transport;
-use hellas_work::{grant_service::GrantService, work_store::grant::*};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
+use {
+    crate::model::grant::budget::*, crate::model::grant::standing::*, crate::model::grant::*,
+    hellas_channel::model::work::*,
+};
 
-use crate::test_support::backend::{Backend, Reply};
+use hellas_channel::test_support::backend::{Backend, Reply};
 fn context() -> TransportContext {
     TransportContext {
         peer: Some(PeerIdentity([1; 32])),

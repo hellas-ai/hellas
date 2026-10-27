@@ -5,8 +5,8 @@ use crate::model::grant::{
     records::GrantPolicy,
 };
 use crate::model::http_usage::{AccountingProfile, Mode, UsageDecoder};
-use crate::model::profile::WorkPolicy;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hellas_channel::model::profile::WorkPolicy;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent};
 use std::time::Duration;
@@ -105,7 +105,7 @@ mod tests {
     use hellas_rpc::{Assurance, InputCommitment, fetch::FetchOutputTranscriptBuilder};
 
     fn transcript(usage: Option<hellas_rpc::output::Usage>) -> Vec<OutputEventEnvelope> {
-        let key = crate::test_support::principal(2).1;
+        let key = hellas_channel::test_support::principal(2).1;
         FetchOutputTranscriptBuilder::new(
             InputCommitment::from_digest(Digest::hash(b"accounting fixture")),
             Assurance::ProducerSigned,

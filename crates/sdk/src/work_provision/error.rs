@@ -4,11 +4,11 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
-    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
+    Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error(transparent)]
-    Offer(#[from] hellas_work::model::offer::PaidOfferError),
+    Offer(#[from] hellas_channel::model::offer::PaidOfferError),
     #[error("bond timeout {timeout} must be after finalized height {height}")]
     ExpiredBond { timeout: u64, height: u64 },
     #[error("bond timeout exceeds the chain maximum lifetime")]
@@ -32,21 +32,21 @@ pub enum ProvisionError {
     #[error("work journal under {}: {source}", root.display())]
     Journal {
         root: PathBuf,
-        source: hellas_work::work_store::WorkStoreError,
+        source: hellas_channel::work_store::WorkStoreError,
     },
     #[error("setup journal {} cannot be identified: {source}", path.display())]
     Unidentified {
         path: PathBuf,
-        source: hellas_work::work_store::SetupDiscoveryError,
+        source: hellas_channel::work_store::SetupDiscoveryError,
     },
     #[error("the local node is not ready with a finalized block to floor this offer at")]
     NoFinalizedBlock,
     #[error(transparent)]
-    Setup(#[from] hellas_work::work_handshake::SetupExchangeError),
+    Setup(#[from] hellas_channel::work_handshake::SetupExchangeError),
     #[error(transparent)]
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]
     Config(#[from] crate::work_config::WorkConfigError),
     #[error(transparent)]
-    BlockSource(#[from] hellas_work::work_close::BlockSourceError),
+    BlockSource(#[from] hellas_channel::work_close::BlockSourceError),
 }

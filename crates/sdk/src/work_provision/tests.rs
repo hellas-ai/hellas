@@ -1,16 +1,16 @@
 use super::*;
 use hellas_auth::test_support::actors::{FRIEND, ROOT};
 use hellas_auth::{Digest, ProducerSigningKey};
+use hellas_channel::model::work::{EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannelPolicyV1};
+use hellas_channel::work_store::discover_setups;
 use hellas_kernel::{EdgeValues, Fees};
-use hellas_work::model::work::{EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_work::work_store::discover_setups;
 
 fn signer(seed: u8) -> Secp256k1Signer {
     Secp256k1Signer::from_secret_scalar([seed; 32]).unwrap()
 }
 fn options(root: &Path) -> ProvisionOptions {
     let key = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
-    let provider = hellas_work::test_support::enrollment(&key, &key, [7; 32], [3; 32]);
+    let provider = hellas_channel::test_support::enrollment(&key, &key, [7; 32], [3; 32]);
     ProvisionOptions {
         network: NetworkId::new("hellas-devnet-1").unwrap(),
         journal_root: root.to_path_buf(),
@@ -256,7 +256,7 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
             }
         }
         if let Ok(signed) =
-            serde_json::from_value::<hellas_work::model::offer::SignedPaidOffer>(changed)
+            serde_json::from_value::<hellas_channel::model::offer::SignedPaidOffer>(changed)
         {
             assert!(signed.check().is_err(), "mutated {field}");
         }

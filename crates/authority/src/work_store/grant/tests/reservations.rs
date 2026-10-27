@@ -1,10 +1,10 @@
 use super::*;
-use crate::test_support::{
-    actors::{FRIEND, PROVIDER, ROOT},
-    ids,
-};
 use hellas_auth::{Signature, authority::AuthenticatedCaller};
 use std::num::NonZeroU16;
+use {
+    crate::test_support::ids, hellas_channel::test_support::actors::FRIEND,
+    hellas_channel::test_support::actors::PROVIDER, hellas_channel::test_support::actors::ROOT,
+};
 
 fn shared_budget() -> BudgetNode {
     BudgetNode::Subject {

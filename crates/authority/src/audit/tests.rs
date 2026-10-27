@@ -1,8 +1,8 @@
 use crate::model::grant::admin::WorkControlCommand;
-use crate::model::work::PrivateRecord;
-use crate::test_support::assert_err;
 use crate::{grant_service::GrantService, node::NodeCoordinator, test_support as common};
 use hellas_auth::authority::*;
+use hellas_channel::model::work::PrivateRecord;
+use hellas_channel::test_support::assert_err;
 use hellas_rpc::pb::work::*;
 use std::{
     collections::BTreeMap,

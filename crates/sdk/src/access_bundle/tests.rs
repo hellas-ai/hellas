@@ -1,7 +1,9 @@
 use super::*;
-use hellas_work::model::grant::records::Offer;
-use hellas_work::test_support::{
-    definition, ids, network, node_key, principal, software_enrollment,
+use hellas_authority::model::grant::records::Offer;
+use {
+    hellas_authority::test_support::definition, hellas_authority::test_support::ids,
+    hellas_channel::test_support::network, hellas_channel::test_support::node_key,
+    hellas_channel::test_support::principal, hellas_channel::test_support::software_enrollment,
 };
 
 fn offer(allowance: GrantId, subject: PrincipalId) -> SignedOffer {

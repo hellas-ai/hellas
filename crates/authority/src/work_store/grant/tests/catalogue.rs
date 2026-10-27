@@ -2,9 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn signed_model_and_settings_limits_reject_before_client_signing_and_provider_reservation() {
-    use crate::model::fetch::PreparedPaidFetchInputV1;
     use crate::model::grant::resource::TemplateError;
-    use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
+    use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
+    use hellas_channel::model::fetch::PreparedPaidFetchInputV1;
     let directory = tempfile::tempdir().unwrap();
     let (mut store, application) = setup(&directory.path().join("provider")).await;
     let now = UnixMillis(1000);
@@ -14,12 +14,12 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
     let mut client = GrantClientStore::open(
         &directory.path().join("client"),
         network(),
-        crate::test_support::software_enrollment(2, [2; 32]),
+        hellas_channel::test_support::software_enrollment(2, [2; 32]),
         GrantChannelState {
             id: template.channel_id,
             grant: template.grant_id,
             generation: 0,
-            client: crate::test_support::channel_client(principal(1).0),
+            client: hellas_channel::test_support::channel_client(principal(1).0),
         },
         now,
     )
@@ -120,7 +120,9 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
     let store = NodeStore::open(
         &directory.path().join("provider"),
         network(),
-        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        Some(hellas_channel::test_support::software_enrollment(
+            2, [2; 32],
+        )),
         now,
     )
     .await
@@ -246,7 +248,9 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
     let store = NodeStore::open(
         directory.path(),
         network(),
-        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        Some(hellas_channel::test_support::software_enrollment(
+            2, [2; 32],
+        )),
         now,
     )
     .await
@@ -339,7 +343,7 @@ async fn rename_resource(node: &mut TestNode) -> GrantPolicy {
 
 #[tokio::test]
 async fn resource_revision_releases_queued_work() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let queued = node.proposal(FRIEND, ids::ALLOWANCE, 1);
@@ -411,7 +415,7 @@ async fn a_resource_cannot_move_to_another_account() {
 
 #[tokio::test]
 async fn checkpoints_bind_every_policy_copy_to_its_account() {
-    use crate::test_support::{actors::FRIEND, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
     let request = node.proposal(FRIEND, ids::ALLOWANCE, 1);
@@ -446,7 +450,7 @@ async fn checkpoints_bind_every_policy_copy_to_its_account() {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[cfg(test)]
 fn test_items_contract() -> hellas_rpc::FetchContract {

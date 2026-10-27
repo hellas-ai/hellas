@@ -1,7 +1,7 @@
 //! One response's live authority, serialized with each carrier write.
 use super::*;
-use crate::endpoint_lock::OwnedEndpointGuard;
-use crate::work::admission::Cancellation;
+use hellas_channel::endpoint_lock::OwnedEndpointGuard;
+use hellas_channel::work::admission::Cancellation;
 use std::{io, task::Context};
 
 pub(crate) struct Delivery {

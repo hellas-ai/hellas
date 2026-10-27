@@ -14,6 +14,17 @@
 //! `the_real_input_constructor_passes_the_whole_pipeline`.
 
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
+use hellas_channel::model::fetch::{
+    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, check_fetch_authorization,
+    check_fetch_policy, check_prepared_fetch_input, fetch_canonical_output_digest,
+    fetch_policy_digest, fetch_route_commitment, prepared_fetch_input_digest,
+    propose_fetch_authorization, terminal_fetch_result,
+};
+use hellas_channel::model::work::{
+    CreditLedger, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    PaidWorkError, PrivateRecord, check_authorization, check_result, next_payment, result_digest,
+    signing_hash, work_id, work_policy_digest,
+};
 use hellas_kernel::{
     BlockHeight, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, PartyKeys, Payout,
     Secp256k1Signer, Secp256k1Verifier, SigVerifier, WorkPaymentSettlement, WorkPaymentTerms,
@@ -27,17 +38,6 @@ use hellas_rpc::output::{OutputEvent, StopReason, TextChannel, Usage};
 use hellas_rpc::{
     Assurance, ContentId, InputCommitment, InputEventEnvelope, InputTranscriptBuilder, Operation,
     OutputEventEnvelope, ProgramManifest, RequestCommitment, Retention, scheme_id,
-};
-use hellas_work::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, check_fetch_authorization,
-    check_fetch_policy, check_prepared_fetch_input, fetch_canonical_output_digest,
-    fetch_policy_digest, fetch_route_commitment, prepared_fetch_input_digest,
-    propose_fetch_authorization, terminal_fetch_result,
-};
-use hellas_work::model::work::{
-    CreditLedger, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PaidWorkError, PrivateRecord, check_authorization, check_result, next_payment, result_digest,
-    signing_hash, work_id, work_policy_digest,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ fn payment_terms() -> WorkPaymentTerms {
     WorkPaymentTerms {
         bond_edge: EdgeId::from_bytes([0xb0; 32]),
         bond_terms: bond,
-        private_policy_commitment: hellas_work::model::work::private_policy_commitment(
+        private_policy_commitment: hellas_channel::model::work::private_policy_commitment(
             network(),
             &SALT,
             &channel_policy(),
@@ -152,7 +152,7 @@ fn channel() -> PaidChannel {
 /// A channel on another network, or another payment edge.
 fn channel_on(network: NetworkId, payment_edge: EdgeId) -> PaidChannel {
     let terms = WorkPaymentTerms {
-        private_policy_commitment: hellas_work::model::work::private_policy_commitment(
+        private_policy_commitment: hellas_channel::model::work::private_policy_commitment(
             network,
             &SALT,
             &channel_policy(),
@@ -927,7 +927,7 @@ fn check_fetch_authorization_refusals() {
     dear_policy.fixed_price = 501;
     let mut dear = propose(&channel, &policy, &bundle());
     dear.price = dear_policy.fixed_price;
-    dear.payment_policy_digest = hellas_work::model::work::job_payment_policy_digest(
+    dear.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
         channel.network(),
         channel.id(),
         &dear_policy,
@@ -1356,7 +1356,7 @@ fn open_fetch_checks_manifest_host_and_tls_pins() {
 
 #[test]
 fn paid_fetch_result_cannot_downgrade_the_signed_assurance() {
-    use hellas_work::model::profile::PreparedWorkInput;
+    use hellas_channel::model::profile::PreparedWorkInput;
     let channel = channel();
     let input = signed_input(
         &caller_key(),
@@ -1418,7 +1418,7 @@ fn terminal_fetch_result_is_pinned() {
     // profile-agnostic result check accepts it.
     let encoded = result.encode();
     assert_eq!(
-        hellas_work::model::work::PaidJobResultV1::decode(&encoded),
+        hellas_channel::model::work::PaidJobResultV1::decode(&encoded),
         Ok(result)
     );
     assert_eq!(
@@ -1701,7 +1701,7 @@ fn the_two_profiles_do_not_mix() {
 
     // An evaluate execution policy over the same environment is not a
     // fetch policy: different domains, different digests.
-    let evaluate_policy = hellas_work::model::work::EvaluatePolicyV2 {
+    let evaluate_policy = hellas_channel::model::work::EvaluatePolicyV2 {
         allowed_environment: fetch_policy.allowed_environment,
         generation_policy_digest: Digest::from_bytes([0x41; 32]),
         identity_source_digest: Digest::from_bytes([0x42; 32]),
@@ -1750,8 +1750,8 @@ fn the_two_profiles_do_not_mix() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 250,
         dispatch_margin_blocks: 20,
         delivery_margin_blocks: 10,
@@ -1759,4 +1759,4 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

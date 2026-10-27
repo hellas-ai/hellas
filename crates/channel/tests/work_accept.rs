@@ -12,6 +12,28 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_auth::PublicKey;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::{ReadyChannel, WorkChannelDescriptor, payment_terms_hash};
+use hellas_channel::model::work::{
+    JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
+    propose_authorization, signing_hash, work_id, work_policy_digest,
+};
+use hellas_channel::test_support::channel::{
+    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle,
+    bundle_bytes, channel_policy, client, deadlines, descriptor,
+    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, manifest,
+    network, origin, payload_at, payment_edge, payment_policy, payment_terms, prompt_tokens,
+    provider, settlement, signer, text_execution, text_policy, work_policy,
+};
+use hellas_channel::test_support::channel::{accept_uploaded, accept_uploaded_service};
+use hellas_channel::work::{
+    ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
+    WorkRefusal, WorkService, propose_work,
+};
+use hellas_channel::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
+use hellas_channel::work_store::{
+    Channel, ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+};
 use hellas_kernel::{
     EdgeId, EdgeValues, Fees, PayloadHash, Secp256k1Signer, Secp256k1Verifier, Sig,
     SigVerifier as _, WorkPaymentSettlement, work_payment_settlement,
@@ -27,28 +49,6 @@ use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_rpc::{ContentId, Evaluate};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, payment_terms_hash};
-use hellas_work::model::work::{
-    JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
-    propose_authorization, signing_hash, work_id, work_policy_digest,
-};
-use hellas_work::test_support::channel::{
-    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle,
-    bundle_bytes, channel_policy, client, deadlines, descriptor,
-    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, manifest,
-    network, origin, payload_at, payment_edge, payment_policy, payment_terms, prompt_tokens,
-    provider, settlement, signer, text_execution, text_policy, work_policy,
-};
-use hellas_work::test_support::channel::{accept_uploaded, accept_uploaded_service};
-use hellas_work::work::{
-    ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
-    WorkRefusal, WorkService, propose_work,
-};
-use hellas_work::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
-use hellas_work::work_store::{
-    Channel, ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
-};
 
 mod support;
 
@@ -64,7 +64,7 @@ fn ready() -> ReadyChannel {
 }
 
 fn ready_with_descriptor(descriptor: WorkChannelDescriptor) -> ReadyChannel {
-    hellas_work::test_support::channel::ready_of(&descriptor, CURSOR)
+    hellas_channel::test_support::channel::ready_of(&descriptor, CURSOR)
 }
 
 async fn store(root: &std::path::Path, role: Role) -> ChannelStore {
@@ -222,7 +222,7 @@ fn refusal_text(response: &AcceptWorkResponse) -> String {
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
 
-use hellas_work::test_support::transport;
+use hellas_channel::test_support::transport;
 use transport::transport_pair;
 
 /// Serves one provider endpoint over one transport until the caller
@@ -753,7 +753,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
     };
     assert_eq!(
         progress,
-        hellas_work::work_close::CloseProgress::Nothing,
+        hellas_channel::work_close::CloseProgress::Nothing,
         "this channel has no contest and no retained start, so nothing was sent",
     );
     assert_eq!(
@@ -776,7 +776,7 @@ struct NoSink {
     taken: AtomicUsize,
 }
 
-impl hellas_work::work_close::TxSink for NoSink {
+impl hellas_channel::work_close::TxSink for NoSink {
     async fn submit(
         &self,
         _tx: hellas_kernel::Tx,
@@ -1861,14 +1861,14 @@ async fn the_wire_carries_the_authorization_the_signature_covers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_observer_does_not_hold_the_journal_during_chain_io() {
-    use hellas_work::work::{ClientChannel as _, ClientService};
+    use hellas_channel::work::{ClientChannel as _, ClientService};
     let root = temp();
     let mut service = ClientService::new(client_endpoint(root.path()).await);
     service
         .observer()
         .observe_ready(
             ready(),
-            hellas_work::work::ObservationTime::now(),
+            hellas_channel::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
         .await
@@ -1907,7 +1907,7 @@ async fn client_observer_does_not_hold_the_journal_during_chain_io() {
 
 #[tokio::test]
 async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance() {
-    use hellas_work::work::ClientService;
+    use hellas_channel::work::ClientService;
     let client_root = temp();
     let provider_root = temp();
     let mut client = ClientService::new(client_endpoint(client_root.path()).await);
@@ -1915,7 +1915,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
         .observer()
         .observe_ready(
             ready(),
-            hellas_work::work::ObservationTime::now(),
+            hellas_channel::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
         .await
@@ -1964,7 +1964,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
 
 #[tokio::test]
 async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() {
-    use hellas_work::work::{ClientChannel as _, ClientService};
+    use hellas_channel::work::{ClientChannel as _, ClientService};
     let client_root = temp();
     let provider_root = temp();
     let mut client = ClientService::new(client_endpoint(client_root.path()).await);
@@ -1982,7 +1982,7 @@ async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readin
         std::time::Duration::ZERO,
         std::time::Duration::from_secs(30),
     ] {
-        let started = hellas_work::work::ObservationTime::now();
+        let started = hellas_channel::work::ObservationTime::now();
         client
             .observer()
             .observe_ready(ready(), started, max_age)

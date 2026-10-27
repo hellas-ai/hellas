@@ -1,4 +1,4 @@
-//! Paid Fetch runs have their own durable admission in hellas-work. Bodies
+//! Paid Fetch runs have their own durable admission in hellas-channel. Bodies
 //! remain in memory; the payment journal owns recovery.
 
 use futures_util::future::BoxFuture;
@@ -7,11 +7,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::{
+use hellas_channel::work::{
     BackendFault, PreparedFetchInput,
     admission::{AdmittedWork, RunningWork},
 };
+use hellas_rpc::OutputEventEnvelope;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument as _;
 
@@ -22,11 +22,11 @@ use crate::fetch_policy::FetchRoute;
 use crate::fetch_provider::FetchCall;
 
 pub(super) struct PendingPaidFetch {
-    parts: hellas_work::model::fetch::PreparedPaidFetchInputParts,
-    policy: hellas_work::model::fetch::FetchPolicyV2,
+    parts: hellas_channel::model::fetch::PreparedPaidFetchInputParts,
+    policy: hellas_channel::model::fetch::FetchPolicyV2,
     is_owed: bool,
     dispatch: BoxFuture<'static, Result<RunningWork, BackendFault>>,
-    progress: Option<hellas_work::work::PaidProgress>,
+    progress: Option<hellas_channel::work::PaidProgress>,
     reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
     span: tracing::Span,
 }
@@ -41,7 +41,7 @@ impl Executor {
     pub(super) fn queue_paid_fetch(
         &mut self,
         input: PreparedFetchInput<AdmittedWork>,
-        progress: Option<hellas_work::work::PaidProgress>,
+        progress: Option<hellas_channel::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
         span: tracing::Span,
     ) {
@@ -144,7 +144,7 @@ impl Executor {
                     let _ = completion.send(ExecutorCompletion::PaidFetch {
                         reply,
                         result: Err(ExecutorError::Backend(
-                            hellas_work::work::admission::AdmissionError::Cancelled.into(),
+                            hellas_channel::work::admission::AdmissionError::Cancelled.into(),
                         )),
                     }).await;
                     return;
@@ -179,7 +179,7 @@ impl Executor {
                         ExecutorError::Execution("paid fetch upstream or projection failed".into())
                     })
                     .and_then(|run| {
-                        hellas_work::model::fetch::check_fetch_output_limits(
+                        hellas_channel::model::fetch::check_fetch_output_limits(
                             &policy,
                             &run.output_events,
                         )
@@ -200,14 +200,14 @@ impl Executor {
 
     fn prepare_paid_fetch(
         &self,
-        parts: hellas_work::model::fetch::PreparedPaidFetchInputParts,
-        policy: hellas_work::model::fetch::FetchPolicyV2,
+        parts: hellas_channel::model::fetch::PreparedPaidFetchInputParts,
+        policy: hellas_channel::model::fetch::FetchPolicyV2,
     ) -> Result<
         (
             crate::FetchRouteEntry,
             crate::FetchAdaptorSession,
             hellas_rpc::fetch::FetchInput,
-            hellas_work::model::fetch::FetchPolicyV2,
+            hellas_channel::model::fetch::FetchPolicyV2,
         ),
         ExecutorError,
     > {
@@ -271,7 +271,7 @@ pub(super) fn poll_dispatch(
 }
 
 #[cfg(test)]
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[cfg(test)]
 mod tests {
@@ -281,6 +281,8 @@ mod tests {
 
     use futures_util::stream;
     use hellas_auth::{Digest, ProducerSigningKey};
+    use hellas_channel::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
+    use hellas_channel::work::PaidProgress;
     use hellas_rpc::fetch::{
         FetchTerminalPayload, build_input_events_with_retention, decode_fetch_event_payload,
         decode_fetch_terminal_payload, encode_fetch_event_payload, encode_fetch_terminal_payload,
@@ -288,8 +290,6 @@ mod tests {
     };
     use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
     use hellas_rpc::{Assurance, ContentId, InputCommitment, InputEventEnvelope, Retention};
-    use hellas_work::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
-    use hellas_work::work::PaidProgress;
     use tokio::sync::Notify;
     use tokio::time::timeout;
 
@@ -554,12 +554,12 @@ mod tests {
         input: PreparedFetchInput,
         progress: Option<PaidProgress>,
     ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
-        let input = input
-            .reserve(
-                handle
-                    .reserve_payment_capacity(hellas_work::work::admission::CapacityDomain::Fetch),
-            )
-            .await?;
+        let input =
+            input
+                .reserve(handle.reserve_payment_capacity(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                ))
+                .await?;
         let (reply, receive) = oneshot::channel();
         handle
             .owed_tx
@@ -821,7 +821,7 @@ mod tests {
                         Assurance::ProducerSigned,
                     ))
                     .reserve(handle.reserve_payment_capacity(
-                        hellas_work::work::admission::CapacityDomain::Fetch,
+                        hellas_channel::work::admission::CapacityDomain::Fetch,
                     ))
                     .await
                     .unwrap(),

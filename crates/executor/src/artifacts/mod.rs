@@ -1,10 +1,10 @@
 //! Validate the canonical input graph carried by an admitted Work job.
 use crate::{ExecutorError, state::Invocation};
+use hellas_channel::model::prepared_input::PreparedPaidInputParts;
 use hellas_rpc::protocol::artifacts::{
     InputAddressed, OutputAddressed, SourceRef, TextArtifact, TokenIds,
 };
 use hellas_rpc::{EvaluateRequest, ProgramManifest};
-use hellas_work::model::prepared_input::PreparedPaidInputParts;
 pub(crate) struct ResolvedEvaluateExecution {
     pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,

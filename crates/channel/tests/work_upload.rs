@@ -1,17 +1,5 @@
 use hellas_auth::Digest;
-use hellas_kernel::{PendingSlot, Secp256k1Verifier};
-use hellas_rpc::{
-    ContentId, ContentRef,
-    pb::work::{AcceptWorkRequest, UploadContentRequest, accept_work_response},
-    protocol::{
-        artifacts::{
-            InputAddressed as _, OutputAddressed as _, SourceRef, TextExecution, TokenIds,
-        },
-        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
-    },
-};
-use hellas_wire::TransportContext;
-use hellas_work::{
+use hellas_channel::{
     content::{ContentError, UploadQuota, UploadStore},
     model::{
         prepared_input::PreparedPaidInputV1,
@@ -24,6 +12,18 @@ use hellas_work::{
     work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService},
     work_store::{ChannelStore, Role},
 };
+use hellas_kernel::{PendingSlot, Secp256k1Verifier};
+use hellas_rpc::{
+    ContentId, ContentRef,
+    pb::work::{AcceptWorkRequest, UploadContentRequest, accept_work_response},
+    protocol::{
+        artifacts::{
+            InputAddressed as _, OutputAddressed as _, SourceRef, TextExecution, TokenIds,
+        },
+        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
+    },
+};
+use hellas_wire::TransportContext;
 
 fn ready(policy: EvaluatePolicyV2) -> ReadyChannel {
     descriptor_with(policy)
@@ -198,8 +198,8 @@ async fn close_clears_staging_and_cannot_be_followed_by_another_upload() {
 
 #[tokio::test]
 async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after_crash() {
+    use hellas_channel::work_store::ChannelRecord;
     use hellas_kernel::Sig;
-    use hellas_work::work_store::ChannelRecord;
     let root = tempfile::tempdir().unwrap();
     let r = ready(work_policy());
     let provider_root = root.path().join("provider");
@@ -291,8 +291,8 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
 
 #[tokio::test]
 async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
+    use hellas_channel::work_store::{ChannelRecord, TerminalOutcome, journal::Journal};
     use hellas_kernel::Sig;
-    use hellas_work::work_store::{ChannelRecord, TerminalOutcome, journal::Journal};
     let root = tempfile::tempdir().unwrap();
     let r = ready(work_policy());
     let provider_root = root.path().join("provider");
@@ -403,8 +403,8 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
 
 #[tokio::test]
 async fn failed_cosign_journal_append_cannot_publish_content_and_retry_recovers() {
+    use hellas_channel::work_store::ChannelRecord;
     use hellas_kernel::Sig;
-    use hellas_work::work_store::ChannelRecord;
     use sqlx::Connection as _;
     let root = tempfile::tempdir().unwrap();
     let r = ready(work_policy());

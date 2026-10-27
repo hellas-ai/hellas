@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{actors::FRIEND, ids};
+use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
 
 #[derive(Clone, Copy, Debug)]
 enum Profile {

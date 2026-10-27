@@ -8,10 +8,9 @@ pub use hellas_attestation::{AttestationError, Attester, Binding, RootProver};
 pub use hellas_chain::node::{Config as ChainNodeConfig, FullNode};
 pub use hellas_rpc as rpc;
 pub use hellas_wire as wire;
-pub use hellas_work as work;
 
 #[cfg(test)]
-use hellas_work::test_support::common_node as test_node;
+use hellas_authority::test_support::common_node as test_node;
 
 mod counter_store;
 pub use counter_store::FilesystemAssertionCounterStore;

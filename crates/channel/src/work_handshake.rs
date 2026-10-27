@@ -87,7 +87,7 @@
 //! edge, so terms that fail them yield a channel this endpoint will
 //! never admit work over. It is bounded by the stake sitting locked
 //! until the horizon, and no automatic step returns it — see
-//! `hellas_work::work_open`'s note on `SetupDecision::TimeoutBond`.
+//! `hellas_channel::work_open`'s note on `SetupDecision::TimeoutBond`.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;

@@ -2,8 +2,8 @@
 use super::{NodeStore, NodeStoreError};
 use crate::grant_service::{Access, ResultCache};
 use crate::model::grant::{GrantJobAuthorizationV1, records::GrantError};
-use crate::work::admission::{CancelOnFailure, Cancellation};
 use hellas_auth::{Digest, authority::UnixMillis};
+use hellas_channel::work::admission::{CancelOnFailure, Cancellation};
 
 pub(super) struct ActiveExecution {
     authorization: GrantJobAuthorizationV1,
@@ -109,7 +109,7 @@ impl ActiveExecution {
             .state()
             .grant(a.grant_id)
             .ok_or(GrantError::Unauthorized)?;
-        if phase == Some(crate::work_store::JobPhase::Accepted) {
+        if phase == Some(hellas_channel::work_store::JobPhase::Accepted) {
             allowance.admit()?;
         }
         if now >= expires {

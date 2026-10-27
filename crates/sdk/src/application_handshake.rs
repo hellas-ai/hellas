@@ -1,15 +1,15 @@
 //! One bounded exchange before ordinary RPC framing. Lengths are checked before
 //! reading any body byte. Owned authentication buffers clear themselves on drop.
 use hellas_auth::{Digest, authority::*};
+use hellas_authority::{
+    node::{NodeCoordinator, SessionKey},
+    work_store::grant::NodeStoreError,
+};
 use hellas_rpc::authentication::{
     MAX_AUTHENTICATION_MESSAGE_BYTES, decode_challenge, decode_response, encode_challenge,
     encode_response,
 };
 use hellas_wire::{WireCode, WireStatus};
-use hellas_work::{
-    node::{NodeCoordinator, SessionKey},
-    work_store::grant::NodeStoreError,
-};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;

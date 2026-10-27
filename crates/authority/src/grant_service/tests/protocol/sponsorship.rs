@@ -107,11 +107,11 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
     assert_eq!(used(&store, budget(), Meter::Requests), 2);
     assert_eq!(
         store.state().channel_binding(a.channel_id).unwrap().client,
-        crate::test_support::channel_client(principal(1).0)
+        hellas_channel::test_support::channel_client(principal(1).0)
     );
     assert_eq!(
         store.state().channel_binding(b.channel_id).unwrap().client,
-        crate::test_support::channel_client(principal(3).0)
+        hellas_channel::test_support::channel_client(principal(3).0)
     );
     let service = GrantService::new(
         store,
@@ -124,9 +124,9 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
     // This grant now names actor 3; it still cannot expose actor 1's channel.
     let rebound = service.for_caller(other, JOURNAL_AUTHORIZATION);
     let locator = StandingLocator {
-        provider: crate::test_support::software_enrollment(2, [2; 32]).content_id(),
+        provider: hellas_channel::test_support::software_enrollment(2, [2; 32]).content_id(),
         grant: terms,
-        client: crate::test_support::channel_client(principal(1).0),
+        client: hellas_channel::test_support::channel_client(principal(1).0),
         generation: 0,
     };
     let response = rebound

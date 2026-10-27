@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::grant::pricing::{Pricing, UnitPrice};
-use crate::test_support::{actors::FRIEND, ids};
 use std::num::NonZeroU64;
+use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
 
 fn rate(meter: Meter, usd_micros: u64, units: u64) -> UnitPrice {
     UnitPrice {

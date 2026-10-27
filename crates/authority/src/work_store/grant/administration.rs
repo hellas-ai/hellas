@@ -20,7 +20,7 @@ pub(crate) enum WorkMutation {
     PaidPolicy {
         expected: Revision,
         policy_salt: [u8; 32],
-        policy: Box<crate::model::paid_policy::PaidPolicy>,
+        policy: Box<hellas_channel::model::paid_policy::PaidPolicy>,
     },
     Capacity {
         expected: Revision,

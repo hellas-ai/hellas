@@ -76,7 +76,7 @@ impl GrantWork {
             runtime.uploads.retain(|_, uploads| uploads.is_staged());
             let fresh = !runtime.uploads.contains_key(&a.channel_id.0);
             let uploads = runtime.uploads.entry(a.channel_id.0).or_insert_with(|| {
-                crate::content::UploadStore::memory(
+                hellas_channel::content::UploadStore::memory(
                     a.channel_id.0,
                     self.service.upload_quota.clone(),
                 )
@@ -105,9 +105,11 @@ impl GrantWork {
                     let bytes = uploads
                         .read(id, object)
                         .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                    let input =
-                        PreparedWorkInput::decode(&bytes, crate::content::MAX_CONTENT_BYTES)
-                            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                    let input = PreparedWorkInput::decode(
+                        &bytes,
+                        hellas_channel::content::MAX_CONTENT_BYTES,
+                    )
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                     let context = WorkContext {
                         network: store.state().network(),
                         channel: a.channel_id.0,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::content::UploadQuota;
+use hellas_channel::content::UploadQuota;
 use hellas_rpc::{
     ContentRef, pb::work::UploadContentRequest, protocol::content_upload::chunk_digest,
 };
@@ -143,7 +143,8 @@ async fn an_idle_partial_grant_upload_expires_without_another_request_or_mutatio
     })
     .await;
     assert_no_payload_files(root.path(), &bytes);
-    let mut probe = crate::content::UploadStore::memory(Digest::hash(b"quota after expiry"), quota);
+    let mut probe =
+        hellas_channel::content::UploadStore::memory(Digest::hash(b"quota after expiry"), quota);
     let all = vec![0; 1 << 20];
     probe
         .stage(
@@ -159,9 +160,9 @@ async fn an_idle_partial_grant_upload_expires_without_another_request_or_mutatio
 
 #[tokio::test]
 async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_staging() {
-    use crate::model::setup::ObservedChannel;
-    use crate::test_support::channel as paid;
-    use crate::work::{ProviderEndpoint, WorkService};
+    use hellas_channel::model::setup::ObservedChannel;
+    use hellas_channel::test_support::channel as paid;
+    use hellas_channel::work::{ProviderEndpoint, WorkService};
     let root = tempfile::tempdir().unwrap();
     let paid_bytes = paid::bundle_bytes(1);
     let (grants, work, request, bytes) =
@@ -189,7 +190,7 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
             paid::store_at(
                 &root.path().join("paid"),
                 &ready,
-                crate::work_store::Role::Provider,
+                hellas_channel::work_store::Role::Provider,
                 paid::CURSOR,
             )
             .await,
@@ -198,7 +199,7 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
         .unwrap(),
     );
     paid.set_upload_quota(quota.clone()).await.unwrap();
-    let a = crate::model::work::propose_authorization(
+    let a = hellas_channel::model::work::propose_authorization(
         ready.channel(),
         &paid::work_policy(),
         &paid::payment_policy(),
@@ -207,12 +208,12 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
         paid::deadlines(),
     )
     .unwrap();
-    let id = crate::model::work::work_id(ready.channel(), &a);
+    let id = hellas_channel::model::work::work_id(ready.channel(), &a);
     let req = AcceptWorkRequest {
         route: Some(WorkRoute::payment(a.channel_id)),
         authorization: a.encode(),
         client_signature: paid::client()
-            .sign(crate::model::work::signing_hash(id))
+            .sign(hellas_channel::model::work::signing_hash(id))
             .as_bytes()
             .to_vec(),
         prepared_input: paid_bytes.clone(),
@@ -261,7 +262,8 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
         .unwrap(),
         GrantRefusalCode::QueueCapacity
     );
-    let mut probe = crate::content::UploadStore::memory(Digest::hash(b"another channel"), quota);
+    let mut probe =
+        hellas_channel::content::UploadStore::memory(Digest::hash(b"another channel"), quota);
     let entire_cap = vec![0; paid_bytes.len().max(bytes.len())];
     probe
         .stage(

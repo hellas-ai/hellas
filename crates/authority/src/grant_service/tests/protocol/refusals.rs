@@ -1,7 +1,7 @@
 use super::*;
-use crate::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
-use crate::test_support::{actors::*, ids};
+use hellas_channel::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
 use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTrustRoots};
+use {crate::test_support::ids, hellas_channel::test_support::actors::*};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {

@@ -52,7 +52,7 @@ async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
     let root = f.directory.path().to_owned();
     let error = NodeStore::open(
         &root,
-        hellas_work::test_support::network(),
+        hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
     )
@@ -67,7 +67,7 @@ async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
             Box::pin(async move {
                 NodeStore::open(
                     &root,
-                    hellas_work::test_support::network(),
+                    hellas_channel::test_support::network(),
                     None,
                     UnixMillis(1000),
                 )

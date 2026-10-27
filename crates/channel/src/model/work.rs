@@ -6,7 +6,7 @@
 //! certificate, while these private records identify the job it paid for.
 //!
 //! [`CreditLedger`] checks cumulative payment arithmetic. Durable endpoint
-//! state in `hellas-work` prevents duplicate job payments across restarts.
+//! state in `hellas-channel` prevents duplicate job payments across restarts.
 //! Payment requires an authenticated result; local reproduction is optional.
 //! These records grant no correctness-challenge or slashing right.
 //!
@@ -683,7 +683,7 @@ pub(crate) fn xh(domain: &[u8], fields: &[&[u8]]) -> Digest {
 /// one-shot [`Digest::hash`] of the same concatenation under every write
 /// segmentation, which is what lets a caller stream a large body without
 /// holding it.
-pub(crate) fn xfh(domain: &[u8], fields: &[&[u8]]) -> Digest {
+pub fn xfh(domain: &[u8], fields: &[&[u8]]) -> Digest {
     let mut hasher = XetFileHasher::new();
     hasher.update(domain);
     for field in fields {

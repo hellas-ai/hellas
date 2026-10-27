@@ -11,6 +11,18 @@
 //! fails when the rule is deleted is not a rule.
 
 use hellas_auth::{Digest, PublicKey};
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::work::{
+    CreditLedger, EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1,
+    PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord,
+    canonical_output_digest, check_authorization, check_payment_policy_binding,
+    check_prepared_input, check_result, check_work_policy, decode_transcript, encode_transcript,
+    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
+    prepared_input_digest, private_policy_commitment, result_digest, work_id, work_policy_digest,
+};
+use hellas_channel::test_support::channel::{
+    identity_artifact, manifest, prompt_tokens, text_execution, text_policy,
+};
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, PartyKeys,
     Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentSettlement,
@@ -24,18 +36,6 @@ use hellas_rpc::protocol::artifacts::{
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
     EvaluateRequest, EventCommitment, ProgramManifest, RequestCommitment,
-};
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::work::{
-    CreditLedger, EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1,
-    PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord,
-    canonical_output_digest, check_authorization, check_payment_policy_binding,
-    check_prepared_input, check_result, check_work_policy, decode_transcript, encode_transcript,
-    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
-    prepared_input_digest, private_policy_commitment, result_digest, work_id, work_policy_digest,
-};
-use hellas_work::test_support::channel::{
-    identity_artifact, manifest, prompt_tokens, text_execution, text_policy,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
         payment_edge: channel.payment_edge(),
         payment_terms_hash: channel.payment_terms_hash(),
         work_policy_digest: work_policy_digest(&channel, &work_policy()),
-        payment_policy_digest: hellas_work::model::work::job_payment_policy_digest(
+        payment_policy_digest: hellas_channel::model::work::job_payment_policy_digest(
             channel.network(),
             channel.id(),
             &payment_policy(),
@@ -1104,7 +1104,7 @@ fn authorization_rules_reject_their_violations() {
     zero_price.price = 0;
     let mut zero_policy = payment_policy();
     zero_policy.fixed_price = 0;
-    zero_price.payment_policy_digest = hellas_work::model::work::job_payment_policy_digest(
+    zero_price.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
         channel.network(),
         channel.id(),
         &zero_policy,
@@ -1121,7 +1121,7 @@ fn authorization_rules_reject_their_violations() {
     over_bond.price = 501;
     let mut over_policy = payment_policy();
     over_policy.fixed_price = 501;
-    over_bond.payment_policy_digest = hellas_work::model::work::job_payment_policy_digest(
+    over_bond.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
         channel.network(),
         channel.id(),
         &over_policy,
@@ -1331,8 +1331,11 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     authorization.channel_id = channel.id();
     authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.price = 500;
-    authorization.payment_policy_digest =
-        hellas_work::model::work::job_payment_policy_digest(channel.network(), channel.id(), &dear);
+    authorization.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &dear,
+    );
     authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
     authorization.input_content = hellas_rpc::ContentRef::for_bytes(&bundle().encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &bundle());
@@ -1366,8 +1369,11 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     .expect("terms that commit to this credit policy");
     authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.channel_id = channel.id();
-    authorization.payment_policy_digest =
-        hellas_work::model::work::job_payment_policy_digest(channel.network(), channel.id(), &dear);
+    authorization.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &dear,
+    );
     authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
     assert_eq!(
         check_authorization(&channel, &authorization, &work_policy(), &dear, 900),
@@ -2744,8 +2750,8 @@ fn the_completed_output_derivation_is_reproducible_by_hand() {
     assert_ne!(longer.artifact, completed.artifact);
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 250,
         dispatch_margin_blocks: 20,
         delivery_margin_blocks: 10,

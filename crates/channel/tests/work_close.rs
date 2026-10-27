@@ -14,12 +14,33 @@
 //! before it sends, what it refuses once it has, and what its watcher
 //! does with the blocks that come back.
 
-use hellas_work::test_support::channel::NONCE;
-use hellas_work::test_support::transport::transport_pair;
+use hellas_channel::test_support::channel::NONCE;
+use hellas_channel::test_support::transport::transport_pair;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use support::temp;
 
 use hellas_auth::Digest;
+use hellas_channel::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
+use hellas_channel::model::work::{
+    PrivateRecord as _, propose_authorization, signing_hash, work_id,
+};
+use hellas_channel::test_support::channel::{
+    CURSOR, HORIZON, OMISSION_BOND, PRICE, SALT, advance, bond_edge, bond_object, bundle,
+    channel_policy, client, commit, deadlines, descriptor, lease_over, network, origin, payload_at,
+    payment_edge, payment_object, payment_policy, payment_terms, provider, settlement, signer,
+    store_at, work_policy,
+};
+use hellas_channel::work::{
+    ClientEndpoint, CloseEndpoint, PaymentError, ProviderEndpoint, WorkService, admit_payment,
+    fetch_result,
+};
+use hellas_channel::work_close::{
+    BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
+    close_start, response_body_digest, start_body_digest,
+};
+use hellas_channel::work_store::{
+    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, TerminalOutcome,
+};
 use hellas_kernel::{
     Edge, EdgeId, LeaseSlots, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PaymentCloseStart, Payout,
     PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Secp256k1Verifier, Terms,
@@ -29,29 +50,10 @@ use hellas_rpc::pb::work::{
     AcceptWorkRequest, WorkRefusalCode, accept_work_response::Outcome as AcceptOutcome,
 };
 use hellas_rpc::services::work::WorkClientImpl;
-use hellas_work::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
-use hellas_work::model::work::{PrivateRecord as _, propose_authorization, signing_hash, work_id};
-use hellas_work::test_support::channel::{
-    CURSOR, HORIZON, OMISSION_BOND, PRICE, SALT, advance, bond_edge, bond_object, bundle,
-    channel_policy, client, commit, deadlines, descriptor, lease_over, network, origin, payload_at,
-    payment_edge, payment_object, payment_policy, payment_terms, provider, settlement, signer,
-    store_at, work_policy,
-};
-use hellas_work::work::{
-    ClientEndpoint, CloseEndpoint, PaymentError, ProviderEndpoint, WorkService, admit_payment,
-    fetch_result,
-};
-use hellas_work::work_close::{
-    BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
-    close_start, response_body_digest, start_body_digest,
-};
-use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, TerminalOutcome,
-};
 
 mod support;
 
-use hellas_work::test_support::channel::{
+use hellas_channel::test_support::channel::{
     Checked, accept, authorization, checked_job, ready, run_to_result, serve_work as serve, stop,
 };
 
@@ -1790,7 +1792,7 @@ fn adjudicated(ready: &ReadyChannel, payout: u64) -> hellas_kernel::Tx {
 /// where a second write would have to show up — and the only place it
 /// could be counted from.
 async fn journal_records(root: &std::path::Path) -> usize {
-    use hellas_work::work_store::journal::Journal;
+    use hellas_channel::work_store::journal::Journal;
     let Ok(stems) = Journal::stems(root) else {
         panic!("the journal directory reads");
     };
@@ -1926,10 +1928,10 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
 // ── The signed window ─────────────────────────────────────────────────
 
 /// The same channel under another start-validity span.
-fn channel_with_span(span: u64) -> hellas_work::model::work::PaidChannel {
+fn channel_with_span(span: u64) -> hellas_channel::model::work::PaidChannel {
     let mut terms = payment_terms();
     terms.start_validity_blocks = span;
-    match hellas_work::model::work::PaidChannel::new(
+    match hellas_channel::model::work::PaidChannel::new(
         network(),
         payment_edge(),
         terms,
@@ -1943,8 +1945,8 @@ fn channel_with_span(span: u64) -> hellas_work::model::work::PaidChannel {
 
 #[test]
 fn close_witnesses_follow_the_actual_keys_for_sole_and_split_parties() {
+    use hellas_channel::work_close::close_response;
     use hellas_kernel::{Authority, EarnedCertificate, Parties, PartyKeys, StartId};
-    use hellas_work::work_close::close_response;
     for split in [false, true] {
         let client_owner = if split { signer(0x31) } else { client() };
         let provider_owner = if split { signer(0x32) } else { provider() };
@@ -1961,7 +1963,7 @@ fn close_witnesses_follow_the_actual_keys_for_sole_and_split_parties() {
                 split.then_some(client().party_key()),
             ),
         );
-        let channel = hellas_work::model::work::PaidChannel::new(
+        let channel = hellas_channel::model::work::PaidChannel::new(
             network(),
             payment_edge(),
             terms,
@@ -2655,10 +2657,10 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
     let serving = serve(server, fixture.service.clone());
     let refused = fetch_result(transport, &mut fixture.client, &ready, id).await;
     stop(serving).await;
-    let Err(hellas_work::work::DeliverError::Refused { refusal, .. }) = refused else {
+    let Err(hellas_channel::work::DeliverError::Refused { refusal, .. }) = refused else {
         panic!("a closed channel releases nothing: {refused:?}");
     };
-    assert_eq!(refusal, hellas_work::work::WorkRefusal::Declined);
+    assert_eq!(refusal, hellas_channel::work::WorkRefusal::Declined);
     assert_eq!(
         fixture.client.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted),
@@ -2710,8 +2712,8 @@ async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
         matches!(
             applied,
             Err(CatchUpError::Store(
-                hellas_work::work_store::WorkStoreError::Channel(
-                    hellas_work::work_store::ChannelStateError::CursorNotNext { held, actual }
+                hellas_channel::work_store::WorkStoreError::Channel(
+                    hellas_channel::work_store::ChannelStateError::CursorNotNext { held, actual }
                 )
             )) if held == CURSOR && actual == skipped
         ),
@@ -2823,7 +2825,7 @@ impl Mempool {
     }
 }
 
-impl hellas_work::work_close::TxSink for Mempool {
+impl hellas_channel::work_close::TxSink for Mempool {
     async fn submit(
         &self,
         tx: hellas_kernel::Tx,
@@ -3503,7 +3505,7 @@ async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
         .await
         .expect("a fresh readiness for this journal's own channel is taken");
 
-    match hellas_work::test_support::channel::accept_uploaded_service(
+    match hellas_channel::test_support::channel::accept_uploaded_service(
         &service,
         &signed_request(NONCE, 1),
     )

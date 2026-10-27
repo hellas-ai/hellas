@@ -1,6 +1,9 @@
 use super::*;
-use crate::test_support::{Actor, actors::*, assert_err, ids};
 use hellas_kernel::NetworkId;
+use {
+    crate::test_support::ids, hellas_channel::test_support::Actor,
+    hellas_channel::test_support::actors::*, hellas_channel::test_support::assert_err,
+};
 
 fn scope(actor: Actor) -> GrantSpec {
     crate::test_support::common_node::admin_spec(
@@ -223,12 +226,12 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 assert_eq!(node.store.lock().await.unwrap().state(), &before);
                 assert_err!(
                     crate::test_support::try_session(&node, &secret).await,
-                    NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
                 assert_err!(
                     node.begin_authentication(Digest::hash(b"new session"))
                         .await,
-                    NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
                 assert_err!(
                     node.grant(
@@ -236,16 +239,16 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                         issue(ids::ROOT_GRANT, ids::OPERATOR_GRANT, OPERATOR)
                     )
                     .await,
-                    NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
                 assert_err!(
                     node.status(&caller, ids::ROOT_GRANT).await,
-                    NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
                 assert_err!(
                     node.set_machine_capacity(&caller, ids::ROOT_GRANT, Revision(1), 3, vec![])
                         .await,
-                    NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
+                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
                 node.store.lock().await.unwrap().resume_statements(release).await;
                 drop(node);

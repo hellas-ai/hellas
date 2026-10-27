@@ -27,7 +27,7 @@ pub(super) fn discarded(cache: &ResultCache) {
 pub(super) async fn another_application(
     service: &GrantService,
     secret: &hellas_auth::authority::CredentialSecret,
-) -> hellas_work::grant_service::GrantWork {
+) -> hellas_authority::grant_service::GrantWork {
     let node = service.node();
     let admin = crate::test_support::session(&node, secret).await;
     let scope = snapshot(service)
@@ -42,7 +42,7 @@ pub(super) async fn another_application(
         &admin,
         GrantId([0; 16]),
         scope,
-        crate::test_support::holder(principal(1).0),
+        hellas_channel::test_support::holder(principal(1).0),
     )
     .await
     .unwrap();
@@ -68,7 +68,7 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
                 crate::test_support::accept_grant(
                     &work,
                     &request,
-                    &crate::test_support::principal(1).1,
+                    &hellas_channel::test_support::principal(1).1,
                 )
                 .await,
             );
@@ -95,8 +95,8 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
             } else {
                 assert!(
                     matches!(
-                        cause.downcast_ref::<crate::work::admission::AdmissionError>(),
-                        Some(crate::work::admission::AdmissionError::Cancelled)
+                        cause.downcast_ref::<hellas_channel::work::admission::AdmissionError>(),
+                        Some(hellas_channel::work::admission::AdmissionError::Cancelled)
                     ),
                     "{error:?}"
                 );
@@ -169,8 +169,12 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
     set_execution_expiry(&service, &secret, UnixMillis(1100)).await;
     let id = accepted_id(
-        crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1)
-            .await,
+        crate::test_support::accept_grant(
+            &work,
+            &request,
+            &hellas_channel::test_support::principal(1).1,
+        )
+        .await,
     );
     within(backend.started.notified()).await;
     backend.finish.release();
@@ -188,7 +192,9 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
     let reopened = NodeStore::open(
         dir.path(),
         network(),
-        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        Some(hellas_channel::test_support::software_enrollment(
+            2, [2; 32],
+        )),
         UnixMillis(1100),
     )
     .await
@@ -234,7 +240,7 @@ async fn discarded_prefix_still_verifies_usage_and_rejects_a_different_signed_co
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );
@@ -292,7 +298,7 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
             crate::test_support::accept_grant(
                 &work,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );

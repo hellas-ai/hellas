@@ -2,7 +2,7 @@
 //!
 //! # Why an adapter and not a blanket impl
 //!
-//! The watcher's block source is `hellas_work::work_close::FinalizedBlocks`
+//! The watcher's block source is `hellas_channel::work_close::FinalizedBlocks`
 //! and a light client is `crate::LightClient`. Both are foreign to each
 //! other, so nothing can implement the first for every one of the
 //! second; [`WorkBlocks`] is the one type that owns that pairing. It
@@ -42,13 +42,13 @@
 //! `WorkChannelSnapshot::finalized_setup` is what refuses to produce
 //! one from a snapshot that asked about other coins.
 
-use hellas_kernel::{Terms, Tx};
-use hellas_work::work::WorkService;
-use hellas_work::work_close::{
+use hellas_channel::work::WorkService;
+use hellas_channel::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
     TxSink,
 };
-use hellas_work::work_open::{FinalizedSetup, SetupQuery, SetupView};
+use hellas_channel::work_open::{FinalizedSetup, SetupQuery, SetupView};
+use hellas_kernel::{Terms, Tx};
 
 use crate::SubmitTxOutcome;
 use crate::block_view::FinalizedBlockView;
@@ -439,16 +439,16 @@ mod tests {
 
     use hellas_rpc::protocol::ContentId;
 
-    use hellas_work::model::setup::{
+    use hellas_channel::model::setup::{
         ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
     };
-    use hellas_work::model::work::{
+    use hellas_channel::model::work::{
         EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
     };
-    use hellas_work::work_close::{BlockSourceError, adjudicated_close, close_start};
-    use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-    use hellas_work::work_store::{
+    use hellas_channel::work_close::{BlockSourceError, adjudicated_close, close_start};
+    use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+    use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+    use hellas_channel::work_store::{
         Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
         SetupStore, WorkStoreError,
     };
@@ -518,7 +518,7 @@ mod tests {
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
-        hellas_work::test_support::channel::bond_terms_for(
+        hellas_channel::test_support::channel::bond_terms_for(
             Parties::new(
                 hellas_kernel::PartyKeys::sole(provider().party_key()),
                 hellas_kernel::PartyKeys::sole(client().party_key()),
@@ -538,11 +538,11 @@ mod tests {
     }
 
     fn channel_policy() -> PaidChannelPolicyV1 {
-        hellas_work::test_support::channel::credit_policy(40, 40)
+        hellas_channel::test_support::channel::credit_policy(40, 40)
     }
 
     fn work_policy() -> EvaluatePolicyV2 {
-        hellas_work::test_support::channel::evaluate_policy(
+        hellas_channel::test_support::channel::evaluate_policy(
             ContentId::from_bytes([0x31; 32]),
             ProtocolDigest::from_bytes([0x32; 32]),
             ProtocolDigest::from_bytes([0x33; 32]),
@@ -568,7 +568,7 @@ mod tests {
     }
 
     fn payment_terms() -> WorkPaymentTerms {
-        hellas_work::test_support::channel::payment_terms_for(
+        hellas_channel::test_support::channel::payment_terms_for(
             bond_edge(),
             bond_terms(),
             private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
@@ -750,7 +750,7 @@ mod tests {
             PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
 
-        hellas_work::test_support::channel::finish_setup(
+        hellas_channel::test_support::channel::finish_setup(
             &service,
             &mut caller,
             bond_edge(),
@@ -767,8 +767,13 @@ mod tests {
     }
 
     async fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
-        hellas_work::test_support::channel::open_setup_store(root, TEST_NETWORK, bond_edge(), role)
-            .await
+        hellas_channel::test_support::channel::open_setup_store(
+            root,
+            TEST_NETWORK,
+            bond_edge(),
+            role,
+        )
+        .await
     }
 
     fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -1294,8 +1299,8 @@ mod tests {
         }
     }
 
-    fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-        hellas_work::model::work::JobPaymentPolicyV2 {
+    fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+        hellas_channel::model::work::JobPaymentPolicyV2 {
             fixed_price: 10,
             dispatch_margin_blocks: 4,
             delivery_margin_blocks: 2,

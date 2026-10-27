@@ -6,14 +6,31 @@
 //! handed to a function. Every crash is a real one: the store is dropped
 //! and reopened over its own files.
 
-use hellas_work::test_support::channel::ANSWER;
-use hellas_work::test_support::channel::ready_of;
-use hellas_work::test_support::channel::serve_work as serve;
+use hellas_channel::test_support::channel::ANSWER;
+use hellas_channel::test_support::channel::ready_of;
+use hellas_channel::test_support::channel::serve_work as serve;
 use std::sync::Arc;
 use support::temp;
 
 use futures::StreamExt as _;
 use hellas_auth::Digest;
+use hellas_channel::model::setup::{ReadyChannel, WorkSetupError};
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, PrivateRecord as _,
+    delivery_request_digest, encode_transcript, propose_authorization, signing_hash,
+    terminal_result, work_id,
+};
+use hellas_channel::test_support::channel::{
+    CURSOR, WIDE_FRAME, advance, bundle, client, commit, deadlines, descriptor_with,
+    evaluate_request, payment_policy, provider, store_at, transcript_for, work_policy,
+};
+use hellas_channel::work::{
+    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint, RunError,
+    RunOutcome, WorkBackend, WorkService, fetch_result, run_accepted_work,
+};
+use hellas_channel::work_store::{
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
+};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::{
     DeliverResultRequest, DeliverResultResponse, WorkDelivered, WorkRefusalCode,
@@ -22,23 +39,6 @@ use hellas_rpc::pb::work::{
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_wire::StreamTransport;
 use hellas_wire::mux::MuxTransport;
-use hellas_work::model::setup::{ReadyChannel, WorkSetupError};
-use hellas_work::model::work::{
-    EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, PrivateRecord as _,
-    delivery_request_digest, encode_transcript, propose_authorization, signing_hash,
-    terminal_result, work_id,
-};
-use hellas_work::test_support::channel::{
-    CURSOR, WIDE_FRAME, advance, bundle, client, commit, deadlines, descriptor_with,
-    evaluate_request, payment_policy, provider, store_at, transcript_for, work_policy,
-};
-use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint, RunError,
-    RunOutcome, WorkBackend, WorkService, fetch_result, run_accepted_work,
-};
-use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
-};
 
 mod support;
 
@@ -121,7 +121,7 @@ async fn accept(
 
 // ── Transcripts and the backend that produces them ────────────────────
 
-use hellas_work::test_support::channel::{AnsweringBackend, run_to_result};
+use hellas_channel::test_support::channel::{AnsweringBackend, run_to_result};
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
@@ -133,7 +133,7 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_work::test_support::transport::transport_pair_without_write_authority(
+    hellas_channel::test_support::transport::transport_pair_without_write_authority(
         session(),
         session(),
     )
@@ -188,7 +188,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
 
     // The answer the client holds is the answer the provider computed,
     // rebuilt here from the delivered events rather than trusted.
-    let Ok(events) = hellas_work::model::work::decode_transcript(&delivered.transcript, 1 << 20)
+    let Ok(events) = hellas_channel::model::work::decode_transcript(&delivered.transcript, 1 << 20)
     else {
         panic!("the delivered transcript decodes");
     };
@@ -364,21 +364,23 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     impl WorkBackend for FailingBackend {
         fn try_admit(
             &self,
-            domain: hellas_work::work::admission::CapacityDomain,
-        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
-            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
         async fn execute(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
-        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Fetch,
-                )
-                .into());
+            prepared: hellas_channel::work::PreparedWorkInput,
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+            let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Fetch,
+                    )
+                    .into(),
+                );
             };
             let _input = *input;
             Err(BackendFault::caused_by(std::io::Error::new(
@@ -1026,7 +1028,7 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     run_to_result(&service, &ready, id).await;
 
     let (client_transport, server_transport) =
-        hellas_work::test_support::transport::transport_pair_without_write_authority(
+        hellas_channel::test_support::transport::transport_pair_without_write_authority(
             hellas_wire::TransportContext::default(),
             hellas_wire::TransportContext::default(),
         );
@@ -1056,42 +1058,46 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
 /// reserving credit precedes that byte, and final delivery remains durable.
 #[tokio::test]
 async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
-    use hellas_work::work::{PaidProgress, fetch_result_stream};
+    use hellas_channel::work::{PaidProgress, fetch_result_stream};
     struct PausedBackend {
         release: Arc<tokio::sync::Notify>,
     }
     impl WorkBackend for PausedBackend {
         fn try_admit(
             &self,
-            domain: hellas_work::work::admission::CapacityDomain,
-        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
-            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
         async fn execute(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
-        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Fetch,
-                )
-                .into());
+            prepared: hellas_channel::work::PreparedWorkInput,
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+            let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Fetch,
+                    )
+                    .into(),
+                );
             };
             let input = *input;
             Ok(transcript_for(input.evaluate_request(), &ANSWER))
         }
         async fn execute_stream(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
+            prepared: hellas_channel::work::PreparedWorkInput,
             progress: PaidProgress,
-        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Fetch,
-                )
-                .into());
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+            let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Fetch,
+                    )
+                    .into(),
+                );
             };
             let input = *input;
             let transcript = transcript_for(input.evaluate_request(), &ANSWER);
@@ -1182,10 +1188,10 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
 
 #[tokio::test]
 async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery() {
+    use hellas_channel::work::fetch_result_stream;
     use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
     use hellas_rpc::services::work::StreamResult;
     use hellas_wire::{WireCode, WireStatus};
-    use hellas_work::work::fetch_result_stream;
 
     for (terminal_count, status) in [
         (0, WireCode::Unavailable),
@@ -1282,7 +1288,7 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
 }
 
 fn delivery_request(
-    channel: &hellas_work::model::work::PaidChannel,
+    channel: &hellas_channel::model::work::PaidChannel,
     work_id: Digest,
 ) -> DeliverResultRequest {
     DeliverResultRequest {

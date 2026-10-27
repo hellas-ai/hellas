@@ -3,7 +3,7 @@
 use crate::grant_client::{
     GrantClientError, GrantSession, GrantSessionOptions, GrantTransport, GrantWorkResult,
 };
-use hellas_work::model::grant::records::{grant_producer, grant_transport};
+use hellas_authority::model::grant::records::{grant_producer, grant_transport};
 
 pub mod responses;
 use futures::future::BoxFuture;
@@ -13,16 +13,17 @@ use hellas_gateway::{
     WorkGatewayError, WorkOutputStream,
 };
 use hellas_rpc::output::OutputEvent;
-use hellas_work::model::{
-    fetch::{FetchRoutePolicy, PreparedPaidFetchInputV1},
-    grant::records::SignedOffer,
-    profile::{PreparedWorkInput, WorkPolicy},
-};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use {
+    hellas_authority::model::grant::records::SignedOffer,
+    hellas_channel::model::fetch::FetchRoutePolicy,
+    hellas_channel::model::fetch::PreparedPaidFetchInputV1,
+    hellas_channel::model::profile::PreparedWorkInput, hellas_channel::model::profile::WorkPolicy,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrantGatewayError {
@@ -65,7 +66,7 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
             .grant
             .and_then(|r| C::try_from(r.code).ok()),
         GrantClientError::Grant(grant) => WorkRefused::from(
-            &hellas_work::work_store::grant::NodeStoreError::Grant(grant.clone()),
+            &hellas_authority::work_store::grant::NodeStoreError::Grant(grant.clone()),
         )
         .grant
         .and_then(|r| C::try_from(r.code).ok()),
@@ -326,7 +327,7 @@ enum Request {
 fn prepare(
     request: Request,
     offer: &SignedOffer,
-    channel: &hellas_work::work_store::grant::GrantChannelState,
+    channel: &hellas_authority::work_store::grant::GrantChannelState,
     selected: Option<&str>,
     signer: &ProducerSigningKey,
     assurance: hellas_rpc::Assurance,
@@ -380,7 +381,7 @@ fn prepare(
         }
     };
     let standing = offer.offer();
-    let context = hellas_work::model::profile::WorkContext {
+    let context = hellas_channel::model::profile::WorkContext {
         network: standing.network,
         channel: channel.id.0,
         client: channel.client.signer(),
@@ -394,7 +395,7 @@ fn prepare(
     );
     let input_content = hellas_rpc::ContentRef::for_bytes(&input.encode().map_err(error)?);
     let mut candidates = standing.grant.policies.iter().filter(|p| {
-        let binding = hellas_work::model::profile::JobInputBinding {
+        let binding = hellas_channel::model::profile::JobInputBinding {
             input_content,
             prepared_input_digest,
             request_commitment,

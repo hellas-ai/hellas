@@ -12,13 +12,25 @@
 
 #![cfg(feature = "work")]
 
-use hellas_work::test_support::channel::serve_work as serve;
-use hellas_work::test_support::channel::{
+use hellas_channel::test_support::channel::serve_work as serve;
+use hellas_channel::test_support::channel::{
     CURSOR, PRICE, PROMPT_TOKENS, bundle, client, commit, deadlines, descriptor_with, payload_at,
     payment_policy, provider, provider_producer, ready, ready_of, store_at, work_policy,
 };
 
 use hellas_auth::Digest;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::ReadyChannel;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, PaidJobAuthorizationV2, propose_authorization, signing_hash, work_id,
+};
+use hellas_channel::work::{
+    ClientEndpoint, ProviderEndpoint, RunOutcome, WorkService, run_accepted_work,
+};
+use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
+use hellas_channel::work_store::{
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
+};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
 use hellas_client::work::{
@@ -29,18 +41,6 @@ use hellas_rpc::evaluate::EvaluateStopReason;
 use hellas_rpc::protocol::artifacts::{OutputAddressed as _, TextExecutionId, completed_text};
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
 use hellas_wire::mux::MuxTransport;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::ReadyChannel;
-use hellas_work::model::work::{
-    EvaluatePolicyV2, PaidJobAuthorizationV2, propose_authorization, signing_hash, work_id,
-};
-use hellas_work::work::{
-    ClientEndpoint, ProviderEndpoint, RunOutcome, WorkService, run_accepted_work,
-};
-use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
-use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
-};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     .artifact
     .output_id()
     .digest();
-    hellas_work::test_support::channel::transcript_chunks(
+    hellas_channel::test_support::channel::transcript_chunks(
         request,
         &[answer],
         &provider_producer(),
@@ -132,7 +132,7 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
 
 async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) {
     let backend =
-        hellas_work::test_support::channel::AnsweringBackend::with_transcript(transcript_for);
+        hellas_channel::test_support::channel::AnsweringBackend::with_transcript(transcript_for);
     let outcome = run_accepted_work(service, ready, &backend, id).await;
     assert!(
         matches!(outcome, Ok(RunOutcome::Completed { .. })),
@@ -150,7 +150,7 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_work::test_support::transport::transport_pair_without_write_authority(
+    hellas_channel::test_support::transport::transport_pair_without_write_authority(
         session(),
         session(),
     )

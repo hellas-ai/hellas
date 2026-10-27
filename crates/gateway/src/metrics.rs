@@ -99,9 +99,9 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(fixture.access);
-        hellas_work::work_store::grant::NodeStore::open(
+        hellas_authority::work_store::grant::NodeStore::open(
             fixture.root.path(),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             None,
             hellas_auth::authority::UnixMillis(1001),
         )

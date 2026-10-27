@@ -137,7 +137,7 @@ pub struct ChainCrossCheck {
 pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
-        hellas_work::work_store::journal::MAX_RECORD_BYTES,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
     )
     .map_err(|source| WorkConfigError::Read {
         path: path.to_path_buf(),

@@ -68,10 +68,11 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
     let mut admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
     let before = snapshot(&service).await;
     let journal_files = || {
-        let mut files: Vec<_> = crate::test_support::all_files(&root.path().join("journals"))
-            .into_iter()
-            .map(|path| (std::fs::read(&path).unwrap(), path))
-            .collect();
+        let mut files: Vec<_> =
+            hellas_channel::test_support::all_files(&root.path().join("journals"))
+                .into_iter()
+                .map(|path| (std::fs::read(&path).unwrap(), path))
+                .collect();
         files.sort();
         files
     };
@@ -153,7 +154,7 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
             let locator = StandingLocator {
                 provider: store.state().provider()?.content_id(),
                 grant: ALLOWANCE,
-                client: crate::test_support::channel_client(principal(1).0),
+                client: hellas_channel::test_support::channel_client(principal(1).0),
                 generation: 0,
             };
             store.standing(locator, &principal(2).1, vec![], now)
@@ -235,7 +236,7 @@ async fn correcting_a_forward_clock_jump_restores_writes() {
 
 #[tokio::test]
 async fn work_administration_requires_the_mounted_operation() {
-    use crate::test_support::{actors::*, ids};
+    use {crate::test_support::ids, hellas_channel::test_support::actors::*};
     let directory = tempfile::tempdir().unwrap();
     let world = Node::bootstrap(directory.path())
         .with_allowance(Allowance::responses(ids::ALLOWANCE, FRIEND))

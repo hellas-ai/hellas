@@ -12,6 +12,18 @@
 //! fails when the rule is deleted is not a rule.
 
 use hellas_auth::Digest;
+use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
+};
+use hellas_channel::test_support::channel::serve_setup as serve;
+use hellas_channel::test_support::channel::{client, network, provider, signer};
+use hellas_channel::work_handshake::{
+    PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
+    prepare_setup_exchange, send_setup_exchange,
+};
+use hellas_channel::work_store::{Role, SetupScan, SetupStore};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS, Parties,
     PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, Tx,
@@ -25,16 +37,6 @@ use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{ServiceMarker, StreamTransport};
-use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_work::test_support::channel::serve_setup as serve;
-use hellas_work::test_support::channel::{client, network, provider, signer};
-use hellas_work::work_handshake::{
-    PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
-    prepare_setup_exchange, send_setup_exchange,
-};
-use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use prost::Message as _;
 
 async fn exchange_setup<T>(
@@ -88,7 +90,7 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
@@ -111,7 +113,7 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge,
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
@@ -122,15 +124,15 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(40, 40)
+    hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
 fn other_channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(39, 40)
+    hellas_channel::test_support::channel::credit_policy(39, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         ContentId::from_bytes([0x31; 32]),
         Digest::from_bytes([0x32; 32]),
         Digest::from_bytes([0x33; 32]),
@@ -243,7 +245,7 @@ async fn no_export_path_can_return_unjournaled_revision_bytes() {
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_work::test_support::transport::transport_pair_without_write_authority(
+    hellas_channel::test_support::transport::transport_pair_without_write_authority(
         hellas_wire::TransportContext::default(),
         hellas_wire::TransportContext::default(),
     )
@@ -434,7 +436,7 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
             Err(SetupExchangeError::Refused { refusal, reason }) => {
                 assert_eq!(
                     refusal,
-                    hellas_work::work::WorkRefusal::Declined,
+                    hellas_channel::work::WorkRefusal::Declined,
                     "{what}: refused as {refusal} — {reason}",
                 );
             }
@@ -506,7 +508,7 @@ async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
     }
     match exchange_setup(dialer, &mut caller).await {
         Err(SetupExchangeError::Refused { refusal, .. }) => {
-            assert_eq!(refusal, hellas_work::work::WorkRefusal::Declined);
+            assert_eq!(refusal, hellas_channel::work::WorkRefusal::Declined);
         }
         other => panic!("a proposing endpoint countersigned: {other:?}"),
     }
@@ -1012,8 +1014,8 @@ fn revision_two_signed_by(
     }
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -1022,6 +1024,6 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
 }
 
 async fn stop(serving: tokio::task::JoinHandle<()>, service: SetupService) {
-    hellas_work::test_support::channel::stop(serving).await;
+    hellas_channel::test_support::channel::stop(serving).await;
     drop(service);
 }

@@ -1,12 +1,14 @@
 use super::*;
 use axum::{Router, routing::get};
 use hellas_auth::{Digest, authority::*};
-use hellas_work::{
-    node::{GATEWAY_INVOKE, host_resource},
-    test_support::{Rights, TestClock, actors::ROOT, assert_err, common_node, ids::ROOT_GRANT},
-    work_store::grant::NodeStore,
-};
 use tower::ServiceExt;
+use {
+    hellas_authority::node::GATEWAY_INVOKE, hellas_authority::node::host_resource,
+    hellas_authority::test_support::TestClock, hellas_authority::test_support::common_node,
+    hellas_authority::test_support::ids::ROOT_GRANT,
+    hellas_authority::work_store::grant::NodeStore, hellas_channel::test_support::Rights,
+    hellas_channel::test_support::actors::ROOT, hellas_channel::test_support::assert_err,
+};
 
 const HTTP_ACCESS: GrantId = GrantId([104; 16]);
 
@@ -33,9 +35,9 @@ impl Fixture {
         );
         let (store, admin) = NodeStore::bootstrap(
             root.path(),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             ROOT_GRANT,
-            hellas_work::test_support::common_node::approval_for(
+            hellas_authority::test_support::common_node::approval_for(
                 hellas_auth::authority::Ownership::Bootstrap {
                     root: ROOT_GRANT,
                     target: None,
@@ -50,7 +52,7 @@ impl Fixture {
         .unwrap();
         let clock = TestClock::new(now);
         let node = NodeCoordinator::new(store, clock.source());
-        let caller = hellas_work::test_support::session(&node, &admin).await;
+        let caller = hellas_authority::test_support::session(&node, &admin).await;
         let scope = Rights::new(authority, ROOT)
             .allow(GATEWAY_INVOKE, host_resource(authority))
             .valid_from(now)
@@ -67,7 +69,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let (_, credential) = hellas_work::test_support::credentials::issue_one(
+        let (_, credential) = hellas_authority::test_support::credentials::issue_one(
             &node,
             &caller,
             ROOT_GRANT,
@@ -217,7 +219,7 @@ async fn http_admission_consults_current_authority() {
     for revoke in [Change::Credential, Change::Grant, Change::Expiry] {
         let fixture = Fixture::new().await;
         let node = &fixture.access.node;
-        let caller = hellas_work::test_support::session(node, &fixture.admin).await;
+        let caller = hellas_authority::test_support::session(node, &fixture.admin).await;
         let app = router(fixture.access.clone());
         let token = format!("Bearer {}", fixture.access.bearer());
         assert_eq!(status(&app, Some(&token)).await, StatusCode::OK);
@@ -265,19 +267,19 @@ async fn listening_remotely_requires_explicit_opt_in() {
 async fn administrator_credentials_cannot_be_exposed_as_http_bearers() {
     let fixture = Fixture::new().await;
     let node = &fixture.access.node;
-    let caller = hellas_work::test_support::session(node, &fixture.admin).await;
+    let caller = hellas_authority::test_support::session(node, &fixture.admin).await;
     assert_err!(
         node.authorize_gateway(&caller, ROOT_GRANT).await,
-        hellas_work::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)
+        hellas_authority::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
 
 #[tokio::test]
 async fn each_principal_is_admitted_under_its_own_grant() {
-    use hellas_work::test_support::actors::{FRIEND, STRANGER};
+    use hellas_channel::test_support::actors::{FRIEND, STRANGER};
     let fixture = Fixture::new().await;
     let node = &fixture.access.node;
-    let caller = hellas_work::test_support::session(node, &fixture.admin).await;
+    let caller = hellas_authority::test_support::session(node, &fixture.admin).await;
     let authority = caller.authority();
     let scope = |actor| {
         Rights::new(authority, actor)
@@ -287,7 +289,7 @@ async fn each_principal_is_admitted_under_its_own_grant() {
             .build()
     };
     let bearer = async |actor| {
-        let (_, credential) = hellas_work::test_support::credentials::issue_one(
+        let (_, credential) = hellas_authority::test_support::credentials::issue_one(
             node,
             &caller,
             ROOT_GRANT,
@@ -324,7 +326,7 @@ async fn each_principal_is_admitted_under_its_own_grant() {
         StatusCode::UNAUTHORIZED
     );
     // A device-held credential never authenticates by its secret.
-    let (_, held) = hellas_work::test_support::credentials::issue_one(
+    let (_, held) = hellas_authority::test_support::credentials::issue_one(
         node,
         &caller,
         ROOT_GRANT,

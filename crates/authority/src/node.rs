@@ -1,10 +1,10 @@
 //! Checked authority service sharing the node's existing durable writer.
 use crate::authenticator::Authenticator;
-use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 use crate::operations::validate_scope;
 use crate::work_store::grant::{NodeStore, NodeStoreError};
 use hellas_auth::authority::*;
 use hellas_auth::{Digest, ProducerSigningKey};
+use hellas_channel::endpoint_lock::{EndpointGuard, EndpointLock};
 use std::sync::Arc;
 mod host;
 pub use host::{
@@ -97,7 +97,7 @@ impl NodeCoordinator {
     /// Current owner-approved paid terms; callers retain a snapshot per offer.
     pub async fn paid_policy(
         &self,
-    ) -> Result<Option<crate::model::paid_policy::StoredPaidPolicy>, NodeStoreError> {
+    ) -> Result<Option<hellas_channel::model::paid_policy::StoredPaidPolicy>, NodeStoreError> {
         let (store, _) = self.lock().await?;
         Ok(store.state().paid_policy().cloned())
     }

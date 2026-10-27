@@ -1,7 +1,7 @@
 use super::*;
 use hellas_auth::authority as auth;
+use hellas_authority::model::grant::records::decode_enrollment;
 use hellas_sdk::node_control::{bootstrap::Invitation, configuration::*};
-use hellas_work::model::grant::records::decode_enrollment;
 
 struct ManagedWorker {
     root: tempfile::TempDir,
@@ -85,10 +85,13 @@ impl ManagedWorker {
         std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
         let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
         let now = auth::UnixMillis::now().unwrap();
-        let extra: Vec<_> = hellas_work::operations::OPERATIONS
+        let extra: Vec<_> = hellas_authority::operations::OPERATIONS
             .iter()
             .filter(|operation| {
-                !matches!(operation.scope, hellas_work::operations::Scope::Allowance)
+                !matches!(
+                    operation.scope,
+                    hellas_authority::operations::Scope::Allowance
+                )
             })
             .map(|operation| {
                 (
@@ -103,7 +106,7 @@ impl ManagedWorker {
             &extra,
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
-            &[hellas_work::grant_service::WORK_EXECUTE],
+            &[hellas_authority::grant_service::WORK_EXECUTE],
         );
         let administrator_file = root.join("administrator.json");
         let scope_file = root.join("scope.json");
@@ -185,8 +188,8 @@ impl ManagedWorker {
             .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
         let subject = owner.principal();
-        let allowance = hellas_work::model::grant::owner_grant_id(
-            hellas_work::model::grant::grant_network(),
+        let allowance = hellas_authority::model::grant::owner_grant_id(
+            hellas_authority::model::grant::grant_network(),
             provider.content_id(),
             subject,
         );

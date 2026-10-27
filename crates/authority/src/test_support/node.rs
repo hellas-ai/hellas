@@ -1,13 +1,13 @@
 //! Explicit test worlds, provisioned through the same checked APIs as a host.
 use super::{common_node, credentials, enrollment, network};
 use crate::model::grant::{budget::*, records::*};
-use crate::model::work::PrivateRecord;
 use crate::work_store::grant::{NodeStore, State};
 use hellas_auth::{
     Digest,
     authority::*,
     test_support::{Actor, actors::*, ids},
 };
+use hellas_channel::model::work::PrivateRecord;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -242,7 +242,7 @@ pub struct TestNode {
 pub struct Proposal {
     pub authorization: crate::model::grant::GrantJobAuthorizationV1,
     pub signature: hellas_auth::Signature,
-    pub input: crate::model::profile::PreparedWorkInput,
+    pub input: hellas_channel::model::profile::PreparedWorkInput,
 }
 impl Proposal {
     fn new(
@@ -287,7 +287,7 @@ impl Proposal {
     }
 }
 impl TestNode {
-    pub fn serve<B: crate::work::WorkBackend + Send + Sync + 'static>(
+    pub fn serve<B: hellas_channel::work::WorkBackend + Send + Sync + 'static>(
         self,
         backend: B,
     ) -> TestService {

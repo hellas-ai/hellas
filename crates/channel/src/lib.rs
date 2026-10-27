@@ -8,20 +8,15 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 #[cfg(test)]
-extern crate self as hellas_work;
+extern crate self as hellas_channel;
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod test_support;
 
-mod audit;
-pub mod authenticator;
 pub mod content;
-mod endpoint_lock;
-pub mod grant_service;
+pub mod endpoint_lock;
 pub mod model;
-pub mod node;
-pub mod operations;
 pub mod work;
 pub mod work_close;
 pub mod work_handshake;

@@ -18,7 +18,7 @@ pub enum PaidClientError {
     #[error("provider refused offer request ({0}). Nothing was paid.")]
     OfferRefused(i32),
     #[error(transparent)]
-    Offer(#[from] hellas_work::model::offer::PaidOfferError),
+    Offer(#[from] hellas_channel::model::offer::PaidOfferError),
     #[error("invalid paid-work options: {0}")]
     InvalidOptions(&'static str),
     #[error("paid input does not match {0}")]
@@ -38,7 +38,7 @@ pub enum PaidClientError {
     #[error("provider identity lock poisoned")]
     ProviderIdentityPoisoned,
     #[error("paid-work setup ended: {0:?}")]
-    SetupEnded(hellas_work::work_open::SetupProgress),
+    SetupEnded(hellas_channel::work_open::SetupProgress),
     #[error("cannot create journal directory {}: {source}", path.display())]
     JournalDirectory {
         path: PathBuf,
@@ -56,31 +56,31 @@ pub enum PaidClientError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
-    WorkSetup(#[from] hellas_work::model::setup::WorkSetupError),
+    WorkSetup(#[from] hellas_channel::model::setup::WorkSetupError),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
-    Endpoint(#[from] hellas_work::work::EndpointError),
+    Endpoint(#[from] hellas_channel::work::EndpointError),
     #[error(transparent)]
-    Propose(#[from] hellas_work::work::ProposeError),
+    Propose(#[from] hellas_channel::work::ProposeError),
     #[error(transparent)]
-    Deliver(#[from] hellas_work::work::DeliverError),
+    Deliver(#[from] hellas_channel::work::DeliverError),
     #[error(transparent)]
-    Payment(#[from] hellas_work::work::PaymentError),
+    Payment(#[from] hellas_channel::work::PaymentError),
     #[error(transparent)]
     Collect(#[from] hellas_client::work::CollectResultError),
     #[error(transparent)]
-    Close(#[from] hellas_work::work_close::CloseError),
+    Close(#[from] hellas_channel::work_close::CloseError),
     #[error(transparent)]
-    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
     #[error(transparent)]
-    Setup(#[from] hellas_work::work_handshake::SetupExchangeError),
+    Setup(#[from] hellas_channel::work_handshake::SetupExchangeError),
     #[error(transparent)]
-    SetupDrive(#[from] hellas_work::work_open::SetupDriveError),
+    SetupDrive(#[from] hellas_channel::work_open::SetupDriveError),
     #[error(transparent)]
-    BlockSource(#[from] hellas_work::work_close::BlockSourceError),
+    BlockSource(#[from] hellas_channel::work_close::BlockSourceError),
     #[error(transparent)]
     Config(#[from] crate::work_config::WorkConfigError),
     #[error(transparent)]

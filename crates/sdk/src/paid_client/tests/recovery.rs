@@ -1,5 +1,7 @@
 use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture, signer};
+use hellas_channel::model::work::PrivateRecord as _;
+use hellas_channel::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
 use hellas_rpc::fetch::{
     FetchOutputTranscriptBuilder, encode_fetch_event_payload, encode_fetch_terminal_payload,
     verify_input_events,
@@ -8,8 +10,6 @@ use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::pb::work::WorkDelivered;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
-use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -28,32 +28,35 @@ impl Default for Backend {
 impl WorkBackend for Backend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
-        Ok(hellas_work::work::admission::WorkPermit::new(
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+        Ok(hellas_channel::work::admission::WorkPermit::new(
             domain,
             self.1.clone().try_acquire_owned().map_err(|_| {
-                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
             })?,
         ))
     }
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Gpu,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Gpu,
+                )
+                .into(),
+            );
         };
         let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
         let (parts, admission) = input.into_parts_and_admission();
         let _running = admission
-            .reserve(hellas_work::work::admission::CapacityDomain::Fetch, async {
-                self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
-            })
+            .reserve(
+                hellas_channel::work::admission::CapacityDomain::Fetch,
+                async { self.try_admit(hellas_channel::work::admission::CapacityDomain::Fetch) },
+            )
             .await?
             .dispatch()
             .await?;
@@ -103,31 +106,35 @@ fn assert_no_payloads(root: &std::path::Path) {
 
 async fn accept_uploaded_fetch(
     fixture: &PaidFixture,
-    provider: &hellas_work::work::WorkService,
-    client: &hellas_work::work::ClientEndpoint,
+    provider: &hellas_channel::work::WorkService,
+    client: &hellas_channel::work::ClientEndpoint,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     let authorization =
-        hellas_work::model::work::PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
-    let work = hellas_work::model::work::work_id(fixture.ready.channel(), &authorization);
+        hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
+            .unwrap();
+    let work = hellas_channel::model::work::work_id(fixture.ready.channel(), &authorization);
     let bytes = client
         .state()
         .job_by_id(work)
         .unwrap()
         .prepared_input()
         .to_vec();
-    let (wire, uploads) =
-        hellas_work::test_support::channel::input_uploads(fixture.ready.channel(), request, &bytes);
+    let (wire, uploads) = hellas_channel::test_support::channel::input_uploads(
+        fixture.ready.channel(),
+        request,
+        &bytes,
+    );
     let context = hellas_wire::TransportContext {
         open_exporter: Some([7; 32]),
         ..Default::default()
     };
-    let a =
-        hellas_work::model::work::PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
-    let id = hellas_work::model::work::work_id(fixture.ready.channel(), &a);
+    let a = hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
+        .unwrap();
+    let id = hellas_channel::model::work::work_id(fixture.ready.channel(), &a);
     for mut upload in uploads {
         upload.chunk_signature = signer(1)
-            .sign(hellas_work::model::work::signing_hash(
+            .sign(hellas_channel::model::work::signing_hash(
                 hellas_rpc::protocol::content_upload::chunk_digest(
                     a.channel_id,
                     id,

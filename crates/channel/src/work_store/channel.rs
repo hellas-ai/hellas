@@ -238,7 +238,7 @@ impl JobPhase {
         matches!(self, Self::Delivered | Self::Streaming)
     }
 
-    pub(in crate::work_store) const fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         match self {
             Self::HalfSigned => 0,
             Self::Accepted => 1,
@@ -250,7 +250,7 @@ impl JobPhase {
         }
     }
 
-    pub(in crate::work_store) const fn from_code(code: u8) -> Result<Self, ChannelStateError> {
+    pub const fn from_code(code: u8) -> Result<Self, ChannelStateError> {
         match code {
             0 => Ok(Self::HalfSigned),
             1 => Ok(Self::Accepted),
@@ -590,14 +590,14 @@ const JOB_TAIL_BYTES: usize = PaidJobResultV1::ENCODED_SIZE
 /// One active job on a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobState<F: Funding = PaymentFunding> {
-    pub(in crate::work_store) authorization: F::Authorization,
-    pub(in crate::work_store) work_id: Digest,
-    pub(in crate::work_store) prepared_input: Vec<u8>,
-    pub(in crate::work_store) client_signature: F::Signature,
-    pub(in crate::work_store) provider_signature: Option<F::Signature>,
-    pub(in crate::work_store) phase: JobPhase,
-    pub(in crate::work_store) result: Option<(F::Result, F::Signature)>,
-    pub(in crate::work_store) transcript: Vec<u8>,
+    pub authorization: F::Authorization,
+    pub work_id: Digest,
+    pub prepared_input: Vec<u8>,
+    pub client_signature: F::Signature,
+    pub provider_signature: Option<F::Signature>,
+    pub phase: JobPhase,
+    pub result: Option<(F::Result, F::Signature)>,
+    pub transcript: Vec<u8>,
 }
 
 impl<F: Funding> JobState<F> {
@@ -686,10 +686,10 @@ pub struct PaidCertificate {
 /// What one endpoint durably knows about one channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Channel<F: Funding = PaymentFunding> {
-    pub(in crate::work_store) funding: F::State,
-    pub(in crate::work_store) ledger: F::Ledger,
-    pub(in crate::work_store) role: Role,
-    pub(in crate::work_store) book: JobBook<F>,
+    pub funding: F::State,
+    pub ledger: F::Ledger,
+    pub role: Role,
+    pub book: JobBook<F>,
 }
 
 impl<F: Funding> Channel<F> {

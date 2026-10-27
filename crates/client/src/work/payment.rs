@@ -5,9 +5,9 @@
 //! call re-sends retained bytes and never credits the job twice.
 
 use hellas_auth::Digest;
+use hellas_channel::work::{ClientChannel, PaymentError, admit_payment};
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_wire::StreamTransport;
-use hellas_work::work::{ClientChannel, PaymentError, admit_payment};
 
 /// Signs and admits payment for one authenticated result.
 ///

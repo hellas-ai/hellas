@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ExecutorError {
     #[error(transparent)]
-    Backend(#[from] hellas_work::work::BackendFault),
+    Backend(#[from] hellas_channel::work::BackendFault),
     #[error("worker exited without acknowledging completion")]
     Completion(#[source] tokio::sync::oneshot::error::RecvError),
     #[error("executor channel closed")]

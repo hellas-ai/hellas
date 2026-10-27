@@ -49,7 +49,7 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                         &admin,
                         GrantId([0; 16]),
                         scope,
-                        crate::test_support::holder(principal(1).0),
+                        hellas_channel::test_support::holder(principal(1).0),
                     )
                     .await
                     .unwrap();
@@ -82,7 +82,7 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                 crate::test_support::accept_grant(
                     &work_service,
                     &request,
-                    &crate::test_support::principal(1).1,
+                    &hellas_channel::test_support::principal(1).1,
                 )
                 .await,
             );

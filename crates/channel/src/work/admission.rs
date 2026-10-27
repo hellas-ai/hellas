@@ -3,7 +3,7 @@ use super::BackendFault;
 use std::{future::Future, time::Instant};
 use tokio::sync::OwnedSemaphorePermit;
 mod cancellation;
-pub(crate) use cancellation::{CancelOnFailure, Cancellation};
+pub use cancellation::{CancelOnFailure, Cancellation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityDomain {
@@ -64,7 +64,7 @@ impl WorkAdmission {
         Self(Authorization::Payment)
     }
 
-    pub(crate) fn grant(
+    pub fn grant(
         permit: WorkPermit,
         deadline: Instant,
         cancellation: Cancellation,

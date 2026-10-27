@@ -1,6 +1,6 @@
 //! Revocable output bodies and a body-free commitment to accepted progress.
 use super::*;
-use crate::work::admission::Cancellation;
+use hellas_channel::work::admission::Cancellation;
 
 pub(crate) struct ResultCache {
     body: Mutex<Body>,
@@ -152,7 +152,7 @@ impl Prefix {
     pub(super) fn push(
         &mut self,
         event: &OutputEventEnvelope,
-    ) -> Result<(), crate::model::work::PaidWorkError> {
+    ) -> Result<(), hellas_channel::model::work::PaidWorkError> {
         let encoded = encode_transcript(std::slice::from_ref(event))?;
         self.digest = hellas_auth::hash_tuple(
             "hellas.work.grant.prefix.v1",
@@ -164,7 +164,7 @@ impl Prefix {
     pub(super) fn matches(
         &self,
         events: &[OutputEventEnvelope],
-    ) -> Result<bool, crate::model::work::PaidWorkError> {
+    ) -> Result<bool, hellas_channel::model::work::PaidWorkError> {
         let Some(events) = events.get(..self.count) else {
             return Ok(false);
         };

@@ -7,6 +7,9 @@ use hellas_auth::{
     Digest, ProducerSigningKey, PublicKey, Signature,
     authority::{GrantId, NodeKey, PrincipalId, UnixMillis},
 };
+use hellas_authority::model::grant::records::{
+    check_grant_provider, grant_producer, grant_transport,
+};
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
@@ -27,28 +30,32 @@ use hellas_rpc::{
 };
 use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
-use hellas_work::model::grant::records::{check_grant_provider, grant_producer, grant_transport};
-use hellas_work::model::{
-    grant::{
-        ChannelClient, ChannelId, GrantJobAuthorizationV1, grant_work_id,
-        records::{GrantError, GrantPolicy, SignedOffer},
-        standing::{Standing, StandingLocator},
-    },
-    profile::{PreparedWorkInput, WorkPolicy},
-    work::{
-        PaidJobResultV1, PrivateRecord, bound_result_digest, decode_transcript, encode_transcript,
-    },
-};
-use hellas_work::{
-    grant_service::{GrantService, GrantWork},
-    work::PaidProgress,
-    work_store::grant::{GrantChannelState, GrantClientStore, NodeStoreError, SignedResult},
-};
 use iroh::{Endpoint, EndpointId};
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
+};
+use {
+    hellas_authority::grant_service::GrantService, hellas_authority::grant_service::GrantWork,
+    hellas_authority::work_store::grant::GrantChannelState,
+    hellas_authority::work_store::grant::GrantClientStore,
+    hellas_authority::work_store::grant::NodeStoreError,
+    hellas_authority::work_store::grant::SignedResult, hellas_channel::work::PaidProgress,
+};
+use {
+    hellas_authority::model::grant::ChannelClient, hellas_authority::model::grant::ChannelId,
+    hellas_authority::model::grant::GrantJobAuthorizationV1,
+    hellas_authority::model::grant::grant_work_id,
+    hellas_authority::model::grant::records::GrantError,
+    hellas_authority::model::grant::records::GrantPolicy,
+    hellas_authority::model::grant::records::SignedOffer,
+    hellas_authority::model::grant::standing::Standing,
+    hellas_authority::model::grant::standing::StandingLocator,
+    hellas_channel::model::profile::PreparedWorkInput, hellas_channel::model::profile::WorkPolicy,
+    hellas_channel::model::work::PaidJobResultV1, hellas_channel::model::work::PrivateRecord,
+    hellas_channel::model::work::bound_result_digest,
+    hellas_channel::model::work::decode_transcript, hellas_channel::model::work::encode_transcript,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -68,7 +75,7 @@ pub enum GrantClientError {
     #[error(transparent)]
     Address(#[from] std::net::AddrParseError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
     Signature(#[from] hellas_auth::signature::SignatureError),
     #[error(transparent)]
@@ -78,7 +85,7 @@ pub enum GrantClientError {
     #[error(transparent)]
     FetchPayload(#[from] hellas_rpc::fetch::FetchPayloadError),
     #[error(transparent)]
-    Progress(#[from] hellas_work::work::BackendFault),
+    Progress(#[from] hellas_channel::work::BackendFault),
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
@@ -285,7 +292,7 @@ impl SessionTransport {
                     .node()
                     .authenticate_session(
                         &application.credential,
-                        hellas_work::node::SessionKey::Node(signer),
+                        hellas_authority::node::SessionKey::Node(signer),
                     )
                     .await?;
                 if caller.authority() != application.authority {
@@ -748,7 +755,7 @@ impl GrantSession {
                     Some(work_stream_event::Outcome::Prefix(bytes)) => {
                         for event in decode_transcript(
                             &bytes,
-                            hellas_work::work_store::journal::MAX_RECORD_BYTES,
+                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
                         )
                         .map_err(GrantClientError::from)?
                         {
@@ -761,7 +768,7 @@ impl GrantSession {
                     Some(work_stream_event::Outcome::Terminal(terminal)) => {
                         let tail = decode_transcript(
                             &terminal.terminal_transcript,
-                            hellas_work::work_store::journal::MAX_RECORD_BYTES,
+                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
                         )
                         .map_err(GrantClientError::from)?;
                         if tail.len() != 1 {

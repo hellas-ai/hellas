@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::test_support::{credentials, ids, within};
+use hellas_authority::test_support::{credentials, ids, within};
 
 struct Reader {
     fixture: Fixture,
@@ -13,7 +13,7 @@ struct Reader {
 impl Reader {
     async fn new() -> Self {
         let fixture = fixture().await;
-        let root = hellas_work::test_support::session(&fixture.node, &fixture.secret).await;
+        let root = hellas_authority::test_support::session(&fixture.node, &fixture.secret).await;
         let mut rights = scope(OPERATOR);
         rights.issuance = None;
         rights
@@ -46,7 +46,7 @@ impl Reader {
             outgoing,
             authority(),
             &credential,
-            hellas_work::node::SessionKey::Passkey(&OPERATOR.passkey()),
+            hellas_authority::node::SessionKey::Passkey(&OPERATOR.passkey()),
         )
         .await
         .unwrap();
@@ -76,7 +76,7 @@ impl Reader {
 async fn a_live_connection_rechecks_its_selected_grant() {
     let reader = Reader::new().await;
     let root =
-        hellas_work::test_support::session(&reader.fixture.node, &reader.fixture.secret).await;
+        hellas_authority::test_support::session(&reader.fixture.node, &reader.fixture.secret).await;
     reader
         .fixture
         .node
@@ -116,7 +116,7 @@ async fn a_live_connection_rechecks_its_credential_before_decoding_rpc() {
         outgoing,
         authority(),
         &reader.fixture.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();

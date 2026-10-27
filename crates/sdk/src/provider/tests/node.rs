@@ -1,5 +1,15 @@
 use hellas_auth::authority::GrantId;
 use hellas_chain::FinalizedWorkView;
+use hellas_channel::test_support::channel::{
+    client, identity_artifact, manifest, prompt_tokens, provider, provider_producer, signer,
+    text_execution, text_policy,
+};
+use hellas_channel::work::WorkBackend;
+use hellas_channel::work_close::FinalizedBlocks;
+use hellas_channel::work_close::TxSink;
+use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint};
+use hellas_channel::work_open::SetupView;
+use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::pb::work::{
@@ -10,22 +20,12 @@ use hellas_rpc::pb::work::{
 };
 use hellas_rpc::services::{work::WorkHandler, work_setup::WorkSetupHandler};
 use hellas_wire::{TransportContext, WireStatus};
-use hellas_work::test_support::channel::{
-    client, identity_artifact, manifest, prompt_tokens, provider, provider_producer, signer,
-    text_execution, text_policy,
-};
-use hellas_work::work::WorkBackend;
-use hellas_work::work_close::FinalizedBlocks;
-use hellas_work::work_close::TxSink;
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_work::work_open::SetupView;
-use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 use crate::work_router::UnmountedWork;
 use futures::StreamExt;
-use hellas_work::test_support::common_node;
+use hellas_authority::test_support::common_node;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +33,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hellas_auth::Digest;
 use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
+use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
+    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
+    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
+    work_id,
+};
+use hellas_channel::work::{BackendFault, WorkRefusal};
+use hellas_channel::work_close::{BlockSourceError, FinalizedWork};
+use hellas_channel::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
+use hellas_channel::work_open::{FinalizedSetup, SetupQuery};
+use hellas_channel::work_store::{
+    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
+};
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
     Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
@@ -46,23 +63,6 @@ use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
 use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 use hellas_wire::{AuthLevel, PeerIdentity};
-use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
-    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
-    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
-    work_id,
-};
-use hellas_work::work::{BackendFault, WorkRefusal};
-use hellas_work::work_close::{BlockSourceError, FinalizedWork};
-use hellas_work::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
-use hellas_work::work_open::{FinalizedSetup, SetupQuery};
-use hellas_work::work_store::{
-    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
-};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
 
@@ -645,7 +645,7 @@ fn upload_messages(
         .find(|offer| offer.descriptor().channel().id() == a.channel_id)
         .map(|offer| offer.client())
         .unwrap_or_else(client);
-    let id = hellas_work::model::work::paid_work_v2_id(network(), a.channel_id, &a);
+    let id = hellas_channel::model::work::paid_work_v2_id(network(), a.channel_id, &a);
     let object = ContentRef::for_bytes(&request.prepared_input);
     let chunks = request
         .prepared_input
@@ -1169,7 +1169,7 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
@@ -1189,11 +1189,11 @@ fn payment_funding() -> Funding {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(40, 40)
+    hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         manifest().content_id(),
         match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -1207,7 +1207,7 @@ fn work_policy() -> EvaluatePolicyV2 {
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge(),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
@@ -1236,9 +1236,9 @@ fn recorded_offer(
     policy: ProviderChannelPolicy,
 ) -> SetupRecord {
     let key = provider_producer();
-    let provider = hellas_work::test_support::enrollment(&key, &key, [0x63; 32], [3; 32]);
-    let offer = hellas_work::model::offer::SignedPaidOffer::sign(
-        hellas_work::model::offer::PaidOffer {
+    let provider = hellas_channel::test_support::enrollment(&key, &key, [0x63; 32], [3; 32]);
+    let offer = hellas_channel::model::offer::SignedPaidOffer::sign(
+        hellas_channel::model::offer::PaidOffer {
             provider,
             proposal: one,
             policy,
@@ -1322,7 +1322,7 @@ fn payment_edge() -> EdgeId {
 
 /// The channel the retained descriptor names, which is the one the
 /// runner's mount must open.
-fn descriptor() -> hellas_work::model::setup::CloseDescriptor {
+fn descriptor() -> hellas_channel::model::setup::CloseDescriptor {
     match provider_policy().describe_close(payment_edge(), payment_terms()) {
         Ok(descriptor) => descriptor,
         Err(error) => panic!("the fixture close descriptor opens: {error}"),
@@ -1428,7 +1428,7 @@ async fn open_channel(root: &Path) -> ChannelStore {
 // ── One job, paid for, and then contested ─────────────────────────
 
 fn evaluate_request() -> EvaluateRequest {
-    hellas_work::test_support::channel::evaluate_request_for(
+    hellas_channel::test_support::channel::evaluate_request_for(
         text_execution().input_id().digest(),
         PublicKey::Secp256k1(client().party_key().to_bytes()),
         manifest().content_id(),
@@ -1471,7 +1471,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
 
 /// One complete signed transcript for the fixture request.
 fn answer_transcript() -> Vec<OutputEventEnvelope> {
-    hellas_work::test_support::channel::transcript_for(
+    hellas_channel::test_support::channel::transcript_for(
         &evaluate_request(),
         &[101, 102, 103, 104, 105],
     )
@@ -1488,20 +1488,23 @@ struct AnsweringPaidBackend {
 impl WorkBackend for AnsweringPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let input = *input;
         assert_eq!(
@@ -1544,21 +1547,24 @@ impl BlockingPaidBackend {
 impl WorkBackend for BlockingPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
     async fn execute_stream(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-        progress: hellas_work::work::PaidProgress,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+        progress: hellas_channel::work::PaidProgress,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let input = *input;
         for event in answer_transcript() {
@@ -1571,13 +1577,15 @@ impl WorkBackend for BlockingPaidBackend {
 
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let _input = *input;
         self.entered.add_permits(1);
@@ -2505,7 +2513,7 @@ impl OfferFixture {
     }
 
     fn bond_terms(self) -> WorkStakeBondTerms {
-        hellas_work::test_support::channel::bond_terms_for(
+        hellas_channel::test_support::channel::bond_terms_for(
             Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(self.client().party_key()),
@@ -2528,7 +2536,7 @@ impl OfferFixture {
     }
 
     fn payment_terms(self) -> WorkPaymentTerms {
-        hellas_work::test_support::channel::payment_terms_for(
+        hellas_channel::test_support::channel::payment_terms_for(
             self.bond_edge(),
             self.bond_terms(),
             private_policy_commitment(network(), &SALT, &channel_policy()),
@@ -2592,7 +2600,7 @@ impl OfferFixture {
         }
     }
 
-    fn descriptor(self) -> hellas_work::model::setup::CloseDescriptor {
+    fn descriptor(self) -> hellas_channel::model::setup::CloseDescriptor {
         match provider_policy().describe_close(self.payment_edge(), self.payment_terms()) {
             Ok(descriptor) => descriptor,
             Err(error) => panic!("the routed close descriptor opens: {error}"),
@@ -2648,7 +2656,7 @@ impl OfferFixture {
     }
 
     fn evaluate_request(self) -> EvaluateRequest {
-        hellas_work::test_support::channel::evaluate_request_for(
+        hellas_channel::test_support::channel::evaluate_request_for(
             text_execution().input_id().digest(),
             PublicKey::Secp256k1(self.client().party_key().to_bytes()),
             manifest().content_id(),
@@ -4092,8 +4100,8 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -4233,7 +4241,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
 #[tokio::test]
 async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     use crate::grant_provider::ProviderResources;
-    use hellas_work::model::grant::{budget::*, records::*, *};
+    use hellas_authority::model::grant::{budget::*, records::*, *};
     let root = temp();
     let (enrollment, producer_key) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
@@ -4264,7 +4272,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let id = GrantId([8; 16]);
     let definition = common_node::allowance(
         id,
-        hellas_work::test_support::actors::ROOT.principal(),
+        hellas_channel::test_support::actors::ROOT.principal(),
         vec![GrantPolicy {
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
@@ -4274,7 +4282,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             name: "initial".into(),
             work: work_policy().into(),
             https: None,
-            pricing: hellas_work::model::grant::pricing::Pricing {
+            pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
                 rates: None,
             },
@@ -4300,7 +4308,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         name: "evaluate".into(),
         work: work_policy().into(),
         https: None,
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },
@@ -4311,12 +4319,12 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             .open(ProviderResources::EvaluateAndFetch(&routes), &provider)
             .await
             .unwrap();
-        let caller = hellas_work::test_support::session(&node, &secret).await;
+        let caller = hellas_authority::test_support::session(&node, &secret).await;
         let status = node.status(&caller, GrantId([0; 16])).await.unwrap();
         let machine = status.machine.unwrap();
         assert_eq!(machine.max_in_flight.get(), 2);
         assert_eq!(machine.limits, vec![limit]);
-        let service = hellas_work::grant_service::GrantService::from_node(
+        let service = hellas_authority::grant_service::GrantService::from_node(
             node,
             &provider,
             Arc::new(producer_key.clone()),
@@ -4325,17 +4333,17 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         )
         .await
         .unwrap();
-        let admin = hellas_work::grant_service::WorkAdministration::new(
+        let admin = hellas_authority::grant_service::WorkAdministration::new(
             service,
             options.config.policies,
             options.config.max_job_millis,
         )
         .unwrap();
-        let hellas_work::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
+        let hellas_authority::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
             .execute(
                 &caller,
                 GrantId([0; 16]),
-                hellas_work::model::grant::admin::WorkControlCommand::List,
+                hellas_authority::model::grant::admin::WorkControlCommand::List,
             )
             .await
             .unwrap()
@@ -4351,14 +4359,15 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
 
 #[tokio::test]
 async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
-    use hellas_work::model::{
-        grant,
-        grant::{budget::*, records::*},
-        profile::PreparedWorkInput,
+    use {
+        hellas_authority::grant_service::GrantService,
+        hellas_channel::work::admission::CapacityDomain,
+        hellas_channel::work::admission::WorkPermit,
     };
-    use hellas_work::{
-        grant_service::GrantService,
-        work::admission::{CapacityDomain, WorkPermit},
+    use {
+        hellas_authority::model::grant, hellas_authority::model::grant::budget::*,
+        hellas_authority::model::grant::records::*,
+        hellas_channel::model::profile::PreparedWorkInput,
     };
     #[derive(Clone)]
     struct Backend {
@@ -4370,26 +4379,30 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             Ok(WorkPermit::new(
                 domain,
                 self.slots.clone().try_acquire_owned().map_err(|_| {
-                    BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                    BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
                 })?,
             ))
         }
         async fn execute(
             &self,
-            prepared: hellas_work::work::PreparedWorkInput,
-        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                    hellas_work::work::admission::CapacityDomain::Fetch,
-                )
-                .into());
+            prepared: hellas_channel::work::PreparedWorkInput,
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
+        {
+            let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        hellas_channel::work::admission::CapacityDomain::Fetch,
+                    )
+                    .into(),
+                );
             };
             let input = *input;
             let (_, admission) = input.into_parts_and_admission();
             let _running = admission
-                .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {
-                    self.try_admit(hellas_work::work::admission::CapacityDomain::Gpu)
-                })
+                .reserve(
+                    hellas_channel::work::admission::CapacityDomain::Gpu,
+                    async { self.try_admit(hellas_channel::work::admission::CapacityDomain::Gpu) },
+                )
                 .await?
                 .dispatch()
                 .await?;
@@ -4401,7 +4414,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         key: &ProducerSigningKey,
         transport: PeerId,
     ) -> hellas_rpc::ProviderEnrollmentBundle {
-        hellas_work::test_support::enrollment(key, key, transport.into_bytes(), [7; 32])
+        hellas_channel::test_support::enrollment(key, key, transport.into_bytes(), [7; 32])
     }
     let root = temp();
     write_setup_journal(root.path()).await;
@@ -4421,7 +4434,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         .unwrap()
         .unwrap();
     // The paid fixture's runner key doubles as this grant client's node key.
-    let (grantee, grantee_key) = hellas_work::test_support::principal(0x21);
+    let (grantee, grantee_key) = hellas_channel::test_support::principal(0x21);
     let provider_key = provider_producer();
     let network = grant::grant_network();
     let now = hellas_auth::authority::UnixMillis(1_000_000);
@@ -4446,7 +4459,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             name: "native".into(),
             work: work_policy().into(),
             https: None,
-            pricing: hellas_work::model::grant::pricing::Pricing {
+            pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
                 rates: None,
             },
@@ -4479,7 +4492,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     .await;
     let channel = store
         .state()
-        .channel_id(id, hellas_work::test_support::channel_client(grantee))
+        .channel_id(id, hellas_channel::test_support::channel_client(grantee))
         .unwrap();
     let input = PreparedWorkInput::Evaluate(bundle());
     let auth = grant::GrantJobAuthorizationV1 {
@@ -4546,8 +4559,12 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     let before_paid = paid.with_state(Channel::checkpoint).await.unwrap();
     let mut context = vouched_context(peer);
     context.open_exporter = Some([7; 32]);
-    let (request, uploads) =
-        hellas_work::test_support::grant_upload_requests(&request, &grantee_key, network, [7; 32]);
+    let (request, uploads) = hellas_channel::test_support::grant_upload_requests(
+        &request,
+        &grantee_key,
+        network,
+        [7; 32],
+    );
     for upload in uploads {
         let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = execution
             .upload_content(upload, context.clone())

@@ -39,7 +39,7 @@ async fn verified_usage_survives_error_status_and_late_settlement_without_faulti
             crate::test_support::accept_grant(
                 &work_service,
                 &request,
-                &crate::test_support::principal(1).1,
+                &hellas_channel::test_support::principal(1).1,
             )
             .await,
         );

@@ -1,8 +1,8 @@
 //! The measurement seams §4's budgets are made of.
 
+use hellas_channel::work_store::Role;
+use hellas_channel::work_store::journal::{Journal, JournalId, JournalKind};
 use hellas_rpc::observe::Samples;
-use hellas_work::work_store::Role;
-use hellas_work::work_store::journal::{Journal, JournalId, JournalKind};
 use tracing::instrument::WithSubscriber;
 
 /// The records a measured fixture writes, and the state a rotation
@@ -110,7 +110,7 @@ async fn each_append_and_each_rotation_is_its_own_sample() {
 /// generation moved.
 #[tokio::test]
 async fn work_that_was_not_done_is_not_sampled() {
-    use hellas_work::work_store::journal::MAX_CHECKPOINT_BYTES;
+    use hellas_channel::work_store::journal::MAX_CHECKPOINT_BYTES;
 
     let Ok(dir) = tempfile::tempdir() else {
         panic!("a temporary directory");

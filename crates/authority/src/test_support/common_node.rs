@@ -326,12 +326,13 @@ pub fn allowance(
     }
 }
 
-impl crate::work::WorkBackend for NoBackend {
+impl hellas_channel::work::WorkBackend for NoBackend {
     fn try_admit(
         &self,
-        domain: crate::work::admission::CapacityDomain,
-    ) -> Result<crate::work::admission::WorkPermit, crate::work::BackendFault> {
-        Err(crate::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 }
 

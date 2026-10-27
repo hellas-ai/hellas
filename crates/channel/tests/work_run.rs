@@ -12,27 +12,27 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_auth::{ProducerSigningKey, PublicKey};
-use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
-use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
-use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
-use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, WorkSetupError};
-use hellas_work::model::work::{
+use hellas_channel::model::setup::{ReadyChannel, WorkChannelDescriptor, WorkSetupError};
+use hellas_channel::model::work::{
     EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, canonical_output_digest,
     propose_authorization, result_digest, signing_hash, terminal_result, work_id,
 };
-use hellas_work::test_support::channel::{
+use hellas_channel::test_support::channel::{
     CURSOR, PRICE, PROMPT_TOKENS, advance, bundle, bundle_bytes, client, commit, deadlines,
     descriptor, descriptor_with, evaluate_request, manifest, network, origin, payment_policy,
     provider, provider_producer, settlement, work_policy,
 };
-use hellas_work::work::{
+use hellas_channel::work::{
     BackendFault, ProviderEndpoint, RunAdmission, RunError, RunOutcome, WorkBackend, WorkService,
     run_accepted_work,
 };
-use hellas_work::work_store::{
+use hellas_channel::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
     WorkStoreError,
 };
+use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
+use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
+use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
 
 #[path = "work_run/fetch.rs"]
 mod fetch;
@@ -65,7 +65,7 @@ fn ready_at(height: u64) -> ReadyChannel {
 }
 
 fn ready_of(descriptor: WorkChannelDescriptor, height: u64) -> ReadyChannel {
-    hellas_work::test_support::channel::ready_of(&descriptor, height)
+    hellas_channel::test_support::channel::ready_of(&descriptor, height)
 }
 
 fn ready() -> ReadyChannel {
@@ -73,7 +73,7 @@ fn ready() -> ReadyChannel {
 }
 
 async fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
-    hellas_work::test_support::channel::store_at(root, &ready(), Role::Provider, height).await
+    hellas_channel::test_support::channel::store_at(root, &ready(), Role::Provider, height).await
 }
 
 fn endpoint(store: ChannelStore) -> ProviderEndpoint {
@@ -147,7 +147,7 @@ fn transcript_for(
     chunks: &[&[u32]],
     key: &ProducerSigningKey,
 ) -> Vec<OutputEventEnvelope> {
-    hellas_work::test_support::channel::transcript_chunks(
+    hellas_channel::test_support::channel::transcript_chunks(
         request,
         chunks,
         key,
@@ -202,20 +202,23 @@ impl CountingBackend {
 impl WorkBackend for CountingBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
     async fn execute(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+        prepared: hellas_channel::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);

@@ -1,4 +1,4 @@
-use hellas_work::model::http_usage::*;
+use hellas_authority::model::http_usage::*;
 use std::io::Write;
 fn compressed(bytes: &[u8], encoding: &str) -> Vec<u8> {
     match encoding {

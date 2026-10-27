@@ -12,13 +12,13 @@ use crate::model::grant::{
     grant_work_id,
     records::{GrantError, Offer, SignedOffer},
 };
-use crate::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
-use crate::work_store::journal::{
-    Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
-};
-use crate::work_store::{Applied, JobPhase, Role};
 use hellas_auth::authority::{Revision, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
+use hellas_channel::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
+use hellas_channel::work_store::journal::{
+    Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
+};
+use hellas_channel::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};

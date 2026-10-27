@@ -2,15 +2,14 @@
 use super::funding::{Clock, JobAuthorization, JobOutcome};
 use super::*;
 
-/// Job lifecycle shared by all supported funding models. Mutations are private
-/// to the journal implementation; signatures and funding are checked before
-/// the journal can publish a transition.
+/// Job lifecycle shared by the channel and authority journals. Each journal
+/// checks signatures and funding before it can publish a transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobBook<F: Funding> {
-    pub(in crate::work_store) pending_proposal: Option<Digest>,
-    pub(in crate::work_store) jobs: BTreeMap<Digest, JobState<F>>,
-    pub(in crate::work_store) terminals: BTreeMap<Digest, JobTerminal<F>>,
-    pub(in crate::work_store) proposal_nonce_high_water: u64,
+    pub pending_proposal: Option<Digest>,
+    pub jobs: BTreeMap<Digest, JobState<F>>,
+    pub terminals: BTreeMap<Digest, JobTerminal<F>>,
+    pub proposal_nonce_high_water: u64,
     pub(in crate::work_store) indeterminate: BTreeSet<Digest>,
 }
 
@@ -53,7 +52,7 @@ impl<F: Funding> JobBook<F> {
         self.pending_proposal
     }
 
-    pub(in crate::work_store) fn proposal_exchange(
+    pub fn proposal_exchange(
         &mut self,
         id: Digest,
         pending: bool,
@@ -78,10 +77,7 @@ impl<F: Funding> JobBook<F> {
         Ok(Applied::Changed)
     }
 
-    pub(in crate::work_store) fn revalidate_exchange(
-        &self,
-        role: Role,
-    ) -> Result<(), ChannelStateError> {
+    pub fn revalidate_exchange(&self, role: Role) -> Result<(), ChannelStateError> {
         if let Some(id) = self.pending_proposal {
             if role != Role::Client {
                 return Err(ChannelStateError::WrongRole {
@@ -146,11 +142,7 @@ impl<F: Funding> JobBook<F> {
             None => Ok(()),
         }
     }
-    pub(in crate::work_store) fn propose(
-        &mut self,
-        job: JobState<F>,
-        role: Role,
-    ) -> Result<Applied, ChannelStateError> {
+    pub fn propose(&mut self, job: JobState<F>, role: Role) -> Result<Applied, ChannelStateError> {
         if let Some(held) = self.jobs.get(&job.work_id) {
             return if held == &job {
                 Ok(Applied::Redundant)
@@ -179,7 +171,7 @@ impl<F: Funding> JobBook<F> {
         self.proposal_nonce_high_water = nonce;
         Ok(Applied::Changed)
     }
-    pub(in crate::work_store) fn accept(
+    pub fn accept(
         &mut self,
         id: Digest,
         signature: F::Signature,
@@ -209,11 +201,7 @@ impl<F: Funding> JobBook<F> {
         }
         Ok(Applied::Changed)
     }
-    pub(in crate::work_store) fn run(
-        &mut self,
-        id: Digest,
-        now: F::Clock,
-    ) -> Result<Applied, ChannelStateError> {
+    pub fn run(&mut self, id: Digest, now: F::Clock) -> Result<Applied, ChannelStateError> {
         let job = self.open_job_mut(id, "a running marker")?;
         match job.phase {
             JobPhase::Running | JobPhase::Streaming => return Ok(Applied::Redundant),
@@ -234,7 +222,7 @@ impl<F: Funding> JobBook<F> {
         job.phase = JobPhase::Running;
         Ok(Applied::Changed)
     }
-    pub(in crate::work_store) fn record_result(
+    pub fn record_result(
         &mut self,
         id: Digest,
         result: F::Result,
@@ -301,7 +289,7 @@ impl<F: Funding> JobBook<F> {
         };
         Ok(Applied::Changed)
     }
-    pub(in crate::work_store) fn rest_at(&mut self, terminal: JobTerminal<F>) {
+    pub fn rest_at(&mut self, terminal: JobTerminal<F>) {
         if self.pending_proposal == Some(terminal.work_id) {
             self.pending_proposal = None;
         }

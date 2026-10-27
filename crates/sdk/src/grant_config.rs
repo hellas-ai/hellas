@@ -2,7 +2,7 @@
 //! Grants and their counters remain runtime state in the provider journal.
 use crate::resource_config::{ExecutionPolicyFile, FetchPolicyFile, ResourceConfigError};
 use hellas_auth::authority::{ResourceId, Revision};
-use hellas_work::model::grant::{
+use hellas_authority::model::grant::{
     records::{GrantError, GrantPolicy},
     resource::HttpsResource,
     responses::ResponsesResource,
@@ -37,7 +37,7 @@ struct ResourceFile {
     fetch: Option<FetchPolicyFile>,
     https: Option<HttpsResource>,
     responses: Option<ResponsesResource>,
-    pricing: hellas_work::model::grant::pricing::Pricing,
+    pricing: hellas_authority::model::grant::pricing::Pricing,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,12 +160,12 @@ impl GrantConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_work::test_support::assert_err;
+    use hellas_channel::test_support::assert_err;
     use serde_json::json;
 
     #[test]
     fn resource_configuration_cannot_override_budgets() {
-        let policy = hellas_work::test_support::policy();
+        let policy = hellas_authority::test_support::policy();
         let baseline = json!({"resource":policy.resource, "account":policy.account, "revision":policy.revision, "name":policy.name, "pricing":policy.pricing});
         serde_json::from_value::<ResourceFile>(baseline.clone()).unwrap();
         for field in ["budget", "limits", "allowances", "permissions"] {
@@ -270,13 +270,13 @@ mod tests {
     fn responses_configuration_preserves_explicit_constraints_and_rejects_unbounded_resources() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.json");
-        let mut expected = hellas_work::test_support::policy();
-        expected.pricing.rates = Some(vec![hellas_work::model::grant::pricing::UnitPrice {
-            meter: hellas_work::model::grant::budget::Meter::OutputTokens,
+        let mut expected = hellas_authority::test_support::policy();
+        expected.pricing.rates = Some(vec![hellas_authority::model::grant::pricing::UnitPrice {
+            meter: hellas_authority::model::grant::budget::Meter::OutputTokens,
             usd_micros: 3,
             units: NonZeroU64::new(4).unwrap(),
         }]);
-        let hellas_work::model::profile::WorkPolicy::Fetch {
+        let hellas_channel::model::profile::WorkPolicy::Fetch {
             policy, contract, ..
         } = &expected.work
         else {

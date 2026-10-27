@@ -11,13 +11,8 @@ use hellas_kernel::{Encode, NetworkId};
 use hellas_rpc::{ContentId, RequestCommitment};
 use hellas_xet::MIN_CHUNK_SIZE;
 use serde::{Deserialize, Serialize};
-pub mod admin;
-pub mod budget;
-pub mod pricing;
+
 pub mod records;
-pub mod resource;
-pub mod responses;
-pub mod standing;
 
 /// Standalone Work namespace shared by CLI providers and managed workers.
 /// It names no financial chain and does not require a chain client.

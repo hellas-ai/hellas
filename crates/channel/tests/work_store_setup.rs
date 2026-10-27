@@ -5,13 +5,31 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
-use hellas_work::test_support::channel::{client, network, provider};
+use hellas_channel::test_support::channel::{client, network, provider};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hellas_auth::Digest;
+use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
+};
+use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
+use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_channel::work_open::{
+    FinalizedSetup, SetupChannel, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView,
+    advance_setup,
+};
+use hellas_channel::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
+use hellas_channel::work_store::setup::setup_key;
+use hellas_channel::work_store::{
+    DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
+    SetupFault, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
+    discover_setups,
+};
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
     LeaseSlots, List, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party, PartyAuth, PartyKeys,
@@ -21,22 +39,6 @@ use hellas_kernel::{
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
-use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_work::work_open::{
-    FinalizedSetup, SetupChannel, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView,
-    advance_setup,
-};
-use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
-use hellas_work::work_store::setup::setup_key;
-use hellas_work::work_store::{
-    DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
-    SetupFault, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
-    discover_setups,
-};
 
 mod support;
 use support::temp;
@@ -73,7 +75,7 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
@@ -101,7 +103,7 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge,
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
@@ -112,11 +114,11 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(40, 40)
+    hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         ContentId::from_bytes([0x31; 32]),
         Digest::from_bytes([0x32; 32]),
         Digest::from_bytes([0x33; 32]),
@@ -2420,7 +2422,7 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
     let response: hellas_rpc::call::WithTrailer<_> = reply.into();
     assert!(
         matches!(response.response.outcome, Some(Outcome::Refused(refused))
-        if refused.code == hellas_work::work::WorkRefusal::Unavailable.code() as i32)
+        if refused.code == hellas_channel::work::WorkRefusal::Unavailable.code() as i32)
     );
 }
 
@@ -2448,7 +2450,7 @@ impl SetupView for HeldChannel {
 /// Offers one revision to a setup service through its own handler, and
 /// returns the revision it answers with.
 async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
-    hellas_work::test_support::channel::exchange_setup(service, bond_edge(), bundle).await
+    hellas_channel::test_support::channel::exchange_setup(service, bond_edge(), bundle).await
 }
 
 /// A payment leg learned while a finalized read is suspended changes the
@@ -3217,8 +3219,8 @@ async fn a_rotated_setup_is_still_discovered() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

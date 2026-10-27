@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 
 #[derive(Debug)]
-pub(crate) struct EndpointLock<T>(Arc<Mutex<State<T>>>);
+pub struct EndpointLock<T>(Arc<Mutex<State<T>>>);
 
 #[derive(Debug)]
 struct State<T> {
@@ -16,15 +16,16 @@ struct State<T> {
     failed: bool,
 }
 
+#[allow(clippy::result_unit_err)]
 impl<T> EndpointLock<T> {
-    pub(crate) fn new(value: T) -> Self {
+    pub fn new(value: T) -> Self {
         Self(Arc::new(Mutex::new(State {
             value,
             failed: false,
         })))
     }
 
-    pub(crate) async fn lock(&self) -> Result<EndpointGuard<'_, T>, ()> {
+    pub async fn lock(&self) -> Result<EndpointGuard<'_, T>, ()> {
         let held = self.0.lock().await;
         if held.failed {
             return Err(());
@@ -32,7 +33,7 @@ impl<T> EndpointLock<T> {
         Ok(EndpointGuard(held))
     }
 
-    pub(crate) async fn lock_owned(&self) -> Result<OwnedEndpointGuard<T>, ()> {
+    pub async fn lock_owned(&self) -> Result<OwnedEndpointGuard<T>, ()> {
         let held = self.0.clone().lock_owned().await;
         if held.failed {
             return Err(());
@@ -41,7 +42,7 @@ impl<T> EndpointLock<T> {
     }
 }
 
-pub(crate) struct OwnedEndpointGuard<T>(OwnedMutexGuard<State<T>>);
+pub struct OwnedEndpointGuard<T>(OwnedMutexGuard<State<T>>);
 impl<T> Deref for OwnedEndpointGuard<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -59,7 +60,7 @@ impl<T> Drop for OwnedEndpointGuard<T> {
     }
 }
 
-pub(crate) struct EndpointGuard<'a, T>(MutexGuard<'a, State<T>>);
+pub struct EndpointGuard<'a, T>(MutexGuard<'a, State<T>>);
 
 impl<T> Deref for EndpointGuard<'_, T> {
     type Target = T;

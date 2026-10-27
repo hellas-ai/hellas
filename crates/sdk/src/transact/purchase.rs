@@ -1,8 +1,8 @@
 //! Caller purchase/report state. This contains identifiers only, never input or output.
 use super::super::{job::Job, paid_client::PaidWorkOptions};
 use hellas_auth::Digest;
+use hellas_channel::work_store::{ChannelStore, Role, SetupStore, TerminalOutcome};
 use hellas_kernel::{EdgeId, Secp256k1Verifier};
-use hellas_work::work_store::{ChannelStore, Role, SetupStore, TerminalOutcome};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -28,9 +28,9 @@ pub enum PurchaseError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
-    Setup(#[from] hellas_work::model::setup::WorkSetupError),
+    Setup(#[from] hellas_channel::model::setup::WorkSetupError),
 }
 type Result<T> = std::result::Result<T, PurchaseError>;
 
@@ -130,7 +130,7 @@ impl Purchase {
         if !options.journal_root.exists() {
             return Err(self.unfinished("channel journal is missing"));
         }
-        let found = hellas_work::work_store::discover_setups(
+        let found = hellas_channel::work_store::discover_setups(
             &options.journal_root,
             options.config.chain.network,
         )
@@ -165,7 +165,7 @@ impl Purchase {
         let settlement = descriptor.expected_settlement()?;
         let metadata_only = matches!(
             descriptor.work_policy(),
-            hellas_work::model::profile::WorkPolicy::Fetch { .. }
+            hellas_channel::model::profile::WorkPolicy::Fetch { .. }
         );
         let store = if metadata_only {
             ChannelStore::open_metadata_only(
@@ -210,7 +210,7 @@ impl Purchase {
             .find(|job| job.authorization().proposal_nonce == record.nonce)
         {
             if job.authorization().payment_deadline < store.state().cursor().0
-                || (job.phase() == hellas_work::work_store::JobPhase::HalfSigned
+                || (job.phase() == hellas_channel::work_store::JobPhase::HalfSigned
                     && job.authorization().acceptance_deadline < store.state().cursor().0)
             {
                 return Err(self.unfinished("its authorization expired"));

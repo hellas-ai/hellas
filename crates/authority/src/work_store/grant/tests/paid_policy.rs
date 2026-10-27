@@ -1,12 +1,13 @@
 use super::*;
-use crate::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use crate::model::{
-    grant::admin::WorkControlCommand,
-    paid_policy::{OfferPolicy, PaidPolicy},
-};
 use crate::test_support::common_node::{NoBackend, WorkAdmin};
+use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_kernel::{EdgeValues, Fees};
 use std::sync::Arc;
+use {
+    crate::model::grant::admin::WorkControlCommand,
+    hellas_channel::model::paid_policy::OfferPolicy,
+    hellas_channel::model::paid_policy::PaidPolicy,
+};
 
 fn paid() -> PaidPolicy {
     PaidPolicy {

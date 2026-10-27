@@ -1,7 +1,7 @@
 use super::*;
+use hellas_channel::model::offer::{SignedPaidOffer, request_digest};
 use hellas_rpc::pb::work::{Quote, RequestOfferRequest, request_offer_response::Outcome};
 use hellas_wire::{Metadata, StreamTransport};
-use hellas_work::model::offer::{SignedPaidOffer, request_digest};
 use iroh::{EndpointAddr, TransportAddr};
 
 #[derive(Clone, Debug)]
@@ -37,7 +37,7 @@ impl OfferConnection {
             hellas_rpc::services::work_setup::Open,
         >(&transport, args.assurance, args.apple_trust.as_ref())
         .await?;
-        if hellas_work::model::grant::records::grant_transport(&provider)
+        if hellas_authority::model::grant::records::grant_transport(&provider)
             .map_err(|_| PaidClientError::ProviderIdentityChanged)?
             != *args.provider.as_bytes()
         {
@@ -124,7 +124,7 @@ fn check_quote(
 ) -> Result<PaidQuote> {
     let policy: ProviderChannelPolicy = hellas_rpc::protocol::value::decode_canonical_bounded(
         &quote.provider_channel_policy,
-        hellas_work::model::grant::records::MAX_OFFER_BYTES,
+        hellas_authority::model::grant::records::MAX_OFFER_BYTES,
     )
     .map_err(|_| PaidClientError::InputMismatch("quote encoding"))?;
     check_policy(args, &policy, quote.omission_bond)?;
@@ -180,8 +180,8 @@ pub(super) fn check_policy(
     policy.payment_policy.check()?;
     let settlement =
         hellas_kernel::work_payment_settlement(policy.expected_payment_values, omission_bond)
-            .ok_or(hellas_work::model::setup::WorkSetupError::Unsettleable)?;
-    hellas_work::model::setup::check_collateral(omission_bond, settlement.capacity())?;
+            .ok_or(hellas_channel::model::setup::WorkSetupError::Unsettleable)?;
+    hellas_channel::model::setup::check_collateral(omission_bond, settlement.capacity())?;
     Ok(())
 }
 
@@ -260,7 +260,7 @@ pub(crate) async fn retained_offer<
     provider: EndpointId,
     chain: &WorkBlocks<C>,
 ) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
-    let found = hellas_work::work_store::discover_setups(journal_root, network).await?;
+    let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
     if !found.unidentified.is_empty() {
         return Err(PaidClientError::MissingState("unidentified client journal"));
     }
@@ -288,7 +288,7 @@ pub(crate) async fn retained_offer<
         let Some((_, offer)) = store.state().offer() else {
             return Err(PaidClientError::MissingState("client offer"));
         };
-        if hellas_work::model::grant::records::grant_transport(&offer.offer().provider)
+        if hellas_authority::model::grant::records::grant_transport(&offer.offer().provider)
             .map_err(|_| PaidClientError::ProviderIdentityChanged)?
             != *provider.as_bytes()
         {
@@ -297,13 +297,13 @@ pub(crate) async fn retained_offer<
         if matches!(
             store.state().end(),
             Some(
-                hellas_work::work_store::SetupEnd::Aborted(_)
-                    | hellas_work::work_store::SetupEnd::Faulted(_)
+                hellas_channel::work_store::SetupEnd::Aborted(_)
+                    | hellas_channel::work_store::SetupEnd::Faulted(_)
             )
         ) {
             continue;
         }
-        if store.state().end() != Some(hellas_work::work_store::SetupEnd::Complete) {
+        if store.state().end() != Some(hellas_channel::work_store::SetupEnd::Complete) {
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: setup.bond_edge,
@@ -319,7 +319,7 @@ pub(crate) async fn retained_offer<
             }
         }
         if let Some(payment) = store.state().payment_edge()
-            && store.state().end() == Some(hellas_work::work_store::SetupEnd::Complete)
+            && store.state().end() == Some(hellas_channel::work_store::SetupEnd::Complete)
         {
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {

@@ -22,6 +22,7 @@ commonware-runtime = { workspace = true, optional = true }
 futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-auth.workspace = true
+hellas-channel.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = [
@@ -32,7 +33,6 @@ hellas-rpc = { workspace = true, features = [
 ] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
-hellas-work.workspace = true
 opentelemetry = { workspace = true, optional = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
@@ -48,7 +48,7 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
-hellas-work = { workspace = true, features = ["test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

@@ -8,6 +8,10 @@ use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
     CredentialId, GrantCommand, GrantId, GrantSpec, Ownership, Revision, ownership_digest,
 };
+use hellas_authority::model::grant::admin::{
+    MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply,
+};
+use hellas_authority::model::grant::records::{decode_enrollment, grant_transport};
 use hellas_rpc::{
     pb::host::{
         BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
@@ -20,15 +24,8 @@ use hellas_rpc::{
 use hellas_sdk::{
     access_bundle::{AccessBundle, MAX_BUNDLE_OFFERS, MAX_LABEL_BYTES},
     node_control::{self, profile},
-    work::{
-        authenticator::Authenticator,
-        node::SessionKey,
-        work_store::grant::{NodeStore, OwnerApproval},
-    },
 };
 use hellas_wire::{ServiceMarker, StreamTransport};
-use hellas_work::model::grant::admin::{MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply};
-use hellas_work::model::grant::records::{decode_enrollment, grant_transport};
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -48,9 +45,12 @@ pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
             "offline inspection does not connect to a daemon"
         );
         let query: hellas_auth::authority::InspectionQuery = read(command)?;
-        let inspection =
-            NodeStore::inspect_offline(journal, hellas_work::model::grant::grant_network(), &query)
-                .await?;
+        let inspection = NodeStore::inspect_offline(
+            journal,
+            hellas_authority::model::grant::grant_network(),
+            &query,
+        )
+        .await?;
         println!("{}", serde_json::to_string(&inspection)?);
         return Ok(());
     }
@@ -105,7 +105,7 @@ pub async fn run(
             }
             let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
                 Path::new(&target),
-                hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES,
+                hellas_authority::model::grant::records::MAX_ENROLLMENT_BYTES,
             )?)?;
             Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
         })
@@ -234,7 +234,7 @@ where
             max_in_flight,
             limits,
         } => {
-            let limits: Vec<hellas_work::model::grant::budget::Limit> = read(&limits)?;
+            let limits: Vec<hellas_authority::model::grant::budget::Limit> = read(&limits)?;
             let result = client
                 .set_machine_capacity(SetMachineCapacityRequest {
                     authorization: authorization.0.to_vec(),
@@ -254,7 +254,7 @@ where
                     authorization: authorization.0.to_vec(),
                     enrollment: hellas_private::read_bounded_regular_file(
                         &enrollment,
-                        hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES,
+                        hellas_authority::model::grant::records::MAX_ENROLLMENT_BYTES,
                     )?,
                 })
                 .await?;
@@ -332,9 +332,9 @@ where
                     .context("allowance must be 16 bytes of hex")?;
                 ensure!(
                     scope.permissions.iter().any(|p| {
-                        p.operation.as_str() == hellas_work::grant_service::WORK_EXECUTE
+                        p.operation.as_str() == hellas_authority::grant_service::WORK_EXECUTE
                             && p.resource
-                                == hellas_work::grant_service::allowance_resource(
+                                == hellas_authority::grant_service::allowance_resource(
                                     scope.authority,
                                     allowance,
                                 )
@@ -533,7 +533,7 @@ async fn offline(
     let authority = scope.authority;
     let output = credential_output(&credential_out)?;
     let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
-    let network = hellas_work::model::grant::grant_network();
+    let network = hellas_authority::model::grant::grant_network();
     let approve = |ownership| owner_approval(passkey, ownership, &administrator, &scope, holder);
     let (secret, revision) = match (root, revision) {
         (Some(root), None) => {
@@ -548,7 +548,7 @@ async fn offline(
             .await?;
             let mut revision = store.state().authority().revision();
             if let Some((scope, output, out)) = bearer {
-                let node = hellas_sdk::work::node::NodeCoordinator::new(
+                let node = hellas_authority::node::NodeCoordinator::new(
                     store,
                     std::sync::Arc::new(|| {
                         hellas_auth::authority::UnixMillis::now().unwrap_or_default()
@@ -674,7 +674,7 @@ async fn bootstrap_remote(
 fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
     let configuration = status.provider_configuration;
     let machine = status.machine.map(|m| -> Result<_> {
-                let limits: Vec<hellas_work::model::grant::budget::Limit> = decode_dag_cbor(&m.limits)?;
+                let limits: Vec<hellas_authority::model::grant::budget::Limit> = decode_dag_cbor(&m.limits)?;
                 Ok(serde_json::json!({"revision": m.revision, "max_in_flight": m.max_in_flight, "limits": limits}))
             }).transpose()?;
     println!(
@@ -692,3 +692,9 @@ fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
     );
     Ok(())
 }
+
+use hellas_authority::{
+    authenticator::Authenticator,
+    node::SessionKey,
+    work_store::grant::{NodeStore, OwnerApproval},
+};

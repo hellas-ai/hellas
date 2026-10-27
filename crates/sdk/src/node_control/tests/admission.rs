@@ -5,7 +5,7 @@ async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
     let f = fixture().await;
     let admission = f.service.remote_admission.clone();
     assert!(!RemoteControlAdmission::default().enabled());
-    hellas_work::test_support::assert_err!(RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public(); 2]), status if status.code() == WireCode::InvalidArgument);
+    hellas_channel::test_support::assert_err!(RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public(); 2]), status if status.code() == WireCode::InvalidArgument);
     let server = Endpoint::builder(presets::Minimal)
         .hooks(admission)
         .alpns(vec![HostControl::ALPN.as_bytes().to_vec()])
@@ -33,18 +33,18 @@ async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
         if seed == 63 {
             accepted.unwrap_err();
             if let Ok(connection) = client_connection {
-                tokio::time::timeout(hellas_work::test_support::WAIT, connection.closed())
+                tokio::time::timeout(hellas_authority::test_support::WAIT, connection.closed())
                     .await
                     .unwrap();
             }
         } else {
             let task = serve(&f.service, accepted.unwrap());
             // Endpoint admission alone never grants application authority.
-            hellas_work::test_support::assert_err!(connect_iroh(
+            hellas_channel::test_support::assert_err!(connect_iroh(
                     client_connection.unwrap(),
                     authority(),
                     &f.secret,
-                    hellas_work::node::SessionKey::Passkey(&OPERATOR.passkey())
+                    hellas_authority::node::SessionKey::Passkey(&OPERATOR.passkey())
                 )
                 .await, status if status.code() == WireCode::PermissionDenied);
             rejected(task).await;
@@ -73,7 +73,7 @@ async fn incomplete_authentication_releases_control_capacity_at_its_deadline() {
         MAX_CONNECTIONS - 1
     );
     tokio::time::advance(HANDSHAKE_TIMEOUT).await;
-    hellas_work::test_support::assert_err!(pending.await.unwrap(), status if status.code() == WireCode::PermissionDenied);
+    hellas_channel::test_support::assert_err!(pending.await.unwrap(), status if status.code() == WireCode::PermissionDenied);
     assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
     tokio::time::resume();
 }
@@ -91,7 +91,7 @@ async fn idle_sessions_release_control_capacity() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -101,9 +101,9 @@ async fn idle_sessions_release_control_capacity() {
         .unwrap();
     tokio::time::pause();
     tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
-    hellas_work::test_support::assert_err!(task.await.unwrap(), status if status.code() == WireCode::PermissionDenied);
+    hellas_channel::test_support::assert_err!(task.await.unwrap(), status if status.code() == WireCode::PermissionDenied);
     assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
-    hellas_work::test_support::assert_err!(client
+    hellas_channel::test_support::assert_err!(client
             .get_host_status(read_request(ROOT_GRANT))
             .await, status if matches!(status.code(), WireCode::Unavailable | WireCode::Internal));
 }
@@ -145,7 +145,7 @@ async fn pending_peer_cannot_take_session_capacity_or_block_a_second_owner_key()
         }
     );
     // Await admission deterministically before testing the third connection.
-    hellas_work::test_support::within(async {
+    hellas_authority::test_support::within(async {
         while service.remote_capacity.handshakes.available_permits() != MAX_CONNECTIONS - 2 {
             tokio::task::yield_now().await;
         }
@@ -176,11 +176,11 @@ async fn pending_peer_cannot_take_session_capacity_or_block_a_second_owner_key()
         owner.unwrap(),
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
-    hellas_work::test_support::within(async {
+    hellas_authority::test_support::within(async {
         while service.remote_capacity.sessions.available_permits() != MAX_CONNECTIONS - 1 {
             tokio::task::yield_now().await;
         }

@@ -19,7 +19,7 @@
 //! scratch and returns it. That digest binds the whole answer — the
 //! output token ids in position order, the final position, the stop
 //! reason and matched stop-token witness, the output text artifact, and the usage counts
-//! (`hellas_work::model::work::canonical_output_digest`) — so
+//! (`hellas_channel::model::work::canonical_output_digest`) — so
 //! reproducing it reproduces all of them. Every part of it except the
 //! tokens, stop reason, and matched stop-token witness is *derived* here from the job's own
 //! inputs, through the same [`completed_text`] the provider's artifact
@@ -30,7 +30,7 @@
 //! is the one the provider signed, that it names this job, and that the
 //! transcript it summarises is this job's — those are the endpoint
 //! journal's, established when the delivery was recorded
-//! (`hellas_work::work_store::Channel`), on commit and on every
+//! (`hellas_channel::work_store::Channel`), on commit and on every
 //! replay. Repeating them here would be a second opinion about a question
 //! already settled.
 //!
@@ -51,14 +51,14 @@
 //! the damage to the one job the client actually asked for.
 
 use hellas_auth::Digest;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::work::{PaidJobResultV1, canonical_output_digest};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ContentId;
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::protocol::artifacts::{
     OutputAddressed as _, TextArtifact, TextExecutionId, completed_text,
 };
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::work::{PaidJobResultV1, canonical_output_digest};
 
 /// Why a result could not be reproduced at all.
 ///

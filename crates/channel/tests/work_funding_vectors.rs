@@ -1,14 +1,14 @@
 //! Fixed V2 encodings assembled field-by-field before caller migration.
 use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, NodeKey, PrincipalId, ResourceId, Revision, UnixMillis};
-use hellas_kernel::{EdgeId, NetworkId, TermsHash};
-use hellas_rpc::{ContentId, RequestCommitment};
-use hellas_work::model::fetch::{FetchPolicyV2, fetch_policy_v2_digest};
-use hellas_work::model::grant::*;
-use hellas_work::model::work::{
+use hellas_channel::model::fetch::{FetchPolicyV2, fetch_policy_v2_digest};
+use hellas_channel::model::grant::*;
+use hellas_channel::model::work::{
     EvaluatePolicyV2, JobPaymentPolicyV2, PaidJobAuthorizationV2, PrivateRecord,
     evaluate_policy_v2_digest, job_payment_policy_digest, paid_work_v2_id,
 };
+use hellas_kernel::{EdgeId, NetworkId, TermsHash};
+use hellas_rpc::{ContentId, RequestCommitment};
 fn network() -> NetworkId {
     NetworkId::new("funding-v2").unwrap()
 }

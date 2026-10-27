@@ -1,12 +1,12 @@
 mod protocol;
 mod uploads;
 use super::*;
-use crate::work_store::journal::JournalError;
+use hellas_channel::work_store::journal::JournalError;
 
 use crate::test_support as common;
-use crate::test_support::{assert_err, within};
+use {crate::test_support::within, hellas_channel::test_support::assert_err};
 
-use crate::test_support::backend::{Backend, Reply};
+use hellas_channel::test_support::backend::{Backend, Reply};
 async fn start(directory: &std::path::Path, backend: Backend) -> (GrantService, ChannelId, Digest) {
     let (store, secret) = common::setup_with_credential(directory).await;
     let (mut authorization, _, input) = common::proposal(&store, 1);
@@ -79,7 +79,9 @@ async fn backend_panic_finishes_the_job_and_does_not_strand_shutdown() {
     let reopened = NodeStore::open(
         directory.path(),
         common::network(),
-        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        Some(hellas_channel::test_support::software_enrollment(
+            2, [2; 32],
+        )),
         UnixMillis(1000),
     )
     .await

@@ -516,7 +516,7 @@ fn paid_services_app_attest_binds_the_exact_connection_and_service() {
 #[test]
 fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     use crate::{FetchChunkVerifier, ProducerTrust, UnpinnedOffer};
-    use hellas_work::model::grant::{records::*, *};
+    use hellas_authority::model::grant::{records::*, *};
     use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
     let (trust, response, public_key) =
@@ -527,30 +527,32 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         verify_software_enrollment(&bundle).is_err(),
         "platform roots remain provider-only"
     );
-    let client = hellas_work::test_support::principal(1).0;
+    let client = hellas_channel::test_support::principal(1).0;
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-    let route =
-        hellas_work::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
+    let route = hellas_channel::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses")
+        .unwrap();
     let policy = GrantPolicy {
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "responses".into(),
         https: None,
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },
-        responses: Some(hellas_work::model::grant::responses::ResponsesResource {
-            model: "fixture".into(),
-            max_output_tokens: 8,
-            settings: Default::default(),
-        }),
-        work: hellas_work::model::profile::WorkPolicy::Fetch {
+        responses: Some(
+            hellas_authority::model::grant::responses::ResponsesResource {
+                model: "fixture".into(),
+                max_output_tokens: 8,
+                settings: Default::default(),
+            },
+        ),
+        work: hellas_channel::model::profile::WorkPolicy::Fetch {
             contract: test_responses_contract(),
-            policy: hellas_work::model::fetch::FetchPolicyV2 {
+            policy: hellas_channel::model::fetch::FetchPolicyV2 {
                 allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: hellas_work::model::fetch::fetch_route_commitment(
+                route_commitment: hellas_channel::model::fetch::fetch_route_commitment(
                     &route.canonical_body_bytes(),
                 )
                 .unwrap(),
@@ -642,4 +644,4 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     );
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

@@ -299,7 +299,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
             println!("output-0000 (base64): {}", STANDARD.encode(http_body(&job, &result)?));
         } else {
-            println!("output: {}", serde_json::to_string(&hellas_work::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
+            println!("output: {}", serde_json::to_string(&hellas_channel::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
         }
         println!("{}", wording(&args.client.provider, &job, &result));
         std::io::stdout().lock().flush()?;
@@ -326,7 +326,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 args.client.owner(&context)?.principal(),
             )
             .await?;
-            let hellas_work::model::profile::WorkPolicy::Fetch {
+            let hellas_channel::model::profile::WorkPolicy::Fetch {
                 contract,
                 route,
                 policy,
@@ -351,10 +351,10 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 );
             }
             let (service, method) = match route {
-                hellas_work::model::fetch::FetchRoutePolicy::OpenFetch { .. } => {
+                hellas_channel::model::fetch::FetchRoutePolicy::OpenFetch { .. } => {
                     ("http".into(), "request".into())
                 }
-                hellas_work::model::fetch::FetchRoutePolicy::SealedRoute { service, method } => {
+                hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { service, method } => {
                     (service.clone(), method.clone())
                 }
             };
@@ -487,8 +487,10 @@ fn http_body(job: &Job, result: &PaidWorkResult) -> super::CliResult<Vec<u8>> {
         "not an HTTPS Fetch contract"
     );
     let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)?;
-    let events =
-        hellas_work::model::work::decode_transcript(&result.transcript, result.transcript.len())?;
+    let events = hellas_channel::model::work::decode_transcript(
+        &result.transcript,
+        result.transcript.len(),
+    )?;
     let output = hellas_rpc::fetch::verify_output_events(result.input, job.assurance(), &events)?;
     ensure!(
         output.producer_key == result.provider_key,
@@ -510,7 +512,7 @@ fn save_outputs(directory: &Path, job: &Job, result: &PaidWorkResult) -> super::
     {
         write(&directory.join("output-0000"), &http_body(job, result)?)?;
     } else {
-        let events = hellas_work::model::work::decode_transcript(
+        let events = hellas_channel::model::work::decode_transcript(
             &result.transcript,
             result.transcript.len(),
         )?;

@@ -6,7 +6,7 @@ mod managed;
 mod native_owner;
 mod offer_gateway;
 
-use hellas_work::test_support::common_node;
+use hellas_authority::test_support::common_node;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
@@ -271,7 +271,7 @@ fn string(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 use hellas_auth::authority::GrantId;
-use hellas_work::model::grant::{admin::*, budget::*};
+use hellas_authority::model::grant::{admin::*, budget::*};
 
 fn request_file(root: &Path, command: &impl serde::Serialize) -> PathBuf {
     let path = root.join("work-command.json");
@@ -404,8 +404,12 @@ async fn issue_work_profile_at(
         authority: profile.authority,
         subject,
         permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(profile.authority, allowance),
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(
+                profile.authority,
+                allowance,
+            ),
         }]
         .into(),
         not_before: now,
@@ -455,21 +459,25 @@ async fn issue_work_profile_at(
 /// through the checked node API by the passkey session of `administrator`'s
 /// subject.
 async fn execution_credential(
-    node: &hellas_work::node::NodeCoordinator,
+    node: &hellas_authority::node::NodeCoordinator,
     administrator: &hellas_auth::authority::CredentialSecret,
     subject: hellas_auth::authority::PrincipalId,
     allowance: GrantId,
     holder: hellas_auth::authority::CredentialHolder,
 ) -> hellas_auth::authority::CredentialSecret {
     use hellas_auth::authority as auth;
-    let caller = hellas_work::test_support::session(node, administrator).await;
+    let caller = hellas_authority::test_support::session(node, administrator).await;
     let root = GrantId([0; 16]);
     let scope = auth::GrantSpec {
         authority: caller.authority(),
         subject,
         permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(caller.authority(), allowance),
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(
+                caller.authority(),
+                allowance,
+            ),
         }]
         .into(),
         not_before: auth::UnixMillis(1000),
@@ -487,7 +495,7 @@ async fn execution_credential(
     )
     .await
     .unwrap();
-    hellas_work::test_support::credentials::issue_one(node, &caller, root, scope, holder)
+    hellas_authority::test_support::credentials::issue_one(node, &caller, root, scope, holder)
         .await
         .unwrap()
         .1
@@ -497,16 +505,17 @@ async fn execution_credential(
 async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     use hellas_auth::{Digest, authority::*};
     let authority = AuthorityId(Digest::hash(b"CLI HTTP authority"));
-    let subject = hellas_work::test_support::actors::OPERATOR.principal();
+    let subject = hellas_channel::test_support::actors::OPERATOR.principal();
     let now = UnixMillis::now().unwrap_or_default();
-    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
-        .unwrap()
-        .permission(authority, None)
-        .unwrap();
+    let permission =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+            .unwrap()
+            .permission(authority, None)
+            .unwrap();
     let administrator = common_node::admin_spec(
         authority,
         subject,
-        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
         (now, UnixMillis(now.0 + 600_000)),
         (600_000, 0),
         &[],
@@ -522,9 +531,9 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     };
     let journal = root.join("gateway-authority");
     let root_grant = GrantId([0; 16]);
-    let (store, admin) = hellas_work::work_store::grant::NodeStore::bootstrap(
+    let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
         &journal,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
             Ownership::Bootstrap {
@@ -538,12 +547,12 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     )
     .await
     .unwrap();
-    let node = hellas_work::node::NodeCoordinator::new(
+    let node = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
-    let caller = hellas_work::test_support::session(&node, &admin).await;
-    let (_, credential) = hellas_work::test_support::credentials::issue_one(
+    let caller = hellas_authority::test_support::session(&node, &admin).await;
+    let (_, credential) = hellas_authority::test_support::credentials::issue_one(
         &node,
         &caller,
         root_grant,

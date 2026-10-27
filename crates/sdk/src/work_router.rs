@@ -2,6 +2,7 @@
 use hellas_rpc::pb::work::Refusable;
 
 use crate::paid_provider::{MountedWork, MountedWorkService};
+use hellas_authority::grant_service::{GrantService, GrantWork};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
@@ -11,7 +12,6 @@ use hellas_rpc::pb::work::{
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_wire::{TransportContext, WireCode, WireStatus};
-use hellas_work::grant_service::{GrantService, GrantWork};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 mod admission;
@@ -146,7 +146,7 @@ impl WorkHandler for UnmountedWork {
         &self,
         _request: DeliverResultRequest,
         _context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         Err(WireStatus::new(
             hellas_wire::WireCode::Unavailable,
             "work authority is not mounted",
@@ -225,7 +225,7 @@ impl WorkHandler for ConnectionWork {
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
             Handler::Grants(service) => service.stream_result(request, context).await,
             Handler::Payment(service) => service.stream_result(request, context).await,

@@ -8,19 +8,19 @@
 //! fields transposed; these do not.
 
 use hellas_auth::Digest;
+use hellas_channel::model::setup::{
+    CloseDescriptor, LeaseState, ObservedChannel, PendingState, WorkChannelConfig,
+    WorkChannelDescriptor, WorkSetupError, check_collateral, payment_terms_hash,
+};
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, PaidChannelPolicyV1, PaidWorkError, private_policy_commitment,
+};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, LeaseSlots, NetworkId, Parties,
     PartyKeys, Payout, PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Terms,
     TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::protocol::ContentId;
-use hellas_work::model::setup::{
-    CloseDescriptor, LeaseState, ObservedChannel, PendingState, WorkChannelConfig,
-    WorkChannelDescriptor, WorkSetupError, check_collateral, payment_terms_hash,
-};
-use hellas_work::model::work::{
-    EvaluatePolicyV2, PaidChannelPolicyV1, PaidWorkError, private_policy_commitment,
-};
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ fn payment_edge() -> EdgeId {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    hellas_work::test_support::channel::bond_terms_for(
+    hellas_channel::test_support::channel::bond_terms_for(
         Parties::new(
             PartyKeys::sole(provider_key()),
             PartyKeys::sole(client_key()),
@@ -71,11 +71,11 @@ fn bond_terms() -> WorkStakeBondTerms {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(40, 40)
+    hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         bond_edge(),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
@@ -86,7 +86,7 @@ fn payment_terms() -> WorkPaymentTerms {
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         ContentId::from_bytes([0x31; 32]),
         Digest::from_bytes([0x32; 32]),
         Digest::from_bytes([0x33; 32]),
@@ -839,8 +839,8 @@ fn close_descriptor_round_trips_without_new_work_policy() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

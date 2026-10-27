@@ -165,7 +165,7 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
     assert_eq!(policy.max_upload_bytes, 1024 * 1024);
     assert!(matches!(
         route,
-        hellas_work::model::fetch::FetchRoutePolicy::OpenFetch {
+        hellas_channel::model::fetch::FetchRoutePolicy::OpenFetch {
             require_spki_pin: true,
             ..
         }
@@ -537,7 +537,7 @@ async fn override_case(case: Box<Case>) {
     );
     let store = NodeStore::open(
         &faucet_root.join("provider"),
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         UnixMillis::now().unwrap(),
     )

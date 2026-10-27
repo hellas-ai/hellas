@@ -1,5 +1,8 @@
 use super::*;
-use crate::test_support::{actors::*, evaluate::Evaluate, ids};
+use {
+    crate::test_support::evaluate::Evaluate, crate::test_support::ids,
+    hellas_channel::test_support::actors::*,
+};
 
 struct NativeWork {
     world: TestService,

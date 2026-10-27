@@ -8,9 +8,9 @@ use hellas_auth::authority::{AuthorityId, CredentialSecret};
 use hellas_rpc::pb::work::{FundingKind, WorkRoute};
 use hellas_rpc::services::work::{AcceptWork, Open, Work, WorkClientImpl};
 use hellas_wire::{Dispatcher, Metadata, WireCode};
-use hellas_work::test_support::{assert_err, within};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use {hellas_authority::test_support::within, hellas_channel::test_support::assert_err};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApplicationAttack {
@@ -235,11 +235,11 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                         } else {
                             &f.application.credential
                         },
-                        hellas_work::node::SessionKey::Node(
+                        hellas_authority::node::SessionKey::Node(
                             &if attack == ApplicationAttack::Identity {
-                                hellas_work::test_support::actors::STRANGER
+                                hellas_channel::test_support::actors::STRANGER
                             } else {
-                                hellas_work::test_support::actors::ROOT
+                                hellas_channel::test_support::actors::ROOT
                             }
                             .node_key(),
                         ),
@@ -335,7 +335,7 @@ async fn revoked_credentials_are_rejected_before_work_body_decoding() {
     let pair = Pair::new().await;
     let server = pair.admit(&router, Some(&f.application)).await;
     let node = f.service.node();
-    let caller = hellas_work::test_support::session(&node, &f.administrator).await;
+    let caller = hellas_authority::test_support::session(&node, &f.administrator).await;
     node.revoke_credential(
         &caller,
         GrantId([0; 16]),

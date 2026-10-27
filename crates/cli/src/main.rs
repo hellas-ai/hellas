@@ -688,7 +688,7 @@ async fn async_main() {
     };
     let passkey = owner
         .as_ref()
-        .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
+        .map(|key| key as &dyn hellas_authority::authenticator::Authenticator);
 
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {

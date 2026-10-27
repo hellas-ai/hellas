@@ -55,7 +55,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
         drop(
             crate::test_node::bootstrap_node(
                 &state.join("grants"),
-                hellas_work::model::grant::grant_network(),
+                hellas_authority::model::grant::grant_network(),
                 Some(enrollment.clone()),
                 hellas_auth::authority::UnixMillis::now().unwrap(),
             )
@@ -268,7 +268,7 @@ impl hellas_executor::FetchAdaptorFactory for ProbeRoute {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[test]
 fn work_is_the_only_execution_protocol_advertised() {
@@ -303,13 +303,13 @@ fn work_is_the_only_execution_protocol_advertised() {
 #[tokio::test]
 async fn invalid_resources_are_rejected_before_opening_a_journal() {
     use crate::grant_provider::{GrantProviderError, ProviderResources};
-    use hellas_work::work_store::grant::NodeStoreError;
+    use hellas_authority::work_store::grant::NodeStoreError;
     let root = tempfile::tempdir().unwrap();
     let provider =
         crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0;
     let mut options = ProviderGrants {
         config: crate::GrantProviderOptions {
-            policies: vec![hellas_work::test_support::policy()],
+            policies: vec![hellas_authority::test_support::policy()],
             max_job_millis: std::num::NonZeroU64::MIN,
         },
         authority: ProviderAuthority::Journal {

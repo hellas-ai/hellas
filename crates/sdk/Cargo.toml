@@ -13,11 +13,13 @@ futures = { workspace = true }
 futures-core = { workspace = true }
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth = { workspace = true }
+hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "full-node",
     "proof-verify",
     "work-watcher",
 ] }
+hellas-channel = { workspace = true }
 hellas-client = { workspace = true, features = ["iroh", "work"] }
 hellas-executor = { workspace = true, default-features = false }
 hellas-gateway = { workspace = true }
@@ -40,7 +42,6 @@ hellas-wire = { workspace = true, features = [
     "tls",
     "discovery-mdns",
 ] }
-hellas-work = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true, features = ["tls-ring"] }
 iroh-mdns-address-lookup = { workspace = true }
@@ -69,8 +70,9 @@ bytes.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
+hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["test-support"] }
-hellas-work = { workspace = true, features = ["test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [
