@@ -20,8 +20,8 @@
           cat device.txt
           exit 1
         fi
+        cat device.txt
         if ! grep -E 'Name:.*gfx1151' device.txt; then
-          cat device.txt
           exit 1
         fi
         hipcc --offload-arch=gfx1151 -x hip -shared -fPIC -O2 \
@@ -31,7 +31,6 @@
         $CXX ${./gpu-smoke.cc} -ldl -o smoke
         ./smoke "$PWD/smoke.so"
         mkdir -p "$out"
-        cp device.txt "$out/"
         echo 'gfx1151: HIP shared library loaded and all 256 sums matched' > "$out/result"
       '';
 }
