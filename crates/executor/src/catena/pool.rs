@@ -70,6 +70,7 @@ type SpawnReply = std::result::Result<Spawned, String>;
 enum SpawnRequest {
     New {
         cancel: Cancellation,
+        dialect: GpuDialect,
         scratch: Option<Arc<Scratch>>,
         reply: mpsc::Sender<SpawnReply>,
     },
@@ -84,10 +85,11 @@ fn start_spawner() -> mpsc::SyncSender<SpawnRequest> {
             match request {
                 SpawnRequest::New {
                     cancel,
+                    dialect,
                     scratch,
                     reply,
                 } => {
-                    let result = spawn_child(cancel, scratch.as_deref())
+                    let result = spawn_child(cancel, scratch.as_deref(), dialect)
                         .map(|(runtime, pid)| Spawned {
                             runtime: Some(runtime),
                             pid,
@@ -124,17 +126,20 @@ fn spawner() -> &'static mpsc::SyncSender<SpawnRequest> {
 fn spawn(
     cancel: Cancellation,
     scratch: Option<Arc<Scratch>>,
+    dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {
-    spawn_on(spawner(), cancel, scratch)
+    spawn_on(spawner(), cancel, scratch, dialect)
 }
 fn spawn_on(
     spawner: &mpsc::SyncSender<SpawnRequest>,
     cancel: Cancellation,
     scratch: Option<Arc<Scratch>>,
+    dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {
     let (reply, receive) = mpsc::channel();
     let mut request = SpawnRequest::New {
         cancel: cancel.clone(),
+        dialect,
         scratch,
         reply,
     };
@@ -247,7 +252,11 @@ fn monitor_init(
     }
 }
 
-fn spawn_child(cancel: Cancellation, scratch: Option<&Scratch>) -> Result<(SafeRuntime, i32)> {
+fn spawn_child(
+    cancel: Cancellation,
+    scratch: Option<&Scratch>,
+    dialect: GpuDialect,
+) -> Result<(SafeRuntime, i32)> {
     if cancel.is_cancelled() {
         return Err("SafeRuntime initialization cancelled".into());
     }
@@ -255,7 +264,7 @@ fn spawn_child(cancel: Cancellation, scratch: Option<&Scratch>) -> Result<(SafeR
     let before = children()?;
     let (done, receive) = mpsc::channel();
     let monitor = thread::spawn(move || monitor_init(before, cancel, receive));
-    let runtime = SafeRuntime::new(GpuDialect::Hip);
+    let runtime = SafeRuntime::new(dialect);
     let _ = done.send(runtime.is_ok());
     let pid = monitor.join().map_err(|_| "spawn monitor panicked")?;
     match (runtime, pid) {
@@ -273,6 +282,7 @@ fn key(module: &RuntimeModule) -> Result<[u8; 32]> {
 }
 
 struct Worker {
+    dialect: GpuDialect,
     runtime: SafeRuntime,
     pid: i32,
     artifacts: HashMap<[u8; 32], Artifact>,
@@ -414,7 +424,7 @@ impl Device for Lease {
         if self
             .worker
             .as_ref()
-            .is_some_and(|w| w.scratch.is_some() != ephemeral)
+            .is_some_and(|w| w.scratch.is_some() != ephemeral || w.dialect != module.dialect)
         {
             self.worker = None;
         }
@@ -424,7 +434,7 @@ impl Device for Lease {
             } else {
                 None
             };
-            match spawn(self.cancel.clone(), scratch.clone()) {
+            match spawn(self.cancel.clone(), scratch.clone(), module.dialect) {
                 Ok((runtime, pid)) => {
                     self.pool
                         .state
@@ -432,6 +442,7 @@ impl Device for Lease {
                         .map_err(|_| "worker pool poisoned")?
                         .consecutive_failures = 0;
                     self.worker = Some(Worker {
+                        dialect: module.dialect,
                         runtime,
                         pid,
                         artifacts: HashMap::new(),

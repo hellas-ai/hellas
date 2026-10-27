@@ -193,15 +193,15 @@ fn call_once(
                 Some(slots.remove(name).ok_or("moved slot absent")?)
             }
             Arg::Input { object } if *kind == ValueKind::MemOwn => {
-                Some(Value::MemOwn(upload(&inputs[object])?))
+                Some(Value::MemOwn(upload(&inputs[object], module.dialect)?))
             }
             Arg::Input { object } => {
                 if !uploads.contains_key(object) {
-                    uploads.insert(object.clone(), upload(&inputs[object])?);
+                    uploads.insert(object.clone(), upload(&inputs[object], module.dialect)?);
                 }
                 None
             }
-            Arg::Zeroed { bytes } => Some(Value::MemOwn(memory::zeroed(*bytes)?)),
+            Arg::Zeroed { bytes } => Some(Value::MemOwn(memory::zeroed(*bytes, module.dialect)?)),
             _ => None,
         };
         owned.push(value);

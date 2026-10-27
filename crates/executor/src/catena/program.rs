@@ -1,5 +1,5 @@
 use super::{compile, validate};
-use catena_lang::runtime::RuntimeModule;
+use catena_lang::{codegen::GpuDialect, runtime::RuntimeModule};
 use hellas_channel::content::InvocationContent;
 use hellas_rpc::{
     ContentId, ContentRef,
@@ -20,6 +20,7 @@ impl BoundProgram {
         prepared: &PreparedInvocation,
         limits: &Limits,
         executable: &Path,
+        dialect: GpuDialect,
     ) -> Result<Self> {
         Self::compile_cancellable(
             content,
@@ -27,6 +28,7 @@ impl BoundProgram {
             limits,
             executable,
             &super::Cancellation::default(),
+            dialect,
         )
     }
     pub fn compile_cancellable(
@@ -35,6 +37,7 @@ impl BoundProgram {
         limits: &Limits,
         executable: &Path,
         cancel: &super::Cancellation,
+        dialect: GpuDialect,
     ) -> Result<Self> {
         prepared.validate()?;
         if prepared.request.retain != (content.retention() == hellas_rpc::Retention::Retain) {
@@ -67,8 +70,13 @@ impl BoundProgram {
                 Ok(std::str::from_utf8(&bytes)?.to_owned())
             })
             .collect::<Result<Vec<_>>>()?;
-        let module =
-            compile::compile_cancellable(&sources, executable, cancel, content.retention())?;
+        let module = compile::compile_cancellable(
+            &sources,
+            executable,
+            cancel,
+            content.retention(),
+            dialect,
+        )?;
         validate::validate(&module, &environment, &inputs, &plan, limits, content)?;
         Ok(Self {
             environment,

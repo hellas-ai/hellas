@@ -17,7 +17,7 @@ pub struct Resident {
     memory: MemOwn,
     bytes: u64,
 }
-// HIP allocations are process-wide device addresses. The owner never moves
+// Device allocations are process-wide device addresses. The owner never moves
 // its allocation out, all public access borrows it, and Arc pins outlive IPC calls.
 unsafe impl Send for Resident {}
 unsafe impl Sync for Resident {}
@@ -32,7 +32,7 @@ impl Resident {
             MemRef::from_raw_parts(
                 self.memory.as_ptr().cast::<u8>().add(offset).cast(),
                 bytes,
-                GpuDialect::Hip,
+                self.memory.dialect(),
                 self,
             )
         })
@@ -50,9 +50,10 @@ struct State {
 pub struct Assets {
     state: Mutex<State>,
     capacity: u64,
+    dialect: GpuDialect,
 }
 impl Assets {
-    pub fn new(capacity: u64) -> Self {
+    pub fn new(capacity: u64, dialect: GpuDialect) -> Self {
         Self {
             state: Mutex::new(State {
                 entries: BTreeMap::new(),
@@ -60,6 +61,7 @@ impl Assets {
                 clock: 0,
             }),
             capacity,
+            dialect,
         }
     }
     pub fn pin(&self, content: &InvocationContent, object: ContentRef) -> Result<Arc<Resident>> {
@@ -119,7 +121,7 @@ impl Assets {
         }
         let words = asset_words(content, object)?;
         let resident = Arc::new(Resident {
-            memory: MemOwn::from_u16_slice(&words, GpuDialect::Hip)?,
+            memory: MemOwn::from_u16_slice(&words, self.dialect)?,
             bytes: object.bytes(),
         });
         state.used += padded;
@@ -155,20 +157,20 @@ fn read_words(length: u64, mut input: impl Read) -> Result<Vec<u16>> {
     Ok(words)
 }
 
-pub fn upload(bytes: &[u8]) -> Result<MemOwn> {
+pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
     let mut words = Vec::new();
     words.try_reserve_exact(bytes.len().div_ceil(2))?;
     for pair in bytes.chunks(2) {
         words.push(u16::from_ne_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
     }
-    let memory = MemOwn::from_u16_slice(&words, GpuDialect::Hip)?;
+    let memory = MemOwn::from_u16_slice(&words, dialect)?;
     if bytes.len().is_multiple_of(2) {
         return Ok(memory);
     }
     // Input ownership has an exact byte length; its allocation may have one padding byte.
     let ptr = memory.as_ptr();
     let mut memory = std::mem::ManuallyDrop::new(memory);
-    match unsafe { MemOwn::from_raw_parts(ptr, bytes.len() as u64, GpuDialect::Hip) } {
+    match unsafe { MemOwn::from_raw_parts(ptr, bytes.len() as u64, dialect) } {
         Ok(exact) => Ok(exact),
         Err(error) => {
             unsafe {
@@ -198,7 +200,7 @@ mod tests {
 
     #[test]
     fn resident_pin_lock_wait_obeys_cancellation_and_deadline() {
-        let assets = Assets::new(0);
+        let assets = Assets::new(0, GpuDialect::Hip);
         let _held = assets.state.lock().unwrap();
         let object = ContentRef::for_bytes(b"not accessed");
         for cancelled in [false, true] {

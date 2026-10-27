@@ -550,6 +550,48 @@ mod tests {
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
+        // Retained content lost after admission still yields an authenticated failure.
+        let compute_policy = InvocationPolicy {
+            admissions: vec![Admission::Compute {
+                evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+            }],
+            limits,
+        };
+        let mut compute = hellas_channel::test_support::channel::bundle(1);
+        compute.request.runner_public_key = key.public_key();
+        compute.application_policy =
+            hellas_rpc::JsonBytes(compute_policy.canonical_bytes().unwrap());
+        let published = Arc::new(AtomicUsize::new(0));
+        let observed = published.clone();
+        let events = executor
+            .execute_stream(
+                Admitted::new(
+                    compute.clone(),
+                    limits,
+                    CapacityDomain::Gpu,
+                    InvocationContent::Retained(hellas_store::ContentStore::new()),
+                    WorkAdmission::payment(),
+                ),
+                Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+        let output = compute
+            .verify_output(
+                &compute_policy,
+                &caller.public_key(),
+                &key.public_key(),
+                &events,
+            )
+            .unwrap()
+            .output;
+        assert_eq!(output.outcome, Outcome::Failed(FailureReason::Compilation));
+        assert_eq!(events.len(), 1);
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+
         // Each admitted bound must leave a terminal before any prefix escapes.
         for (events_cap, frame_cap, spool_cap, bytes) in [
             (1, 1 << 16, 1 << 20, 1),

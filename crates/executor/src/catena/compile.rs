@@ -23,13 +23,18 @@ const MAX_MODULE_BYTES: u64 = 256 << 20;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn child_main() -> Result<bool> {
-    let compile = std::env::var_os(COMPILE_ENV).is_some();
+    let compile = std::env::var(COMPILE_ENV).ok();
     let runtime = std::env::var_os("CATENA_SAFE_RUNTIME_CHILD").is_some();
-    if !compile && !runtime {
+    if compile.is_none() && !runtime {
         return Ok(false);
     }
     isolate_child()?;
-    if compile {
+    if let Some(dialect) = compile {
+        let dialect = match dialect.as_str() {
+            "hip" => GpuDialect::Hip,
+            "cuda" => GpuDialect::Cuda,
+            _ => return Err("unknown compile GPU dialect".into()),
+        };
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(MAX_SOURCE_BYTES + 1)
@@ -42,7 +47,7 @@ pub fn child_main() -> Result<bool> {
             .with_limit(MAX_SOURCE_BYTES)
             .reject_trailing_bytes()
             .deserialize(&bytes)?;
-        let module = compile_sources(&sources)?;
+        let module = compile_sources(&sources, dialect)?;
         bincode::serialize_into(std::io::stdout().lock(), &module)?;
         return Ok(true);
     }
@@ -50,7 +55,7 @@ pub fn child_main() -> Result<bool> {
     Ok(catena_lang::safe_runtime::run_safe_runtime_child_if_requested()?)
 }
 
-pub fn compile_sources(sources: &[String]) -> Result<RuntimeModule> {
+pub fn compile_sources(sources: &[String], dialect: GpuDialect) -> Result<RuntimeModule> {
     let texts: Vec<_> = catena_lang::stdlib::core_sources()
         .map(|s| -> &str { s })
         .chain(sources.iter().map(String::as_str))
@@ -59,16 +64,21 @@ pub fn compile_sources(sources: &[String]) -> Result<RuntimeModule> {
     Ok(catena_lang::compile::compile(
         &mut CompileReport::new(raw),
         CodegenKind::Default,
-        GpuDialect::Hip,
+        dialect,
     )?)
 }
 
-pub fn compile(sources: &[String], executable: &Path) -> Result<RuntimeModule> {
+pub fn compile(
+    sources: &[String],
+    executable: &Path,
+    dialect: GpuDialect,
+) -> Result<RuntimeModule> {
     compile_cancellable(
         sources,
         executable,
         &Cancellation::default(),
         Retention::Retain,
+        dialect,
     )
 }
 
@@ -77,6 +87,7 @@ pub fn compile_cancellable(
     executable: &Path,
     cancel: &Cancellation,
     retention: Retention,
+    dialect: GpuDialect,
 ) -> Result<RuntimeModule> {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -107,13 +118,13 @@ pub fn compile_cancellable(
         .chain(sources.iter().map(String::as_str))
         .collect();
     let cache = if retention == Retention::Retain {
-        ModuleCache::from_sources(&all, CodegenKind::Default, GpuDialect::Hip)
+        ModuleCache::from_sources(&all, CodegenKind::Default, dialect)
     } else {
         None
     };
     let Some(cache) = cache else {
         check_cancelled()?;
-        let result = compile_child(sources, executable, cancel.clone());
+        let result = compile_child(sources, executable, cancel.clone(), dialect);
         check_cancelled()?;
         return result;
     };
@@ -140,7 +151,7 @@ pub fn compile_cancellable(
                 if child_cancel.is_cancelled() {
                     return Err("Catena frontend compile cancelled".into());
                 }
-                compile_child(&sources, &executable, child_cancel.clone())
+                compile_child(&sources, &executable, child_cancel.clone(), dialect)
             })
             .map_err(|error| error.to_string());
         let _ = send.send(result);
@@ -165,6 +176,7 @@ fn compile_child(
     sources: &[String],
     executable: &Path,
     cancel: Cancellation,
+    dialect: GpuDialect,
 ) -> Result<RuntimeModule> {
     use std::os::unix::process::CommandExt;
     let input = bincode::serialize(sources)?;
@@ -172,7 +184,13 @@ fn compile_child(
         return Err("sources exceed compile limit".into());
     }
     let mut child = Command::new(executable)
-        .env(COMPILE_ENV, "1")
+        .env(
+            COMPILE_ENV,
+            match dialect {
+                GpuDialect::Hip => "hip",
+                GpuDialect::Cuda => "cuda",
+            },
+        )
         .env_remove("CATENA_SAFE_RUNTIME_CHILD")
         .process_group(0)
         .stdin(Stdio::piped())

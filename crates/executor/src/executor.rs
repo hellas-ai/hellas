@@ -122,7 +122,10 @@ impl Executor {
                 fetch_active: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
                 gpu_active: Arc::new(Semaphore::new(1)),
                 pool,
-                assets: catena::assets::Assets::new(config.gpu_config.session_asset_bytes),
+                assets: catena::assets::Assets::new(
+                    config.gpu_config.session_asset_bytes,
+                    config.gpu_config.backend,
+                ),
                 config,
             }),
         })
@@ -210,18 +213,49 @@ impl ExecutorHandle {
                     let _active = active;
                     let _physical = physical;
                     let result = (|| {
-                        let program = catena::program::BoundProgram::compile_cancellable(
-                            &content,
-                            &prepared,
-                            &limits,
-                            &std::env::current_exe()?,
-                            &control,
-                        )?;
-                        let mut worker = executor.pool.lease_cancellable(
-                            program.module(),
-                            Duration::from_millis(limits.execution_timeout_ms),
-                            control,
-                        )?;
+                        let loaded = (|| {
+                            let program = catena::program::BoundProgram::compile_cancellable(
+                                &content,
+                                &prepared,
+                                &limits,
+                                &std::env::current_exe()?,
+                                &control,
+                                executor.config.gpu_config.backend,
+                            )?;
+                            let worker = executor.pool.lease_cancellable(
+                                program.module(),
+                                Duration::from_millis(limits.execution_timeout_ms),
+                                control.clone(),
+                            )?;
+                            Ok::<_, Box<dyn std::error::Error>>((program, worker))
+                        })();
+                        let (program, mut worker) = match loaded {
+                            Ok(loaded) => loaded,
+                            Err(error) => {
+                                if error
+                                    .downcast_ref::<catena::validate::InvalidPlan>()
+                                    .is_some()
+                                {
+                                    return Err(error);
+                                }
+                                tracing::warn!(%error, "compute preparation failed");
+                                let reason = if control.is_cancelled() {
+                                    FailureReason::Cancelled
+                                } else {
+                                    FailureReason::Compilation
+                                };
+                                let (_, events) = OutputStream::new(
+                                    &prepared.request,
+                                    &executor.config.producer_key,
+                                    hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
+                                )?
+                                .fail(reason)?;
+                                if let Some(progress) = &progress {
+                                    progress(events.last().unwrap().clone())?;
+                                }
+                                return Ok(events);
+                            }
+                        };
                         catena::driver::execute_signed(
                             &mut worker,
                             &program,

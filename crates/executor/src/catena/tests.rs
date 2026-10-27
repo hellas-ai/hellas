@@ -20,7 +20,10 @@ const SOURCE: &str = r#"(def program initialize : [] -> (u64 val) = const.u64.0x
 "#;
 fn module() -> &'static RuntimeModule {
     static MODULE: OnceLock<RuntimeModule> = OnceLock::new();
-    MODULE.get_or_init(|| compile::compile_sources(&[SOURCE.to_owned()]).unwrap())
+    MODULE.get_or_init(|| {
+        compile::compile_sources(&[SOURCE.to_owned()], catena_lang::codegen::GpuDialect::Hip)
+            .unwrap()
+    })
 }
 fn limits() -> Limits {
     Limits {
@@ -176,7 +179,7 @@ fn counter_and_first_then_resolve_by_step_index() {
         &BTreeMap::new(),
         &plan,
         &limits(),
-        &Assets::new(0),
+        &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
         &InvocationContent::Retained(ContentStore::new()),
         |v| {
             observed.push(v);
@@ -219,7 +222,7 @@ fn invalid_plan_never_loads_or_calls_a_device() {
                 &BTreeMap::new(),
                 &plan,
                 &limit,
-                &Assets::new(0),
+                &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
                 &InvocationContent::Retained(ContentStore::new()),
                 |_| Ok(())
             )
