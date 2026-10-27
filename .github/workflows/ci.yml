@@ -3,11 +3,13 @@ name: CI
 # Trigger model:
 #   pull_request → checks + image builds; publish previews for trusted branches
 #   push to master / workflow_dispatch → checks + commit-tagged images
+#   push of v* tag → same builds + version-tagged images + Release assets
 on:
   workflow_dispatch:
   pull_request:
   push:
     branches: [master]
+    tags: ['v*']
 
 permissions:
   contents: read
@@ -259,11 +261,12 @@ jobs:
           for archive in ./*.tar.gz; do
             docker load --input "$archive"
           done
-      - name: Publish commit-tagged images
+      - name: Publish commit and version-tagged images
         env:
           GH_TOKEN: ${{ github.token }}
           BACKEND: ${{ matrix.backend }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERSION_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: |
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -278,6 +281,53 @@ jobs:
           target="$repository:$prefix-$flavor"
           docker tag "$source" "$target"
           docker push "$target"
+          if [ -n "$VERSION_TAG" ]; then
+            version_target="$repository:$VERSION_TAG-$flavor"
+            docker tag "$source" "$version_target"
+            docker push "$version_target"
+            printf 'Version image: %s\n\n' "$version_target" >> "$GITHUB_STEP_SUMMARY"
+          fi
           digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$target")
           [[ "$digest" == "$repository@sha256:"* ]]
           printf '%s: %s\n\nPull by digest: %s\n\n' "$flavor" "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-release:
+    needs: [build-smoke-passed, publish-images]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-smoke-passed.result == 'success' &&
+      needs.publish-images.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hellas-static-*
+          path: release-artifacts
+      - name: Verify and collect static binaries
+        run: |
+          set -euo pipefail
+          mkdir release
+          for arch in x86_64 aarch64; do
+            artifact="release-artifacts/hellas-static-$arch"
+            (cd "$artifact" && sha256sum --check SHA256SUMS)
+            cp "$artifact/hellas-static-$arch-$GITHUB_SHA.tar.gz" \
+              "release/hellas-static-$arch-$GITHUB_REF_NAME.tar.gz"
+          done
+          cd release
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - name: Publish Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+              release/*.tar.gz release/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              release/*.tar.gz release/SHA256SUMS
+          fi
