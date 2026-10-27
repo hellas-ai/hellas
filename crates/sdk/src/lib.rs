@@ -45,7 +45,9 @@ pub mod paid_provider;
 pub mod work_config;
 pub mod work_router;
 
+pub mod job;
 pub mod paid_client;
+pub mod transact;
 mod work_link;
 
 pub mod work_provision;

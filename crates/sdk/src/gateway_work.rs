@@ -21,6 +21,14 @@ pub fn prepare_evaluate(
     request: WorkExecutionRequest,
     runner: hellas_auth::PublicKey,
 ) -> Result<PreparedPaidInputV1, WorkGatewayError> {
+    prepare_evaluate_with_nonce(request, runner, rand::random())
+}
+
+pub(crate) fn prepare_evaluate_with_nonce(
+    request: WorkExecutionRequest,
+    runner: hellas_auth::PublicKey,
+    nonce: [u8; 32],
+) -> Result<PreparedPaidInputV1, WorkGatewayError> {
     hellas_client::execution::validate_causal_lm_invocation(
         &request.environment,
         &request.input_ids,
@@ -41,7 +49,7 @@ pub fn prepare_evaluate(
         text_execution: execution.input_id().digest(),
         runner_public_key: runner,
         execution_environment: manifest.content_id(),
-        nonce: rand::random(),
+        nonce,
         assurance: hellas_rpc::Assurance::ProducerSigned,
         retain: true,
     };

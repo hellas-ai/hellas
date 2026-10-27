@@ -15,11 +15,11 @@ use std::sync::atomic::AtomicUsize;
 
 const RESPONSE: &str = "sdk-private-response";
 
-pub(super) struct Backend(AtomicUsize, Arc<tokio::sync::Semaphore>);
+pub(super) struct Backend(pub(super) Arc<AtomicUsize>, Arc<tokio::sync::Semaphore>);
 impl Default for Backend {
     fn default() -> Self {
         Self(
-            AtomicUsize::new(0),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(tokio::sync::Semaphore::new(2)),
         )
     }

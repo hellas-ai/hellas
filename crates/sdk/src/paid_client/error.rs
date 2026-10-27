@@ -4,8 +4,18 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum PaidClientError {
     #[error(transparent)]
+    Purchase(#[from] crate::transact::PurchaseError),
+    #[error(transparent)]
     Owner(#[from] crate::client_owner::ClientOwnerError),
-    #[error("provider refused offer request ({0})")]
+    #[error("no retained open channel with this provider")]
+    NoRetainedChannel,
+    #[error(transparent)]
+    Job(#[from] crate::job::JobError),
+    #[error(
+        "provider charges {quoted} per job; this job says {requested}. Nothing was signed or paid."
+    )]
+    PriceMismatch { quoted: u64, requested: u64 },
+    #[error("provider refused offer request ({0}). Nothing was paid.")]
     OfferRefused(i32),
     #[error(transparent)]
     Offer(#[from] hellas_work::model::offer::PaidOfferError),

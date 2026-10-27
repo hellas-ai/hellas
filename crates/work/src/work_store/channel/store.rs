@@ -170,6 +170,17 @@ impl ChannelStore {
         &self.state
     }
 
+    /// Reinstalls caller-supplied bytes in memory after metadata-only replay.
+    /// The retained authorization authenticates every byte; no body is appended.
+    pub(crate) fn restore_client_input(
+        &mut self,
+        work_id: Digest,
+        bytes: Vec<u8>,
+    ) -> Result<(), WorkStoreError> {
+        self.state.restore_client_input(work_id, bytes)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn pause_next_statement_for_test(
         &mut self,

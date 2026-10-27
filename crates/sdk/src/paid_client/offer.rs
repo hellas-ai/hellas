@@ -167,10 +167,14 @@ pub(super) fn check_policy(
     policy: &ProviderChannelPolicy,
     omission_bond: u64,
 ) -> Result<()> {
-    if policy.network != args.config.chain.network
-        || policy.payment_policy.fixed_price != args.expected_price
-    {
-        return Err(PaidClientError::InputMismatch("quoted network or price"));
+    if policy.network != args.config.chain.network {
+        return Err(PaidClientError::InputMismatch("quoted network"));
+    }
+    if policy.payment_policy.fixed_price != args.expected_price {
+        return Err(PaidClientError::PriceMismatch {
+            quoted: policy.payment_policy.fixed_price,
+            requested: args.expected_price,
+        });
     }
     policy.work_policy.check()?;
     policy.payment_policy.check()?;
@@ -202,6 +206,7 @@ pub(super) async fn obtain_offer(
     signer: &Secp256k1Signer,
     owner: &crate::client_owner::ClientOwner,
     chain: &RemoteLightClient,
+    job: Option<&crate::job::Job>,
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
     let connection = OfferConnection::open(args, endpoint).await?;
@@ -210,6 +215,9 @@ pub(super) async fn obtain_offer(
         Outcome::Refused(refused) => return Err(PaidClientError::OfferRefused(refused.code)),
         _ => return Err(PaidClientError::InputMismatch("expected quote")),
     };
+    if let Some(job) = job {
+        job.check_policy(&quote.policy)?;
+    }
     let quoted_provider = connection.provider.clone();
     drop(connection);
     let funding = owner
@@ -247,12 +255,12 @@ pub(super) async fn obtain_offer(
 pub(crate) async fn retained_offer<
     C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
 >(
-    args: &PaidWorkOptions,
+    journal_root: &std::path::Path,
+    network: hellas_kernel::NetworkId,
+    provider: EndpointId,
     chain: &WorkBlocks<C>,
 ) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
-    let found =
-        hellas_work::work_store::discover_setups(&args.journal_root, args.config.chain.network)
-            .await?;
+    let found = hellas_work::work_store::discover_setups(journal_root, network).await?;
     if !found.unidentified.is_empty() {
         return Err(PaidClientError::MissingState("unidentified client journal"));
     }
@@ -263,8 +271,8 @@ pub(crate) async fn retained_offer<
         .filter(|setup| setup.role == Role::Client)
     {
         let store = SetupStore::open(
-            &args.journal_root,
-            args.config.chain.network,
+            journal_root,
+            network,
             setup.bond_edge,
             Role::Client,
             &Secp256k1Verifier::new(),
@@ -282,7 +290,7 @@ pub(crate) async fn retained_offer<
         };
         if hellas_work::model::grant::records::grant_transport(&offer.offer().provider)
             .map_err(|_| PaidClientError::ProviderIdentityChanged)?
-            != *args.provider.as_bytes()
+            != *provider.as_bytes()
         {
             continue;
         }
@@ -332,4 +340,30 @@ pub(crate) async fn retained_offer<
         retained = Some((store, offer));
     }
     Ok(retained)
+}
+
+/// Reads the actual live retained channel's terms without funding or contacting
+/// the provider. Closed historical offers cannot choose the price or assurance.
+pub async fn retained_paid_policy(
+    config: &WorkConfig,
+    journal_root: &std::path::Path,
+    provider: EndpointId,
+    timeout: Duration,
+) -> Result<Option<(ProviderChannelPolicy, hellas_rpc::Assurance)>> {
+    config.clone().validate()?;
+    let timeout = timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+    let remote = crate::client_chain::connect(config, timeout).await?;
+    let chain = WorkBlocks::new(remote).with_read_retry(config.poll, timeout);
+    Ok(
+        retained_offer(journal_root, config.chain.network, provider, &chain)
+            .await?
+            .map(|(_, signed)| {
+                let offer = signed.offer();
+                let assurance = match offer.provider.genesis.statement.root_kind {
+                    hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
+                    _ => hellas_rpc::Assurance::ProducerSigned,
+                };
+                (offer.policy.clone(), assurance)
+            }),
+    )
 }

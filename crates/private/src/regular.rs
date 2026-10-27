@@ -4,6 +4,210 @@ use std::{
     path::Path,
 };
 
+/// Reads one ordinary file confined to an explicitly selected directory.
+/// Portable relative names use `/`, with no parent, root or symlink components.
+/// Unix resolves beneath held directory descriptors without following symlinks.
+/// Windows holds directory handles that deny replacement for the read's lifetime.
+#[derive(Debug)]
+pub struct ReadDirectory {
+    _root: std::fs::File,
+    #[cfg(windows)]
+    _parents: Vec<std::fs::File>,
+    #[cfg(windows)]
+    path: std::path::PathBuf,
+}
+
+impl ReadDirectory {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                _root: crate::imp::open_directory(root)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let path = root.canonicalize()?;
+            let mut current = std::path::PathBuf::new();
+            let mut handles = Vec::new();
+            for component in path.components() {
+                current.push(component);
+                if matches!(component, std::path::Component::Prefix(_)) {
+                    continue;
+                }
+                let handle = pinned_windows_file(&current)?;
+                if !handle.metadata()?.is_dir() {
+                    return Err(not_a_regular_file(&current));
+                }
+                handles.push(handle);
+            }
+            let _root = handles
+                .pop()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing directory"))?;
+            Ok(Self {
+                _root,
+                _parents: handles,
+                path,
+            })
+        }
+    }
+
+    pub fn read(&self, relative: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+        use std::path::Component;
+        let spelling = relative.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 relative path")
+        })?;
+        if spelling.is_empty()
+            || spelling.contains(['\\', ':'])
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path must stay inside the selected folder",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let file = {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            let directory = &self._root;
+            let name = CString::new(spelling)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            #[repr(C)]
+            struct OpenHow {
+                flags: u64,
+                mode: u64,
+                resolve: u64,
+            }
+            let how = OpenHow {
+                flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                mode: 0,
+                resolve: libc::RESOLVE_BENEATH
+                    | libc::RESOLVE_NO_SYMLINKS
+                    | libc::RESOLVE_NO_MAGICLINKS,
+            };
+            let handle = loop {
+                // SAFETY: the live directory fd, terminated name, and correctly
+                // sized open_how are valid; no creation flag needs a mode.
+                let fd = unsafe {
+                    libc::syscall(
+                        libc::SYS_openat2,
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        &how,
+                        std::mem::size_of::<OpenHow>(),
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: openat2 returned a new descriptor owned only here.
+                    break unsafe { std::fs::File::from_raw_fd(fd as i32) };
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            };
+            reopen_regular_path_handle(relative, &handle)?
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let file = {
+            use std::{
+                ffi::CString,
+                os::fd::{AsRawFd as _, FromRawFd as _},
+            };
+            let mut directory = self._root.try_clone()?;
+            let mut components = relative.components().peekable();
+            loop {
+                let component = components.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing filename")
+                })?;
+                let name = CString::new(component.as_os_str().to_str().unwrap_or_default())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                let last = components.peek().is_none();
+                let flags = libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | if last {
+                        libc::O_NONBLOCK
+                    } else {
+                        libc::O_DIRECTORY
+                    };
+                let next = loop {
+                    // SAFETY: a held directory fd, valid C name and read-only flags.
+                    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+                    if fd >= 0 {
+                        break unsafe { std::fs::File::from_raw_fd(fd) };
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                };
+                if last {
+                    if !next.metadata()?.is_file() {
+                        return Err(not_a_regular_file(relative));
+                    }
+                    break next;
+                }
+                directory = next;
+            }
+        };
+        #[cfg(windows)]
+        {
+            let mut path = self.path.clone();
+            let mut parents = Vec::new();
+            let mut components = relative.components().peekable();
+            let file = loop {
+                let component = components.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing filename")
+                })?;
+                path.push(component);
+                let handle = pinned_windows_file(&path)?;
+                if components.peek().is_none() {
+                    if !handle.metadata()?.is_file() {
+                        return Err(not_a_regular_file(relative));
+                    }
+                    break handle;
+                }
+                if !handle.metadata()?.is_dir() {
+                    return Err(not_a_regular_file(relative));
+                }
+                parents.push(handle);
+            };
+            // Retain every parent until the selected file has been opened and read.
+            return read_bounded(file, maximum);
+        };
+        #[cfg(unix)]
+        {
+            read_bounded(file, maximum)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pinned_windows_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    };
+    // Deny directory replacement and reparse edits while any descendant is read.
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "job paths must not be reparse points",
+        ));
+    }
+    Ok(file)
+}
+
 /// Opens a local regular file without first opening a FIFO or device for I/O.
 ///
 /// Explicit content paths may be symlinks: the target descriptor, rather than

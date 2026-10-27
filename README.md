@@ -126,6 +126,7 @@ The causal-LM gateway requires the same canonical environment and an explicit
 presentation tokenizer. `--model` is only an API response label; when omitted,
 the manifest ID is used.
 
+Buy a single job with [`transact` or `fetch`](docs/jobs.md).
 Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
 then pass `--paid-work-config POOL` together with `--environment` and
 `--tokenizer`. Local execution requires an explicitly provisioned owner grant.

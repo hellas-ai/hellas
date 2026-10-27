@@ -2,6 +2,22 @@ use super::*;
 use hellas_kernel::PartyAuth;
 
 impl Channel<PaymentFunding> {
+    pub(super) fn restore_client_input(
+        &mut self,
+        work_id: Digest,
+        input: Vec<u8>,
+    ) -> Result<(), ChannelStateError> {
+        self.require_role("restoring caller input", Role::Client)?;
+        let job = self.book.open_job(work_id, "restoring caller input")?;
+        self.check_authorization(&job.authorization, &input, false)?;
+        self.book
+            .jobs
+            .get_mut(&work_id)
+            .ok_or(ChannelStateError::Malformed)?
+            .prepared_input = input;
+        Ok(())
+    }
+
     fn check_result_payload(
         &self,
         job: &JobState,
@@ -1182,6 +1198,20 @@ impl Channel<PaymentFunding> {
         if let Some((held, signature)) = &job.result {
             if held == result && *signature == provider_signature && job.transcript == transcript {
                 return Ok(Applied::Redundant);
+            }
+            if self.role == Role::Client
+                && !metadata_only
+                && held == result
+                && *signature == provider_signature
+                && job.transcript.is_empty()
+            {
+                self.check_result_payload(&job, result, transcript, false)?;
+                self.book
+                    .jobs
+                    .get_mut(&work_id)
+                    .ok_or(ChannelStateError::Malformed)?
+                    .transcript = transcript.to_vec();
+                return Ok(Applied::Changed);
             }
             return Err(ChannelStateError::Conflict {
                 what: "this job's result",

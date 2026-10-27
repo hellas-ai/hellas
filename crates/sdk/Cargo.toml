@@ -57,6 +57,7 @@ subtle = "2"
 tempfile = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
+toml.workspace = true
 tracing = { workspace = true }
 url = { version = "2" }
 zeroize = { version = "1.9" }

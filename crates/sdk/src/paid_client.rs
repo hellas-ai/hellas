@@ -9,7 +9,7 @@ use tracing::Instrument as _;
 mod error;
 pub(crate) mod offer;
 pub use error::PaidClientError;
-pub use offer::{PaidQuote, request_paid_quote};
+pub use offer::{PaidQuote, request_paid_quote, retained_paid_policy};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;
@@ -62,7 +62,7 @@ pub struct PaidWorkOptions {
     pub terminal_blocks: u64,
     pub payment_blocks: u64,
     /// Bounds retries while a provider is not ready. A session's overall lifetime
-    /// is controlled by its caller; `run_paid_work` also enforces an overall limit.
+    /// is controlled by its caller; `transact` also enforces an overall limit.
     pub timeout: Duration,
 }
 
@@ -119,13 +119,7 @@ fn check_client_party(
     Ok(())
 }
 
-/// Convenience options for one complete paid job.
-pub struct PaidWorkRun {
-    pub options: PaidWorkOptions,
-    pub prepared_input: PreparedWorkInput,
-    pub settle: bool,
-}
-
+/// A paid result authenticated against its channel and caller input.
 pub struct PaidWorkResult {
     pub bond_edge: EdgeId,
     pub payment_edge: EdgeId,
@@ -139,41 +133,6 @@ pub struct PaidWorkResult {
     pub settled_provider_payout: Option<u64>,
 }
 
-/// Executes one job using a client-owned journal, with an overall time limit.
-pub async fn run_paid_work(
-    args: PaidWorkRun,
-    transport_key: SecretKey,
-    settlement_key: Secp256k1Signer,
-    owner: Arc<ClientOwner>,
-) -> Result<PaidWorkResult> {
-    if args.options.timeout.is_zero() {
-        return Err(PaidClientError::InvalidOptions("timeout must be positive"));
-    }
-    tokio::time::timeout(args.options.timeout, async move {
-        let PaidWorkRun {
-            options,
-            prepared_input,
-            settle,
-        } = args;
-        let endpoint = bind_paid_endpoint(transport_key).await?;
-        let mut session =
-            PaidWorkSession::open(options, endpoint.clone(), settlement_key, owner).await?;
-        let mut result = session
-            .run(Some(prepared_input), false, None)
-            .await?
-            .ok_or(PaidClientError::MissingState(
-                "paid execution returned no result",
-            ))?;
-        if settle {
-            result.settled_provider_payout = Some(session.settle().await?);
-        }
-        session.shutdown().await;
-        endpoint.close().await;
-        Ok(result)
-    })
-    .await
-    .map_err(|_| PaidClientError::Timeout { stage: "paid job" })?
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputIdentities {
     pub allowed_environment: hellas_rpc::ContentId,
@@ -323,6 +282,21 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
         .await?
 }
 
+enum OpenIntent {
+    Any,
+    Job(Box<crate::job::Job>),
+    Retained,
+}
+impl OpenIntent {
+    fn job(&self) -> Option<&crate::job::Job> {
+        if let Self::Job(job) = self {
+            Some(job)
+        } else {
+            None
+        }
+    }
+}
+
 impl PaidWorkSession {
     pub fn open(
         args: PaidWorkOptions,
@@ -330,7 +304,46 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(args, endpoint, settlement_key, owner))
+        Box::pin(Self::open_inner(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            OpenIntent::Any,
+        ))
+    }
+
+    /// Reopens an existing channel without requesting fresh owner funding.
+    pub fn open_retained(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        owner: Arc<ClientOwner>,
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        Box::pin(Self::open_inner(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            OpenIntent::Retained,
+        ))
+    }
+
+    /// Admits the unsigned job against the actual quote before funding it.
+    pub fn open_for_job(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        owner: Arc<ClientOwner>,
+        job: &crate::job::Job,
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        Box::pin(Self::open_inner(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            OpenIntent::Job(Box::new(job.clone())),
+        ))
     }
 
     async fn open_inner(
@@ -338,6 +351,7 @@ impl PaidWorkSession {
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
+        intent: OpenIntent,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
@@ -357,11 +371,28 @@ impl PaidWorkSession {
                 source,
             }
         })?;
-        let (store, signed) = match offer::retained_offer(&args, &chain).await? {
+        let (store, signed) = match offer::retained_offer(
+            &args.journal_root,
+            config.chain.network,
+            args.provider,
+            &chain,
+        )
+        .await?
+        {
             Some(retained) => retained,
+            None if matches!(intent, OpenIntent::Retained) => {
+                return Err(PaidClientError::NoRetainedChannel);
+            }
             None => {
-                let signed =
-                    offer::obtain_offer(&args, &endpoint, &settlement_key, &owner, &remote).await?;
+                let signed = offer::obtain_offer(
+                    &args,
+                    &endpoint,
+                    &settlement_key,
+                    &owner,
+                    &remote,
+                    intent.job(),
+                )
+                .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,
@@ -379,6 +410,9 @@ impl PaidWorkSession {
         let policy = signed.offer().policy.clone();
         let omission_bond = signed.offer().omission_bond;
         offer::check_policy(&args, &policy, omission_bond)?;
+        if let Some(job) = intent.job() {
+            job.check_policy(&policy)?;
+        }
         check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
         let bond = signed.offer().proposal.bond_edge();
         let trust = hellas_client::selected_provider_trust(
@@ -558,18 +592,19 @@ impl PaidWorkSession {
         recover: bool,
         progress: Option<hellas_work::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
-        self.run_with_admission(prepared, recover, progress, None)
+        self.run_prepared(prepared, recover, progress, None, None)
             .await
     }
 
     /// Like `run`, also marking `proposed` before a proposal can leave the process.
     /// A caller using cancellation must continue payment/recovery once it is set.
-    pub async fn run_with_admission(
+    pub(crate) async fn run_prepared(
         &mut self,
         prepared: Option<PreparedWorkInput>,
         recover: bool,
         progress: Option<hellas_work::work::PaidProgress>,
         proposed: Option<&AtomicBool>,
+        purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
         let Self {
             args,
@@ -589,15 +624,16 @@ impl PaidWorkSession {
                 hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
         }
-        if recover
-            && *needs_recovery
+        // A fresh job still depends on the provider seeing the preceding
+        // certificate. Repair its acknowledgement even without active-job replay.
+        if *needs_recovery
             && let Some(work_id) = client
                 .with_state(|state| state.last_payment().map(|payment| payment.work_id))
                 .await?
         {
             // A lost acknowledgement never requires fresh admission: these
             // exact certificate bytes are already durable on the client.
-            pay_for_result(dialer.work().await?, client, work_id).await?;
+            pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
         }
         if client.with_state(|state| state.is_closing()).await? {
             return if prepared.is_none() {
@@ -667,7 +703,8 @@ impl PaidWorkSession {
             for recovered in pending {
                 let (work_id, phase, pending) = match recovered {
                     RecoveredJob::Delivered(work_id) => {
-                        pay_for_result(dialer.work().await?, client, work_id).await?;
+                        pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout)
+                            .await?;
                         continue;
                     }
                     RecoveredJob::Unrecoverable(work_id) => {
@@ -696,6 +733,7 @@ impl PaidWorkSession {
                     None,
                     JobLookup::Retained(work_id),
                     None,
+                    None,
                 )
                 .await;
                 if let Err(error) = &result
@@ -720,8 +758,8 @@ impl PaidWorkSession {
         }
         // Keep recovery armed across any error or cancellation after acceptance.
         // A caller that declined recovery keeps the flag for a later run.
-        if recover {
-            *needs_recovery = prepared.is_some();
+        if prepared.is_some() {
+            *needs_recovery = true;
         }
         let result = match prepared {
             Some(prepared) => {
@@ -741,14 +779,22 @@ impl PaidWorkSession {
                             JobLookup::PreparedInput
                         },
                         proposed,
+                        purchase,
                     )
                     .await?,
                 )
             }
             None => None,
         };
-        if recover {
-            *needs_recovery = false;
+        if recover || result.is_some() {
+            *needs_recovery = client
+                .with_state(|state| {
+                    state.jobs().any(|job| {
+                        job.authorization().payment_deadline >= state.cursor().0
+                            && (!job.prepared_input().is_empty() || job.result().is_some())
+                    })
+                })
+                .await?;
         }
         Ok(result)
     }
@@ -800,15 +846,48 @@ async fn propose_when_ready(
         match result {
             Ok(work_id) => return Ok(work_id),
             Err(hellas_work::work::ProposeError::Refused { refusal, .. })
-                if refusal.is_retryable() =>
-            {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                tokio::time::sleep(delay.min(remaining)).await;
-                delay = delay.saturating_mul(2).min(Duration::from_secs(10));
-            }
+                if refusal.is_retryable() => {}
+            // Finalized setup can reach the client before the provider's clock
+            // mounts Work. Upload has no structured NotReady response; the
+            // retained half-signed proposal makes this retry the same purchase.
+            Err(hellas_work::work::ProposeError::Transport(status))
+                if status.code() == hellas_wire::WireCode::Unavailable => {}
             Err(error) => return Err(error.into()),
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(delay.min(remaining)).await;
+        delay = delay.saturating_mul(2).min(Duration::from_secs(10));
     }
+}
+
+/// A committed certificate remains the same payment when the provider's chain
+/// observation is temporarily unavailable. Both endpoints deduplicate it.
+async fn pay_when_ready(
+    dialer: &ProviderDialer,
+    client: &mut ClientService,
+    work_id: hellas_auth::Digest,
+    poll: Duration,
+    timeout: Duration,
+) -> Result<u64> {
+    tokio::time::timeout(timeout, async {
+        let mut delay = poll.max(Duration::from_secs(1));
+        loop {
+            match pay_for_result(dialer.work().await?, client, work_id).await {
+                Ok(credited) => return Ok(credited),
+                Err(hellas_work::work::PaymentError::Refused { refusal, .. })
+                    if refusal.is_retryable() => {}
+                Err(hellas_work::work::PaymentError::Transport(status))
+                    if status.code() == hellas_wire::WireCode::Unavailable => {}
+                Err(error) => return Err(error.into()),
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(Duration::from_secs(10));
+        }
+    })
+    .await
+    .map_err(|_| PaidClientError::Timeout {
+        stage: "payment acknowledgement",
+    })?
 }
 
 enum JobLookup {
@@ -828,6 +907,7 @@ async fn execute_paid_job(
     progress: Option<&hellas_work::work::PaidProgress>,
     lookup: JobLookup,
     proposed: Option<&AtomicBool>,
+    mut purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
     let readiness_timeout = args.timeout;
     let prepared_bytes = prepared.encode()?;
@@ -850,7 +930,8 @@ async fn execute_paid_job(
                     JobLookup::Retained(work_id) => job.work_id() == *work_id,
                     JobLookup::New => false,
                     JobLookup::PreparedInput => {
-                        job.prepared_input() == prepared_bytes.as_slice()
+                        job.authorization().input_content
+                            == hellas_rpc::ContentRef::for_bytes(&prepared_bytes)
                             && job.authorization().payment_deadline >= current
                             && (job.phase() != hellas_work::work_store::JobPhase::HalfSigned
                                 || job.authorization().acceptance_deadline >= current)
@@ -868,6 +949,12 @@ async fn execute_paid_job(
     {
         proposed.store(true, Ordering::Release);
     }
+    if let Some((work_id, _, _)) = existing.first() {
+        client
+            .restore_input(*work_id, ready, &proposal.prepared_input)
+            .await?;
+        tracing::debug!(%work_id, "retained job input restored");
+    }
     let (work_id, already_collected) = match existing.first().copied() {
         Some((work_id, hellas_work::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
@@ -883,7 +970,16 @@ async fn execute_paid_job(
             false,
         ),
         Some((work_id, hellas_work::work_store::JobPhase::Ready, _))
-        | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => (work_id, true),
+        | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => {
+            let retained = client
+                .with_state(|state| {
+                    state
+                        .job_by_id(work_id)
+                        .is_some_and(|job| !job.transcript().is_empty())
+                })
+                .await?;
+            (work_id, retained)
+        }
         Some((work_id, _, _)) => (work_id, false),
         None => (
             propose_when_ready(
@@ -899,6 +995,9 @@ async fn execute_paid_job(
             false,
         ),
     };
+    if let Some(purchase) = purchase.as_deref_mut() {
+        purchase.accepting(work_id)?;
+    }
     let transcript = if already_collected {
         client
             .with_state(|state| {
@@ -956,7 +1055,13 @@ async fn execute_paid_job(
     } else {
         collect_until_ready(dialer, client, ready, work_id, poll).await?
     };
-    let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
+    if let Some(purchase) = purchase.as_deref_mut() {
+        purchase.paying(work_id)?;
+    }
+    let credited = pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
+    if let Some(purchase) = purchase {
+        purchase.paid(work_id)?;
+    }
     Ok(PaidWorkResult {
         bond_edge: ready.channel().payment_terms().bond_edge,
         payment_edge: ready.channel().payment_edge(),

@@ -38,8 +38,8 @@ fn validate_serve_assurance(
     }
 }
 
-/// Read-only queries and existing authorities keep their identity requirement.
-/// A requester creates local keys before its first owner-approved channel funding.
+/// Providers and existing authority operations read their identity; requester
+/// commands create a local signing identity on first use.
 fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
@@ -458,11 +458,10 @@ enum Commands {
         #[arg(long = "address", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
-    /// Inspect or run the durable paid-work client path.
-    PaidWork {
-        #[command(subcommand)]
-        command: commands::paid_work::PaidWorkCommand,
-    },
+    /// Execute a reusable job folder, or settle its provider channels.
+    Transact(commands::transact::TransactArgs),
+    /// Buy an HTTPS Fetch using the same job and payment path.
+    Fetch(commands::transact::FetchArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -669,7 +668,8 @@ async fn async_main() {
     let faucet_requester = cli.owner.is_faucet()
         && matches!(
             &cli.command,
-            Commands::PaidWork { .. }
+            Commands::Transact(_)
+                | Commands::Fetch(_)
                 | Commands::Gateway {
                     paid_work_config: Some(_),
                     ..
@@ -1167,20 +1167,12 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::PaidWork { command } => match identity::settlement_signer(&local_identity) {
-            Ok(settlement_key) => async {
-                commands::paid_work::run(
-                    command,
-                    secret_key,
-                    settlement_key,
-                    local_identity.node_key.clone(),
-                    owner.clone(),
-                    identity::funding_root(cli.identity.as_deref())?,
-                )
-                .await
-            }.await,
-            Err(error) => Err(error),
-        },
+        Commands::Transact(args) => async {
+            commands::transact::run(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
+        Commands::Fetch(args) => async {
+            commands::transact::fetch(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),

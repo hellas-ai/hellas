@@ -1,6 +1,6 @@
 //! One paid Fetch job through the SDK, against the six-validator devnet.
 //!
-//! The provider creates its offer over RPC under its owner-approved policy; the client runs `run_paid_work`, then settles
+//! The provider creates its offer over RPC under its owner-approved policy; the client runs `transact`, then settles
 //! through a recovered `PaidWorkSession`.
 //! Both parties hold genesis allocations owned by software passkeys and
 //! authenticate remote reads; only the provider runs a full node. Only block ordering (the
@@ -31,9 +31,7 @@ use hellas_executor::{
 use hellas_kernel::{CoinId, EdgeValues, Fees, Funding, Key, List, Secp256k1Signer};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
-use hellas_sdk::paid_client::{
-    PaidWorkOptions, PaidWorkRun, PaidWorkSession, bind_paid_endpoint, run_paid_work,
-};
+use hellas_sdk::paid_client::{PaidWorkOptions, PaidWorkSession, bind_paid_endpoint};
 use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
@@ -166,7 +164,7 @@ async fn start_provider(
     config: WorkConfig,
     node: hellas_sdk::FullNode,
     identity: &NodeIdentity,
-) -> (hellas_sdk::ProviderHandle, MockFetchProvider) {
+) -> (hellas_sdk::ProviderHandle, PausedFetch) {
     let (routes, upstream) = routes();
     let provider = start_fetch_provider(
         FetchProviderOptions {
@@ -223,10 +221,44 @@ impl hellas_work::authenticator::Authenticator for Approvals {
 
 /// The upstream: one programmed response, projected as one text delta and
 /// a finished terminal.
-fn routes() -> (FetchRouteRegistry, MockFetchProvider) {
+#[derive(Clone)]
+struct PausedFetch {
+    inner: MockFetchProvider,
+    pause: Arc<std::sync::atomic::AtomicBool>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl hellas_executor::FetchProvider for PausedFetch {
+    fn execution_environment(&self) -> ContentId {
+        hellas_executor::FetchProvider::execution_environment(&self.inner)
+    }
+    fn run(&self, request: PreparedFetchRequest) -> hellas_executor::FetchProviderFuture<'_> {
+        Box::pin(async move {
+            let response = hellas_executor::FetchProvider::run(&self.inner, request).await?;
+            if self.pause.load(std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+                eprintln!("h6: gated upstream released");
+            }
+            Ok(response)
+        })
+    }
+}
+impl PausedFetch {
+    fn calls(&self, service: &str, method: &str, body: &[u8]) -> usize {
+        self.inner.calls(service, method, body)
+    }
+}
+fn routes() -> (FetchRouteRegistry, PausedFetch) {
     let environment = test_responses_contract().manifest_id();
     let upstream = MockFetchProvider::new(environment);
     upstream.insert("openai", "responses", BODY, [b"upstream".to_vec()]);
+    let upstream = PausedFetch {
+        inner: upstream,
+        pause: Arc::default(),
+        started: Arc::default(),
+        release: Arc::default(),
+    };
     let mut routes = FetchRouteRegistry::new();
     routes
         .register(
@@ -701,14 +733,8 @@ async fn paid_setup(
         owner.clone(),
     );
     tokio::pin!(open);
-    tokio::select! {
-        result = &mut open => panic!("setup ended before its proof read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
-    }
-    assert!(
-        approvals.0.lock().unwrap().is_empty(),
-        "unverified money cannot reach the passkey"
-    );
+    // A completed typed timeout is the expected result in the outage case;
+    // it need not lose a scheduling race to the proof-attempt observer.
     if never_catches_up {
         let error = tokio::time::timeout(Duration::from_secs(5), &mut open)
             .await
@@ -719,12 +745,24 @@ async fn paid_setup(
             matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if timeout == options.timeout),
             "typed proof read expiry: {error}"
         );
+        assert!(
+            approvals.0.lock().unwrap().is_empty(),
+            "unverified money cannot reach the passkey"
+        );
         endpoint.close().await;
         provider.shutdown().await.unwrap();
         relays.shutdown().await;
         devnet.shutdown().await;
         return None;
     }
+    tokio::select! {
+        result = &mut open => panic!("setup ended before its proof read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
+    }
+    assert!(
+        approvals.0.lock().unwrap().is_empty(),
+        "unverified money cannot reach the passkey"
+    );
     relays
         .source
         .unavailable
@@ -890,31 +928,128 @@ async fn paid_finish(case: PaidScenario) {
     drop(recovered);
     endpoint.close().await;
     eprintln!("H4 offline recovery complete; running paid job");
-    let result = run_paid_work(
-        PaidWorkRun {
-            options: options.clone(),
-            prepared_input: prepared_input.clone().into(),
-            settle: false,
-        },
-        client_transport.clone(),
+    let client_producer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let job = hellas_sdk::job::Job::fetch(
+        PRICE,
+        test_responses_contract(),
+        "openai".into(),
+        "responses".into(),
+        BODY.to_vec(),
+        Assurance::ProducerSigned,
+    )
+    .unwrap();
+    let job_folder = root.path().join("job");
+    job.save(&job_folder).unwrap();
+    let purchase_path = root.path().join("purchases/job.json");
+    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
+    let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
+    let mut session = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
         client_settlement(),
         owner.clone(),
     )
     .await
     .unwrap();
-    let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
-    let mut session = tokio::time::timeout(
-        options.timeout,
-        PaidWorkSession::open(
-            options.clone(),
-            endpoint.clone(),
-            client_settlement(),
-            owner.clone(),
+    session.run(None, true, None).await.unwrap();
+    assert!(
+        !session.needs_recovery(),
+        "initial recovery has completed before this request"
+    );
+    upstream
+        .pause
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let first = hellas_sdk::transact::transact(
+            &mut session,
+            &job,
+            &client_producer,
+            hellas_sdk::transact::TransactionOptions {
+                purchase: Some(&mut purchase),
+                ..Default::default()
+            },
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            result = &mut first => panic!("job completed before interruption: {:?}", result.err()),
+            () = upstream.started.notified() => {},
+        }
+        // The provider has accepted and dispatched, but has exposed no output.
+    }
+    assert!(
+        session.needs_recovery(),
+        "cancellation keeps recovery armed for the next request"
+    );
+    eprintln!("h6: first attempt interrupted after backend dispatch");
+    let interrupted = session
+        .with_state(|state| {
+            let jobs = state.jobs().collect::<Vec<_>>();
+            assert_eq!(jobs.len(), 1);
+            eprintln!("h6: interrupted client phase {:?}", jobs[0].phase());
+            (jobs[0].work_id(), jobs[0].authorization().proposal_nonce)
+        })
+        .await
+        .unwrap();
+    session.shutdown().await;
+    drop(session);
+    drop(purchase);
+    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
+    purchase.reconcile(&options).await.unwrap();
+    let mut session = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
+    session
+        .with_state(|state| {
+            assert!(
+                state.jobs().all(|job| job.prepared_input().is_empty()),
+                "reopened Fetch journals retain metadata only"
+            );
+        })
+        .await
+        .unwrap();
+    eprintln!("h6: reopened metadata-only client; releasing backend");
+    upstream
+        .pause
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    upstream.release.notify_one();
+    let loaded = hellas_sdk::job::Job::load(&job_folder).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        hellas_sdk::transact::transact(
+            &mut session,
+            &loaded,
+            &client_producer,
+            hellas_sdk::transact::TransactionOptions {
+                purchase: Some(&mut purchase),
+                ..Default::default()
+            },
         ),
     )
     .await
-    .expect("the settled session opens within its deadline")
+    .expect("accepted retry completes within its test deadline")
     .unwrap();
+    eprintln!("h6: accepted retry paid once");
+    assert!(
+        !session.needs_recovery(),
+        "the completed payment clears recovery"
+    );
+    assert_eq!(
+        result.work_id, interrupted.0,
+        "the original accepted work resumes"
+    );
+    assert_eq!(
+        session
+            .with_state(|state| state.proposal_nonce_high_water())
+            .await
+            .unwrap(),
+        interrupted.1,
+        "retry creates no second proposal"
+    );
     eprintln!("H4 paid job complete; settling");
     let settled_provider_payout =
         sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
@@ -931,6 +1066,13 @@ async fn paid_finish(case: PaidScenario) {
         "the settled close paid the provider the price",
     );
     assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+    let marker = std::fs::read(&purchase_path).unwrap();
+    assert!(
+        !marker.windows(BODY.len()).any(|bytes| bytes == BODY),
+        "purchase state contains no request bytes"
+    );
+    purchase.reported().unwrap();
+    drop(purchase);
 
     assert_eq!(
         approvals.0.lock().unwrap().len(),
@@ -938,13 +1080,16 @@ async fn paid_finish(case: PaidScenario) {
         "a reopened channel never prompts again"
     );
 
-    // Earnings: while the stake is still bonded, the price is the whole
-    // of what the provider owner holds.
+    // Earnings and returned principal are distinct finalized coins.
     let earnings = holdings(&devnet, PROVIDER_OWNER.key()).await;
     assert_eq!(
-        earnings.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+        earnings
+            .iter()
+            .filter(|(_, value)| *value == PRICE)
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>(),
         vec![PRICE],
-        "EARNINGS: exactly the price, and no principal yet",
+        "EARNINGS: exactly the job price",
     );
     assert_eq!(
         holdings(&devnet, CLIENT_OWNER.key())
@@ -956,9 +1101,7 @@ async fn paid_finish(case: PaidScenario) {
         "the client got back its funding less exactly the price",
     );
 
-    eprintln!("H4 settlement complete; awaiting provider bond timeout");
-    // Principal: the provider's own clock times the bond out.
-    devnet.seal_through(bond_timeout).await;
+    eprintln!("H4 settlement complete; awaiting early stake reclaim");
     let mut held = Vec::new();
     for _ in 0..200 {
         held = holdings(&devnet, PROVIDER_OWNER.key()).await;
@@ -968,18 +1111,30 @@ async fn paid_finish(case: PaidScenario) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         devnet.seal().await;
     }
+    assert!(
+        devnet.height() < bond_timeout,
+        "payment closure releases stake before the horizon"
+    );
     assert_eq!(
         held.len(),
         2,
-        "the bond timeout returned the stake: {held:?}"
+        "the closed payment's bond returned its stake: {held:?}"
     );
     assert_eq!(
         held,
-        vec![earnings[0], (held[1].0, PROVIDER_STAKE)],
+        vec![
+            *earnings.iter().find(|(_, value)| *value == PRICE).unwrap(),
+            (held[1].0, PROVIDER_STAKE)
+        ],
         "RETURNED PRINCIPAL: the stake, unchanged, beside the unchanged earnings",
     );
     assert_ne!(
-        held[1].0, earnings[0].0,
+        held[1].0,
+        earnings
+            .iter()
+            .find(|(_, value)| *value == PRICE)
+            .unwrap()
+            .0,
         "principal and earnings are different coins"
     );
 
@@ -1041,11 +1196,7 @@ async fn provider_close_offline(
     let channel = session.descriptor().channel().clone();
     session.shutdown().await;
     drop(session);
-    let provider_before = holdings(devnet, PROVIDER_OWNER.key())
-        .await
-        .iter()
-        .map(|(_, value)| value)
-        .sum::<u64>();
+    let provider_before = holdings(devnet, PROVIDER_OWNER.key()).await;
     let start = hellas_work::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
@@ -1113,14 +1264,27 @@ async fn provider_close_offline(
             .sum::<u64>(),
         CLIENT_OWNER.balance - 2 * PRICE
     );
+    let provider_after = holdings(devnet, PROVIDER_OWNER.key()).await;
+    let earnings = hellas_kernel::Payout::delegated(
+        PROVIDER_OWNER.key().into_kernel(),
+        Some(provider_settlement().party_key()),
+        0,
+    )
+    .id(channel.payment_edge(), 0);
     assert_eq!(
-        holdings(devnet, PROVIDER_OWNER.key())
-            .await
+        provider_after
             .iter()
-            .map(|(_, value)| value)
-            .sum::<u64>(),
-        provider_before + PRICE
+            .find(|(id, _)| *id == earnings)
+            .map(|(_, value)| *value),
+        Some(PRICE),
+        "this payment close pays the exact price; reclaimed stake is separate"
     );
+    for coin in provider_before {
+        assert!(
+            provider_after.contains(&coin),
+            "unspent coins survive settlement"
+        );
+    }
 }
 
 #[test]

@@ -54,6 +54,30 @@ impl ClientService {
         self.observer.with_state(read).await
     }
 
+    /// Supply the original caller input when replay retained only accounting.
+    /// Policy and the existing signed authorization are checked before it is
+    /// restored in memory. This neither accepts work nor writes payloads.
+    pub async fn restore_input(
+        &mut self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+        input: &crate::model::profile::PreparedWorkInput,
+    ) -> Result<(), DeliverError> {
+        let mut endpoint = self.observer.endpoint().await?;
+        bind(ready, &endpoint.store, &endpoint.signer, Role::Client)?;
+        let job = endpoint
+            .state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
+        ready
+            .work_policy()
+            .check_input(ready.channel(), job.authorization(), input)?;
+        endpoint
+            .store
+            .restore_client_input(work_id, input.encode().map_err(PaidWorkError::from)?)?;
+        Ok(())
+    }
+
     /// Checks the observer's current admission decision locally.
     pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
         self.observer.readiness().await
