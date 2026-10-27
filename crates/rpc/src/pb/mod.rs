@@ -197,10 +197,12 @@ mod id_pins {
     #[cfg(feature = "work")]
     #[test]
     fn work_setup_ids_are_stable() {
-        use super::services::work_setup::{ExchangeSetup, Open, WorkSetup};
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xdfbb90af);
+        use super::services::work_setup::{ExchangeSetup, Open, RequestOffer, WorkSetup};
+        // RequestOffer deliberately rotates the setup service descriptor.
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0fb60b29);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
         assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x14d05693);
+        assert_eq!(<RequestOffer as MethodMarker>::METHOD_ID, 0x97c491fd);
     }
 
     #[cfg(feature = "host-control")]
