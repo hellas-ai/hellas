@@ -562,9 +562,7 @@ in
     };
   nixosTests = linuxOutputs.nixosTests or { };
 
-  # Evaluated by a separate, non-reporting Hydra jobset (infra
-  # services/ci/hydra.nix). Deliberately not under hydraJobs: nothing here may
-  # join `required` or report a GitHub status.
+  # GPU checks have a separate Hydra project and never join `required`.
   gpuJobs = lib.optionalAttrs isX86_64Linux (
     import ./gpu.nix {
       inherit pkgs;
@@ -577,6 +575,9 @@ in
     }
   );
 
+  # Evaluated by a separate, non-reporting Hydra jobset (infra
+  # services/ci/hydra.nix). Deliberately not under hydraJobs: nothing here may
+  # join `required` or report a GitHub status.
   windowsJobs = lib.optionalAttrs isX86_64Linux {
     inherit (windowsPackages) cli;
     # Runs on the `wsl` builder (NixOS-WSL inside a Windows VM), whose sandbox
