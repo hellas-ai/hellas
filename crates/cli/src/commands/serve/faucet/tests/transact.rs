@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 async fn sealing<T>(devnet: &mut Devnet, work: impl std::future::Future<Output = T>) -> T {
-    // Use the network's one-second block cadence: accelerated heights must not
+    // Use a one-second sealing cadence: accelerated heights must not
     // expire a valid CLI authorization while its disk writes are still pending.
     super::sealing_with_period(devnet, work, Duration::from_secs(1)).await
 }
