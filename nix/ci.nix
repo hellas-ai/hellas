@@ -42,6 +42,9 @@ let
       trap 'rm -rf "$cargo_home"' EXIT
       cp ${config} "$cargo_home/config.toml"
       export CARGO_HOME="$cargo_home"
+      # Native build scripts copy source permissions into OUT_DIR. Keep registry
+      # builds and different read-only vendor snapshots in separate caches.
+      export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
       export CARGO_NET_OFFLINE=${lib.boolToString offline}
       export SQLX_OFFLINE=true
       ${cmd}
