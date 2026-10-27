@@ -51,7 +51,6 @@ pub fn child_main() -> Result<bool> {
         bincode::serialize_into(std::io::stdout().lock(), &module)?;
         return Ok(true);
     }
-    super::scratch::install_child()?;
     Ok(catena_lang::safe_runtime::run_safe_runtime_child_if_requested()?)
 }
 

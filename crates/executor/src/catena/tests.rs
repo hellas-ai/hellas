@@ -92,11 +92,7 @@ impl HostScalarDevice {
     }
 }
 impl Device for HostScalarDevice {
-    fn load(
-        &mut self,
-        module: &RuntimeModule,
-        _retention: hellas_rpc::Retention,
-    ) -> Result<super::Cancellation> {
+    fn load(&mut self, module: &RuntimeModule) -> Result<super::Cancellation> {
         self.loads += 1;
         let dir = self._dir.path();
         std::fs::create_dir_all(dir.join("hip"))?;

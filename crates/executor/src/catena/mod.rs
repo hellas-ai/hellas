@@ -5,7 +5,6 @@ pub mod driver;
 pub mod pool;
 pub(crate) mod process;
 pub mod program;
-pub(crate) mod scratch;
 pub use process::{Cancellation, isolate_child};
 mod memory;
 pub mod validate;

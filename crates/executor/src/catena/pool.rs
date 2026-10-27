@@ -1,4 +1,3 @@
-use super::scratch::Scratch;
 use super::{
     driver::Device,
     process::{Cancellation, Watchdog, kill_group},
@@ -8,7 +7,6 @@ use catena_lang::{
     runtime::{RuntimeModule, Value},
     safe_runtime::{Artifact, SafeRuntime},
 };
-use hellas_rpc::Retention;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -52,7 +50,6 @@ fn children() -> io::Result<BTreeSet<i32>> {
 struct Spawned {
     runtime: Option<SafeRuntime>,
     pid: i32,
-    _scratch: Option<Arc<Scratch>>,
 }
 impl Spawned {
     fn into_parts(mut self) -> (SafeRuntime, i32) {
@@ -71,7 +68,6 @@ enum SpawnRequest {
     New {
         cancel: Cancellation,
         dialect: GpuDialect,
-        scratch: Option<Arc<Scratch>>,
         reply: mpsc::Sender<SpawnReply>,
     },
 }
@@ -86,14 +82,12 @@ fn start_spawner() -> mpsc::SyncSender<SpawnRequest> {
                 SpawnRequest::New {
                     cancel,
                     dialect,
-                    scratch,
                     reply,
                 } => {
-                    let result = spawn_child(cancel, scratch.as_deref(), dialect)
+                    let result = spawn_child(cancel, dialect)
                         .map(|(runtime, pid)| Spawned {
                             runtime: Some(runtime),
                             pid,
-                            _scratch: scratch,
                         })
                         .map_err(|e| e.to_string());
                     let _ = reply.send(result);
@@ -125,22 +119,19 @@ fn spawner() -> &'static mpsc::SyncSender<SpawnRequest> {
 }
 fn spawn(
     cancel: Cancellation,
-    scratch: Option<Arc<Scratch>>,
     dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {
-    spawn_on(spawner(), cancel, scratch, dialect)
+    spawn_on(spawner(), cancel, dialect)
 }
 fn spawn_on(
     spawner: &mpsc::SyncSender<SpawnRequest>,
     cancel: Cancellation,
-    scratch: Option<Arc<Scratch>>,
     dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {
     let (reply, receive) = mpsc::channel();
     let mut request = SpawnRequest::New {
         cancel: cancel.clone(),
         dialect,
-        scratch,
         reply,
     };
     loop {
@@ -252,15 +243,10 @@ fn monitor_init(
     }
 }
 
-fn spawn_child(
-    cancel: Cancellation,
-    scratch: Option<&Scratch>,
-    dialect: GpuDialect,
-) -> Result<(SafeRuntime, i32)> {
+fn spawn_child(cancel: Cancellation, dialect: GpuDialect) -> Result<(SafeRuntime, i32)> {
     if cancel.is_cancelled() {
         return Err("SafeRuntime initialization cancelled".into());
     }
-    let _scratch = scratch.map(Scratch::inherit).transpose()?;
     let before = children()?;
     let (done, receive) = mpsc::channel();
     let monitor = thread::spawn(move || monitor_init(before, cancel, receive));
@@ -286,8 +272,6 @@ struct Worker {
     runtime: SafeRuntime,
     pid: i32,
     artifacts: HashMap<[u8; 32], Artifact>,
-    // Last: SafeRuntime must reap the child before scratch is removed.
-    scratch: Option<Arc<Scratch>>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -409,7 +393,7 @@ impl Lease {
 }
 
 impl Device for Lease {
-    fn load(&mut self, module: &RuntimeModule, retention: Retention) -> Result<Cancellation> {
+    fn load(&mut self, module: &RuntimeModule) -> Result<Cancellation> {
         if self.cancel.timed_out() {
             return Err(super::driver::Interruption::TimedOut.into());
         }
@@ -419,22 +403,15 @@ impl Device for Lease {
         if self.loaded || key(module)? != self.key {
             return Err("lease module mismatch or repeated load".into());
         }
-        let ephemeral = retention == Retention::Ephemeral;
-        // Workers keep separate native artifact lifetimes for retained and ephemeral jobs.
         if self
             .worker
             .as_ref()
-            .is_some_and(|w| w.scratch.is_some() != ephemeral || w.dialect != module.dialect)
+            .is_some_and(|w| w.dialect != module.dialect)
         {
             self.worker = None;
         }
         if self.worker.is_none() {
-            let scratch = if ephemeral {
-                Some(Arc::new(Scratch::new()?))
-            } else {
-                None
-            };
-            match spawn(self.cancel.clone(), scratch.clone(), module.dialect) {
+            match spawn(self.cancel.clone(), module.dialect) {
                 Ok((runtime, pid)) => {
                     self.pool
                         .state
@@ -446,7 +423,6 @@ impl Device for Lease {
                         runtime,
                         pid,
                         artifacts: HashMap::new(),
-                        scratch,
                     });
                 }
                 Err(e) => {
@@ -463,15 +439,6 @@ impl Device for Lease {
             let interrupted = watchdog.finish();
             match artifact {
                 Ok(artifact) if !interrupted && !self.cancel.is_cancelled() => {
-                    if let Some(scratch) = &worker.scratch
-                        && let Err(error) = scratch.clear()
-                    {
-                        self.failed = true;
-                        kill_group(worker.pid);
-                        drop(artifact);
-                        self.worker = None;
-                        return Err(error.into());
-                    }
                     worker.artifacts.insert(self.key, artifact);
                 }
                 result => {
