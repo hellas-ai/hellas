@@ -617,27 +617,27 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let owners = [
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x11,
+            secret_scalar: [0x11; 32],
             balance: 39,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x13,
+            secret_scalar: [0x13; 32],
             balance: 3 * FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x12,
+            secret_scalar: [0x12; 32],
             balance: 2 * FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x14,
+            secret_scalar: [0x14; 32],
             balance: FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x16,
+            secret_scalar: [0x16; 32],
             balance: FUNDING,
         },
     ];

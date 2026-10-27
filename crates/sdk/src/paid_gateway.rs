@@ -919,7 +919,7 @@ mod tests {
                         name: "gateway_policy_recovery",
                         owners: vec![GenesisOwner {
                             kind: OwnerKind::Passkey,
-                            seed: 0x13,
+                            secret_scalar: [0x13; 32],
                             balance: 1,
                         }],
                         full_nodes: 1,
