@@ -1168,14 +1168,19 @@ async fn settle_on_the_clock(devnet: &mut WorkDevnet, service: &WorkService) -> 
     block
 }
 
-/// Lets the production clock return the completed bond at its horizon.
+/// Lets the production clock return the bond after finalized payment closure.
 async fn return_the_stake(devnet: &mut WorkDevnet, service: &WorkService) -> CoinId {
     let allocations = devnet.allocations.clone();
-    devnet.seal_through(HORIZON).await;
-    assert_eq!(
-        provider_clock(devnet, service).await.bond_timeout,
-        Some(crate::SubmitTxOutcome::Enqueued),
-        "the production clock submits the completed bond's timeout",
+    assert!(
+        devnet.height() < HORIZON,
+        "stake is reclaimed before the bond horizon"
+    );
+    assert!(
+        matches!(
+            provider_clock(devnet, service).await.bond_timeout,
+            Some(crate::SubmitTxOutcome::Enqueued | crate::SubmitTxOutcome::Duplicate)
+        ),
+        "the production clock submits the closed payment's bond timeout"
     );
     let block = devnet.seal().await;
     assert!(
@@ -1311,7 +1316,11 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
                     },
                 );
                 assert_eq!(advance.adjudication, None, "the payment edge is gone");
-                assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
+                assert_eq!(
+                    advance.bond_timeout,
+                    Some(crate::SubmitTxOutcome::Enqueued),
+                    "a finalized payment close releases its bond before the horizon"
+                );
 
                 // ── The money ─────────────────────────────────────────────────
                 //

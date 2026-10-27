@@ -186,7 +186,7 @@ impl From<QueryError> for BlockSourceError {
 /// bond terms. One coherent finalized snapshot from `source` decides both
 /// permissionless submissions: the payment close through
 /// [`WorkService::adjudicated_close`], and the bond timeout when that same
-/// read still contains the bond at or beyond its committed horizon.
+/// read still contains the bond after finalized payment closure or at its horizon.
 ///
 /// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
 /// not failures. They leave adjudication absent from the returned advance
@@ -207,7 +207,7 @@ where
         .advance_close(source, source)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let (query, bond_terms) = service
+    let (query, bond_terms, settled_height) = service
         .with_state(|state| {
             let channel = state.channel();
             let payment_terms = channel.payment_terms();
@@ -218,6 +218,7 @@ where
                     funding: Default::default(),
                 },
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
+                state.close_settled().map(|settled| settled.height),
             )
         })
         .await
@@ -254,19 +255,24 @@ where
         Err(error) => return Err(PaidWorkClockError::Decision(error)),
     };
 
-    let bond_timeout =
-        if snapshot.bond().is_some() && snapshot.block().height >= bond_terms.timeout().get() {
-            let tx = Tx::timeout_close(bond_edge, &bond_terms)
-                .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
-            Some(
-                source
-                    .submit(tx)
-                    .await
-                    .map_err(PaidWorkClockError::Submission)?,
-            )
-        } else {
-            None
-        };
+    // The journal's finalized close and a snapshot at least that new jointly
+    // prove the lease no longer protects a live payment edge.
+    let payment_closed = settled_height.is_some_and(|height| snapshot.block().height >= height)
+        && snapshot.payment().is_none();
+    let bond_timeout = if snapshot.bond().is_some()
+        && (payment_closed || snapshot.block().height >= bond_terms.timeout().get())
+    {
+        let tx = Tx::timeout_close(bond_edge, &bond_terms)
+            .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
+        Some(
+            source
+                .submit(tx)
+                .await
+                .map_err(PaidWorkClockError::Submission)?,
+        )
+    } else {
+        None
+    };
 
     Ok(PaidWorkClockAdvance {
         snapshot: Some(snapshot),
