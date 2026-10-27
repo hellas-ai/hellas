@@ -37,9 +37,6 @@ let
     "/var/cache/hellas-gateway"
   ];
   providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content ++ cfg.contentRoots));
-  gatewayContentPaths = lib.unique (
-    map normalizeRuntimePath (gateway.content ++ gateway.contentRoots)
-  );
   providerWritablePaths = lib.unique (
     lib.optional (
       cfg.contentIndex != null
@@ -49,13 +46,7 @@ let
     ) (builtins.dirOf (normalizeRuntimePath cfg.contentIndex))
   );
   gatewayWritablePaths = lib.unique (
-    lib.optional (
-      gateway.contentIndex != null
-      && outsideManagedRoots gatewayManagedWritableRoots (
-        builtins.dirOf (normalizeRuntimePath gateway.contentIndex)
-      )
-    ) (builtins.dirOf (normalizeRuntimePath gateway.contentIndex))
-    ++ map normalizeRuntimePath gateway.paidWorkJournalRoots
+    map normalizeRuntimePath gateway.paidWorkJournalRoots
     ++ lib.optional (
       gateway.authorityJournal != null
       && outsideManagedRoots gatewayManagedWritableRoots gateway.authorityJournal
@@ -64,10 +55,7 @@ let
   providerWritablePathsAreDisjoint = lib.all (
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
   ) providerWritablePaths;
-  gatewayWritablePathsAreDisjoint = lib.all (
-    writable: lib.all (content: !pathsOverlap writable content) gatewayContentPaths
-  ) gatewayWritablePaths;
-  providerCatenaConfigured = hellas.catenaConfigured cfg || cfg.readinessEnvironments != [ ];
+  providerCatenaConfigured = hellas.catenaConfigured cfg;
   providerLocalExecutionEnabled = cfg.workConfigFile != null && hellas.catenaConfigured cfg;
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
@@ -119,19 +107,14 @@ let
   ]
   ++ cfg.content
   ++ cfg.contentRoots
-  ++ cfg.readinessEnvironments
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
   ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
-    lib.optional (gateway.causalLmEnvironment != null) gateway.causalLmEnvironment
-    ++ lib.optional (gateway.tokenizer != null) gateway.tokenizer
+    lib.optional (gateway.textModel != null) gateway.textModel
     ++ [ gateway.identityPath ]
-    ++ gateway.content
-    ++ gateway.contentRoots
-    ++ lib.optional (gateway.contentIndex != null) gateway.contentIndex
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
@@ -161,30 +144,6 @@ let
         "char-nvidia-caps rw"
       ];
   };
-  providerReadinessCommands = map (
-    environment:
-    lib.escapeShellArgs (
-      [
-        "${cfg.package}/bin/hellas"
-        "environment"
-        "verify"
-        "--environment"
-        environment
-      ]
-      ++ lib.concatMap (path: [
-        "--content"
-        path
-      ]) cfg.content
-      ++ lib.concatMap (path: [
-        "--content-root"
-        path
-      ]) cfg.contentRoots
-      ++ lib.optionals (cfg.contentIndex != null) [
-        "--content-index"
-        cfg.contentIndex
-      ]
-    )
-  ) cfg.readinessEnvironments;
 in
 {
   options.services.hellas =
@@ -207,11 +166,7 @@ in
           defaultText = lib.literalMD ''
             `services.hellas.package`: the platform's default node CLI.
           '';
-          description = ''
-            The hellas CLI used to run the HTTP gateway. The default supports
-            local Catena execution only on x86_64-linux; other platforms use
-            the network-only CLI.
-          '';
+          description = "The hellas CLI used to run the HTTP gateway.";
         };
       };
       openFirewall = mkOption {
@@ -229,20 +184,6 @@ in
           Pass a plain absolute path; never interpolate a Nix path or a
           builtins.readFile result, which would copy or read the secret during
           evaluation before this module can validate the path.
-        '';
-      };
-      readinessEnvironments = mkOption {
-        type = types.listOf (types.strMatching "/.*");
-        default = [ ];
-        example = [ "/srv/hellas/content/smollm2.environment" ];
-        description = ''
-          Canonical causal-LM environments whose complete local content
-          closures must verify before the provider starts. Each environment
-          must also be discoverable through content or contentRoots; the path
-          is not an implicit content source. This is a readiness baseline,
-          never an execution allowlist: Work funding governs admission
-          of every locally satisfiable environment. Routine startup trusts the
-          persistent content index and does not re-hash unchanged large assets.
         '';
       };
       memoryMaxBytes = mkOption {
@@ -276,7 +217,7 @@ in
       }
       {
         assertion = lib.all outsideStorePath (providerRuntimePaths ++ gatewayRuntimePaths);
-        message = "services.hellas content, identity, artifact store, environment, work config, Fetch config, EnvironmentFile, and tokenizer paths must be runtime data outside the Nix store.";
+        message = "services.hellas content, identity, artifact store, environment, work config, Fetch config, EnvironmentFile, and text model paths must be runtime data outside the Nix store.";
       }
       {
         assertion = lib.all outsideStoreString userEnvironmentStrings;
@@ -288,19 +229,11 @@ in
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
-        message = "services.hellas.gateway contentIndex parent must not expose the filesystem root as writable.";
+        message = "services.hellas.gateway writable journal paths must not expose the filesystem root as writable.";
       }
       {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
         message = "services.hellas external contentIndex parent must be dedicated writable locations outside content and contentRoots.";
-      }
-      {
-        assertion = !gateway.enable || gatewayWritablePathsAreDisjoint;
-        message = "services.hellas.gateway external contentIndex parent must be a dedicated writable location outside content and contentRoots.";
-      }
-      {
-        assertion = cfg.readinessEnvironments == [ ] || cfg.content != [ ] || cfg.contentRoots != [ ];
-        message = "services.hellas.readinessEnvironments requires services.hellas.content or contentRoots; an environment path is not an implicit content source.";
       }
       {
         assertion = cfg.memoryMaxBytes == null || cfg.memoryMaxBytes > effectiveGpuSessionAssetBytes;
@@ -315,37 +248,16 @@ in
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
-        assertion = hellas.catenaPlatform pkgs || (!providerCatenaConfigured && !gateway.local);
-        message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds, gateway.local on this platform.";
+        assertion = hellas.catenaPlatform pkgs || !providerCatenaConfigured;
+        message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds on this platform.";
       }
       {
-        assertion =
-          !gateway.enable
-          || (
-            (gateway.causalLmEnvironment == null) == (gateway.tokenizer == null)
-            && (gateway.causalLmEnvironment != null || (!gateway.local && gateway.responsesBackend != "hellas"))
-          );
-        message = "services.hellas.gateway.causalLmEnvironment and tokenizer must be set together and are required for native inference.";
+        assertion = !gateway.enable || gateway.textModel != null || gateway.responsesBackend != "hellas";
+        message = "services.hellas.gateway.textModel is required for native inference.";
       }
       {
         assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
         message = "services.hellas.gateway.nodeAddrs requires nodeId.";
-      }
-      {
-        assertion = !gateway.local || (gateway.nodeId == null && gateway.nodeAddrs == [ ]);
-        message = "services.hellas.gateway.local cannot be combined with direct node ids.";
-      }
-      {
-        assertion = gateway.local || (gateway.content == [ ] && gateway.contentRoots == [ ]);
-        message = "services.hellas.gateway.content and contentRoots are only valid for local execution.";
-      }
-      {
-        assertion = gateway.local || gateway.contentIndex == null;
-        message = "services.hellas.gateway.contentIndex is only valid for local execution.";
-      }
-      {
-        assertion = !gateway.local || gateway.content != [ ] || gateway.contentRoots != [ ];
-        message = "services.hellas.gateway local execution require content or contentRoots.";
       }
       {
         assertion =
@@ -353,22 +265,19 @@ in
           || gateway.offer != null
 
           || gateway.paidWorkConfig != null
-          || gateway.local
           || (
             gateway.responsesBackend == "proxy"
 
             && gateway.nodeId == null
 
           );
-        message = "services.hellas.gateway execution requires an offer, local allowance or paidWorkConfig.";
+        message = "services.hellas.gateway execution requires an offer or paidWorkConfig.";
       }
       {
         assertion =
           gateway.paidWorkConfig == null
           || (
-            !gateway.local
-
-            && gateway.nodeId == null
+            gateway.nodeId == null
             && gateway.offer == null
             && gateway.trustStore == null
             && gateway.trustPolicy == null
@@ -389,21 +298,12 @@ in
       {
         assertion =
           !gateway.enable
-          || !(gateway.local || gateway.offer != null)
+          || gateway.offer == null
           || (gateway.trustPolicy != null && gateway.workProfile != null && gateway.passkey != null);
         message = "services.hellas.gateway grant execution requires trustPolicy, workProfile and passkey.";
       }
       {
-        assertion = !gateway.enable || !gateway.local || gateway.localGrant != null;
-        message = "services.hellas.gateway local execution requires localGrant.";
-      }
-      {
-        assertion =
-          lib.count (target: target) [
-            gateway.local
-            (gateway.offer != null)
-            (gateway.paidWorkConfig != null)
-          ] <= 1;
+        assertion = gateway.offer == null || gateway.paidWorkConfig == null;
         message = "services.hellas.gateway must select only one funding target.";
       }
     ];
@@ -476,12 +376,6 @@ in
       // lib.optionalAttrs (cfg.memoryMaxBytes != null) {
         MemoryMax = toString cfg.memoryMaxBytes;
       }
-      // lib.optionalAttrs (providerReadinessCommands != [ ]) {
-        # One argv-safe systemd command per baseline environment. Deliberately
-        # omit --recheck on routine starts: the persistent index avoids hashing
-        # tens of GiB again while verified opens still check exact identities.
-        ExecStartPre = providerReadinessCommands;
-      }
       // lib.optionalAttrs (cfg.environmentFile != null) {
         EnvironmentFile = cfg.environmentFile;
       }
@@ -505,7 +399,6 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
-      path = lib.optionals gateway.local gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -515,15 +408,6 @@ in
         // {
           HOME = "/var/lib/hellas-gateway";
         }
-        // lib.optionalAttrs gateway.local (
-          {
-            # Local Catena execution dlopens generated shared objects, which
-            # cannot live below DynamicUser's noexec CacheDirectory.
-            TMPDIR = "/run/hellas-gateway";
-            XDG_CACHE_HOME = "/var/cache/hellas-gateway";
-          }
-          // gpuEnvironment
-        )
         // lib.optionalAttrs cfg.otel.enable {
           # Distinguish gateway spans from the node's in shared trace storage.
           OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
@@ -544,28 +428,8 @@ in
         UMask = "0077";
       }
       // lib.optionalAttrs (gatewayWritablePaths != [ ]) {
-        # The index uses atomic sibling publication, so only its dedicated
-        # parent needs to be writable.
         ReadWritePaths = gatewayWritablePaths;
       }
-      // lib.optionalAttrs (gatewayContentPaths != [ ]) {
-        # Adopted content remains input even when it lives below one of the
-        # unit's systemd-managed writable directories.
-        ReadOnlyPaths = gatewayContentPaths;
-      }
-      // lib.optionalAttrs gateway.local (
-        {
-          RuntimeDirectory = "hellas-gateway";
-          RuntimeDirectoryMode = "0700";
-          CacheDirectory = "hellas-gateway";
-          CacheDirectoryMode = "0700";
-        }
-        // gpuDeviceAccess
-        // {
-          # Local gateways use the CLI's bounded default resident-asset limit.
-          LimitMEMLOCK = "infinity";
-        }
-      )
       // lib.optionalAttrs (gateway.environmentFile != null) {
         EnvironmentFile = gateway.environmentFile;
       };

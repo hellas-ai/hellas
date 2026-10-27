@@ -15,18 +15,11 @@
         export HOME="$TMPDIR/home"
         mkdir -p "$HOME"
 
-        ! ${package}/bin/hellas fetch --help
         ! ${package}/bin/hellas llm --help
         ${package}/bin/hellas --version
         ${package}/bin/hellas --help | grep -F "Hellas node CLI"
         ${package}/bin/hellas gateway --help | grep -F -- "--wrap"
-        ${package}/bin/hellas gateway --help | grep -F -- "--environment <FILE>"
-        ${package}/bin/hellas gateway --help | grep -F -- "--manifest-id <CONTENT_ID>"
-        ${package}/bin/hellas gateway --help | grep -F -- "--model <NAME>"
-        ${package}/bin/hellas gateway --help | grep -F -- "--tokenizer"
-        ${package}/bin/hellas gateway --help | grep -F -- "--stop-token"
-        ${package}/bin/hellas gateway --help | grep -F -- "--content <PATH>"
-        ${package}/bin/hellas gateway --help | grep -F -- "--content-root <DIR>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--text-model <FILE>"
         ${package}/bin/hellas gateway --help | grep -F -- "--responses-fetch-execution-environment"
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-policy"
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-store"

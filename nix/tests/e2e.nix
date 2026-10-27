@@ -291,10 +291,8 @@ in
         (mkBaseNode package)
         {
           systemd.tmpfiles.rules = [
-            # The test creates its Catena program and canonical environments
-            # after the VM has booted.  Keeping only an empty runtime root here
-            # proves the provider did not receive a model/environment through
-            # Nix evaluation or the store.
+            # Keeping only an empty runtime root here proves the provider did
+            # not receive a model through Nix evaluation or the store.
             "d /srv/hellas-content 0755 root root -"
           ];
           systemd.services.hellas-monitor = {
@@ -333,47 +331,6 @@ in
       machine.wait_for_unit("hellas.service")
       machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
 
-      # Materialize three previously unknown environments entirely at VM
-      # runtime. All canonical roots are adopted from the configured content
-      # root on restart. The admitted case has both its program and weights;
-      # the two refusal cases independently omit one of them.
-      machine.succeed(
-          "systemctl stop hellas.service; "
-          "install -d -m 0755 /var/lib/hellas-e2e; "
-          "nonce=$(tr -d - < /proc/sys/kernel/random/uuid); "
-          "printf 'not-valid-catena-%s\\n' \"$nonce\" > /srv/hellas-content/arbitrary.hex; "
-          "printf 'also-not-valid-catena-%s\\n' \"$nonce\" > /var/lib/hellas-e2e/missing.hex; "
-          "printf 'runtime-only-weights-%s' \"$nonce\" > /srv/hellas-content/weights.bin; "
-          "printf 'missing-runtime-weights-%s' \"$nonce\" > /var/lib/hellas-e2e/missing-weights.bin; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/srv/hellas-content/weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/environment.toml; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/var/lib/hellas-e2e/missing-weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/missing-static.toml; "
-          "printf '%s\\n' "
-          "'{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Whitespace\"},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"hello\":0,\"world\":1,\"<unk>\":2},\"unk_token\":\"<unk>\"}}' "
-          "> /var/lib/hellas-e2e/tokenizer.json; "
-          "${package}/bin/hellas environment build "
-          "--program /srv/hellas-content/arbitrary.hex "
-          "--settings /var/lib/hellas-e2e/environment.toml "
-          "--out /srv/hellas-content/arbitrary.environment; "
-          "${package}/bin/hellas environment build "
-          "--program /var/lib/hellas-e2e/missing.hex "
-          "--settings /var/lib/hellas-e2e/environment.toml "
-          "--out /srv/hellas-content/missing-program.environment; "
-          "${package}/bin/hellas environment build "
-          "--program /srv/hellas-content/arbitrary.hex "
-          "--settings /var/lib/hellas-e2e/missing-static.toml "
-          "--out /srv/hellas-content/missing-static.environment; "
-          "chmod 0444 /srv/hellas-content/* /var/lib/hellas-e2e/*; "
-          "chmod 0555 /srv/hellas-content; "
-          "systemctl start hellas.service"
-      )
-      machine.wait_for_unit("hellas.service")
-      machine.succeed("test -s /var/lib/hellas/content-index.bin")
-
-      # Readiness remains a local content check, independent of execution funding.
-      verifier = "${package}/bin/hellas environment verify --content-root /srv/hellas-content --content-index /var/lib/hellas-e2e/verify-index.bin"
-      machine.succeed(f"{verifier} --environment /srv/hellas-content/arbitrary.environment")
-      for missing in ["missing-program", "missing-static"]:
-          machine.fail(f"{verifier} --environment /srv/hellas-content/{missing}.environment")
       machine.fail("${package}/bin/hellas llm --help")
 
       unit = machine.succeed(
@@ -458,8 +415,7 @@ in
       unit = gateway.succeed("systemctl show hellas-gateway.service --property=Environment --property=ExecStart")
       assert "--responses-backend proxy" in unit
       assert "--responses-proxy-url http://127.0.0.1:18080/v1/responses" in unit
-      assert "--environment" not in unit
-      assert "--tokenizer" not in unit
+      assert "--text-model" not in unit
       assert "TMPDIR=/var/cache/hellas-gateway" not in unit
       gateway.wait_for_open_port(${toString gatewayPort})
       gateway.wait_until_succeeds("test -e /var/lib/hellas-gateway/probed")
