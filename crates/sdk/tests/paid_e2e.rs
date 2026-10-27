@@ -733,14 +733,8 @@ async fn paid_setup(
         owner.clone(),
     );
     tokio::pin!(open);
-    tokio::select! {
-        result = &mut open => panic!("setup ended before its proof read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
-    }
-    assert!(
-        approvals.0.lock().unwrap().is_empty(),
-        "unverified money cannot reach the passkey"
-    );
+    // A completed typed timeout is the expected result in the outage case;
+    // it need not lose a scheduling race to the proof-attempt observer.
     if never_catches_up {
         let error = tokio::time::timeout(Duration::from_secs(5), &mut open)
             .await
@@ -751,12 +745,24 @@ async fn paid_setup(
             matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if timeout == options.timeout),
             "typed proof read expiry: {error}"
         );
+        assert!(
+            approvals.0.lock().unwrap().is_empty(),
+            "unverified money cannot reach the passkey"
+        );
         endpoint.close().await;
         provider.shutdown().await.unwrap();
         relays.shutdown().await;
         devnet.shutdown().await;
         return None;
     }
+    tokio::select! {
+        result = &mut open => panic!("setup ended before its proof read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
+    }
+    assert!(
+        approvals.0.lock().unwrap().is_empty(),
+        "unverified money cannot reach the passkey"
+    );
     relays
         .source
         .unavailable
@@ -1190,11 +1196,7 @@ async fn provider_close_offline(
     let channel = session.descriptor().channel().clone();
     session.shutdown().await;
     drop(session);
-    let provider_before = holdings(devnet, PROVIDER_OWNER.key())
-        .await
-        .iter()
-        .map(|(_, value)| value)
-        .sum::<u64>();
+    let provider_before = holdings(devnet, PROVIDER_OWNER.key()).await;
     let start = hellas_work::work_close::close_start(
         &channel,
         hellas_kernel::Party::Taker,
@@ -1262,15 +1264,27 @@ async fn provider_close_offline(
             .sum::<u64>(),
         CLIENT_OWNER.balance - 2 * PRICE
     );
+    let provider_after = holdings(devnet, PROVIDER_OWNER.key()).await;
+    let earnings = hellas_kernel::Payout::delegated(
+        PROVIDER_OWNER.key().into_kernel(),
+        Some(provider_settlement().party_key()),
+        0,
+    )
+    .id(channel.payment_edge(), 0);
     assert_eq!(
-        holdings(devnet, PROVIDER_OWNER.key())
-            .await
+        provider_after
             .iter()
-            .filter(|(_, value)| *value == PRICE)
-            .map(|(_, value)| value)
-            .sum::<u64>(),
-        provider_before + PRICE
+            .find(|(id, _)| *id == earnings)
+            .map(|(_, value)| *value),
+        Some(PRICE),
+        "this payment close pays the exact price; reclaimed stake is separate"
     );
+    for coin in provider_before {
+        assert!(
+            provider_after.contains(&coin),
+            "unspent coins survive settlement"
+        );
+    }
 }
 
 #[test]
