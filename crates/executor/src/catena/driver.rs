@@ -21,11 +21,7 @@ pub(crate) enum Interruption {
 }
 
 pub trait Device {
-    fn load(
-        &mut self,
-        module: &RuntimeModule,
-        retention: hellas_rpc::Retention,
-    ) -> Result<super::Cancellation>;
+    fn load(&mut self, module: &RuntimeModule) -> Result<super::Cancellation>;
     fn call(&mut self, entry: &str, args: Vec<Value<'_>>) -> Result<Vec<Value<'static>>>;
 }
 
@@ -56,7 +52,7 @@ pub fn execute(
         .map(|(name, bytes)| (name.clone(), ContentRef::for_bytes(bytes)))
         .collect();
     validate::validate(module, env, &descriptors, plan, limits, content)?;
-    let cancel = device.load(module, content.retention())?;
+    let cancel = device.load(module)?;
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(
             limits.execution_timeout_ms,
