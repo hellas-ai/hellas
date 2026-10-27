@@ -375,6 +375,8 @@ mod outcome_code {
 
 /// One durable step of a channel's life.
 #[derive(Clone, Debug, PartialEq, Eq)]
+// These short-lived canonical append records keep their fixed-width fields inline.
+#[allow(clippy::large_enum_variant)]
 pub enum ChannelRecord {
     /// The origin block's own close transactions are durable.
     OriginObserved,

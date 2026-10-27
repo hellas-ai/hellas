@@ -125,11 +125,10 @@ impl ChannelStore {
             .collect();
         for bytes in &replay.records {
             let mut record = ChannelRecord::decode(bytes)?;
-            if !metadata_only {
-                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut record {
-                    *prepared_input = payloads.read(prepared_input)?;
-                    referenced.insert(hellas_rpc::ContentId::hash(prepared_input).to_string());
-                }
+            if !metadata_only && let ChannelRecord::JobProposed { prepared_input, .. } = &mut record
+            {
+                *prepared_input = payloads.read(prepared_input)?;
+                referenced.insert(hellas_rpc::ContentId::hash(prepared_input).to_string());
             }
             state.apply(&record, verifier, metadata_only)?;
         }
@@ -216,10 +215,10 @@ impl ChannelStore {
             }
             self.rotate_if_full(record.is_new_work()).await?;
             let mut stored = record;
-            if !self.metadata_only {
-                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored {
-                    *prepared_input = self.payloads.write(prepared_input)?;
-                }
+            if !self.metadata_only
+                && let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored
+            {
+                *prepared_input = self.payloads.write(prepared_input)?;
             }
             self.journal
                 .append(&stored.encode_for_storage(self.metadata_only))

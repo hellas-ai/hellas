@@ -397,6 +397,16 @@ async fn signed_chunks_bind_connection_job_offset_and_closure_and_publish_only_a
             .next_offset,
         10
     );
+    let mut moved_probe = chunk(&request, reference, 0, b"", [3; 32]);
+    moved_probe.offset = 1;
+    assert!(
+        service
+            .upload(&moved_probe, &context([3; 32]))
+            .await
+            .unwrap()
+            .refused
+            .is_some()
+    );
     let foreign = object(b"another object");
     assert!(
         service
@@ -556,6 +566,14 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     assert!(second.directory().is_none());
     second.gc(51, false).unwrap();
     assert!(!second.is_staged());
+    assert!(matches!(
+        second.stage(work, object(bytes), 60, 10, 0, b"012345678X"),
+        Err(ContentError::Hash)
+    ));
+    assert!(
+        !second.is_staged(),
+        "a complete object with the wrong hash releases its proposal and quota"
+    );
 }
 
 #[tokio::test]

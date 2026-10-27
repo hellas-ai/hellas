@@ -143,10 +143,10 @@ impl GrantWork {
                             let Some(runtime) = runtime.upgrade() else {
                                 return;
                             };
-                            if let Ok(mut runtime) = runtime.lock() {
-                                if let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0) {
-                                    let _ = uploads.gc(now, false);
-                                }
+                            if let Ok(mut runtime) = runtime.lock()
+                                && let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0)
+                            {
+                                let _ = uploads.gc(now, false);
                             }
                         }
                         if now > a.acceptance_deadline_ms.0 {

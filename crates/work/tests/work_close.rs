@@ -3710,7 +3710,13 @@ async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
         .await
         .expect("a fresh readiness for this journal's own channel is taken");
 
-    match service.accept(&signed_request(NONCE, 1)).await.outcome {
+    match hellas_work::test_support::paid::accept_uploaded_service(
+        &service,
+        &signed_request(NONCE, 1),
+    )
+    .await
+    .outcome
+    {
         Some(AcceptOutcome::Accepted(_)) => {}
         other => panic!("the same proposal is now co-signed: {other:?}"),
     }
@@ -3840,18 +3846,21 @@ async fn a_restart_samples_the_replay_it_ran() {
     let replay = &replays[0];
     assert_eq!(replay.field("kind"), Some("Channel"));
     assert_eq!(replay.field("role"), Some("Provider"));
-    assert_eq!(replay.field("generation"), Some("0"));
+    assert_eq!(replay.field("generation"), Some("1"));
 
     let number = |name: &str| match replay.field(name).map(str::parse::<u64>) {
         Some(Ok(value)) => value,
         other => panic!("{name} is a number: {other:?}"),
     };
     let frames = number("frames");
-    assert!(frames > 0, "a paid job leaves records to replay");
+    assert!(
+        number("records") > 0,
+        "a paid job leaves a checkpoint to replay"
+    );
     assert_eq!(
         number("records"),
-        frames,
-        "generation zero holds no checkpoint, so every frame was replayed",
+        frames + 1,
+        "retiring the paid job rotates its payload out; replay includes that checkpoint",
     );
     assert!(
         number("bytes") > frames,
