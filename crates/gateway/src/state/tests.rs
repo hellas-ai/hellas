@@ -114,7 +114,7 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
                 // available before durable payment, but its terminal is not.
                 payment_ack.notified().await;
                 yield ExecutionEvent::Done(Outcome::Completed {
-                    total_tokens: 2,
+                    output_tokens: 1,
                     stop_reason: StopReason::MaxNewTokens,
                     text_artifact: hellas_auth::Digest::from_bytes([7; 32]),
                     output_events: Vec::new(),

@@ -771,7 +771,7 @@ impl GatewayEvent for ExecutionEvent {
             None => return Err(PoolError::MissingOutput("text output has no stop reason")),
         };
         Ok(vec![Self::Done(Outcome::Completed {
-            total_tokens: metadata.steps,
+            output_tokens: metadata.steps,
             stop_reason,
             text_artifact: emitted.content_id()?.digest(),
             output_events: Vec::new(),

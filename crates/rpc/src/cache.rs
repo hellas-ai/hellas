@@ -54,7 +54,8 @@ pub enum TextEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TextOutcome {
     Completed {
-        total_tokens: u64,
+        /// Tokens generated after the prompt.
+        output_tokens: u64,
         stop_reason: TextStop,
         text_artifact: Digest,
         output_events: Vec<crate::OutputEventEnvelope>,

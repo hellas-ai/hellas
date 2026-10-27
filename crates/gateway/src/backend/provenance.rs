@@ -8,13 +8,12 @@ pub(super) fn provenance_from_execution(provenance: &ExecutionProvenance) -> Pro
     }
 }
 
-pub(super) fn usage(input_tokens: u32, total_tokens: u64) -> Usage {
+pub(super) fn usage(input_tokens: u32, output_tokens: u64) -> Usage {
     let input = u64::from(input_tokens);
-    let output = total_tokens.saturating_sub(input);
     Usage {
         input_tokens: Some(input),
-        output_tokens: Some(output),
-        total_tokens: Some(total_tokens),
+        output_tokens: Some(output_tokens),
+        total_tokens: Some(input.saturating_add(output_tokens)),
     }
 }
 
