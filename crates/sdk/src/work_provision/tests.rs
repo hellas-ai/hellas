@@ -78,7 +78,7 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
     let options = options(&dir.path().join("journal"));
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor())
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     offered.offer.check().unwrap();
@@ -146,7 +146,7 @@ async fn every_unanswered_offer_reserves_its_coins_before_another_offer_is_signe
     let first = options(dir.path());
     let offered = planned(&first, &[])
         .unwrap()
-        .journal(floor())
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     let store = open_provider_journal(dir.path(), first.network, offered.bond_edge)
@@ -171,10 +171,18 @@ async fn expired_or_excessive_lifetime_offers_leave_no_journal_or_signature() {
         let root = dir.path().join(timeout.to_string());
         let mut options = options(&root);
         options.bond_timeout = timeout;
+        let write_started = std::sync::atomic::AtomicBool::new(false);
         assert!(matches!(
-            planned(&options, &[]).unwrap().journal(floor()).await,
+            planned(&options, &[])
+                .unwrap()
+                .journal(floor(), &write_started)
+                .await,
             Err(ProvisionError::ExpiredBond { .. } | ProvisionError::BondLifetime)
         ));
+        assert!(
+            !write_started.load(std::sync::atomic::Ordering::Acquire),
+            "preflight failures cannot disable the allocator"
+        );
         assert!(!root.exists());
     }
 }
@@ -193,7 +201,7 @@ async fn a_crash_after_creating_an_unsigned_header_does_not_block_discovery_or_r
     assert!(found.setups.is_empty() && found.unidentified.is_empty());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor())
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     assert_eq!(offered.bond_edge, candidate.bond_edge);
@@ -226,7 +234,7 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
     let options = options(dir.path());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor())
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     let original = serde_json::to_value(&offered.offer).unwrap();

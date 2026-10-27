@@ -87,10 +87,59 @@ impl WorkBackend for CpuEvaluate {
 /// Only arithmetic execution is a double. Setup, Work, journals, clocks and
 /// owner signatures use the native services and the six-validator chain.
 struct Provider {
+    node: hellas_sdk::FullNode,
+    funded_height: Arc<std::sync::atomic::AtomicU64>,
+    unavailable: Arc<std::sync::atomic::AtomicUsize>,
     endpoint: Endpoint,
     clock: WorkWatcher,
     serving: tokio::task::JoinHandle<()>,
     admin: hellas_work::grant_service::WorkAdministration,
+}
+
+#[derive(Clone)]
+struct RecoveringSetup {
+    inner: MountedSetup,
+    node: hellas_sdk::FullNode,
+    funded_height: Arc<std::sync::atomic::AtomicU64>,
+    unavailable: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
+    async fn request_offer(
+        &self,
+        request: RequestOfferRequest,
+        context: hellas_wire::TransportContext,
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
+    {
+        if !request.funding_coins.is_empty() {
+            let height = self
+                .funded_height
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            if height != 0 {
+                self.node.require_finalized_height_for_test(height);
+            }
+        }
+        let result = self.inner.request_offer(request, context).await;
+        if result
+            .as_ref()
+            .is_err_and(|status| status.code() == hellas_wire::WireCode::Unavailable)
+        {
+            self.unavailable
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn exchange_setup(
+        &self,
+        request: ExchangeSetupRequest,
+        context: hellas_wire::TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::ExchangeSetupResponse>> + Send,
+        WireStatus,
+    > {
+        self.inner.exchange_setup(request, context).await
+    }
 }
 impl Provider {
     fn start<'a>(
@@ -161,7 +210,7 @@ impl Provider {
         .await
         .unwrap()
         .on_node(
-            node,
+            node.clone(),
             authority,
             provider_enrollment(),
             endpoint
@@ -171,6 +220,14 @@ impl Provider {
                 .collect(),
         );
         let clock = WorkWatcher::spawn(runner);
+        let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let unavailable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = RecoveringSetup {
+            inner: setup,
+            node: node.clone(),
+            funded_height: funded_height.clone(),
+            unavailable: unavailable.clone(),
+        };
         let router = WorkRouter::payment(work);
         let open = Arc::new(
             hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, provider_enrollment(), None)
@@ -219,6 +276,9 @@ impl Provider {
             }
         });
         Self {
+            node,
+            funded_height,
+            unavailable,
             endpoint,
             clock,
             serving,
@@ -406,19 +466,61 @@ async fn evaluate_and_settle(
         .next()
         .copied()
         .unwrap();
-    let mut session = sealing_while(
-        devnet,
-        Duration::from_millis(100),
-        PaidWorkSession::open(
-            options.clone(),
-            endpoint.clone(),
-            key.clone(),
-            client_node.clone(),
-            authority.clone(),
+    provider
+        .node
+        .require_finalized_height_for_test(devnet.height() + 1);
+    let mut unavailable_args = options.clone();
+    unavailable_args.timeout = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        hellas_sdk::paid_client::request_paid_quote(
+            &unavailable_args,
+            endpoint,
+            key,
+            FRIEND.principal(),
         ),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            hellas_sdk::paid_client::PaidClientError::Timeout {
+                stage: "offer availability"
+            }
+        ),
+        "bounded quote expiry: {error}"
+    );
+    assert!(started.elapsed() >= unavailable_args.timeout);
+    devnet.seal().await;
+
+    provider
+        .funded_height
+        .store(devnet.height() + 1, std::sync::atomic::Ordering::SeqCst);
+    let attempts = provider
+        .unavailable
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let open = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        key.clone(),
+        client_node.clone(),
+        authority.clone(),
+    );
+    tokio::pin!(open);
+    tokio::time::timeout(options.timeout, async {
+        tokio::select! {
+            result = &mut open => panic!("setup ended before provider recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+            () = async {
+                while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; }
+            } => {},
+        }
+    }).await.expect("the same funded offer request retries while the provider is behind");
+    let mut session = sealing_while(devnet, Duration::from_millis(100), &mut open)
+        .await
+        .unwrap();
     assert_eq!(
         session.descriptor().bond_edge(),
         original.offer().proposal.bond_edge()

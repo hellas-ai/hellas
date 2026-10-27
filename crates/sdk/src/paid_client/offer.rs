@@ -85,14 +85,32 @@ impl OfferConnection {
             .sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
             .as_bytes()
             .to_vec();
-        let response =
-            hellas_rpc::call::unary::<_, hellas_rpc::services::work_setup::RequestOffer>(
-                &self.transport,
-                request,
-                Metadata::new(),
-            )
-            .await
-            .map_err(|status| hellas_client::ClientError::wire("offer request failed", status))?;
+        let timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+        let response = tokio::time::timeout(timeout, async {
+            loop {
+                let response = hellas_rpc::call::unary::<
+                    _,
+                    hellas_rpc::services::work_setup::RequestOffer,
+                >(&self.transport, request.clone(), Metadata::new())
+                .await;
+                match response {
+                    // A block may advance between the provider's coherent proof
+                    // reads. Retrying this signed request reuses its retained offer.
+                    Err(status) if status.code() == hellas_wire::WireCode::Unavailable => {
+                        tokio::time::sleep(args.config.poll).await;
+                    }
+                    response => {
+                        return response.map_err(|status| {
+                            hellas_client::ClientError::wire("offer request failed", status)
+                        });
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| PaidClientError::Timeout {
+            stage: "offer availability",
+        })??;
         response
             .outcome
             .ok_or(PaidClientError::MissingState("offer response"))

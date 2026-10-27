@@ -373,10 +373,6 @@ impl OfferAllocator {
             .checked_add(current.policy.offers.bond_lifetime_blocks)
             .ok_or_else(invalid)?;
         let adoption = self.adopt.try_reserve().map_err(unavailable)?;
-        // A failed write or reopen may already have committed an offer. Until
-        // restart replays every reservation, allocating again could reuse stake.
-        self.needs_restart
-            .store(true, std::sync::atomic::Ordering::Release);
         let provisioned = crate::work_provision::provision_offer(
             crate::work_provision::ProvisionOptions {
                 network: self.config.network,
@@ -405,6 +401,7 @@ impl OfferAllocator {
             &self.node,
             &self.authority,
             &held,
+            &self.needs_restart,
         )
         .await
         .map_err(unavailable)?;
