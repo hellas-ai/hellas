@@ -1,9 +1,9 @@
 # Paid Fetch and provider payload retention
 
 Paid Fetch shares the existing channel authorization, execution gate, delivery,
-payment certificate, and settlement flow with Evaluate. A Fetch channel selects
-`WorkPolicy::Fetch`; the policy commits to its route, manifest and resource
-limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
+payment certificate, and settlement flow with Compute. A Fetch channel's
+`InvocationPolicy` admits Fetch; the admission commits to its route, contract and
+resource limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
 Both profiles use version-3 close descriptors and journal format 7. Older
 journals are refused; close old devnet channels with the old binary first.
 
@@ -119,7 +119,7 @@ rejects a weaker output scheme.
   journal. Both session types use `WorkLink` for authenticated transport and the
   common Work policy and transcript verification code. Grant Responses startup
   lives in `grant_gateway::responses`; `gateway` always names `hellas-gateway`.
-- `PreparedPaidWorkInput` and `WorkPolicy` select Evaluate or Fetch. Each
+- `PreparedInvocation` and `InvocationPolicy` select Compute or Fetch. Each
   profile validates its own canonical input, bounds and terminal result; the
   payment lifecycle does not interpret HTTP or model output.
 - `FetchProviderOptions` and `start_fetch_provider` take an operator's route

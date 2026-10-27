@@ -62,23 +62,6 @@ Apple-attested providers require the independent `--trust-store` and
 `--trust-policy` approval. Fetch additionally selects
 `--assurance apple-app-attest`; raw folders declare that assurance in `[fetch]`.
 
-The causal-LM application uses its canonical environment and a JSON array of
-input token IDs:
-
-```toml
-format = "hellas.job.v1"
-[application]
-evaluator = "hellas/catena-gpu-0.0.1"
-adaptor = "causal-lm-0.0.1"
-[payment]
-price = 20
-[causal_lm]
-environment = "model.environment"
-tokens = "tokens.json"
-max_new_tokens = 32
-stop_token_ids = [2]
-```
-
 ## Retries and outputs
 
 Reusing an unfinished folder resumes its signed authorization and work ID. A
