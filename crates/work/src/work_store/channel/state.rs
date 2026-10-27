@@ -21,8 +21,9 @@ impl Channel<PaymentFunding> {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let input = PreparedWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
-            .map_err(PaidWorkError::from)?;
+        let input =
+            PreparedWorkInput::decode(&job.prepared_input, crate::content::MAX_CONTENT_BYTES)
+                .map_err(PaidWorkError::from)?;
         let budget = match &input {
             PreparedWorkInput::Fetch(_) => crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             PreparedWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
@@ -73,8 +74,16 @@ impl Channel<PaymentFunding> {
         role: Role,
         verifier: &V,
         metadata_only: bool,
+        payloads: &super::payload::PayloadStore,
     ) -> Result<Self, ChannelStateError> {
-        let state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
+        let mut state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
+        if !metadata_only {
+            for job in state.book.jobs.values_mut() {
+                job.prepared_input = payloads
+                    .read(&job.prepared_input)
+                    .map_err(|_| ChannelStateError::Malformed)?;
+            }
+        }
         state.revalidate(verifier, metadata_only)?;
         Ok(state)
     }
@@ -963,7 +972,7 @@ impl Channel<PaymentFunding> {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let bundle = PreparedWorkInput::decode(prepared_input, MAX_RECORD_BYTES)
+        let bundle = PreparedWorkInput::decode(prepared_input, crate::content::MAX_CONTENT_BYTES)
             .map_err(PaidWorkError::from)?;
         if bundle.digest(&self.funding.channel)?.as_bytes()
             != authorization.prepared_input_digest.as_bytes()

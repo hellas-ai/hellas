@@ -74,7 +74,14 @@ async fn committed_loss_cannot_revive_a_native_stream_or_an_unpolled_carrier_bin
             ..Backend::default()
         };
         let (service, work, _) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         backend.finish.release();
         within(service.drain()).await.unwrap();
@@ -142,7 +149,10 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
     )
     .unwrap();
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
-    let id = accepted_id(work.accept(&request).await);
+    let id = accepted_id(
+        crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1)
+            .await,
+    );
     within(backend.started.notified()).await;
     backend.finish.release();
     within(service.drain()).await.unwrap();
@@ -225,7 +235,14 @@ async fn extending_expired_authority_does_not_revive_an_unpolled_response() {
         let (work, _) =
             common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
         set_execution_expiry(&service, &secret, UnixMillis(1100)).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         if completed {
             backend.finish.release();
@@ -273,7 +290,14 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
         let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
         let backend = Backend::default();
         let (service, work, credential) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         let delivery = service
             .bind_delivery(&work.access, &delivery_request(&a, id))
@@ -345,7 +369,14 @@ async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier(
                 let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
                 let backend = Backend::default();
                 let (service, work, credential) = service(store, backend.clone(), &secret).await;
-                let id = accepted_id(work.accept(&request).await);
+                let id = accepted_id(
+                    crate::test_support::accept_grant(
+                        &work,
+                        &request,
+                        &crate::test_support::principal(1).1,
+                    )
+                    .await,
+                );
                 within(backend.started.notified()).await;
                 backend.finish.release();
                 within(service.drain()).await.unwrap();

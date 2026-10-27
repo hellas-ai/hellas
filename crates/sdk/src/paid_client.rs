@@ -663,11 +663,12 @@ impl PaidWorkSession {
                                     RecoveredJob::Unrecoverable(job.work_id())
                                 });
                             }
-                            PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
-                                .map(|input| {
-                                    RecoveredJob::Replay(job.work_id(), job.phase(), input)
-                                })
-                                .map_err(PaidClientError::from)
+                            PreparedWorkInput::decode(
+                                job.prepared_input(),
+                                hellas_work::content::MAX_CONTENT_BYTES,
+                            )
+                            .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
+                            .map_err(PaidClientError::from)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })

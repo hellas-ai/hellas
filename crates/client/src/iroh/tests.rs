@@ -251,28 +251,53 @@ fn selected_software_provider_requires_a_valid_open_from_the_selected_peer() {
     let exporter = [5; 32];
     let nonce = [6; 32];
     let (_, response) = signed_open_response(&exporter, &nonce);
-    let bundle = ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
+    let bundle =
+        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     let trust = selected_provider_trust(&bundle, Assurance::ProducerSigned, None).unwrap();
-    verify_open_response(&trust, &exporter, &nonce, ALPN, ENROLLED_PEER, response.clone()).unwrap();
-    assert!(verify_open_response(&trust, &exporter, &nonce, ALPN, PeerIdentity([0; 32]), response.clone()).is_err());
+    verify_open_response(
+        &trust,
+        &exporter,
+        &nonce,
+        ALPN,
+        ENROLLED_PEER,
+        response.clone(),
+    )
+    .unwrap();
+    assert!(
+        verify_open_response(
+            &trust,
+            &exporter,
+            &nonce,
+            ALPN,
+            PeerIdentity([0; 32]),
+            response.clone()
+        )
+        .is_err()
+    );
     assert!(verify_open_response(&trust, &[0; 32], &nonce, ALPN, ENROLLED_PEER, response).is_err());
     assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
 }
 
 #[test]
 fn selected_apple_provider_keeps_independent_app_and_cdhash_approval() {
-    let (trust, response, _) = apple_open_response(&[5; 32], &[6; 32], 2, Arc::new(TestCounterStore::default()));
-    let bundle = ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
+    let (trust, response, _) =
+        apple_open_response(&[5; 32], &[6; 32], 2, Arc::new(TestCounterStore::default()));
+    let bundle =
+        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
     assert!(selected_provider_trust(&bundle, Assurance::ProducerSigned, None).is_err());
     for wrong_app in [true, false] {
         let mut bad = trust.clone();
         let apple = bad.apple_app_attest.as_mut().unwrap();
-        if wrong_app { apple.app_id = "OTHER.app".into(); }
-        else { apple.allowed_cd_hashes = vec![[0; 32]]; }
+        if wrong_app {
+            apple.app_id = "OTHER.app".into();
+        } else {
+            apple.allowed_cd_hashes = vec![[0; 32]];
+        }
         assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&bad)).is_err());
     }
-    let approved = selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&trust)).unwrap();
+    let approved =
+        selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&trust)).unwrap();
     verify_open_response(&approved, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).unwrap();
 }
 
@@ -535,6 +560,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
                 max_spool_bytes: 131072,
                 max_encoded_result_frame: 131072,
                 max_encoded_prepared_input: 65536,
+                max_upload_bytes: 65536,
             },
             route,
         },

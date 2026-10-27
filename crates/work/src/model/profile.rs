@@ -127,6 +127,20 @@ impl WorkPolicy {
         }
     }
 
+    pub const fn max_encoded_prepared_input(&self) -> u32 {
+        match self {
+            Self::Evaluate(policy) => policy.max_encoded_prepared_input,
+            Self::Fetch { policy, .. } => policy.max_encoded_prepared_input,
+        }
+    }
+    /// Maximum bytes missing from the provider's content store for one job.
+    pub const fn max_upload_bytes(&self) -> u64 {
+        match self {
+            Self::Evaluate(policy) => policy.max_upload_bytes,
+            Self::Fetch { policy, .. } => policy.max_upload_bytes,
+        }
+    }
+
     /// Maximum retained encoded transcript.
     pub const fn max_spool_bytes(&self) -> u64 {
         match self {

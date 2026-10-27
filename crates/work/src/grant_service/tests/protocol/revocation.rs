@@ -16,10 +16,24 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
             common_node::EXECUTION_AUTHORIZATION,
         );
         assert_eq!(
-            refusal(wrong.accept(&request).await),
+            refusal(
+                crate::test_support::accept_grant(
+                    &wrong,
+                    &request,
+                    &crate::test_support::principal(1).1
+                )
+                .await
+            ),
             GrantRefusalCode::Unauthorized
         );
-        accepted_id(work_service.accept(&request).await);
+        accepted_id(
+            crate::test_support::accept_grant(
+                &work_service,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         revoke_access(&service, &secret, &_credential, target).await;
         backend.queued.as_ref().unwrap().notify_one();
         within(service.drain()).await.unwrap();
@@ -50,7 +64,14 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             ..Backend::default()
         };
         let (service, work, credential) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         let reserved = snapshot(&service)
             .await
@@ -179,7 +200,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 ..Backend::default()
             };
             let (service, work, credential) = service(store, backend.clone(), &secret).await;
-            let id = accepted_id(work.accept(&request).await);
+            let id = accepted_id(crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1).await);
             within(backend.started.notified()).await;
             let cache = cache::cached(&service, id);
             let node = service.node();
@@ -261,7 +282,14 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             ..Backend::default()
         };
         let (service, work_service, _credential) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work_service.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work_service,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         let mut stream = work_service.stream(delivery::delivery_request(&auth, id));
         assert!(matches!(
@@ -293,7 +321,13 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
         );
         assert!(stream.next().await.is_none());
         assert!(matches!(
-            work_service.accept(&request).await.outcome,
+            crate::test_support::accept_grant(
+                &work_service,
+                &request,
+                &crate::test_support::principal(1).1
+            )
+            .await
+            .outcome,
             Some(accept_work_response::Outcome::Refused(_))
         ));
         backend.finish.release();

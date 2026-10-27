@@ -42,6 +42,7 @@ impl Evaluate {
                 max_spool_bytes: 1 << 20,
                 max_encoded_result_frame: 1 << 20,
                 max_encoded_prepared_input: 1 << 20,
+                max_upload_bytes: 1 << 20,
             }
             .into(),
             ..policy()

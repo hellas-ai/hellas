@@ -129,7 +129,7 @@ use hellas_rpc::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 /// endpoint's own storage.
 fn refuse(error: &WorkStoreError) -> Refusal {
     let code = match error {
-        WorkStoreError::Journal(_) => WorkRefusal::Unavailable,
+        WorkStoreError::Journal(_) | WorkStoreError::Content(_) => WorkRefusal::Unavailable,
         WorkStoreError::Setup(SetupStateError::Ended(_)) => WorkRefusal::Declined,
         WorkStoreError::Setup(_) => WorkRefusal::Invalid,
         // A channel record cannot reach a setup journal: `SetupStore`

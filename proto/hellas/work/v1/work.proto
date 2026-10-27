@@ -20,6 +20,9 @@ service Work {
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
 
+  // Exporter-bound signed chunks for the proposal's missing content objects.
+  rpc UploadContent(UploadContentRequest) returns (UploadContentResponse);
+
   // Private grant status and current Offer, bound to this connection. A stale
   // generation may discover the current one; it cannot authorize new work.
   rpc GetStanding(GetStandingRequest) returns (GetStandingResponse);
@@ -198,11 +201,24 @@ message AcceptWorkRequest {
   // 64 bytes. The channel key is native by construction, so there is no
   // key-kind discriminator to disagree with the payment terms.
   bytes client_signature = 2;
-  // Canonical `PreparedPaidInputV1`: the inputs the authorization's
-  // `prepared_input_digest` commits to, carried so the provider can
-  // still execute the job it accepted after the quote that produced
-  // them is gone.
+  // Fixed 40-byte ContentRef (content id followed by big-endian length).
+  // The complete prepared input must have been uploaded or already be held.
   bytes prepared_input = 3;
+}
+
+message UploadContentRequest {
+  WorkRoute route = 1;
+  bytes authorization = 2;
+  bytes client_signature = 3;
+  bytes content_id = 4;
+  uint64 total_bytes = 5;
+  uint64 offset = 6;
+  bytes chunk = 7;
+  bytes chunk_signature = 8;
+}
+message UploadContentResponse {
+  // A zero-byte probe returns the durable offset; total_bytes means have.
+  uint64 next_offset = 1;
 }
 
 message AcceptWorkResponse {

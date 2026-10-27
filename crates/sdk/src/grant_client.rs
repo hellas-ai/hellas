@@ -11,6 +11,10 @@ use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
 use hellas_rpc::{
+    ContentId, ContentRef,
+    protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
+};
+use hellas_rpc::{
     EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProviderEnrollmentBundle,
     RequestCommitment, SchemeId, StreamId, output_genesis,
     pb::work::{
@@ -21,6 +25,7 @@ use hellas_rpc::{
     },
     scheme_id, verify_output_event_continuation,
 };
+use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
 use hellas_work::model::grant::records::{check_grant_provider, grant_producer, grant_transport};
 use hellas_work::model::{
@@ -288,6 +293,7 @@ impl SessionTransport {
                 }
                 Ok(Link::Local(
                     service.for_caller(caller, application.authorization),
+                    rand::random(),
                 ))
             }
             Self::Closed => Err(GrantClientError::Closed),
@@ -298,13 +304,13 @@ enum Link {
     /// The host closes the connection, and cancels its work, when the
     /// authenticated session expires.
     Remote(IrohTransport, Option<tokio::time::Instant>),
-    Local(GrantWork),
+    Local(GrantWork, [u8; 32]),
 }
 impl Link {
     fn expires(&self) -> Option<tokio::time::Instant> {
         match self {
             Self::Remote(_, expires) => *expires,
-            Self::Local(_) => None,
+            Self::Local(_, _) => None,
         }
     }
     async fn standing(&self, request: GetStandingRequest) -> Result<GetStandingResponse> {
@@ -315,10 +321,86 @@ impl Link {
             .get_standing(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s) => Ok(s.standing(&request).await),
+            Self::Local(s, _) => Ok(s.standing(&request).await),
         }
     }
-    async fn accept(&self, request: AcceptWorkRequest) -> Result<AcceptWorkResponse> {
+    async fn accept(
+        &self,
+        request: AcceptWorkRequest,
+        work: Digest,
+        input: Option<&[u8]>,
+        signer: &ProducerSigningKey,
+    ) -> Result<AcceptWorkResponse> {
+        if let Some(bytes) = input {
+            let reference = ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
+            let exporter = match self {
+                Self::Remote(transport, _) => transport
+                    .context()
+                    .open_exporter
+                    .ok_or(GrantError::Signature)?,
+                Self::Local(_, exporter) => *exporter,
+            };
+            let authorization = GrantJobAuthorizationV1::decode(&request.authorization)?;
+            let mut offset = 0_u64;
+            let mut probing = true;
+            loop {
+                let chunk = if probing {
+                    Vec::new()
+                } else {
+                    bytes[offset as usize..(offset as usize + CONTENT_CHUNK_BYTES).min(bytes.len())]
+                        .to_vec()
+                };
+                let end = offset + chunk.len() as u64;
+                let signature = signer.sign_digest(chunk_digest(
+                    authorization.channel_id.0,
+                    work,
+                    reference,
+                    offset,
+                    &chunk,
+                    &exporter,
+                ))?;
+                let upload = hellas_rpc::pb::work::UploadContentRequest {
+                    route: request.route.clone(),
+                    authorization: request.authorization.clone(),
+                    client_signature: request.client_signature.clone(),
+                    content_id: reference.id().as_bytes().to_vec(),
+                    total_bytes: reference.bytes(),
+                    offset,
+                    chunk,
+                    chunk_signature: signature.bytes().to_vec(),
+                };
+                let response = match self {
+                    Self::Remote(transport, _) => {
+                        hellas_rpc::services::work::WorkClientImpl::new(IrohTransport::new(
+                            transport.connection().clone(),
+                        ))
+                        .upload_content(upload)
+                        .await?
+                    }
+                    Self::Local(service, _) => {
+                        service
+                            .upload(
+                                &upload,
+                                &hellas_wire::TransportContext {
+                                    open_exporter: Some(exporter),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?
+                    }
+                };
+                if response.next_offset > reference.bytes()
+                    || (!probing && response.next_offset < end)
+                {
+                    return Err(GrantError::Malformed.into());
+                }
+                if response.next_offset == reference.bytes() {
+                    break;
+                }
+                offset = response.next_offset;
+                probing = false;
+            }
+        }
         match self {
             Self::Remote(t, _) => hellas_rpc::services::work::WorkClientImpl::new(
                 IrohTransport::new(t.connection().clone()),
@@ -326,7 +408,7 @@ impl Link {
             .accept_work(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s) => Ok(s.accept(&request).await),
+            Self::Local(s, _) => Ok(s.accept(&request).await),
         }
     }
     async fn stream(
@@ -346,7 +428,7 @@ impl Link {
                     if let Err(error) = stream.finish() { yield Err(GrantClientError::from(error)); }
                 }))
             }
-            Self::Local(s) => Ok(Box::pin(
+            Self::Local(s, _) => Ok(Box::pin(
                 s.stream(request)
                     .map(|event| event.map_err(GrantClientError::from)),
             )),
@@ -534,12 +616,20 @@ impl GrantSession {
             route: Some(WorkRoute::grant(a.channel_id.0)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: prepared.unwrap_or_default(),
+            prepared_input: prepared
+                .as_ref()
+                .map(|bytes| {
+                    encode_reference(ContentRef::new(ContentId::hash(bytes), bytes.len() as u64))
+                })
+                .unwrap_or_default(),
         };
         let link = self.link().await?;
-        let response = tokio::time::timeout(self.options.timeout, link.accept(request))
-            .await
-            .map_err(|_| GrantClientError::Timeout)??;
+        let response = tokio::time::timeout(
+            self.options.timeout,
+            link.accept(request, id, prepared.as_deref(), &self.options.signer),
+        )
+        .await
+        .map_err(|_| GrantClientError::Timeout)??;
         match self.apply_acceptance(id, response, probe).await {
             Ok(()) => Ok(Recovery::Accepted(id)),
             Err(error @ GrantClientError::Refused { .. }) => {
@@ -828,15 +918,22 @@ impl GrantSession {
             .await?;
         let id = grant_work_id(self.target.network, &a);
         self.pending_body = Some((id, input.clone()));
+        let prepared = input.encode().map_err(GrantClientError::from)?;
         let request = AcceptWorkRequest {
             route: Some(WorkRoute::grant(channel.0)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: input.encode().map_err(GrantClientError::from)?,
+            prepared_input: encode_reference(ContentRef::new(
+                ContentId::hash(&prepared),
+                prepared.len() as u64,
+            )),
         };
-        let response = tokio::time::timeout(self.options.timeout, link.accept(request))
-            .await
-            .map_err(|_| GrantClientError::Timeout)??;
+        let response = tokio::time::timeout(
+            self.options.timeout,
+            link.accept(request, id, Some(&prepared), &self.options.signer),
+        )
+        .await
+        .map_err(|_| GrantClientError::Timeout)??;
         self.apply_acceptance(id, response, false).await?;
         let delivery = DeliverResultRequest {
             route: Some(WorkRoute::grant(channel.0)),

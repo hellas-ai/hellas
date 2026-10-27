@@ -7,6 +7,8 @@ pub struct ChannelStore {
     journal: Journal,
     state: Channel,
     metadata_only: bool,
+    payloads: payload::PayloadStore,
+    pub(crate) uploads: crate::content::UploadStore,
 }
 
 impl ChannelStore {
@@ -83,6 +85,13 @@ impl ChannelStore {
             .into());
         }
         let key = channel_key(&channel).into_bytes();
+        let stem = format!("channel-{}", hex(key));
+        let payloads = payload::PayloadStore::new(root, &stem);
+        let uploads = if metadata_only {
+            crate::content::UploadStore::memory(channel.id(), Default::default())
+        } else {
+            crate::content::UploadStore::durable(root, &stem, channel.id())?
+        };
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
@@ -99,13 +108,24 @@ impl ChannelStore {
         )
         .await?;
         let mut state = match &replay.checkpoint {
-            Some(bytes) => {
-                Channel::from_checkpoint(bytes, channel, settlement, role, verifier, metadata_only)?
-            }
+            Some(bytes) => Channel::from_checkpoint(
+                bytes,
+                channel,
+                settlement,
+                role,
+                verifier,
+                metadata_only,
+                &payloads,
+            )?,
             None => Channel::new(channel, settlement, role, origin),
         };
         for bytes in &replay.records {
-            let record = ChannelRecord::decode(bytes)?;
+            let mut record = ChannelRecord::decode(bytes)?;
+            if !metadata_only {
+                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut record {
+                    *prepared_input = payloads.read(prepared_input)?;
+                }
+            }
             state.apply(&record, verifier, metadata_only)?;
         }
         state.book.indeterminate = state
@@ -116,11 +136,14 @@ impl ChannelStore {
             .map(|job| job.work_id)
             .collect();
         journal.observe_replay(replayed, replay.records.len());
-        let store = Self {
+        let mut store = Self {
             journal,
             state,
             metadata_only,
+            payloads,
+            uploads,
         };
+        store.gc_uploads()?;
         Ok(store)
     }
 
@@ -175,8 +198,7 @@ impl ChannelStore {
             // answered with and the terminal that pays for it — because
             // by then there is no refusal left that costs nothing.
             if let Some(tail) = record.checkpoint_tail() {
-                let len = next
-                    .checkpoint_for_storage(self.metadata_only)
+                let len = payload::checkpoint(&next, self.metadata_only)
                     .len()
                     .saturating_add(tail);
                 if len > MAX_CHECKPOINT_BYTES {
@@ -184,12 +206,29 @@ impl ChannelStore {
                 }
             }
             self.rotate_if_full(record.is_new_work()).await?;
+            let mut stored = record;
+            if !self.metadata_only {
+                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored {
+                    *prepared_input = self.payloads.write(prepared_input)?;
+                }
+            }
             self.journal
-                .append(&record.encode_for_storage(self.metadata_only))
+                .append(&stored.encode_for_storage(self.metadata_only))
                 .await?;
             self.state = next;
         }
+        self.gc_uploads()?;
         Ok(&self.state)
+    }
+
+    pub(crate) fn gc_uploads(&mut self) -> Result<(), WorkStoreError> {
+        self.uploads.gc(
+            self.state.cursor().0,
+            self.state.close_prepared().is_some()
+                || self.state.close_opened().is_some()
+                || self.state.close_settled().is_some(),
+        )?;
+        Ok(())
     }
 
     /// Moves the journal on to its next generation, carrying this state
@@ -207,8 +246,11 @@ impl ChannelStore {
     /// frame or an install step fails.
     pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
         self.journal
-            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
             .await?;
+        if !self.metadata_only {
+            self.payloads.prune(&self.state)?;
+        }
         Ok(())
     }
 
@@ -225,7 +267,7 @@ impl ChannelStore {
         }
         match self
             .journal
-            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
             .await
         {
             Ok(()) => Ok(()),

@@ -47,7 +47,14 @@ impl NativeWork {
         }
     }
     async fn finish_first(&self) {
-        let id = accepted_id(self.work.accept(&self.first.request()).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &self.work,
+                &self.first.request(),
+                &FRIEND.node_key(),
+            )
+            .await,
+        );
         within(self.backend.started.notified()).await;
         self.backend.finish.release();
         let mut stream = self
@@ -98,7 +105,12 @@ async fn an_exhausted_token_budget_refuses_before_native_execution() {
     let native = NativeWork::new(directory.path()).await;
     native.finish_first().await;
 
-    let response = native.work.accept(&native.second.request()).await;
+    let response = crate::test_support::accept_grant(
+        &native.work,
+        &native.second.request(),
+        &FRIEND.node_key(),
+    )
+    .await;
 
     assert_eq!(refusal(response), GrantRefusalCode::Budget);
     assert_eq!(native.backend.calls.load(Ordering::SeqCst), 1);

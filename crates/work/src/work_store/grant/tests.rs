@@ -673,6 +673,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
                 max_spool_bytes: 1_048_576,
                 max_encoded_result_frame: 262_144,
                 max_encoded_prepared_input: 1_048_576,
+                max_upload_bytes: 1_048_576,
             });
         }
         if !revoke {

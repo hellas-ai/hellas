@@ -35,7 +35,14 @@ async fn verified_usage_survives_error_status_and_late_settlement_without_faulti
         .unwrap();
         let (work_service, _) =
             common_node::execution(&service, &secret, &principal(1).1, GrantId([1; 16])).await;
-        let work = accepted_id(work_service.accept(&request).await);
+        let work = accepted_id(
+            crate::test_support::accept_grant(
+                &work_service,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         if late {
             clock.set(UnixMillis(a.terminal_deadline_ms.0 + 1));

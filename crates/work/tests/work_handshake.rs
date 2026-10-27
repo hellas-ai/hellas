@@ -153,6 +153,7 @@ fn work_policy() -> EvaluatePolicyV2 {
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
         max_encoded_prepared_input: 1_048_576,
+        max_upload_bytes: 1_048_576,
     }
 }
 

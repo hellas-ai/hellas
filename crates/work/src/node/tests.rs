@@ -767,7 +767,9 @@ async fn checked_capacity_changes_reach_work_admission() {
     let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
     let first = world.proposal(FRIEND, ids::ALLOWANCE, 1).await;
     assert!(matches!(
-        work.accept(&first.request()).await.outcome,
+        crate::test_support::accept_grant(&work, &first.request(), &FRIEND.node_key())
+            .await
+            .outcome,
         Some(Outcome::Accepted(_))
     ));
     within(backend.started.notified()).await;
@@ -784,7 +786,8 @@ async fn checked_capacity_changes_reach_work_admission() {
         .await
         .unwrap();
     let second = world.proposal(FRIEND, ids::ALLOWANCE, 2).await;
-    let response = work.accept(&second.request()).await;
+    let response =
+        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key()).await;
     let Some(Outcome::Refused(refused)) = response.outcome else {
         panic!("capacity did not reach Work: {response:?}")
     };
@@ -796,7 +799,9 @@ async fn checked_capacity_changes_reach_work_admission() {
         .await
         .unwrap();
     assert!(matches!(
-        work.accept(&second.request()).await.outcome,
+        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key())
+            .await
+            .outcome,
         Some(Outcome::Accepted(_))
     ));
     within(backend.started.notified()).await;

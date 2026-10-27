@@ -237,11 +237,12 @@ pub struct FetchPolicyV2 {
     pub max_encoded_result_frame: u32,
     /// Maximum size of the complete encoded prepared-input bundle.
     pub max_encoded_prepared_input: u32,
+    pub max_upload_bytes: u64,
 }
 
 impl PrivateRecord for FetchPolicyV2 {
     const TAG: u8 = tag::FETCH_POLICY_V2;
-    const BODY_SIZE: usize = 2 * 32 + 3 * 4 + 8 + 2 * 4;
+    const BODY_SIZE: usize = 2 * 32 + 3 * 4 + 8 + 2 * 4 + 8;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.allowed_environment.as_bytes());
@@ -252,6 +253,7 @@ impl PrivateRecord for FetchPolicyV2 {
         put_u64(out, self.max_spool_bytes);
         put_u32(out, self.max_encoded_result_frame);
         put_u32(out, self.max_encoded_prepared_input);
+        put_u64(out, self.max_upload_bytes);
     }
 
     fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
@@ -264,6 +266,7 @@ impl PrivateRecord for FetchPolicyV2 {
             max_spool_bytes: reader.u64()?,
             max_encoded_result_frame: reader.u32()?,
             max_encoded_prepared_input: reader.u32()?,
+            max_upload_bytes: reader.u64()?,
         })
     }
 }
@@ -278,6 +281,7 @@ pub fn check_fetch_policy(policy: &FetchPolicyV2) -> Result<(), PaidWorkError> {
         ("max_output_events", u64::from(policy.max_output_events)),
         ("max_output_bytes", u64::from(policy.max_output_bytes)),
         ("max_spool_bytes", policy.max_spool_bytes),
+        ("max_upload_bytes", policy.max_upload_bytes),
         (
             "max_encoded_result_frame",
             u64::from(policy.max_encoded_result_frame),

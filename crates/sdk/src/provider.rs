@@ -527,7 +527,8 @@ where
                 .map(ToString::to_string)
                 .collect(),
         )
-        .await?;
+        .await?
+        .with_upload_quota(work_mount.upload_quota());
         let administration = hellas_work::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.policies,

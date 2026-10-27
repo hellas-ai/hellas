@@ -46,9 +46,17 @@ async fn portable_grant_rpc_streams_before_terminal_reserves_once_and_survives_r
         response.outcome,
         Some(get_standing_response::Outcome::Standing(_))
     ));
+    let (first, uploads) = grant_upload_requests(&first, &principal(1).1, network(), [7; 32]);
+    for upload in uploads {
+        rpc.upload_content(upload).await.unwrap();
+    }
     let id = accepted_id(rpc.accept_work(first.clone()).await.unwrap());
     within(backend.started.notified()).await;
     assert_eq!(accepted_id(rpc.accept_work(first).await.unwrap()), id);
+    let (second, uploads) = grant_upload_requests(&second, &principal(1).1, network(), [7; 32]);
+    for upload in uploads {
+        rpc.upload_content(upload).await.unwrap();
+    }
     assert_eq!(
         refusal(rpc.accept_work(second).await.unwrap()),
         GrantRefusalCode::QueueCapacity

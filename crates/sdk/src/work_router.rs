@@ -121,6 +121,19 @@ impl WorkHandler for UnmountedWork {
         Ok(AcceptWorkResponse::refused(not_ready()))
     }
 
+    async fn upload_content(
+        &self,
+        _request: hellas_rpc::pb::work::UploadContentRequest,
+        _context: TransportContext,
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        Err::<hellas_rpc::pb::work::UploadContentResponse, _>(WireStatus::new(
+            WireCode::Unavailable,
+            "work channel is not mounted",
+        ))
+    }
     async fn deliver_result(
         &self,
         _request: DeliverResultRequest,
@@ -170,6 +183,20 @@ impl WorkHandler for ConnectionWork {
             Handler::Grants(service) => wt(service.accept_work(request, context)).await,
             Handler::Payment(service) => wt(service.accept_work(request, context)).await,
             Handler::Unavailable => wt(UnmountedWork.accept_work(request, context)).await,
+        }
+    }
+    async fn upload_content(
+        &self,
+        request: hellas_rpc::pb::work::UploadContentRequest,
+        context: TransportContext,
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        match self.handler(&context, request.route.as_ref())? {
+            Handler::Grants(service) => wt(service.upload_content(request, context)).await,
+            Handler::Payment(service) => wt(service.upload_content(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.upload_content(request, context)).await,
         }
     }
     async fn deliver_result(

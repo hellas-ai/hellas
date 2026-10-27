@@ -199,6 +199,7 @@ fn work_policy() -> EvaluatePolicyV2 {
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
         max_encoded_prepared_input: 1_048_576,
+        max_upload_bytes: 1_048_576,
     }
 }
 
@@ -309,6 +310,7 @@ fn golden_record_encodings_are_pinned() {
         max_spool_bytes: 5,
         max_encoded_result_frame: 6,
         max_encoded_prepared_input: 7,
+        max_upload_bytes: 7,
     };
     assert_eq!(
         hex(&policy.encode()),
@@ -1385,6 +1387,7 @@ fn an_absent_work_policy_bound_is_refused() {
             "max_encoded_prepared_input",
             EvaluatePolicyV2 {
                 max_encoded_prepared_input: 0,
+                max_upload_bytes: 0,
                 ..base
             },
         ),
@@ -1740,6 +1743,7 @@ fn each_envelope_bound_is_checked_on_its_own() {
     let encoded = bundle().encode().expect("a representable bundle");
     let cramped = EvaluatePolicyV2 {
         max_encoded_prepared_input: 100,
+        max_upload_bytes: 100,
         ..base
     };
     assert_eq!(
@@ -1753,6 +1757,7 @@ fn each_envelope_bound_is_checked_on_its_own() {
     // The exact length is legal; one byte less is not.
     let exact = EvaluatePolicyV2 {
         max_encoded_prepared_input: encoded.len() as u32,
+        max_upload_bytes: u64::from(encoded.len() as u32),
         ..base
     };
     assert!(check_prepared_input(&channel, &authorization, &exact, &bundle()).is_ok());

@@ -189,6 +189,7 @@ fn fetch_policy() -> FetchPolicyV2 {
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
         max_encoded_prepared_input: 1_048_576,
+        max_upload_bytes: 1_048_576,
     }
 }
 
@@ -347,6 +348,7 @@ fn golden_fetch_policy_encoding_is_pinned() {
         max_spool_bytes: 4,
         max_encoded_result_frame: 5,
         max_encoded_prepared_input: 6,
+        max_upload_bytes: 6,
     };
     assert_eq!(
         hex(&policy.encode()),
@@ -1007,6 +1009,7 @@ fn an_absent_fetch_policy_bound_is_refused() {
             "max_encoded_prepared_input",
             FetchPolicyV2 {
                 max_encoded_prepared_input: 0,
+                max_upload_bytes: 0,
                 ..base
             },
         ),
@@ -1133,6 +1136,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     let encoded = bundle().encode().expect("a representable bundle");
     let cramped = FetchPolicyV2 {
         max_encoded_prepared_input: 100,
+        max_upload_bytes: 100,
         ..policy
     };
     assert_eq!(
@@ -1146,6 +1150,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     // The exact length is legal; one byte less is not.
     let exact = FetchPolicyV2 {
         max_encoded_prepared_input: encoded.len() as u32,
+        max_upload_bytes: u64::from(encoded.len() as u32),
         ..policy
     };
     assert!(check_prepared_fetch_input(&channel, &base, &exact, &route(), &bundle()).is_ok());
@@ -1694,6 +1699,7 @@ fn the_two_profiles_do_not_mix() {
         max_spool_bytes: fetch_policy.max_spool_bytes,
         max_encoded_result_frame: fetch_policy.max_encoded_result_frame,
         max_encoded_prepared_input: fetch_policy.max_encoded_prepared_input,
+        max_upload_bytes: u64::from(fetch_policy.max_encoded_prepared_input),
     };
     assert_ne!(
         work_policy_digest(&channel, &evaluate_policy),

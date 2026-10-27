@@ -3281,6 +3281,7 @@ dependencies = [
  "hellas-kernel",
  "hellas-private",
  "hellas-rpc",
+ "hellas-store",
  "hellas-webauthn",
  "hellas-wire",
  "hellas-work",

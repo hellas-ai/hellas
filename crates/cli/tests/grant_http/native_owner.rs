@@ -430,6 +430,7 @@ pub(super) fn native_model(
             max_spool_bytes: 32 << 20,
             max_encoded_result_frame: 4 << 20,
             max_encoded_prepared_input: 4 << 20,
+            max_upload_bytes: 4 << 20,
         }
         .into(),
     };

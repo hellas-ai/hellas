@@ -1,3 +1,4 @@
+use crate::model::work::PrivateRecord as _;
 use crate::model::{
     fetch::*,
     grant::{budget::*, records::*, *},
@@ -228,6 +229,7 @@ pub fn policy() -> GrantPolicy {
                 max_spool_bytes: 65_536,
                 max_encoded_result_frame: 262_144,
                 max_encoded_prepared_input: 1_048_576,
+                max_upload_bytes: 1_048_576,
             },
             route,
         },
@@ -469,6 +471,87 @@ pub fn test_responses_contract() -> hellas_rpc::FetchContract {
 pub mod backend;
 pub mod credentials;
 pub mod transport;
+
+/// Turns a fixture's locally held input body into signed upload RPCs and a
+/// reference-only acceptance. Provider handlers never receive the body inline.
+pub fn grant_upload_requests(
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+    signer: &ProducerSigningKey,
+    network: NetworkId,
+    exporter: [u8; 32],
+) -> (
+    hellas_rpc::pb::work::AcceptWorkRequest,
+    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+) {
+    use hellas_rpc::protocol::content_upload::{
+        CONTENT_CHUNK_BYTES, chunk_digest, encode_reference,
+    };
+    let mut wire = request.clone();
+    let Ok(a) = GrantJobAuthorizationV1::decode(&request.authorization) else {
+        return (wire, Vec::new());
+    };
+    if request.prepared_input.is_empty() {
+        return (wire, Vec::new());
+    }
+    let reference = ContentRef::new(
+        ContentId::hash(&request.prepared_input),
+        request.prepared_input.len() as u64,
+    );
+    wire.prepared_input = encode_reference(reference);
+    let work = grant_work_id(network, &a);
+    let chunks = request
+        .prepared_input
+        .chunks(CONTENT_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
+            let signature = signer
+                .sign_digest(chunk_digest(
+                    a.channel_id.0,
+                    work,
+                    reference,
+                    offset,
+                    chunk,
+                    &exporter,
+                ))
+                .unwrap();
+            hellas_rpc::pb::work::UploadContentRequest {
+                route: wire.route.clone(),
+                authorization: wire.authorization.clone(),
+                client_signature: wire.client_signature.clone(),
+                content_id: reference.id().as_bytes().to_vec(),
+                total_bytes: reference.bytes(),
+                offset,
+                chunk: chunk.to_vec(),
+                chunk_signature: signature.bytes().to_vec(),
+            }
+        })
+        .collect();
+    (wire, chunks)
+}
+
+pub async fn accept_grant(
+    work: &crate::grant_service::GrantWork,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+    signer: &ProducerSigningKey,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let exporter = [7; 32];
+    let (wire, chunks) = grant_upload_requests(request, signer, network(), exporter);
+    for chunk in chunks {
+        // Refusal tests still exercise AcceptWork's independently checked
+        // permission/signature/deadline response after an upload was denied.
+        let _ = work
+            .upload(
+                &chunk,
+                &hellas_wire::TransportContext {
+                    open_exporter: Some(exporter),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+    work.accept(&wire).await
+}
 
 /// Raw store operations used by accounting tests; preserve the caller and simulated time.
 pub async fn accept(

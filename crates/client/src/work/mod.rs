@@ -297,8 +297,11 @@ where
     let Some(job) = endpoint.state().job_by_id(work_id) else {
         return Err(CollectError::Deliver(DeliverError::NoSuchJob));
     };
-    let bundle = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)
-        .map_err(|error| CollectError::Bundle(error.to_string()))?;
+    let bundle = PreparedPaidInputV1::decode(
+        job.prepared_input(),
+        hellas_work::content::MAX_CONTENT_BYTES,
+    )
+    .map_err(|error| CollectError::Bundle(error.to_string()))?;
     let network = endpoint.state().channel().network();
 
     let reproduction =

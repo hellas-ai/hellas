@@ -47,6 +47,7 @@ fn evaluate() -> EvaluatePolicyV2 {
         max_spool_bytes: 0x1112131415161718,
         max_encoded_result_frame: 0x21222324,
         max_encoded_prepared_input: 0x31323334,
+        max_upload_bytes: 0x31323334,
     }
 }
 fn fetch() -> FetchPolicyV2 {
@@ -59,6 +60,7 @@ fn fetch() -> FetchPolicyV2 {
         max_spool_bytes: 0x2122232425262728,
         max_encoded_result_frame: 0x31323334,
         max_encoded_prepared_input: 0x41424344,
+        max_upload_bytes: 0x41424344,
     }
 }
 fn payment() -> JobPaymentPolicyV2 {

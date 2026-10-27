@@ -37,6 +37,7 @@ use funding::{Clock, ClockReading};
 pub use funding::{FinalizedHeight, Funding, PaymentFunding};
 
 mod codec;
+mod payload;
 mod state;
 mod store;
 

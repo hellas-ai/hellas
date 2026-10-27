@@ -30,9 +30,9 @@ const SQLITE_NOTADB: i32 = 26;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// Largest record this journal will write or read back: one job proposal
-/// with the whole prepared input a provider must still execute after a
-/// restart. The profile's tighter bound is checked where it is known.
+/// Largest metadata/result record this journal writes or reads back.
+/// Compute input bodies live in verified payload objects referenced by the
+/// journal; profile-specific bounds are checked before acceptance.
 pub const MAX_RECORD_BYTES: usize = 4 << 20;
 
 /// Most payload bytes, checkpoint included, one generation may hold. Hard,

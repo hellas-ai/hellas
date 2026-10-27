@@ -3,13 +3,10 @@
 //!
 //! # What crosses the wire
 //!
-//! Canonical private records, and nothing else. `AcceptWorkRequest`
-//! carries the exact bytes of a [`PaidJobAuthorizationV2`] and a
-//! [`crate::model::prepared_input::PreparedPaidInputV1`], not a protobuf transcription of their
-//! fields, because the two signatures on this exchange are over digests
-//! of those bytes. A protobuf spelling beside them would be a second
-//! definition of what both parties signed, agreeing with the first until
-//! one of them gained a field.
+//! Canonical private records and content references. `AcceptWorkRequest`
+//! carries canonical [`PaidJobAuthorizationV2`] bytes and a content reference
+//! to the prepared input transferred by UploadContent. Signatures cover the
+//! canonical authorization and its exact input commitment.
 //!
 //! # The order
 //!
@@ -132,9 +129,13 @@ mod stream;
 use admission::{AdmissionError, AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
+mod upload;
+use hellas_rpc::protocol::content_upload::{decode_reference, encode_reference};
+use hellas_rpc::{ContentId, ContentRef};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use upload::content_refusal;
 
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
@@ -339,7 +340,9 @@ impl From<WorkStoreError> for Refusal {
     fn from(error: WorkStoreError) -> Self {
         let code = match &error {
             WorkStoreError::Channel(channel) => channel_refusal(channel),
-            WorkStoreError::Journal(_) | WorkStoreError::Setup(_) => WorkRefusal::Unavailable,
+            WorkStoreError::Journal(_) | WorkStoreError::Setup(_) | WorkStoreError::Content(_) => {
+                WorkRefusal::Unavailable
+            }
         };
         Self::new(code, error.to_string())
     }
@@ -771,7 +774,18 @@ impl ProviderEndpoint {
 
     async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
+        self.close.store.gc_uploads()?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
+            if let Some(job) = self.state().job_by_id(work_id) {
+                let bytes = job.prepared_input().to_vec();
+                if !bytes.is_empty() {
+                    self.close
+                        .store
+                        .uploads
+                        .publish_accepted(work_id, &bytes)
+                        .map_err(content_refusal)?;
+                }
+            }
             return Ok((work_id, retained));
         }
         let ready = self
@@ -786,14 +800,34 @@ impl ProviderEndpoint {
             &authorization,
             cursor_height,
         )?;
-        let bundle = PreparedWorkBundle::decode(&request.prepared_input, MAX_RECORD_BYTES)
-            .map_err(|error| Refusal::invalid(error.to_string()))?;
-        policy.check_input(ready.channel(), &authorization, &bundle)?;
         ready.check_signable(
             cursor_height,
             authorization.terminal_deadline,
             authorization.payment_deadline,
         )?;
+        let reference = decode_reference(&request.prepared_input)
+            .ok_or_else(|| Refusal::invalid("prepared input must be a content reference"))?;
+        if self
+            .close
+            .store
+            .uploads
+            .missing_bytes(reference)
+            .map_err(content_refusal)?
+            > policy.max_upload_bytes()
+        {
+            return Err(content_refusal(crate::content::ContentError::UploadLimit(
+                policy.max_upload_bytes(),
+            )));
+        }
+        let prepared_input = self
+            .close
+            .store
+            .uploads
+            .read(work_id, reference)
+            .map_err(content_refusal)?;
+        let bundle = PreparedWorkBundle::decode(&prepared_input, crate::content::MAX_CONTENT_BYTES)
+            .map_err(|error| Refusal::invalid(error.to_string()))?;
+        policy.check_input(ready.channel(), &authorization, &bundle)?;
 
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
@@ -803,7 +837,7 @@ impl ProviderEndpoint {
                 ChannelRecord::JobProposed {
                     authorization,
                     client_signature,
-                    prepared_input: request.prepared_input.clone(),
+                    prepared_input: prepared_input.clone(),
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -820,6 +854,11 @@ impl ProviderEndpoint {
                 &Secp256k1Verifier::new(),
             )
             .await?;
+        self.close
+            .store
+            .uploads
+            .publish_accepted(work_id, &prepared_input)
+            .map_err(content_refusal)?;
         Ok((work_id, signature))
     }
 
@@ -926,8 +965,9 @@ impl ProviderEndpoint {
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
-        let bundle = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
-            .map_err(PaidWorkError::from)?;
+        let bundle =
+            PreparedWorkBundle::decode(job.prepared_input(), crate::content::MAX_CONTENT_BYTES)
+                .map_err(PaidWorkError::from)?;
         ready
             .work_policy()
             .check_input(ready.channel(), &authorization, &bundle)?;
@@ -984,8 +1024,9 @@ impl ProviderEndpoint {
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
-        let input = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
-            .map_err(|e| RunError::Transcript(e.into()))?;
+        let input =
+            PreparedWorkBundle::decode(job.prepared_input(), crate::content::MAX_CONTENT_BYTES)
+                .map_err(|e| RunError::Transcript(e.into()))?;
         let ready = self
             .ready
             .as_ref()
@@ -2923,11 +2964,23 @@ impl WorkService {
             .endpoint()
             .await
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
-            .and_then(|endpoint| {
+            .and_then(|mut endpoint| {
                 let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
-                Ok(endpoint
-                    .prior_acceptance(&authorization, work_id)?
-                    .map(|signature| (work_id, signature)))
+                let retained = endpoint.prior_acceptance(&authorization, work_id)?;
+                if retained.is_some() {
+                    if let Some(job) = endpoint.state().job_by_id(work_id) {
+                        let bytes = job.prepared_input().to_vec();
+                        if !bytes.is_empty() {
+                            endpoint
+                                .close
+                                .store
+                                .uploads
+                                .publish_accepted(work_id, &bytes)
+                                .map_err(content_refusal)?;
+                        }
+                    }
+                }
+                Ok(retained.map(|signature| (work_id, signature)))
             });
         result.transpose().map(acceptance_response)
     }
@@ -3134,6 +3187,17 @@ impl WorkHandler for WorkService {
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
     {
         Ok(self.accept(&request).await)
+    }
+
+    async fn upload_content(
+        &self,
+        request: hellas_rpc::pb::work::UploadContentRequest,
+        context: TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        self.upload(&request, &context).await
     }
 
     async fn deliver_result(
@@ -3678,7 +3742,7 @@ impl ClientEndpoint {
                     .job_by_id(work_id)
                     .ok_or(DeliverError::NoSuchJob)?
                     .prepared_input(),
-                MAX_RECORD_BYTES,
+                crate::content::MAX_CONTENT_BYTES,
             )
             .map_err(PaidWorkError::from)?;
             let expected = ready.work_policy().terminal_result(
@@ -4054,8 +4118,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.propose(proposal).await?;
-    let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.client().await?.accepted(&response).await
+    upload::send_proposal(transport, endpoint, request).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -4074,8 +4137,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.client().await?.accepted(&response).await
+    upload::send_proposal(transport, endpoint, request).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────
@@ -4107,7 +4169,10 @@ fn wire_request(
         )),
         authorization: authorization.encode(),
         client_signature: client_signature.as_bytes().to_vec(),
-        prepared_input,
+        prepared_input: encode_reference(ContentRef::new(
+            ContentId::hash(&prepared_input),
+            prepared_input.len() as u64,
+        )),
     }
 }
 

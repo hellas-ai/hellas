@@ -16,6 +16,7 @@ pub mod test_support;
 
 mod audit;
 pub mod authenticator;
+pub mod content;
 mod endpoint_lock;
 pub mod grant_service;
 pub mod model;
