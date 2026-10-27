@@ -23,8 +23,8 @@ hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }
 hellas-private.workspace = true
-hellas-store.workspace = true
 hellas-rpc = { workspace = true, features = ["evaluate", "fetch", "work"] }
+hellas-store.workspace = true
 hellas-webauthn.workspace = true
 hellas-wire.workspace = true
 hellas-xet.workspace = true
