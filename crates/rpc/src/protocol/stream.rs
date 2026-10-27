@@ -597,6 +597,10 @@ pub struct OutputTranscriptBuilder<'a> {
 }
 
 impl<'a> OutputTranscriptBuilder<'a> {
+    pub(crate) fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
     pub fn new(
         scheme: SchemeId,
         input: InputCommitment,

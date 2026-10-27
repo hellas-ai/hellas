@@ -3,11 +3,13 @@
 pub mod artifacts;
 pub mod causal_lm;
 pub mod commitment;
+pub mod content;
 pub mod content_upload;
 pub mod digest;
 pub mod fetch_contract;
 pub use fetch_contract::{FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema};
 pub mod identity;
+pub mod invocation;
 pub mod job;
 pub mod manifest;
 pub mod open;
@@ -19,10 +21,11 @@ pub mod value;
 
 pub use causal_lm::{
     CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CausalLmEnvironment, CausalLmEnvironmentError,
-    CausalLmGenerationSchedule, ContentRef, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
-    MAX_CAUSAL_LM_STATIC_BYTES, StaticSlice,
+    CausalLmGenerationSchedule, MAX_CAUSAL_LM_ENVIRONMENT_BYTES, MAX_CAUSAL_LM_STATIC_BYTES,
+    StaticSlice,
 };
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
+pub use content::ContentRef;
 pub use digest::ContentId;
 pub use identity::{
     AppleAppAttestEnrollment, Decoder as DagCborDecoder, PlatformCredential, PlatformEnrollment,

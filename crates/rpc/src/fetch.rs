@@ -45,7 +45,7 @@ pub const MAX_FETCH_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum UTF-8 bytes in each signed Fetch route component (`service` and
 /// `method`).
-pub const MAX_FETCH_ROUTE_COMPONENT_BYTES: usize = 256;
+pub use crate::protocol::fetch_contract::MAX_FETCH_ROUTE_COMPONENT_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchInput {
@@ -67,6 +67,18 @@ pub struct FetchOutput {
 }
 
 impl FetchOutput {
+    pub(crate) fn from_authenticated_payloads(
+        producer_key: PublicKey,
+        event_payloads: Vec<Vec<u8>>,
+        terminal_payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            producer_key,
+            event_payloads,
+            terminal_payload,
+        }
+    }
+
     pub fn output_event_payloads(&self) -> (&[Vec<u8>], &[u8]) {
         (&self.event_payloads, &self.terminal_payload)
     }

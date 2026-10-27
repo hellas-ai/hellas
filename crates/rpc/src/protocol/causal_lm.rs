@@ -19,7 +19,7 @@
 //! Providers may reuse an exact-prefix checkpoint only if all mutable state is
 //! restored independently at the same capacity and chunk boundary.
 
-use crate::{Application, ContentId, DagCborEncoder, ProgramManifest};
+use crate::{Application, ContentId, ContentRef, DagCborEncoder, ProgramManifest};
 
 use super::value::{CanonicalDecodeError, CanonicalDecoder};
 
@@ -41,41 +41,6 @@ const MAX_STATES: usize = 8;
 const MAX_STATE_BYTES: u64 = 1 << 40;
 const MAX_VOCABULARY_SIZE: u64 = u32::MAX as u64 + 1;
 const MAXIMUM_CAPACITY: u64 = 8_388_608;
-
-/// An exact Xet-addressed content object and its expected byte length.
-///
-/// Acquisition must verify both before the object is compiled or lent to the
-/// persistent Catena runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContentRef {
-    id: ContentId,
-    bytes: u64,
-}
-
-impl ContentRef {
-    /// Names content together with the length its verified handle must expose.
-    #[must_use]
-    pub const fn new(id: ContentId, bytes: u64) -> Self {
-        Self { id, bytes }
-    }
-
-    #[must_use]
-    pub fn for_bytes(bytes: &[u8]) -> Self {
-        Self::new(ContentId::hash(bytes), bytes.len() as u64)
-    }
-
-    /// Returns the Xet content identifier.
-    #[must_use]
-    pub const fn id(self) -> ContentId {
-        self.id
-    }
-
-    /// Returns the exact expected object length.
-    #[must_use]
-    pub const fn bytes(self) -> u64 {
-        self.bytes
-    }
-}
 
 /// One ordered, read-only entry-point input borrowed from a static object.
 ///
@@ -403,10 +368,10 @@ impl CausalLmEnvironment {
             "prefill chunk must be in 1..=fixed_capacity",
         )?;
         invalid_if(
-            self.program.bytes == 0 || self.program.bytes > MAX_PROGRAM_BYTES,
+            self.program.bytes() == 0 || self.program.bytes() > MAX_PROGRAM_BYTES,
             format!(
                 "Catena program length must be in 1..={MAX_PROGRAM_BYTES} bytes, got {}",
-                self.program.bytes
+                self.program.bytes()
             ),
         )?;
         validate_entrypoint(&self.entrypoint)?;
@@ -434,14 +399,14 @@ impl CausalLmEnvironment {
 
         let mut static_bytes = 0_u64;
         for (index, object) in self.static_objects.iter().enumerate() {
-            invalid_if(object.bytes == 0, "static objects must not be empty")?;
+            invalid_if(object.bytes() == 0, "static objects must not be empty")?;
             invalid_if(
                 self.static_objects[..index]
                     .iter()
-                    .any(|previous| previous.id == object.id),
-                format!("static object {index} repeats content id {}", object.id),
+                    .any(|previous| previous.id() == object.id()),
+                format!("static object {index} repeats content id {}", object.id()),
             )?;
-            static_bytes = static_bytes.checked_add(object.bytes).ok_or_else(|| {
+            static_bytes = static_bytes.checked_add(object.bytes()).ok_or_else(|| {
                 CausalLmEnvironmentError::Invalid(
                     "aggregate static object length overflowed u64".to_string(),
                 )
@@ -476,10 +441,12 @@ impl CausalLmEnvironment {
                 ))
             })?;
             invalid_if(
-                end > object.bytes,
+                end > object.bytes(),
                 format!(
                     "static slice {index} range {}..{end} exceeds object {} ({} bytes)",
-                    slice.offset, slice.object, object.bytes
+                    slice.offset,
+                    slice.object,
+                    object.bytes()
                 ),
             )?;
             static_input_bytes = static_input_bytes.checked_add(slice.bytes).ok_or_else(|| {
@@ -567,8 +534,8 @@ fn validate_entrypoint(entrypoint: &str) -> Result<(), CausalLmEnvironmentError>
 
 fn encode_content_ref(encoder: &mut DagCborEncoder, content: ContentRef) {
     encoder.array(2);
-    encoder.bytes(content.id.as_bytes());
-    encoder.u64(content.bytes);
+    encoder.bytes(content.id().as_bytes());
+    encoder.u64(content.bytes());
 }
 
 fn decode_content_ref(
