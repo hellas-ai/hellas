@@ -45,7 +45,7 @@
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-max-generation-device-bytes"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-compile-timeout-secs"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-execution-timeout-secs"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--work-config"
+        ${package}/bin/hellas-cli serve --help | grep -F -- "--paid-work-config"
         ! ${package}/bin/hellas-cli serve --help | grep -F -- "--gfx"
         ${package}/bin/hellas-cli identity --help | grep -F -- "show-enrollment-id"
 

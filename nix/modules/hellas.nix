@@ -204,7 +204,8 @@ rec {
     "--gpu-max-generation-device-bytes"
     "--gpu-compile-timeout-secs"
     "--gpu-execution-timeout-secs"
-    "--work-config"
+    "--paid-work-config"
+    "--passkey"
     "--metrics-port"
     "--graffiti"
     "--fetch-config"
@@ -479,13 +480,17 @@ rec {
       workConfigFile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        example = "/var/lib/hellas/work.json";
+        example = "/var/lib/hellas/paid-work.toml";
         description = ''
-          Runtime chain pins, validator URLs, journal root and observation
-          bounds passed as --work-config. Paid policies live in the initialized
-          node authority and client routes are recorded in setup journals.
-          Keep the file and journal paths outside the Nix store.
+          Runtime TOML paid terms passed as --paid-work-config. The owner
+          selected by passkey approves exactly these terms at startup; paid
+          work is sold only with this file. Keep it outside the Nix store.
         '';
+      };
+      passkey = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Private software passkey of the provider's owner, passed as --passkey; required by workConfigFile unless extraArgs selects a faucet account.";
       };
       fetchConfigFile = mkOption {
         type = types.nullOr runtimePath;
@@ -860,7 +865,8 @@ rec {
     ++ optArg "--gpu-max-generation-device-bytes" serve.gpuMaxGenerationDeviceBytes
     ++ optArg "--gpu-compile-timeout-secs" serve.gpuCompileTimeoutSeconds
     ++ optArg "--gpu-execution-timeout-secs" serve.gpuExecutionTimeoutSeconds
-    ++ optArg "--work-config" serve.workConfigFile
+    ++ optArg "--paid-work-config" serve.workConfigFile
+    ++ optArg "--passkey" serve.passkey
     ++ optArg "--metrics-port" serve.metricsPort
     ++ [
       "--assurance"
