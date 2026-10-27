@@ -87,6 +87,7 @@ impl WorkBackend for CpuEvaluate {
 /// Only arithmetic execution is a double. Setup, Work, journals, clocks and
 /// owner signatures use the native services and the six-validator chain.
 struct Provider {
+    enrollment: hellas_rpc::ProviderEnrollmentBundle,
     node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
@@ -155,8 +156,9 @@ impl Provider {
         config: WorkConfig,
         node: hellas_sdk::FullNode,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        identity: NodeIdentity,
     ) -> impl std::future::Future<Output = Self> + 'a {
-        Box::pin(Self::start_inner(root, config, node, calls))
+        Box::pin(Self::start_inner(root, config, node, calls, identity))
     }
 
     async fn start_inner(
@@ -164,11 +166,13 @@ impl Provider {
         config: WorkConfig,
         node: hellas_sdk::FullNode,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        identity: NodeIdentity,
     ) -> Self {
+        let enrollment = provider_enrollment(&identity);
         let store = NodeStore::open(
             &root.join("authority"),
             hellas_work::model::grant::grant_network(),
-            Some(provider_enrollment()),
+            Some(enrollment.clone()),
             UnixMillis(1),
         )
         .await
@@ -177,7 +181,7 @@ impl Provider {
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
         let grants = hellas_work::grant_service::GrantService::from_node(
             authority.clone(),
-            &provider_enrollment(),
+            &enrollment,
             key.clone(),
             hellas_work::test_support::common_node::NoBackend,
             vec![],
@@ -191,7 +195,7 @@ impl Provider {
         )
         .unwrap();
         let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(provider_identity().transport_key())
+            .secret_key(identity.transport_key())
             .alpns(vec![
                 WorkSetup::ALPN.as_bytes().to_vec(),
                 hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
@@ -220,7 +224,7 @@ impl Provider {
         .on_node(
             node.clone(),
             authority,
-            provider_enrollment(),
+            enrollment.clone(),
             endpoint
                 .bound_sockets()
                 .iter()
@@ -238,7 +242,7 @@ impl Provider {
         };
         let router = WorkRouter::payment(work);
         let open = Arc::new(
-            hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, provider_enrollment(), None)
+            hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, enrollment.clone(), None)
                 .unwrap(),
         );
         let server = endpoint.clone();
@@ -284,6 +288,7 @@ impl Provider {
             }
         });
         Self {
+            enrollment,
             node,
             funded_height,
             unavailable,
@@ -376,7 +381,7 @@ async fn request(
     let genesis = if mutation == Some("provider") {
         ContentId::from_bytes([7; 32])
     } else {
-        provider_enrollment().content_id()
+        provider.enrollment.content_id()
     };
     let hash = request_digest(signed_network, genesis, &request, &exporter);
     request.signature = key
@@ -628,6 +633,7 @@ pub(super) fn exercise(
 }
 
 struct Case {
+    identity: NodeIdentity,
     root: tempfile::TempDir,
     devnet: Devnet,
     chain: RemoteLightClient,
@@ -652,6 +658,7 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
 }
 
 async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
+    let identity = provider_identity();
     let root = tempfile::tempdir().unwrap();
     let owners = [
         GenesisOwner {
@@ -865,7 +872,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
         &root.path().join("authority"),
         hellas_work::model::grant::grant_network(),
-        Some(provider_enrollment()),
+        Some(provider_enrollment(&identity)),
         UnixMillis(1),
     )
     .await
@@ -878,9 +885,10 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
-    let endpoint = bind_paid_endpoint(iroh::SecretKey::from_bytes(&[0x43; 32]))
+    let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
     refused(
@@ -1048,6 +1056,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     let first = granted(
@@ -1119,7 +1128,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first.encode().unwrap()
     );
     assert_eq!(files(&config.journal_root), before);
-    let other_peer = bind_paid_endpoint(iroh::SecretKey::from_bytes(&[0x44; 32]))
+    let other_peer = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
     assert_eq!(
@@ -1302,6 +1311,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     assert_eq!(
@@ -1334,6 +1344,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first.encode().unwrap()
     );
     Box::new(Case {
+        identity,
         root,
         devnet,
         chain,
@@ -1355,6 +1366,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
 
 async fn finish(case: Box<Case>) {
     let Case {
+        identity,
         root,
         mut devnet,
         chain,
@@ -1508,6 +1520,7 @@ async fn finish(case: Box<Case>) {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     policy.offers.max_stake_per_client = 11;

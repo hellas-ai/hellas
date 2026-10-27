@@ -85,18 +85,18 @@ fn client_settlement() -> Secp256k1Signer {
 }
 
 fn provider_identity() -> NodeIdentity {
-    NodeIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap()
+    NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [2; 32]).unwrap()
 }
 
 fn provider_settlement() -> Secp256k1Signer {
-    Secp256k1Signer::from_secret_scalar(provider_identity().node_secret_bytes()).unwrap()
+    Secp256k1Signer::from_secret_scalar([2; 32]).unwrap()
 }
 
-fn provider_enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
+fn provider_enrollment(identity: &NodeIdentity) -> hellas_rpc::ProviderEnrollmentBundle {
     enrollment(
         &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(),
         &ProducerSigningKey::from_secret_bytes([2; 32]).unwrap(),
-        *provider_identity().transport_key().public().as_bytes(),
+        *identity.transport_key().public().as_bytes(),
         [3; 32],
     )
 }
@@ -165,13 +165,14 @@ async fn start_provider(
     root: &std::path::Path,
     config: WorkConfig,
     node: hellas_sdk::FullNode,
+    identity: &NodeIdentity,
 ) -> (hellas_sdk::ProviderHandle, MockFetchProvider) {
     let (routes, upstream) = routes();
     let provider = start_fetch_provider(
         FetchProviderOptions {
             port: Some(0),
-            identity: provider_identity(),
-            enrollment: provider_enrollment(),
+            identity: identity.clone(),
+            enrollment: provider_enrollment(identity),
             root: Arc::new(SoftwareRoot),
             state_directory: root.join("provider-state"),
             grants: Some(hellas_sdk::GrantProviderOptions {
@@ -426,7 +427,8 @@ async fn check_gateway_quote(
             providers: vec![args],
             max_pending_requests: 1,
         },
-        NodeIdentity::from_secret_bytes([0x45; 32], [0x21; 32]).unwrap(),
+        NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
+            .unwrap(),
         owner,
     )
     .await
@@ -466,6 +468,7 @@ fn setup_reports_a_typed_error_if_remote_proofs_stay_unavailable() {
 }
 
 struct PaidScenario {
+    identity: NodeIdentity,
     root: tempfile::TempDir,
     devnet: Devnet,
     provider_node: hellas_sdk::FullNode,
@@ -498,6 +501,7 @@ async fn paid_setup(
     never_catches_up: bool,
 ) -> Option<PaidScenario> {
     let root = tempfile::tempdir().unwrap();
+    let identity = provider_identity();
     let now = UnixMillis(1);
     // The genesis owners are the actors whose passkeys own the two
     // node authorities.
@@ -541,7 +545,7 @@ async fn paid_setup(
     let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
         &root.path().join("provider-state/grants"),
         hellas_work::model::grant::grant_network(),
-        Some(provider_enrollment()),
+        Some(provider_enrollment(&identity)),
         now,
     )
     .await
@@ -549,7 +553,13 @@ async fn paid_setup(
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let mut relays = remote::Relays::start(&devnet).await;
-    let (provider, _) = start_provider(root.path(), config.clone(), provider_node.clone()).await;
+    let (provider, _) = start_provider(
+        root.path(),
+        config.clone(),
+        provider_node.clone(),
+        &identity,
+    )
+    .await;
     let authority = provider.administration().unwrap().node();
     let caller = hellas_work::test_support::session(&authority, &secret).await;
     let command = || hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
@@ -601,7 +611,7 @@ async fn paid_setup(
         ))
     ));
     drop(authority);
-    let client_transport = iroh::SecretKey::from_bytes(&[0x41; 32]);
+    let client_transport = iroh::SecretKey::generate();
     let provider_addrs = addresses(&provider);
 
     // The client: one job, paid, then settled.
@@ -731,6 +741,7 @@ async fn paid_setup(
     assert!(!client_home.join("chain").exists());
     assert!(!root.path().join("client-authority").exists());
     Some(PaidScenario {
+        identity,
         root,
         devnet,
         provider_node,
@@ -751,6 +762,7 @@ async fn paid_setup(
 async fn paid_finish(case: PaidScenario) {
     eprintln!("H4 setup complete; checking transport recovery");
     let PaidScenario {
+        identity,
         root,
         mut devnet,
         provider_node,
@@ -814,8 +826,13 @@ async fn paid_finish(case: PaidScenario) {
     endpoint.close().await;
 
     provider.shutdown().await.unwrap();
-    let (provider, upstream) =
-        start_provider(root.path(), options.config.clone(), provider_node).await;
+    let (provider, upstream) = start_provider(
+        root.path(),
+        options.config.clone(),
+        provider_node,
+        &identity,
+    )
+    .await;
     assert_eq!(
         provider
             .administration()
