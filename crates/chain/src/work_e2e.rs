@@ -137,14 +137,14 @@ impl Allocations {
     fn client_owner(&self) -> GenesisOwner {
         GenesisOwner {
             kind: self.owners,
-            seed: 0x31,
+            secret_scalar: [0x31; 32],
             balance: CLIENT_FUNDING,
         }
     }
     fn provider_owner(&self) -> GenesisOwner {
         GenesisOwner {
             kind: self.owners,
-            seed: 0x32,
+            secret_scalar: [0x32; 32],
             balance: PROVIDER_STAKE,
         }
     }
