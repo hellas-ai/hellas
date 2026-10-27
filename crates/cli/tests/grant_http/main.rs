@@ -54,8 +54,13 @@ impl Https {
             while let Ok((socket, _)) = listener.accept().await {
                 let (acceptor, count, release) = (acceptor.clone(), count.clone(), release.clone());
                 tokio::spawn(async move {
-                    let Ok(mut socket) = acceptor.accept(socket).await else {
-                        return;
+                    let address = socket.local_addr();
+                    let mut socket = match acceptor.accept(socket).await {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            eprintln!("upstream TLS handshake at {address:?} failed: {error:?}");
+                            return;
+                        }
                     };
                     let mut headers = vec![];
                     while !headers.ends_with(b"\r\n\r\n") && headers.len() < 32768 {
