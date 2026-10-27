@@ -232,12 +232,8 @@ impl ExecutorHandle {
                         let (program, mut worker) = match loaded {
                             Ok(loaded) => loaded,
                             Err(error) => {
-                                if error
-                                    .downcast_ref::<catena::validate::InvalidPlan>()
-                                    .is_some()
-                                {
-                                    return Err(error);
-                                }
+                                // Accepted work owes B a signed terminal, an
+                                // invalid plan included: B retires it unpaid.
                                 tracing::warn!(%error, "compute preparation failed");
                                 let reason = if control.is_cancelled() {
                                     FailureReason::Cancelled

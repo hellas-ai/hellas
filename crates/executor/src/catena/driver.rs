@@ -359,9 +359,6 @@ pub(crate) fn execute_signed_in(
             if let Some(error) = publish_error {
                 return Err(error);
             }
-            if error.downcast_ref::<validate::InvalidPlan>().is_some() {
-                return Err(error);
-            }
             let reason = match error.downcast_ref::<Interruption>() {
                 Some(Interruption::Cancelled) => FailureReason::Cancelled,
                 Some(Interruption::TimedOut) => FailureReason::ExecutionTimeout,

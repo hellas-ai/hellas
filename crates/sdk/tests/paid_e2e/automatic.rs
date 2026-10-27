@@ -103,14 +103,28 @@ impl WorkBackend for HostCompute {
         let state = self.0.clone();
         tokio::task::spawn_blocking(move || -> Result<_, String> {
             let dialect = hellas_executor::GpuDialect::Hip;
-            let program = BoundProgram::compile(
+            let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
+            // As the executor does: a preparation failure, an invalid plan
+            // included, is a signed Failed terminal.
+            let program = match BoundProgram::compile(
                 &content,
                 &prepared,
                 &limits,
                 &std::env::current_exe().unwrap(),
                 dialect,
-            )
-            .map_err(|e| e.to_string())?;
+            ) {
+                Ok(program) => program,
+                Err(_) => {
+                    return invocation::output::OutputStream::new(
+                        &prepared.request,
+                        &key,
+                        invocation::MAX_INVOCATION_BYTES,
+                    )
+                    .and_then(|stream| stream.fail(invocation::output::FailureReason::Compilation))
+                    .map(|(_, events)| events)
+                    .map_err(|e| e.to_string());
+                }
+            };
             driver::execute_signed(
                 &mut HostScalarDevice::new(state),
                 &program,
@@ -118,7 +132,7 @@ impl WorkBackend for HostCompute {
                 &limits,
                 &Assets::new(0, dialect),
                 &content,
-                &ProducerSigningKey::from_secret_bytes([2; 32]).unwrap(),
+                &key,
                 |_| Ok(()),
             )
             .map(|(_, events)| events)
@@ -796,6 +810,24 @@ async fn compute_and_settle(
     assert!(!compute.have(source));
     assert_eq!(staged(&options.config.journal_root), 0);
     assert_eq!(compute.calls(), 1);
+    assert_eq!(credited(&session).await, JOB_PRICE);
+
+    // 8b: a mistyped argument fails validation after acceptance. A signs the
+    // Failed terminal, nothing is loaded, and B retires the job unpaid.
+    let (job, _) = compute_job(&increment(k ^ 3), increment_plan(Arg::U32(41)));
+    let Err(error) = transact(&mut session, &job, &client_key, None).await else {
+        panic!("a mistyped argument produced a payable result");
+    };
+    assert!(
+        matches!(
+            error,
+            hellas_sdk::transact::TransactError::Client(
+                hellas_sdk::paid_client::PaidClientError::InvocationFailed { .. }
+            )
+        ),
+        "{error}"
+    );
+    assert_eq!((compute.calls(), compute.loads()), (2, 1));
     assert_eq!(credited(&session).await, JOB_PRICE);
 
     // 8d: a counter streams one signed event per step and stops on its match.
@@ -1823,7 +1855,7 @@ async fn finish(case: Box<Case>) {
         &first,
     ))
     .await;
-    assert_eq!(compute.calls(), 3);
+    assert_eq!(compute.calls(), 4);
     assert_eq!(
         holdings(&devnet, owners[1].key())
             .await
