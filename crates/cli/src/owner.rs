@@ -33,8 +33,8 @@ impl OwnerArgs {
         Ok(PathBuf::from(path))
     }
 
-    /// Keep the selected public owner with this provider across restarts.
-    pub(crate) fn load_provider(
+    /// Keep the selected public owner with this identity across restarts.
+    pub(crate) fn load_persistent(
         &self,
         identity: Option<&std::path::Path>,
     ) -> anyhow::Result<Option<SoftPasskey>> {

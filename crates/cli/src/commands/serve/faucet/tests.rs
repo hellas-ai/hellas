@@ -1,7 +1,6 @@
 use super::*;
 use clap::Parser as _;
 use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, run};
-use hellas_kernel::{Funding, List};
 use hellas_sdk::{
     paid_client::*,
     work_config::{ChainCrossCheck, WorkConfig},
@@ -99,7 +98,7 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet"]).unwrap();
     let owner = cli
         .owner
-        .load_provider(Some(&identity_path))
+        .load_persistent(Some(&identity_path))
         .unwrap()
         .unwrap();
     let faucet_root = crate::owner::OwnerArgs::provider_root(Some(&identity_path)).unwrap();
@@ -173,52 +172,14 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
 
     // The requester uses an independent published owner and settlement key.
     let client_key = Secp256k1Signer::from_secret_scalar([0x21; 32]).unwrap();
-    let chain = node.view().unwrap().client();
-    let inputs = devnet.coins(0, requester.key(), []).await;
-    let input = inputs[0].0;
-    let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
-        &chain,
-        devnet.network(),
-        requester.key().into_kernel(),
-        &[input],
-        Some(client_key.party_key()),
-        Some(401),
-    )
-    .await
-    .unwrap();
-    let funding_coin = plan.output_ids().as_slice()[0];
-    chain
-        .submit_tx(Transaction::Kernel(
-            plan.clone()
-                .authorize(requester.authorize(plan.payload_hash()))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-    devnet.seal().await;
     let client_root = root.path().join("client");
-    let client_owner = SoftPasskey::from_secret_scalar(requester.secret_scalar).unwrap();
-    let client_startup =
-        Startup::new(client_root.clone(), client_owner, PolicyArgs::default()).unwrap();
-    client_startup
-        .prepare(
-            &hellas_sdk::grant_config::GrantConfig::unconfigured(&client_root),
-            &identity.enrollment,
-            &identity.node_key,
+    let client_owner = Arc::new(
+        hellas_sdk::client_owner::ClientOwner::new(
+            Arc::new(SoftPasskey::from_secret_scalar(requester.secret_scalar).unwrap()),
+            client_key.party_key(),
+            &client_root.join("funding"),
         )
-        .await
-        .unwrap();
-    let client_store = NodeStore::open(
-        &client_root.join("provider"),
-        hellas_work::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
-        UnixMillis::now().unwrap(),
-    )
-    .await
-    .unwrap();
-    let client_authority = hellas_work::node::NodeCoordinator::new(
-        client_store,
-        Arc::new(|| UnixMillis::now().unwrap()),
+        .unwrap(),
     );
     let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
@@ -240,33 +201,18 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
         expected_price: 20,
-        payment_funding: Funding::new(
-            hellas_sdk::work_config::coin_list(&[funding_coin]).unwrap(),
-            List::empty(CoinId::from_bytes([0; 32])),
-        ),
         acceptance_blocks: 16,
         terminal_blocks: 64,
         payment_blocks: 32,
         timeout: hellas_chain::node::RECOVERY_TIMEOUT,
     };
-    let quote = request_paid_quote(
-        &options,
-        &endpoint,
-        &client_key,
-        crate::commands::contributions::principal(&client_startup.owner).unwrap(),
-    )
-    .await
-    .unwrap();
+    let quote = request_paid_quote(&options, &endpoint, &client_key, client_owner.principal())
+        .await
+        .unwrap();
     assert_eq!(quote.funding_value, 401);
     let mut session = sealing(
         &mut devnet,
-        PaidWorkSession::open(
-            options,
-            endpoint.clone(),
-            client_key.clone(),
-            node.clone(),
-            client_authority,
-        ),
+        PaidWorkSession::open(options, endpoint.clone(), client_key.clone(), client_owner),
     )
     .await
     .unwrap();
@@ -293,7 +239,7 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
     let resumed_cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet"]).unwrap();
     let resumed_owner = resumed_cli
         .owner
-        .load_provider(Some(&identity_path))
+        .load_persistent(Some(&identity_path))
         .unwrap()
         .unwrap();
     assert_eq!(resumed_owner.party_key(), startup.owner.party_key());
@@ -326,6 +272,7 @@ async fn allocate_case(runtime: commonware_runtime::tokio::Context) -> Box<Case>
         "restart cannot delegate change or replace consumed bond principal"
     );
 
+    let chain = node.view().unwrap().client();
     Box::new(Case {
         root,
         faucet_root,
@@ -702,18 +649,18 @@ fn embedded_defaults_validate_without_rpc_and_reject_identity_reselection() {
     );
     let identity = root.path().join("identity");
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let first = cli.owner.load_provider(Some(&identity)).unwrap().unwrap();
+    let first = cli.owner.load_persistent(Some(&identity)).unwrap().unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet"]).unwrap();
     assert_eq!(
         cli.owner
-            .load_provider(Some(&identity))
+            .load_persistent(Some(&identity))
             .unwrap()
             .unwrap()
             .party_key(),
         first.party_key()
     );
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "8"]).unwrap();
-    assert!(cli.owner.load_provider(Some(&identity)).is_err());
+    assert!(cli.owner.load_persistent(Some(&identity)).is_err());
     for args in [
         vec!["hellas", "serve", "--faucet", "--paid-price", "0"],
         vec![

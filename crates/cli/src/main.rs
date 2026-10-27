@@ -38,22 +38,8 @@ fn validate_serve_assurance(
     }
 }
 
-/// Loads the identity this command runs under, creating one only where
-/// creating one is what the operator asked for.
-///
-/// Identity queries read the file and create nothing as a side effect: doing
-/// so could race with a running service's own creator. Paid-work commands also read
-/// an existing identity: providers, the operator client, and
-/// gateways configured with a paid provider pool. They sign with the stored
-/// identity's key, so the key must be one an operator already made —
-/// `identity init` is where it comes from. Minting one here would give
-/// the node a settlement party nobody has funded and no bond names, and
-/// the first symptom would be a channel that cannot be opened.
-///
-/// # Errors
-///
-/// Whatever the identity file's own loader says, which names the file it
-/// could not read.
+/// Read-only queries and existing authorities keep their identity requirement.
+/// A requester creates local keys before its first owner-approved channel funding.
 fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
@@ -63,11 +49,7 @@ fn load_command_identity(
         Commands::Serve {
             work_config_file: Some(_),
             ..
-        } | Commands::PaidWork { .. }
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
+        }
     );
     let grant_identity = matches!(
         command,
@@ -390,8 +372,6 @@ enum Commands {
         /// Pay a pool of providers using durable on-chain funded work channels.
         #[arg(long = "paid-work-config", value_name = "FILE")]
         paid_work_config: Option<PathBuf>,
-        #[command(flatten)]
-        chain_node: commands::chain_node::ChainNodeArgs,
         /// Private profile selecting the local HTTP authority and scoped credential.
         #[arg(long = "gateway-profile", value_name = "FILE")]
         gateway_profile: Option<PathBuf>,
@@ -579,11 +559,6 @@ fn validate_identity_options(
                 work_config_file: Some(_),
                 ..
             }
-            | Commands::PaidWork { .. }
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
     );
     if software_root && reads_existing_identity {
         return Err(
@@ -691,8 +666,17 @@ async fn async_main() {
             eprintln!("error: {error:#}");
             std::process::exit(1)
         });
-    let owner = match if faucet_provider {
-        cli.owner.load_provider(cli.identity.as_deref())
+    let faucet_requester = cli.owner.is_faucet()
+        && matches!(
+            &cli.command,
+            Commands::PaidWork { .. }
+                | Commands::Gateway {
+                    paid_work_config: Some(_),
+                    ..
+                }
+        );
+    let owner = match if faucet_provider || faucet_requester {
+        cli.owner.load_persistent(cli.identity.as_deref())
     } else {
         cli.owner.load()
     } {
@@ -954,7 +938,6 @@ async fn async_main() {
             archive_dir,
             zdr,
             paid_work_config,
-            chain_node,
             gateway_profile,
             allow_remote,
             chat_template,
@@ -1077,19 +1060,20 @@ async fn async_main() {
                         "token-native paid work uses producer-signed assurance");
                     Some(hellas_sdk::paid_gateway::load_pool_options(path, assurance)?)
                 } else { None };
-                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: _ } = hellas_sdk::node_control::profile::GatewayProfile::load(
                     gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
                 ).await?;
-                let mut chain_shutdown = None;
                 let paid_work = if let Some(options) = paid_options {
-                    let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
-                    chain_shutdown = Some(node.clone());
+                    let passkey = owner.clone().ok_or_else(|| anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account"))?;
+                    let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
+                        std::sync::Arc::new(passkey), identity::settlement_signer(&local_identity)?.party_key(),
+                        &identity::funding_root(cli.identity.as_deref())?,
+                    )?);
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
                             options,
                             hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
-                            node,
-                            authority,
+                            payer,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
@@ -1175,9 +1159,6 @@ async fn async_main() {
                 if let Some(backend) = shutdown {
                     result = result.and(backend.drain().await.map_err(anyhow::Error::from));
                 }
-                if let Some(node) = chain_shutdown {
-                    result = result.and(node.shutdown().await.map_err(anyhow::Error::from));
-                }
                 result
             }
             .await
@@ -1193,7 +1174,8 @@ async fn async_main() {
                     secret_key,
                     settlement_key,
                     local_identity.node_key.clone(),
-                    passkey.map(commands::contributions::principal).transpose()?,
+                    owner.clone(),
+                    identity::funding_root(cli.identity.as_deref())?,
                 )
                 .await
             }.await,

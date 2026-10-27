@@ -5,18 +5,15 @@ use hellas_wire::peers::PeerId;
 #[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
-        grant_config: "grant.json".into(),
-        chain_node: Default::default(),
         trust_store: Some("trust".into()),
         trust_policy: Some("provider".into()),
         validators: vec![],
-        trust: "chain-trust.json".into(),
+        trust: Some("chain-trust.json".into()),
         genesis: None,
         payment: 10,
         journal_root: "journal".into(),
         provider: SecretKey::generate().public(),
         provider_addrs: Vec::new(),
-        payment_coins: vec![hex::encode([2_u8; 32])],
         prepared_input: "input.bin".into(),
         output: None,
         acceptance_blocks: 4,
@@ -35,18 +32,79 @@ fn relative_deadlines_are_ordered_from_the_current_cursor() {
     );
 }
 
-#[test]
-fn payment_coin_parser_refuses_the_fifth_coin() {
-    let values = (0..=MAX_PARTY_INPUTS)
-        .map(|byte| hex::encode([byte as u8; 32]))
-        .collect::<Vec<_>>();
-    assert!(coins(&values).is_err());
+#[tokio::test]
+async fn requester_defaults_need_no_node_options_or_prefunded_coins() {
+    use clap::Parser as _;
+    let root = tempfile::tempdir().unwrap();
+    let provider = SecretKey::generate().public().to_string();
+    let args = [
+        "hellas",
+        "paid-work",
+        "run",
+        "--provider",
+        &provider,
+        "--payment",
+        "10",
+        "--journal-root",
+        root.path().to_str().unwrap(),
+        "--prepared-input",
+        "job.bin",
+    ];
+    let cli = crate::Cli::try_parse_from(args).unwrap();
+    let path = root.path().join("identity");
+    let first = crate::load_command_identity(&cli.command, Some(&path)).unwrap();
+    assert!(
+        path.is_file(),
+        "requester creates its identity on first use"
+    );
+    let reopened = crate::load_command_identity(&cli.command, Some(&path)).unwrap();
+    assert_eq!(
+        first.transport_key.public(),
+        reopened.transport_key.public()
+    );
+    assert_eq!(
+        crate::identity::settlement_signer(&first)
+            .unwrap()
+            .party_key(),
+        crate::identity::settlement_signer(&reopened)
+            .unwrap()
+            .party_key()
+    );
+    let crate::Commands::PaidWork {
+        command: PaidWorkCommand::Run(args),
+    } = cli.command
+    else {
+        panic!("requester command")
+    };
+    let config = client_config(&args).await.unwrap();
+    assert_eq!(config.validators.len(), 6);
+    assert_eq!(config.chain.network.as_str(), "hellas-devnet-1");
+    for removed in ["--payment-coin", "--grant-config", "--chain-storage-dir"] {
+        assert!(
+            crate::Cli::try_parse_from(args_for_removed(&provider, root.path(), removed)).is_err()
+        );
+    }
 }
 
-#[test]
-fn fixed_hex_names_wrong_widths() {
-    let error = fixed_hex::<32>("--bond", "00").unwrap_err().to_string();
-    assert!(error.contains("1 bytes; expected 32"), "{error}");
+fn args_for_removed(provider: &str, root: &std::path::Path, removed: &str) -> Vec<String> {
+    [
+        "hellas",
+        "paid-work",
+        "run",
+        "--provider",
+        provider,
+        "--payment",
+        "10",
+        "--journal-root",
+        root.to_str().unwrap(),
+        "--prepared-input",
+        "job.bin",
+        removed,
+        "unused",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 #[test]

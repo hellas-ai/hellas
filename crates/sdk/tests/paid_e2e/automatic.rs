@@ -112,6 +112,14 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
     {
         if !request.funding_coins.is_empty() {
+            if self.funded_height.load(std::sync::atomic::Ordering::SeqCst) == u64::MAX {
+                self.unavailable
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(WireStatus::new(
+                    hellas_wire::WireCode::Unavailable,
+                    "held funded-offer read",
+                ));
+            }
             let height = self
                 .funded_height
                 .swap(0, std::sync::atomic::Ordering::SeqCst);
@@ -456,8 +464,35 @@ async fn evaluate_and_settle(
     provider: &Provider,
     original: &SignedPaidOffer,
 ) {
-    let authority = client_authority(&root.join("client-authority"), UnixMillis(1)).await;
-    let client_node = devnet.full_node(1).clone();
+    let owner = Arc::new(
+        hellas_sdk::client_owner::ClientOwner::new(
+            Arc::new(FRIEND.passkey()),
+            key.party_key(),
+            &root.join("client-funding"),
+        )
+        .unwrap(),
+    );
+    let store = SetupStore::open(
+        &options.journal_root,
+        devnet.network(),
+        original.offer().proposal.bond_edge(),
+        Role::Client,
+        &hellas_kernel::Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    let mut setup = hellas_work::work_handshake::SetupEndpoint::new(
+        store,
+        key.clone(),
+        hellas_work::work_handshake::PaymentAdmission::Proposes(Box::new(
+            original.offer().policy.clone(),
+        )),
+    );
+    setup
+        .import_offer(*options.provider.as_bytes(), original.clone())
+        .await
+        .unwrap();
+    drop(setup);
     let coin = original
         .offer()
         .payment_funding
@@ -502,22 +537,32 @@ async fn evaluate_and_settle(
     let attempts = provider
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
+    let error = request(
+        endpoint,
+        provider,
+        devnet.network(),
+        FRIEND,
+        key,
+        &[coin],
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), hellas_wire::WireCode::Unavailable);
+    assert!(
+        provider
+            .unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > attempts
+    );
+    devnet.seal().await;
     let open = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
         key.clone(),
-        client_node.clone(),
-        authority.clone(),
+        owner.clone(),
     );
     tokio::pin!(open);
-    tokio::time::timeout(options.timeout, async {
-        tokio::select! {
-            result = &mut open => panic!("setup ended before provider recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-            () = async {
-                while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; }
-            } => {},
-        }
-    }).await.expect("the same funded offer request retries while the provider is behind");
     let mut session = sealing_while(devnet, Duration::from_millis(100), &mut open)
         .await
         .unwrap();
@@ -548,15 +593,9 @@ async fn evaluate_and_settle(
     // race. Reopen from journals on that stable tip before testing payment.
     session.shutdown().await;
     drop(session);
-    let mut session = PaidWorkSession::open(
-        options,
-        endpoint.clone(),
-        key.clone(),
-        client_node,
-        authority,
-    )
-    .await
-    .unwrap();
+    let mut session = PaidWorkSession::open(options, endpoint.clone(), key.clone(), owner)
+        .await
+        .unwrap();
     assert_eq!(
         session.descriptor().bond_edge(),
         original.offer().proposal.bond_edge()
@@ -651,14 +690,15 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         DevnetConfig {
             name: "sdk_automatic_offers",
             owners: owners.to_vec(),
-            full_nodes: 2,
+            full_nodes: 1,
         },
     )
     .await;
     devnet.seal().await;
     let chain = RemoteLightClient::connect(devnet.light_client_url(0))
         .await
-        .unwrap();
+        .unwrap()
+        .with_consensus_verifier(devnet.consensus_verifier());
     let mut payment_coins = Vec::new();
     let mut alternate_funding = Vec::new();
     let mut short_funding = None;
@@ -1340,7 +1380,6 @@ async fn finish(case: Box<Case>) {
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
         expected_price: JOB_PRICE,
-        payment_funding: first.offer().payment_funding.clone(),
         acceptance_blocks: 16,
         terminal_blocks: 64,
         payment_blocks: 32,
@@ -1492,23 +1531,32 @@ async fn finish(case: Box<Case>) {
     let mut fresh_args = options;
     fresh_args.journal_root = interrupted_root;
     fresh_args.provider_addrs = provider.endpoint.bound_sockets();
-    fresh_args.payment_funding = third.offer().payment_funding.clone();
-    let agent_authority =
-        client_authority_for(&root.path().join("agent-authority"), UnixMillis(1), AGENT).await;
-    let client_node = devnet.full_node(1).clone();
-    let mut fresh = sealing_while(
-        &mut devnet,
-        Duration::from_millis(100),
-        PaidWorkSession::open(
-            fresh_args,
-            endpoint.clone(),
-            keys[3].clone(),
-            client_node,
-            agent_authority,
-        ),
-    )
-    .await
-    .unwrap();
+    let agent_owner = Arc::new(
+        hellas_sdk::client_owner::ClientOwner::new(
+            Arc::new(AGENT.passkey()),
+            keys[3].party_key(),
+            &root.path().join("agent-funding"),
+        )
+        .unwrap(),
+    );
+    provider
+        .funded_height
+        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    let attempts = provider
+        .unavailable
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let open = PaidWorkSession::open(fresh_args, endpoint.clone(), keys[3].clone(), agent_owner);
+    let mut fresh = sealing_while(&mut devnet, Duration::from_millis(100), async {
+        tokio::pin!(open);
+        tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, async {
+            tokio::select! {
+                result = &mut open => panic!("session ended before funded offer recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+                () = async { while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
+            }
+        }).await.expect("one session retries its funded offer while the provider source is unavailable");
+        provider.funded_height.store(0, std::sync::atomic::Ordering::SeqCst);
+        open.await
+    }).await.unwrap();
     assert_ne!(
         fresh.descriptor().bond_edge(),
         third.offer().proposal.bond_edge(),

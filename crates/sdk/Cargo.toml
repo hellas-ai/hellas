@@ -15,6 +15,7 @@ hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "full-node",
+    "proof-verify",
     "work-watcher",
 ] }
 hellas-client = { workspace = true, features = ["iroh", "work"] }
@@ -81,4 +82,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
 ] }
+tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true

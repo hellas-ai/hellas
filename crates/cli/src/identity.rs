@@ -111,35 +111,18 @@ pub(crate) fn default_grant_data_path() -> anyhow::Result<PathBuf> {
     default_hellas_path("grants", "HELLAS_GRANT_DATA_DIR")
 }
 
-/// Open the authority already selected by the node's existing grant configuration.
-/// A running host retains the exclusive writer; this never creates an authority.
-pub(crate) async fn open_authority(
-    config: &Path,
-    principal: Option<hellas_auth::authority::PrincipalId>,
-) -> anyhow::Result<hellas_work::node::NodeCoordinator> {
-    let root = principal
-        .map(|owner| crate::commands::contributions::data_root(&owner))
-        .transpose()?;
-    let config = hellas_sdk::grant_config::GrantConfig::load(config, root.as_deref())?;
-    let store = hellas_work::work_store::grant::NodeStore::open(
-        &config.journal_root,
-        hellas_work::model::grant::grant_network(),
-        None,
-        hellas_auth::authority::UnixMillis::now()?,
-    )
-    .await
-    .with_context(|| format!(
-        "open existing node authority at {}; bootstrap it explicitly before paid work, and stop any host holding its writer",
-        config.journal_root.display(),
-    ))?;
-    Ok(hellas_work::node::NodeCoordinator::new(
-        store,
-        Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-    ))
-}
-
 pub(crate) fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
+}
+
+pub(crate) fn funding_root(identity: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let mut path = identity
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(default_path)?
+        .into_os_string();
+    path.push(".funding");
+    Ok(PathBuf::from(path))
 }
 
 pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {

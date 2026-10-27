@@ -123,40 +123,7 @@ pub(super) fn default_policy(args: &PolicyArgs) -> CliResult<PaidPolicy> {
 }
 
 pub(crate) fn chain_defaults(root: &Path) -> CliResult<WorkConfig> {
-    use hellas_chain::genesis::*;
-    let trust: TrustDocument = serde_json::from_str(HELLAS_DEVNET_1_TRUST_JSON)?;
-    hellas_chain::proof_verify::ProofVerifier::with_genesis(
-        trust.clone(),
-        HELLAS_DEVNET_1_JSON.as_bytes(),
-    )?;
-    let [epoch] = trust.epochs.as_slice() else {
-        anyhow::bail!("embedded devnet trust must have one initial epoch");
-    };
-    ensure!(
-        epoch.epoch == 0 && epoch.start_height == 0 && epoch.end_height.is_none(),
-        "embedded devnet epoch differs from its genesis"
-    );
-    WorkConfig {
-        chain: hellas_sdk::work_config::ChainCrossCheck {
-            network: hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID)
-                .context("embedded devnet network")?,
-            genesis_payload_digest: Digest::from_bytes(
-                hex::decode(HELLAS_DEVNET_1_GENESIS_PAYLOAD.trim())?
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("embedded genesis payload length"))?,
-            ),
-            threshold_identity: hex::decode(&epoch.threshold_identity)?,
-            genesis: None,
-        },
-        validators: (0..6)
-            .map(|index| format!("wss://devnet.hellas.ai/ws/validator-{index}"))
-            .collect(),
-        journal_root: root.join("channels"),
-        poll: Duration::from_millis(500),
-        max_observation_age: hellas_chain::node::RECOVERY_TIMEOUT,
-    }
-    .validate()
-    .map_err(Into::into)
+    hellas_sdk::client_chain::devnet(root).map_err(Into::into)
 }
 
 fn publish(path: &Path, bytes: &[u8]) -> CliResult<()> {

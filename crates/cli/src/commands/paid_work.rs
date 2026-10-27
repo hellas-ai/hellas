@@ -9,7 +9,7 @@ use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{ConsensusInfo, FinalizedBlockQuery, FinalizedBlockView, LightClient as _};
-use hellas_kernel::{CoinId, Funding, List, MAX_PARTY_INPUTS, Secp256k1Signer};
+use hellas_kernel::Secp256k1Signer;
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkOptions, PaidWorkRun, run_paid_work};
 use hellas_work::model::fetch::PreparedPaidFetchInputV1;
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
@@ -109,11 +109,6 @@ pub struct InspectChainArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Existing node grant configuration; its authority must already be bootstrapped.
-    #[arg(long = "grant-config")]
-    grant_config: PathBuf,
-    #[command(flatten)]
-    chain_node: super::chain_node::ChainNodeArgs,
     /// Caller-owned private trust directory.
     #[arg(long)]
     trust_store: Option<PathBuf>,
@@ -123,9 +118,9 @@ pub struct RunArgs {
     /// Validator RPC URL. Repeat exactly six times.
     #[arg(long = "validator")]
     validators: Vec<String>,
-    /// Independently authenticated chain trust document.
+    /// Independently authenticated chain trust document; defaults to embedded devnet trust.
     #[arg(long)]
-    trust: PathBuf,
+    trust: Option<PathBuf>,
     /// Genesis document; defaults to the shipped devnet.
     #[arg(long)]
     genesis: Option<PathBuf>,
@@ -144,10 +139,6 @@ pub struct RunArgs {
     /// Direct UDP address for the provider. Repeat or comma-separate.
     #[arg(long = "address", value_delimiter = ',', value_name = "IP:PORT")]
     provider_addrs: Vec<SocketAddr>,
-
-    /// Client coin funding the payment edge. Repeat or comma-separate.
-    #[arg(long = "payment-coin", value_delimiter = ',', value_name = "HEX")]
-    payment_coins: Vec<String>,
 
     /// Canonical prepared Evaluate or Fetch input to execute.
     #[arg(long = "prepared-input", value_name = "FILE")]
@@ -178,13 +169,14 @@ pub struct RunArgs {
     settle: bool,
 }
 
-/// Runs a paid-work operator command under an existing client identity.
+/// Runs paid work using the requester's persistent local signing keys.
 pub async fn run(
     command: PaidWorkCommand,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_auth::ProducerSigningKey,
-    principal: Option<hellas_auth::authority::PrincipalId>,
+    owner: Option<hellas_kernel::SoftPasskey>,
+    funding_root: PathBuf,
 ) -> CliResult<()> {
     match command {
         PaidWorkCommand::PrepareFetch(args) => prepare_fetch(args, &producer_key),
@@ -200,25 +192,20 @@ pub async fn run(
                 args.timeout_secs > 0,
                 "--timeout-secs must be greater than zero"
             );
-            let authority = crate::identity::open_authority(&args.grant_config, principal).await?;
+            let owner =
+                owner.context("paid work requires --passkey, --faucet or --faucet-account")?;
+            let owner = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
+                std::sync::Arc::new(owner),
+                settlement_key.party_key(),
+                &funding_root,
+            )?);
             let timeout = Duration::from_secs(args.timeout_secs);
-            let config = client_config(&args).await?;
-            let node = args.chain_node.start(&config).await?;
-            let result = tokio::time::timeout(
-                timeout,
-                run_one(
-                    *args,
-                    config,
-                    transport_key,
-                    settlement_key,
-                    node.clone(),
-                    authority,
-                ),
-            )
+            tokio::time::timeout(timeout, async {
+                let config = client_config(&args).await?;
+                run_one(*args, config, transport_key, settlement_key, owner).await
+            })
             .await
-            .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"));
-            node.shutdown().await?;
-            result?
+            .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"))?
         }
     }
 }
@@ -391,9 +378,9 @@ async fn read_chain(
             .await
             .with_context(|| format!("failed to read finalized block 1 from {url}"))?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "validator {url} has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
-                )
+                hellas_chain::QueryError::StateUnavailable(format!(
+                    "validator {url} has no finalized block 1"
+                ))
             })?;
         super::chain::pinned_consensus_verifier(&trust, &genesis_json, &info)?
             .verify_snapshot(&first.snapshot, &first.block)
@@ -425,25 +412,47 @@ async fn read_chain(
 }
 
 async fn client_config(args: &RunArgs) -> CliResult<WorkConfig> {
-    let (info, genesis_payload) =
-        read_chain(&args.validators, &args.trust, args.genesis.as_deref()).await?;
-    let genesis = match &args.genesis {
-        Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
-        None => serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON)?,
-    };
-    Ok(WorkConfig {
-        chain: ChainCrossCheck {
+    let mut config = hellas_sdk::client_chain::devnet(&args.journal_root)?;
+    config.journal_root = args.journal_root.clone();
+    if !args.validators.is_empty() {
+        config.validators = args.validators.clone();
+    }
+    if let Some(trust) = &args.trust {
+        let (info, genesis_payload) = loop {
+            match read_chain(&config.validators, trust, args.genesis.as_deref()).await {
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<hellas_chain::QueryError>(),
+                        Some(
+                            hellas_chain::QueryError::StateUnavailable(_)
+                                | hellas_chain::QueryError::Connect(_)
+                                | hellas_chain::QueryError::ChannelClosed
+                        )
+                    ) =>
+                {
+                    tokio::time::sleep(config.poll).await;
+                }
+                result => break result?,
+            }
+        };
+        let genesis = match &args.genesis {
+            Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+            None => serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON)?,
+        };
+        config.chain = ChainCrossCheck {
             network: hellas_kernel::NetworkId::new(&info.network_id)
                 .context("invalid chain network")?,
             genesis_payload_digest: genesis_payload.into(),
             threshold_identity: info.threshold_identity,
             genesis: Some(genesis),
-        },
-        validators: args.validators.clone(),
-        journal_root: args.journal_root.clone(),
-        poll: Duration::from_millis(100),
-        max_observation_age: Duration::from_secs(60),
-    })
+        };
+    } else {
+        anyhow::ensure!(
+            args.genesis.is_none(),
+            "--genesis requires independently authenticated --trust"
+        );
+    }
+    config.validate().map_err(Into::into)
 }
 
 fn paid_options(
@@ -451,10 +460,6 @@ fn paid_options(
     config: WorkConfig,
     assurance: hellas_rpc::Assurance,
 ) -> CliResult<PaidWorkOptions> {
-    anyhow::ensure!(
-        !args.payment_coins.is_empty(),
-        "at least one --payment-coin is required"
-    );
     let apple_trust = match (&args.trust_store, &args.trust_policy) {
         (Some(directory), Some(id)) => Some(
             hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
@@ -474,10 +479,6 @@ fn paid_options(
         apple_trust,
         assurance,
         expected_price: args.payment,
-        payment_funding: Funding::new(
-            coins(&args.payment_coins)?,
-            List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
-        ),
         acceptance_blocks: args.acceptance_blocks,
         terminal_blocks: args.terminal_blocks,
         payment_blocks: args.payment_blocks,
@@ -490,8 +491,7 @@ async fn run_one(
     config: WorkConfig,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
-    node: hellas_sdk::FullNode,
-    authority: hellas_work::node::NodeCoordinator,
+    owner: std::sync::Arc<hellas_sdk::client_owner::ClientOwner>,
 ) -> CliResult<()> {
     let prepared = read_prepared_work_input(&args.prepared_input)?;
     let result = run_paid_work(
@@ -502,8 +502,7 @@ async fn run_one(
         },
         transport_key,
         settlement_key,
-        node,
-        authority,
+        owner,
     )
     .await?;
     println!("bond_edge: {}", hex::encode(result.bond_edge.to_bytes()));
@@ -555,24 +554,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> CliResult<()> {
     }
     hellas_private::write_atomically(path, ".tmp", bytes)
         .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn coins(values: &[String]) -> CliResult<List<CoinId, MAX_PARTY_INPUTS>> {
-    let ids = values
-        .iter()
-        .map(|value| fixed_hex("--payment-coin", value).map(CoinId::from_bytes))
-        .collect::<CliResult<Vec<_>>>()?;
-    hellas_sdk::work_config::coin_list(&ids).context("too many --payment-coin values")
-}
-
-pub(crate) fn fixed_hex<const N: usize>(flag: &str, value: &str) -> CliResult<[u8; N]> {
-    hellas_auth::hex::parse(value).with_context(|| {
-        if value.len() != N * 2 {
-            format!("{flag} has {} bytes; expected {N}", value.len() / 2)
-        } else {
-            format!("{flag} must be hexadecimal")
-        }
-    })
 }
 
 #[cfg(test)]

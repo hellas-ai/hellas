@@ -254,7 +254,6 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 .await
                 .unwrap();
             let mut session = PaidWorkSession {
-                chain: SessionChain::Constructed,
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),
@@ -263,10 +262,6 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     apple_trust: None,
                     assurance: Assurance::ProducerSigned,
                     expected_price: PRICE,
-                    payment_funding: Funding::new(
-                        hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                        hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                    ),
                     acceptance_blocks: 50,
                     terminal_blocks: 100,
                     payment_blocks: 200,

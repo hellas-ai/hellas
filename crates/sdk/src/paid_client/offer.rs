@@ -54,20 +54,20 @@ impl OfferConnection {
         args: &PaidWorkOptions,
         signer: &Secp256k1Signer,
         owner: hellas_auth::authority::PrincipalId,
-        funded: bool,
+        funding: Option<&Funding>,
     ) -> Result<Outcome> {
         let mut request = RequestOfferRequest {
             client_principal: owner.as_bytes().to_vec(),
             client_key: signer.party_key().to_bytes().to_vec(),
-            funding_coins: if funded {
-                args.payment_funding
-                    .maker()
-                    .iter()
-                    .map(|coin| coin.to_bytes().to_vec())
-                    .collect()
-            } else {
-                vec![]
-            },
+            funding_coins: funding
+                .map(|funding| {
+                    funding
+                        .maker()
+                        .iter()
+                        .map(|coin| coin.to_bytes().to_vec())
+                        .collect()
+                })
+                .unwrap_or_default(),
             signature: vec![],
         };
         let exporter = self
@@ -189,7 +189,7 @@ pub async fn request_paid_quote(
 ) -> Result<PaidQuote> {
     args.validate()?;
     let connection = OfferConnection::open(args, endpoint).await?;
-    match connection.request(args, signer, owner, false).await? {
+    match connection.request(args, signer, owner, None).await? {
         Outcome::Quote(quote) => check_quote(args, quote, &connection.provider),
         Outcome::Refused(refused) => Err(PaidClientError::OfferRefused(refused.code)),
         _ => Err(PaidClientError::InputMismatch("expected quote")),
@@ -200,20 +200,41 @@ pub(super) async fn obtain_offer(
     args: &PaidWorkOptions,
     endpoint: &Endpoint,
     signer: &Secp256k1Signer,
-    owner: hellas_auth::authority::PrincipalId,
+    owner: &crate::client_owner::ClientOwner,
+    chain: &RemoteLightClient,
 ) -> Result<SignedPaidOffer> {
+    let principal = owner.principal();
     let connection = OfferConnection::open(args, endpoint).await?;
-    let quote = match connection.request(args, signer, owner, false).await? {
+    let quote = match connection.request(args, signer, principal, None).await? {
         Outcome::Quote(quote) => check_quote(args, quote, &connection.provider)?,
         Outcome::Refused(refused) => return Err(PaidClientError::OfferRefused(refused.code)),
         _ => return Err(PaidClientError::InputMismatch("expected quote")),
     };
-    let offer = match connection.request(args, signer, owner, true).await? {
+    let quoted_provider = connection.provider.clone();
+    drop(connection);
+    let funding = owner
+        .fund(
+            chain,
+            args.config.chain.network,
+            args.provider,
+            quote.funding_value,
+            args.config.poll,
+            args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+        )
+        .await?;
+    let connection = OfferConnection::open(args, endpoint).await?;
+    if connection.provider != quoted_provider {
+        return Err(PaidClientError::ProviderIdentityChanged);
+    }
+    let offer = match connection
+        .request(args, signer, principal, Some(&funding))
+        .await?
+    {
         Outcome::Granted(granted) => SignedPaidOffer::decode(&granted.offer)?,
         Outcome::Refused(refused) => return Err(PaidClientError::OfferRefused(refused.code)),
         _ => return Err(PaidClientError::InputMismatch("expected funded offer")),
     };
-    if offer.offer().payment_funding != args.payment_funding
+    if offer.offer().payment_funding != funding
         || offer.offer().provider != connection.provider
         || offer.offer().policy != quote.policy
         || offer.offer().omission_bond != quote.omission_bond
@@ -223,9 +244,11 @@ pub(super) async fn obtain_offer(
     Ok(offer)
 }
 
-pub(crate) async fn retained_offer(
+pub(crate) async fn retained_offer<
+    C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
+>(
     args: &PaidWorkOptions,
-    chain: &WorkBlocks<LocalLightClient>,
+    chain: &WorkBlocks<C>,
 ) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
     let found =
         hellas_work::work_store::discover_setups(&args.journal_root, args.config.chain.network)
@@ -247,6 +270,13 @@ pub(crate) async fn retained_offer(
             &Secp256k1Verifier::new(),
         )
         .await?;
+        let floor = store
+            .state()
+            .origin()
+            .map_or(0, |origin| origin.height)
+            .max(store.state().scan_cursor().map_or(0, |scan| scan.height))
+            .max(store.state().scan_armed().map_or(0, |scan| scan.height));
+        let chain = chain.clone().with_min_height(floor);
         let Some((_, offer)) = store.state().offer() else {
             return Err(PaidClientError::MissingState("client offer"));
         };

@@ -1,6 +1,6 @@
 # Paid gateway
 
-`hellas-cli gateway --paid-work-config /srv/hellas/pool.json` sends token-native
+`hellas-cli --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json` sends token-native
 inference to the configured providers and pays through their real funded work
 channels. Each provider has its own endpoint identity, bond, payment funding,
 and client journals. The gateway prefers idle matching providers and matching
@@ -63,8 +63,7 @@ The pool selects providers and expected prices. It obtains each policy with
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
       "provider_addrs": ["192.0.2.10:31145"],
-      "payment": 20,
-      "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"]
+      "payment": 20
     }
   ],
   "acceptance_blocks": 16,
@@ -77,7 +76,19 @@ The pool selects providers and expected prices. It obtains each policy with
 
 `chain_config` contains the chain cross-check, six validator URLs, journal root,
 `poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
-client routes. The gateway checks that its entries use its executing chain node.
+client routes. The requester and gateway start no chain node. They authenticate
+remote state against independently configured genesis and consensus pins; relay
+URLs supply transport only. `paid-work run` defaults to the embedded devnet trust
+and `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
+keys are created on first use and retained with the identity.
+
+Use `--passkey owner.key`, `--faucet`, or `--faucet-account N` for channel funding.
+A new channel asks for one owner approval over its exact quoted amount: the
+provider's jobs per channel times its price, plus omission reserve and fees.
+At most four eligible owner coins fund one delegated output; change returns
+undelegated to the same owner. The wallet records the signed reshape before
+submission and shares reservations across gateway providers. Later jobs reuse
+the open channel. `paid-work run --settle` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -300,10 +311,10 @@ reuse. Worker spans report that observed reuse as
 
 The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Load
 the same pool file with `load_pool_options(path, assurance)`,
-and pass the resulting typed `PaidGatewayOptions` and a `NodeIdentity` to
-`PaidGateway::open`. Applications can also construct the options directly from
-`PaidWorkOptions`; the pool validates duplicate providers, journals and funding
-before opening any connections. It owns recovery, admission, per-channel
+and pass the resulting typed `PaidGatewayOptions`, a `NodeIdentity`, and an
+`Arc<ClientOwner>` to `PaidGateway::open`. Construct the owner with the passkey
+authenticator, the identity's settlement key and a private funding directory. Applications can also construct the options directly from
+`PaidWorkOptions`; the pool validates duplicate providers and journals before opening connections. It owns recovery, admission, per-channel
 serialization and payment tasks. No CLI argument structures are part of its API.
 
 For transparent HTTP, pass this pool to `hellas_gateway::start_http` using
