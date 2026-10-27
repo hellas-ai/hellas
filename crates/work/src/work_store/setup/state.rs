@@ -3,6 +3,7 @@ use super::*;
 impl SetupState {
     pub(super) fn new(network: NetworkId, bond_edge: EdgeId, role: Role) -> Self {
         Self {
+            offer: None,
             network,
             bond_edge,
             role,
@@ -51,7 +52,16 @@ impl SetupState {
 
     /// Checks signed-handshake structure and the compact finalized outcomes.
     fn revalidate(&self) -> Result<(), SetupStateError> {
+        if let Some((_, offer)) = &self.offer {
+            offer.check().map_err(|_| SetupStateError::Malformed)?;
+            if self.bundle.as_ref().is_none_or(|bundle| {
+                !bundle.encode()[2..].starts_with(&offer.offer().proposal.encode()[2..])
+            }) {
+                return Err(SetupStateError::Malformed);
+            }
+        }
         if let Some(bundle) = &self.bundle {
+            self.check_offered_bundle(bundle)?;
             if bundle.network() != self.network {
                 return Err(SetupStateError::WrongChannel { field: "network" });
             }
@@ -109,6 +119,24 @@ impl SetupState {
         Ok(())
     }
 
+    fn check_offered_bundle(
+        &self,
+        bundle: &WorkChannelSetupBundleV2,
+    ) -> Result<(), SetupStateError> {
+        if let Some((_, signed)) = &self.offer {
+            if bundle
+                .payment_funding()
+                .is_some_and(|funding| *funding != signed.offer().payment_funding)
+                || bundle
+                    .payment_terms()
+                    .is_some_and(|terms| terms.omission_bond != signed.offer().omission_bond)
+            {
+                return Err(SetupStateError::Malformed);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the revision this endpoint has durably retained.
     #[must_use]
     pub fn revision(&self) -> Option<u8> {
@@ -126,6 +154,10 @@ impl SetupState {
     #[must_use]
     pub const fn bundle(&self) -> Option<&WorkChannelSetupBundleV2> {
         self.bundle.as_ref()
+    }
+
+    pub fn offer(&self) -> Option<(&[u8; 32], &crate::model::offer::SignedPaidOffer)> {
+        self.offer.as_ref().map(|(peer, offer)| (peer, offer))
     }
 
     /// Returns the exact bytes of the retained revision.
@@ -222,11 +254,10 @@ impl SetupState {
     #[must_use]
     pub fn funding_coins(&self) -> BTreeSet<CoinId> {
         let mut coins = BTreeSet::new();
-        for tx in [self.bond_open(), self.payment_open()]
-            .into_iter()
-            .flatten()
-        {
-            if let Tx::Open { funding, .. } = tx {
+        if let Some(bundle) = &self.bundle {
+            coins.extend(bundle.bond_funding().maker().iter().copied());
+            coins.extend(bundle.bond_funding().taker().iter().copied());
+            if let Some(funding) = bundle.payment_funding() {
                 coins.extend(funding.maker().iter().copied());
                 coins.extend(funding.taker().iter().copied());
             }
@@ -260,10 +291,9 @@ impl SetupState {
     /// from it, the channel's.
     #[must_use]
     pub fn horizon(&self) -> Option<u64> {
-        let Some(Tx::Open { terms, .. }) = self.bond_open() else {
-            return None;
-        };
-        Some(terms.timeout().get())
+        self.bundle
+            .as_ref()
+            .map(|bundle| bundle.bond_terms().timeout.get())
     }
 
     /// Decides what this endpoint should do next, from one finalized
@@ -289,9 +319,37 @@ impl SetupState {
             };
         }
         let Some(payment_edge) = self.payment_edge() else {
-            // Revision 1: no payment leg exists yet, so nothing on
-            // chain can be about this channel.
-            return SetupDecision::AwaitingCounterparty;
+            let Some(bundle) = &self.bundle else {
+                return SetupDecision::AwaitingCounterparty;
+            };
+            if observed.bond.is_some() {
+                return match observed.lease {
+                    LeaseSlots::Absent if self.role == Role::Provider => SetupDecision::TimeoutBond,
+                    LeaseSlots::Absent => SetupDecision::AwaitingCounterparty,
+                    LeaseSlots::Present(_) => SetupDecision::Fault(SetupFault::LeasedElsewhere),
+                    LeaseSlots::Faulty(_) => SetupDecision::Fault(SetupFault::LeaseMalformed),
+                };
+            }
+            if self.bond_closed {
+                return SetupDecision::Abort(SetupAbort::BondReclaimed);
+            }
+            if self.bond_timeout_submitted {
+                return SetupDecision::AwaitingCounterparty;
+            }
+            if !bundle
+                .bond_funding()
+                .maker()
+                .iter()
+                .chain(bundle.bond_funding().taker().iter())
+                .all(|coin| observed.live_funding.contains(coin))
+            {
+                return SetupDecision::Fault(SetupFault::BondFundingSpent);
+            }
+            return if observed.height >= bundle.bond_terms().timeout.get() {
+                SetupDecision::Abort(SetupAbort::BondOpenExpired)
+            } else {
+                SetupDecision::AwaitingCounterparty
+            };
         };
 
         let leased_here = match observed.lease {
@@ -434,6 +492,32 @@ impl SetupState {
             return Err(SetupStateError::Ended(end));
         }
         match record {
+            SetupRecord::Offer { peer, floor, offer } => {
+                offer.check().map_err(|_| SetupStateError::Malformed)?;
+                if self.role == Role::Provider {
+                    let floor = floor.ok_or(SetupStateError::Malformed)?;
+                    if self.scan_armed.is_none() {
+                        self.apply(&SetupRecord::ScanArmed {
+                            height: floor.height,
+                            payload: floor.payload,
+                        })?;
+                    } else if self.scan_armed != Some(floor) {
+                        return Err(SetupStateError::Malformed);
+                    }
+                } else if floor.is_some() {
+                    return Err(SetupStateError::Malformed);
+                }
+                if let Some(held) = &self.offer {
+                    return if held == &(*peer, offer.as_ref().clone()) {
+                        Ok(Applied::Redundant)
+                    } else {
+                        Err(SetupStateError::Malformed)
+                    };
+                }
+                self.apply_bundle(&offer.offer().proposal.encode())?;
+                self.offer = Some((*peer, offer.as_ref().clone()));
+                Ok(Applied::Changed)
+            }
             SetupRecord::Bundle { bundle } => self.apply_bundle(bundle),
             SetupRecord::ScanArmed { height, payload } => {
                 let scan = SetupScan {
@@ -470,7 +554,9 @@ impl SetupState {
             SetupRecord::Observed(observed) => self.apply_observation(observed),
             SetupRecord::BondTimeoutSubmitted => {
                 self.require_provider("bond Timeout submission")?;
-                self.require_executable("bond Timeout submission")?;
+                if self.bundle.is_none() {
+                    return Err(SetupStateError::Malformed);
+                }
                 if self.bond_timeout_submitted {
                     return Ok(Applied::Redundant);
                 }
@@ -610,6 +696,7 @@ impl SetupState {
         bytes: &[u8],
         bundle: WorkChannelSetupBundleV2,
     ) -> Result<Applied, SetupStateError> {
+        self.check_offered_bundle(&bundle)?;
         if bundle.network() != self.network {
             return Err(SetupStateError::WrongChannel { field: "network" });
         }
@@ -647,10 +734,7 @@ impl SetupState {
             step: "observing before arming the scan floor",
             revision: self.revision(),
         })?;
-        let payment_edge = self.payment_edge().ok_or(SetupStateError::WrongStage {
-            step: "observing before the payment edge is named",
-            revision: self.revision(),
-        })?;
+        let payment_edge = self.payment_edge();
         let mut observed = SetupObservation {
             from,
             through: from,
@@ -672,10 +756,10 @@ impl SetupState {
                         let edge = Tx::edge_id_of(funding, terms);
                         if edge == self.bond_edge {
                             observed.bond_finalized = true;
-                        } else if edge == payment_edge {
+                        } else if Some(edge) == payment_edge {
                             observed.payment_finalized = true;
                             observed.origin.get_or_insert(SetupOrigin {
-                                payment_edge,
+                                payment_edge: edge,
                                 height: block.height,
                                 payload: block.payload,
                                 parent: block.parent,
@@ -688,7 +772,7 @@ impl SetupState {
                         observed.bond_finalized = true;
                         observed.bond_closed = true;
                     }
-                    Tx::Close { input, .. } if *input == payment_edge => {
+                    Tx::Close { input, .. } if Some(*input) == payment_edge => {
                         observed.payment_closed = true;
                     }
                     _ => {}

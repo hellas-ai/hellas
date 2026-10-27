@@ -14,8 +14,14 @@ pub const WORK_OFFER_EXPORT: &str = "work.offer.export";
 pub const WORK_GENERATION_RESET: &str = "work.generation.reset";
 pub const WORK_RESOURCE_CONFIGURE: &str = "work.resource.configure";
 pub const WORK_RESOURCE_REPAIR: &str = "work.resource.repair";
+pub const WORK_PAID_POLICY_CONFIGURE: &str = "work.paid.configure";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WorkMutation {
+    PaidPolicy {
+        expected: Revision,
+        policy_salt: [u8; 32],
+        policy: Box<crate::model::paid_policy::PaidPolicy>,
+    },
     Capacity {
         expected: Revision,
         max_in_flight: u16,
@@ -36,6 +42,7 @@ pub(crate) enum WorkMutation {
 impl WorkMutation {
     pub(crate) fn operation(&self) -> &'static str {
         match self {
+            Self::PaidPolicy { .. } => WORK_PAID_POLICY_CONFIGURE,
             Self::Capacity { .. } => crate::node::WORK_CAPACITY_CONFIGURE,
             Self::Resource(_) => WORK_RESOURCE_CONFIGURE,
             Self::Budget(_) => WORK_BUDGET_CONFIGURE,

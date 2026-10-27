@@ -431,7 +431,7 @@ impl WorkDevnet {
         self.light_client(node)
             .work_channel_snapshot(WorkChannelQuery {
                 bond_edge: bond_edge(allocations),
-                payment_edge: payment_edge(allocations),
+                payment_edge: Some(payment_edge(allocations)),
                 funding: BTreeSet::new(),
             })
             .await

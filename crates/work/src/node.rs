@@ -94,6 +94,14 @@ impl NodeCoordinator {
         Ok(store.state().provider().ok().cloned())
     }
 
+    /// Current owner-approved paid terms; callers retain a snapshot per offer.
+    pub async fn paid_policy(
+        &self,
+    ) -> Result<Option<crate::model::paid_policy::StoredPaidPolicy>, NodeStoreError> {
+        let (store, _) = self.lock().await?;
+        Ok(store.state().paid_policy().cloned())
+    }
+
     /// Validate a host's configured enrollment before attaching a service.
     pub async fn check_provider(
         &self,

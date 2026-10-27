@@ -245,9 +245,11 @@ pub struct WorkChannelConfig {
 /// [`Self::admit`] run the same gates on proposed terms that
 /// [`WorkChannelDescriptor::open`] runs on configured ones, before the
 /// countersignature that makes those terms executable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderChannelPolicy {
     /// The network every signature on this channel is bound to.
+    #[serde(with = "crate::model::grant::records::network")]
     pub network: NetworkId,
     /// Salt of the private credit-policy commitment.
     pub policy_salt: [u8; 32],
@@ -259,6 +261,7 @@ pub struct ProviderChannelPolicy {
     pub payment_policy: JobPaymentPolicyV2,
     /// The payment edge's value, reserve, and close fees as the provider
     /// requires them to be funded.
+    #[serde(with = "crate::model::paid_policy::edge_values")]
     pub expected_payment_values: EdgeValues,
     /// The shortest response window this provider will sign terms over.
     ///

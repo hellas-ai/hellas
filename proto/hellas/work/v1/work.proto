@@ -68,6 +68,7 @@ service Work {
 // yet, and every setup method answer for one that already does.
 service WorkSetup {
   rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
+  rpc RequestOffer(RequestOfferRequest) returns (RequestOfferResponse);
 
   // One step of the handshake: the caller offers the revision it holds,
   // and is answered with the revision that extends it.
@@ -85,6 +86,52 @@ service WorkSetup {
   // A replay of the same call returns the same bytes and writes
   // nothing: the journal recognises a revision it already holds.
   rpc ExchangeSetup(ExchangeSetupRequest) returns (ExchangeSetupResponse);
+}
+
+message RequestOfferRequest {
+  bytes client_principal = 1;
+  bytes client_key = 2;
+  repeated bytes funding_coins = 3;
+  bytes signature = 4;
+}
+
+message RequestOfferResponse {
+  oneof outcome {
+    Quote quote = 1;
+    OfferGranted granted = 2;
+    OfferRefused refused = 3;
+  }
+}
+
+message Quote {
+  bytes provider_channel_policy = 1;
+  PaymentEdgeValues required = 2;
+  uint64 omission_bond = 3;
+  uint64 funding_value = 4;
+}
+
+message PaymentEdgeValues {
+  uint64 value = 1;
+  uint64 reserve = 2;
+  uint64 base_fee = 3;
+  uint64 slot_fee = 4;
+  uint64 proof_fee = 5;
+  uint64 lifetime_fee = 6;
+}
+
+message OfferGranted { bytes offer = 1; }
+
+message OfferRefused {
+  OfferRefusalCode code = 1;
+  uint64 required = 2;
+}
+
+enum OfferRefusalCode {
+  OFFER_REFUSAL_CODE_UNSPECIFIED = 0;
+  OFFER_REFUSAL_CODE_NO_POLICY = 1;
+  OFFER_REFUSAL_CODE_NEEDS_FUNDING = 2;
+  OFFER_REFUSAL_CODE_NO_STAKE_AVAILABLE = 3;
+  OFFER_REFUSAL_CODE_OFFER_LIMIT = 4;
 }
 
 message ExchangeSetupRequest {

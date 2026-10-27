@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use futures::{StreamExt as _, stream};
-use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Tx};
+use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Terms, Tx};
 
 use crate::work_close::{
     BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink, apply_finalized_txs, observe,
@@ -33,7 +33,7 @@ pub struct SetupQuery {
     /// The tag-4 work-stake bond this setup opens.
     pub bond_edge: EdgeId,
     /// The tag-2 payment edge it opens over that bond.
-    pub payment_edge: EdgeId,
+    pub payment_edge: Option<EdgeId>,
     /// Every coin the two retained Opens spend.
     pub funding: BTreeSet<CoinId>,
 }
@@ -523,12 +523,12 @@ where
             SetupDecision::TimeoutBond => {
                 let tx = store
                     .state()
-                    .bond_open()
-                    .and_then(|open| match open {
-                        Tx::Open { terms, .. } => {
-                            Tx::timeout_close(store.state().bond_edge(), &terms)
-                        }
-                        _ => None,
+                    .bundle()
+                    .and_then(|bundle| {
+                        Tx::timeout_close(
+                            store.state().bond_edge(),
+                            &Terms::work_stake_bond(bundle.bond_terms().clone()),
+                        )
                     })
                     .ok_or(SetupDriveError::TimeoutUnavailable)?;
                 store
@@ -752,9 +752,10 @@ where
 /// the signed bytes do not name, and the preflight cannot be run against
 /// a convenient one.
 fn query_of(state: &SetupState) -> Option<SetupQuery> {
+    state.bundle()?;
     Some(SetupQuery {
         bond_edge: state.bond_edge(),
-        payment_edge: state.payment_edge()?,
+        payment_edge: state.payment_edge(),
         funding: state.funding_coins(),
     })
 }

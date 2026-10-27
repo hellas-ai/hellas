@@ -301,7 +301,8 @@ pub trait PrivateRecord: Sized {
 /// cannot live there: the commitment is fixed by the payment edge's id,
 /// so a per-job body would mean a new edge — and a new channel — for
 /// every job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaidChannelPolicyV1 {
     /// Compute the provider may lose to a defaulting client before it
     /// stops working for that client.
@@ -329,7 +330,8 @@ impl PrivateRecord for PaidChannelPolicyV1 {
 }
 
 /// Versioned funding-independent execution record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluatePolicyV2 {
     /// The one environment manifest this channel will run.
     pub allowed_environment: ContentId,
@@ -1907,7 +1909,8 @@ impl CreditLedger {
 }
 
 /// The price and block margins of payment-funded execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobPaymentPolicyV2 {
     /// Price of one accepted terminal result.
     pub fixed_price: u64,

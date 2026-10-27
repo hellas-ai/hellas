@@ -361,6 +361,10 @@ impl WorkChannelSetupBundleV2 {
         Some(&self.payment()?.terms)
     }
 
+    pub fn payment_funding(&self) -> Option<&Funding> {
+        Some(&self.payment()?.funding)
+    }
+
     /// Returns the hash both parties sign to authorize the bond open.
     #[must_use]
     pub fn bond_open_hash(&self) -> PayloadHash {

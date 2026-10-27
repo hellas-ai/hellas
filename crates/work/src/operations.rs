@@ -43,6 +43,11 @@ pub const OPERATIONS: &[Operation] = &[
     Operation::new(grant::WORK_GENERATION_RESET, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_RESOURCE_CONFIGURE, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_RESOURCE_REPAIR, Scope::Machine, Mount::Work),
+    Operation::new(
+        grant::WORK_PAID_POLICY_CONFIGURE,
+        Scope::Machine,
+        Mount::Work,
+    ),
     Operation::new(grant_service::WORK_EXECUTE, Scope::Allowance, Mount::Work),
 ];
 impl Operation {

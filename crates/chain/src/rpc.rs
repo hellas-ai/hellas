@@ -552,9 +552,12 @@ async fn work_channel_snapshot_at(
     let mut bond = None;
     let mut payment = None;
     for (slot, edge) in [
-        (&mut bond, query.bond_edge),
+        (&mut bond, Some(query.bond_edge)),
         (&mut payment, query.payment_edge),
     ] {
+        let Some(edge) = edge else {
+            continue;
+        };
         *slot =
             match reader.get(&edge_object_id(edge)).await.map_err(|error| {
                 QueryError::StateUnavailable(format!("edge read failed: {error:?}"))
@@ -573,10 +576,15 @@ async fn work_channel_snapshot_at(
     let [first_lease, second_lease] = bond_lease_slots(network, query.bond_edge);
     let mut registry = [None, None, None];
     for (stored, id) in registry.iter_mut().zip([
-        first_lease,
-        second_lease,
-        pending_payment_close_slot(network, query.payment_edge),
+        Some(first_lease),
+        Some(second_lease),
+        query
+            .payment_edge
+            .map(|edge| pending_payment_close_slot(network, edge)),
     ]) {
+        let Some(id) = id else {
+            continue;
+        };
         *stored = match reader
             .get(&registry_chunk_object_id(id))
             .await

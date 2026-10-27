@@ -18,6 +18,7 @@ brotli = "9"
 bytes = { workspace = true, optional = true }
 flate2 = "1"
 futures.workspace = true
+getrandom = "0.4"
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }

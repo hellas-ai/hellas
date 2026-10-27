@@ -205,7 +205,7 @@ where
             (
                 WorkChannelQuery {
                     bond_edge: payment_terms.bond_edge,
-                    payment_edge: channel.payment_edge(),
+                    payment_edge: Some(channel.payment_edge()),
                     funding: Default::default(),
                 },
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
@@ -953,7 +953,7 @@ mod tests {
             let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: BTreeSet::new(),
                 })
                 .await
@@ -1063,7 +1063,7 @@ mod tests {
             let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: BTreeSet::new(),
                 })
                 .await

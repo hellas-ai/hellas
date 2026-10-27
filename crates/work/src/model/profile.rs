@@ -61,7 +61,8 @@ impl From<&crate::model::grant::GrantJobAuthorizationV1> for JobInputBinding {
 }
 
 /// The execution contract fixed when a channel is mounted.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum WorkPolicy {
     /// Reproducible local evaluation.
     Evaluate(EvaluatePolicyV2),

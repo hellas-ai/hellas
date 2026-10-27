@@ -3275,6 +3275,7 @@ dependencies = [
  "bytes",
  "flate2",
  "futures",
+ "getrandom 0.4.3",
  "hellas-attestation",
  "hellas-auth",
  "hellas-kernel",
