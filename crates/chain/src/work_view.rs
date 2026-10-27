@@ -74,6 +74,7 @@ pub struct WorkChannelQuery {
 }
 
 impl WorkChannelQuery {
+    #[cfg(feature = "client-core")]
     pub(crate) fn object_keys(
         &self,
         network: hellas_kernel::NetworkId,
@@ -113,6 +114,7 @@ pub struct WorkChannelSnapshot {
 }
 
 impl WorkChannelSnapshot {
+    #[cfg(feature = "client-core")]
     pub(crate) fn from_objects(
         network: hellas_kernel::NetworkId,
         query: WorkChannelQuery,
@@ -367,6 +369,21 @@ pub trait FinalizedWorkView: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send;
 }
 
+#[cfg(feature = "client-core")]
+impl FinalizedWorkView for crate::client::RemoteLightClient {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        use crate::LightClient as _;
+        let network = self.pinned_network()?;
+        self.get_objects(query.object_keys(network))
+            .await?
+            .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,20 +514,5 @@ mod tests {
             derived[0].to_bytes(),
             pending_payment_close_slot(network, payment()).to_bytes(),
         );
-    }
-}
-
-#[cfg(feature = "client-core")]
-impl FinalizedWorkView for crate::client::RemoteLightClient {
-    async fn work_channel_snapshot(
-        &self,
-        query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        use crate::LightClient as _;
-        let network = self.pinned_network()?;
-        self.get_objects(query.object_keys(network))
-            .await?
-            .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
-            .transpose()
     }
 }

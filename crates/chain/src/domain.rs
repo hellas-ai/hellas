@@ -287,6 +287,7 @@ pub fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
 
 /// Returns the chain object id for a kernel edge id.
 #[must_use]
+#[cfg(feature = "client-core")]
 pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
@@ -297,6 +298,7 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
 /// already domain-separates the three derivations, so the chain does not
 /// separate them a second time.
 #[must_use]
+#[cfg(feature = "client-core")]
 pub(crate) fn registry_chunk_object_id(id: hellas_kernel::RegistryChunkId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
