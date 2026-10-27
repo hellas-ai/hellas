@@ -559,9 +559,9 @@ fn paid_scenario(
             timeout: Duration::from_secs(120),
         };
         let client_authority = client_authority(&root.path().join("client-authority"), now).await;
-        // Open on controlled blocks, then run the job on a fixed finalized
-        // tip. The local-node setup path rejects reads during catch-up, and
-        // its observer suspends payment readiness during that same window.
+        // Setup waits for local-node catch-up. Execute on a stable finalized
+        // tip because its independent observer suspends payment readiness
+        // while newer blocks are being applied.
         let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
         assert!(!options.config.journal_root.exists());
         let quote = hellas_sdk::paid_client::request_paid_quote(
@@ -594,7 +594,7 @@ fn paid_scenario(
         .await;
         let mut options = options;
         if never_catches_up {
-            options.timeout = options.config.poll;
+            options.timeout = hellas_chain::node::RECOVERY_TIMEOUT;
         }
         let open = PaidWorkSession::open(
             options.clone(),
@@ -611,11 +611,16 @@ fn paid_scenario(
         client_node.require_finalized_height_for_test(devnet.height() + 1);
         assert!(client_node.view().is_err());
         if never_catches_up {
-            let error = tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, &mut open)
-                .await
-                .expect("setup reads have a bounded deadline")
-                .err()
-                .expect("setup cannot finish while its node stays behind");
+            // Quote, funded offer and the unavailable local read each have the
+            // same recovery bound; only the last one is held behind here.
+            let error = tokio::time::timeout(
+                hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(3),
+                &mut open,
+            )
+            .await
+            .expect("setup reads have a bounded deadline")
+            .err()
+            .expect("setup cannot finish while its node stays behind");
             assert!(
                 matches!(error, hellas_sdk::paid_client::PaidClientError::BlockSource(hellas_work::work_close::BlockSourceError::ReadUnavailableTimeout { timeout, .. }) if timeout == options.timeout),
                 "typed setup read expiry, got {error}"

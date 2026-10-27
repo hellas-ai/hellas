@@ -1384,7 +1384,8 @@ async fn finish(case: Box<Case>) {
         .into_iter()
         .flat_map(|o| o.offer().proposal.bond_funding().maker().iter().copied())
         .collect();
-    for _ in 0..20 {
+    let reclaim_deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
+    loop {
         if holdings(&devnet, owners[0].key())
             .await
             .iter()
@@ -1392,7 +1393,15 @@ async fn finish(case: Box<Case>) {
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::Instant::now() < reclaim_deadline,
+            "partial bond reclaimed within the chain recovery bound"
+        );
+        assert!(
+            devnet.height() < second.offer().proposal.bond_terms().timeout.get(),
+            "unleased bond reclaimed before its horizon"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
         devnet.seal().await;
     }
     assert!(
