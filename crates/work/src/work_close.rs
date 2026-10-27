@@ -106,18 +106,24 @@ pub struct FinalizedWork {
 
 /// Why a finalized block could not be read.
 ///
-/// Opaque, like [`crate::work::BackendFault`]: a watcher does the same
-/// thing for every one of them, which is stop and leave the cursor
-/// where it was.
+/// A watcher stops and leaves its cursor where it was. Setup callers can
+/// distinguish a bounded wait for an unavailable read from other failures.
 #[derive(Clone, Debug, thiserror::Error)]
-#[error("the finalized block source failed: {0}")]
-pub struct BlockSourceError(String);
+pub enum BlockSourceError {
+    #[error("the finalized block source failed: {0}")]
+    Failed(String),
+    #[error("chain read remained unavailable for {timeout:?}: {reason}")]
+    ReadUnavailableTimeout {
+        timeout: std::time::Duration,
+        reason: String,
+    },
+}
 
 impl BlockSourceError {
     /// Reports a source failure.
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
-        Self(reason.into())
+        Self::Failed(reason.into())
     }
 }
 

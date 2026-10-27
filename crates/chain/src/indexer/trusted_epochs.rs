@@ -51,7 +51,7 @@ impl TrustedEpochs {
             verifiers: Arc::new(verifiers),
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn verifier(
         &self,
         height: Height,

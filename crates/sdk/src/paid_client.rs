@@ -341,12 +341,14 @@ impl PaidWorkSession {
         let bond = args.bond;
         let payment_funding = args.payment_funding.clone();
         config.check_node(&node)?;
-        let view = tokio::time::timeout(args.timeout, node.wait_ready())
+        let read_timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+        let view = tokio::time::timeout(read_timeout, node.wait_ready())
             .await
-            .map_err(|_| PaidClientError::Timeout {
-                stage: "chain synchronization",
+            .map_err(|_| hellas_chain::QueryError::ReadUnavailableTimeout {
+                timeout: read_timeout,
+                reason: "chain node is catching up".into(),
             })??;
-        let chain = WorkBlocks::new(view.client());
+        let chain = WorkBlocks::new(view.client()).with_read_retry(config.poll, read_timeout);
 
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
@@ -434,6 +436,7 @@ impl PaidWorkSession {
                 .observe_ready(ready, started, config.max_observation_age)
                 .await?;
         }
+        let chain = WorkBlocks::new(view.client());
         let observer = spawn_observer(
             client.observer(),
             descriptor.clone(),

@@ -58,7 +58,10 @@ use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot}
 
 /// One light client, as a paid endpoint's block source.
 #[derive(Clone, Debug)]
-pub struct WorkBlocks<C>(C);
+pub struct WorkBlocks<C> {
+    client: C,
+    read_retry: Option<(std::time::Duration, std::time::Duration)>,
+}
 
 /// What one production clock step did for a mounted paid channel.
 #[derive(Debug)]
@@ -107,7 +110,63 @@ impl PaidWorkClockError {
 impl<C: LightClient> WorkBlocks<C> {
     /// Reads finalized blocks for a watcher through `client`.
     pub const fn new(client: C) -> Self {
-        Self(client)
+        Self {
+            client,
+            read_retry: None,
+        }
+    }
+
+    /// Waits for transiently unavailable setup reads without retrying transactions.
+    #[must_use]
+    pub const fn with_read_retry(
+        mut self,
+        poll: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.read_retry = Some((poll, timeout));
+        self
+    }
+
+    async fn read<T, F, Fut>(&self, mut read: F) -> Result<T, QueryError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, QueryError>>,
+    {
+        let Some((poll, timeout)) = self.read_retry else {
+            return read().await;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_reason = "chain read did not answer".to_owned();
+        loop {
+            let result = tokio::time::timeout_at(deadline, read())
+                .await
+                .map_err(|_| QueryError::ReadUnavailableTimeout {
+                    timeout,
+                    reason: last_reason.clone(),
+                })?;
+            match result {
+                Err(QueryError::StateUnavailable(reason)) => {
+                    last_reason.clone_from(&reason);
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(QueryError::ReadUnavailableTimeout { timeout, reason });
+                    }
+                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll))
+                        .await;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+impl From<QueryError> for BlockSourceError {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::ReadUnavailableTimeout { timeout, reason } => {
+                Self::ReadUnavailableTimeout { timeout, reason }
+            }
+            error => Self::new(error.to_string()),
+        }
     }
 }
 
@@ -230,14 +289,15 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
     ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
         let funding = query.funding;
         let Some(snapshot) = self
-            .0
-            .work_channel_snapshot(WorkChannelQuery {
-                bond_edge: query.bond_edge,
-                payment_edge: query.payment_edge,
-                funding: funding.clone(),
+            .read(|| {
+                self.client.work_channel_snapshot(WorkChannelQuery {
+                    bond_edge: query.bond_edge,
+                    payment_edge: query.payment_edge,
+                    funding: funding.clone(),
+                })
             })
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
         else {
             return Ok(None);
         };
@@ -259,13 +319,14 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        self.0.work_channel_snapshot(query).await
+        self.read(|| self.client.work_channel_snapshot(query.clone()))
+            .await
     }
 }
 
 impl<C: LightClient> TxSink for WorkBlocks<C> {
     async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
-        self.0
+        self.client
             .submit_tx(Transaction::Kernel(tx))
             .await
             .map_err(|error| BlockSourceError::new(error.to_string()))
@@ -275,19 +336,20 @@ impl<C: LightClient> TxSink for WorkBlocks<C> {
 impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
         Ok(self
-            .0
-            .get_latest_block()
+            .read(|| self.client.get_latest_block())
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
             .map(|block| block.height))
     }
 
     async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
         let Some(finalized) = self
-            .0
-            .get_finalized_block(FinalizedBlockQuery::Height(height))
+            .read(|| {
+                self.client
+                    .get_finalized_block(FinalizedBlockQuery::Height(height))
+            })
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
         else {
             return Ok(None);
         };

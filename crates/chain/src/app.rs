@@ -161,7 +161,7 @@ impl Mempool {
         SubmitTxOutcome::Enqueued
     }
 
-    #[cfg(all(test, feature = "validator"))]
+    #[cfg(all(any(test, feature = "test-support"), feature = "validator"))]
     pub(crate) async fn test_transactions(&self) -> Vec<Transaction> {
         let mempool = self.inner.lock().await;
         mempool
