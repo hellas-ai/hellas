@@ -567,11 +567,13 @@ in
     import ./gpu.nix {
       inherit pkgs;
       inherit (pkgs) hellasLib;
-      rocminfo =
+      inherit
         (import ./rocm.nix {
           inherit pkgs;
           inherit (self.inputs) nix-strix-halo;
-        }).rocminfo;
+        })
+        rocminfo
+        ;
     }
   );
 
