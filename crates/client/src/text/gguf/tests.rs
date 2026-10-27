@@ -269,6 +269,16 @@ fn all_metadata_scalar_types_and_nested_arrays_preserve_the_tensor_table() {
 
 #[test]
 fn excessive_counts_strings_arrays_and_nesting_fail_before_large_allocations() {
+    let mut bytes = prefix(1, 0);
+    tensor(&mut bytes, "rank-five", &[1; 5], 0, 0);
+    bytes.resize(160, 0);
+    assert!(matches!(
+        read_header(&mut Cursor::new(bytes)),
+        Err(Error::Limit {
+            field: "tensor rank",
+            ..
+        })
+    ));
     for (at, field) in [(8, "tensor count"), (16, "metadata count")] {
         let mut bytes = prefix(0, 0);
         patch64(&mut bytes, at, u64::MAX);
