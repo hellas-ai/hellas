@@ -210,8 +210,10 @@ type RunAcceptedWork = dyn Fn(WorkService, ReadyChannel, Digest) -> BoxFuture<'s
     + Send
     + Sync;
 
+/// Runs accepted jobs detached from requests and the clock; provider shutdown
+/// aborts them, which cancels their backend work (including compilation).
 #[derive(Clone)]
-struct AcceptedWorkDriver(Arc<RunAcceptedWork>);
+struct AcceptedWorkDriver(Arc<RunAcceptedWork>, Arc<Mutex<tokio::task::JoinSet<()>>>);
 
 impl AcceptedWorkDriver {
     fn new<B>(backend: B) -> Self
@@ -219,12 +221,24 @@ impl AcceptedWorkDriver {
         B: WorkBackend + Send + Sync + 'static,
     {
         let backend = Arc::new(backend);
-        Self(Arc::new(move |service, ready, work_id| {
-            let backend = Arc::clone(&backend);
-            Box::pin(
-                async move { run_accepted_work(&service, &ready, backend.as_ref(), work_id).await },
-            )
-        }))
+        Self(
+            Arc::new(move |service, ready, work_id| {
+                let backend = Arc::clone(&backend);
+                Box::pin(async move {
+                    run_accepted_work(&service, &ready, backend.as_ref(), work_id).await
+                })
+            }),
+            Default::default(),
+        )
+    }
+
+    /// Aborts every accepted job and waits until each has been dropped.
+    async fn shutdown(&self) {
+        let mut tasks = match self.1.lock() {
+            Ok(mut tasks) => std::mem::take(&mut *tasks),
+            Err(error) => std::mem::take(&mut *error.into_inner()),
+        };
+        tasks.shutdown().await;
     }
 
     /// Starts one accepted job without lending its lifetime to either the
@@ -232,7 +246,12 @@ impl AcceptedWorkDriver {
     fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
         let running = (self.0)(service, ready, work_id);
         let span = hellas_rpc::request_span!(target: "hellas_request", "paid.provider.execute", hellas.work.id = ?work_id, otel.status_code = tracing::field::Empty);
-        tokio::spawn(tracing::Instrument::instrument(
+        let mut tasks = match self.1.lock() {
+            Ok(tasks) => tasks,
+            Err(error) => error.into_inner(),
+        };
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(tracing::Instrument::instrument(
             async move {
                 match running.await {
                     Ok(RunOutcome::Completed { .. }) => {
@@ -445,10 +464,13 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Suspends every channel before releasing its mount. Cancellation retains
+    /// Aborts accepted jobs, then suspends every channel before releasing its mount. Cancellation retains
     /// the mounts so shutdown can resume; namespace changes serialize with draining.
     pub async fn clear_all(&self) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
+        if let Some(driver) = &self.driver {
+            driver.shutdown().await;
+        }
         let (channels, mut result) = {
             let (held, result) = match self.mounted.lock() {
                 Ok(held) => (held, Ok(())),
