@@ -272,7 +272,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     acceptance_blocks: 50,
                     terminal_blocks: 100,
                     payment_blocks: 200,
-                    timeout: Duration::from_secs(5),
+                    timeout: Some(Duration::from_secs(5)),
                 },
                 descriptor: fixture.descriptor.clone(),
                 policy: fixture.policy.clone(),

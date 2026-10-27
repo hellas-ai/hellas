@@ -42,13 +42,6 @@ fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
 ) -> anyhow::Result<identity::LocalIdentity> {
-    let settles_paid_work = matches!(
-        command,
-        Commands::Serve {
-            work_config_file: Some(_),
-            ..
-        }
-    );
     let grant_identity = matches!(
         command,
         Commands::Admin(_)
@@ -58,7 +51,6 @@ fn load_command_identity(
             }
     );
     let read_only = grant_identity
-        || settles_paid_work
         || matches!(
             command,
             Commands::Identity {
@@ -235,9 +227,9 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid-work configuration. Its presence serves WorkSetup and Work;
-        /// Work remains retryably not ready until the configured state mounts.
-        #[arg(long = "paid-work-config")]
+        /// Paid terms (TOML) the selected owner approves at startup. Paid
+        /// work is sold only with this file.
+        #[arg(long = "paid-work-config", value_name = "FILE", conflicts_with = "await_owner")]
         work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
@@ -402,6 +394,8 @@ enum Commands {
     Transact(commands::transact::TransactArgs),
     /// Buy an HTTPS Fetch using the same job and payment path.
     Fetch(commands::transact::FetchArgs),
+    /// Buy one call of a Catena program using the same job and payment path.
+    Run(commands::transact::RunArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -487,10 +481,6 @@ fn validate_identity_options(
                     | IdentityCommand::ShowEnrollmentId
                     | IdentityCommand::ShowHolder
                     | IdentityCommand::ExportEnrollment { .. },
-            }
-            | Commands::Serve {
-                work_config_file: Some(_),
-                ..
             }
     );
     if software_root && reads_existing_identity {
@@ -583,18 +573,19 @@ async fn async_main() {
         return;
     }
 
-    let faucet_provider = cli.owner.is_faucet() && matches!(&cli.command, Commands::Serve { .. });
-    let faucet_requester = cli.owner.is_faucet()
-        && matches!(
-            &cli.command,
-            Commands::Transact(_)
-                | Commands::Fetch(_)
-                | Commands::Gateway {
-                    paid_work_config: Some(_),
-                    ..
-                }
-        );
-    let owner = match if faucet_provider || faucet_requester {
+    // A selected faucet account stays with this identity across restarts.
+    let persistent_owner = matches!(
+        &cli.command,
+        Commands::Serve { .. }
+            | Commands::Transact(_)
+            | Commands::Fetch(_)
+            | Commands::Run(_)
+            | Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
+            }
+    );
+    let owner = match if persistent_owner {
         cli.owner.load_persistent(cli.identity.as_deref())
     } else {
         cli.owner.load()
@@ -711,11 +702,7 @@ async fn async_main() {
 
     // Before anything binds, and before any other startup work: a
     // command that cannot have an identity has nothing further to do.
-    let local_identity = match if faucet_provider {
-        identity::load_or_create(cli.identity.as_deref())
-    } else {
-        load_command_identity(&command, cli.identity.as_deref())
-    } {
+    let local_identity = match load_command_identity(&command, cli.identity.as_deref()) {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -765,11 +752,19 @@ async fn async_main() {
             // ALPNs and then have nothing to mount behind them.
             match work_config_file
                 .as_deref()
-                .map(commands::serve::load_work_config)
+                .map(|path| {
+                    commands::serve::paid::PaidWork::load(
+                        path,
+                        identity::provider_root(cli.identity.as_deref())?,
+                        owner.clone().ok_or_else(|| {
+                            anyhow::anyhow!("--paid-work-config requires --passkey, --faucet or --faucet-account")
+                        })?,
+                    )
+                })
                 .transpose()
             {
-                Err(error) => Err(error.into()),
-                Ok(work_config) => {
+                Err(error) => Err(error),
+                Ok(paid) => {
                     async {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
@@ -811,7 +806,7 @@ async fn async_main() {
                             discovery: !no_discovery,
                             queue_size,
                             native,
-                            work_config,
+                            paid,
                             chain_node,
                             grants,
                             metrics_port,
@@ -1023,6 +1018,9 @@ async fn async_main() {
         }.await,
         Commands::Fetch(args) => async {
             commands::transact::fetch(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
+        Commands::Run(args) => async {
+            commands::transact::run_program(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
         }.await,
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),

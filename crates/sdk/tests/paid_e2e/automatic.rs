@@ -506,7 +506,7 @@ async fn compute_and_settle(
         .node
         .require_finalized_height_for_test(devnet.height() + 1);
     let mut unavailable_args = options.clone();
-    unavailable_args.timeout = Duration::from_millis(100);
+    unavailable_args.timeout = Some(Duration::from_millis(100));
     let started = tokio::time::Instant::now();
     let error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -529,7 +529,7 @@ async fn compute_and_settle(
         ),
         "bounded quote expiry: {error}"
     );
-    assert!(started.elapsed() >= unavailable_args.timeout);
+    assert!(started.elapsed() >= unavailable_args.timeout.unwrap());
     devnet.seal().await;
 
     provider
@@ -1408,7 +1408,7 @@ async fn finish(case: Box<Case>) {
         acceptance_blocks: 16,
         terminal_blocks: 64,
         payment_blocks: 32,
-        timeout: Duration::from_secs(120),
+        timeout: Some(Duration::from_secs(120)),
     };
     Box::pin(compute_and_settle(
         &mut devnet,

@@ -701,7 +701,7 @@ async fn paid_setup(
         acceptance_blocks: 16,
         terminal_blocks: 64,
         payment_blocks: 32,
-        timeout: Duration::from_secs(120),
+        timeout: Some(Duration::from_secs(120)),
     };
     let approvals = Arc::new(Approvals::default());
     let client_home = root.path().join("requester");
@@ -744,7 +744,7 @@ async fn paid_setup(
     );
     let mut options = options;
     if never_catches_up {
-        options.timeout = Duration::from_millis(250);
+        options.timeout = Some(Duration::from_millis(250));
     }
     relays
         .source
@@ -770,7 +770,7 @@ async fn paid_setup(
             .err()
             .expect("proof reads remain bounded");
         assert!(
-            matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if timeout == options.timeout),
+            matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if Some(timeout) == options.timeout),
             "typed proof read expiry: {error}"
         );
         assert!(
@@ -869,7 +869,7 @@ async fn paid_finish(case: PaidScenario) {
     devnet.seal().await;
     devnet.seal().await;
     let resumed_height = devnet.height();
-    tokio::time::timeout(options.timeout, async {
+    tokio::time::timeout(options.timeout.unwrap(), async {
         loop {
             if session.with_state(|state| state.cursor().0).await.unwrap() == resumed_height {
                 break;

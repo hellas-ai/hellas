@@ -124,6 +124,17 @@ pub(crate) fn funding_root(identity: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// Paid-provider owner state beside the identity.
+pub(crate) fn provider_root(identity: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let mut path = identity
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(default_path)?
+        .into_os_string();
+    path.push(".provider");
+    Ok(PathBuf::from(path))
+}
+
 pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
     default_hellas_path("gateway-archive", "--archive-dir")
 }
