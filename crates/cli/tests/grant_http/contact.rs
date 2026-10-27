@@ -39,9 +39,10 @@ async fn contact_cards_introduce_the_passkey_principal() {
     );
     assert_eq!(imported["display_name"], "Provider");
     // The card is the friend's, saved under the importer's principal.
-    let decoded =
-        hellas_work::model::grant::records::decode_contact_card(&std::fs::read(&card).unwrap())
-            .unwrap();
+    let decoded = hellas_authority::model::grant::records::decode_contact_card(
+        &std::fs::read(&card).unwrap(),
+    )
+    .unwrap();
     assert_eq!(decoded.principal(), provider.principal());
     assert!(
         directory

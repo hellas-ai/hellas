@@ -30,7 +30,7 @@ impl EvaluateRequest {
 /// Returns the canonical DAG-CBOR array [`Evaluate::commit_request`] hashes.
 ///
 /// Exposed as bytes because a second protocol — the paid-work bundle in
-/// `hellas_work::model::prepared_input::PreparedPaidInputV1` — must carry the
+/// `hellas_channel::model::prepared_input::PreparedPaidInputV1` — must carry the
 /// exact preimage of the request commitment, not a second spelling of the
 /// same fields. There is one encoder and one field order; a caller that
 /// re-derived these bytes could disagree with the commitment they claim

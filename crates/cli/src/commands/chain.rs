@@ -1,4 +1,4 @@
-use hellas_work::authenticator::{Authenticator, kernel_auth};
+use hellas_authority::authenticator::{Authenticator, kernel_auth};
 use std::time::Duration;
 use std::{
     fs,
@@ -1171,7 +1171,7 @@ mod signer {
     //! material is read only from the file paths supplied to the chain commands;
     //! no command accepts a scalar value directly.
 
-    use hellas_work::authenticator::{Authenticator, kernel_auth};
+    use hellas_authority::authenticator::{Authenticator, kernel_auth};
     use std::{fs, path::Path};
 
     use anyhow::{Context as _, Result, anyhow};

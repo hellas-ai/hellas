@@ -1,20 +1,24 @@
 use super::*;
 use hellas_auth::authority::Revision;
+use hellas_authority::model::grant::records::{GrantDef, Offer};
+use hellas_authority::test_support::TestClock;
+use hellas_authority::work_store::grant::NodeStore;
 use hellas_rpc::pb::work::GrantRefusal;
 use hellas_rpc::{Assurance, Retention};
 use hellas_wire::{MethodMarker, ServiceMarker, StreamTransport};
-use hellas_work::model::grant::records::{GrantDef, Offer};
-use hellas_work::model::{fetch::*, grant::budget::*};
-use hellas_work::test_support::TestClock;
-use hellas_work::test_support::{WAIT, assert_err, definition, network, policy};
-use hellas_work::work_store::grant::NodeStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
+use {hellas_authority::model::grant::budget::*, hellas_channel::model::fetch::*};
+use {
+    hellas_authority::test_support::WAIT, hellas_authority::test_support::definition,
+    hellas_authority::test_support::policy, hellas_channel::test_support::assert_err,
+    hellas_channel::test_support::network,
+};
 mod connections;
 
-pub use hellas_work::test_support::principal;
+pub use hellas_channel::test_support::principal;
 pub fn provider_enrollment(seed: u8) -> ProviderEnrollmentBundle {
-    hellas_work::test_support::software_enrollment(
+    hellas_channel::test_support::software_enrollment(
         seed,
         *iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes(),
     )
@@ -92,7 +96,7 @@ async fn setup(
     (store, secret)
 }
 
-use hellas_work::test_support::backend::{Backend, Completion, Reply};
+use hellas_channel::test_support::backend::{Backend, Completion, Reply};
 fn backend(slots: Arc<Semaphore>, calls: Arc<AtomicUsize>) -> Backend {
     Backend {
         slots,
@@ -261,7 +265,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 .node()
                 .authenticate_session(
                     &f.application.credential,
-                    hellas_work::node::SessionKey::Node(&principal(1).1),
+                    hellas_authority::node::SessionKey::Node(&principal(1).1),
                 )
                 .await
                 .unwrap();
@@ -273,7 +277,8 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 prepared_input: input.encode().unwrap(),
             };
             let response =
-                hellas_work::test_support::accept_grant(&work, &request, &principal(1).1).await;
+                hellas_authority::test_support::accept_grant(&work, &request, &principal(1).1)
+                    .await;
             assert!(matches!(
                 response.outcome,
                 Some(accept_work_response::Outcome::Accepted(_))
@@ -553,7 +558,7 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[tokio::test]
 async fn current_grant_cannot_disclose_a_new_contract_without_independent_client_approval() {

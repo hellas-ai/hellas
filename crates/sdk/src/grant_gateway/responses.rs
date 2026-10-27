@@ -3,14 +3,14 @@ use crate::{
     grant_client::{GrantSessionOptions, GrantTransport, PinnedOffer},
     grant_gateway::GrantGateway,
 };
+use hellas_authority::model::grant::records::grant_transport;
 use hellas_gateway::GatewayHandle;
-use hellas_work::model::grant::records::grant_transport;
-use hellas_work::model::{
-    fetch::FetchRoutePolicy,
-    grant::records::{GrantError, GrantPolicy},
-    profile::WorkPolicy,
-};
 use std::sync::Arc;
+use {
+    hellas_authority::model::grant::records::GrantError,
+    hellas_authority::model::grant::records::GrantPolicy,
+    hellas_channel::model::fetch::FetchRoutePolicy, hellas_channel::model::profile::WorkPolicy,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchGatewayError {

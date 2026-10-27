@@ -4,6 +4,7 @@ use hellas_auth::{
     Digest,
     authority::{AuthorityError, PrincipalId},
 };
+use hellas_authority::authenticator::{Authenticator, PublicKey, kernel_auth};
 use hellas_chain::{
     LightClient as _, QueryError,
     client::RemoteLightClient,
@@ -13,7 +14,6 @@ use hellas_kernel::{
     CoinId, Decode as _, Encode as _, Funding, Key, List, NetworkId, Reshape, Secp256k1Verifier,
     SigVerifier, Tx,
 };
-use hellas_work::authenticator::{Authenticator, PublicKey, kernel_auth};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,

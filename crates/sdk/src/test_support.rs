@@ -3,6 +3,16 @@
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_auth::ProducerSigningKey;
+use hellas_channel::model::fetch::{
+    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
+};
+use hellas_channel::model::profile::WorkPolicy;
+use hellas_channel::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+};
+use hellas_channel::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
+use hellas_channel::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
+use hellas_channel::work_store::{ChannelStore, Role, SetupOrigin};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk,
@@ -10,46 +20,36 @@ use hellas_kernel::{
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::{Assurance, Retention};
-use hellas_work::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_work::model::profile::WorkPolicy;
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
-};
-use hellas_work::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_work::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
-use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 
 pub(crate) use crate::test_identity::enrollment;
 
 pub(crate) async fn authority(
     root: &std::path::Path,
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
-) -> hellas_work::node::NodeCoordinator {
+) -> hellas_authority::node::NodeCoordinator {
     let now = hellas_auth::authority::UnixMillis(1);
     let store = crate::test_node::bootstrap_node(
         root,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         Some(enrollment),
         now,
     )
     .await
     .unwrap();
-    hellas_work::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now))
+    hellas_authority::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now))
 }
 
 pub(crate) const PRICE: u64 = 10;
 
 pub(crate) async fn application_profile(
-    node: &hellas_work::node::NodeCoordinator,
+    node: &hellas_authority::node::NodeCoordinator,
     administrator: &hellas_auth::authority::CredentialSecret,
     subject: hellas_auth::authority::PrincipalId,
     allowance: hellas_auth::authority::GrantId,
 ) -> std::sync::Arc<crate::node_control::profile::ClientProfile> {
     let credential =
         crate::test_node::execution_credential(node, administrator, subject, allowance).await;
-    let caller = hellas_work::test_support::session(node, administrator).await;
+    let caller = hellas_authority::test_support::session(node, administrator).await;
     std::sync::Arc::new(crate::node_control::profile::ClientProfile {
         authority: caller.authority(),
         authorization: crate::test_node::EXECUTION_AUTHORIZATION,
@@ -67,8 +67,8 @@ pub(crate) struct PaidFixture {
     pub ready: ReadyChannel,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
-    pub policy: hellas_work::model::setup::ProviderChannelPolicy,
-    pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV2,
+    pub policy: hellas_channel::model::setup::ProviderChannelPolicy,
+    pub proposal: hellas_channel::model::bundle::WorkChannelSetupBundleV2,
 }
 
 pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
@@ -182,7 +182,7 @@ impl PaidFixture {
             &funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let proposal = hellas_work::model::bundle::WorkChannelSetupBundleV2::propose_bond(
+        let proposal = hellas_channel::model::bundle::WorkChannelSetupBundleV2::propose_bond(
             network,
             funding,
             bond_terms.clone(),
@@ -256,7 +256,7 @@ impl PaidFixture {
                 pending: PendingSlot::Absent,
             })
             .unwrap();
-        let policy = hellas_work::model::setup::ProviderChannelPolicy {
+        let policy = hellas_channel::model::setup::ProviderChannelPolicy {
             payment_policy: payment_policy(),
             network,
             policy_salt: [9; 32],
@@ -368,8 +368,8 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     Edge::decode_exact(&bytes).unwrap()
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -377,4 +377,4 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

@@ -5,7 +5,7 @@
 //! journal to verify durability before returning. Unanswered offers reserve their
 //! staked coins as soon as revision one is signed.
 
-use hellas_work::model::grant::records::check_grant_provider;
+use hellas_authority::model::grant::records::check_grant_provider;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -14,15 +14,15 @@ pub use error::ProvisionError;
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
 use hellas_chain::WorkBlocks;
 use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
+use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::work_close::FinalizedBlocks;
+use hellas_channel::work_store::{Role, SetupScan, SetupStore};
+use hellas_channel::work_store::{SetupRecord, SetupState};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
     Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
-use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::work_close::FinalizedBlocks;
-use hellas_work::work_store::{Role, SetupScan, SetupStore};
-use hellas_work::work_store::{SetupRecord, SetupState};
 
 /// Checked inputs selected by the provider under its standing policy.
 pub struct ProvisionOptions {
@@ -59,7 +59,7 @@ pub struct ProvisionOptions {
 pub async fn provision_offer(
     options: ProvisionOptions,
     node: &hellas_chain::node::FullNode,
-    authority: &hellas_work::node::NodeCoordinator,
+    authority: &hellas_authority::node::NodeCoordinator,
     held: &[SetupState],
     write_started: &std::sync::atomic::AtomicBool,
 ) -> Result<Provisioned> {
@@ -83,7 +83,7 @@ pub struct Provisioned {
     pub bond_edge: EdgeId,
     /// The floor its history starts above, as retained.
     pub floor: SetupScan,
-    pub offer: hellas_work::model::offer::SignedPaidOffer,
+    pub offer: hellas_channel::model::offer::SignedPaidOffer,
 }
 
 /// Deterministic bond inputs, checked before a signature is journaled.
@@ -167,11 +167,11 @@ impl Offer {
         held: &[SetupState],
     ) -> Result<Self> {
         check_grant_provider(&options.provider)
-            .map_err(|_| hellas_work::model::offer::PaidOfferError::Provider)?;
+            .map_err(|_| hellas_channel::model::offer::PaidOfferError::Provider)?;
         if options.provider.genesis.statement.producer_public_key
             != hellas_auth::PublicKey::Secp256k1(options.settlement_key.party_key().to_bytes())
         {
-            return Err(hellas_work::model::offer::PaidOfferError::Provider.into());
+            return Err(hellas_channel::model::offer::PaidOfferError::Provider.into());
         }
         if options.addresses.len() > 16
             || options
@@ -180,7 +180,7 @@ impl Offer {
                 .any(|a| a.len() > 512 || a.parse::<std::net::SocketAddr>().is_err())
             || options.provider.canonical_bytes().len() > 32 * 1024
         {
-            return Err(hellas_work::model::offer::PaidOfferError::Malformed.into());
+            return Err(hellas_channel::model::offer::PaidOfferError::Malformed.into());
         }
         refuse_offer_collisions(candidate.bond_edge, &candidate.bond_funding, held)?;
         Ok(Self {
@@ -234,9 +234,9 @@ impl Offer {
         ));
         let proposal =
             WorkChannelSetupBundleV2::propose_bond(network, bond_funding, bond_terms, auth)
-                .map_err(hellas_work::model::offer::PaidOfferError::from)?;
-        let offer = hellas_work::model::offer::SignedPaidOffer::sign(
-            hellas_work::model::offer::PaidOffer {
+                .map_err(hellas_channel::model::offer::PaidOfferError::from)?;
+        let offer = hellas_channel::model::offer::SignedPaidOffer::sign(
+            hellas_channel::model::offer::PaidOffer {
                 provider,
                 proposal,
                 policy,

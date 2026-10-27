@@ -4,7 +4,7 @@
 //!
 //! One implementation of [`WorkBackend`], over this crate's own
 //! Evaluate engine. The gate that decides whether a backend may be
-//! called at all is [`hellas_work::work::run_accepted_work`]'s, and it is
+//! called at all is [`hellas_channel::work::run_accepted_work`]'s, and it is
 //! not here: it belongs beside the journal that records the decision,
 //! and a second copy of it in front of one backend would be a second
 //! opinion about when a paid job may run.
@@ -43,11 +43,11 @@
 
 use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
-use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::admission::{AdmissionError, CapacityDomain, WorkPermit};
-use hellas_work::work::{
+use hellas_channel::work::admission::{AdmissionError, CapacityDomain, WorkPermit};
+use hellas_channel::work::{
     BackendFault, PaidProgress, PreparedEvaluateInput, PreparedWorkInput, WorkBackend,
 };
+use hellas_rpc::OutputEventEnvelope;
 
 impl ExecutorHandle {
     fn capacity(

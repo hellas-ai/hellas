@@ -239,7 +239,7 @@ pub(crate) async fn connect_work(
                 application.authority,
                 binding(&transport.context(), application.authorization)?,
                 &application.credential,
-                hellas_work::node::SessionKey::Node(identity),
+                hellas_authority::node::SessionKey::Node(identity),
                 &mut recv,
                 &mut send,
                 handshake::Framing::Substream,

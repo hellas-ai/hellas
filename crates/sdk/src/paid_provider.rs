@@ -8,6 +8,17 @@ use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery};
 use hellas_chain::{node::FullNode, rpc::LocalLightClient};
+use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
+use hellas_channel::model::work::{
+    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
+};
+use hellas_channel::work::{
+    CloseEndpoint, RunError, RunOutcome, WorkBackend, WorkService, run_accepted_work,
+};
+use hellas_channel::work_close::{FinalizedBlocks, TxSink};
+use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_channel::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
+use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
@@ -20,17 +31,6 @@ use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_wire::peers::PeerId;
 use hellas_wire::{TransportContext, WireStatus};
-use hellas_work::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
-use hellas_work::model::work::{
-    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
-};
-use hellas_work::work::{
-    CloseEndpoint, RunError, RunOutcome, WorkBackend, WorkService, run_accepted_work,
-};
-use hellas_work::work_close::{FinalizedBlocks, TxSink};
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_work::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
-use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
 use offers::{AutomaticOffers, OfferAllocator};
 use std::{
     collections::BTreeMap,
@@ -44,7 +44,7 @@ use tracing::{Instrument as _, debug, info, warn};
 #[derive(Debug, thiserror::Error)]
 pub enum PaidProviderError {
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error("provider setup has no durable offer or its signing identity differs")]
     InvalidOffer,
     #[error("paid-work observer task failed")]
@@ -62,19 +62,19 @@ pub enum PaidProviderError {
     #[error("observer age must exceed a positive polling interval")]
     InvalidObservationPolicy,
     #[error(transparent)]
-    BlockSource(#[from] hellas_work::work_close::BlockSourceError),
+    BlockSource(#[from] hellas_channel::work_close::BlockSourceError),
     #[error(transparent)]
-    Endpoint(#[from] hellas_work::work::EndpointError),
+    Endpoint(#[from] hellas_channel::work::EndpointError),
     #[error(transparent)]
-    Setup(#[from] hellas_work::model::setup::WorkSetupError),
+    Setup(#[from] hellas_channel::model::setup::WorkSetupError),
     #[error(transparent)]
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]
-    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
     #[error("cannot discover work journals under {}: {source}", path.display())]
     Discover {
         path: PathBuf,
-        source: hellas_work::work_store::WorkStoreError,
+        source: hellas_channel::work_store::WorkStoreError,
     },
 }
 
@@ -165,7 +165,7 @@ pub enum MountError {
     #[error("invalid channel identity")]
     ChannelId,
     #[error(transparent)]
-    Endpoint(#[from] hellas_work::work::EndpointError),
+    Endpoint(#[from] hellas_channel::work::EndpointError),
 }
 
 impl From<MountError> for WireStatus {
@@ -190,7 +190,7 @@ pub struct MountedWork {
     changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
     node: AdmissionNode,
-    upload_quota: hellas_work::content::UploadQuota,
+    upload_quota: hellas_channel::content::UploadQuota,
 }
 
 impl Default for MountedWork {
@@ -365,7 +365,7 @@ impl WorkHandler for MountedWorkService {
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         self.service.stream_result(request, context).await
     }
 
@@ -379,7 +379,7 @@ impl WorkHandler for MountedWorkService {
 }
 
 impl MountedWork {
-    pub fn upload_quota(&self) -> hellas_work::content::UploadQuota {
+    pub fn upload_quota(&self) -> hellas_channel::content::UploadQuota {
         self.upload_quota.clone()
     }
     pub fn with_backend<B>(backend: B) -> Self
@@ -633,7 +633,7 @@ impl WorkHandler for MountedWork {
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => service.stream_result(request, context).await,
             None => UnmountedWork.stream_result(request, context).await,
@@ -686,7 +686,7 @@ impl DrivenChannel {
     async fn refresh<S>(
         &self,
         source: &S,
-        started: hellas_work::work::ObservationTime,
+        started: hellas_channel::work::ObservationTime,
         snapshot: Option<hellas_chain::WorkChannelSnapshot>,
     ) -> Result<(), PaidProviderError>
     where
@@ -811,7 +811,7 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(channel) = &self.driven {
-            let started = hellas_work::work::ObservationTime::now();
+            let started = hellas_channel::work::ObservationTime::now();
             let snapshot = match advance_paid_work_clock(&channel.service, source).await {
                 Ok(progress) => {
                     debug!(bond, close = ?progress.close, "the channel advanced");
@@ -830,7 +830,7 @@ impl SetupClock {
                     error,
                     PaidProviderError::Query(_)
                         | PaidProviderError::CatchUp(
-                            hellas_work::work_close::CatchUpError::Source(_)
+                            hellas_channel::work_close::CatchUpError::Source(_)
                         )
                 );
             } else if let Err(error) = channel.resume_accepted().await {
@@ -1140,7 +1140,7 @@ impl WorkRunner {
     pub fn on_node(
         self,
         node: FullNode,
-        authority: hellas_work::node::NodeCoordinator,
+        authority: hellas_authority::node::NodeCoordinator,
         provider: hellas_rpc::ProviderEnrollmentBundle,
         addresses: Vec<String>,
     ) -> NodeWorkRunner {
@@ -1212,7 +1212,7 @@ mod tests {
         let mount = MountedWork::default();
         mount.mount(peer, &service).await.unwrap();
         // Cancellation while suspension waits must retain the registered channel.
-        use hellas_work::work_close::CloseChannel as _;
+        use hellas_channel::work_close::CloseChannel as _;
         let mut driver = service.drive().unwrap();
         let held = driver.store().await.unwrap();
         let mut clearing = Box::pin(mount.clear_all());

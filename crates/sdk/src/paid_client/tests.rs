@@ -34,7 +34,7 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
     assert!(matches!(
         super::offer::check_policy(&args, &policy, 51),
         Err(PaidClientError::WorkSetup(
-            hellas_work::model::setup::WorkSetupError::Undercollateralised {
+            hellas_channel::model::setup::WorkSetupError::Undercollateralised {
                 bond: 51,
                 capacity: 949
             }
@@ -196,8 +196,8 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
 
 #[test]
 fn recovery_skips_only_permanent_delivery_refusals() {
+    use hellas_channel::work::{DeliverError, WorkRefusal};
     use hellas_client::work::CollectResultError;
-    use hellas_work::work::{DeliverError, WorkRefusal};
 
     for (refusal, permanent) in [
         (WorkRefusal::Declined, true),
@@ -227,10 +227,10 @@ fn fetch_request(
     assurance: Assurance,
     retention: hellas_rpc::Retention,
 ) -> (ProviderChannelPolicy, PreparedWorkInput, PublicKey) {
-    use hellas_work::model::fetch::{
+    use hellas_channel::model::fetch::{
         FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
     };
-    use hellas_work::model::work::PaidChannelPolicyV1;
+    use hellas_channel::model::work::PaidChannelPolicyV1;
     let environment = test_responses_contract();
     let caller = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
     let events = hellas_rpc::fetch::build_input_events_with_retention(
@@ -321,8 +321,8 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -330,15 +330,15 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[tokio::test]
 async fn client_checks_live_owner_and_own_payout_before_countersigning() {
     use crate::test_support::{PaidFixture, signer};
     use hellas_auth::test_support::actors::{FRIEND, ROOT};
+    use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+    use hellas_channel::work_store::SetupScan;
     use hellas_kernel::{Auth, Key, Parties, PartyAuth, PartyKeys, Terms, Tx};
-    use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-    use hellas_work::work_store::SetupScan;
 
     let root = tempfile::tempdir().unwrap();
     let peer = SecretKey::from_bytes(&[71; 32]).public();

@@ -1,4 +1,4 @@
-use hellas_work::model::grant::records::{check_grant_provider, grant_transport};
+use hellas_authority::model::grant::records::{check_grant_provider, grant_transport};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,9 +36,9 @@ pub enum ProviderError {
     #[error(transparent)]
     GrantConfig(#[from] crate::grant_provider::GrantProviderError),
     #[error(transparent)]
-    Grant(#[from] hellas_work::model::grant::records::GrantError),
+    Grant(#[from] hellas_authority::model::grant::records::GrantError),
     #[error(transparent)]
-    NodeStore(#[from] hellas_work::work_store::grant::NodeStoreError),
+    NodeStore(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("invalid provider settlement key")]
     SettlementKey,
     #[error(transparent)]
@@ -188,19 +188,21 @@ impl ProviderGrants {
         &self,
         resources: crate::grant_provider::ProviderResources<'_>,
         provider: &ProviderEnrollmentBundle,
-    ) -> Result<hellas_work::node::NodeCoordinator, ProviderError> {
+    ) -> Result<hellas_authority::node::NodeCoordinator, ProviderError> {
         resources.validate(&self.config.policies)?;
         match &self.authority {
-            ProviderAuthority::Journal { root, .. } => Ok(hellas_work::node::NodeCoordinator::new(
-                hellas_work::work_store::grant::NodeStore::open(
-                    root,
-                    hellas_work::model::grant::grant_network(),
-                    Some(provider.clone()),
-                    hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-                )
-                .await?,
-                Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-            )),
+            ProviderAuthority::Journal { root, .. } => {
+                Ok(hellas_authority::node::NodeCoordinator::new(
+                    hellas_authority::work_store::grant::NodeStore::open(
+                        root,
+                        hellas_authority::model::grant::grant_network(),
+                        Some(provider.clone()),
+                        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+                    )
+                    .await?,
+                    Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+                ))
+            }
             ProviderAuthority::Host(control) => {
                 let node = control.node();
                 node.check_provider(provider).await?;
@@ -290,7 +292,7 @@ impl IncomingConnection {
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = IDLE_TIMEOUT;
 pub struct ProviderHandle {
     configuration: Option<crate::node_control::configuration::ProviderMetadata>,
-    administration: Option<hellas_work::grant_service::WorkAdministration>,
+    administration: Option<hellas_authority::grant_service::WorkAdministration>,
     router: Option<WorkRouter>,
     discovery: Option<discovery::DiscoveryAdvertiser>,
     stop: Option<oneshot::Sender<()>>,
@@ -337,7 +339,7 @@ impl ProviderHandle {
         self.accept_task.is_finished()
     }
 
-    pub fn administration(&self) -> Option<&hellas_work::grant_service::WorkAdministration> {
+    pub fn administration(&self) -> Option<&hellas_authority::grant_service::WorkAdministration> {
         self.administration.as_ref()
     }
 
@@ -516,7 +518,7 @@ where
 
     let open_identity = config.open_identity;
     let (grants, administration, admin) = if let Some((grants, store)) = prepared_grants {
-        let service = hellas_work::grant_service::GrantService::from_node(
+        let service = hellas_authority::grant_service::GrantService::from_node(
             store,
             &open_identity.enrollment,
             signer,
@@ -529,7 +531,7 @@ where
         )
         .await?
         .with_upload_quota(work_mount.upload_quota());
-        let administration = hellas_work::grant_service::WorkAdministration::new(
+        let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.policies,
             grants.config.max_job_millis,

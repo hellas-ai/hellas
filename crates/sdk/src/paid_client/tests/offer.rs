@@ -1,9 +1,9 @@
 use super::*;
 use crate::test_support::{PaidFixture, enrollment, signer};
+use hellas_channel::model::offer::{PaidOffer, SignedPaidOffer};
+use hellas_channel::work::ObservationTime;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
-use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
-use hellas_work::work::ObservationTime;
 use std::sync::Arc;
 
 /// Chain readiness is supplied by the funded-channel fixture. Offer import,
@@ -68,11 +68,11 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         use crate::grant_client::tests::principal;
         use crate::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
         use hellas_auth::authority::{GrantId, UnixMillis};
-        use hellas_work::model::grant::{
+        use hellas_authority::model::grant::{
             budget::{Limit, Meter, Window},
             records::{Offer, SignedOffer},
         };
-        use hellas_work::test_support::{definition, network};
+        use {hellas_authority::test_support::definition, hellas_channel::test_support::network};
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
         let grant = definition(GrantId([1; 16]), principal(1).0);
         let (store, secret) = crate::test_node::bootstrap_node_with_credential(
@@ -83,7 +83,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         )
         .await
         .unwrap();
-        let grants = hellas_work::grant_service::GrantService::new(
+        let grants = hellas_authority::grant_service::GrantService::new(
             store,
             Arc::new(producer.clone()),
             super::recovery::Backend::default(),
@@ -253,7 +253,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             needs_recovery: false,
         };
         let error = session.run(Some(fixture.proposal().prepared_input), false, None).await.err().expect("interrupted before acknowledgement");
-        assert!(matches!(error, PaidClientError::Payment(hellas_work::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
+        assert!(matches!(error, PaidClientError::Payment(hellas_channel::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
         assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
         let first = session.with_state(|state| {
@@ -279,7 +279,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         service.with_state(|state| {
             assert_eq!(state.ledger().credited_cumulative(), 2 * crate::test_support::PRICE);
             for id in [first, result.work_id] {
-                assert!(matches!(state.terminal_by_id(id).unwrap().outcome, hellas_work::work_store::TerminalOutcome::Certified { .. }));
+                assert!(matches!(state.terminal_by_id(id).unwrap().outcome, hellas_channel::work_store::TerminalOutcome::Certified { .. }));
             }
         }).await.unwrap();
         assert_eq!(backend_calls.load(std::sync::atomic::Ordering::SeqCst), 2);

@@ -1,18 +1,18 @@
 use super::*;
 use hellas_chain::LightClient as _;
+use hellas_channel::model::offer::{SignedPaidOffer, request_digest};
 use hellas_kernel::{CoinId, Key, MAX_PARTY_INPUTS};
 use hellas_rpc::pb::work::{
     OfferGranted, OfferRefusalCode, OfferRefused, PaymentEdgeValues, Quote, RequestOfferRequest,
     RequestOfferResponse, request_offer_response::Outcome,
 };
-use hellas_work::model::offer::{SignedPaidOffer, request_digest};
 use std::collections::BTreeSet;
 
 pub(super) struct OfferAllocator {
     pub needs_restart: std::sync::atomic::AtomicBool,
     pub config: WorkRunnerConfig,
     pub node: FullNode,
-    pub authority: hellas_work::node::NodeCoordinator,
+    pub authority: hellas_authority::node::NodeCoordinator,
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
     pub addresses: Vec<String>,
     pub registry: Arc<tokio::sync::Mutex<BTreeMap<EdgeId, SetupService>>>,
@@ -127,7 +127,7 @@ fn quote(
     let fees = values.close_fees();
     let bytes = hellas_rpc::protocol::value::encode_bounded(
         &policy,
-        hellas_work::model::grant::records::MAX_OFFER_BYTES,
+        hellas_authority::model::grant::records::MAX_OFFER_BYTES,
     )
     .map_err(unavailable)?;
     Ok(RequestOfferResponse {
@@ -256,9 +256,9 @@ impl OfferAllocator {
             let released = matches!(
                 state.end(),
                 Some(
-                    hellas_work::work_store::SetupEnd::Complete
-                        | hellas_work::work_store::SetupEnd::Aborted(
-                            hellas_work::work_store::SetupAbort::BondReclaimed
+                    hellas_channel::work_store::SetupEnd::Complete
+                        | hellas_channel::work_store::SetupEnd::Aborted(
+                            hellas_channel::work_store::SetupAbort::BondReclaimed
                         )
                 )
             );

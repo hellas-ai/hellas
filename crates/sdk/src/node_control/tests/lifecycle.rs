@@ -1,7 +1,7 @@
 use super::*;
 use crate::node_control::host::{HostHandle, HostOptions};
-use hellas_work::test_support::{assert_err, within};
 use std::sync::atomic::AtomicUsize;
+use {hellas_authority::test_support::within, hellas_channel::test_support::assert_err};
 
 type Client = Arc<HostControlClientImpl<hellas_wire::mux::MuxTransport>>;
 mod gateway_keys;
@@ -69,13 +69,13 @@ impl Harness {
                                 port: Some(0),
                                 identity: crate::NodeIdentity::from_secret_bytes(
                                     [5; 32],
-                                    hellas_work::test_support::actors::PROVIDER
+                                    hellas_channel::test_support::actors::PROVIDER
                                         .node_key()
                                         .to_secret_bytes(),
                                 )?,
                                 enrollment,
                                 root: Arc::new(
-                                    hellas_work::test_support::actors::PROVIDER.node_key(),
+                                    hellas_channel::test_support::actors::PROVIDER.node_key(),
                                 ),
                                 state_directory: forbidden_journal,
                                 grants: Some(crate::GrantProviderOptions {
@@ -144,7 +144,7 @@ impl Harness {
                 "localhost".try_into().unwrap(),
                 authority(),
                 credential,
-                hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+                hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
             )
             .await
             .unwrap()
@@ -156,19 +156,19 @@ impl Harness {
     }
     async fn credential(&self, operation: &str) -> CredentialSecret {
         let admin =
-            hellas_work::test_support::session(&self.fixture.node, &self.fixture.secret).await;
+            hellas_authority::test_support::session(&self.fixture.node, &self.fixture.secret).await;
         let mut scope = scope(ROOT);
         scope
             .permissions
             .retain(|p| p.operation.as_str() == operation);
         scope.issuance = None;
         scope.delegation_depth = 0;
-        hellas_work::test_support::credentials::issue_one(
+        hellas_authority::test_support::credentials::issue_one(
             &self.fixture.node,
             &admin,
             ROOT_GRANT,
             scope.clone(),
-            hellas_work::test_support::holder(scope.subject),
+            hellas_channel::test_support::holder(scope.subject),
         )
         .await
         .unwrap()
@@ -207,9 +207,9 @@ async fn unbound_fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let (store, secret) = NodeStore::bootstrap(
         directory.path(),
-        hellas_work::test_support::network(),
+        hellas_channel::test_support::network(),
         ROOT_GRANT,
-        hellas_work::test_support::common_node::approval_for(
+        hellas_authority::test_support::common_node::approval_for(
             hellas_auth::authority::Ownership::Bootstrap {
                 root: ROOT_GRANT,
                 target: None,
@@ -256,7 +256,7 @@ async fn an_unbound_host_serves_control_and_starts_its_provider_once_bound() {
     );
     let enrollment = crate::test_support::provider_enrollment();
     let gateway = h
-        .connect(&h.credential(hellas_work::node::GATEWAY_INVOKE).await)
+        .connect(&h.credential(hellas_authority::node::GATEWAY_INVOKE).await)
         .await;
     assert_eq!(
         gateway
@@ -281,7 +281,7 @@ async fn an_unbound_host_serves_control_and_starts_its_provider_once_bound() {
         .await
         .unwrap();
     assert_eq!(bound.provider_genesis, enrollment.content_id().as_bytes());
-    let other = hellas_work::test_support::software_enrollment(3, [3; 32]);
+    let other = hellas_channel::test_support::software_enrollment(3, [3; 32]);
     let refused = owner
         .bind_provider(bind_request(other.canonical_bytes()))
         .await
@@ -309,7 +309,7 @@ async fn an_unbound_host_serves_control_and_starts_its_provider_once_bound() {
 async fn status_only_credentials_cannot_control_services_or_read_gateway_secrets() {
     let h = Harness::new().await;
     let reader = h
-        .connect(&h.credential(hellas_work::node::HOST_STATUS).await)
+        .connect(&h.credential(hellas_authority::node::HOST_STATUS).await)
         .await;
     reader
         .get_host_status(read_request(ROOT_GRANT))
@@ -373,7 +373,7 @@ async fn standalone_node_control_reports_unmounted_lifecycle() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -460,13 +460,13 @@ async fn eight_lifecycle_commands_can_queue_over_rpc() {
 async fn accepted_start_survives_requester_cancellation() {
     let h = Harness::new().await;
     let credential = h
-        .credential(hellas_work::node::HOST_PROVIDER_CONFIGURE)
+        .credential(hellas_authority::node::HOST_PROVIDER_CONFIGURE)
         .await;
     let request = Harness::enable(h.connect(&credential).await);
     within(h.starting.notified()).await;
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    let admin = hellas_work::test_support::session(&h.fixture.node, &h.fixture.secret).await;
+    let admin = hellas_authority::test_support::session(&h.fixture.node, &h.fixture.secret).await;
     h.fixture
         .node
         .revoke_credential(&admin, ROOT_GRANT, credential.id(), Revision(1))
@@ -513,13 +513,13 @@ async fn provider_restart_retains_the_host_control_writer() {
         assert_err!(
             NodeStore::open(
                 h.fixture.directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 Some(crate::test_support::provider_enrollment()),
                 UnixMillis(1000)
             )
             .await,
-            hellas_work::work_store::grant::NodeStoreError::Journal(
-                hellas_work::work_store::journal::JournalError::Locked { .. }
+            hellas_authority::work_store::grant::NodeStoreError::Journal(
+                hellas_channel::work_store::journal::JournalError::Locked { .. }
             )
         );
     }
@@ -534,7 +534,7 @@ async fn provider_restart_retains_the_host_control_writer() {
     drop(h.fixture.node);
     NodeStore::open(
         h.fixture.directory.path(),
-        hellas_work::test_support::network(),
+        hellas_channel::test_support::network(),
         Some(crate::test_support::provider_enrollment()),
         UnixMillis(1000),
     )
@@ -593,7 +593,7 @@ async fn controlled_host(
             "localhost".try_into().unwrap(),
             authority(),
             secret,
-            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+            hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap()
@@ -606,7 +606,7 @@ async fn controlled_host(
             "localhost".try_into().unwrap(),
             authority(),
             secret,
-            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+            hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap()
@@ -728,7 +728,7 @@ async fn stopped_gateway_does_not_disclose_access() {
 
 #[tokio::test]
 async fn stopping_gateway_drains_in_flight_work() {
-    use hellas_work::test_support::backend::{Backend, Completion};
+    use hellas_channel::test_support::backend::{Backend, Completion};
     let backend = Backend {
         finish: Completion::Permits(Arc::new(Semaphore::new(0))),
         ..Default::default()
@@ -805,7 +805,7 @@ async fn normal_remote_control_survives_provider_restarts_and_accepts_another_de
             connection,
             authority(),
             &h.fixture.secret,
-            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+            hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap();
@@ -843,7 +843,7 @@ async fn host_enforces_configuration_step_up_before_calling_the_embedder() {
         "localhost".try_into().unwrap(),
         authority(),
         &h.fixture.secret,
-        hellas_work::node::SessionKey::Node(&ROOT.node_key()),
+        hellas_authority::node::SessionKey::Node(&ROOT.node_key()),
     )
     .await
     .unwrap();

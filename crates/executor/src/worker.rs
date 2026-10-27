@@ -239,7 +239,7 @@ pub(crate) enum EnqueueError {
 
 pub(crate) struct ExecuteJob {
     pub complete: tokio::sync::oneshot::Sender<()>,
-    pub running: hellas_work::work::admission::RunningWork,
+    pub running: hellas_channel::work::admission::RunningWork,
     pub span: tracing::Span,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,
@@ -251,7 +251,7 @@ pub(crate) struct ExecuteJob {
 }
 
 pub(crate) struct WorkerCompletion {
-    pub running: hellas_work::work::admission::RunningWork,
+    pub running: hellas_channel::work::admission::RunningWork,
     pub complete: tokio::sync::oneshot::Sender<()>,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,

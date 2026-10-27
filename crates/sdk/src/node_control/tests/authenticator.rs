@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::authenticator::{Authenticator, PublicKey};
+use hellas_authority::authenticator::{Authenticator, PublicKey};
 use std::sync::atomic::AtomicBool;
 
 struct Prompt {

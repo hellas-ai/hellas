@@ -16,6 +16,23 @@ use crate::work_link::WorkLink as ProviderDialer;
 use futures::StreamExt as _;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::profile::{PreparedWorkInput, WorkPolicy};
+use hellas_channel::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
+use hellas_channel::model::work::{
+    JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
+};
+use hellas_channel::work::{
+    ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, fetch_result,
+    propose_work, resume_work_proposal,
+};
+use hellas_channel::work_close::FinalizedBlocks as _;
+use hellas_channel::work_handshake::{
+    PaymentAdmission, SetupEndpoint, SetupService, apply_setup_exchange, prepare_setup_exchange,
+    send_setup_exchange,
+};
+use hellas_channel::work_open::{SetupAdvance, SetupProgress};
+use hellas_channel::work_store::{Role, SetupScan, SetupStore};
 use hellas_client::work::payment::pay_for_result;
 use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
@@ -25,23 +42,6 @@ use hellas_rpc::protocol::artifacts::Canonical as _;
 use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::profile::{PreparedWorkInput, WorkPolicy};
-use hellas_work::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
-use hellas_work::model::work::{
-    JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
-};
-use hellas_work::work::{
-    ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, fetch_result,
-    propose_work, resume_work_proposal,
-};
-use hellas_work::work_close::FinalizedBlocks as _;
-use hellas_work::work_handshake::{
-    PaymentAdmission, SetupEndpoint, SetupService, apply_setup_exchange, prepare_setup_exchange,
-    send_setup_exchange,
-};
-use hellas_work::work_open::{SetupAdvance, SetupProgress};
-use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use std::sync::Arc;
@@ -102,7 +102,7 @@ async fn propose_client_payment(
 }
 
 fn check_client_party(
-    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV2,
+    bundle: &hellas_channel::model::bundle::WorkChannelSetupBundleV2,
     owner: hellas_auth::authority::PrincipalId,
     signer: &Secp256k1Signer,
 ) -> Result<()> {
@@ -147,7 +147,7 @@ impl InputIdentities {
     }
 
     fn from_parts(
-        parts: &hellas_work::model::prepared_input::PreparedPaidInputParts,
+        parts: &hellas_channel::model::prepared_input::PreparedPaidInputParts,
     ) -> Result<Self> {
         let allowed_environment = parts.manifest.content_id();
         if parts.evaluate_request.execution_environment != allowed_environment {
@@ -211,7 +211,7 @@ fn spawn_observer(
                 break;
             };
             let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
-            let started = hellas_work::work::ObservationTime::now();
+            let started = hellas_channel::work::ObservationTime::now();
             let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
             let result = tokio::time::timeout(
                 config.max_observation_age,
@@ -477,7 +477,7 @@ impl PaidWorkSession {
         let (mounted, descriptor) =
             drive_setup(&setup_service, &policy, &chain, config.poll).await?;
         let chain = chain.with_min_height(mounted.state().cursor().0);
-        let started = hellas_work::work::ObservationTime::now();
+        let started = hellas_channel::work::ObservationTime::now();
         let ready = match ready_channel(&descriptor, &chain).await {
             Ok(ready) => Some(ready),
             Err(PaidClientError::WorkSetup(_)) => None,
@@ -552,7 +552,7 @@ impl PaidWorkSession {
     /// Reads local journal state under a short lock.
     pub async fn with_state<R>(
         &self,
-        read: impl FnOnce(&hellas_work::work_store::Channel) -> R,
+        read: impl FnOnce(&hellas_channel::work_store::Channel) -> R,
     ) -> Result<R> {
         Ok(self.client.with_state(read).await?)
     }
@@ -590,7 +590,7 @@ impl PaidWorkSession {
         &mut self,
         prepared: Option<PreparedWorkInput>,
         recover: bool,
-        progress: Option<hellas_work::work::PaidProgress>,
+        progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
         self.run_prepared(prepared, recover, progress, None, None)
             .await
@@ -602,7 +602,7 @@ impl PaidWorkSession {
         &mut self,
         prepared: Option<PreparedWorkInput>,
         recover: bool,
-        progress: Option<hellas_work::work::PaidProgress>,
+        progress: Option<hellas_channel::work::PaidProgress>,
         proposed: Option<&AtomicBool>,
         purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -639,7 +639,7 @@ impl PaidWorkSession {
             return if prepared.is_none() {
                 Ok(None)
             } else {
-                Err(hellas_work::work::EndpointError::NotAdmitting.into())
+                Err(hellas_channel::work::EndpointError::NotAdmitting.into())
             };
         }
         let ready = client.readiness().await?;
@@ -655,7 +655,7 @@ impl PaidWorkSession {
                 Unrecoverable(hellas_auth::Digest),
                 Replay(
                     hellas_auth::Digest,
-                    hellas_work::work_store::JobPhase,
+                    hellas_channel::work_store::JobPhase,
                     PreparedWorkInput,
                 ),
             }
@@ -692,7 +692,7 @@ impl PaidWorkSession {
                             }
                             PreparedWorkInput::decode(
                                 job.prepared_input(),
-                                hellas_work::content::MAX_CONTENT_BYTES,
+                                hellas_channel::content::MAX_CONTENT_BYTES,
                             )
                             .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
                             .map_err(PaidClientError::from)
@@ -737,10 +737,10 @@ impl PaidWorkSession {
                 )
                 .await;
                 if let Err(error) = &result
-                    && ((phase == hellas_work::work_store::JobPhase::HalfSigned
+                    && ((phase == hellas_channel::work_store::JobPhase::HalfSigned
                         && matches!(
                             error,
-                            PaidClientError::Propose(hellas_work::work::ProposeError::Refused {
+                            PaidClientError::Propose(hellas_channel::work::ProposeError::Refused {
                                 refusal,
                                 ..
                             }) if !refusal.is_retryable()
@@ -801,8 +801,8 @@ impl PaidWorkSession {
 }
 
 fn permanently_refused_delivery(error: &PaidClientError) -> bool {
+    use hellas_channel::work::DeliverError;
     use hellas_client::work::CollectResultError;
-    use hellas_work::work::DeliverError;
     let delivery = match error {
         PaidClientError::Deliver(error)
         | PaidClientError::Collect(CollectResultError::Deliver(error)) => Some(error),
@@ -845,12 +845,12 @@ async fn propose_when_ready(
         };
         match result {
             Ok(work_id) => return Ok(work_id),
-            Err(hellas_work::work::ProposeError::Refused { refusal, .. })
+            Err(hellas_channel::work::ProposeError::Refused { refusal, .. })
                 if refusal.is_retryable() => {}
             // Finalized setup can reach the client before the provider's clock
             // mounts Work. Upload has no structured NotReady response; the
             // retained half-signed proposal makes this retry the same purchase.
-            Err(hellas_work::work::ProposeError::Transport(status))
+            Err(hellas_channel::work::ProposeError::Transport(status))
                 if status.code() == hellas_wire::WireCode::Unavailable => {}
             Err(error) => return Err(error.into()),
         }
@@ -874,9 +874,9 @@ async fn pay_when_ready(
         loop {
             match pay_for_result(dialer.work().await?, client, work_id).await {
                 Ok(credited) => return Ok(credited),
-                Err(hellas_work::work::PaymentError::Refused { refusal, .. })
+                Err(hellas_channel::work::PaymentError::Refused { refusal, .. })
                     if refusal.is_retryable() => {}
-                Err(hellas_work::work::PaymentError::Transport(status))
+                Err(hellas_channel::work::PaymentError::Transport(status))
                     if status.code() == hellas_wire::WireCode::Unavailable => {}
                 Err(error) => return Err(error.into()),
             }
@@ -902,9 +902,9 @@ async fn execute_paid_job(
     prepared: PreparedWorkInput,
     dialer: &ProviderDialer,
     client: &mut ClientService,
-    ready: &hellas_work::model::setup::ReadyChannel,
+    ready: &hellas_channel::model::setup::ReadyChannel,
     poll: Duration,
-    progress: Option<&hellas_work::work::PaidProgress>,
+    progress: Option<&hellas_channel::work::PaidProgress>,
     lookup: JobLookup,
     proposed: Option<&AtomicBool>,
     mut purchase: Option<&mut crate::transact::Purchase>,
@@ -933,7 +933,7 @@ async fn execute_paid_job(
                         job.authorization().input_content
                             == hellas_rpc::ContentRef::for_bytes(&prepared_bytes)
                             && job.authorization().payment_deadline >= current
-                            && (job.phase() != hellas_work::work_store::JobPhase::HalfSigned
+                            && (job.phase() != hellas_channel::work_store::JobPhase::HalfSigned
                                 || job.authorization().acceptance_deadline >= current)
                     }
                 })
@@ -956,7 +956,7 @@ async fn execute_paid_job(
         tracing::debug!(%work_id, "retained job input restored");
     }
     let (work_id, already_collected) = match existing.first().copied() {
-        Some((work_id, hellas_work::work_store::JobPhase::HalfSigned, _)) => (
+        Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
                 dialer,
                 client,
@@ -969,8 +969,8 @@ async fn execute_paid_job(
             .await?,
             false,
         ),
-        Some((work_id, hellas_work::work_store::JobPhase::Ready, _))
-        | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => {
+        Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
+        | Some((work_id, hellas_channel::work_store::JobPhase::Matched, _)) => {
             let retained = client
                 .with_state(|state| {
                     state
@@ -1012,7 +1012,7 @@ async fn execute_paid_job(
     } else if progress.is_some() || matches!(proposal.prepared_input, PreparedWorkInput::Fetch(_)) {
         let mut emitted = false;
         let delivery = loop {
-            let result = hellas_work::work::fetch_result_stream(
+            let result = hellas_channel::work::fetch_result_stream(
                 dialer.work().await?,
                 client,
                 ready,
@@ -1023,7 +1023,9 @@ async fn execute_paid_job(
                     if let Some(progress) = progress {
                         emitted = true;
                         progress(event.clone()).map_err(|error| {
-                            hellas_work::model::work::PaidWorkError::Transcript(error.to_string())
+                            hellas_channel::model::work::PaidWorkError::Transcript(
+                                error.to_string(),
+                            )
                         })?;
                     }
                     Ok(())
@@ -1035,10 +1037,12 @@ async fn execute_paid_job(
                 Err(error) => error,
             };
             let retryable = match &error {
-                hellas_work::work::DeliverError::Transport(status) => {
+                hellas_channel::work::DeliverError::Transport(status) => {
                     status.code == hellas_wire::WireCode::Unavailable
                 }
-                hellas_work::work::DeliverError::Refused { refusal, .. } => refusal.is_retryable(),
+                hellas_channel::work::DeliverError::Refused { refusal, .. } => {
+                    refusal.is_retryable()
+                }
                 _ => false,
             };
             // Retry delivery of this accepted job only before exposing output.
@@ -1121,7 +1125,7 @@ pub(crate) fn check_request(
                     "Fetch retention must be ephemeral",
                 ));
             }
-            if let hellas_work::model::fetch::FetchRoutePolicy::SealedRoute { service, method } =
+            if let hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { service, method } =
                 route
                 && (&request.service != service || &request.method != method)
             {
@@ -1145,7 +1149,7 @@ pub fn check_evaluate_input(
     if expected.allowed_environment != input.allowed_environment {
         return Err(PaidClientError::InputMismatch("Evaluate environment"));
     }
-    if !(hellas_work::model::work::matches_generation_policy(expected, &parts.text_policy)?) {
+    if !(hellas_channel::model::work::matches_generation_policy(expected, &parts.text_policy)?) {
         return Err(PaidClientError::InputMismatch("generation policy"));
     }
     if expected.identity_source_digest != input.identity_source_digest {
@@ -1157,7 +1161,7 @@ pub fn check_evaluate_input(
 fn payment_terms(
     config: &WorkConfig,
     policy: &ProviderChannelPolicy,
-    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV2,
+    bundle: &hellas_channel::model::bundle::WorkChannelSetupBundleV2,
     omission_bond: u64,
 ) -> WorkPaymentTerms {
     WorkPaymentTerms {
@@ -1179,7 +1183,10 @@ async fn drive_setup(
     policy: &ProviderChannelPolicy,
     chain: &WorkBlocks<RemoteLightClient>,
     poll: Duration,
-) -> Result<(hellas_work::work_store::ChannelStore, WorkChannelDescriptor)> {
+) -> Result<(
+    hellas_channel::work_store::ChannelStore,
+    WorkChannelDescriptor,
+)> {
     loop {
         let SetupAdvance { progress, mounted } = setup.advance_setup(chain, chain, chain).await?;
         if let Some(store) = mounted {
@@ -1200,7 +1207,7 @@ async fn drive_setup(
 async fn ready_channel(
     descriptor: &WorkChannelDescriptor,
     chain: &WorkBlocks<RemoteLightClient>,
-) -> Result<hellas_work::model::setup::ReadyChannel> {
+) -> Result<hellas_channel::model::setup::ReadyChannel> {
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
         payment_edge: Some(descriptor.channel().payment_edge()),
@@ -1221,7 +1228,7 @@ async fn ready_channel(
 async fn collect_until_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
-    ready: &hellas_work::model::setup::ReadyChannel,
+    ready: &hellas_channel::model::setup::ReadyChannel,
     work_id: hellas_auth::Digest,
     poll: Duration,
 ) -> Result<Vec<u8>> {
@@ -1231,7 +1238,7 @@ async fn collect_until_ready(
                 check_payment_window(client, work_id).await?;
                 return Ok(delivery.transcript);
             }
-            Err(hellas_work::work::DeliverError::Refused { refusal, reason })
+            Err(hellas_channel::work::DeliverError::Refused { refusal, reason })
                 if refusal.is_retryable() =>
             {
                 check_payment_window(client, work_id).await?;
@@ -1293,8 +1300,9 @@ async fn exchange_setup(
         loop {
             let response = send_setup_exchange(dialer.setup().await?, request.clone()).await?;
             match apply_setup_exchange(setup, response).await {
-                Err(hellas_work::work_handshake::SetupExchangeError::Refused {
-                    refusal, ..
+                Err(hellas_channel::work_handshake::SetupExchangeError::Refused {
+                    refusal,
+                    ..
                 }) if refusal.is_retryable() => tokio::time::sleep(poll).await,
                 result => return Ok(result?),
             }

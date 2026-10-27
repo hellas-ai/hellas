@@ -12,16 +12,16 @@ use hellas_rpc::{
     *,
 };
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, iroh::IrohTransport};
-use hellas_work::model::{
-    grant::{budget::*, grant_network, records::*},
-    work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest},
+use {
+    hellas_authority::grant_service::GrantService, hellas_channel::work::BackendFault,
+    hellas_channel::work::PaidProgress, hellas_channel::work::WorkBackend,
+    hellas_channel::work::admission::CapacityDomain, hellas_channel::work::admission::WorkPermit,
 };
-use hellas_work::{
-    grant_service::GrantService,
-    work::{
-        BackendFault, PaidProgress, WorkBackend,
-        admission::{CapacityDomain, WorkPermit},
-    },
+use {
+    hellas_authority::model::grant::budget::*, hellas_authority::model::grant::grant_network,
+    hellas_authority::model::grant::records::*, hellas_channel::model::work::EvaluatePolicyV2,
+    hellas_channel::model::work::generation_policy_digest,
+    hellas_channel::model::work::identity_source_digest,
 };
 
 struct Native {
@@ -35,27 +35,30 @@ impl WorkBackend for Native {
         Ok(WorkPermit::new(
             domain,
             self.slots.clone().try_acquire_owned().map_err(|_| {
-                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
             })?,
         ))
     }
     async fn execute_stream(
         &self,
-        prepared: hellas_work::work::PreparedWorkInput,
+        prepared: hellas_channel::work::PreparedWorkInput,
         progress: PaidProgress,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(
+                    hellas_channel::work::admission::CapacityDomain::Fetch,
+                )
+                .into(),
+            );
         };
         let input = *input;
         let (parts, admission) = input.into_parts_and_admission();
         let _running = admission
-            .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {
-                self.try_admit(hellas_work::work::admission::CapacityDomain::Gpu)
-            })
+            .reserve(
+                hellas_channel::work::admission::CapacityDomain::Gpu,
+                async { self.try_admit(hellas_channel::work::admission::CapacityDomain::Gpu) },
+            )
             .await?
             .dispatch()
             .await?;
@@ -107,7 +110,7 @@ impl NativeOwner {
         let owner_holder = owner.holder().await;
         let transport = iroh::SecretKey::generate();
         let signer = Arc::new(ProducerSigningKey::from_secret_bytes([42; 32]).unwrap());
-        let provider = hellas_work::test_support::enrollment(
+        let provider = hellas_channel::test_support::enrollment(
             &ProducerSigningKey::from_secret_bytes([41; 32]).unwrap(),
             &signer,
             *transport.public().as_bytes(),
@@ -137,7 +140,7 @@ impl NativeOwner {
         )
         .await
         .unwrap();
-        let owner_id = hellas_work::model::grant::owner_grant_id(
+        let owner_id = hellas_authority::model::grant::owner_grant_id(
             grant_network(),
             provider.content_id(),
             owner_principal,
@@ -182,13 +185,13 @@ impl NativeOwner {
             owner_holder,
         )
         .await;
-        let authority = hellas_work::test_support::session(&service.node(), &secret)
+        let authority = hellas_authority::test_support::session(&service.node(), &secret)
             .await
             .authority();
         let work_profile = work_profile(root, authority, &credential);
         work_admin
             .command(
-                hellas_work::model::grant::admin::WorkControlCommand::NewGeneration {
+                hellas_authority::model::grant::admin::WorkControlCommand::NewGeneration {
                     id: owner_id,
                     expected_generation: 0,
                 },
@@ -408,7 +411,7 @@ pub(super) fn native_model(
         revision: hellas_auth::authority::Revision(1),
         name: name.into(),
         https: None,
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },

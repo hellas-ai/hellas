@@ -2,7 +2,7 @@
 //!
 //! The honest result every test starts from is built the way a provider
 //! builds one: a real signed transcript, through
-//! `hellas_work::model::work::terminal_result`. Nothing here computes
+//! `hellas_channel::model::work::terminal_result`. Nothing here computes
 //! the expected digest with the function under test, so a derivation that
 //! drifted would show up as the re-execution refuting an honest result
 //! rather than as two wrongs agreeing.
@@ -10,6 +10,12 @@
 #![cfg(feature = "work")]
 
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::work::{
+    EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    PaidJobResultV1, generation_policy_digest, identity_source_digest, private_policy_commitment,
+    propose_authorization, terminal_result, work_id,
+};
 use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
@@ -24,12 +30,6 @@ use hellas_rpc::protocol::artifacts::{
 use hellas_rpc::{
     Application, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     ProgramManifest,
-};
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PaidJobResultV1, generation_policy_digest, identity_source_digest, private_policy_commitment,
-    propose_authorization, terminal_result, work_id,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -74,13 +74,13 @@ fn provider_producer() -> ProducerSigningKey {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    hellas_work::test_support::channel::credit_policy(100, 100)
+    hellas_channel::test_support::channel::credit_policy(100, 100)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    hellas_work::test_support::channel::payment_terms_for(
+    hellas_channel::test_support::channel::payment_terms_for(
         EdgeId::from_bytes([0x11; 32]),
-        hellas_work::test_support::channel::bond_terms_for(
+        hellas_channel::test_support::channel::bond_terms_for(
             Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(client().party_key()),
@@ -134,7 +134,7 @@ fn text_execution() -> TextExecution {
 }
 
 fn evaluate_request() -> EvaluateRequest {
-    hellas_work::test_support::channel::evaluate_request_for(
+    hellas_channel::test_support::channel::evaluate_request_for(
         text_execution().input_id().digest(),
         PublicKey::Secp256k1(client().party_key().to_bytes()),
         manifest().content_id(),
@@ -154,7 +154,7 @@ fn bundle() -> PreparedPaidInputV1 {
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    hellas_work::test_support::channel::evaluate_policy(
+    hellas_channel::test_support::channel::evaluate_policy(
         manifest().content_id(),
         match generation_policy_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&text_policy()),
@@ -209,7 +209,7 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
     .artifact
     .output_id()
     .digest();
-    let transcript = hellas_work::test_support::channel::transcript_chunks(
+    let transcript = hellas_channel::test_support::channel::transcript_chunks(
         &request,
         &[answer],
         &key,
@@ -558,8 +558,8 @@ async fn the_answer_is_bound_to_the_job_it_answers() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

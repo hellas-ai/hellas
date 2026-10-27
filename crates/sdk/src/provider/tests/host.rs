@@ -1,10 +1,13 @@
 //! SDK transport worlds built on the shared, checked Work fixture.
 use crate::{grant_client::*, node_control::profile::ClientProfile};
 use hellas_auth::authority::*;
+use hellas_authority::model::grant::records::{GrantDef, Offer, SignedOffer};
 use hellas_rpc::Assurance;
-use hellas_work::model::grant::records::{GrantDef, Offer, SignedOffer};
-use hellas_work::test_support::{self as work, actors::*, *};
 use std::sync::Arc;
+use {
+    hellas_authority::test_support as work, hellas_authority::test_support::*,
+    hellas_channel::test_support::actors::*,
+};
 
 pub(crate) fn provider_enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
     work::enrollment(
@@ -87,8 +90,8 @@ impl Host {
         let admin = self.world.administrator(ROOT).await;
         let scope = Rights::new(authority(), ROOT)
             .allow(
-                hellas_work::node::GATEWAY_INVOKE,
-                hellas_work::node::host_resource(authority()),
+                hellas_authority::node::GATEWAY_INVOKE,
+                hellas_authority::node::host_resource(authority()),
             )
             .valid_from(self.world.clock.now())
             .valid_until(UnixMillis(u64::MAX))
@@ -101,7 +104,7 @@ impl Host {
             scope.clone(),
         )
         .await;
-        let (_, secret) = hellas_work::test_support::credentials::issue_one(
+        let (_, secret) = hellas_authority::test_support::credentials::issue_one(
             &node,
             &admin,
             ids::ROOT_GRANT,
@@ -206,8 +209,11 @@ impl HostBuilder {
                 ids::FRIEND_GRANT,
                 Rights::new(authority(), FRIEND)
                     .allow(
-                        hellas_work::grant_service::WORK_EXECUTE,
-                        hellas_work::grant_service::allowance_resource(authority(), allowance.id),
+                        hellas_authority::grant_service::WORK_EXECUTE,
+                        hellas_authority::grant_service::allowance_resource(
+                            authority(),
+                            allowance.id,
+                        ),
                     )
                     .valid_from(clock.now())
                     .valid_until(UnixMillis(u64::MAX))

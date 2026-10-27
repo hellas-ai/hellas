@@ -1,6 +1,6 @@
 #[cfg(test)]
-use hellas_work::model::http_usage::Usage;
-use hellas_work::model::http_usage::UsageDecoder;
+use hellas_authority::model::http_usage::Usage;
+use hellas_authority::model::http_usage::UsageDecoder;
 #[cfg(test)]
 use std::io::Write;
 use std::time::Instant;

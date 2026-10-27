@@ -1,17 +1,19 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
+use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
+use hellas_authority::model::grant::{budget::*, resource::*};
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
-use hellas_work::model::grant::admin::{WorkControlCommand, WorkControlReply};
-use hellas_work::model::grant::{budget::*, resource::*};
-use hellas_work::test_support::{
-    Allowance, Capacity,
-    actors::{FRIEND, ROOT},
-    assert_err, chat_resource, ids, use_https, within,
-};
 use std::sync::atomic::Ordering;
+use {
+    hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
+    hellas_authority::test_support::chat_resource, hellas_authority::test_support::ids,
+    hellas_authority::test_support::use_https, hellas_authority::test_support::within,
+    hellas_channel::test_support::actors::FRIEND, hellas_channel::test_support::actors::ROOT,
+    hellas_channel::test_support::assert_err,
+};
 
-use hellas_work::test_support::backend::{Backend, Completion, Reply};
+use hellas_channel::test_support::backend::{Backend, Completion, Reply};
 fn inspect_chat(request: &hellas_rpc::fetch::FetchInput) {
     let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(request.body.as_bytes()).unwrap();
     let body: serde_json::Value = serde_json::from_slice(&http.body().unwrap()).unwrap();
@@ -156,7 +158,7 @@ impl Fixture {
         }
     }
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
-        hellas_work::grant_service::WorkAdministration::new(
+        hellas_authority::grant_service::WorkAdministration::new(
             self.host.world.service.clone(),
             self.host.allowance.policies.clone(),
             self.host.allowance.max_job_millis,
@@ -295,7 +297,7 @@ async fn paused_terms_are_denied_at_the_gateway() {
         panic!("allowance status")
     };
     let grant = &fixture.host.allowance;
-    let terms = hellas_work::model::grant::admin::AllowanceTerms {
+    let terms = hellas_authority::model::grant::admin::AllowanceTerms {
         policies: grant.policies.iter().map(|p| p.name.clone()).collect(),
         budget: grant.budget,
         max_job_millis: grant.max_job_millis,

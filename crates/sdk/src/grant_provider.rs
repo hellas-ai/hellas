@@ -1,11 +1,11 @@
 //! Validate available resources and open explicitly initialized provider authority.
 use crate::{FetchRoute, FetchRouteRegistry};
-use hellas_work::model::{
-    fetch::FetchRoutePolicy,
-    grant::records::{GrantError, GrantPolicy},
-    profile::WorkPolicy,
-};
 use std::{collections::BTreeSet, num::NonZeroU64};
+use {
+    hellas_authority::model::grant::records::GrantError,
+    hellas_authority::model::grant::records::GrantPolicy,
+    hellas_channel::model::fetch::FetchRoutePolicy, hellas_channel::model::profile::WorkPolicy,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrantProviderError {

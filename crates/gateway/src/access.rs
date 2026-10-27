@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode, header};
 use futures::future::BoxFuture;
 use hellas_auth::authority::{CredentialId, CredentialSecret, GrantId};
-use hellas_work::node::NodeCoordinator;
+use hellas_authority::node::NodeCoordinator;
 use std::{
     fmt,
     io::Write,
@@ -54,7 +54,7 @@ impl GatewayAccess {
     async fn authenticate(
         &self,
         credential: &CredentialSecret,
-    ) -> Result<(), hellas_work::work_store::grant::NodeStoreError> {
+    ) -> Result<(), hellas_authority::work_store::grant::NodeStoreError> {
         let caller = self.node.authenticate(credential).await?;
         if self
             .node

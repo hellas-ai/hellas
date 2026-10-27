@@ -404,8 +404,8 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     foreign.shutdown().await;
     assert!(FinalizedBlockView::decode(&latest).is_ok());
-    use hellas_work::work_open::SetupView as _;
-    let query = hellas_work::work_open::SetupQuery {
+    use hellas_channel::work_open::SetupView as _;
+    let query = hellas_channel::work_open::SetupQuery {
         bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),
         payment_edge: None,
         funding: Default::default(),
@@ -426,7 +426,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     assert!(
         matches!(
             behind,
-            Err(hellas_work::work_close::BlockSourceError::ReadUnavailableTimeout { .. })
+            Err(hellas_channel::work_close::BlockSourceError::ReadUnavailableTimeout { .. })
         ),
         "a valid state below persisted progress cannot establish channel absence"
     );

@@ -52,9 +52,9 @@ pub enum PoolError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]

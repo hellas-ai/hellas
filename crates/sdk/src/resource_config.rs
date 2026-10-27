@@ -1,11 +1,11 @@
 //! Execution policy parsing shared by payment and grant configuration.
 use hellas_auth::Digest;
-use hellas_rpc::ContentId;
-use hellas_work::model::{
+use hellas_channel::model::{
     fetch::{FetchPolicyV2, FetchRoutePolicy, fetch_route_commitment},
     profile::WorkPolicy,
     work::{EvaluatePolicyV2, check_work_policy},
 };
+use hellas_rpc::ContentId;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +28,7 @@ pub enum ResourceConfigError {
         reason: &'static str,
     },
     #[error("execution policy is not usable: {0}")]
-    Policy(#[from] hellas_work::model::work::PaidWorkError),
+    Policy(#[from] hellas_channel::model::work::PaidWorkError),
 }
 type Result<T> = std::result::Result<T, ResourceConfigError>;
 

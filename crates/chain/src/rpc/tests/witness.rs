@@ -256,7 +256,7 @@ fn unapplied_checkpoint_and_operation_requests_return_a_typed_wire_status() {
 #[test]
 fn work_freshness_reference_uses_the_applied_witness_checkpoint() {
     use crate::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
-    use hellas_work::work_close::FinalizedBlocks as _;
+    use hellas_channel::work_close::FinalizedBlocks as _;
 
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;

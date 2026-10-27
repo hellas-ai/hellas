@@ -43,7 +43,7 @@
 //! # What is not here
 //!
 //! No retry loop and no deadline timer. The cursor they would be
-//! bounded by does move — `hellas_work::work_close::catch_up` is what
+//! bounded by does move — `hellas_channel::work_close::catch_up` is what
 //! moves it, and `ClientEndpoint::catch_up` is how this endpoint asks
 //! it to — but nothing here owns a clock, and a loop written without
 //! one polls until it is killed. What this module gives a caller
@@ -54,11 +54,11 @@
 pub mod payment;
 pub mod reproduce;
 
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::ReadyChannel;
+use hellas_channel::model::work::PaidJobResultV1;
+use hellas_channel::work::{ClientEndpoint, DeliverError, fetch_result};
 use hellas_wire::StreamTransport;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::ReadyChannel;
-use hellas_work::model::work::PaidJobResultV1;
-use hellas_work::work::{ClientEndpoint, DeliverError, fetch_result};
 
 use reproduce::{ReproduceFault, Reproducer, Reproduction};
 
@@ -112,7 +112,7 @@ pub enum CollectResultError {
     Deliver(#[from] DeliverError),
     /// The post-answer finalized-height barrier could not be made.
     #[error("the post-answer catch-up failed: {0}")]
-    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
     /// Catch-up crossed the job's last safe payment height.
     #[error(
         "the result became stale at finalized height {height}; payment deadline was {deadline}"
@@ -145,7 +145,7 @@ where
     T: StreamTransport + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
-    C: hellas_work::work_close::FinalizedBlocks + ?Sized,
+    C: hellas_channel::work_close::FinalizedBlocks + ?Sized,
 {
     let delivery = match fetch_result(transport, endpoint, ready, work_id).await {
         Ok(delivery) => delivery,
@@ -204,7 +204,7 @@ pub enum CollectError {
     /// on the disk from the fetch, and a fresh attempt re-runs the
     /// re-execution and the catch-up.
     #[error("the post-answer catch-up failed: {0}")]
-    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
     /// The journal holds a bundle that does not parse.
     ///
     /// Unreachable through an honest path: the bundle was parsed and
@@ -280,7 +280,7 @@ where
     T: StreamTransport + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
-    C: hellas_work::work_close::FinalizedBlocks + ?Sized,
+    C: hellas_channel::work_close::FinalizedBlocks + ?Sized,
     E: Reproducer + ?Sized,
 {
     // Phase 1 — network and re-execution, holding no durable barrier.
@@ -298,7 +298,7 @@ where
     };
     let bundle = PreparedPaidInputV1::decode(
         job.prepared_input(),
-        hellas_work::content::MAX_CONTENT_BYTES,
+        hellas_channel::content::MAX_CONTENT_BYTES,
     )
     .map_err(|error| CollectError::Bundle(error.to_string()))?;
     let network = endpoint.state().channel().network();

@@ -1,15 +1,15 @@
 //! Funding-independent gateway input preparation and bounded output delivery.
 use futures::stream::BoxStream;
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
 use hellas_gateway::{ExecutionEvent, Outcome, StopReason, WorkExecutionRequest, WorkGatewayError};
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
     TextPolicy, TokenIds,
 };
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
-pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_work::work_store::journal::MAX_RECORD_BYTES;
+pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_channel::work_store::journal::MAX_RECORD_BYTES;
 pub const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 pub const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
 pub type BufferedEvent<E, X> = (Result<E, X>, OwnedSemaphorePermit);

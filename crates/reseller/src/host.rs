@@ -12,7 +12,7 @@ pub enum OpenAiProviderError {
     #[error(transparent)]
     Config(#[from] crate::OpenAiConfigError),
     #[error(transparent)]
-    Grant(#[from] hellas_work::model::grant::records::GrantError),
+    Grant(#[from] hellas_authority::model::grant::records::GrantError),
     #[error(transparent)]
     Route(#[from] hellas_executor::FetchRouteBindingError),
     #[error(transparent)]
@@ -33,8 +33,8 @@ pub struct OpenAiProviderOptions<R> {
     pub resource: hellas_auth::authority::ResourceId,
     pub account: hellas_auth::authority::ResourceId,
     pub policy_revision: hellas_auth::authority::Revision,
-    pub responses: hellas_work::model::grant::responses::ResponsesResource,
-    pub pricing: hellas_work::model::grant::pricing::Pricing,
+    pub responses: hellas_authority::model::grant::responses::ResponsesResource,
+    pub pricing: hellas_authority::model::grant::pricing::Pricing,
     pub max_job_millis: std::num::NonZeroU64,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,

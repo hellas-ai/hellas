@@ -7,6 +7,7 @@ use crate::worker::{
 };
 use crate::{ExecutorError, ExecutorMetrics};
 use futures_util::future::BoxFuture;
+use hellas_channel::work::{BackendFault, admission::RunningWork};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
@@ -14,7 +15,6 @@ use hellas_rpc::evaluate::{
 use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, completed_text};
 use hellas_rpc::{Assurance, ContentId, EvaluateRequest, OutputEventEnvelope};
 use hellas_store::ContentStore;
-use hellas_work::work::{BackendFault, admission::RunningWork};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -47,7 +47,7 @@ enum WorkerState {
 
 enum PendingExecution {
     Prepared {
-        parts: hellas_work::model::prepared_input::PreparedPaidInputParts,
+        parts: hellas_channel::model::prepared_input::PreparedPaidInputParts,
         is_owed: bool,
         dispatch: BoxFuture<'static, Result<RunningWork, BackendFault>>,
         complete: tokio::sync::oneshot::Sender<()>,
@@ -336,7 +336,9 @@ impl EvaluateEngine {
     }
     pub(crate) async fn start_prepared_input(
         &mut self,
-        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
+        input: hellas_channel::work::PreparedEvaluateInput<
+            hellas_channel::work::admission::AdmittedWork,
+        >,
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let (complete, completion) = tokio::sync::oneshot::channel();
@@ -427,7 +429,7 @@ impl EvaluateEngine {
     }
     fn prepare_for_dispatch(
         &mut self,
-        parts: hellas_work::model::prepared_input::PreparedPaidInputParts,
+        parts: hellas_channel::model::prepared_input::PreparedPaidInputParts,
         running: RunningWork,
         sender: mpsc::Sender<
             Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>,
@@ -464,13 +466,13 @@ impl EvaluateEngine {
         let stat_prompt = job.invocation.input_ids.len() as u64;
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let (complete, completion) = tokio::sync::oneshot::channel();
-        let permit = hellas_work::work::admission::WorkPermit::new(
-            hellas_work::work::admission::CapacityDomain::Gpu,
+        let permit = hellas_channel::work::admission::WorkPermit::new(
+            hellas_channel::work::admission::CapacityDomain::Gpu,
             Arc::new(tokio::sync::Semaphore::new(1))
                 .try_acquire_owned()
                 .unwrap(),
         );
-        let running = hellas_work::work::admission::AdmittedWork::payment(permit)
+        let running = hellas_channel::work::admission::AdmittedWork::payment(permit)
             .dispatch()
             .await
             .unwrap();

@@ -2,8 +2,8 @@
 use super::{CliResult, read_bounded_regular_file};
 use anyhow::ensure;
 use hellas_auth::authority::{ContactCard, PrincipalId, UnixMillis};
-use hellas_work::authenticator::Authenticator;
-use hellas_work::model::grant::records::*;
+use hellas_authority::authenticator::Authenticator;
+use hellas_authority::model::grant::records::*;
 use std::{
     io::Write,
     path::{Path, PathBuf},

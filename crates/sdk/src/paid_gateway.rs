@@ -5,10 +5,10 @@ use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
     check_evaluate_input,
 };
+use hellas_channel::model::prepared_input::PreparedPaidInputV1;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::work_store::journal::MAX_RECORD_BYTES;
 use hellas_kernel::Secp256k1Signer;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::EndpointId;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -20,13 +20,13 @@ pub use error::PoolError;
 type Result<T, E = PoolError> = std::result::Result<T, E>;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+#[cfg(test)]
+use hellas_channel::model::profile::PreparedWorkInput;
+use hellas_channel::model::profile::WorkPolicy;
 use hellas_gateway::{
     ExecutionEvent, Outcome, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest,
 };
 use hellas_rpc::output::OutputEvent as FetchEvent;
-#[cfg(test)]
-use hellas_work::model::profile::PreparedWorkInput;
-use hellas_work::model::profile::WorkPolicy;
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -401,8 +401,8 @@ impl PaidGateway {
             let token_budget = output_budget.clone();
             let streamed = prepared.is_some();
             let recovery = !streamed;
-            let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
-                let event = E::prefix(event).map_err(hellas_work::work::BackendFault::caused_by)?;
+            let progress: hellas_channel::work::PaidProgress = Arc::new(move |event| {
+                let event = E::prefix(event).map_err(hellas_channel::work::BackendFault::caused_by)?;
                 emit(&token_sender, &token_overflow, &token_budget, Ok(event));
                 Ok(())
             });
@@ -539,7 +539,7 @@ impl PaidGateway {
                         // this provider, just like a proposal with no response.
                         let uncertain_append = matches!(
                             error,
-                            PoolError::Client(PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
+                            PoolError::Client(PaidClientError::Propose(hellas_channel::work::ProposeError::Store(_))),
                         );
                         if !uncertain_append
                             && session.with_state(|state| state.proposal_nonce_high_water()).await? == proposal_nonce
@@ -586,7 +586,7 @@ impl PaidGateway {
 }
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
-    let found = hellas_work::work_store::discover_setups(
+    let found = hellas_channel::work_store::discover_setups(
         &options.journal_root,
         options.config.chain.network,
     )
@@ -598,7 +598,7 @@ async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
         || found
             .setups
             .iter()
-            .any(|setup| setup.role == hellas_work::work_store::Role::Client))
+            .any(|setup| setup.role == hellas_channel::work_store::Role::Client))
 }
 
 impl WorkExecutionBackend for PaidGateway {
@@ -781,7 +781,7 @@ fn prepare_fetch(
         return Err(PoolError::NoMatchingPolicy);
     };
     channel_policy.work_policy.check()?;
-    if let hellas_work::model::fetch::FetchRoutePolicy::SealedRoute { service, method } = route
+    if let hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { service, method } = route
         && (request.service != *service || request.method != *method)
     {
         return Err(PoolError::NoMatchingPolicy);
@@ -809,7 +809,8 @@ fn prepare_request(
 }
 
 fn output_events(output: PaidWorkResult) -> Result<Vec<ExecutionEvent>> {
-    let events = hellas_work::model::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
+    let events =
+        hellas_channel::model::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
     let verified = hellas_rpc::evaluate::verify_output_events_for_producer(
         output.input,
         hellas_rpc::Assurance::ProducerSigned,
@@ -867,9 +868,9 @@ impl GatewayEvent for FetchEvent {
         )?)
     }
     fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
-        let events = hellas_work::model::work::decode_transcript(
+        let events = hellas_channel::model::work::decode_transcript(
             &output.transcript,
-            hellas_work::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
+            hellas_channel::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
         )?;
         let terminal = events
             .last()
@@ -892,7 +893,7 @@ impl GatewayEvent for FetchEvent {
 }
 
 #[cfg(test)]
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;
 
 #[cfg(test)]
 mod tests {
@@ -924,8 +925,8 @@ mod tests {
         use hellas_chain::test_support::devnet::{
             Devnet, DevnetConfig, GenesisOwner, OwnerKind, run,
         };
-        use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
-        use hellas_work::work_store::{Role, SetupRecord, SetupStore};
+        use hellas_channel::model::offer::{PaidOffer, SignedPaidOffer};
+        use hellas_channel::work_store::{Role, SetupRecord, SetupStore};
         run(|runtime| {
             Box::pin(async move {
                 let mut devnet = Devnet::start(
@@ -1158,11 +1159,11 @@ mod tests {
         )
         .unwrap();
         assert!(!has_retained_setup(provider).await.unwrap());
-        let store = hellas_work::work_store::SetupStore::open(
+        let store = hellas_channel::work_store::SetupStore::open(
             &provider.journal_root,
             provider.config.chain.network,
             fixture.descriptor.bond_edge(),
-            hellas_work::work_store::Role::Client,
+            hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
         )
         .await
@@ -1172,19 +1173,19 @@ mod tests {
             !has_retained_setup(provider).await.unwrap(),
             "an unsigned header carries no recovery obligation"
         );
-        let store = hellas_work::work_store::SetupStore::open(
+        let store = hellas_channel::work_store::SetupStore::open(
             &provider.journal_root,
             provider.config.chain.network,
             fixture.descriptor.bond_edge(),
-            hellas_work::work_store::Role::Client,
+            hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
         )
         .await
         .unwrap();
-        let mut endpoint = hellas_work::work_handshake::SetupEndpoint::new(
+        let mut endpoint = hellas_channel::work_handshake::SetupEndpoint::new(
             store,
             crate::test_support::signer(1),
-            hellas_work::work_handshake::PaymentAdmission::Proposes(Box::new(
+            hellas_channel::work_handshake::PaymentAdmission::Proposes(Box::new(
                 fixture.policy.clone(),
             )),
         );

@@ -3,6 +3,12 @@ use hellas_auth::test_support::{
     Actor,
     actors::{AGENT, OPERATOR, STRANGER},
 };
+use hellas_channel::model::offer::{SignedPaidOffer, request_digest};
+use hellas_channel::work::{
+    BackendFault, WorkBackend,
+    admission::{CapacityDomain, WorkPermit},
+};
+use hellas_channel::work_store::{Role, SetupAbort, SetupEnd, SetupStore};
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, OfferRefusalCode, RequestOfferRequest, RequestOfferResponse,
     exchange_setup_response, request_offer_response::Outcome,
@@ -15,12 +21,6 @@ use hellas_sdk::work_router::WorkRouter;
 use hellas_wire::{
     Dispatcher, Metadata, ServiceMarker, StreamTransport, WireStatus, iroh::IrohTransport,
 };
-use hellas_work::model::offer::{SignedPaidOffer, request_digest};
-use hellas_work::work::{
-    BackendFault, WorkBackend,
-    admission::{CapacityDomain, WorkPermit},
-};
-use hellas_work::work_store::{Role, SetupAbort, SetupEnd, SetupStore};
 use iroh::{Endpoint, EndpointAddr, TransportAddr, endpoint::presets};
 
 const JOB_PRICE: u64 = 20;
@@ -33,20 +33,22 @@ struct CpuEvaluate(
 impl WorkBackend for CpuEvaluate {
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
         if domain != CapacityDomain::Gpu {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into());
+            return Err(
+                hellas_channel::work::admission::AdmissionError::Unsupported(domain).into(),
+            );
         }
         Ok(WorkPermit::new(
             domain,
             self.0.clone().try_acquire_owned().map_err(|_| {
-                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
             })?,
         ))
     }
     async fn execute(
         &self,
-        input: hellas_work::work::PreparedWorkInput,
+        input: hellas_channel::work::PreparedWorkInput,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = input else {
+        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = input else {
             return Err(BackendFault::caused_by(std::io::Error::other(
                 "Evaluate fixture",
             )));
@@ -94,7 +96,7 @@ struct Provider {
     endpoint: Endpoint,
     clock: WorkWatcher,
     serving: tokio::task::JoinHandle<()>,
-    admin: hellas_work::grant_service::WorkAdministration,
+    admin: hellas_authority::grant_service::WorkAdministration,
 }
 
 #[derive(Clone)]
@@ -171,7 +173,7 @@ impl Provider {
         let enrollment = provider_enrollment(&identity);
         let store = NodeStore::open(
             &root.join("authority"),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             Some(enrollment.clone()),
             UnixMillis(1),
         )
@@ -179,16 +181,16 @@ impl Provider {
         .unwrap();
         let authority = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1)));
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
-        let grants = hellas_work::grant_service::GrantService::from_node(
+        let grants = hellas_authority::grant_service::GrantService::from_node(
             authority.clone(),
             &enrollment,
             key.clone(),
-            hellas_work::test_support::common_node::NoBackend,
+            hellas_authority::test_support::common_node::NoBackend,
             vec![],
         )
         .await
         .unwrap();
-        let admin = hellas_work::grant_service::WorkAdministration::new(
+        let admin = hellas_authority::grant_service::WorkAdministration::new(
             grants,
             vec![],
             std::num::NonZeroU64::new(5000).unwrap(),
@@ -302,15 +304,15 @@ impl Provider {
         &self,
         secret: &auth::CredentialSecret,
         revision: u64,
-        policy: hellas_work::model::paid_policy::PaidPolicy,
+        policy: hellas_channel::model::paid_policy::PaidPolicy,
     ) {
         let node = self.admin.node();
-        let caller = hellas_work::test_support::session(&node, secret).await;
+        let caller = hellas_authority::test_support::session(&node, secret).await;
         self.admin
             .execute(
                 &caller,
                 auth::GrantId([0; 16]),
-                hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
+                hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
                     expected_revision: auth::Revision(revision),
                     policy: Box::new(policy),
                 },
@@ -430,14 +432,14 @@ fn revision_two(
     key: &Secp256k1Signer,
     funding: Funding,
     omission: u64,
-) -> hellas_work::model::bundle::WorkChannelSetupBundleV2 {
+) -> hellas_channel::model::bundle::WorkChannelSetupBundleV2 {
     let one = &offer.offer().proposal;
     let policy = &offer.offer().policy;
     let terms = hellas_kernel::WorkPaymentTerms {
         bond_edge: one.bond_edge(),
         bond_terms: one.bond_terms().clone(),
         omission_bond: omission,
-        private_policy_commitment: hellas_work::model::work::private_policy_commitment(
+        private_policy_commitment: hellas_channel::model::work::private_policy_commitment(
             policy.network,
             &policy.policy_salt,
             &policy.channel_policy,
@@ -486,10 +488,10 @@ async fn evaluate_and_settle(
     )
     .await
     .unwrap();
-    let mut setup = hellas_work::work_handshake::SetupEndpoint::new(
+    let mut setup = hellas_channel::work_handshake::SetupEndpoint::new(
         store,
         key.clone(),
-        hellas_work::work_handshake::PaymentAdmission::Proposes(Box::new(
+        hellas_channel::work_handshake::PaymentAdmission::Proposes(Box::new(
             original.offer().policy.clone(),
         )),
     );
@@ -607,7 +609,7 @@ async fn evaluate_and_settle(
     );
     let result = session
         .run(
-            Some(hellas_work::test_support::channel::bundle(7).into()),
+            Some(hellas_channel::test_support::channel::bundle(7).into()),
             false,
             None,
         )
@@ -644,7 +646,7 @@ struct Case {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     provider: Provider,
     endpoint: Endpoint,
-    policy: hellas_work::model::paid_policy::PaidPolicy,
+    policy: hellas_channel::model::paid_policy::PaidPolicy,
     secret: auth::CredentialSecret,
     first: Box<SignedPaidOffer>,
     second: Box<SignedPaidOffer>,
@@ -869,14 +871,15 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         Some(keys[1].party_key())
     );
     assert_eq!(short.value, FUNDING - 1);
-    let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
-        &root.path().join("authority"),
-        hellas_work::model::grant::grant_network(),
-        Some(provider_enrollment(&identity)),
-        UnixMillis(1),
-    )
-    .await
-    .unwrap();
+    let (store, secret) =
+        hellas_authority::test_support::common_node::bootstrap_node_with_credential(
+            &root.path().join("authority"),
+            hellas_authority::model::grant::grant_network(),
+            Some(provider_enrollment(&identity)),
+            UnixMillis(1),
+        )
+        .await
+        .unwrap();
     drop(store);
     let config = work_config(&devnet, root.path().join("paid"));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -907,7 +910,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     assert_eq!(files(&config.journal_root), 0);
     let mut policy = paid_policy();
-    policy.work_policy = hellas_work::test_support::channel::work_policy().into();
+    policy.work_policy = hellas_channel::test_support::channel::work_policy().into();
     policy.payment_policy.fixed_price = JOB_PRICE;
     policy.expected_payment_values = EdgeValues::new(FUNDING, 0, Fees::ZERO);
     policy.offers.omission_bond = 201;
@@ -1076,7 +1079,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         quote.provider_channel_policy,
         hellas_rpc::protocol::value::encode_bounded(
             &first.offer().policy,
-            hellas_work::model::grant::records::MAX_OFFER_BYTES
+            hellas_authority::model::grant::records::MAX_OFFER_BYTES
         )
         .unwrap()
     );
@@ -1255,7 +1258,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     .unwrap();
     interrupted
         .commit(
-            hellas_work::work_store::SetupRecord::Offer {
+            hellas_channel::work_store::SetupRecord::Offer {
                 peer: *provider.endpoint.id().as_bytes(),
                 floor: None,
                 offer: third.clone(),
@@ -1495,7 +1498,7 @@ async fn finish(case: Box<Case>) {
             let response = hellas_rpc::call::unary::<_,hellas_rpc::services::work_setup::ExchangeSetup>(
                 &transport, ExchangeSetupRequest { bond_edge: third.offer().proposal.bond_edge().to_bytes().to_vec(), bundle: vec![] }, Metadata::new(),
             ).await.unwrap();
-            if matches!(response.outcome, Some(exchange_setup_response::Outcome::Refused(ref r)) if r.code == hellas_work::work::WorkRefusal::Expired.code() as i32) { break; }
+            if matches!(response.outcome, Some(exchange_setup_response::Outcome::Refused(ref r)) if r.code == hellas_channel::work::WorkRefusal::Expired.code() as i32) { break; }
             tokio::time::sleep(config.poll).await;
         }
     }).await.expect("the unanswered offer durably expires at its horizon");

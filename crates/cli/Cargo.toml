@@ -54,11 +54,13 @@ futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
+hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "client",
     "proof-verify",
     "work-watcher",
 ] }
+hellas-channel = { workspace = true }
 hellas-client = { workspace = true, features = ["iroh", "work", "evaluate"] }
 hellas-executor = { workspace = true, default-features = false }
 hellas-gateway.workspace = true
@@ -82,7 +84,6 @@ hellas-wire = { workspace = true, features = [
     "discovery-dht",
     "discovery-mdns",
 ] }
-hellas-work = { workspace = true }
 hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
@@ -112,9 +113,10 @@ tracing-subscriber.workspace = true
 ciborium.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
+hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["client", "test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
-hellas-work = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [

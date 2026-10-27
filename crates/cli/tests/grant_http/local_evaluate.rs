@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::decode_enrollment;
+use hellas_authority::model::grant::records::decode_enrollment;
 
 struct LocalGateway {
     _root: tempfile::TempDir,
@@ -9,7 +9,7 @@ struct LocalGateway {
 }
 impl LocalGateway {
     async fn start_with_exhausted_allowance() -> Self {
-        use hellas_work::model::grant::{budget::*, grant_network, owner_grant_id};
+        use hellas_authority::model::grant::{budget::*, grant_network, owner_grant_id};
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -67,14 +67,14 @@ impl LocalGateway {
             (vec![], 256),
         )
         .await;
-        let node = hellas_work::node::NodeCoordinator::new(
+        let node = hellas_authority::node::NodeCoordinator::new(
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
         // The local gateway signs its jobs with this node's own key.
         let credential =
             execution_credential(&node, &secret, principal, allowance, owner.holder().await).await;
-        let authority = hellas_work::test_support::session(&node, &secret)
+        let authority = hellas_authority::test_support::session(&node, &secret)
             .await
             .authority();
         let work_profile = work_profile(root, authority, &credential);

@@ -229,7 +229,7 @@ pub struct GatewayControl {
 /// Shut the listener down after the gateway stops.
 pub struct GatewayHost {
     /// The same live authority writer used by HTTP admission and HostControl.
-    pub node: hellas_work::node::NodeCoordinator,
+    pub node: hellas_authority::node::NodeCoordinator,
     pub access: hellas_gateway::GatewayAccess,
     pub control: Option<hellas_wire::local::LocalControlServer>,
 }
@@ -241,9 +241,9 @@ impl GatewayProfile {
         let parent = path
             .parent()
             .ok_or_else(|| invalid("profile needs a parent"))?;
-        let store = hellas_work::work_store::grant::NodeStore::open(
+        let store = hellas_authority::work_store::grant::NodeStore::open(
             &parent.join(profile.journal),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             None,
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
         )
@@ -251,7 +251,7 @@ impl GatewayProfile {
         if store.state().authority().authority() != profile.authority {
             return Err(invalid("gateway profile authority mismatch").into());
         }
-        let node = hellas_work::node::NodeCoordinator::new(
+        let node = hellas_authority::node::NodeCoordinator::new(
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );

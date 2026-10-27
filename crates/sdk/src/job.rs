@@ -1,8 +1,8 @@
 //! Caller-owned job folders. Purchase nonces are derived from durable channel
 //! state rather than stored with the reusable application input.
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, hash_tuple};
+use hellas_channel::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
 use hellas_rpc::{Assurance, CausalLmEnvironment, FetchContract, ProgramManifest};
-use hellas_work::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -26,7 +26,7 @@ pub enum JobError {
     #[error(transparent)]
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
     Gateway(#[from] hellas_gateway::WorkGatewayError),
 }
@@ -213,9 +213,9 @@ impl Job {
     /// Check unsigned application constraints before asking the owner to fund.
     pub fn check_policy(
         &self,
-        policy: &hellas_work::model::setup::ProviderChannelPolicy,
+        policy: &hellas_channel::model::setup::ProviderChannelPolicy,
     ) -> Result<()> {
-        use hellas_work::model::{fetch::FetchRoutePolicy, profile::WorkPolicy};
+        use hellas_channel::model::{fetch::FetchRoutePolicy, profile::WorkPolicy};
         if self.price != policy.payment_policy.fixed_price {
             return Err(invalid(format!(
                 "provider charges {} per job; this job says {}. Nothing was signed or paid.",
@@ -254,8 +254,8 @@ impl Job {
             let identity = TextArtifact::identity(BoundTermId::from_digest(
                 self.manifest().content_id().digest(),
             ));
-            if !hellas_work::model::work::matches_generation_policy(expected, &generation)?
-                || hellas_work::model::work::identity_source_digest(&identity.canonical_bytes())?
+            if !hellas_channel::model::work::matches_generation_policy(expected, &generation)?
+                || hellas_channel::model::work::identity_source_digest(&identity.canonical_bytes())?
                     != expected.identity_source_digest
             {
                 return Err(invalid(

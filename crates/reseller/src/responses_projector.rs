@@ -4,15 +4,15 @@ use hellas_adaptors::{
     OutputEvent, SseDecoder, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd,
     ToolCallStart, Usage, WireEventData, WireStreamEvent,
 };
+use hellas_authority::model::grant::responses::{
+    ReasoningEffort as TrustedReasoningEffort, ReasoningSummary as TrustedReasoningSummary,
+};
 use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchProviderResponseHead, FetchRequestView, PreparedFetchRequest, ProjectedFetch,
 };
 use hellas_rpc::fetch::{MAX_FETCH_REQUEST_BODY_BYTES, encode_fetch_terminal_payload};
 use hellas_rpc::{ContentId, JsonBytes};
-use hellas_work::model::grant::responses::{
-    ReasoningEffort as TrustedReasoningEffort, ReasoningSummary as TrustedReasoningSummary,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 

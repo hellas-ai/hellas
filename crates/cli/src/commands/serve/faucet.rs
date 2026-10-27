@@ -5,17 +5,19 @@ use hellas_auth::{Digest, authority::*};
 use hellas_chain::{LightClient as _, domain::Transaction};
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
 use hellas_sdk::node_control::profile;
-use hellas_work::{
-    authenticator::{Authenticator, kernel_auth},
-    grant_service::WorkAdministration,
-    model::{
-        fetch::*, grant::admin::WorkControlCommand, paid_policy::*, profile::WorkPolicy, work::*,
-    },
-    node::SessionKey,
-    work_store::grant::{NodeStore, NodeStoreError, OwnerApproval, PreparedBootstrap},
-};
 use std::path::Path;
 use std::time::Duration;
+use {
+    hellas_authority::authenticator::Authenticator, hellas_authority::authenticator::kernel_auth,
+    hellas_authority::grant_service::WorkAdministration,
+    hellas_authority::model::grant::admin::WorkControlCommand, hellas_authority::node::SessionKey,
+    hellas_authority::work_store::grant::NodeStore,
+    hellas_authority::work_store::grant::NodeStoreError,
+    hellas_authority::work_store::grant::OwnerApproval,
+    hellas_authority::work_store::grant::PreparedBootstrap, hellas_channel::model::fetch::*,
+    hellas_channel::model::paid_policy::*, hellas_channel::model::profile::WorkPolicy,
+    hellas_channel::model::work::*,
+};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, clap::Args)]
 #[serde(deny_unknown_fields)]
@@ -80,7 +82,7 @@ pub(super) fn default_policy(args: &PolicyArgs) -> CliResult<PaidPolicy> {
         .context("paid funding overflow")?;
     let credit = price.checked_mul(2).context("paid credit overflow")?;
     let contract = hellas_rpc::FetchContract::http()?;
-    let route = hellas_work::model::fetch::FetchRoutePolicy::open_fetch(true, vec![]);
+    let route = hellas_channel::model::fetch::FetchRoutePolicy::open_fetch(true, vec![]);
     let policy = PaidPolicy {
         channel_policy: PaidChannelPolicyV1 {
             compute_credit_limit: credit,
@@ -282,7 +284,7 @@ impl Startup {
         producer: &ProducerSigningKey,
     ) -> CliResult<Option<CredentialSecret>> {
         let now = UnixMillis::now()?;
-        let network = hellas_work::model::grant::grant_network();
+        let network = hellas_authority::model::grant::grant_network();
         let bootstrap_path = self.root.join("bootstrap.json");
         let store =
             match NodeStore::open(&config.journal_root, network, Some(enrollment.clone()), now)
@@ -308,9 +310,12 @@ impl Startup {
                             })
                         })
                         .collect::<Result<_, hellas_auth::authority::AuthorityError>>()?;
-                        for op in hellas_work::operations::OPERATIONS.iter().filter(|op| {
-                            !matches!(op.scope, hellas_work::operations::Scope::Allowance)
-                        }) {
+                        for op in hellas_authority::operations::OPERATIONS
+                            .iter()
+                            .filter(|op| {
+                                !matches!(op.scope, hellas_authority::operations::Scope::Allowance)
+                            })
+                        {
                             permissions.insert(op.permission(authority, None)?);
                         }
                         let administrator = GrantSpec {

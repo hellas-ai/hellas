@@ -35,7 +35,7 @@ pub(crate) fn enrollment(peer: EndpointId) -> (ProviderEnrollmentBundle, Produce
     let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
     (
-        hellas_work::test_support::enrollment(&root, &producer, *peer.as_bytes(), [3; 32]),
+        hellas_channel::test_support::enrollment(&root, &producer, *peer.as_bytes(), [3; 32]),
         producer,
     )
 }

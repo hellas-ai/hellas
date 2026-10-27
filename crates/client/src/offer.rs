@@ -1,7 +1,7 @@
 //! Application import boundary: structural Offer decoding never grants trust.
 use crate::{ClientError, ClientResult, ProviderTrustAnchor};
 use hellas_auth::authority::UnixMillis;
-use hellas_work::model::grant::records::{Offer, SignedOffer};
+use hellas_authority::model::grant::records::{Offer, SignedOffer};
 
 pub struct UnpinnedOffer(SignedOffer);
 #[derive(Clone, Debug)]
