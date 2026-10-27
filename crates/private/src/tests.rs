@@ -107,6 +107,7 @@ fn this_process_runs_as_the_current_user() {
     assert!(windows::process_is_current_user(std::process::id()).unwrap());
 }
 
+#[cfg(unix)]
 #[test]
 fn read_write_open_keeps_a_private_existing_file_and_refuses_symlinks() {
     let directory = tempfile::tempdir().unwrap();
@@ -119,11 +120,8 @@ fn read_write_open_keeps_a_private_existing_file_and_refuses_symlinks() {
     file.sync_all().unwrap();
     drop(file);
     assert_eq!(std::fs::read(&path).unwrap(), b"after!");
-    #[cfg(unix)]
-    {
-        let link = directory.path().join("linked.part");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(open_nofollow_rw(&link).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"after!");
-    }
+    let link = directory.path().join("linked.part");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(open_nofollow_rw(&link).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"after!");
 }

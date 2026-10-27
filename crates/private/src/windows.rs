@@ -233,21 +233,6 @@ pub(super) fn open_nofollow(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-pub(super) fn open_nofollow_rw(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "staging file is a reparse point",
-        ));
-    }
-    Ok(file)
-}
-
 pub(super) fn is_private(file: &File) -> io::Result<bool> {
     let user = ProcessUser::current()?;
     let mut owner: PSID = null_mut();

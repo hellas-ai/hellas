@@ -40,8 +40,17 @@ pub fn open_nofollow(path: &Path) -> io::Result<File> {
 }
 
 /// Opens an existing private staging file for bounded upload append without following links.
+/// Providers do not serve on Windows, so provider upload staging is Unix-only.
 pub fn open_nofollow_rw(path: &Path) -> io::Result<File> {
-    imp::open_nofollow_rw(path)
+    #[cfg(unix)]
+    {
+        imp::open_nofollow_rw(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Whether `file` is a regular file that only this user can reach.
