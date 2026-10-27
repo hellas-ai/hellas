@@ -13,6 +13,9 @@ use hellas_rpc::pb::work::{
     ExchangeSetupRequest, OfferRefusalCode, RequestOfferRequest, RequestOfferResponse,
     exchange_setup_response, request_offer_response::Outcome,
 };
+use hellas_rpc::protocol::invocation::compute::{
+    Arg, Bind, Call, Declared, OutputKind, Plan, Step, StepArg, Stop, ValueKind,
+};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupServer};
 use hellas_sdk::paid_provider::{
     MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher,
@@ -26,20 +29,52 @@ use iroh::{Endpoint, EndpointAddr, TransportAddr, endpoint::presets};
 const JOB_PRICE: u64 = 20;
 const FUNDING: u64 = 401;
 
-struct CpuCompute(
-    Arc<tokio::sync::Semaphore>,
-    Arc<std::sync::atomic::AtomicUsize>,
-);
-impl WorkBackend for CpuCompute {
+/// The executor's own compile child, validation and signed driver over the
+/// Hex-generated scalar C ABI, built for the host instead of a GPU. Only the
+/// device is a double; it counts loads, and the source it compiles is read
+/// from A's content store.
+#[derive(Clone, Default)]
+struct HostCompute(Arc<HostComputeState>);
+#[derive(Default)]
+struct HostComputeState {
+    permits: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
+    calls: std::sync::atomic::AtomicUsize,
+    loads: std::sync::atomic::AtomicUsize,
+    store: std::sync::Mutex<Option<hellas_store::ContentStore>>,
+    pause: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+impl HostCompute {
+    fn calls(&self) -> usize {
+        self.0.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn loads(&self) -> usize {
+        self.0.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn have(&self, object: hellas_rpc::ContentRef) -> bool {
+        self.0
+            .store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|store| store.have(object.id().digest()))
+    }
+}
+impl WorkBackend for HostCompute {
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
         if domain != CapacityDomain::Gpu {
             return Err(
                 hellas_channel::work::admission::AdmissionError::Unsupported(domain).into(),
             );
         }
+        let permits = self
+            .0
+            .permits
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)));
         Ok(WorkPermit::new(
             domain,
-            self.0.clone().try_acquire_owned().map_err(|_| {
+            permits.clone().try_acquire_owned().map_err(|_| {
                 BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
             })?,
         ))
@@ -48,7 +83,8 @@ impl WorkBackend for CpuCompute {
         &self,
         input: hellas_channel::work::Admitted<PreparedInvocation>,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let (prepared, _, _, admission) = input.into_parts_and_admission();
+        use hellas_executor::catena::{assets::Assets, driver, program::BoundProgram};
+        let (prepared, limits, content, admission) = input.into_parts_and_admission();
         let _running = admission
             .reserve(CapacityDomain::Gpu, async {
                 self.try_admit(CapacityDomain::Gpu)
@@ -56,32 +92,133 @@ impl WorkBackend for CpuCompute {
             .await?
             .dispatch()
             .await?;
-        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-        Ok(invocation::output::InvocationOutput {
-            outcome: invocation::output::Outcome::Succeeded,
-            artifacts: vec![invocation::Artifact::new(
-                "answer",
-                "catena.bytes.v1",
-                1u32.to_le_bytes().to_vec(),
-            )],
-            metadata: hellas_rpc::JsonBytes(
-                hellas_rpc::protocol::value::canonical_dag_cbor(
-                    &invocation::compute::RunMetadata {
-                        steps: 0,
-                        stop: None,
-                    },
-                )
-                .unwrap(),
-            ),
+        self.0
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.0.store.lock().unwrap() = content.retained_store().cloned();
+        if self.0.pause.load(std::sync::atomic::Ordering::SeqCst) {
+            self.0.started.notify_one();
+            self.0.release.notified().await;
         }
-        .sign(&prepared.request, &key, 1024)
-        .unwrap())
+        let state = self.0.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let dialect = hellas_executor::GpuDialect::Hip;
+            let program = BoundProgram::compile(
+                &content,
+                &prepared,
+                &limits,
+                &std::env::current_exe().unwrap(),
+                dialect,
+            )
+            .map_err(|e| e.to_string())?;
+            driver::execute_signed(
+                &mut HostScalarDevice::new(state),
+                &program,
+                &prepared,
+                &limits,
+                &Assets::new(0, dialect),
+                &content,
+                &ProducerSigningKey::from_secret_bytes([2; 32]).unwrap(),
+                |_| Ok(()),
+            )
+            .map(|(_, events)| events)
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(BackendFault::caused_by)?
+        .map_err(|e| BackendFault::caused_by(hellas_executor::ExecutorError::Execution(e)))
     }
 }
 
-/// Only arithmetic execution is a double. Setup, Work, journals, clocks and
-/// owner signatures use the native services and the six-validator chain.
+/// Compiles the generated C ABI with the host C++ compiler. The header
+/// aborts on any GPU operation; there is no arithmetic model here.
+struct HostScalarDevice {
+    dir: tempfile::TempDir,
+    library: Option<libloading::Library>,
+    signatures: Vec<catena_lang::runtime::GeneratedFunction>,
+    state: Arc<HostComputeState>,
+}
+impl HostScalarDevice {
+    fn new(state: Arc<HostComputeState>) -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+            library: None,
+            signatures: vec![],
+            state,
+        }
+    }
+}
+type DeviceResult<T> = Result<T, Box<dyn std::error::Error>>;
+impl hellas_executor::catena::driver::Device for HostScalarDevice {
+    fn load(
+        &mut self,
+        module: &catena_lang::runtime::RuntimeModule,
+        _retention: Retention,
+    ) -> DeviceResult<hellas_executor::catena::Cancellation> {
+        self.state
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = self.dir.path();
+        std::fs::create_dir_all(dir.join("hip"))?;
+        std::fs::write(
+            dir.join("hip/hip_runtime.h"),
+            "#pragma once\n#include <cstdlib>\n#define __host__\n#define __device__\nusing hipError_t = int;\nconstexpr int hipSuccess = 0;\ninline const char* hipGetErrorString(int) { std::abort(); }\ninline int hipMalloc(void**, size_t) { std::abort(); }\nstruct dim3 { unsigned x,y,z; dim3(unsigned a,unsigned b,unsigned c):x(a),y(b),z(c){} };\n",
+        )?;
+        std::fs::write(dir.join("module.cpp"), &module.source)?;
+        let output = std::process::Command::new("c++")
+            .args(["-std=c++17", "-shared", "-fPIC", "-O1", "-I"])
+            .arg(dir)
+            .arg(dir.join("module.cpp"))
+            .arg("-o")
+            .arg(dir.join("module.so"))
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        self.library = Some(unsafe { libloading::Library::new(dir.join("module.so"))? });
+        self.signatures = module.functions.clone();
+        Ok(hellas_executor::catena::Cancellation::default())
+    }
+    fn call(
+        &mut self,
+        entry: &str,
+        args: Vec<catena_lang::runtime::Value<'_>>,
+    ) -> DeviceResult<Vec<catena_lang::runtime::Value<'static>>> {
+        use catena_lang::runtime::{Value, ValueKind};
+        let signature = self
+            .signatures
+            .iter()
+            .find(|f| f.source_name == entry)
+            .ok_or("unknown entry")?;
+        assert_eq!(signature.outputs, vec![ValueKind::U64]);
+        let args: Vec<u64> = args
+            .into_iter()
+            .map(|v| match v {
+                Value::U64(n) => n,
+                _ => panic!("the scalar double takes u64 arguments"),
+            })
+            .collect();
+        let lib = self.library.as_ref().unwrap();
+        let symbol = signature.symbol.as_bytes();
+        let mut result = 0;
+        unsafe {
+            match args.as_slice() {
+                [] => lib.get::<unsafe extern "C" fn(*mut u64)>(symbol)?(&mut result),
+                [a] => lib.get::<unsafe extern "C" fn(u64, *mut u64)>(symbol)?(*a, &mut result),
+                [a, b] => lib.get::<unsafe extern "C" fn(u64, u64, *mut u64)>(symbol)?(
+                    *a,
+                    *b,
+                    &mut result,
+                ),
+                _ => return Err("unsupported scalar arity".into()),
+            }
+        }
+        Ok(vec![Value::U64(result)])
+    }
+}
+
+/// Only the device is a double. Setup, Work, journals, clocks and owner
+/// signatures use the native services and the six-validator chain.
 struct Provider {
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
     node: hellas_sdk::FullNode,
@@ -91,6 +228,7 @@ struct Provider {
     clock: WorkWatcher,
     serving: tokio::task::JoinHandle<()>,
     admin: hellas_authority::grant_service::WorkAdministration,
+    compute: HostCompute,
 }
 
 #[derive(Clone)]
@@ -151,17 +289,17 @@ impl Provider {
         root: &'a std::path::Path,
         config: WorkConfig,
         node: hellas_sdk::FullNode,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        compute: HostCompute,
         identity: NodeIdentity,
     ) -> impl std::future::Future<Output = Self> + 'a {
-        Box::pin(Self::start_inner(root, config, node, calls, identity))
+        Box::pin(Self::start_inner(root, config, node, compute, identity))
     }
 
     async fn start_inner(
         root: &std::path::Path,
         config: WorkConfig,
         node: hellas_sdk::FullNode,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        compute: HostCompute,
         identity: NodeIdentity,
     ) -> Self {
         let enrollment = provider_enrollment(&identity);
@@ -202,8 +340,7 @@ impl Provider {
             .await
             .unwrap();
         let setup = MountedSetup::default();
-        let work =
-            MountedWork::with_backend(CpuCompute(Arc::new(tokio::sync::Semaphore::new(1)), calls));
+        let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
                 network: config.chain.network,
@@ -292,6 +429,7 @@ impl Provider {
             clock,
             serving,
             admin,
+            compute,
         }
     }
     async fn policy(
@@ -465,6 +603,7 @@ async fn compute_and_settle(
     provider: &Provider,
     original: &SignedPaidOffer,
 ) {
+    let compute = &provider.compute;
     let owner = Arc::new(
         hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(FRIEND.passkey()),
@@ -594,48 +733,303 @@ async fn compute_and_settle(
     // race. Reopen from journals on that stable tip before testing payment.
     session.shutdown().await;
     drop(session);
-    let mut session = PaidWorkSession::open(options, endpoint.clone(), key.clone(), owner)
-        .await
-        .unwrap();
+    let mut session = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        key.clone(),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         session.descriptor().bond_edge(),
         original.offer().proposal.bond_edge()
     );
-    let job = hellas_sdk::job::Job::from_input(
-        JOB_PRICE,
-        hellas_sdk::job::JobInput::Compute {
-            environment: hellas_channel::test_support::channel::environment(),
-            plan: hellas_channel::test_support::channel::plan(),
-            inputs: vec![],
-            content: hellas_channel::test_support::channel::program_content(),
-        },
-    )
-    .unwrap();
-    let prepared = job
-        .prepare(
-            &ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap(),
-            [7; 32],
-            ProducerSigningKey::from_secret_bytes([2; 32])
-                .unwrap()
-                .public_key(),
-            session.descriptor().invocation_policy(),
-        )
-        .unwrap();
-    let result = session
-        .run(Some(prepared), &job.content(), false, None)
+    // Job 1: A has never seen this program. B uploads it, A compiles and runs
+    // it, and B pays exactly the price for the signed result.
+    let client_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let (k, nonce) = (u64::from(rand::random::<u32>()), rand::random::<u32>());
+    let (job, source) = compute_job(&increment(k), increment_plan(Arg::U64(41)));
+    let result = transact(&mut session, &job, &client_key, None)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(result.job_price, JOB_PRICE);
-    assert_eq!(result.credited_cumulative, JOB_PRICE);
+    assert_eq!(
+        (result.job_price, result.credited_cumulative),
+        (JOB_PRICE, JOB_PRICE)
+    );
+    assert_eq!(
+        result.provider_key,
+        ProducerSigningKey::from_secret_bytes([2; 32])
+            .unwrap()
+            .public_key()
+    );
+    assert_eq!(result.output.artifacts.len(), 1);
+    assert_eq!(
+        result.output.artifacts[0].bytes.as_bytes(),
+        (41 + k).to_le_bytes()
+    );
+    assert!(compute.have(source), "A retained B's uploaded source");
+    assert_eq!(staged(&options.config.journal_root), 0);
+    assert_eq!((compute.calls(), compute.loads()), (1, 1));
+    assert!(
+        !session
+            .with_state(|state| state.is_closing())
+            .await
+            .unwrap()
+    );
+
+    // 8a: a step bound over A's policy is refused; nothing is uploaded,
+    // compiled or credited.
+    let mut over = counter_plan();
+    over.step.as_mut().unwrap().stop.max_steps = 65;
+    let (job, source) = compute_job(&increment(k ^ 1), over);
+    assert!(
+        session
+            .run(
+                Some(unchecked(&job, &session, nonce)),
+                &job.content(),
+                false,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(!compute.have(source));
+    assert_eq!(staged(&options.config.journal_root), 0);
+    assert_eq!(compute.calls(), 1);
+    assert_eq!(credited(&session).await, JOB_PRICE);
+
+    // 8d: a counter streams one signed event per step and stops on its match.
+    let streamed = Arc::new(std::sync::Mutex::new(0usize));
+    let progress = streamed.clone();
+    let (job, _) = compute_job(COUNTER, counter_plan());
+    let result = transact(
+        &mut session,
+        &job,
+        &client_key,
+        Some(Arc::new(move |_| {
+            *progress.lock().unwrap() += 1;
+            Ok(())
+        })),
+    )
+    .await
+    .unwrap();
+    let metadata: invocation::compute::RunMetadata =
+        hellas_rpc::value::decode_canonical_dag_cbor(result.output.metadata.as_bytes()).unwrap();
+    assert_eq!(
+        metadata,
+        invocation::compute::RunMetadata {
+            steps: 5,
+            stop: Some(invocation::compute::StopReason::Matched(5)),
+        }
+    );
+    assert_eq!(
+        *streamed.lock().unwrap(),
+        5 + 1,
+        "one signed event per step, then the terminal"
+    );
+    assert_eq!(result.credited_cumulative, 2 * JOB_PRICE);
+
+    // 9: interrupted after A accepted, the same work resumes and pays once.
+    let (job, _) = compute_job(&increment(k ^ 2), increment_plan(Arg::U64(41)));
+    let calls = compute.calls();
+    compute
+        .0
+        .pause
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let first = transact(&mut session, &job, &client_key, None);
+        tokio::pin!(first);
+        tokio::select! {
+            result = &mut first => panic!("job completed before interruption: {:?}", result.err()),
+            () = compute.0.started.notified() => {},
+        }
+    }
+    let interrupted = session
+        .with_state(|state| state.jobs().last().unwrap().work_id())
+        .await
+        .unwrap();
+    session.shutdown().await;
+    drop(session);
+    let mut session = PaidWorkSession::open(options, endpoint.clone(), key.clone(), owner)
+        .await
+        .unwrap();
+    compute
+        .0
+        .pause
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    compute.0.release.notify_one();
+    let result = transact(&mut session, &job, &client_key, None)
+        .await
+        .unwrap();
+    assert_eq!(result.work_id, interrupted);
+    assert_eq!(compute.calls(), calls + 1);
+    assert_eq!(result.credited_cumulative, CREDITED);
+
+    // 10: the settled close pays A exactly the credited total.
     assert_eq!(
         sealing_while(devnet, Duration::from_millis(100), session.settle())
             .await
             .unwrap(),
-        JOB_PRICE
+        CREDITED
     );
     session.shutdown().await;
     drop(session);
+}
+
+const CREDITED: u64 = 3 * JOB_PRICE;
+const COUNTER: &str = r#"(def program initialize : [] -> (u64 val) = const.u64.0x0000000000000000)
+(def program advance : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
+"#;
+fn increment(k: u64) -> String {
+    format!(
+        "(def program increment : (u64 val) -> (u64 val) = ({{_ const.u64.0x{k:016X}}} {{smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64}} stdlib.numeric.+ :.forget))\n"
+    )
+}
+fn increment_plan(arg: Arg) -> Plan {
+    Plan {
+        calls: vec![Call {
+            entry: "increment".into(),
+            args: vec![arg],
+            bind: vec![Bind::Name("answer".into())],
+        }],
+        step: None,
+        outputs: vec![Declared {
+            slot: "answer".into(),
+            kind: OutputKind::Scalar(ValueKind::U64),
+        }],
+    }
+}
+fn counter_plan() -> Plan {
+    let value = || Bind::Name("value".into());
+    Plan {
+        calls: vec![Call {
+            entry: "initialize".into(),
+            args: vec![],
+            bind: vec![value()],
+        }],
+        step: Some(Step {
+            entry: "advance".into(),
+            args: vec![
+                StepArg::Arg(Arg::Slot {
+                    name: "value".into(),
+                }),
+                StepArg::Arg(Arg::U64(1)),
+            ],
+            bind: vec![value()],
+            emit: "value".into(),
+            stop: Stop {
+                any_of: vec![5],
+                max_steps: 64,
+            },
+        }),
+        outputs: vec![Declared {
+            slot: "value".into(),
+            kind: OutputKind::Scalar(ValueKind::U64),
+        }],
+    }
+}
+fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_rpc::ContentRef) {
+    let mut content = hellas_channel::content::EphemeralContent::default();
+    let source = content.insert(source.as_bytes().to_vec());
+    let environment = invocation::compute::Environment {
+        sources: vec![source],
+        assets: vec![],
+    };
+    content.insert(environment.canonical_bytes().unwrap());
+    let job = hellas_sdk::job::Job::compute(
+        JOB_PRICE,
+        environment,
+        plan,
+        vec![],
+        InvocationContent::Ephemeral(content),
+    )
+    .unwrap();
+    (job, source)
+}
+/// `Job::prepare` without B's policy pre-check, as a client that skips it.
+fn unchecked(
+    job: &hellas_sdk::job::Job,
+    session: &PaidWorkSession,
+    nonce: u32,
+) -> PreparedInvocation {
+    let hellas_sdk::job::JobInput::Compute { plan, .. } = job.input() else {
+        unreachable!()
+    };
+    let input = invocation::InvocationInput {
+        parameters: hellas_rpc::JsonBytes(plan.canonical_bytes().unwrap()),
+        artifacts: vec![],
+    };
+    let request = invocation::InvocationRequest {
+        execution_environment: job.manifest().content_id(),
+        input: input.content_id().unwrap(),
+        runner_public_key: ProducerSigningKey::from_secret_bytes([2; 32])
+            .unwrap()
+            .public_key(),
+        nonce: [
+            nonce.to_le_bytes(),
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+        ]
+        .concat()
+        .try_into()
+        .unwrap(),
+        assurance: Assurance::ProducerSigned,
+        retain: true,
+    };
+    PreparedInvocation::new(
+        request,
+        &job.manifest(),
+        input,
+        session
+            .descriptor()
+            .invocation_policy()
+            .canonical_bytes()
+            .unwrap(),
+    )
+    .unwrap()
+}
+async fn transact(
+    session: &mut PaidWorkSession,
+    job: &hellas_sdk::job::Job,
+    key: &ProducerSigningKey,
+    progress: Option<hellas_channel::work::PaidProgress>,
+) -> Result<hellas_sdk::paid_client::PaidWorkResult, hellas_sdk::transact::TransactError> {
+    hellas_sdk::transact::transact(
+        session,
+        job,
+        key,
+        hellas_sdk::transact::TransactionOptions {
+            progress,
+            ..Default::default()
+        },
+    )
+    .await
+}
+async fn credited(session: &PaidWorkSession) -> u64 {
+    session
+        .with_state(|state| state.ledger().credited_cumulative())
+        .await
+        .unwrap()
+}
+/// Files left in A's upload staging directories.
+fn staged(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| match path.is_dir() {
+            true if path.extension().is_some_and(|e| e == "staging") => files(&path),
+            true => staged(&path),
+            false => 0,
+        })
+        .sum()
 }
 
 pub(super) fn exercise(
@@ -653,7 +1047,7 @@ struct Case {
     keys: Vec<Secp256k1Signer>,
     payment_coins: Vec<CoinId>,
     config: WorkConfig,
-    calls: Arc<std::sync::atomic::AtomicUsize>,
+    compute: HostCompute,
     provider: Provider,
     endpoint: Endpoint,
     policy: hellas_channel::model::paid_policy::PaidPolicy,
@@ -892,12 +1286,12 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap();
     drop(store);
     let config = work_config(&devnet, root.path().join("paid"));
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let compute = HostCompute::default();
     let mut provider = Provider::start(
         root.path(),
         config.clone(),
         devnet.full_node(0).clone(),
-        calls.clone(),
+        compute.clone(),
         identity.clone(),
     )
     .await;
@@ -920,7 +1314,17 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     assert_eq!(files(&config.journal_root), 0);
     let mut policy = paid_policy();
-    policy.invocation_policy = hellas_channel::test_support::channel::work_policy().into();
+    policy.invocation_policy = InvocationPolicy {
+        admissions: vec![Admission::Compute {
+            evaluator: invocation::compute::EVALUATOR.into(),
+        }],
+        limits: Limits {
+            max_upload_bytes: 1 << 20,
+            max_output_bytes: 4096,
+            max_steps: 64,
+            execution_timeout_ms: 10_000,
+        },
+    };
     policy.payment_policy.fixed_price = JOB_PRICE;
     policy.expected_payment_values = EdgeValues::new(FUNDING, 0, Fees::ZERO);
     policy.offers.omission_bond = 201;
@@ -1068,7 +1472,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         root.path(),
         config.clone(),
         devnet.full_node(0).clone(),
-        calls.clone(),
+        compute.clone(),
         identity.clone(),
     )
     .await;
@@ -1323,7 +1727,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         root.path(),
         config.clone(),
         devnet.full_node(0).clone(),
-        calls.clone(),
+        compute.clone(),
         identity.clone(),
     )
     .await;
@@ -1365,7 +1769,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         keys,
         payment_coins,
         config,
-        calls,
+        compute,
         provider,
         endpoint,
         policy,
@@ -1387,7 +1791,7 @@ async fn finish(case: Box<Case>) {
         keys,
         payment_coins,
         config,
-        calls,
+        compute,
         mut provider,
         endpoint,
         mut policy,
@@ -1420,14 +1824,14 @@ async fn finish(case: Box<Case>) {
         &first,
     ))
     .await;
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(compute.calls(), 3);
     assert_eq!(
         holdings(&devnet, owners[1].key())
             .await
             .iter()
             .map(|(_, v)| *v)
             .sum::<u64>(),
-        owners[1].balance - JOB_PRICE
+        owners[1].balance - CREDITED
     );
     // A malicious no-show can post its countersigned bond alone. The same
     // production clock reclaims it without waiting for a payment proposal.
@@ -1491,7 +1895,7 @@ async fn finish(case: Box<Case>) {
             .iter()
             .map(|(_, v)| *v)
             .sum::<u64>()
-            == 39 + JOB_PRICE
+            == 39 + CREDITED
         {
             break;
         }
@@ -1499,9 +1903,9 @@ async fn finish(case: Box<Case>) {
         devnet.seal().await;
     }
     let held = holdings(&devnet, owners[0].key()).await;
-    assert_eq!(held.iter().map(|(_, v)| *v).sum::<u64>(), 39 + JOB_PRICE);
+    assert_eq!(held.iter().map(|(_, v)| *v).sum::<u64>(), 39 + CREDITED);
     assert_eq!(held.iter().filter(|(_, v)| *v == 12).count(), 3);
-    assert_eq!(held.iter().filter(|(_, v)| *v == JOB_PRICE).count(), 1);
+    assert_eq!(held.iter().filter(|(_, v)| *v == CREDITED).count(), 1);
     let transport = connect_offer(&endpoint, &provider).await;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -1532,7 +1936,7 @@ async fn finish(case: Box<Case>) {
         root.path(),
         config.clone(),
         devnet.full_node(0).clone(),
-        calls.clone(),
+        compute.clone(),
         identity.clone(),
     )
     .await;

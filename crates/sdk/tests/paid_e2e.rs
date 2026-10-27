@@ -7,6 +7,14 @@
 //! devnet's proposer) and the upstream HTTP response are fixtures; the
 //! money is read back out of the validators' finalized state.
 
+// The executor re-executes this binary as its Catena compile child.
+#[ctor::ctor(unsafe)]
+fn catena_child() {
+    if hellas_executor::child_main().unwrap() {
+        std::process::exit(0);
+    }
+}
+
 #[path = "paid_e2e/automatic.rs"]
 mod automatic;
 #[path = "paid_e2e/remote.rs"]
@@ -1386,8 +1394,10 @@ async fn provider_close_offline(
     }
 }
 
+/// Plan-v4 §6, CI variant: B, with no node, buys one run of a program A has
+/// never seen through an automatic offer, and pays for it exactly once.
 #[test]
-fn automatic_offers_fund_and_settle_evaluate_with_bounded_stake() {
+fn unseen_program_pays_exactly_once() {
     run(automatic::exercise);
 }
 
