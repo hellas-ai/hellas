@@ -617,6 +617,7 @@ impl PaidWorkSession {
                 /// restart; only its payment is outstanding, and settling it
                 /// needs none of the payload a Fetch journal strips.
                 Delivered(hellas_auth::Digest),
+                Failed(hellas_auth::Digest, hellas_auth::Digest),
                 /// No payload and no result: the job can neither execute nor
                 /// settle. Its evidence is retained until the payment deadline
                 /// filters it out, without blocking every later request.
@@ -636,27 +637,42 @@ impl PaidWorkSession {
                             // Keep the evidence, but do not let an unpayable old job
                             // prevent this channel from serving a new request. Retained
                             // certificates are re-sent separately above.
+                            let failed = job.result().is_some_and(|(result, _)| {
+                                result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                            });
                             let payable = job.authorization().payment_deadline >= state.cursor().0;
-                            if !payable {
+                            if !payable && !failed {
                                 tracing::info!(
                                     work_id = %hex::encode(job.work_id().as_bytes()),
                                     payment_deadline = job.authorization().payment_deadline,
                                     "retaining expired unpaid job without retrying execution",
                                 );
                             }
-                            payable
+                            failed || payable
                         })
                         .map(|job| {
+                            if let Some((result, _)) = job.result()
+                                && result.outcome
+                                    == hellas_channel::model::work::ResultOutcome::Failed
+                            {
+                                return Ok(RecoveredJob::Failed(
+                                    job.work_id(),
+                                    result.transcript_content.id().digest(),
+                                ));
+                            }
                             // Fetch journals retain accounting only. A restart cannot
                             // reconstruct a lost request or authorize another
                             // execution, but an already delivered result still
                             // settles: signing payment needs no payload.
                             if job.prepared_input().is_empty() {
-                                return Ok(if job.result().is_some() {
-                                    RecoveredJob::Delivered(job.work_id())
-                                } else {
-                                    RecoveredJob::Unrecoverable(job.work_id())
-                                });
+                                return Ok(
+                                    if job.phase() == hellas_channel::work_store::JobPhase::Verified
+                                    {
+                                        RecoveredJob::Delivered(job.work_id())
+                                    } else {
+                                        RecoveredJob::Unrecoverable(job.work_id())
+                                    },
+                                );
                             }
                             PreparedInvocation::from_canonical_bytes(
                                 job.prepared_input(),
@@ -670,6 +686,10 @@ impl PaidWorkSession {
                 .await??;
             for recovered in pending {
                 let (work_id, phase, pending) = match recovered {
+                    RecoveredJob::Failed(work_id, evidence) => {
+                        client.client().await?.rejected(work_id, evidence).await?;
+                        continue;
+                    }
                     RecoveredJob::Delivered(work_id) => {
                         pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout)
                             .await?;
@@ -722,7 +742,9 @@ impl PaidWorkSession {
                     tracing::info!(%work_id, %error, "retaining an unpaid job refused by the provider");
                     continue;
                 }
-                result?;
+                if !matches!(&result, Err(PaidClientError::InvocationFailed { .. })) {
+                    result?;
+                }
             }
         }
         // Keep recovery armed across any error or cancellation after acceptance.
@@ -733,40 +755,46 @@ impl PaidWorkSession {
         let result = match prepared {
             Some(prepared) => {
                 let ready = client.readiness().await?;
-                Some(
-                    execute_paid_job(
-                        args,
-                        prepared,
-                        content,
-                        dialer,
-                        client,
-                        &ready,
-                        config.poll,
-                        progress.as_ref(),
-                        if recover {
-                            JobLookup::New
-                        } else {
-                            JobLookup::PreparedInput
-                        },
-                        proposed,
-                        purchase,
-                    )
-                    .await?,
+                execute_paid_job(
+                    args,
+                    prepared,
+                    content,
+                    dialer,
+                    client,
+                    &ready,
+                    config.poll,
+                    progress.as_ref(),
+                    if recover {
+                        JobLookup::New
+                    } else {
+                        JobLookup::PreparedInput
+                    },
+                    proposed,
+                    purchase,
                 )
+                .await
+                .map(Some)
             }
-            None => None,
+            None => Ok(None),
         };
-        if recover || result.is_some() {
+        if (recover && result.is_ok())
+            || matches!(
+                &result,
+                Ok(Some(_)) | Err(PaidClientError::InvocationFailed { .. })
+            )
+        {
             *needs_recovery = client
                 .with_state(|state| {
                     state.jobs().any(|job| {
-                        job.authorization().payment_deadline >= state.cursor().0
-                            && (!job.prepared_input().is_empty() || job.result().is_some())
+                        job.result().is_some_and(|(result, _)| {
+                            result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                        }) || (job.authorization().payment_deadline >= state.cursor().0
+                            && (!job.prepared_input().is_empty() || job.result().is_some()))
                     })
                 })
                 .await?;
         }
-        Ok(result)
+        result
     }
 }
 
@@ -1031,18 +1059,28 @@ async fn execute_paid_job(
         check_payment_window(client, work_id).await?;
         delivery.transcript
     };
-    let output = proposal
-        .prepared_input
-        .verify_output(
-            ready.invocation_policy(),
-            &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
-            &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-            &hellas_channel::model::work::decode_transcript(
-                &transcript,
-                hellas_channel::work_store::journal::MAX_RECORD_BYTES,
-            )?,
-        )?
-        .output;
+    let verified = proposal.prepared_input.verify_output(
+        ready.invocation_policy(),
+        &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+        &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+        &hellas_channel::model::work::decode_transcript(
+            &transcript,
+            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+        )?,
+    )?;
+    let output = verified.output;
+    if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) = output.outcome {
+        client
+            .client()
+            .await?
+            .rejected(work_id, verified.transcript.id().digest())
+            .await?;
+        if let Some(purchase) = purchase {
+            purchase.unpaid(work_id)?;
+        }
+        return Err(PaidClientError::InvocationFailed { work_id, reason });
+    }
+    client.client().await?.verified(work_id).await?;
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.paying(work_id)?;
     }

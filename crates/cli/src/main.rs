@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate tracing;
 
-use anyhow::Context as _;
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
@@ -93,17 +92,6 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     }
 }
 
-/// Execution requires an explicit Work backend; proxy mode has no Hellas peer.
-fn gateway_provider_trust(
-    responses_backend: GatewayResponsesBackend,
-) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    if responses_backend != GatewayResponsesBackend::Proxy {
-        return Err(hellas_client::ClientError::FundingRequired.into());
-    }
-    Ok(None)
-}
-
-/// Caller-selected trust policy for commands that execute on a remote provider.
 #[derive(Args)]
 struct RemoteTrustArgs {
     /// Assurance required for remote execution.
@@ -968,9 +956,9 @@ async fn async_main() {
                 let http_config = if let Some(path) = http_fetch_config {
                     let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
                     Some(serde_json::from_slice(&bytes)?)
-                } else if loaded_environment.is_none() {
+                } else {
                     grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
-                } else { None };
+                };
                 let served = async {
                 if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,

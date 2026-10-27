@@ -29,6 +29,11 @@ pub enum PaidClientError {
     AmbiguousRecovery,
     #[error("payment deadline elapsed during result delivery")]
     PaymentExpired,
+    #[error("invocation {work_id} failed ({reason:?}); nothing was paid")]
+    InvocationFailed {
+        work_id: hellas_auth::Digest,
+        reason: hellas_rpc::protocol::invocation::output::FailureReason,
+    },
     #[error("{stage} deadline overflow")]
     DeadlineOverflow { stage: &'static str },
     #[error("{stage} timed out; journals retain payment state")]

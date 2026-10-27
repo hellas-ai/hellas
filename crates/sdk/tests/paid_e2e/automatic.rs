@@ -26,11 +26,11 @@ use iroh::{Endpoint, EndpointAddr, TransportAddr, endpoint::presets};
 const JOB_PRICE: u64 = 20;
 const FUNDING: u64 = 401;
 
-struct CpuEvaluate(
+struct CpuCompute(
     Arc<tokio::sync::Semaphore>,
     Arc<std::sync::atomic::AtomicUsize>,
 );
-impl WorkBackend for CpuEvaluate {
+impl WorkBackend for CpuCompute {
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
         if domain != CapacityDomain::Gpu {
             return Err(
@@ -46,14 +46,9 @@ impl WorkBackend for CpuEvaluate {
     }
     async fn execute(
         &self,
-        input: hellas_channel::work::PreparedWorkInput,
+        input: hellas_channel::work::Admitted<PreparedInvocation>,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = input else {
-            return Err(BackendFault::caused_by(std::io::Error::other(
-                "Evaluate fixture",
-            )));
-        };
-        let (parts, admission) = input.into_parts_and_admission();
+        let (prepared, _, _, admission) = input.into_parts_and_admission();
         let _running = admission
             .reserve(CapacityDomain::Gpu, async {
                 self.try_admit(CapacityDomain::Gpu)
@@ -63,26 +58,25 @@ impl WorkBackend for CpuEvaluate {
             .await?;
         self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-        let mut output = hellas_rpc::evaluate::EvaluateOutputTranscriptBuilder::new(
-            hellas_rpc::evaluate::input_commitment(&parts.evaluate_request),
-            parts.evaluate_request.assurance,
-            &key,
-        );
-        output.push_token_delta(vec![1]).unwrap();
-        let usage = hellas_rpc::evaluate::EvaluateUsage {
-            input_units: parts.prompt_tokens.as_slice().len() as u64,
-            output_units: 1,
-        };
-        Ok(output
-            .finish(hellas_rpc::evaluate::EvaluateTerminal {
-                final_position: 1,
-                stop_reason: hellas_rpc::evaluate::EvaluateStopReason::STOP_TOKEN,
-                matched_stop_token_id: Some(1),
-                text_artifact: Digest::hash(b"cpu-evaluate-fixture"),
-                usage,
-                billable_units: usage.billable_units().unwrap(),
-            })
-            .unwrap())
+        Ok(invocation::output::InvocationOutput {
+            outcome: invocation::output::Outcome::Succeeded,
+            artifacts: vec![invocation::Artifact::new(
+                "answer",
+                "catena.bytes.v1",
+                1u32.to_le_bytes().to_vec(),
+            )],
+            metadata: hellas_rpc::JsonBytes(
+                hellas_rpc::protocol::value::canonical_dag_cbor(
+                    &invocation::compute::RunMetadata {
+                        steps: 0,
+                        stop: None,
+                    },
+                )
+                .unwrap(),
+            ),
+        }
+        .sign(&prepared.request, &key, 1024)
+        .unwrap())
     }
 }
 
@@ -209,7 +203,7 @@ impl Provider {
             .unwrap();
         let setup = MountedSetup::default();
         let work =
-            MountedWork::with_backend(CpuEvaluate(Arc::new(tokio::sync::Semaphore::new(1)), calls));
+            MountedWork::with_backend(CpuCompute(Arc::new(tokio::sync::Semaphore::new(1)), calls));
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
                 network: config.chain.network,
@@ -462,7 +456,7 @@ fn revision_two(
         .unwrap()
 }
 
-async fn evaluate_and_settle(
+async fn compute_and_settle(
     devnet: &mut Devnet,
     options: PaidWorkOptions,
     endpoint: &Endpoint,
@@ -607,12 +601,28 @@ async fn evaluate_and_settle(
         session.descriptor().bond_edge(),
         original.offer().proposal.bond_edge()
     );
-    let result = session
-        .run(
-            Some(hellas_channel::test_support::channel::bundle(7).into()),
-            false,
-            None,
+    let job = hellas_sdk::job::Job::from_input(
+        JOB_PRICE,
+        hellas_sdk::job::JobInput::Compute {
+            environment: hellas_channel::test_support::channel::environment(),
+            plan: hellas_channel::test_support::channel::plan(),
+            inputs: vec![],
+            content: hellas_channel::test_support::channel::program_content(),
+        },
+    )
+    .unwrap();
+    let prepared = job
+        .prepare(
+            &ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap(),
+            [7; 32],
+            ProducerSigningKey::from_secret_bytes([2; 32])
+                .unwrap()
+                .public_key(),
+            session.descriptor().invocation_policy(),
         )
+        .unwrap();
+    let result = session
+        .run(Some(prepared), &job.content(), false, None)
         .await
         .unwrap()
         .unwrap();
@@ -910,7 +920,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     assert_eq!(files(&config.journal_root), 0);
     let mut policy = paid_policy();
-    policy.work_policy = hellas_channel::test_support::channel::work_policy().into();
+    policy.invocation_policy = hellas_channel::test_support::channel::work_policy().into();
     policy.payment_policy.fixed_price = JOB_PRICE;
     policy.expected_payment_values = EdgeValues::new(FUNDING, 0, Fees::ZERO);
     policy.offers.omission_bond = 201;
@@ -1400,7 +1410,7 @@ async fn finish(case: Box<Case>) {
         payment_blocks: 32,
         timeout: Duration::from_secs(120),
     };
-    Box::pin(evaluate_and_settle(
+    Box::pin(compute_and_settle(
         &mut devnet,
         options.clone(),
         &endpoint,

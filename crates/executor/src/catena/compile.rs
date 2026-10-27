@@ -15,6 +15,8 @@ use std::{
 
 use super::process::{Cancellation, Watchdog, isolate_child};
 
+// Decision 23's killable compile child, specified in plan-v4 §§2.2/2.5.
+// Decision 41 removes its deadline but retains explicit cancellation.
 const COMPILE_ENV: &str = "HELLAS_CATENA_COMPILE";
 const MAX_MODULE_BYTES: u64 = 256 << 20;
 

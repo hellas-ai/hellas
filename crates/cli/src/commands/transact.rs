@@ -326,41 +326,57 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 args.client.owner(&context)?.principal(),
             )
             .await?;
-            let hellas_channel::model::profile::WorkPolicy::Fetch {
-                contract,
-                route,
-                policy,
-            } = &quote.policy.work_policy
-            else {
-                bail!("provider does not admit Fetch. Nothing was paid.");
-            };
-            ensure!(
-                contract.schema() == hellas_rpc::FetchSchema::HttpV1,
-                "provider does not admit HTTPS Fetch. Nothing was paid."
-            );
-            if let Some(path) = &args.contract {
-                let selected: hellas_rpc::FetchContract =
-                    serde_json::from_slice(&super::read_bounded_regular_file(
-                        path,
-                        "contract",
-                        hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
-                    )?)?;
-                ensure!(
-                    &selected == contract,
+            let selected = args
+                .contract
+                .as_ref()
+                .map(|path| -> super::CliResult<hellas_rpc::FetchContract> {
+                    serde_json::from_slice::<hellas_rpc::FetchContract>(
+                        &super::read_bounded_regular_file(
+                            path,
+                            "contract",
+                            hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+                        )?,
+                    )
+                    .map_err(Into::into)
+                })
+                .transpose()?;
+            let admission = quote
+                .policy
+                .invocation_policy
+                .admissions
+                .iter()
+                .find_map(|a| match a {
+                    hellas_rpc::protocol::invocation::Admission::Fetch { admission }
+                        if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1
+                            && selected
+                                .as_ref()
+                                .is_none_or(|contract| contract == &admission.contract) =>
+                    {
+                        Some(admission)
+                    }
+                    _ => None,
+                })
+                .context(if selected.is_some() {
                     "selected contract is not admitted. Nothing was paid."
-                );
-            }
+                } else {
+                    "provider does not admit HTTPS Fetch. Nothing was paid."
+                })?;
+            let contract = &admission.contract;
+            let route = &admission.route;
             let (service, method) = match route {
-                hellas_channel::model::fetch::FetchRoutePolicy::OpenFetch { .. } => {
+                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch { .. } => {
                     ("http".into(), "request".into())
                 }
-                hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { service, method } => {
-                    (service.clone(), method.clone())
-                }
+                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                    service,
+                    method,
+                } => (service.clone(), method.clone()),
             };
             if args.max_response_bytes.is_none() {
-                request.max_response_bytes = (policy.max_output_bytes / 4 * 3)
-                    .min(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES);
+                request.max_response_bytes =
+                    (quote.policy.invocation_policy.limits.max_output_bytes / 4 * 3)
+                        .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
+                        as u32;
             }
             let job = Job::fetch(
                 args.payment,
@@ -487,15 +503,10 @@ fn http_body(job: &Job, result: &PaidWorkResult) -> super::CliResult<Vec<u8>> {
         "not an HTTPS Fetch contract"
     );
     let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)?;
-    let events = hellas_channel::model::work::decode_transcript(
-        &result.transcript,
-        result.transcript.len(),
+    let output = hellas_rpc::protocol::invocation::fetch::decode_output(
+        &result.output,
+        &result.provider_key,
     )?;
-    let output = hellas_rpc::fetch::verify_output_events(result.input, job.assurance(), &events)?;
-    ensure!(
-        output.producer_key == result.provider_key,
-        "output signer differs from the channel provider"
-    );
     Ok(hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &output)?.body)
 }
 
@@ -512,13 +523,15 @@ fn save_outputs(directory: &Path, job: &Job, result: &PaidWorkResult) -> super::
     {
         write(&directory.join("output-0000"), &http_body(job, result)?)?;
     } else {
-        let events = hellas_channel::model::work::decode_transcript(
-            &result.transcript,
-            result.transcript.len(),
-        )?;
+        for (index, artifact) in result.output.artifacts.iter().enumerate() {
+            write(
+                &directory.join(format!("output-{index:04}")),
+                artifact.bytes.as_bytes(),
+            )?;
+        }
         write(
             &directory.join("output.json"),
-            &serde_json::to_vec_pretty(&events)?,
+            &serde_json::to_vec_pretty(&result.output)?,
         )?;
     }
     Ok(())

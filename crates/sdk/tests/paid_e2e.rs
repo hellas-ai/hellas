@@ -26,10 +26,7 @@ use hellas_chain::test_support::devnet::{
     Devnet, DevnetConfig, GenesisOwner, OwnerKind, delegate_allocation, run,
 };
 use hellas_chain::{FinalizedWorkView as _, LightClient as _};
-use hellas_channel::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy as PaidRoute, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_channel::model::profile::WorkPolicy;
+use hellas_channel::content::InvocationContent;
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_channel::test_support::{enrollment, test_responses_contract};
 use hellas_executor::{
@@ -38,6 +35,9 @@ use hellas_executor::{
 };
 use hellas_kernel::{CoinId, EdgeValues, Fees, Funding, Key, List, Secp256k1Signer};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
+use hellas_rpc::protocol::invocation::{
+    self as invocation, Admission, InvocationPolicy, Limits, PreparedInvocation,
+};
 use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
 use hellas_sdk::paid_client::{PaidWorkOptions, PaidWorkSession, bind_paid_endpoint};
 use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
@@ -45,6 +45,7 @@ use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
 };
+use invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy as PaidRoute};
 
 /// The job's flat price.
 const PRICE: u64 = 10;
@@ -99,22 +100,27 @@ fn provider_enrollment(identity: &NodeIdentity) -> hellas_rpc::ProviderEnrollmen
     )
 }
 
-fn work_policy() -> WorkPolicy {
-    let route = PaidRoute::sealed_route("openai", "responses").unwrap();
-    WorkPolicy::Fetch {
-        contract: test_responses_contract(),
-        policy: FetchPolicyV2 {
-            allowed_environment: test_responses_contract().manifest_id(),
-            route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-            max_request_body_bytes: 4096,
-            max_output_events: 64,
-            max_output_bytes: 16384,
-            max_spool_bytes: 65536,
-            max_encoded_result_frame: 65536,
-            max_encoded_prepared_input: 65536,
+fn work_policy() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: test_responses_contract(),
+                route: PaidRoute::sealed_route("openai", "responses").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input: 65536,
+                },
+            },
+        }],
+        limits: Limits {
             max_upload_bytes: 65536,
+            max_output_bytes: 16384,
+            max_steps: 1,
+            execution_timeout_ms: 5000,
         },
-        route,
     }
 }
 
@@ -139,7 +145,7 @@ fn paid_policy() -> hellas_channel::model::paid_policy::PaidPolicy {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         },
-        work_policy: work_policy(),
+        invocation_policy: work_policy(),
         payment_policy: JobPaymentPolicyV2 {
             fixed_price: PRICE,
             dispatch_margin_blocks: 4,
@@ -227,6 +233,7 @@ impl hellas_authority::authenticator::Authenticator for Approvals {
 struct PausedFetch {
     inner: MockFetchProvider,
     pause: Arc<std::sync::atomic::AtomicBool>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -236,6 +243,11 @@ impl hellas_executor::FetchProvider for PausedFetch {
     }
     fn run(&self, request: PreparedFetchRequest) -> hellas_executor::FetchProviderFuture<'_> {
         Box::pin(async move {
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(hellas_executor::FetchProviderError::failed(
+                    "upstream unavailable",
+                ));
+            }
             let response = hellas_executor::FetchProvider::run(&self.inner, request).await?;
             if self.pause.load(std::sync::atomic::Ordering::SeqCst) {
                 self.started.notify_one();
@@ -258,6 +270,7 @@ fn routes() -> (FetchRouteRegistry, PausedFetch) {
     let upstream = PausedFetch {
         inner: upstream,
         pause: Arc::default(),
+        fail: Arc::default(),
         started: Arc::default(),
         release: Arc::default(),
     };
@@ -514,7 +527,7 @@ struct PaidScenario {
     client_transport: iroh::SecretKey,
     endpoint: iroh::Endpoint,
     options: PaidWorkOptions,
-    prepared_input: PreparedPaidFetchInputV1,
+    prepared_input: PreparedInvocation,
     quote: hellas_sdk::paid_client::PaidQuote,
     session: PaidWorkSession,
 }
@@ -665,8 +678,16 @@ async fn paid_setup(
         Retention::Ephemeral,
     )
     .unwrap();
-    let prepared_input =
-        PreparedPaidFetchInputV1::new(&events, &test_responses_contract()).unwrap();
+    let prepared_input = invocation::fetch::prepare(
+        &events,
+        &test_responses_contract(),
+        ProducerSigningKey::from_secret_bytes([2; 32])
+            .unwrap()
+            .public_key(),
+        work_policy().canonical_bytes().unwrap(),
+        [0; 32],
+    )
+    .unwrap();
     let mut client_config = config;
     client_config.validators = relays.urls.clone();
     let options = PaidWorkOptions {
@@ -832,8 +853,8 @@ async fn paid_finish(case: PaidScenario) {
         .timeout
         .get();
     assert_eq!(
-        session.descriptor().work_policy(),
-        &quote.policy.work_policy
+        session.descriptor().invocation_policy(),
+        &quote.policy.invocation_policy
     );
     assert_eq!(
         session.descriptor().channel().payment_terms().omission_bond,
@@ -958,11 +979,67 @@ async fn paid_finish(case: PaidScenario) {
     )
     .await
     .unwrap();
-    session.run(None, true, None).await.unwrap();
+    session
+        .run(None, &InvocationContent::Ephemeral(Default::default()), true, None)
+        .await
+        .unwrap();
     assert!(
         !session.needs_recovery(),
         "initial recovery has completed before this request"
     );
+    // A signed failure retires unpaid, including the caller's purchase marker.
+    upstream
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = hellas_sdk::transact::transact(
+        &mut session,
+        &job,
+        &client_producer,
+        hellas_sdk::transact::TransactionOptions {
+            purchase: Some(&mut purchase),
+            ..Default::default()
+        },
+    )
+    .await
+    .err()
+    .expect("signed failure is reported without payment");
+    let hellas_sdk::transact::TransactError::Client(
+        hellas_sdk::paid_client::PaidClientError::InvocationFailed { work_id, .. },
+    ) = failed
+    else {
+        panic!("unexpected failure: {failed}");
+    };
+    session
+        .with_state(|state| {
+            assert_eq!(state.ledger().credited_cumulative(), 0);
+            assert!(state.last_payment().is_none());
+            assert!(matches!(
+                state.terminal_by_id(work_id).unwrap().outcome,
+                hellas_channel::work_store::TerminalOutcome::Rejected { .. }
+            ));
+        })
+        .await
+        .unwrap();
+    assert!(!purchase.is_pending());
+    assert!(!purchase_path.exists());
+    assert!(!session.needs_recovery());
+    session.shutdown().await;
+    drop(session);
+    drop(purchase);
+    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
+    purchase.reconcile(&options).await.unwrap();
+    let mut session = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
+    session
+        .run(None, &InvocationContent::Ephemeral(Default::default()), true, None)
+        .await
+        .unwrap();
     upstream
         .pause
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1186,11 +1263,11 @@ async fn paid_finish(case: PaidScenario) {
 async fn provider_close_offline(
     devnet: &mut Devnet,
     mut session: PaidWorkSession,
-    input: PreparedPaidFetchInputV1,
+    input: PreparedInvocation,
 ) {
     use hellas_chain::{WorkBlocks, work_view::WorkChannelQuery};
     let result = session
-        .run(Some(input.into()), false, None)
+        .run(Some(input), &InvocationContent::Ephemeral(Default::default()), false, None)
         .await
         .unwrap()
         .unwrap();

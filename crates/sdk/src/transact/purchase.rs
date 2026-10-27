@@ -1,7 +1,7 @@
 //! Caller purchase/report state. This contains identifiers only, never input or output.
 use super::super::{job::Job, paid_client::PaidWorkOptions};
 use hellas_auth::Digest;
-use hellas_channel::work_store::{ChannelStore, Role, SetupStore, TerminalOutcome};
+use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
 use hellas_kernel::{EdgeId, Secp256k1Verifier};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -163,7 +163,7 @@ impl Purchase {
             .ok_or_else(|| self.unfinished("channel origin is missing"))?;
         let channel = descriptor.channel().clone();
         let settlement = descriptor.expected_settlement()?;
-        let store = ChannelStore::open(
+        let mut store = ChannelStore::open(
             &options.journal_root,
             channel,
             settlement,
@@ -172,6 +172,34 @@ impl Purchase {
             &Secp256k1Verifier::new(),
         )
         .await?;
+        if let Some(work) = record.work.map(Digest::from_bytes)
+            && let Some((result, _)) = store.state().job_by_id(work).and_then(|job| job.result())
+            && result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+        {
+            let outcome = TerminalOutcome::Rejected {
+                result_digest: hellas_channel::model::work::result_digest(
+                    store.state().channel(),
+                    result,
+                ),
+                evidence_digest: result.transcript_content.id().digest(),
+            };
+            store
+                .commit(
+                    ChannelRecord::JobTerminated {
+                        work_id: work,
+                        outcome,
+                    },
+                    &Secp256k1Verifier::new(),
+                )
+                .await?;
+        }
+        if let Some(work) = record.work.map(Digest::from_bytes)
+            && store.state().terminal_by_id(work).is_some_and(|terminal| {
+                matches!(terminal.outcome, TerminalOutcome::Rejected { .. })
+            })
+        {
+            return self.unpaid(work);
+        }
         if let Some(work) = record.work.map(Digest::from_bytes)
             && store.state().terminal_by_id(work).is_some_and(|terminal| {
                 matches!(terminal.outcome, TerminalOutcome::Certified { .. })
@@ -250,6 +278,23 @@ impl Purchase {
     }
     pub(crate) fn paid(&mut self, work: Digest) -> Result<()> {
         self.advance(work, Phase::Paid)
+    }
+    /// Clear only after the channel journal durably retires this unpaid result.
+    pub(crate) fn unpaid(&mut self, work: Digest) -> Result<()> {
+        let record = self.record.as_ref().ok_or(PurchaseError::Identity)?;
+        if record.work != Some(*work.as_bytes())
+            || matches!(record.phase, Phase::Paid | Phase::Reported)
+        {
+            return Err(PurchaseError::Identity);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        hellas_private::sync_directory(self.path.parent().ok_or(PurchaseError::Identity)?)?;
+        self.record = None;
+        Ok(())
     }
     /// Call only after all selected output writes and the result report succeed.
     pub fn reported(&mut self) -> Result<()> {
