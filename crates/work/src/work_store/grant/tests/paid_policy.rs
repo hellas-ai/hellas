@@ -81,7 +81,7 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
     let node = service.node();
     let command = |revision| WorkControlCommand::SetPaidPolicy {
         expected_revision: Revision(revision),
-        policy: paid(),
+        policy: Box::new(paid()),
     };
     let daily_key = device(admin.caller.subject());
     let daily = node

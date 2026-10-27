@@ -59,7 +59,6 @@ use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::setup::ReadyChannel;
 use hellas_work::model::work::PaidJobResultV1;
 use hellas_work::work::{ClientEndpoint, DeliverError, fetch_result};
-use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 
 use reproduce::{ReproduceFault, Reproducer, Reproduction};
 

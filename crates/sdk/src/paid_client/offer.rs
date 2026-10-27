@@ -262,19 +262,19 @@ pub(crate) async fn retained_offer(
                 continue;
             }
         }
-        if let Some(payment) = store.state().payment_edge() {
-            if store.state().end() == Some(hellas_work::work_store::SetupEnd::Complete) {
-                let snapshot = chain
-                    .work_channel_snapshot(WorkChannelQuery {
-                        bond_edge: setup.bond_edge,
-                        payment_edge: Some(payment),
-                        funding: Default::default(),
-                    })
-                    .await?
-                    .ok_or(PaidClientError::MissingState("finalized client channel"))?;
-                if snapshot.payment().is_none() {
-                    continue;
-                }
+        if let Some(payment) = store.state().payment_edge()
+            && store.state().end() == Some(hellas_work::work_store::SetupEnd::Complete)
+        {
+            let snapshot = chain
+                .work_channel_snapshot(WorkChannelQuery {
+                    bond_edge: setup.bond_edge,
+                    payment_edge: Some(payment),
+                    funding: Default::default(),
+                })
+                .await?
+                .ok_or(PaidClientError::MissingState("finalized client channel"))?;
+            if snapshot.payment().is_none() {
+                continue;
             }
         }
         if retained.is_some() {

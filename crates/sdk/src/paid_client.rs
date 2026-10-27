@@ -39,7 +39,6 @@ use hellas_work::work_handshake::{
     send_setup_exchange,
 };
 use hellas_work::work_open::{SetupAdvance, SetupProgress};
-use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointId, SecretKey};

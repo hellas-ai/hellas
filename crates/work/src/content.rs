@@ -180,13 +180,13 @@ impl UploadStore {
         Ok(())
     }
     pub fn clear(&mut self) -> Result<(), ContentError> {
-        if let Some(directory) = &self.directory {
-            if directory.try_exists()? {
-                for entry in std::fs::read_dir(directory)? {
-                    std::fs::remove_file(entry?.path())?;
-                }
-                hellas_private::sync_directory(directory)?;
+        if let Some(directory) = &self.directory
+            && directory.try_exists()?
+        {
+            for entry in std::fs::read_dir(directory)? {
+                std::fs::remove_file(entry?.path())?;
             }
+            hellas_private::sync_directory(directory)?;
         }
         self.stage = None;
         self.quota.release(self.channel);
@@ -223,16 +223,15 @@ impl UploadStore {
         Ok(Some(bytes))
     }
     pub fn read(&self, work: Digest, object: ContentRef) -> Result<Vec<u8>, ContentError> {
-        if let Some(stage) = &self.stage {
-            if stage.work == work
-                && stage.object == object
-                && stage.bytes.len() as u64 == object.bytes()
-            {
-                if ContentId::hash(&stage.bytes) != object.id() {
-                    return Err(ContentError::Hash);
-                }
-                return Ok(stage.bytes.clone());
+        if let Some(stage) = &self.stage
+            && stage.work == work
+            && stage.object == object
+            && stage.bytes.len() as u64 == object.bytes()
+        {
+            if ContentId::hash(&stage.bytes) != object.id() {
+                return Err(ContentError::Hash);
             }
+            return Ok(stage.bytes.clone());
         }
         self.held(object)?.ok_or(ContentError::Missing)
     }

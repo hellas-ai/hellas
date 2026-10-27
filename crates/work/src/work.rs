@@ -2967,17 +2967,17 @@ impl WorkService {
             .and_then(|mut endpoint| {
                 let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
                 let retained = endpoint.prior_acceptance(&authorization, work_id)?;
-                if retained.is_some() {
-                    if let Some(job) = endpoint.state().job_by_id(work_id) {
-                        let bytes = job.prepared_input().to_vec();
-                        if !bytes.is_empty() {
-                            endpoint
-                                .close
-                                .store
-                                .uploads
-                                .publish_accepted(work_id, &bytes)
-                                .map_err(content_refusal)?;
-                        }
+                if retained.is_some()
+                    && let Some(job) = endpoint.state().job_by_id(work_id)
+                {
+                    let bytes = job.prepared_input().to_vec();
+                    if !bytes.is_empty() {
+                        endpoint
+                            .close
+                            .store
+                            .uploads
+                            .publish_accepted(work_id, &bytes)
+                            .map_err(content_refusal)?;
                     }
                 }
                 Ok(retained.map(|signature| (work_id, signature)))

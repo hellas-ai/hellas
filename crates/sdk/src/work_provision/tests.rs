@@ -47,6 +47,7 @@ fn options(root: &Path) -> ProvisionOptions {
                 max_spool_bytes: 1 << 20,
                 max_encoded_result_frame: 262144,
                 max_encoded_prepared_input: 1 << 20,
+                max_upload_bytes: 1 << 20,
             }
             .into(),
             payment_policy: JobPaymentPolicyV2 {
@@ -246,9 +247,10 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
                 bytes[0] = ((bytes[0].as_u64().unwrap() + 1) % 256).into();
             }
         }
-        match serde_json::from_value::<hellas_work::model::offer::SignedPaidOffer>(changed) {
-            Ok(signed) => assert!(signed.check().is_err(), "mutated {field}"),
-            Err(_) => {}
+        if let Ok(signed) =
+            serde_json::from_value::<hellas_work::model::offer::SignedPaidOffer>(changed)
+        {
+            assert!(signed.check().is_err(), "mutated {field}");
         }
     }
 }

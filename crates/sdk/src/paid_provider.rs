@@ -1147,6 +1147,7 @@ impl WorkRunner {
         self.setup_mount
             .2
             .set(AutomaticOffers::spawn(OfferAllocator {
+                needs_restart: Default::default(),
                 config: self.config.clone(),
                 node: node.clone(),
                 authority,

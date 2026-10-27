@@ -1046,9 +1046,6 @@ fn network() -> NetworkId {
     network
 }
 
-/// A threshold identity consensus accepts: the compressed BLS12-381 G1
-/// generator used by the configuration loader's fixture too.
-
 fn temp() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hellas-cli-tests");
     if let Err(error) = std::fs::create_dir_all(&root) {

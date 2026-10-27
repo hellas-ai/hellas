@@ -308,12 +308,10 @@ pub fn fixture_uploads(
     hellas_rpc::pb::work::AcceptWorkRequest,
     Vec<hellas_rpc::pb::work::UploadContentRequest>,
 ) {
-    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id};
-    use hellas_rpc::protocol::content_upload::{
-        CONTENT_CHUNK_BYTES, chunk_digest, decode_reference, encode_reference,
-    };
-    let mut wire = request.clone();
-    let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
+    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _};
+    use hellas_rpc::protocol::content_upload::decode_reference;
+    let wire = request.clone();
+    let Ok(_) = PaidJobAuthorizationV2::decode(&request.authorization) else {
         return (wire, Vec::new());
     };
     let bytes = if let Some(reference) = decode_reference(&request.prepared_input) {
@@ -345,7 +343,7 @@ pub fn input_uploads(
     let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
         return (wire, Vec::new());
     };
-    let reference = hellas_rpc::ContentRef::new(ContentId::hash(&bytes), bytes.len() as u64);
+    let reference = hellas_rpc::ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
     wire.prepared_input = encode_reference(reference);
     let id = work_id(channel, &a);
     let uploads = bytes

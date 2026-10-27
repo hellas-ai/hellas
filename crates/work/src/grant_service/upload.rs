@@ -117,10 +117,10 @@ impl GrantWork {
                         .saturating_sub((service.node.clock)().0)
                         .saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if let Ok(mut runtime) = service.inner.lock() {
-                        if let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0) {
-                            let _ = uploads.gc((service.node.clock)().0, false);
-                        }
+                    if let Ok(mut runtime) = service.inner.lock()
+                        && let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0)
+                    {
+                        let _ = uploads.gc((service.node.clock)().0, false);
                     }
                 });
             }

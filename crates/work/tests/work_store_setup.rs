@@ -304,9 +304,8 @@ async fn completed_store(root: &std::path::Path) -> SetupStore {
 /// A provider store recovered mid-handshake, holding revision 2.
 ///
 /// The client's countersigned bond and proposed payment are journaled and
-/// this endpoint has not countersigned the payment yet — so the payment
-/// Open is not executable, and `funding_coins` names the bond's coin
-/// alone.
+/// this endpoint has not countersigned the payment yet. Both retained legs
+/// already name their funding, even before the payment Open is executable.
 async fn revision_two_store(root: &std::path::Path) -> SetupStore {
     let mut store = store(root, Role::Provider).await;
     let verifier = Secp256k1Verifier::new();
@@ -1149,7 +1148,11 @@ async fn a_revision_that_is_not_this_journals_bond_is_refused() {
             Err(error) => panic!("the fixture journal opens: {error}"),
         };
         if let Err(error) = journal
-            .append(&bundle_record(&proposed_over(other_bond_funding())).encode())
+            .append(
+                &bundle_record(&proposed_over(other_bond_funding()))
+                    .encode()
+                    .unwrap(),
+            )
             .await
         {
             panic!("the foreign revision appends: {error}");
@@ -1706,11 +1709,11 @@ async fn the_funding_coins_come_from_the_retained_transactions() {
 #[tokio::test]
 async fn the_record_codec_is_exact() {
     let scan_arm = scan_record();
-    let scan_bytes = scan_arm.encode();
+    let scan_bytes = scan_arm.encode().unwrap();
     assert_eq!(SetupRecord::decode(&scan_bytes), Ok(scan_arm));
 
     let armed = armed_record(&countersigned(proposed()));
-    let armed_bytes = armed.encode();
+    let armed_bytes = armed.encode().unwrap();
     assert_eq!(SetupRecord::decode(&armed_bytes), Ok(armed));
     assert_eq!(
         SetupRecord::decode(&armed_bytes[..armed_bytes.len() - 1]),
@@ -1723,7 +1726,7 @@ async fn the_record_codec_is_exact() {
         origin_payload: [0x01; 32],
         origin_parent: [0x02; 32],
     };
-    let bytes = complete.encode();
+    let bytes = complete.encode().unwrap();
     // tag || edge || height || payload || parent
     assert_eq!(bytes.len(), 1 + 32 + 8 + 32 + 32);
     assert_eq!(SetupRecord::decode(&bytes), Ok(complete));
@@ -1772,7 +1775,7 @@ async fn the_record_codec_is_exact() {
             }])
             .expect("contiguous finalized observation"),
     );
-    assert_eq!(SetupRecord::decode(&history.encode()), Ok(history));
+    assert_eq!(SetupRecord::decode(&history.encode().unwrap()), Ok(history));
 }
 
 #[tokio::test]
@@ -2496,29 +2499,18 @@ async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// A step decides from the revision it asked the chain about, not from
-/// the one the ALPN journaled while it was waiting.
-///
-/// The provider is recovered at revision 2, where the payment Open is
-/// not yet executable and `funding_coins` therefore names the bond's
-/// coin alone. The step asks the chain that question and stops there.
-/// The ALPN — answered from the same journal, which is the whole reason
-/// the borrow is short — countersigns the payment and journals revision
-/// 3, and now the payment Open is executable and its funding coin is
-/// part of the question.
-///
-/// Every coin is live on chain throughout. The revision-2 answer says
-/// nothing about the payment coin because it was never asked, and a
-/// coin that was not asked about is not a coin that was spent: deciding
-/// from that answer at revision 3 aborts the setup with
-/// `PaymentFundingSpent`, or times the bond out, and both are
-/// permanent. So the assertion is the negative one — no end is
-/// journaled — and the positive one that this step reaches the
-/// submission a state it actually observed supports.
+/// A payment leg learned while a finalized read is suspended changes the
+/// query. The driver must read that leg's funding before deciding to submit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     let dir = temp();
-    let journal = revision_two_store(dir.path()).await;
+    let mut journal = store(dir.path(), Role::Provider).await;
+    for record in [scan_record(), bundle_record(&proposed())] {
+        journal
+            .commit(record, &Secp256k1Verifier::new())
+            .await
+            .unwrap();
+    }
     let three = completed(countersigned(proposed()));
     let service = SetupService::new(SetupEndpoint::new(
         journal,
@@ -2549,12 +2541,12 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
         }
     })
     .await;
-    assert!(waited.is_ok(), "the driver reached its revision-2 read");
+    assert!(waited.is_ok(), "the driver reached its revision-1 read");
 
     // Revision 3, journaled through the ALPN while that read waits.
     let answering = tokio::spawn({
         let service = service.clone();
-        async move { exchange(&service, Vec::new()).await }
+        async move { exchange(&service, countersigned(proposed()).encode()).await }
     });
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
     let Ok(Ok(offered)) = answered else {
@@ -2567,7 +2559,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     );
     assert!(
         !driving.is_finished(),
-        "and it did that while the drive was still stopped at its revision-2 read",
+        "and it did that while the drive was still stopped at its revision-1 read",
     );
 
     released.store(true, Ordering::SeqCst);
@@ -2592,7 +2584,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     assert_eq!(
         asked.len(),
         2,
-        "the revision-2 answer was discarded and the read taken again",
+        "the revision-1 answer was discarded and the read taken again",
     );
     assert!(
         !asked[0].funding.contains(&coin(PAYMENT_COIN)),
@@ -2600,7 +2592,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     );
     assert!(
         asked[1].funding.contains(&coin(PAYMENT_COIN)),
-        "and the second asked about the funding revision 3 made executable",
+        "and the second asked about the newly learned payment funding",
     );
     assert_eq!(
         sink.submitted().len(),
@@ -2988,7 +2980,7 @@ fn every_setup_ending_round_trips_under_its_own_code() {
         (SetupEnd::Aborted(SetupAbort::BondReclaimed), 7),
     ];
     for (outcome, code) in endings {
-        let bytes = SetupRecord::Ended { outcome }.encode();
+        let bytes = SetupRecord::Ended { outcome }.encode().unwrap();
         assert_eq!(bytes, [4, code], "the bytes of {outcome:?}");
         assert_eq!(
             SetupRecord::decode(&bytes),
@@ -3287,7 +3279,7 @@ async fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path()).await;
-    let initial_size = journal.state().checkpoint().len();
+    let initial_size = journal.state().checkpoint().unwrap().len();
     for _ in 0..20 {
         let mut cursor = journal.state().scan_cursor().unwrap();
         let blocks: Vec<_> = (0..256)
@@ -3307,12 +3299,12 @@ async fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_
             .collect();
         let observed = journal.state().observe(&blocks).unwrap();
         let record = SetupRecord::Observed(observed);
-        assert!(record.encode().len() < 256);
+        assert!(record.encode().unwrap().len() < 256);
         journal.commit(record.clone(), &verifier).await.unwrap();
         let before = journal.state().clone();
         assert!(journal.commit(record, &verifier).await.is_err());
         assert_eq!(journal.state(), &before);
-        assert_eq!(journal.state().checkpoint().len(), initial_size);
+        assert_eq!(journal.state().checkpoint().unwrap().len(), initial_size);
     }
     let expected = journal.state().clone();
     journal.rotate().await.unwrap();

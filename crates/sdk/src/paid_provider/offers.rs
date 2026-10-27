@@ -9,6 +9,7 @@ use hellas_work::model::offer::{SignedPaidOffer, request_digest};
 use std::collections::BTreeSet;
 
 pub(super) struct OfferAllocator {
+    pub needs_restart: std::sync::atomic::AtomicBool,
     pub config: WorkRunnerConfig,
     pub node: FullNode,
     pub authority: hellas_work::node::NodeCoordinator,
@@ -129,7 +130,7 @@ fn quote(
         hellas_work::model::grant::records::MAX_OFFER_BYTES,
     )
     .map_err(unavailable)?;
-    return Ok(RequestOfferResponse {
+    Ok(RequestOfferResponse {
         outcome: Some(Outcome::Quote(Quote {
             provider_channel_policy: bytes,
             required: Some(PaymentEdgeValues {
@@ -140,10 +141,10 @@ fn quote(
                 proof_fee: fees.proof(),
                 lifetime_fee: fees.lifetime(),
             }),
-            omission_bond: omission_bond,
+            omission_bond,
             funding_value: required,
         })),
-    });
+    })
 }
 
 impl OfferAllocator {
@@ -153,6 +154,12 @@ impl OfferAllocator {
         context: TransportContext,
         mount: &MountedSetup,
     ) -> Result<RequestOfferResponse, WireStatus> {
+        if self
+            .needs_restart
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(unavailable("offer allocation requires journal recovery"));
+        }
         let peer = context.vouched_peer().ok_or_else(invalid)?.0;
         let exporter = context.open_exporter.ok_or_else(invalid)?;
         let principal: [u8; 33] = request
@@ -246,10 +253,18 @@ impl OfferAllocator {
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| unavailable("finalized offer snapshot unavailable"))?;
+            let released = matches!(
+                state.end(),
+                Some(
+                    hellas_work::work_store::SetupEnd::Complete
+                        | hellas_work::work_store::SetupEnd::Aborted(
+                            hellas_work::work_store::SetupAbort::BondReclaimed
+                        )
+                )
+            );
             let live = snapshot.bond().is_some()
                 || snapshot.payment().is_some()
-                || (state.end() != Some(hellas_work::work_store::SetupEnd::Complete)
-                    && snapshot.block().height < bundle.bond_terms().timeout.get());
+                || (!released && snapshot.block().height < bundle.bond_terms().timeout.get());
             if live {
                 open += 1;
                 reserved.extend(bundle.bond_funding().maker().iter().copied());
@@ -265,9 +280,6 @@ impl OfferAllocator {
                         .ok_or_else(|| unavailable("missing retained offer"))?;
                     if coins.is_empty() {
                         return quote(&offer.offer().policy, offer.offer().omission_bond);
-                    }
-                    if snapshot.block().height >= bundle.bond_terms().timeout.get() {
-                        return Ok(refused(OfferRefusalCode::OfferLimit, 0));
                     }
                     return granted(offer);
                 }
@@ -361,6 +373,10 @@ impl OfferAllocator {
             .checked_add(current.policy.offers.bond_lifetime_blocks)
             .ok_or_else(invalid)?;
         let adoption = self.adopt.try_reserve().map_err(unavailable)?;
+        // A failed write or reopen may already have committed an offer. Until
+        // restart replays every reservation, allocating again could reuse stake.
+        self.needs_restart
+            .store(true, std::sync::atomic::Ordering::Release);
         let provisioned = crate::work_provision::provision_offer(
             crate::work_provision::ProvisionOptions {
                 network: self.config.network,
@@ -410,6 +426,8 @@ impl OfferAllocator {
         if self.adopt.is_closed() {
             return Err(unavailable("paid observer stopped"));
         }
+        self.needs_restart
+            .store(false, std::sync::atomic::Ordering::Release);
         granted(&provisioned.offer)
     }
 }

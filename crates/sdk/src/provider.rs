@@ -172,7 +172,7 @@ pub struct ProviderGrants {
 #[derive(Clone)]
 pub enum ProviderAuthority {
     Journal { root: PathBuf },
-    Host(crate::node_control::NodeControl),
+    Host(Box<crate::node_control::NodeControl>),
 }
 impl ProviderAuthority {
     fn remote_admission(&self) -> crate::node_control::RemoteControlAdmission {
@@ -249,7 +249,7 @@ impl<R> ProviderOptions<R> {
         self.grants
             .as_mut()
             .ok_or(ProviderError::FundingRequired)?
-            .authority = ProviderAuthority::Host(control);
+            .authority = ProviderAuthority::Host(Box::new(control));
         Ok(self)
     }
 }
@@ -535,7 +535,7 @@ where
             grants.config.max_job_millis,
         )?;
         let admin = match grants.authority {
-            ProviderAuthority::Host(control) => Some(control),
+            ProviderAuthority::Host(control) => Some(*control),
             ProviderAuthority::Journal { .. } => None,
         };
         (Some(service), Some(administration), admin)

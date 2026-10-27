@@ -200,10 +200,18 @@ fn addresses(provider: &hellas_sdk::ProviderHandle) -> Vec<std::net::SocketAddr>
 
 /// A node authority owned by `FRIEND`, the client's genesis owner.
 async fn client_authority(root: &std::path::Path, now: UnixMillis) -> NodeCoordinator {
+    client_authority_for(root, now, FRIEND).await
+}
+
+async fn client_authority_for(
+    root: &std::path::Path,
+    now: UnixMillis,
+    actor: hellas_auth::test_support::Actor,
+) -> NodeCoordinator {
     let authority = auth::AuthorityId(Digest::hash(b"paid e2e client authority"));
     let administrator = admin_spec(
         authority,
-        FRIEND.principal(),
+        actor.principal(),
         &[],
         (now, UnixMillis(u64::MAX)),
         (u64::MAX, auth::MAX_DELEGATION_DEPTH),
@@ -346,342 +354,421 @@ async fn holdings(devnet: &Devnet, owner: SettlementKey) -> Vec<(CoinId, u64)> {
         .collect()
 }
 
+async fn check_gateway_quote(
+    options: &PaidWorkOptions,
+    node: hellas_sdk::FullNode,
+    authority: NodeCoordinator,
+) {
+    use hellas_gateway::WorkExecutionBackend as _;
+    let mut args = options.clone();
+    args.journal_root = options.journal_root.with_file_name("gateway-client");
+    let journal = args.journal_root.clone();
+    let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
+        hellas_sdk::paid_gateway::PaidGatewayOptions {
+            providers: vec![args],
+            max_pending_requests: 1,
+        },
+        NodeIdentity::from_secret_bytes([0x45; 32], [0x21; 32]).unwrap(),
+        node,
+        authority,
+    )
+    .await
+    .unwrap();
+    assert!(!journal.exists(), "gateway discovery only requests a quote");
+    assert!(
+        !options.config.journal_root.exists(),
+        "gateway quotes never stake"
+    );
+    assert!(
+        gateway
+            .fetch(hellas_gateway::WorkFetchRequest {
+                provider: options.provider,
+                service: "openai".into(),
+                method: "wrong-route".into(),
+                body: BODY.to_vec(),
+            })
+            .is_err(),
+        "gateway checks the quoted route before requesting funding"
+    );
+    gateway.drain().await.unwrap();
+    assert!(!journal.exists());
+    assert!(!options.config.journal_root.exists());
+}
+
 /// The provider earns exactly the price from the payment close, and its
 /// stake comes back separately, as a different coin, at the bond's
 /// timeout.
 #[test]
 fn a_paid_fetch_job_through_the_sdk_earns_the_price_and_returns_the_stake_separately() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("hellas_chain=debug,hellas_sdk=debug")
-        .with_test_writer()
-        .try_init();
-    run(|runtime| {
-        let work = async move {
-            eprintln!("H3 phase: start devnet");
-            let automatic_runtime = commonware_runtime::Supervisor::child(&runtime, "automatic");
-            let root = tempfile::tempdir().unwrap();
-            let now = UnixMillis(1);
-            // The genesis owners are the actors whose passkeys own the two
-            // node authorities.
-            for (owner, actor) in [(PROVIDER_OWNER, ROOT), (CLIENT_OWNER, FRIEND)] {
-                assert_eq!(
-                    owner.key().into_kernel(),
-                    Key::from_bytes(*actor.principal().as_bytes())
-                );
-            }
-            let mut devnet = Devnet::start(
-                runtime,
-                DevnetConfig {
-                    name: "sdk_paid_e2e",
-                    owners: vec![PROVIDER_OWNER, CLIENT_OWNER],
-                    full_nodes: 2,
-                },
+    run(|runtime| paid_scenario(runtime, false));
+}
+
+#[test]
+fn setup_reports_a_typed_error_if_the_client_node_stays_behind() {
+    run(|runtime| paid_scenario(runtime, true));
+}
+
+fn paid_scenario(
+    runtime: commonware_runtime::tokio::Context,
+    never_catches_up: bool,
+) -> impl std::future::Future<Output = ()> {
+    let work = async move {
+        let root = tempfile::tempdir().unwrap();
+        let now = UnixMillis(1);
+        // The genesis owners are the actors whose passkeys own the two
+        // node authorities.
+        for (owner, actor) in [(PROVIDER_OWNER, ROOT), (CLIENT_OWNER, FRIEND)] {
+            assert_eq!(
+                owner.key().into_kernel(),
+                Key::from_bytes(*actor.principal().as_bytes())
+            );
+        }
+        let mut devnet = Devnet::start(
+            runtime,
+            DevnetConfig {
+                name: "sdk_paid_e2e",
+                owners: vec![PROVIDER_OWNER, CLIENT_OWNER],
+                full_nodes: 2,
+            },
+        )
+        .await;
+        let provider_node = devnet.full_node(0).clone();
+        let client_node = devnet.full_node(1).clone();
+
+        // Each owner delegates its allocation to its node's settlement key,
+        // submitted through a validator URL by a client with no node.
+        devnet.seal().await;
+        let (provider_funding, _stake_coin) = delegate_allocation(
+            devnet.allocations(),
+            &PROVIDER_OWNER,
+            provider_settlement().party_key().into(),
+        );
+        let (client_funding, payment_coin) = delegate_allocation(
+            devnet.allocations(),
+            &CLIENT_OWNER,
+            client_settlement().party_key().into(),
+        );
+        let submitter = RemoteLightClient::connect(devnet.light_client_url(2))
+            .await
+            .unwrap();
+        for tx in [provider_funding, client_funding] {
+            assert_eq!(
+                submitter.submit_tx(tx).await.unwrap(),
+                hellas_chain::SubmitTxOutcome::Enqueued
+            );
+        }
+        devnet.seal().await;
+
+        // The owner stores standing policy once; no client route or bond exists.
+        let (store, secret) =
+            hellas_work::test_support::common_node::bootstrap_node_with_credential(
+                &root.path().join("provider-state/grants"),
+                hellas_work::model::grant::grant_network(),
+                Some(provider_enrollment()),
+                now,
             )
-            .await;
-            eprintln!("H3 phase: devnet ready");
-            let provider_node = devnet.full_node(0).clone();
-            let client_node = devnet.full_node(1).clone();
-
-            // Each owner delegates its allocation to its node's settlement key,
-            // submitted through a validator URL by a client with no node.
-            devnet.seal().await;
-            let (provider_funding, _stake_coin) = delegate_allocation(
-                devnet.allocations(),
-                &PROVIDER_OWNER,
-                provider_settlement().party_key().into(),
-            );
-            let (client_funding, payment_coin) = delegate_allocation(
-                devnet.allocations(),
-                &CLIENT_OWNER,
-                client_settlement().party_key().into(),
-            );
-            let submitter = RemoteLightClient::connect(devnet.light_client_url(2))
-                .await
-                .unwrap();
-            for tx in [provider_funding, client_funding] {
-                assert_eq!(
-                    submitter.submit_tx(tx).await.unwrap(),
-                    hellas_chain::SubmitTxOutcome::Enqueued
-                );
-            }
-            devnet.seal().await;
-
-            // The owner stores standing policy once; no client route or bond exists.
-            let (store, secret) =
-                hellas_work::test_support::common_node::bootstrap_node_with_credential(
-                    &root.path().join("provider-state/grants"),
-                    hellas_work::model::grant::grant_network(),
-                    Some(provider_enrollment()),
-                    now,
-                )
-                .await
-                .unwrap();
-            drop(store);
-            let config = work_config(&devnet, root.path().join("provider-journal"));
-            eprintln!("H3 phase: start provider");
-            let (provider, _) =
-                start_provider(root.path(), config.clone(), provider_node.clone()).await;
-            let authority = provider.administration().unwrap().node();
-            let caller = hellas_work::test_support::session(&authority, &secret).await;
-            let command = || hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
-                expected_revision: auth::Revision(0),
-                policy: paid_policy(),
-            };
+            .await
+            .unwrap();
+        drop(store);
+        let config = work_config(&devnet, root.path().join("provider-journal"));
+        let (provider, _) =
+            start_provider(root.path(), config.clone(), provider_node.clone()).await;
+        let authority = provider.administration().unwrap().node();
+        let caller = hellas_work::test_support::session(&authority, &secret).await;
+        let command = || hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
+            expected_revision: auth::Revision(0),
+            policy: Box::new(paid_policy()),
+        };
+        provider
+            .administration()
+            .unwrap()
+            .execute(&caller, auth::GrantId([0; 16]), command())
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.paid_policy().await.unwrap().unwrap().policy,
+            paid_policy()
+        );
+        assert!(matches!(
             provider
                 .administration()
                 .unwrap()
                 .execute(&caller, auth::GrantId([0; 16]), command())
-                .await
-                .unwrap();
-            assert_eq!(
-                authority.paid_policy().await.unwrap().unwrap().policy,
-                paid_policy()
-            );
-            assert!(matches!(
-                provider
-                    .administration()
-                    .unwrap()
-                    .execute(&caller, auth::GrantId([0; 16]), command())
-                    .await,
-                Err(hellas_work::work_store::grant::NodeStoreError::Authority(
-                    auth::AuthorityError::Revision
-                ))
-            ));
-            let daily = authority
-                .authenticate_session(
-                    &secret,
-                    hellas_work::node::SessionKey::Node(&ROOT.node_key()),
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                provider
-                    .administration()
-                    .unwrap()
-                    .execute(
-                        &daily,
-                        auth::GrantId([0; 16]),
-                        hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
-                            expected_revision: auth::Revision(1),
-                            policy: paid_policy()
-                        }
-                    )
-                    .await,
-                Err(hellas_work::work_store::grant::NodeStoreError::Authority(
-                    auth::AuthorityError::StepUp
-                ))
-            ));
-            drop(authority);
-            let client_transport = iroh::SecretKey::from_bytes(&[0x41; 32]);
-            let provider_addrs = addresses(&provider);
-
-            // The client: one job, paid, then settled.
-            let client_producer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
-            let events = hellas_rpc::fetch::build_input_events_with_retention(
-                "openai",
-                "responses",
-                BODY,
-                test_responses_contract().manifest_id(),
-                Assurance::ProducerSigned,
-                &client_producer,
-                Retention::Ephemeral,
-            )
-            .unwrap();
-            let prepared_input =
-                PreparedPaidFetchInputV1::new(&events, &test_responses_contract()).unwrap();
-            let options = PaidWorkOptions {
-                config,
-                journal_root: root.path().join("client-journal"),
-                provider: provider.node_id(),
-                provider_addrs,
-                assurance: Assurance::ProducerSigned,
-                apple_trust: None,
-                expected_price: PRICE,
-                payment_funding: Funding::new(
-                    List::take([payment_coin; hellas_kernel::MAX_PARTY_INPUTS], 1),
-                    List::empty(CoinId::from_bytes([0; 32])),
-                ),
-                acceptance_blocks: 16,
-                terminal_blocks: 64,
-                payment_blocks: 32,
-                timeout: Duration::from_secs(120),
-            };
-            let client_authority =
-                client_authority(&root.path().join("client-authority"), now).await;
-            // Open on controlled blocks, then run the job on a fixed finalized
-            // tip. The local-node setup path rejects reads during catch-up, and
-            // its observer suspends payment readiness during that same window.
-            let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
-            assert!(!options.config.journal_root.exists());
-            eprintln!("H3 phase: quote");
-            let quote = hellas_sdk::paid_client::request_paid_quote(
-                &options,
-                &endpoint,
-                &client_settlement(),
-                FRIEND.principal(),
+                .await,
+            Err(hellas_work::work_store::grant::NodeStoreError::Authority(
+                auth::AuthorityError::Revision
+            ))
+        ));
+        let daily = authority
+            .authenticate_session(
+                &secret,
+                hellas_work::node::SessionKey::Node(&ROOT.node_key()),
             )
             .await
             .unwrap();
-            assert_eq!(quote.funding_value, CLIENT_FUNDING);
-            assert_eq!(
-                hellas_kernel::work_payment_settlement(
-                    quote.policy.expected_payment_values,
-                    quote.omission_bond
-                )
+        assert!(matches!(
+            provider
+                .administration()
                 .unwrap()
-                .capacity(),
-                PRICE * 10
-            );
+                .execute(
+                    &daily,
+                    auth::GrantId([0; 16]),
+                    hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
+                        expected_revision: auth::Revision(1),
+                        policy: Box::new(paid_policy())
+                    }
+                )
+                .await,
+            Err(hellas_work::work_store::grant::NodeStoreError::Authority(
+                auth::AuthorityError::StepUp
+            ))
+        ));
+        drop(authority);
+        let client_transport = iroh::SecretKey::from_bytes(&[0x41; 32]);
+        let provider_addrs = addresses(&provider);
+
+        // The client: one job, paid, then settled.
+        let client_producer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+        let events = hellas_rpc::fetch::build_input_events_with_retention(
+            "openai",
+            "responses",
+            BODY,
+            test_responses_contract().manifest_id(),
+            Assurance::ProducerSigned,
+            &client_producer,
+            Retention::Ephemeral,
+        )
+        .unwrap();
+        let prepared_input =
+            PreparedPaidFetchInputV1::new(&events, &test_responses_contract()).unwrap();
+        let options = PaidWorkOptions {
+            config,
+            journal_root: root.path().join("client-journal"),
+            provider: provider.node_id(),
+            provider_addrs,
+            assurance: Assurance::ProducerSigned,
+            apple_trust: None,
+            expected_price: PRICE,
+            payment_funding: Funding::new(
+                List::take([payment_coin; hellas_kernel::MAX_PARTY_INPUTS], 1),
+                List::empty(CoinId::from_bytes([0; 32])),
+            ),
+            acceptance_blocks: 16,
+            terminal_blocks: 64,
+            payment_blocks: 32,
+            timeout: Duration::from_secs(120),
+        };
+        let client_authority = client_authority(&root.path().join("client-authority"), now).await;
+        // Open on controlled blocks, then run the job on a fixed finalized
+        // tip. The local-node setup path rejects reads during catch-up, and
+        // its observer suspends payment readiness during that same window.
+        let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
+        assert!(!options.config.journal_root.exists());
+        let quote = hellas_sdk::paid_client::request_paid_quote(
+            &options,
+            &endpoint,
+            &client_settlement(),
+            FRIEND.principal(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(quote.funding_value, CLIENT_FUNDING);
+        assert_eq!(
+            hellas_kernel::work_payment_settlement(
+                quote.policy.expected_payment_values,
+                quote.omission_bond
+            )
+            .unwrap()
+            .capacity(),
+            PRICE * 10
+        );
+        assert!(
+            !options.config.journal_root.exists(),
+            "a quote creates no paid journal"
+        );
+        Box::pin(check_gateway_quote(
+            &options,
+            client_node.clone(),
+            client_authority.clone(),
+        ))
+        .await;
+        let mut options = options;
+        if never_catches_up {
+            options.timeout = options.config.poll;
+        }
+        let open = PaidWorkSession::open(
+            options.clone(),
+            endpoint.clone(),
+            client_settlement(),
+            client_node.clone(),
+            client_authority.clone(),
+        );
+        tokio::pin!(open);
+        tokio::select! {
+            result = &mut open => panic!("setup ended before journal creation: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+            () = async { while !options.journal_root.exists() { tokio::task::yield_now().await; } } => {},
+        }
+        client_node.require_finalized_height_for_test(devnet.height() + 1);
+        assert!(client_node.view().is_err());
+        if never_catches_up {
+            let error = tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, &mut open)
+                .await
+                .expect("setup reads have a bounded deadline")
+                .err()
+                .expect("setup cannot finish while its node stays behind");
             assert!(
-                !options.config.journal_root.exists(),
-                "a quote creates no paid journal"
+                matches!(error, hellas_sdk::paid_client::PaidClientError::BlockSource(hellas_work::work_close::BlockSourceError::ReadUnavailableTimeout { timeout, .. }) if timeout == options.timeout),
+                "typed setup read expiry, got {error}"
             );
-            eprintln!("H3 phase: setup");
-            let mut session = sealing_while(
-                &mut devnet,
-                Duration::from_millis(100),
-                PaidWorkSession::open(
-                    options.clone(),
-                    endpoint.clone(),
-                    client_settlement(),
-                    client_node.clone(),
-                    client_authority.clone(),
-                ),
-            )
-            .await
-            .unwrap();
-            let bond = session.descriptor().bond_edge();
-            let bond_timeout = session
-                .descriptor()
-                .channel()
-                .payment_terms()
-                .bond_terms
-                .timeout
-                .get();
-            assert_eq!(
-                session.descriptor().work_policy(),
-                &quote.policy.work_policy
-            );
-            assert_eq!(
-                session.descriptor().channel().payment_terms().omission_bond,
-                OMISSION_BOND
-            );
-            session.shutdown().await;
-            drop(session);
             endpoint.close().await;
-
-            provider.shutdown().await.unwrap();
-            let (provider, upstream) =
-                start_provider(root.path(), options.config.clone(), provider_node).await;
-            assert_eq!(
-                provider
-                    .administration()
-                    .unwrap()
-                    .node()
-                    .paid_policy()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .policy,
-                paid_policy()
-            );
-            let mut options = options;
-            options.provider_addrs = addresses(&provider);
-            let result = run_paid_work(
-                PaidWorkRun {
-                    options: options.clone(),
-                    prepared_input: prepared_input.into(),
-                    settle: false,
-                },
-                client_transport.clone(),
-                client_settlement(),
-                client_node.clone(),
-                client_authority.clone(),
-            )
-            .await
-            .unwrap();
-            let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
-            let mut session = tokio::time::timeout(
-                options.timeout,
-                PaidWorkSession::open(
-                    options,
-                    endpoint.clone(),
-                    client_settlement(),
-                    client_node,
-                    client_authority,
-                ),
-            )
-            .await
-            .expect("the settled session opens within its deadline")
-            .unwrap();
-            let settled_provider_payout =
-                sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
-                    .await
-                    .unwrap();
-            session.shutdown().await;
-            drop(session);
-            endpoint.close().await;
-
-            assert_eq!(result.bond_edge, bond);
-            assert_eq!(result.job_price, PRICE);
-            assert_eq!(result.credited_cumulative, PRICE, "one job at its price");
-            assert_eq!(
-                settled_provider_payout, PRICE,
-                "the settled close paid the provider the price",
-            );
-            assert_eq!(upstream.calls("openai", "responses", BODY), 1);
-
-            // Earnings: while the stake is still bonded, the price is the whole
-            // of what the provider owner holds.
-            let earnings = holdings(&devnet, PROVIDER_OWNER.key()).await;
-            assert_eq!(
-                earnings.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
-                vec![PRICE],
-                "EARNINGS: exactly the price, and no principal yet",
-            );
-            assert_eq!(
-                holdings(&devnet, CLIENT_OWNER.key())
-                    .await
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .collect::<Vec<_>>(),
-                vec![CLIENT_FUNDING - PRICE],
-                "the client got back its funding less exactly the price",
-            );
-
-            // Principal: the provider's own clock times the bond out.
-            devnet.seal_through(bond_timeout).await;
-            let mut held = Vec::new();
-            for _ in 0..200 {
-                held = holdings(&devnet, PROVIDER_OWNER.key()).await;
-                if held.len() == 2 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                devnet.seal().await;
-            }
-            assert_eq!(
-                held.len(),
-                2,
-                "the bond timeout returned the stake: {held:?}"
-            );
-            assert_eq!(
-                held,
-                vec![earnings[0], (held[1].0, PROVIDER_STAKE)],
-                "RETURNED PRINCIPAL: the stake, unchanged, beside the unchanged earnings",
-            );
-            assert_ne!(
-                held[1].0, earnings[0].0,
-                "principal and earnings are different coins"
-            );
-
             provider.shutdown().await.unwrap();
             devnet.shutdown().await;
-            Box::pin(automatic::exercise(automatic_runtime)).await;
-        };
-        eprintln!("H3 outer future bytes: {}", std::mem::size_of_val(&work));
-        Box::pin(work)
-    });
+            return;
+        }
+        let attempts = client_node.read_attempts_for_test();
+        tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, async {
+                tokio::select! {
+                    result = &mut open => panic!("setup did not wait for its unavailable read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+                    () = async { while client_node.read_attempts_for_test() == attempts { tokio::task::yield_now().await; } } => {},
+                }
+            }).await.expect("the retained source attempts a read while behind");
+        let mut session = sealing_while(&mut devnet, Duration::from_millis(100), &mut open)
+            .await
+            .unwrap();
+        let bond = session.descriptor().bond_edge();
+        let bond_timeout = session
+            .descriptor()
+            .channel()
+            .payment_terms()
+            .bond_terms
+            .timeout
+            .get();
+        assert_eq!(
+            session.descriptor().work_policy(),
+            &quote.policy.work_policy
+        );
+        assert_eq!(
+            session.descriptor().channel().payment_terms().omission_bond,
+            OMISSION_BOND
+        );
+        session.shutdown().await;
+        drop(session);
+        endpoint.close().await;
+
+        provider.shutdown().await.unwrap();
+        let (provider, upstream) =
+            start_provider(root.path(), options.config.clone(), provider_node).await;
+        assert_eq!(
+            provider
+                .administration()
+                .unwrap()
+                .node()
+                .paid_policy()
+                .await
+                .unwrap()
+                .unwrap()
+                .policy,
+            paid_policy()
+        );
+        let mut options = options;
+        options.provider_addrs = addresses(&provider);
+        let result = run_paid_work(
+            PaidWorkRun {
+                options: options.clone(),
+                prepared_input: prepared_input.into(),
+                settle: false,
+            },
+            client_transport.clone(),
+            client_settlement(),
+            client_node.clone(),
+            client_authority.clone(),
+        )
+        .await
+        .unwrap();
+        let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
+        let mut session = tokio::time::timeout(
+            options.timeout,
+            PaidWorkSession::open(
+                options,
+                endpoint.clone(),
+                client_settlement(),
+                client_node,
+                client_authority,
+            ),
+        )
+        .await
+        .expect("the settled session opens within its deadline")
+        .unwrap();
+        let settled_provider_payout =
+            sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
+                .await
+                .unwrap();
+        session.shutdown().await;
+        drop(session);
+        endpoint.close().await;
+
+        assert_eq!(result.bond_edge, bond);
+        assert_eq!(result.job_price, PRICE);
+        assert_eq!(result.credited_cumulative, PRICE, "one job at its price");
+        assert_eq!(
+            settled_provider_payout, PRICE,
+            "the settled close paid the provider the price",
+        );
+        assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+
+        // Earnings: while the stake is still bonded, the price is the whole
+        // of what the provider owner holds.
+        let earnings = holdings(&devnet, PROVIDER_OWNER.key()).await;
+        assert_eq!(
+            earnings.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            vec![PRICE],
+            "EARNINGS: exactly the price, and no principal yet",
+        );
+        assert_eq!(
+            holdings(&devnet, CLIENT_OWNER.key())
+                .await
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>(),
+            vec![CLIENT_FUNDING - PRICE],
+            "the client got back its funding less exactly the price",
+        );
+
+        // Principal: the provider's own clock times the bond out.
+        devnet.seal_through(bond_timeout).await;
+        let mut held = Vec::new();
+        for _ in 0..200 {
+            held = holdings(&devnet, PROVIDER_OWNER.key()).await;
+            if held.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            devnet.seal().await;
+        }
+        assert_eq!(
+            held.len(),
+            2,
+            "the bond timeout returned the stake: {held:?}"
+        );
+        assert_eq!(
+            held,
+            vec![earnings[0], (held[1].0, PROVIDER_STAKE)],
+            "RETURNED PRINCIPAL: the stake, unchanged, beside the unchanged earnings",
+        );
+        assert_ne!(
+            held[1].0, earnings[0].0,
+            "principal and earnings are different coins"
+        );
+
+        provider.shutdown().await.unwrap();
+        devnet.shutdown().await;
+    };
+    Box::pin(work)
+}
+
+#[test]
+fn automatic_offers_fund_and_settle_evaluate_with_bounded_stake() {
+    run(automatic::exercise);
 }
 
 #[test]
@@ -753,4 +840,9 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
         assert!(node.view().is_err());
         devnet.shutdown().await;
     });
+}
+
+#[test]
+fn automatic_future_layout() {
+    eprintln!("automatic future bytes {}", automatic::frame_size());
 }
