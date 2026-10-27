@@ -3,17 +3,13 @@ use std::str;
 use crate::pb::execute::InputEventEnvelope as PbInputEventEnvelope;
 use crate::{
     Assurance, CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope,
-    InputTranscriptBuilder, JsonBytes, Operation, OutputEventEnvelope, OutputTranscriptBuilder,
-    Retention, StreamVerifyError, scheme_id, verify_input_event_envelopes,
-    verify_output_event_envelopes,
+    InputTranscriptBuilder, JsonBytes, Operation, Retention, StreamVerifyError, scheme_id,
+    verify_input_event_envelopes,
 };
 use hellas_auth::{ProducerSigningKey, PublicKey};
 use k256::elliptic_curve::Generate as _;
 
 const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
-const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
-pub const OUTPUT_EVENT_KIND: &str = "response.event";
-pub const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
 const INPUT_EVENT_KINDS: [&str; 8] = [
     "assurance",
     "execution.environment",
@@ -86,10 +82,6 @@ impl FetchOutput {
 
 pub fn input_canonicalization() -> CanonicalizationId {
     CanonicalizationId::from_bytes(INPUT_CANONICALIZATION)
-}
-
-pub fn output_canonicalization() -> CanonicalizationId {
-    CanonicalizationId::from_bytes(OUTPUT_CANONICALIZATION)
 }
 
 pub fn build_input_events(
@@ -168,56 +160,6 @@ pub fn build_input_events_with_nonce(
     Ok(events)
 }
 
-pub fn build_output_events(
-    input: InputCommitment,
-    assurance: Assurance,
-    payload: &[u8],
-    key: &ProducerSigningKey,
-) -> Result<Vec<OutputEventEnvelope>, FetchProtocolError> {
-    let mut builder = OutputTranscriptBuilder::new(
-        scheme_id(Operation::Fetch, assurance),
-        input,
-        key,
-        output_canonicalization(),
-    );
-    builder.push(OUTPUT_TERMINAL_KIND, payload.to_vec())?;
-    let (events, _) = builder.finish()?;
-    Ok(events)
-}
-
-pub struct FetchOutputTranscriptBuilder<'a> {
-    inner: OutputTranscriptBuilder<'a>,
-}
-
-impl<'a> FetchOutputTranscriptBuilder<'a> {
-    pub fn new(input: InputCommitment, assurance: Assurance, key: &'a ProducerSigningKey) -> Self {
-        Self {
-            inner: OutputTranscriptBuilder::new(
-                scheme_id(Operation::Fetch, assurance),
-                input,
-                key,
-                output_canonicalization(),
-            ),
-        }
-    }
-
-    pub fn push_event(
-        &mut self,
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<OutputEventEnvelope, FetchProtocolError> {
-        Ok(self.inner.push_envelope(OUTPUT_EVENT_KIND, payload)?)
-    }
-
-    pub fn finish(
-        mut self,
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<Vec<OutputEventEnvelope>, FetchProtocolError> {
-        self.inner.push(OUTPUT_TERMINAL_KIND, payload)?;
-        let (events, _) = self.inner.finish()?;
-        Ok(events)
-    }
-}
-
 pub fn verify_input_events(
     events: &[InputEventEnvelope],
 ) -> Result<FetchInput, FetchProtocolError> {
@@ -267,70 +209,6 @@ pub fn validate_input_event_pb_shape(
         }
     }
     Ok(())
-}
-
-pub fn verify_output_events(
-    input: InputCommitment,
-    assurance: Assurance,
-    events: &[OutputEventEnvelope],
-) -> Result<FetchOutput, FetchProtocolError> {
-    validate_output_limits(events)?;
-    let producer_key = *events
-        .first()
-        .ok_or(FetchProtocolError::EmptyOutputTranscript)?
-        .event()
-        .public_key();
-    verify_output_event_envelopes(
-        scheme_id(Operation::Fetch, assurance),
-        input,
-        &producer_key,
-        events,
-    )?;
-    let (event_payloads, terminal_payload) = output_payloads(events)?;
-    Ok(FetchOutput {
-        producer_key,
-        event_payloads,
-        terminal_payload,
-    })
-}
-
-fn validate_output_limits(events: &[OutputEventEnvelope]) -> Result<(), FetchProtocolError> {
-    if events.len() > MAX_FETCH_OUTPUT_EVENTS {
-        return Err(FetchProtocolError::OutputEventLimit {
-            actual: events.len(),
-        });
-    }
-    let payload_bytes = events.iter().try_fold(0_usize, |total, event| {
-        total
-            .checked_add(event.payload().len())
-            .ok_or(FetchProtocolError::OutputPayloadLengthOverflow)
-    })?;
-    if payload_bytes > MAX_FETCH_OUTPUT_PAYLOAD_BYTES {
-        return Err(FetchProtocolError::OutputPayloadLimit {
-            actual: payload_bytes,
-        });
-    }
-    Ok(())
-}
-
-fn output_payloads(
-    events: &[OutputEventEnvelope],
-) -> Result<(Vec<Vec<u8>>, Vec<u8>), FetchProtocolError> {
-    if events.is_empty() {
-        return Err(FetchProtocolError::EmptyOutputTranscript);
-    }
-    let terminal_index = events.len() - 1;
-    let mut payloads = Vec::with_capacity(terminal_index);
-    for (index, event) in events[..terminal_index].iter().enumerate() {
-        expect_output_event(event, index, OUTPUT_EVENT_KIND)?;
-        payloads.push(event.payload().to_vec());
-    }
-    expect_output_event(
-        &events[terminal_index],
-        terminal_index,
-        OUTPUT_TERMINAL_KIND,
-    )?;
-    Ok((payloads, events[terminal_index].payload().to_vec()))
 }
 
 struct FetchInputParts<'a> {
@@ -481,26 +359,6 @@ fn expect_input_event(
     }
 }
 
-fn expect_output_event(
-    event: &OutputEventEnvelope,
-    index: usize,
-    expected: &'static str,
-) -> Result<(), FetchProtocolError> {
-    if event.event().body().kind() == expected {
-        if event.event().body().canonicalization() == output_canonicalization() {
-            Ok(())
-        } else {
-            Err(FetchProtocolError::OutputCanonicalizationMismatch { index })
-        }
-    } else {
-        Err(FetchProtocolError::UnexpectedOutputEvent {
-            index,
-            expected,
-            actual: bounded_kind(event.event().body().kind()),
-        })
-    }
-}
-
 fn bounded_kind(kind: &str) -> String {
     const MAX_DISPLAY_BYTES: usize = 64;
     if kind.len() <= MAX_DISPLAY_BYTES {
@@ -530,8 +388,6 @@ pub enum FetchProtocolError {
         "fetch {field} contains {actual} bytes, over the {MAX_FETCH_ROUTE_COMPONENT_BYTES}-byte limit"
     )]
     RouteComponentLimit { field: &'static str, actual: usize },
-    #[error("fetch output transcript is empty")]
-    EmptyOutputTranscript,
     #[error("fetch input transcript must contain exactly 8 events, got {actual}")]
     WrongInputEventCount { actual: usize },
     #[error("fetch assurance must be exactly one byte, got {actual}")]
@@ -543,16 +399,6 @@ pub enum FetchProtocolError {
     #[error("fetch {field} must be 32 bytes, got {actual}")]
     WrongInputLength { field: &'static str, actual: usize },
     #[error(
-        "fetch output transcript contains {actual} events, over the {MAX_FETCH_OUTPUT_EVENTS}-event limit"
-    )]
-    OutputEventLimit { actual: usize },
-    #[error(
-        "fetch output transcript contains {actual} payload bytes, over the {MAX_FETCH_OUTPUT_PAYLOAD_BYTES}-byte limit"
-    )]
-    OutputPayloadLimit { actual: usize },
-    #[error("fetch output transcript payload length exceeds usize range")]
-    OutputPayloadLengthOverflow,
-    #[error(
         "fetch request body contains {actual} bytes, over the {MAX_FETCH_REQUEST_BODY_BYTES}-byte limit"
     )]
     RequestBodyLimit { actual: usize },
@@ -562,16 +408,8 @@ pub enum FetchProtocolError {
         expected: &'static str,
         actual: String,
     },
-    #[error("fetch output event {index} must be {expected}, got {actual}")]
-    UnexpectedOutputEvent {
-        index: usize,
-        expected: &'static str,
-        actual: String,
-    },
     #[error("fetch input event {index} must use the fetch input canonicalization")]
     InputCanonicalizationMismatch { index: usize },
-    #[error("fetch output event {index} must use the fetch output canonicalization")]
-    OutputCanonicalizationMismatch { index: usize },
     #[error("fetch input.end payload must be empty")]
     NonEmptyInputEnd,
     #[error("fetch {field} event is not UTF-8: {source}")]
@@ -595,8 +433,8 @@ mod tests;
 
 // ---------------------------------------------------------------------
 // Payload semantics: the dag-cbor event language inside signed fetch
-// output transcripts. `FetchOutput` above verifies envelope signatures
-// and hands out raw payload bytes; these codecs give those bytes their
+// output transcripts. `FetchOutput` above holds authenticated raw payload
+// bytes; these codecs give those bytes their
 // meaning. The codec strings version the payload shapes independently
 // of the transcript canonicalization.
 //

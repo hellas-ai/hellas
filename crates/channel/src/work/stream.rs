@@ -516,7 +516,7 @@ mod tests {
             ),
             hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([2; 32])),
             &key,
-            hellas_rpc::fetch::output_canonicalization(),
+            hellas_rpc::protocol::invocation::output::canonicalization(),
         );
         for _ in 0..100 {
             builder.push("response.event", vec![7; 256]).unwrap();
