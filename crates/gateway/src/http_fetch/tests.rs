@@ -20,6 +20,13 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
             vec![self.provider]
         }
+        fn generate(
+            &self,
+            _: hellas_client::text::TextJob,
+        ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
+        {
+            unreachable!("HTTP must use Fetch")
+        }
         fn fetch(
             &self,
             request: WorkFetchRequest,

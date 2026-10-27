@@ -12,14 +12,10 @@ mod qwen35;
 use std::{path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
-use tokenizers::Tokenizer;
-use tokenizers::tokenizer::{
-    DecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper, PostProcessorWrapper,
-    PreTokenizerWrapper,
-};
+use catena_models::tokenizer::{QwenDecodeStream, QwenTokenizer};
 
 pub struct TextPresentation {
-    tokenizer: Tokenizer,
+    tokenizer: QwenTokenizer,
     chat_template: Option<ChatTemplate>,
 }
 
@@ -179,15 +175,13 @@ impl ChatTemplate {
 }
 
 impl TextPresentation {
-    /// Load an application-selected tokenizer.
+    /// Load the tokenizer embedded in an application-selected GGUF model.
     ///
-    /// This performs local file I/O only. It deliberately has no environment
-    /// directory, URL, or model-name argument: neither Catena nor an RPC peer
+    /// This performs local file I/O only. Neither Catena nor an RPC peer
     /// selects presentation for the caller.
-    pub fn load(tokenizer_path: &Path) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+    pub fn from_gguf(path: &Path) -> Result<Self> {
+        let tokenizer = QwenTokenizer::from_gguf(path)?
+            .with_context(|| format!("{} has no embedded tokenizer", path.display()))?;
         Ok(Self {
             tokenizer,
             chat_template: None,
@@ -216,20 +210,16 @@ impl TextPresentation {
 
     /// Plain text tokenization, independent of the selected chat template.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self
-            .tokenizer
-            .encode(text, true)
-            .map_err(anyhow::Error::msg)
-            .context("failed to tokenize prompt")?
-            .get_ids()
-            .to_vec())
+        self.tokenizer
+            .encode(text)?
+            .into_iter()
+            .map(|id| u32::try_from(id).context("token ID exceeds u32"))
+            .collect()
     }
 
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
-        self.tokenizer
-            .decode(tokens, true)
-            .map_err(anyhow::Error::msg)
-            .context("failed to decode tokens")
+        let tokens = tokens.iter().copied().map(u64::from).collect::<Vec<_>>();
+        self.tokenizer.decode(&tokens, true)
     }
 }
 
@@ -272,14 +262,7 @@ fn render_smollm2(messages: &[ChatMessage], tools: &[serde_json::Value]) -> Resu
 /// Stateful streamed-token decoder for presentation UIs.
 pub struct TextOutputDecoder<'a> {
     presentation: &'a TextPresentation,
-    stream: DecodeStream<
-        'a,
-        ModelWrapper,
-        NormalizerWrapper,
-        PreTokenizerWrapper,
-        PostProcessorWrapper,
-        DecoderWrapper,
-    >,
+    stream: QwenDecodeStream<'a>,
     token_ids: Vec<u32>,
     decoded: String,
 }
@@ -332,13 +315,17 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    pub(crate) fn tokenizer(json: &str) -> QwenTokenizer {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), json).unwrap();
+        QwenTokenizer::open(file.path()).unwrap()
+    }
+
+    const WORDS: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"<unk>":2},"unk_token":"<unk>"}}"#;
+
     fn presentation() -> Arc<TextPresentation> {
-        let tokenizer = Tokenizer::from_bytes(
-            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"<unk>":2},"unk_token":"<unk>"}}"#,
-        )
-        .unwrap();
         Arc::new(TextPresentation {
-            tokenizer,
+            tokenizer: tokenizer(WORDS),
             chat_template: None,
         })
     }
@@ -385,7 +372,7 @@ mod tests {
         );
         assert!(presentation().encode_chat(&messages).is_err());
         let selected = TextPresentation {
-            tokenizer: presentation().tokenizer.clone(),
+            tokenizer: tokenizer(WORDS),
             chat_template: Some(ChatTemplate::Qwen3),
         };
         assert_eq!(selected.encode("hello world").unwrap(), [0, 1]);
@@ -430,12 +417,10 @@ mod tests {
 
     #[test]
     fn streamed_decode_waits_for_complete_utf8_and_flushes_terminal_bytes() {
-        let tokenizer = Tokenizer::from_bytes(
-            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},"model":{"type":"WordLevel","vocab":{"Ã":0,"©":1,"<unk>":2},"unk_token":"<unk>"}}"#,
-        )
-        .unwrap();
         let presentation = TextPresentation {
-            tokenizer,
+            tokenizer: tokenizer(
+                r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},"model":{"type":"WordLevel","vocab":{"Ã":0,"©":1,"<unk>":2},"unk_token":"<unk>"}}"#,
+            ),
             chat_template: None,
         };
         let first = hellas_rpc::encode_token_ids(&[0]);

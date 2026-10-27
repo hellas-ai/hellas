@@ -273,7 +273,12 @@ enum Commands {
     ///
     /// Every route requires `Authorization: Bearer <token>`. Use
     /// --gateway-profile to select its provisioned Auth authority and credential.
+    /// Hellas routes run --text-model as paid Compute jobs; the shared model
+    /// adapter handles text and tool calls with the GGUF's tokenizer.
     Gateway {
+        /// Qwen3 GGUF served by the text routes. Providers must already hold it.
+        #[arg(long, value_name = "FILE")]
+        text_model: Option<PathBuf>,
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
         output_cache: hellas_rpc::cache::CachePolicy,
@@ -291,7 +296,7 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         work_profile: Option<PathBuf>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
-        #[arg(long, value_name = "FILE", conflicts_with = "responses_backend")]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "text_model"])]
         #[arg(requires = "paid_work_config")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
@@ -818,6 +823,7 @@ async fn async_main() {
             }
         }
         Commands::Gateway {
+            text_model,
             output_cache,
             store_dir,
             offer,
@@ -850,7 +856,8 @@ async fn async_main() {
             async {
                 let cache_options =
                     commands::gateway_cache::options(output_cache, store_dir.clone())?;
-                let model_name = String::new();
+                let model_name = text_model.as_deref().and_then(Path::file_stem)
+                    .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
                 let assurance = remote_trust.assurance;
                 let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
                     .transpose()?.map(std::sync::Arc::new);
@@ -969,6 +976,7 @@ async fn async_main() {
                     retries,
                     default_max_tokens,
                     model_name,
+                    text_model,
                     metrics_port,
                     responses_backend: responses_backend.into(),
                     responses_proxy_url,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{WorkFetchStream, WorkShutdownError};
+use crate::{ExecutionEvent, WorkFetchStream, WorkOutputStream, WorkShutdownError};
 use hellas_rpc::output::{
     OutputEvent, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, Usage,
 };
@@ -25,6 +25,13 @@ impl WorkExecutionBackend for RecordedFetch {
         Ok(Box::pin(futures::stream::iter(
             self.events.clone().into_iter().map(Ok),
         )))
+    }
+
+    fn generate(
+        &self,
+        _: hellas_client::text::TextJob,
+    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
+        Err(WorkGatewayError::Unsupported)
     }
 
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {

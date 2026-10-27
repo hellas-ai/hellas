@@ -29,9 +29,13 @@ iroh = [
 # payable. Off by default because it pulls the consensus kernel into a
 # client that may only want to fetch.
 work = ["dep:hellas-kernel", "dep:hellas-channel"]
+# Client-side text package: renders Qwen3 Compute jobs from a GGUF file.
+text = ["work", "dep:anyhow", "dep:catena-models", "dep:hellas-store"]
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
+catena-models = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hellas-adaptors = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
@@ -45,6 +49,7 @@ hellas-channel = { workspace = true, optional = true }
 # it.
 hellas-kernel = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
+hellas-store = { workspace = true, optional = true }
 hellas-wire.workspace = true
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }

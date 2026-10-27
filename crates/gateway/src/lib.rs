@@ -60,7 +60,7 @@ pub enum WorkGatewayError {
     Denied(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("resource allowance exhausted: {0}")]
     Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Work backend does not support HTTP Fetch")]
+    #[error("Work backend does not support this application")]
     Unsupported,
     #[error("provider {0} has no HTTP Fetch resource")]
     Provider(EndpointId),
@@ -101,6 +101,15 @@ pub trait WorkExecutionBackend: Send + Sync {
     /// Authenticated prefixes, then durable completion. After proposal the
     /// backend owns collection and funding obligations across disconnects.
     fn fetch(&self, _request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
+        Err(WorkGatewayError::Unsupported)
+    }
+
+    /// Run a rendered text job on a provider admitting Compute. Emitted
+    /// tokens arrive as authenticated prefixes, then the durable completion.
+    fn generate(
+        &self,
+        _job: hellas_client::text::TextJob,
+    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
@@ -151,6 +160,9 @@ pub struct GatewayOptions {
     /// Fixed presentation label returned to API clients. It is not sent to an
     /// executor and cannot select trusted execution content.
     pub model_name: String,
+    /// Qwen3 GGUF whose rendered program, weights and tokenizer serve the
+    /// text routes; providers must already hold the file.
+    pub text_model: Option<std::path::PathBuf>,
     pub metrics_port: Option<u16>,
     pub responses_backend: ResponsesBackend,
     pub responses_proxy_url: String,
