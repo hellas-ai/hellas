@@ -628,12 +628,86 @@ async fn discover_two_route_runner(
     }
 }
 
+fn upload_messages(
+    mut request: AcceptWorkRequest,
+    exporter: [u8; 32],
+) -> (
+    AcceptWorkRequest,
+    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+) {
+    use hellas_rpc::{
+        ContentRef,
+        protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
+    };
+    let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let key = [OfferFixture::first(), OfferFixture::second()]
+        .into_iter()
+        .find(|offer| offer.descriptor().channel().id() == a.channel_id)
+        .map(|offer| offer.client())
+        .unwrap_or_else(client);
+    let id = hellas_work::model::work::paid_work_v2_id(network(), a.channel_id, &a);
+    let object = ContentRef::for_bytes(&request.prepared_input);
+    let chunks = request
+        .prepared_input
+        .chunks(CONTENT_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
+            hellas_rpc::pb::work::UploadContentRequest {
+                route: request.route.clone(),
+                authorization: request.authorization.clone(),
+                client_signature: request.client_signature.clone(),
+                content_id: object.id().as_bytes().to_vec(),
+                total_bytes: object.bytes(),
+                offset,
+                chunk: bytes.to_vec(),
+                chunk_signature: key
+                    .sign(signing_hash(chunk_digest(
+                        a.channel_id,
+                        id,
+                        object,
+                        offset,
+                        bytes,
+                        &exporter,
+                    )))
+                    .as_bytes()
+                    .to_vec(),
+            }
+        })
+        .collect();
+    request.prepared_input = encode_reference(object);
+    (request, chunks)
+}
 async fn accept_mounted_route(
     mount: &MountedWork,
     peer: PeerId,
     request: AcceptWorkRequest,
 ) -> AcceptWorkResponse {
-    let context = vouched_context(peer);
+    let mut context = vouched_context(peer);
+    context.open_exporter = Some([7; 32]);
+    let (request, uploads) = upload_messages(request, [7; 32]);
+    for upload in uploads {
+        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> =
+            match mount.upload_content(upload, context.clone()).await {
+                Ok(response) => response.into(),
+                Err(status) => {
+                    return AcceptWorkResponse {
+                        outcome: Some(accept_work_response::Outcome::Refused(
+                            hellas_rpc::pb::work::WorkRefused {
+                                code: WorkRefusalCode::Unavailable as i32,
+                                reason: status.message.to_string(),
+                                grant: None,
+                            },
+                        )),
+                    };
+                }
+            };
+        if let Some(refusal) = response.response.refused {
+            return AcceptWorkResponse {
+                outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+            };
+        }
+    }
     let response: WithTrailer<AcceptWorkResponse> = mount
         .accept_work(request, context)
         .await
@@ -3033,7 +3107,17 @@ impl RunningPaidNode {
 
     async fn accept_work(&self, request: AcceptWorkRequest) -> AcceptWorkResponse {
         let (transport, connection) = self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
+        let exporter = transport.open_exporter().unwrap();
         let client = WorkClientImpl::new(transport);
+        let (request, uploads) = upload_messages(request, exporter);
+        for upload in uploads {
+            let response = client.upload_content(upload).await.unwrap();
+            if let Some(refusal) = response.refused {
+                return AcceptWorkResponse {
+                    outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+                };
+            }
+        }
         let response = match client.accept_work(request).await {
             Ok(response) => response,
             Err(error) => panic!("Work acceptance reaches the node: {error}"),
@@ -3817,9 +3901,23 @@ async fn the_clock_does_not_starve_the_request_path() {
         panic!("the channel is mounted before the chain is read")
     };
     let answered = tokio::time::timeout(TEST_TIMEOUT, async move {
-        let response = dispatch
-            .accept_work(signed_accept_request(), TransportContext::default())
-            .await?;
+        let context = TransportContext {
+            open_exporter: Some([7; 32]),
+            ..Default::default()
+        };
+        let (request, uploads) = upload_messages(signed_accept_request(), [7; 32]);
+        for upload in uploads {
+            let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = dispatch
+                .upload_content(upload, context.clone())
+                .await?
+                .into();
+            assert!(
+                response.response.refused.is_none(),
+                "{:?}",
+                response.response
+            );
+        }
+        let response = dispatch.accept_work(request, context).await?;
         Ok::<WithTrailer<AcceptWorkResponse>, WireStatus>(response.into())
     })
     .await;
@@ -4121,9 +4219,16 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     ));
     let mut unmounted_grant = first.signed_accept_request();
     unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
-    let response = accept_mounted_route(&mounted, peer, unmounted_grant).await;
+    unmounted_grant.prepared_input = hellas_rpc::protocol::content_upload::encode_reference(
+        hellas_rpc::ContentRef::for_bytes(&unmounted_grant.prepared_input),
+    );
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(unmounted_grant, context.clone())
+        .await
+        .unwrap()
+        .into();
     assert!(
-        matches!(response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
+        matches!(response.response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
         if refusal.code == WorkRefusalCode::NotReady as i32)
     );
     for kind in [FundingKind::Unspecified as i32, 99] {
@@ -4463,6 +4568,20 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     let before_paid = paid.with_state(Channel::checkpoint).await.unwrap();
     let mut context = vouched_context(peer);
     context.open_exporter = Some([7; 32]);
+    let (request, uploads) =
+        hellas_work::test_support::grant_upload_requests(&request, &grantee_key, network, [7; 32]);
+    for upload in uploads {
+        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = execution
+            .upload_content(upload, context.clone())
+            .await
+            .unwrap()
+            .into();
+        assert!(
+            response.response.refused.is_none(),
+            "{:?}",
+            response.response
+        );
+    }
     let response: WithTrailer<AcceptWorkResponse> = execution
         .accept_work(request.clone(), context.clone())
         .await

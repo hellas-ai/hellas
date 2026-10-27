@@ -293,7 +293,8 @@ mod tests {
                 "max_output_events":policy.max_output_events,"max_output_bytes":policy.max_output_bytes,
                 "max_spool_bytes":policy.max_spool_bytes,
                 "max_encoded_result_frame":policy.max_encoded_result_frame,
-                "max_encoded_prepared_input":policy.max_encoded_prepared_input
+                "max_encoded_prepared_input":policy.max_encoded_prepared_input,
+                "max_upload_bytes":policy.max_upload_bytes
             }
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();

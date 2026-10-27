@@ -290,6 +290,118 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
 }
 
 #[tokio::test]
+async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
+    use hellas_kernel::Sig;
+    use hellas_work::work_store::{ChannelRecord, TerminalOutcome, journal::Journal};
+    let root = tempfile::tempdir().unwrap();
+    let r = ready(work_policy());
+    let provider_root = root.path().join("provider");
+    let provider = service(&provider_root, &r).await;
+    let (_, request, bytes) = proposal(&root.path().join("client"), &r, bundle(1)).await;
+    assert!(
+        provider
+            .upload(
+                &chunk(&request, object(&bytes), 0, &bytes, [3; 32]),
+                &context([3; 32])
+            )
+            .await
+            .unwrap()
+            .refused
+            .is_none()
+    );
+    drop(provider);
+    let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(r.channel(), &a);
+    let mut store = ChannelStore::open(
+        &provider_root,
+        r.channel().clone(),
+        settlement(),
+        Role::Provider,
+        origin(),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    store
+        .commit(
+            ChannelRecord::JobProposed {
+                authorization: a,
+                client_signature: Sig::from_bytes(
+                    request.client_signature.clone().try_into().unwrap(),
+                ),
+                prepared_input: bytes,
+            },
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let stem = Journal::stems(&provider_root).unwrap().pop().unwrap();
+    let (header, _) = Journal::inspect(&provider_root, &stem).await.unwrap();
+    let (mut journal, _) = Journal::open_existing(&provider_root, &stem, header)
+        .await
+        .unwrap();
+    // Persist precisely the terminal and cursor records, then die before
+    // ChannelStore can rotate away their old payload references.
+    let expired = a.acceptance_deadline + 1;
+    journal
+        .append(
+            &ChannelRecord::JobTerminated {
+                work_id: id,
+                outcome: TerminalOutcome::Expired {
+                    deadline: a.acceptance_deadline,
+                    height: expired,
+                    payload: payload_at(expired),
+                },
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    for height in CURSOR + 1..=expired {
+        journal
+            .append(
+                &ChannelRecord::CursorAdvanced {
+                    height,
+                    parent: payload_at(height - 1),
+                    payload: payload_at(height),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+    }
+    drop(journal);
+    for _ in 0..2 {
+        let store = ChannelStore::open(
+            &provider_root,
+            r.channel().clone(),
+            settlement(),
+            Role::Provider,
+            origin(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        assert!(store.state().jobs().next().is_none());
+        assert!(store.state().terminal_by_id(id).is_some());
+        assert_eq!(
+            std::fs::read_dir(provider_root.join(format!("{stem}.payloads")))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(provider_root.join(format!("{stem}.staging")))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(store);
+    }
+}
+
+#[tokio::test]
 async fn failed_cosign_journal_append_cannot_publish_content_and_retry_recovers() {
     use hellas_kernel::Sig;
     use hellas_work::work_store::ChannelRecord;

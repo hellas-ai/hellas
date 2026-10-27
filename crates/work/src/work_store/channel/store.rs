@@ -139,6 +139,11 @@ impl ChannelStore {
             .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
             .map(|job| job.work_id)
             .collect();
+        let live: std::collections::BTreeSet<String> = state
+            .jobs()
+            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
+            .collect();
+        let retired_payloads = !metadata_only && referenced != live;
         if !metadata_only {
             payloads.prune_ids(&referenced)?;
         }
@@ -150,6 +155,11 @@ impl ChannelStore {
             payloads,
             uploads,
         };
+        // A terminal append can survive a crash before its payload cleanup.
+        // Retire those replay references durably before removing their files.
+        if retired_payloads {
+            store.rotate().await?;
+        }
         store.gc_uploads()?;
         Ok(store)
     }
