@@ -841,8 +841,3 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
         devnet.shutdown().await;
     });
 }
-
-#[test]
-fn automatic_future_layout() {
-    eprintln!("automatic future bytes {}", automatic::frame_size());
-}

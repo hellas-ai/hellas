@@ -301,24 +301,6 @@ async fn completed_store(root: &std::path::Path) -> SetupStore {
     store
 }
 
-/// A provider store recovered mid-handshake, holding revision 2.
-///
-/// The client's countersigned bond and proposed payment are journaled and
-/// this endpoint has not countersigned the payment yet. Both retained legs
-/// already name their funding, even before the payment Open is executable.
-async fn revision_two_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Provider).await;
-    let verifier = Secp256k1Verifier::new();
-    let one = proposed();
-    let two = countersigned(one.clone());
-    for record in [scan_record(), bundle_record(&one), bundle_record(&two)] {
-        if let Err(error) = store.commit(record, &verifier).await {
-            panic!("the fixture revision commits: {error}");
-        }
-    }
-    store
-}
-
 /// A client store that has durably retained the complete handshake.
 ///
 /// The client arms its descriptor at revision 2 — after it has signed

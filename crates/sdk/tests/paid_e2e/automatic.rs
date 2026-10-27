@@ -329,11 +329,11 @@ async fn request(
     )
     .await
 }
-fn granted(response: RequestOfferResponse) -> SignedPaidOffer {
+fn granted(response: RequestOfferResponse) -> Box<SignedPaidOffer> {
     let Some(Outcome::Granted(granted)) = response.outcome else {
         panic!("expected offer, got {response:?}")
     };
-    SignedPaidOffer::decode(&granted.offer).unwrap()
+    Box::new(SignedPaidOffer::decode(&granted.offer).unwrap())
 }
 fn refused(response: RequestOfferResponse, code: OfferRefusalCode) {
     let Some(Outcome::Refused(refused)) = response.outcome else {
@@ -410,11 +410,11 @@ async fn evaluate_and_settle(
         devnet,
         Duration::from_millis(100),
         PaidWorkSession::open(
-            options,
+            options.clone(),
             endpoint.clone(),
             key.clone(),
-            client_node,
-            authority,
+            client_node.clone(),
+            authority.clone(),
         ),
     )
     .await
@@ -442,7 +442,23 @@ async fn evaluate_and_settle(
         .unwrap(),
         original.encode().unwrap()
     );
-    eprintln!("automatic: opened; evaluating");
+    // The sealing driver finishes its last block even when setup wins the
+    // race. Reopen from journals on that stable tip before testing payment.
+    session.shutdown().await;
+    drop(session);
+    let mut session = PaidWorkSession::open(
+        options,
+        endpoint.clone(),
+        key.clone(),
+        client_node,
+        authority,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session.descriptor().bond_edge(),
+        original.offer().proposal.bond_edge()
+    );
     let result = session
         .run(
             Some(hellas_work::test_support::paid::bundle(7).into()),
@@ -452,7 +468,6 @@ async fn evaluate_and_settle(
         .await
         .unwrap()
         .unwrap();
-    eprintln!("automatic: evaluated; settling");
     assert_eq!(result.job_price, JOB_PRICE);
     assert_eq!(result.credited_cumulative, JOB_PRICE);
     assert_eq!(
@@ -461,27 +476,41 @@ async fn evaluate_and_settle(
             .unwrap(),
         JOB_PRICE
     );
-    eprintln!("automatic: settled");
     session.shutdown().await;
     drop(session);
-}
-
-pub(super) fn frame_size() -> usize {
-    fn bytes<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
-        std::mem::size_of::<F>()
-    }
-    bytes(exercise_inner)
 }
 
 pub(super) fn exercise(
     runtime: commonware_runtime::tokio::Context,
 ) -> impl std::future::Future<Output = ()> {
-    eprintln!("automatic future bytes {}", frame_size());
     Box::pin(exercise_inner(runtime))
 }
 
+struct Case {
+    root: tempfile::TempDir,
+    devnet: Devnet,
+    chain: RemoteLightClient,
+    owners: [GenesisOwner; 5],
+    keys: Vec<Secp256k1Signer>,
+    payment_coins: Vec<CoinId>,
+    config: WorkConfig,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider: Provider,
+    endpoint: Endpoint,
+    policy: hellas_work::model::paid_policy::PaidPolicy,
+    secret: auth::CredentialSecret,
+    first: Box<SignedPaidOffer>,
+    second: Box<SignedPaidOffer>,
+    third: Box<SignedPaidOffer>,
+    interrupted_root: std::path::PathBuf,
+}
+
 async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
-    eprintln!("automatic: begin");
+    let case = Box::pin(allocate(runtime)).await;
+    Box::pin(finish(case)).await;
+}
+
+async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let root = tempfile::tempdir().unwrap();
     let owners = [
         GenesisOwner {
@@ -957,7 +986,7 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
             hellas_work::work_store::SetupRecord::Offer {
                 peer: *provider.endpoint.id().as_bytes(),
                 floor: None,
-                offer: Box::new(third.clone()),
+                offer: third.clone(),
             },
             &hellas_kernel::Secp256k1Verifier::new(),
         )
@@ -1041,6 +1070,45 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
         .unwrap(),
         first.encode().unwrap()
     );
+    Box::new(Case {
+        root,
+        devnet,
+        chain,
+        owners,
+        keys,
+        payment_coins,
+        config,
+        calls,
+        provider,
+        endpoint,
+        policy,
+        secret,
+        first,
+        second,
+        third,
+        interrupted_root,
+    })
+}
+
+async fn finish(case: Box<Case>) {
+    let Case {
+        root,
+        mut devnet,
+        chain,
+        owners,
+        keys,
+        payment_coins,
+        config,
+        calls,
+        mut provider,
+        endpoint,
+        mut policy,
+        secret,
+        first,
+        second,
+        third,
+        interrupted_root,
+    } = *case;
     let options = PaidWorkOptions {
         config: config.clone(),
         journal_root: root.path().join("client"),
@@ -1115,7 +1183,6 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
         chain.get_latest_block().await.unwrap().unwrap().height
             < second.offer().proposal.bond_terms().timeout.get()
     );
-    eprintln!("automatic: expiry");
     let expiry = [&first, &second, &third]
         .into_iter()
         .map(|o| o.offer().proposal.bond_terms().timeout.get())
@@ -1190,7 +1257,6 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
     );
     policy.offers.max_stake_per_client = 12;
     provider.policy(&secret, 4, policy).await;
-    eprintln!("automatic: fresh after expiry");
     let mut fresh_args = options;
     fresh_args.journal_root = interrupted_root;
     fresh_args.provider_addrs = provider.endpoint.bound_sockets();
