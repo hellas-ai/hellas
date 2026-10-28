@@ -1,6 +1,8 @@
 //! Reusable paid gateway pool over durable client-owned state channels.
 
-use crate::gateway_work::{Completed, GatewayEvent, Requester, WorkGateway, WorkSource};
+use crate::gateway_work::{
+    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
+};
 use crate::job::{Job, JobInput};
 use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
@@ -8,10 +10,10 @@ use crate::paid_client::{
 use futures::future::BoxFuture;
 use hellas_channel::content::{EphemeralContent, InvocationContent};
 use hellas_channel::model::setup::ProviderChannelPolicy;
-use hellas_gateway::{WorkFetchRequest, WorkGatewayError, WorkShutdownError};
+use hellas_gateway::{WorkGatewayError, WorkShutdownError};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
+use hellas_rpc::protocol::invocation::Admission;
 use iroh::{Endpoint, EndpointId};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,7 +34,8 @@ const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // A retained job is durable, but it must not monopolize the channel that
 // serves interactive requests after a restart or a provider interruption.
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-// Bound queueing while another funded provider may be eligible.
+// Bound queueing while another funded provider may be eligible. The last
+// candidate waits for its channel until the request deadline.
 const CHANNEL_QUEUE_BUDGET: Duration = Duration::from_secs(1);
 
 struct Provider {
@@ -111,8 +114,7 @@ enum Routed {
     /// A new job. The first route is reserved when the request is accepted so
     /// concurrent HTTP requests see both queued and executing work.
     Job {
-        candidates: Vec<(Arc<Provider>, Route)>,
-        input: Box<JobInput>,
+        candidates: Vec<(Arc<Provider>, Route, JobInput)>,
         occupied: ProviderUse,
     },
     /// Restart recovery of retained work, never a new job.
@@ -193,6 +195,13 @@ impl PaidGateway {
             let policy =
                 provider_policy(&args, chain, &endpoint, &settlement_key, owner.principal())
                     .await?;
+            if policy.payment_policy.fixed_price != args.expected_price {
+                return Err(PoolError::Price {
+                    provider: args.provider,
+                    quoted: policy.payment_policy.fixed_price,
+                    expected: args.expected_price,
+                });
+            }
             providers.push(Arc::new(Provider {
                 policy,
                 args,
@@ -228,28 +237,28 @@ impl PaidPool {
     /// that fails before this request is proposed yields to the next one.
     async fn route<E: GatewayEvent>(
         &self,
-        candidates: Vec<(Arc<Provider>, Route)>,
-        input: Option<JobInput>,
+        candidates: Vec<(Arc<Provider>, Route, Option<JobInput>)>,
         mut occupied: Option<ProviderUse>,
         deadline: tokio::time::Instant,
         requester: &Requester<E, PoolError>,
     ) -> Result<Option<PaidWorkResult>> {
         let span = tracing::Span::current();
-        let streamed = input.is_some();
-        let recovery = !streamed;
+        let recovery = occupied.is_none();
+        let streamed = !recovery;
         let progress = requester.progress();
         let mut provider_errors = Vec::new();
-        for (provider, route) in candidates {
+        let last = candidates.len() - 1;
+        for (index, (provider, route, input)) in candidates.into_iter().enumerate() {
             let _occupied = occupied
                 .take()
-                .or_else(|| input.as_ref().map(|_| ProviderUse::new(provider.clone())));
+                .or_else(|| streamed.then(|| ProviderUse::new(provider.clone())));
             span.record(
                 "hellas.provider.id",
                 tracing::field::display(provider.args.provider),
             );
             span.record("hellas.route.pending", route.pending);
             // Serialize jobs on one funded channel; its observer runs independently.
-            let mut session = if recovery || matches!(input, Some(JobInput::Fetch { .. })) {
+            let mut session = if recovery || index == last {
                 before_proposal(requester, streamed, deadline, |_| {
                     provider.serial.lock().instrument(
                         hellas_rpc::request_span!(target: "hellas_request", "paid.queue"),
@@ -343,7 +352,6 @@ impl PaidPool {
                 .await?;
             let request_session = &mut *session;
             let job = input
-                .clone()
                 .map(|input| Job::from_input(provider.args.expected_price, input))
                 .transpose()?;
             let signer = self.producer_key.clone();
@@ -467,47 +475,42 @@ impl WorkSource for PaidPool {
             .collect()
     }
 
-    fn fetch_request(&self, request: WorkFetchRequest) -> Result<PaidRequest> {
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| {
-                provider.args.provider == request.provider
-                    && provider
-                        .policy
-                        .invocation_policy
-                        .admissions
-                        .iter()
-                        .any(|a| matches!(a, Admission::Fetch { .. }))
-            })
-            .ok_or(WorkGatewayError::Provider(request.provider))?;
-        let input = prepare_fetch(&provider.args, &provider.policy, &request)?;
-        // Account/session selection is already final. Never substitute another
-        // provider, including on failure before acceptance.
-        Ok(PaidRequest(Routed::Job {
-            candidates: vec![(provider.clone(), provider.route())],
-            input: Box::new(input),
-            occupied: ProviderUse::new(provider.clone()),
-        }))
-    }
-
-    fn job_request(&self, input: JobInput) -> Result<PaidRequest> {
+    /// Every provider whose policy admits the request, least loaded first.
+    /// A pinned request has at most its own provider: account and session
+    /// selection is final, so it never fails over.
+    fn request(&self, request: WorkRequest) -> Result<PaidRequest> {
+        let pinned = request.pinned();
+        let mut refusal = None;
         let mut candidates = self
             .providers
             .iter()
-            .filter(|provider| {
-                Job::from_input(provider.args.expected_price, input.clone())
-                    .and_then(|job| job.check_policy(&provider.policy))
-                    .is_ok()
+            .filter(|provider| pinned.is_none_or(|pin| pin == provider.args.provider))
+            .filter_map(|provider| {
+                match request.admitted(
+                    &provider.policy.invocation_policy,
+                    None,
+                    provider.args.assurance,
+                    true,
+                ) {
+                    Ok(input) => Some((provider.clone(), provider.route(), input)),
+                    Err(error) => {
+                        refusal = Some(error);
+                        None
+                    }
+                }
             })
-            .map(|provider| (provider.clone(), provider.route()))
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(provider, route)| (!provider.available(), route.pending));
-        let (first, _) = candidates.first().ok_or(PoolError::NoMatchingPolicy)?;
+        candidates.sort_by_key(|(provider, route, _)| (!provider.available(), route.pending));
+        let Some((first, _, _)) = candidates.first() else {
+            return Err(match (pinned, refusal) {
+                (_, Some(error)) => error.into(),
+                (Some(pin), None) => WorkGatewayError::Provider(pin).into(),
+                (None, None) => PoolError::NoMatchingPolicy,
+            });
+        };
         let occupied = ProviderUse::new(first.clone());
         Ok(PaidRequest(Routed::Job {
             candidates,
-            input: Box::new(input),
             occupied,
         }))
     }
@@ -517,19 +520,24 @@ impl WorkSource for PaidPool {
         request: PaidRequest,
         requester: Requester<E, PoolError>,
     ) -> BoxFuture<'static, Result<Option<Completed>>> {
-        let (candidates, input, occupied) = match request.0 {
+        let (candidates, occupied) = match request.0 {
             Routed::Job {
                 candidates,
-                input,
                 occupied,
-            } => (candidates, Some(*input), Some(occupied)),
+            } => (
+                candidates
+                    .into_iter()
+                    .map(|(provider, route, input)| (provider, route, Some(input)))
+                    .collect::<Vec<_>>(),
+                Some(occupied),
+            ),
             Routed::Recover(provider) => {
                 let route = provider.route();
-                (vec![(provider, route)], None, None)
+                (vec![(provider, route, None)], None)
             }
         };
-        let (first, _route) = &candidates[0];
-        let recovery = input.is_none();
+        let (first, _route, _) = &candidates[0];
+        let recovery = occupied.is_none();
         let span = hellas_rpc::request_span!(
             target: "hellas_request", "paid.gateway",
             hellas.provider.id = %first.args.provider,
@@ -546,7 +554,7 @@ impl WorkSource for PaidPool {
         Box::pin(
             async move {
                 let result = self
-                    .route(candidates, input, occupied, deadline, &requester)
+                    .route(candidates, occupied, deadline, &requester)
                     .await;
                 if let Err(error) = &result {
                     if recovery {
@@ -653,49 +661,14 @@ async fn before_proposal<T, F: std::future::Future<Output = T>, E: GatewayEvent>
     result.map_err(|_| RequestStopped::Deadline.into())
 }
 
-fn prepare_fetch(
-    options: &PaidWorkOptions,
-    channel_policy: &ProviderChannelPolicy,
-    request: &WorkFetchRequest,
-) -> Result<JobInput> {
-    channel_policy.invocation_policy.validate()?;
-    let admission = channel_policy
-        .invocation_policy
-        .admissions
-        .iter()
-        .find_map(|a| match a {
-            Admission::Fetch { admission }
-                if match &admission.route {
-                    FetchRoutePolicy::SealedRoute { service, method } => {
-                        request.service == *service && request.method == *method
-                    }
-                    FetchRoutePolicy::OpenFetch { .. } => true,
-                } =>
-            {
-                Some(admission)
-            }
-            _ => None,
-        })
-        .ok_or(PoolError::NoMatchingPolicy)?;
-    let contract = &admission.contract;
-    Ok(Job::fetch(
-        options.expected_price,
-        contract.clone(),
-        request.service.clone(),
-        request.method.clone(),
-        request.body.clone(),
-        options.assurance,
-    )?
-    .input()
-    .clone())
-}
-
 #[cfg(test)]
 use hellas_channel::test_support::test_responses_contract;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_gateway::WorkFetchRequest;
+    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
     use iroh::Endpoint;
 
     fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
@@ -850,54 +823,72 @@ mod tests {
         assert!(shared.validate().is_ok());
     }
 
-    #[tokio::test]
-    async fn paid_responses_backend_uses_its_manifest_and_refuses_route_mismatch_before_funding() {
-        let mut fixture = crate::test_support::PaidFixture::new();
-        let node = fixture.node().await;
-        let options = pool_options(&fixture);
-        let identity = crate::NodeIdentity::from_secret_bytes([0x31; 32], [0x32; 32]).unwrap();
-        let provider = options.providers[0].provider;
-        let request = |method: &str| WorkFetchRequest {
-            provider,
+    async fn test_pool(
+        fixture: &crate::test_support::PaidFixture,
+        policy: ProviderChannelPolicy,
+    ) -> PaidPool {
+        let args = pool_options(fixture).providers.remove(0);
+        PaidPool {
+            owner: Arc::new(
+                crate::client_owner::ClientOwner::new(
+                    Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
+                    Secp256k1Signer::from_secret_scalar([7; 32])
+                        .unwrap()
+                        .party_key(),
+                    &fixture.root.path().join("funding"),
+                )
+                .unwrap(),
+            ),
+            providers: vec![Arc::new(Provider {
+                args,
+                policy,
+                serial: AsyncMutex::new(None),
+                pending: AtomicUsize::new(0),
+                unavailable_until: Mutex::new(None),
+            })],
+            endpoint: Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+            settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
+            producer_key: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
+        }
+    }
+
+    fn fetch(pool: &PaidPool, method: &str) -> WorkRequest {
+        WorkRequest::Fetch(WorkFetchRequest {
+            provider: pool.providers[0].args.provider,
             service: "openai".into(),
             method: method.into(),
             body: crate::test_support::BODY.to_vec(),
-        };
-        let prepared = prepare_fetch(
-            &options.providers[0],
-            &fixture.policy,
-            &request("responses"),
-        )
-        .unwrap();
-        let prepared = Job::from_input(10, prepared)
-            .unwrap()
-            .prepare(
-                identity.node_key(),
-                [1; 32],
-                identity.node_key().public_key(),
-                &fixture.policy.invocation_policy,
-            )
-            .unwrap();
-        assert_eq!(
-            prepared.request.execution_environment,
-            test_responses_contract().manifest_id()
-        );
-        assert!(
-            prepare_fetch(
-                &options.providers[0],
-                &fixture.policy,
-                &request("another-route")
-            )
-            .is_err()
-        );
-        assert!(!fixture.root.path().join("client").exists());
-        node.shutdown().await.unwrap();
+        })
     }
 
-    #[test]
-    fn supported_contract_is_prepared_without_vendor_dispatch_and_stale_terms_deny() {
+    fn admitted(request: Result<PaidRequest>) -> JobInput {
+        let PaidRequest(Routed::Job { mut candidates, .. }) = request.unwrap() else {
+            panic!("an admitted paid request")
+        };
+        assert_eq!(candidates.len(), 1, "a pinned request has one route");
+        candidates.remove(0).2
+    }
+
+    #[tokio::test]
+    async fn paid_responses_backend_uses_its_manifest_and_refuses_route_mismatch_before_funding() {
         let fixture = crate::test_support::PaidFixture::new();
-        let options = pool_options(&fixture);
+        let pool = test_pool(&fixture, fixture.policy.clone()).await;
+        let input = admitted(pool.request(fetch(&pool, "responses")));
+        assert_eq!(
+            input.manifest().unwrap().content_id(),
+            test_responses_contract().manifest_id()
+        );
+        assert!(pool.request(fetch(&pool, "another-route")).is_err());
+        assert!(!fixture.root.path().join("client").exists());
+        pool.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn supported_contract_is_prepared_without_vendor_dispatch_and_stale_terms_deny() {
+        let fixture = crate::test_support::PaidFixture::new();
         let contract = hellas_rpc::FetchContract::new(
             "independent-responses-1",
             hellas_rpc::FetchSchema::StatelessResponsesV1,
@@ -910,30 +901,48 @@ mod tests {
             panic!("Fetch fixture")
         };
         admission.contract = contract.clone();
-        let identity = crate::NodeIdentity::from_secret_bytes([0x31; 32], [0x32; 32]).unwrap();
-        let request = WorkFetchRequest {
-            provider: options.providers[0].provider,
-            service: "openai".into(),
-            method: "responses".into(),
-            body: crate::test_support::BODY.to_vec(),
-        };
-        let prepared = prepare_fetch(&options.providers[0], &quoted, &request).unwrap();
-        let prepared = Job::from_input(10, prepared)
-            .unwrap()
-            .prepare(
-                identity.node_key(),
-                [1; 32],
-                identity.node_key().public_key(),
-                &quoted.invocation_policy,
-            )
-            .unwrap();
-        assert_eq!(prepared.manifest().unwrap(), contract.manifest());
+        let pool = test_pool(&fixture, quoted.clone()).await;
+        let input = admitted(pool.request(fetch(&pool, "responses")));
+        assert_eq!(input.manifest().unwrap(), contract.manifest());
+        pool.endpoint.close().await;
+        drop(pool);
+
         let Admission::Fetch { admission } = &mut quoted.invocation_policy.admissions[0] else {
             panic!("Fetch fixture")
         };
         admission.route = FetchRoutePolicy::sealed_route("openai", "other").unwrap();
-        assert!(prepare_fetch(&options.providers[0], &quoted, &request).is_err());
+        let pool = test_pool(&fixture, quoted).await;
+        assert!(pool.request(fetch(&pool, "responses")).is_err());
         assert!(!fixture.root.path().join("client").exists());
+        pool.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn two_admitting_contracts_are_refused_not_chosen_between() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let mut quoted = fixture.policy.clone();
+        let Admission::Fetch { admission } = &quoted.invocation_policy.admissions[0] else {
+            panic!("Fetch fixture")
+        };
+        let mut second = admission.clone();
+        second.contract = hellas_rpc::FetchContract::new(
+            "independent-responses-1",
+            hellas_rpc::FetchSchema::StatelessResponsesV1,
+            "independent-driver-1",
+            hellas_rpc::FetchEgress::FixedHttps("https://example.com/responses".into()),
+        )
+        .unwrap();
+        quoted
+            .invocation_policy
+            .admissions
+            .push(Admission::Fetch { admission: second });
+        let pool = test_pool(&fixture, quoted).await;
+        let refused = pool.request(fetch(&pool, "responses")).err().unwrap();
+        assert!(
+            refused.to_string().contains("several Fetch contracts"),
+            "{refused}"
+        );
+        pool.endpoint.close().await;
     }
 
     #[tokio::test]
@@ -1142,36 +1151,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_rejects_admitted_work_not_yet_registered() {
         let fixture = crate::test_support::PaidFixture::new();
-        let args = pool_options(&fixture).providers.remove(0);
-        let provider = Arc::new(Provider {
-            args,
-            policy: fixture.policy.clone(),
-            serial: AsyncMutex::new(None),
-            pending: AtomicUsize::new(0),
-            unavailable_until: Mutex::new(None),
-        });
-        let gateway = WorkGateway::new(
-            PaidPool {
-                owner: Arc::new(
-                    crate::client_owner::ClientOwner::new(
-                        Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
-                        Secp256k1Signer::from_secret_scalar([7; 32])
-                            .unwrap()
-                            .party_key(),
-                        &fixture.root.path().join("funding"),
-                    )
-                    .unwrap(),
-                ),
-                providers: vec![provider.clone()],
-                endpoint: Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .bind()
-                    .await
-                    .unwrap(),
-                settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
-                producer_key: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
-            },
-            1,
-        );
+        let pool = test_pool(&fixture, fixture.policy.clone()).await;
+        let provider = pool.providers[0].clone();
+        let gateway = WorkGateway::new(pool, 1);
         // Deterministically pause execute at the point after admission but
         // before preparation/routing has reached task registration.
         let permit = gateway.admission.clone().try_acquire_owned().unwrap();

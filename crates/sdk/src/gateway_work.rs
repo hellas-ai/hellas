@@ -1,13 +1,17 @@
 //! One gateway backend over any source of work. A paid pool and a grant
 //! session differ only in how they fund and run one request; input
 //! preparation, admission, streamed output and shutdown are shared here.
+use crate::job::{JobError, JobInput};
 use futures::{future::BoxFuture, stream::BoxStream};
+use hellas_authority::model::grant::resource::HttpsResource;
 use hellas_gateway::{
     ExecutionEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy, WorkGatewayError,
     WorkOutputStream, WorkShutdownError,
 };
+use hellas_rpc::http_fetch::HttpFetchRequest;
 use hellas_rpc::output::OutputEvent;
 use hellas_rpc::protocol::invocation::output::{ArtifactChunk, ArtifactPrefix, InvocationOutput};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -369,14 +373,94 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
     }
 }
 
+/// What HTTP asks for, before any source has matched it to a policy.
+pub enum WorkRequest {
+    /// Pinned to one provider by the HTTP account router; the contract comes
+    /// from the admitting policy.
+    Fetch(WorkFetchRequest),
+    /// A complete program input; any admitting provider may run it.
+    Compute(JobInput),
+}
+
+impl WorkRequest {
+    /// The provider this request must run on, if it names one.
+    pub fn pinned(&self) -> Option<iroh::EndpointId> {
+        match self {
+            WorkRequest::Fetch(request) => Some(request.provider),
+            WorkRequest::Compute(_) => None,
+        }
+    }
+
+    /// The one input `policy` admits for this request. A Fetch tries each
+    /// Fetch contract of `policy`; an HTTPS body is first repaired under
+    /// `https`. Two admitting contracts are refused, never chosen between.
+    pub fn admitted(
+        &self,
+        policy: &InvocationPolicy,
+        https: Option<&HttpsResource>,
+        assurance: hellas_rpc::Assurance,
+        retain: bool,
+    ) -> Result<JobInput, JobError> {
+        let request = match self {
+            WorkRequest::Compute(input) => {
+                input.admits(policy, retain)?;
+                return Ok(input.clone());
+            }
+            WorkRequest::Fetch(request) => request,
+        };
+        let mut contracts = Vec::new();
+        for admission in &policy.admissions {
+            if let Admission::Fetch { admission } = admission
+                && !contracts.contains(&admission.contract)
+            {
+                contracts.push(admission.contract.clone());
+            }
+        }
+        let mut admitted = None;
+        let mut refusal = None;
+        for contract in contracts {
+            let body = match https {
+                Some(https) if contract.schema() == hellas_rpc::FetchSchema::HttpV1 => {
+                    let mut http = HttpFetchRequest::decode(&request.body)
+                        .map_err(|e| JobError::Invalid(e.to_string()))?;
+                    https
+                        .prepare(&mut http)
+                        .map_err(|e| JobError::Invalid(e.to_string()))?;
+                    serde_json::to_vec(&http)?
+                }
+                _ => request.body.clone(),
+            };
+            let input = JobInput::Fetch {
+                contract,
+                service: request.service.clone(),
+                method: request.method.clone(),
+                request: body,
+                assurance,
+            };
+            match input.admits(policy, retain) {
+                Ok(()) if admitted.is_some() => {
+                    return Err(JobError::Invalid(
+                        "several Fetch contracts admit this request".into(),
+                    ));
+                }
+                Ok(()) => admitted = Some(input),
+                Err(error) => refusal = Some(error),
+            }
+        }
+        admitted.ok_or_else(|| {
+            refusal.unwrap_or_else(|| JobError::Invalid("the policy admits no Fetch".into()))
+        })
+    }
+}
+
 /// How one source funds and runs gateway requests.
 pub trait WorkSource: Send + Sync + Sized + 'static {
     type Error: From<WorkGatewayError> + std::fmt::Display + Send + 'static;
     /// One request, already matched to this source's policies.
     type Request: Send + 'static;
     fn fetch_providers(&self) -> Vec<iroh::EndpointId>;
-    fn fetch_request(&self, request: WorkFetchRequest) -> Result<Self::Request, Self::Error>;
-    fn job_request(&self, input: crate::job::JobInput) -> Result<Self::Request, Self::Error>;
+    /// Matches the request to this source's policies and builds its input.
+    fn request(&self, request: WorkRequest) -> Result<Self::Request, Self::Error>;
     /// Runs the request to its verified completion. Work not yet proposed
     /// stops when the requester disconnects; proposed work runs to completion.
     fn run<E: GatewayEvent>(
@@ -429,7 +513,7 @@ impl<S: WorkSource> WorkGateway<S> {
     }
     fn request<E: GatewayEvent>(
         &self,
-        request: impl FnOnce(&S) -> Result<S::Request, S::Error>,
+        request: WorkRequest,
     ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
         use futures::StreamExt as _;
         let permit = self
@@ -437,7 +521,7 @@ impl<S: WorkSource> WorkGateway<S> {
             .clone()
             .try_acquire_owned()
             .map_err(|_| WorkGatewayBusy)?;
-        let request = request(&self.source).map_err(S::gateway_error)?;
+        let request = self.source.request(request).map_err(S::gateway_error)?;
         let stream = self
             .submit::<E>(request, Some(permit))
             .map_err(S::gateway_error)?;
@@ -454,20 +538,18 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
         &self,
         request: WorkFetchRequest,
     ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
-        self.request(|source| source.fetch_request(request))
+        self.request(WorkRequest::Fetch(request))
     }
     fn generate(
         &self,
         job: hellas_client::text::TextJob,
     ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
-        self.request(|source| {
-            source.job_request(crate::job::JobInput::Compute {
-                environment: job.environment,
-                plan: job.plan,
-                inputs: job.inputs,
-                content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
-            })
-        })
+        self.request(WorkRequest::Compute(JobInput::Compute {
+            environment: job.environment,
+            plan: job.plan,
+            inputs: job.inputs,
+            content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
+        }))
     }
     fn timeout(&self) -> Duration {
         self.source.timeout()

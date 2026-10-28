@@ -2,7 +2,9 @@
 //! paid pool. HTTP disconnects never abandon an already signed proposal.
 pub mod responses;
 
-use crate::gateway_work::{Completed, GatewayEvent, Requester, WorkGateway, WorkSource};
+use crate::gateway_work::{
+    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
+};
 use crate::grant_client::{GrantClientError, GrantSession, GrantSessionOptions, GrantTransport};
 use crate::job::JobInput;
 use futures::future::BoxFuture;
@@ -10,9 +12,8 @@ use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_authority::model::grant::records::{
     GrantPolicy, SignedOffer, grant_producer, grant_transport,
 };
-use hellas_channel::content::{EphemeralContent, InvocationContent};
-use hellas_gateway::{WorkFetchRequest, WorkGatewayBusy, WorkGatewayError};
-use hellas_rpc::protocol::invocation::{Admission, PreparedInvocation, fetch::FetchRoutePolicy};
+use hellas_gateway::{WorkGatewayBusy, WorkGatewayError};
+use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -272,46 +273,11 @@ impl GrantSource {
             .iter()
             .filter(|p| self.policy.as_ref().is_none_or(|name| name == &p.name))
     }
-    /// The one granted policy admitting `input`, and its signed invocation.
-    /// Grant work is memory-only.
-    fn prepare(
-        offer: &SignedOffer,
-        selected: Option<&str>,
-        signer: &ProducerSigningKey,
-        input: &JobInput,
-    ) -> Result<(String, PreparedInvocation), WorkGatewayError> {
-        let manifest = input.manifest().map_err(rejected)?;
-        let runner = grant_runner(offer)?;
-        let nonce = rand::random();
-        let mut admitted = offer.offer().grant.policies.iter().filter_map(|policy| {
-            if selected.is_some_and(|name| name != policy.name) {
-                return None;
-            }
-            input
-                .prepare(
-                    &manifest,
-                    signer,
-                    nonce,
-                    runner,
-                    &policy.invocation_policy,
-                    false,
-                )
-                .ok()
-                .map(|prepared| (policy.name.clone(), prepared))
-        });
-        let chosen = admitted
-            .next()
-            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-        if admitted.next().is_some() {
-            return Err(rejected(GrantGatewayError::AmbiguousPolicy));
-        }
-        Ok(chosen)
-    }
 }
 
 impl WorkSource for GrantSource {
     type Error = WorkGatewayError;
-    type Request = JobInput;
+    type Request = (String, JobInput);
 
     fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
         if self.policies().any(|p| {
@@ -326,58 +292,36 @@ impl WorkSource for GrantSource {
         }
     }
 
-    fn fetch_request(&self, request: WorkFetchRequest) -> Result<JobInput, WorkGatewayError> {
-        if request.provider != self.provider {
-            return Err(WorkGatewayError::Provider(request.provider));
+    /// Grant work is memory-only. Exactly one granted policy must admit it.
+    fn request(&self, request: WorkRequest) -> Result<(String, JobInput), WorkGatewayError> {
+        if let Some(provider) = request.pinned().filter(|p| *p != self.provider) {
+            return Err(WorkGatewayError::Provider(provider));
         }
-        let mut candidates = self.policies().filter_map(|policy| {
-            policy.invocation_policy.admissions.iter().find_map(|a| match a {
-                Admission::Fetch { admission }
-                    if matches!(&admission.route, FetchRoutePolicy::SealedRoute { service, method }
-                        if service == &request.service && method == &request.method) =>
-                {
-                    Some((policy, admission))
+        let mut admitted = None;
+        let mut refusal = None;
+        for policy in self.policies() {
+            match request.admitted(
+                &policy.invocation_policy,
+                policy.https.as_ref(),
+                self.assurance,
+                false,
+            ) {
+                Ok(_) if admitted.is_some() => {
+                    return Err(rejected(GrantGatewayError::AmbiguousPolicy));
                 }
-                _ => None,
-            })
-        });
-        let (policy, admission) = candidates
-            .next()
-            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-        if candidates.next().is_some() {
-            return Err(rejected(GrantGatewayError::AmbiguousPolicy));
+                Ok(input) => admitted = Some((policy.name.clone(), input)),
+                Err(error) => refusal = Some(error),
+            }
         }
-        let body = if let Some(https) = &policy.https {
-            let mut http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body)
-                .map_err(rejected)?;
-            https.prepare(&mut http).map_err(rejected)?;
-            serde_json::to_vec(&http).map_err(error)?
-        } else if matches!(
-            admission.contract.schema(),
-            hellas_rpc::FetchSchema::StatelessResponsesV1
-                | hellas_rpc::FetchSchema::ResponsesItemsV1
-        ) {
-            request.body
-        } else {
-            return Err(rejected(GrantGatewayError::NoMatchingPolicy));
-        };
-        Ok(JobInput::Fetch {
-            contract: admission.contract.clone(),
-            service: request.service,
-            method: request.method,
-            request: body,
-            assurance: self.assurance,
+        admitted.ok_or_else(|| match refusal {
+            Some(error) => rejected(error),
+            None => rejected(GrantGatewayError::NoMatchingPolicy),
         })
-    }
-
-    fn job_request(&self, input: JobInput) -> Result<JobInput, WorkGatewayError> {
-        Self::prepare(&self.offer, self.policy.as_deref(), &self.signer, &input)?;
-        Ok(input)
     }
 
     fn run<E: GatewayEvent>(
         self: Arc<Self>,
-        input: JobInput,
+        (name, input): (String, JobInput),
         requester: Requester<E, WorkGatewayError>,
     ) -> BoxFuture<'static, Result<Option<Completed>, WorkGatewayError>> {
         let deadline = tokio::time::Instant::now() + self.timeout;
@@ -395,24 +339,34 @@ impl WorkSource for GrantSource {
             .await
             .map_err(|_| queue_timeout())?
             .map_err(client_error)?;
-            let (name, prepared) = Self::prepare(
-                session.offer(),
-                self.policy.as_deref(),
-                &self.signer,
-                &input,
-            )?;
+            // Scope changes may refresh the named policy; they never move the
+            // request to another one.
+            let offer = session.offer();
+            let policy = offer
+                .offer()
+                .grant
+                .policies
+                .iter()
+                .find(|policy| policy.name == name)
+                .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+            let prepared = input
+                .prepare(
+                    &input.manifest().map_err(rejected)?,
+                    &self.signer,
+                    rand::random(),
+                    grant_runner(offer)?,
+                    &policy.invocation_policy,
+                    false,
+                )
+                .map_err(rejected)?;
             if requester.is_closed() {
                 return Err(WorkGatewayBusy.into());
             }
-            let content = match &input {
-                JobInput::Compute { content, .. } => content.clone(),
-                JobInput::Fetch { .. } => InvocationContent::Ephemeral(EphemeralContent::default()),
-            };
             let output = session
                 .run_before(
                     &name,
                     prepared,
-                    &content,
+                    &input.content(),
                     Some(requester.progress()),
                     deadline,
                 )

@@ -14,6 +14,12 @@ pub enum PoolError {
     DuplicateProvider(iroh::EndpointId),
     #[error("no provider policy admits this application")]
     NoMatchingPolicy,
+    #[error("paid provider {provider} charges {quoted} per job; the gateway expects {expected}")]
+    Price {
+        provider: iroh::EndpointId,
+        quoted: u64,
+        expected: u64,
+    },
     #[error("no eligible paid provider could start this request: {0:?}")]
     ProvidersUnavailable(Vec<String>),
     #[error("retained paid work did not recover within its deadline")]

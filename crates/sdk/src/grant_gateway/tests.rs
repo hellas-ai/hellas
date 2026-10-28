@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
-use hellas_gateway::WorkExecutionBackend;
+use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
 use hellas_rpc::output::OutputEvent;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
 use std::sync::atomic::Ordering;

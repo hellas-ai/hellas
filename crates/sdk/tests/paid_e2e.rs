@@ -504,6 +504,21 @@ async fn check_gateway_quote(
             .is_err(),
         "gateway checks the quoted route before requesting funding"
     );
+    let oversized = format!(
+        "{{\"input\":\"{}\"}}",
+        "x".repeat(4096) // Over the quoted admission's request body limit.
+    );
+    assert!(
+        gateway
+            .fetch(hellas_gateway::WorkFetchRequest {
+                provider: options.provider,
+                service: "openai".into(),
+                method: "responses".into(),
+                body: oversized.into_bytes(),
+            })
+            .is_err(),
+        "gateway admits the whole request before requesting funding"
+    );
     gateway.drain().await.unwrap();
     assert!(!journal.exists());
     assert!(!options.config.journal_root.exists());
