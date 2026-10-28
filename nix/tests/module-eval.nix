@@ -575,6 +575,7 @@ let
             offer = "provider";
             passkey = "/run/hellas/principal.passkey";
             workProfile = "/run/hellas/work-profile.json";
+            metricsPort = 9401;
             defaultMaxTokens = 4294967295;
             assurance = "apple-app-attest";
             trustPolicy = "provider";
@@ -664,6 +665,25 @@ in
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-port 9401" gatewayService.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--metrics-port"
+        (evalGateway { }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
+      );
+    assert lib.all
+      (
+        args:
+        !(gatewayExtraArgsAssertion (evalGateway {
+          extraArgs = args;
+        })).assertion
+      )
+      [
+        [
+          "--metrics-port"
+          "9402"
+        ]
+        [ "--metrics-port=9402" ]
+      ];
     assert lib.hasInfix "--responses-model gpt-x,gpt-y" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--responses-overrides" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"

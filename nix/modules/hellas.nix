@@ -205,6 +205,7 @@ rec {
   ];
 
   protectedGatewayExtraArgs = [
+    "--metrics-port"
     "--paid-work-config"
     "--gateway-profile"
     "--identity"
@@ -539,6 +540,11 @@ rec {
         default = 8080;
         description = "HTTP gateway port. Null lets the CLI auto-select.";
       };
+      metricsPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        description = "Optional loopback-only Prometheus metrics port.";
+      };
       offer = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -736,6 +742,7 @@ rec {
       gateway.host
     ]
     ++ optArg "--port" gateway.port
+    ++ optArg "--metrics-port" gateway.metricsPort
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
     ++ lib.optionals (gateway.responsesOverrides != { }) [
       "--responses-overrides"
