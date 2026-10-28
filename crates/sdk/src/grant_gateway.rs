@@ -197,15 +197,18 @@ impl GrantGateway {
         }))
     }
 
-    /// Exact private HTTP routes derived from current standing. Later scope
-    /// changes must match these routes or be refused; they cannot move accounts.
-    pub fn http_config(&self) -> Result<hellas_gateway::HttpGatewayConfig, WorkGatewayError> {
+    /// Exact private HTTP routes derived from current standing, if the grant
+    /// has an HTTPS resource. Later scope changes must match these routes or be
+    /// refused; they cannot move accounts.
+    pub fn http_config(
+        &self,
+    ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
         let mut policies = self.offer.offer().grant.policies.iter().filter(|p| {
             p.https.is_some() && self.policy.as_ref().is_none_or(|name| name == &p.name)
         });
-        let policy = policies
-            .next()
-            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+        let Some(policy) = policies.next() else {
+            return Ok(None);
+        };
         if policies.next().is_some() {
             return Err(rejected(GrantGatewayError::AmbiguousPolicy));
         }
@@ -225,7 +228,7 @@ impl GrantGateway {
             .https
             .as_ref()
             .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-        Ok(hellas_gateway::HttpGatewayConfig {
+        Ok(Some(hellas_gateway::HttpGatewayConfig {
             service: service.clone(),
             method: method.clone(),
             backends: Default::default(),
@@ -248,12 +251,21 @@ impl GrantGateway {
                         })
                 })
                 .collect(),
-        })
+        }))
     }
 
+    /// Runs one prepared invocation on the grant channel. `prepare` selects the
+    /// granted policy from the current offer and builds the signed input.
     fn submit<E: GrantEvent>(
         &self,
-        request: WorkFetchRequest,
+        prepare: impl FnOnce(
+            &SignedOffer,
+            Option<&str>,
+            &ProducerSigningKey,
+            hellas_rpc::Assurance,
+        ) -> Result<Prepared, WorkGatewayError>
+        + Send
+        + 'static,
     ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
         let permit = self
             .admission
@@ -289,14 +301,8 @@ impl GrantGateway {
                 .await
                 .map_err(|_| queue_timeout())?
                 .map_err(client_error)?;
-                let (name, input) = prepare(
-                    request,
-                    session.offer(),
-                    session.store().channel(),
-                    selected.as_deref(),
-                    &signer,
-                    assurance,
-                )?;
+                let (name, input, content) =
+                    prepare(session.offer(), selected.as_deref(), &signer, assurance)?;
                 if sender.is_closed() || admission.is_closed() {
                     return Err(WorkGatewayBusy.into());
                 }
@@ -323,13 +329,7 @@ impl GrantGateway {
                     Ok(())
                 });
                 let output = session
-                    .run_before(
-                        &name,
-                        input,
-                        &InvocationContent::Ephemeral(EphemeralContent::default()),
-                        Some(progress),
-                        deadline,
-                    )
+                    .run_before(&name, input, &content, Some(progress), deadline)
                     .await
                     .map_err(client_error)?;
                 E::terminal(output)
@@ -345,14 +345,24 @@ impl GrantGateway {
         ))
     }
 }
-fn prepare(
+/// The granted policy name, its signed input and the content the job names.
+type Prepared = (String, PreparedInvocation, InvocationContent);
+
+fn grant_runner(offer: &SignedOffer) -> Result<PublicKey, WorkGatewayError> {
+    Ok(PublicKey::Secp256k1(
+        grant_producer(&offer.offer().provider)
+            .map_err(error)?
+            .to_bytes(),
+    ))
+}
+
+fn prepare_fetch(
     request: WorkFetchRequest,
     offer: &SignedOffer,
-    _channel: &hellas_authority::work_store::grant::GrantChannelState,
     selected: Option<&str>,
     signer: &ProducerSigningKey,
     assurance: hellas_rpc::Assurance,
-) -> Result<(String, PreparedInvocation), WorkGatewayError> {
+) -> Result<Prepared, WorkGatewayError> {
     let mut candidates = offer.offer().grant.policies.iter().filter_map(|policy| {
         if selected.is_some_and(|name| name != policy.name) { return None; }
         policy.invocation_policy.admissions.iter().find_map(|a| match a { Admission::Fetch { admission } if matches!(&admission.route, FetchRoutePolicy::SealedRoute { service, method } if service == &request.service && method == &request.method) => Some((policy, admission)), _ => None })
@@ -389,11 +399,7 @@ fn prepare(
     let input = fetch::prepare(
         &events,
         &admission.contract,
-        PublicKey::Secp256k1(
-            grant_producer(&offer.offer().provider)
-                .map_err(error)?
-                .to_bytes(),
-        ),
+        grant_runner(offer)?,
         policy.invocation_policy.canonical_bytes().map_err(error)?,
         rand::random(),
     )
@@ -402,7 +408,67 @@ fn prepare(
         .invocation_policy
         .admit(&input, &signer.public_key())
         .map_err(rejected)?;
-    Ok((policy.name.clone(), input))
+    Ok((
+        policy.name.clone(),
+        input,
+        InvocationContent::Ephemeral(EphemeralContent::default()),
+    ))
+}
+
+/// A rendered text job on the one granted policy admitting its Compute manifest.
+/// Grant work is memory-only, so the invocation is not retained.
+fn prepare_text(
+    job: hellas_client::text::TextJob,
+    offer: &SignedOffer,
+    selected: Option<&str>,
+    signer: &ProducerSigningKey,
+    assurance: hellas_rpc::Assurance,
+) -> Result<Prepared, WorkGatewayError> {
+    use hellas_rpc::JsonBytes;
+    use hellas_rpc::protocol::invocation::{InvocationInput, InvocationRequest};
+    let manifest = job.environment.manifest().map_err(rejected)?;
+    let mut candidates = offer.offer().grant.policies.iter().filter(|policy| {
+        selected.is_none_or(|name| name == policy.name)
+            && policy
+                .invocation_policy
+                .admissions
+                .iter()
+                .any(|a| matches!(a, Admission::Compute { .. }) && a.admits_manifest(&manifest))
+    });
+    let policy = candidates
+        .next()
+        .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+    if candidates.next().is_some() {
+        return Err(rejected(GrantGatewayError::AmbiguousPolicy));
+    }
+    let input = InvocationInput {
+        parameters: JsonBytes(job.plan.canonical_bytes().map_err(rejected)?),
+        artifacts: job.inputs,
+    };
+    let request = InvocationRequest {
+        execution_environment: manifest.content_id(),
+        input: input.content_id().map_err(rejected)?,
+        runner_public_key: grant_runner(offer)?,
+        nonce: rand::random(),
+        assurance,
+        retain: false,
+    };
+    let input = PreparedInvocation::new(
+        request,
+        &manifest,
+        input,
+        policy.invocation_policy.canonical_bytes().map_err(error)?,
+    )
+    .map_err(rejected)?;
+    policy
+        .invocation_policy
+        .admit(&input, &signer.public_key())
+        .map_err(rejected)?;
+    Ok((
+        policy.name.clone(),
+        input,
+        InvocationContent::Ephemeral(job.content),
+    ))
 }
 trait GrantEvent: Send + 'static {
     fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError>
@@ -419,6 +485,19 @@ impl GrantEvent for OutputEvent {
     }
     fn terminal(output: GrantWorkResult) -> Result<Self, WorkGatewayError> {
         crate::gateway_work::fetch_terminal(&output.output, &output.provider_key)
+    }
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(crate::gateway_work::OUTPUT_BUFFER_BYTES, |bytes| {
+            bytes.len()
+        })
+    }
+}
+impl GrantEvent for hellas_gateway::ExecutionEvent {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError> {
+        crate::gateway_work::text_prefix(chunk, pending)
+    }
+    fn terminal(output: GrantWorkResult) -> Result<Self, WorkGatewayError> {
+        crate::gateway_work::text_terminal(&output.output)
     }
     fn bytes(&self) -> usize {
         serde_json::to_vec(self).map_or(crate::gateway_work::OUTPUT_BUFFER_BYTES, |bytes| {
@@ -447,7 +526,17 @@ impl WorkExecutionBackend for GrantGateway {
         if request.provider != self.provider {
             return Err(WorkGatewayError::Provider(request.provider));
         }
-        self.submit(request)
+        self.submit(move |offer, selected, signer, assurance| {
+            prepare_fetch(request, offer, selected, signer, assurance)
+        })
+    }
+    fn generate(
+        &self,
+        job: hellas_client::text::TextJob,
+    ) -> Result<WorkOutputStream<hellas_gateway::ExecutionEvent>, WorkGatewayError> {
+        self.submit(move |offer, selected, signer, assurance| {
+            prepare_text(job, offer, selected, signer, assurance)
+        })
     }
     fn timeout(&self) -> Duration {
         self.timeout

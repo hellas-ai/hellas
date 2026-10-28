@@ -55,6 +55,76 @@ pub(crate) fn fetch_terminal(
         .to_output_event())
 }
 
+const EMITTED: &str = "emitted";
+
+/// Emitted u64 token ids of a text job become the gateway's u32 token stream.
+pub(crate) fn text_prefix(
+    chunk: hellas_rpc::protocol::invocation::output::ArtifactChunk,
+    pending: &mut Vec<u8>,
+) -> Result<Vec<hellas_gateway::ExecutionEvent>, hellas_gateway::WorkGatewayError> {
+    use hellas_rpc::protocol::invocation::compute;
+    let format = compute::OutputKind::Scalar(compute::ValueKind::U64).format();
+    if chunk.name != EMITTED || chunk.format != format {
+        return Err(output_error(std::io::Error::other(
+            "text output is not the emitted token stream",
+        )));
+    }
+    let position = (chunk.offset - pending.len() as u64) / 8;
+    pending.extend_from_slice(chunk.bytes.as_bytes());
+    let (whole, _) = pending.as_chunks::<8>();
+    let tokens = whole
+        .iter()
+        .map(|token| u32::try_from(u64::from_le_bytes(*token)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(output_error)?;
+    pending.drain(..tokens.len() * 8);
+    Ok(if tokens.is_empty() {
+        Vec::new()
+    } else {
+        vec![hellas_gateway::ExecutionEvent::Chunk {
+            position,
+            tokens: hellas_rpc::encode_token_ids(&tokens),
+        }]
+    })
+}
+
+/// The verified completion of a text job.
+pub(crate) fn text_terminal(
+    output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
+) -> Result<hellas_gateway::ExecutionEvent, hellas_gateway::WorkGatewayError> {
+    use hellas_gateway::{ExecutionEvent, Outcome, StopReason};
+    use hellas_rpc::protocol::invocation::compute;
+    use hellas_rpc::protocol::invocation::output::Outcome as InvocationOutcome;
+    let missing = |message: &'static str| output_error(std::io::Error::other(message));
+    // A signed failure carries no run metadata; report its reason.
+    if let InvocationOutcome::Failed(reason) = output.outcome {
+        return Err(output_error(std::io::Error::other(format!(
+            "text job failed on the provider: {reason:?}"
+        ))));
+    }
+    let metadata: compute::RunMetadata =
+        hellas_rpc::protocol::value::decode_canonical_dag_cbor(output.metadata.as_bytes())
+            .map_err(output_error)?;
+    let emitted = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == EMITTED)
+        .ok_or_else(|| missing("text output has no emitted tokens"))?;
+    let stop_reason = match metadata.stop {
+        Some(compute::StopReason::Matched(token)) => StopReason::StopToken(
+            u32::try_from(token).map_err(|_| missing("stop token id exceeds u32"))?,
+        ),
+        Some(compute::StopReason::MaxSteps) => StopReason::MaxNewTokens,
+        None => return Err(missing("text output has no stop reason")),
+    };
+    Ok(ExecutionEvent::Done(Outcome::Completed {
+        output_tokens: metadata.steps,
+        stop_reason,
+        text_artifact: emitted.content_id().map_err(output_error)?.digest(),
+        output_events: Vec::new(),
+    }))
+}
+
 pub fn emit<E, X>(
     sender: &mpsc::Sender<BufferedEvent<E, X>>,
     overflow: &watch::Sender<bool>,

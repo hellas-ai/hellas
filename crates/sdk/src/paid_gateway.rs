@@ -19,10 +19,10 @@ type Result<T, E = PoolError> = std::result::Result<T, E>;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use hellas_channel::content::{EphemeralContent, InvocationContent};
-use hellas_gateway::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend, WorkFetchRequest};
+use hellas_gateway::{ExecutionEvent, WorkExecutionBackend, WorkFetchRequest};
 use hellas_rpc::output::OutputEvent as FetchEvent;
 use hellas_rpc::protocol::invocation::{
-    Admission, compute,
+    Admission,
     fetch::FetchRoutePolicy,
     output::{ArtifactChunk, ArtifactPrefix},
 };
@@ -720,62 +720,13 @@ impl GatewayEvent for FetchEvent {
     }
 }
 
-const EMITTED: &str = "emitted";
-
 /// Emitted u64 token ids become the gateway's u32 token stream.
 impl GatewayEvent for ExecutionEvent {
     fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>> {
-        let format = compute::OutputKind::Scalar(compute::ValueKind::U64).format();
-        if chunk.name != EMITTED || chunk.format != format {
-            return Err(PoolError::MissingOutput(
-                "text output is not the emitted token stream",
-            ));
-        }
-        let position = (chunk.offset - pending.len() as u64) / 8;
-        pending.extend_from_slice(chunk.bytes.as_bytes());
-        let (whole, _) = pending.as_chunks::<8>();
-        let tokens = whole
-            .iter()
-            .map(|token| u32::try_from(u64::from_le_bytes(*token)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| PoolError::MissingOutput("emitted token id exceeds u32"))?;
-        pending.drain(..tokens.len() * 8);
-        Ok(if tokens.is_empty() {
-            Vec::new()
-        } else {
-            vec![Self::Chunk {
-                position,
-                tokens: hellas_rpc::encode_token_ids(&tokens),
-            }]
-        })
+        Ok(crate::gateway_work::text_prefix(chunk, pending)?)
     }
     fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
-        let metadata: compute::RunMetadata =
-            hellas_rpc::protocol::value::decode_canonical_dag_cbor(
-                output.output.metadata.as_bytes(),
-            )?;
-        let emitted = output
-            .output
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.name == EMITTED)
-            .ok_or(PoolError::MissingOutput(
-                "text output has no emitted tokens",
-            ))?;
-        let stop_reason = match metadata.stop {
-            Some(compute::StopReason::Matched(token)) => StopReason::StopToken(
-                u32::try_from(token)
-                    .map_err(|_| PoolError::MissingOutput("stop token id exceeds u32"))?,
-            ),
-            Some(compute::StopReason::MaxSteps) => StopReason::MaxNewTokens,
-            None => return Err(PoolError::MissingOutput("text output has no stop reason")),
-        };
-        Ok(vec![Self::Done(Outcome::Completed {
-            output_tokens: metadata.steps,
-            stop_reason,
-            text_artifact: emitted.content_id()?.digest(),
-            output_events: Vec::new(),
-        })])
+        Ok(vec![crate::gateway_work::text_terminal(&output.output)?])
     }
     fn is_terminal(&self) -> bool {
         self.terminal().is_some()

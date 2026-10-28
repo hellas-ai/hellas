@@ -176,7 +176,7 @@ impl Fixture {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
         let server = hellas_gateway::start_http(hellas_gateway::HttpGatewayOptions {
-            config: self.gateway.http_config().unwrap(),
+            config: self.gateway.http_config().unwrap().unwrap(),
             paid: self.gateway.clone(),
             archive: hellas_gateway::ArchiveOptions {
                 directory: self.host.root.path().join("archive"),
@@ -242,7 +242,7 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.http_config().unwrap();
+    let config = fixture.gateway.http_config().unwrap().unwrap();
     assert_eq!(config.routes[0].max_response_bytes, 4096);
     assert_eq!(config.routes[0].tls, fixture.template.tls);
     fixture.result(None).await.unwrap();
