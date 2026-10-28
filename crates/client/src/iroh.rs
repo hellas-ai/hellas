@@ -16,6 +16,10 @@ use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, Ser
 use hellas_wire::{Metadata, MethodMarker, PeerIdentity, ServiceMarker, StreamTransport};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::sync::{Arc, Mutex};
+
+mod address;
+pub use address::{ProviderAddress, ProviderAddressError};
+
 #[derive(Clone)]
 pub struct AppleAppAttestTrust {
     pub app_id: String,
