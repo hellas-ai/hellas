@@ -66,6 +66,7 @@ let
     [advisories]
     ignore = [
       { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
+      { id = "RUSTSEC-2025-0141", reason = "Transitive through upstream catena-lang; bincode 1.3.3 is final and no safe upgrade is available." },
     ]
 
     [licenses]
@@ -86,12 +87,21 @@ let
       "Unlicense",
       "Zlib",
     ]
+    # catena-models is hellas-ai's own crate and declares no license.
+    exceptions = [
+      { crate = "catena-models", allow = ["LicenseRef-hellas-ai"] },
+    ]
+
+    [[licenses.clarify]]
+    crate = "catena-models"
+    expression = "LicenseRef-hellas-ai"
+    license-files = []
 
     [bans]
     multiple-versions = "allow"
 
     [sources]
-    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/georgewhewell/catena-lang"]
+    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/hellas-ai/catena-lang", "https://github.com/hellas-ai/catena-models"]
   '';
   denyCommand = "cargo deny --config ${denyConfig} check";
 
