@@ -12,7 +12,6 @@ default = []
 otel = [
     "hellas-rpc/otel",
     "hellas-rpc/http-tracing",
-    "dep:opentelemetry",
     "dep:tracing-opentelemetry",
 ]
 
@@ -34,8 +33,7 @@ hellas-wire = { workspace = true, features = ["iroh"] }
 httpdate = "1"
 iroh.workspace = true
 libc = "0.2"
-opentelemetry = { workspace = true, optional = true }
-prometheus-client.workspace = true
+opentelemetry = { workspace = true }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

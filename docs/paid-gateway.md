@@ -219,8 +219,8 @@ accept complete URLs instead. Give these services distinct `OTEL_SERVICE_NAME`
 values. Validators require both `validator` and `otel`. Sampling honors the
 upstream sampled flag; `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
 `OTEL_TRACES_SAMPLER_ARG` controls new root traces. Default packages omit the
-Hellas telemetry exporters; transitive dependencies still include metrics and SDK
-crates. Nix module `otel` options select enabled builds.
+OTLP exporters; local `serve` and `gateway --metrics-port` scraping remains
+available. Transitive dependencies still include metrics and SDK crates. Nix module `otel` options select enabled builds.
 
 The gateway accepts W3C `traceparent`/`tracestate` headers and returns
 `traceparent` plus `x-hellas-trace-id` for trace lookup. Without an incoming
@@ -261,7 +261,7 @@ Hydra retains these outputs on test failure using its `nix-support/failed`
 convention, so a failing check still has downloadable traces. Local
 `nix build .#nixosTests.x86_64-linux.<name>` keeps the usual failing exit status;
 use the Hydra attribute when retaining failure outputs is needed. Public
-packages still build without telemetry by default.
+packages still build without OTLP export by default.
 
 ## Embedding
 

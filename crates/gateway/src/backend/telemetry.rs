@@ -12,7 +12,10 @@ use futures::Stream;
 use hellas_adaptors::{BackendError, BackendRequest, Input, OutputEvent, StopReason};
 use tracing::Span;
 
-use opentelemetry::{Array, KeyValue, Value};
+use opentelemetry::KeyValue;
+#[cfg(feature = "otel")]
+use opentelemetry::{Array, Value};
+#[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Clone)]
@@ -78,7 +81,7 @@ impl Inference {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let model = &canonical.model.name;
-        let span = tracing::info_span!(
+        let span = hellas_rpc::request_span!(
             target: "hellas_request",
             "gen_ai.inference",
             otel.name = %format!("{operation} {model}"),
@@ -149,12 +152,16 @@ impl Inference {
         self.finish_reason("error");
     }
 
+    #[cfg(feature = "otel")]
     fn finish_reason(&self, reason: &'static str) {
         self.span.set_attribute(
             "gen_ai.response.finish_reasons",
             Value::Array(Array::String(vec![reason.into()])),
         );
     }
+
+    #[cfg(not(feature = "otel"))]
+    fn finish_reason(&self, _: &'static str) {}
 
     fn observe(&mut self, event: &OutputEvent) {
         if self.terminal {

@@ -23,7 +23,6 @@ pub struct ArchiveOptions {
 #[derive(Clone)]
 pub(crate) struct Policy {
     pub options: ArchiveOptions,
-    #[cfg(feature = "otel")]
     failures: opentelemetry::metrics::Counter<u64>,
 }
 
@@ -31,7 +30,6 @@ impl Policy {
     pub(crate) fn new(options: ArchiveOptions) -> Self {
         Self {
             options,
-            #[cfg(feature = "otel")]
             failures: opentelemetry::global::meter("hellas.gateway.archive")
                 .u64_counter("hellas.gateway.archive.failures")
                 .build(),
@@ -56,7 +54,6 @@ impl Policy {
             error_os_code = error.raw_os_error(),
             "archive failed; continuing response delivery"
         );
-        #[cfg(feature = "otel")]
         self.failures.add(
             1,
             &[

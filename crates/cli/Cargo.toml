@@ -22,8 +22,8 @@ test-support = ["hellas-cloud/test-support"]
 indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
 
-# Hellas OTLP export and iroh metrics exposure are opt-in. Dependencies can
-# still compile telemetry: Commonware has its own SDK, and mDNS enables iroh
+# Local OpenTelemetry metrics are always available. OTLP export and iroh
+# metrics exposure are opt-in. Dependencies can still compile telemetry: Commonware has its own SDK, and mDNS enables iroh
 # default features (including metrics collection).
 otel = [
     "hellas-chain/otel",
@@ -31,8 +31,6 @@ otel = [
     "hellas-executor/otel",
     "hellas-gateway/otel",
     "hellas-providers/otel",
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:iroh-metrics",
@@ -85,10 +83,11 @@ iroh = { workspace = true, features = ["tls-ring"] }
 iroh-metrics = { version = "1", default-features = false, features = [
     "metrics",
 ], optional = true }
-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-prometheus-client = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+prometheus = { workspace = true }
 qrcode = { version = "0.14", default-features = false }
 rand.workspace = true
 rcgen = "0.14"

@@ -363,12 +363,26 @@ cargo outdated --workspace --root-deps-only  # outdated deps
 cargo update --workspace   # update Cargo.lock
 ```
 
-### Optional OpenTelemetry
+### Metrics and optional OpenTelemetry export
+
+`hellas serve --metrics-port 9090` and `hellas gateway --metrics-port 9091`
+serve Prometheus text at `http://127.0.0.1:<port>/metrics`. This unauthenticated
+listener is loopback-only and available in default packages, including Docker.
+NixOS exposes `services.hellas.metricsPort` and
+`services.hellas.gateway.metricsPort`. One-shot commands do not start a metrics
+listener. Scrapes collect executor and gateway OpenTelemetry instruments from
+the same meter provider used for optional OTLP push; both can run together.
+OTLP environment opt-outs, including `OTEL_SDK_DISABLED`, leave this explicitly
+requested local listener active.
+The `otel` build additionally includes iroh endpoint metrics for serve and
+remote-grant gateways. Paid-pool gateways do not expose their private endpoint.
+
 
 The `otel` Cargo feature is opt-in across the CLI (including Fetch, node,
 gateway, indexer and validator commands). Default Nix packages, including
-public musl builds, disable Hellas telemetry exporters. Request instrumentation
-uses shared enabled/no-op implementations; ordinary operational logs remain.
+public musl builds, disable OTLP export. Metrics instrumentation remains available
+for local scraping; request tracing uses enabled/no-op implementations and
+ordinary operational logs remain.
 Transitive dependencies still include metrics collection and telemetry SDK crates;
 disabling `otel` does not remove those dependencies.
 
@@ -387,7 +401,7 @@ programs.hellas.otel.collectorEndpoint = "http://127.0.0.1:4318";
 ```
 
 A configured endpoint enables the feature on the module's default package;
-`otel.enable = false` explicitly selects the build without telemetry. Custom
+`otel.enable = false` explicitly selects the build without OTLP export. Custom
 packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
 HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
 continues to accept an exact trace URL. Home Manager and nix-darwin scope
