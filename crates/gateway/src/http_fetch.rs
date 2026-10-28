@@ -21,7 +21,8 @@ use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReaso
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{GatewayHandle, WorkExecutionBackend, WorkFetchRequest, access};
+use super::{WorkExecutionBackend, WorkFetchRequest};
+use hellas_adaptors::BackendError;
 
 #[derive(Clone)]
 pub(crate) struct BackendName(pub String);
@@ -32,8 +33,8 @@ fn attributed(mut response: Response, name: &str) -> Response {
 }
 
 struct HttpState {
-    service: String,
-    method: String,
+    /// The Fetch route of each backend, by backend index.
+    fetch_routes: Vec<(String, String)>,
     paid: Arc<dyn WorkExecutionBackend>,
     routing: Arc<routing::Routing>,
     metrics: observation::Metrics,
@@ -49,77 +50,68 @@ enum HttpOpenError {
     Headers(#[from] hellas_rpc::http_fetch::HttpRequestError),
 }
 
-/// Configuration for transparent HTTP over paid Fetch. Every route uses the
-/// supplied paid pool; tokenizers and inference replay do not apply here.
-pub struct HttpGatewayOptions {
-    pub config: HttpGatewayConfig,
-    pub paid: Arc<dyn WorkExecutionBackend>,
-    pub archive: super::ArchiveOptions,
-    pub host: String,
-    pub port: Option<u16>,
-    pub access: super::GatewayAccess,
-    pub allow_remote: bool,
-    pub wrap: Option<String>,
-    pub wrap_args: Vec<String>,
-}
+/// A path and the models it answers to; empty means any model.
+pub(super) type ServedPath = (String, Vec<String>);
 
-/// Start without signal handlers. Failed startup drains any recovering paid jobs.
-pub async fn start_http(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let paid = options.paid.clone();
-    let result = start(options).await;
-    if result.is_err() {
-        return super::finish_cleanup(result, paid.drain().await);
-    }
-    result
-}
-
-async fn start(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let config = options.config;
+/// The HTTPS presentation over `paid`, and the paths it serves.
+pub(super) fn router(
+    config: HttpGatewayConfig,
+    paid: Arc<dyn WorkExecutionBackend>,
+) -> crate::GatewayResult<(Router, Vec<ServedPath>)> {
     config.validate()?;
-    let paid = options.paid;
-    let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
-    archive_policy.prepare();
-    let routing = Arc::new(routing::Routing::new(&config, &paid.fetch_providers())?);
+    let routes: Vec<_> = paid
+        .fetch_routes()
+        .into_iter()
+        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
+        .collect();
+    let providers: Vec<_> = routes.iter().map(|route| route.provider).collect();
+    let routing = Arc::new(routing::Routing::new(&config, &providers)?);
+    let named = config.service.clone().zip(config.method.clone());
+    let fetch_routes = routing
+        .backends
+        .iter()
+        .map(|backend| {
+            let sealed = routes
+                .iter()
+                .find(|route| route.provider == backend.provider)
+                .map(|route| route.sealed.clone());
+            match (sealed, &named) {
+                (Some(Some(sealed)), Some(named)) if &sealed != named => Err(
+                    crate::GatewayConfigError::FetchRouteMismatch(backend.name.clone()),
+                ),
+                (Some(Some(sealed)), _) => Ok(sealed),
+                (Some(None), Some(named)) => Ok(named.clone()),
+                _ => Err(crate::GatewayConfigError::MissingFetchRoute(
+                    backend.name.clone(),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = std::collections::BTreeMap::<String, Option<Vec<String>>>::new();
+    for backend in &routing.backends {
+        for route in &backend.routes {
+            let models = paths.entry(route.path.clone()).or_insert(Some(Vec::new()));
+            match (models.as_mut(), backend.models.is_empty()) {
+                (Some(models), false) => models.extend(backend.models.iter().cloned()),
+                _ => *models = None,
+            }
+        }
+    }
     let state = Arc::new(HttpState {
-        service: config.service,
-        method: config.method,
-        paid: paid.clone(),
+        fetch_routes,
+        paid,
         routing,
         metrics: observation::Metrics::new(),
     });
-    let bearer = options.access.clone();
-    bearer.validate().await?;
     let mut app = Router::new();
-    let paths: std::collections::BTreeSet<_> = state
-        .routing
-        .backends
-        .iter()
-        .flat_map(|backend| backend.routes.iter().map(|route| route.path.as_str()))
-        .collect();
-    for path in paths {
+    for path in paths.keys() {
         app = app.route(path, axum::routing::any(handle));
     }
-    let app = app
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            archive_policy,
-            super::archive::record,
-        ));
-    #[cfg(feature = "otel")]
-    let app = app.layer(axum::middleware::from_fn(
-        hellas_rpc::telemetry::http::trace_request,
-    ));
-    let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    let listener = super::bind_gateway(&options.host, options.port, options.allow_remote).await?;
-    super::launch_gateway(
-        app,
-        listener,
-        bearer,
-        options.wrap.as_deref(),
-        &options.wrap_args,
-        Some(paid),
-    )
-    .await
+    let paths = paths
+        .into_iter()
+        .map(|(path, models)| (path, models.unwrap_or_default()))
+        .collect();
+    Ok((app.with_state(state), paths))
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {
@@ -207,56 +199,36 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
-    let result = open(&state, backend.provider, payload)
+    let result = open(&state, selected.backend, backend.provider, payload)
         .instrument(observed.span.clone())
         .await;
     let (status, headers, mut events) = match result {
         Ok(value) => value,
-        Err(HttpOpenError::Paid(super::WorkGatewayError::Busy(_))) => {
-            observed.status(503);
-            return attributed(
-                error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Work Fetch is busy; retry later",
-                ),
-                &backend.name,
-            );
-        }
-        Err(HttpOpenError::Paid(
-            ref failure @ (super::WorkGatewayError::Rejected(_)
-            | super::WorkGatewayError::Denied(_)
-            | super::WorkGatewayError::Quota(_)),
-        )) => {
-            let (status, message) = match failure {
-                super::WorkGatewayError::Rejected(_) => (
-                    StatusCode::BAD_REQUEST,
-                    "request exceeds or mismatches the granted resource",
-                ),
-                super::WorkGatewayError::Denied(_) => {
-                    (StatusCode::FORBIDDEN, "grant access refused")
-                }
-                _ => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "resource allowance exhausted",
-                ),
-            };
-            observed.status(status.as_u16());
-            return attributed(error(status, message), &backend.name);
-        }
         Err(failure) => {
-            tracing::warn!(backend = %backend.name, error = %chain(&failure), "HTTP Fetch failed");
-            let (status, message) = match failure {
-                HttpOpenError::Paid(super::WorkGatewayError::Timeout(_)) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "authenticated Fetch timed out")
-                }
-                HttpOpenError::Paid(super::WorkGatewayError::Unreachable(_)) => {
-                    (StatusCode::BAD_GATEWAY, "provider is unreachable")
-                }
-                _ => (StatusCode::BAD_GATEWAY, "authenticated Fetch failed"),
+            let error = match failure {
+                HttpOpenError::Paid(error) => BackendError::from(error),
+                failure => BackendError::Unavailable(chain(&failure)),
             };
+            let message = match error {
+                BackendError::Rejected(_) => "request exceeds or mismatches the granted resource",
+                BackendError::Denied(_) => "grant access refused",
+                BackendError::Quota(_) => "resource allowance exhausted",
+                BackendError::Busy(_) => "Work Fetch is busy; retry later",
+                BackendError::Timeout(_) => "authenticated Fetch timed out",
+                BackendError::Unavailable(_) | BackendError::Failed(_) => {
+                    "authenticated Fetch failed"
+                }
+            };
+            if matches!(
+                error,
+                BackendError::Timeout(_) | BackendError::Unavailable(_) | BackendError::Failed(_)
+            ) {
+                tracing::warn!(backend = %backend.name, %error, "HTTP Fetch failed");
+                state.routing.transport_failed(selected.backend);
+            }
+            let status = super::backend_status(&error);
             observed.status(status.as_u16());
-            state.routing.transport_failed(selected.backend);
-            return attributed(error(status, message), &backend.name);
+            return attributed(self::error(status, message), &backend.name);
         }
     };
     observed.status(status);
@@ -341,13 +313,15 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
 
 async fn open(
     state: &HttpState,
+    backend: usize,
     provider: iroh::EndpointId,
     payload: Vec<u8>,
 ) -> Result<(u16, Vec<(String, String)>, super::WorkFetchStream), HttpOpenError> {
+    let (service, method) = &state.fetch_routes[backend];
     let mut stream = state.paid.fetch(WorkFetchRequest {
         provider,
-        service: state.service.clone(),
-        method: state.method.clone(),
+        service: service.clone(),
+        method: method.clone(),
         body: payload,
     })?;
     match stream.next().await.transpose()? {

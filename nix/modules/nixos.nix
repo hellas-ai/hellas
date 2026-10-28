@@ -248,44 +248,19 @@ in
         message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds on this platform.";
       }
       {
-        assertion = !gateway.enable || gateway.textModel != null || gateway.responsesBackend != "hellas";
-        message = "services.hellas.gateway.textModel is required for native inference.";
-      }
-      {
-        assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
-        message = "services.hellas.gateway.nodeAddrs requires nodeId.";
-      }
-      {
-        assertion =
-          !gateway.enable
-          || gateway.offer != null
-
-          || gateway.paidWorkConfig != null
-          || (
-            gateway.responsesBackend == "proxy"
-
-            && gateway.nodeId == null
-
-          );
+        assertion = !gateway.enable || gateway.offer != null || gateway.paidWorkConfig != null;
         message = "services.hellas.gateway execution requires an offer or paidWorkConfig.";
       }
       {
         assertion =
           gateway.paidWorkConfig == null
           || (
-            gateway.nodeId == null
-            && gateway.offer == null
+            gateway.offer == null
             && gateway.trustStore == null
             && gateway.trustPolicy == null
-            && gateway.responsesBackend == "hellas"
             && gateway.assurance == "producer-signed"
           );
-        message = "services.hellas.gateway.paidWorkConfig requires remote producer-signed Hellas execution without target overrides.";
-      }
-      {
-        assertion =
-          gateway.responsesBackend != "fetch" || gateway.responsesFetchExecutionEnvironment != null;
-        message = "services.hellas.gateway.responsesFetchExecutionEnvironment is required when responsesBackend = \"fetch\".";
+        message = "services.hellas.gateway.paidWorkConfig requires producer-signed execution without an offer or trust policy.";
       }
       {
         assertion = !gateway.enable || (gateway.trustStore == null) == (gateway.trustPolicy == null);

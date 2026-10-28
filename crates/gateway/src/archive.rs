@@ -23,16 +23,14 @@ pub struct ArchiveOptions {
 #[derive(Clone)]
 pub(crate) struct Policy {
     pub options: ArchiveOptions,
-    pub cache_enabled: bool,
     #[cfg(feature = "otel")]
     failures: opentelemetry::metrics::Counter<u64>,
 }
 
 impl Policy {
-    pub(crate) fn new(options: ArchiveOptions, cache_enabled: bool) -> Self {
+    pub(crate) fn new(options: ArchiveOptions) -> Self {
         Self {
             options,
-            cache_enabled,
             #[cfg(feature = "otel")]
             failures: opentelemetry::global::meter("hellas.gateway.archive")
                 .u64_counter("hellas.gateway.archive.failures")
@@ -89,9 +87,6 @@ pub(crate) async fn record(
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    if ephemeral && policy.cache_enabled {
-        return (StatusCode::BAD_REQUEST, "ZDR requires output-cache off").into_response();
-    }
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
         Ok(body) => body,

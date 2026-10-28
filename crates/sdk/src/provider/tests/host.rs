@@ -114,21 +114,28 @@ impl Host {
     pub async fn responses_options(
         &self,
         addresses: Vec<String>,
-    ) -> crate::grant_gateway::responses::FetchGatewayOptions {
-        crate::grant_gateway::responses::FetchGatewayOptions {
-            access: self.gateway_access().await,
-            archive: hellas_gateway::ArchiveOptions {
-                directory: self.root.path().join("archive"),
-                zdr: true,
+    ) -> crate::grant_gateway::GrantServeOptions {
+        crate::grant_gateway::GrantServeOptions {
+            serve: crate::GatewayServeOptions {
+                server: hellas_gateway::ServerOptions {
+                    access: self.gateway_access().await,
+                    archive: hellas_gateway::ArchiveOptions {
+                        directory: self.root.path().join("archive"),
+                        zdr: true,
+                    },
+                    host: "127.0.0.1".into(),
+                    port: Some(0),
+                    allow_remote: false,
+                    wrap: None,
+                    wrap_args: vec![],
+                },
+                text: None,
+                http: None,
+                responses_overrides: Default::default(),
+                responses_models: Vec::new(),
             },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
             session: self.options(addresses),
             policy: None,
-            request_overrides: Default::default(),
         }
     }
     /// The real provider dispatch loop, with a deterministic backend and pinned proof.

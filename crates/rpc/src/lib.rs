@@ -40,7 +40,6 @@ impl core::fmt::Display for SubmitTxOutcome {
 }
 
 pub mod authentication;
-pub mod cache;
 pub mod call;
 #[cfg(feature = "chain")]
 pub mod edge_index;
@@ -55,6 +54,7 @@ pub mod observe;
 pub mod open;
 #[cfg(feature = "fetch")]
 pub mod output;
+pub mod text;
 use hellas_wire::peers;
 pub mod protocol;
 #[cfg(feature = "execute")]

@@ -185,14 +185,7 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
 }
 
 fn backend_error(surface: &str, error: BackendError) -> Response {
-    let status = match error {
-        BackendError::Rejected(_) => StatusCode::BAD_REQUEST,
-        BackendError::Denied(_) => StatusCode::FORBIDDEN,
-        BackendError::Quota(_) => StatusCode::TOO_MANY_REQUESTS,
-        BackendError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
-        BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    json_error(status, format!("{surface}: {error}"))
+    json_error(super::backend_status(&error), format!("{surface}: {error}"))
 }
 
 pub(super) fn wire_response(response: WireResponse) -> Result<Response, String> {

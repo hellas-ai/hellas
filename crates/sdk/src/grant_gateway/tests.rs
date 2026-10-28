@@ -178,19 +178,24 @@ impl Fixture {
     async fn http(&self) -> Http {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
-        let server = hellas_gateway::start_http(hellas_gateway::HttpGatewayOptions {
-            config: self.gateway.http_config().unwrap().unwrap(),
-            paid: self.gateway.clone(),
-            archive: hellas_gateway::ArchiveOptions {
-                directory: self.host.root.path().join("archive"),
-                zdr: true,
+        let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+            server: hellas_gateway::ServerOptions {
+                archive: hellas_gateway::ArchiveOptions {
+                    directory: self.host.root.path().join("archive"),
+                    zdr: true,
+                },
+                host: "127.0.0.1".into(),
+                port: Some(0),
+                access,
+                allow_remote: false,
+                wrap: None,
+                wrap_args: vec![],
             },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access,
-            allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
+            work: self.gateway.clone(),
+            presentations: hellas_gateway::Presentations {
+                http: self.gateway.http_config().unwrap(),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

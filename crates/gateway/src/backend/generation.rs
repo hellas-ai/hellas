@@ -4,7 +4,6 @@ use hellas_adaptors::BackendError;
 use thiserror::Error;
 
 use crate::execution::Outcome;
-use hellas_client::ClientError;
 use hellas_presentation::TextOutputDecoder;
 
 use super::super::state::PreparedGeneration;
@@ -18,7 +17,7 @@ pub(super) enum GenerationEvent {
 #[derive(Debug, Error)]
 pub(super) enum GenerationError {
     #[error("Inference error: {0}")]
-    Execution(#[from] ClientError),
+    Execution(#[from] crate::WorkGatewayError),
     #[error("Inference error: {0}")]
     Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("execution stream ended without terminal outcome")]
@@ -28,7 +27,7 @@ pub(super) enum GenerationError {
 impl From<GenerationError> for BackendError {
     fn from(error: GenerationError) -> Self {
         match error {
-            GenerationError::Execution(error) => super::execution_error(error),
+            GenerationError::Execution(error) => error.into(),
             error => Self::failed(error.to_string()),
         }
     }

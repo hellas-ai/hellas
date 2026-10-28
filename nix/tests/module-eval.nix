@@ -55,11 +55,6 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway execution requires" assertion.message
     ) (throw "missing gateway provider assertion") evaluation.config.assertions;
-  gatewayModelAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "gateway.textModel is required" assertion.message
-    ) (throw "missing gateway model assertion") evaluation.config.assertions;
   runtimeStoreAssertion =
     evaluation:
     lib.findFirst (
@@ -351,21 +346,14 @@ let
       };
     };
   discoveryGateway = evalGateway { };
-  proxyOnlyGateway = evalGateway {
-    responsesBackend = "proxy";
-    textModel = null;
-  };
   nativeGatewayWithoutModel = evalGateway { textModel = null; };
   storePathGateway = evalGateway {
-    responsesBackend = "proxy";
     environmentFile = "${builtins.storeDir}/secret.env";
   };
   storePathIdentityGateway = evalGateway {
-    responsesBackend = "proxy";
     identityPath = "${builtins.storeDir}/identity";
   };
   storePathTextModelGateway = evalGateway {
-    responsesBackend = "proxy";
     textModel = "${builtins.storeDir}/model.gguf";
   };
   storePathIdentityProvider = evalProvider {
@@ -385,7 +373,6 @@ let
     environmentFile = "${builtins.storeDir}/provider.env";
   };
   rootJournalGateway = evalGateway {
-    responsesBackend = "proxy";
     paidWorkJournalRoots = [ "/" ];
   };
   unsafeServeExtraArgs = evalProvider {
@@ -395,7 +382,6 @@ let
     extraArgs = [ "--assurance=producer-signed" ];
   };
   unsafeGatewayExtraArgs = evalGateway {
-    responsesBackend = "proxy";
     extraArgs = [ "--text-model=${builtins.storeDir}/model.gguf" ];
   };
   harmlessExtraArgs = evalProvider {
@@ -405,11 +391,9 @@ let
     assurance = "apple-app-attest";
   };
   incompleteTrust = evalGateway {
-    responsesBackend = "proxy";
     trustPolicy = "provider";
   };
   missingRequiredTrust = evalGateway {
-    responsesBackend = "proxy";
     offer = "provider";
   };
   cudaProvider = evalProvider {
@@ -443,7 +427,6 @@ let
   oversizedDefaultMaxTokens =
     builtins.tryEval
       (evalGateway {
-        responsesBackend = "proxy";
         defaultMaxTokens = 4294967296;
       }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
   environmentPathEvaluation =
@@ -596,9 +579,13 @@ let
             assurance = "apple-app-attest";
             trustPolicy = "provider";
             trustStore = "/var/lib/hellas-gateway/trust";
-            responsesBackend = "fetch";
-            responsesFetchExecutionEnvironment = "a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac";
-            retries = 7;
+            responsesOverrides = {
+              store = false;
+            };
+            responsesModels = [
+              "gpt-x"
+              "gpt-y"
+            ];
             environmentFile = "/run/hellas/gateway.env";
           };
         };
@@ -677,11 +664,8 @@ in
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
-    assert
-      (builtins.length (lib.splitString "--retries" gatewayService.serviceConfig.ExecStart) - 1) == 1;
-    assert lib.hasInfix
-      "--responses-fetch-execution-environment a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac"
-      gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--responses-model gpt-x,gpt-y" gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--responses-overrides" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"
       gatewayService.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/gateway-profile.json" gatewayService.unitConfig.RequiresMountsFor;
@@ -811,12 +795,8 @@ in
     assert !homeManagerRelativeEnvironmentFile.success;
     assert !homeManagerNixPathEnvironmentFile.success;
     assert !(providerAssertion discoveryGateway).assertion;
-    assert (providerAssertion proxyOnlyGateway).assertion;
-    assert (gatewayModelAssertion proxyOnlyGateway).assertion;
-    assert (gatewayModelAssertion discoveryGateway).assertion;
-    assert !(gatewayModelAssertion nativeGatewayWithoutModel).assertion;
     assert
-      !(lib.hasInfix "--text-model" proxyOnlyGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+      !(lib.hasInfix "--text-model" nativeGatewayWithoutModel.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
     pkgs.runCommand "hellas-provider-content-index-module-eval" { } ''
       umask 077
       environment_file="$PWD/provider.env"

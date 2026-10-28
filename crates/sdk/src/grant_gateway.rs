@@ -1,6 +1,5 @@
 //! One private grant channel behind the same gateway execution interface as a
 //! paid pool. HTTP disconnects never abandon an already signed proposal.
-pub mod responses;
 
 use crate::gateway_work::{
     Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
@@ -230,8 +229,8 @@ impl GrantGateway {
             .as_ref()
             .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
         Ok(Some(hellas_gateway::HttpGatewayConfig {
-            service: service.clone(),
-            method: method.clone(),
+            service: Some(service.clone()),
+            method: Some(method.clone()),
             backends: Default::default(),
             max_in_flight: 32,
             routes: template
@@ -253,6 +252,57 @@ impl GrantGateway {
                 })
                 .collect(),
         }))
+    }
+}
+
+/// A gateway over one grant channel.
+#[derive(Clone)]
+pub struct GrantServeOptions {
+    pub serve: crate::GatewayServeOptions,
+    pub session: GrantSessionOptions,
+    /// Selects one granted resource when the offer has several.
+    pub policy: Option<String>,
+}
+
+impl GrantServeOptions {
+    /// HTTPS routes come from the grant unless the caller configures them.
+    /// The gateway owns the channel and its endpoint from here on.
+    pub async fn start(
+        self,
+        transport: GrantTransport,
+    ) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
+        let gateway = GrantGateway::open(self.session, transport, self.policy).await?;
+        let mut serve = self.serve;
+        if serve.http.is_none() {
+            serve.http = match gateway.http_config() {
+                Ok(http) => http,
+                Err(error) => {
+                    let error = hellas_gateway::GatewayError::from(error);
+                    return Err(
+                        match hellas_gateway::WorkExecutionBackend::drain(&*gateway).await {
+                            Ok(()) => error,
+                            Err(cleanup) => hellas_gateway::GatewayError::Cleanup {
+                                primary: Box::new(error),
+                                cleanup,
+                            },
+                        },
+                    );
+                }
+            };
+        }
+        crate::serve_gateway(gateway, serve).await
+    }
+
+    /// The host supplies the access it validated; the configured access is replaced.
+    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
+        Arc::new(move |access| {
+            let (mut options, key) = (self.clone(), key.clone());
+            options.serve.server.access = access;
+            Box::pin(async move {
+                let transport = GrantTransport::remote(key).await?;
+                Ok(options.start(transport).await?)
+            })
+        })
     }
 }
 
@@ -279,17 +329,11 @@ impl WorkSource for GrantSource {
     type Error = WorkGatewayError;
     type Request = (String, JobInput);
 
-    fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
-        if self.policies().any(|p| {
-            p.invocation_policy
-                .admissions
-                .iter()
-                .any(|a| matches!(a, Admission::Fetch { .. }))
-        }) {
-            vec![self.provider]
-        } else {
-            vec![]
-        }
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
+        crate::gateway_work::fetch_routes(
+            self.provider,
+            self.policies().map(|policy| &policy.invocation_policy),
+        )
     }
 
     /// Grant work is memory-only. Exactly one granted policy must admit it.

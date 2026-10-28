@@ -17,8 +17,12 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         busy: bool,
     }
     impl WorkExecutionBackend for Paid {
-        fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
-            vec![self.provider]
+        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+            vec![crate::FetchRoute {
+                provider: self.provider,
+                schema: hellas_rpc::FetchSchema::HttpV1,
+                sealed: Some(("http".into(), "request".into())),
+            }]
         }
         fn generate(
             &self,
@@ -74,19 +78,24 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         })).unwrap();
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
-        let handle = start_http(HttpGatewayOptions {
-            config,
-            paid: paid.clone(),
-            archive: crate::ArchiveOptions {
-                directory: archive.path().into(),
-                zdr: true,
+        let handle = crate::start(crate::GatewayOptions {
+            server: crate::ServerOptions {
+                archive: crate::ArchiveOptions {
+                    directory: archive.path().into(),
+                    zdr: true,
+                },
+                host: "127.0.0.1".into(),
+                port: Some(0),
+                access: fixture.access,
+                allow_remote: false,
+                wrap: None,
+                wrap_args: Vec::new(),
             },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access: fixture.access,
-            allow_remote: false,
-            wrap: None,
-            wrap_args: Vec::new(),
+            work: paid.clone(),
+            presentations: crate::Presentations {
+                http: Some(config),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -206,8 +215,8 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
         .chain(["host", "connection"])
     {
         let config = HttpGatewayConfig {
-            service: "http".into(),
-            method: "request".into(),
+            service: Some("http".into()),
+            method: Some("request".into()),
             max_in_flight: 2,
             backends: BTreeMap::new(),
             routes: vec![HttpRoute {

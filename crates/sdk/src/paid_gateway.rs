@@ -13,8 +13,7 @@ use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_gateway::{WorkGatewayError, WorkShutdownError};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_rpc::protocol::invocation::Admission;
-use iroh::{Endpoint, EndpointId};
+use iroh::Endpoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -457,21 +456,15 @@ impl WorkSource for PaidPool {
     type Error = PoolError;
     type Request = PaidRequest;
 
-    fn fetch_providers(&self) -> Vec<EndpointId> {
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.providers
             .iter()
-            .filter(|provider| {
-                provider
-                    .policy
-                    .invocation_policy
-                    .admissions
-                    .iter()
-                    .any(|a| {
-                        matches!(a, Admission::Fetch { admission }
-                        if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1)
-                    })
+            .flat_map(|provider| {
+                crate::gateway_work::fetch_routes(
+                    provider.args.provider,
+                    [&provider.policy.invocation_policy],
+                )
             })
-            .map(|provider| provider.args.provider)
             .collect()
     }
 
@@ -668,7 +661,7 @@ use hellas_channel::test_support::test_responses_contract;
 mod tests {
     use super::*;
     use hellas_gateway::WorkFetchRequest;
-    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
+    use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
     use iroh::Endpoint;
 
     fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {

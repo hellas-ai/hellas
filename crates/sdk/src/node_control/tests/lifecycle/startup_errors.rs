@@ -161,14 +161,14 @@ async fn gateway_start_projects_bind_failure_to_rpc_and_status() {
     let remote = world.remote().await;
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut options = world.responses_options(remote.addresses()).await;
-    options.port = Some(occupied.local_addr().unwrap().port());
+    options.serve.server.port = Some(occupied.local_addr().unwrap().port());
     let (host, client, _) = controlled_host(
         world.world.service.node(),
         world.world.secret(ROOT),
         world.root.path(),
         None,
         Some((
-            options.access.clone(),
+            options.serve.server.access.clone(),
             options.into_factory(SecretKey::from_bytes(&[3; 32])),
         )),
     )

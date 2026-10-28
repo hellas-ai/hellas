@@ -553,7 +553,7 @@ async fn gateway_host(
         world.root.path(),
         None,
         Some((
-            options.access.clone(),
+            options.serve.server.access.clone(),
             options.into_factory(SecretKey::from_bytes(&[3; 32])),
         )),
     )
@@ -620,7 +620,7 @@ async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
     let world = crate::test_support::Host::builder().build().await;
     let remote = world.remote().await;
     let options = world.responses_options(remote.addresses()).await;
-    let access = options.access.clone();
+    let access = options.serve.server.access.clone();
     let chosen = options.into_factory(SecretKey::from_bytes(&[3; 32]));
     let starts = Arc::new(AtomicUsize::new(0));
     let factory: host::GatewayFactory = {

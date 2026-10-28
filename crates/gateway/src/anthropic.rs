@@ -1,7 +1,7 @@
 use super::backend::GatewayBackend;
 use super::dispatch::{backend_wire_response, parse_backend_request};
 use super::next_id;
-use super::state::GatewayState;
+use super::state::TextState;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
@@ -9,7 +9,7 @@ use hellas_adaptors::RenderContext;
 use hellas_adaptors::anthropic::AnthropicMessagesAdaptor;
 use std::sync::Arc;
 
-pub(super) async fn handle(State(state): State<Arc<GatewayState>>, body: Bytes) -> Response {
+pub(super) async fn handle(State(state): State<Arc<TextState>>, body: Bytes) -> Response {
     let adaptor = AnthropicMessagesAdaptor;
     let (mut parsed, mut request) =
         match parse_backend_request(&adaptor, &body, "Anthropic Messages") {

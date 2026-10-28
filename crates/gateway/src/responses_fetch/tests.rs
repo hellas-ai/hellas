@@ -1,5 +1,7 @@
 use super::*;
-use crate::{ExecutionEvent, WorkFetchStream, WorkOutputStream, WorkShutdownError};
+use crate::{
+    ExecutionEvent, WorkFetchStream, WorkGatewayError, WorkOutputStream, WorkShutdownError,
+};
 use hellas_rpc::output::{
     OutputEvent, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, Usage,
 };
@@ -70,10 +72,13 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
     });
     let backend = FetchBackend {
         work: work.clone(),
-        provider: provider(),
-        service: "openai".into(),
-        method: "responses".into(),
-        overrides: Map::new(),
+        options: crate::ResponsesFetch {
+            provider: provider(),
+            service: "openai".into(),
+            method: "responses".into(),
+            overrides: serde_json::Map::new(),
+            models: Vec::new(),
+        },
     };
     let adaptor = OpenAiResponsesAdaptor;
     let (parsed, request) = super::super::dispatch::parse_backend_request(

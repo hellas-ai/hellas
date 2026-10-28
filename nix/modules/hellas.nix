@@ -213,18 +213,9 @@ rec {
     "--text-model"
     "--host"
     "--port"
-    "--node-id"
-    "--address"
-    "--retries"
     "--default-max-tokens"
-    "--metrics-port"
-    "--responses-backend"
-    "--responses-proxy-url"
-    "--responses-proxy-api-key-env"
-    "--responses-fetch-route-service"
-    "--responses-fetch-route-method"
-    "--responses-fetch-execution-environment"
-    "--responses-fetch-request-overrides"
+    "--responses-overrides"
+    "--responses-model"
     "--trust-store"
     "--trust-policy"
     "--offer"
@@ -548,16 +539,6 @@ rec {
         default = 8080;
         description = "HTTP gateway port. Null lets the CLI auto-select.";
       };
-      nodeId = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Direct target node id. Null enables discovery.";
-      };
-      nodeAddrs = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = "Direct UDP address hints for the target node.";
-      };
       offer = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -578,11 +559,6 @@ rec {
         default = null;
         description = "Select one granted resource by name.";
       };
-      retries = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = "Maximum execution retries in discovery mode.";
-      };
       defaultMaxTokens = mkOption {
         type = types.nullOr positiveU32;
         default = null;
@@ -595,56 +571,18 @@ rec {
         description = ''
           GGUF passed as --text-model and served by the native text routes.
           Providers must already hold it. This is operator-managed runtime
-          data, not a Nix-store artifact. responsesBackend changes only
-          /v1/responses. Omit it for a proxy-only gateway.
+          data, not a Nix-store artifact.
         '';
       };
-      metricsPort = mkOption {
-        type = types.nullOr types.port;
-        default = null;
-        description = "Optional loopback-only Prometheus metrics port.";
-      };
-      responsesBackend = mkOption {
-        type = types.enum [
-          "hellas"
-          "proxy"
-          "fetch"
-        ];
-        default = "hellas";
-        description = "Backend used only by /v1/responses. Other gateway routes remain causal-LM.";
-      };
-      responsesProxyUrl = mkOption {
-        type = types.str;
-        default = "https://api.openai.com/v1/responses";
-        description = "Upstream endpoint used when responsesBackend is proxy.";
-      };
-      responsesProxyApiKeyEnv = mkOption {
-        type = types.str;
-        default = "OPENAI_API_KEY";
-        description = "Environment variable containing the Responses proxy bearer token.";
-      };
-      responsesFetchRouteService = mkOption {
-        type = types.str;
-        default = "codex";
-        description = "Fetch route service used when responsesBackend is fetch.";
-      };
-      responsesFetchRouteMethod = mkOption {
-        type = types.str;
-        default = "responses";
-        description = "Fetch route method used when responsesBackend is fetch.";
-      };
-      responsesFetchExecutionEnvironment = mkOption {
-        type = types.nullOr (types.strMatching "[0-9a-f]{64}");
-        default = null;
-        description = ''
-          Exact ProgramManifest identity for the selected versioned Fetch contract.
-          Vendor-name aliases are not supported.
-        '';
-      };
-      responsesFetchRequestOverrides = mkOption {
+      responsesOverrides = mkOption {
         type = types.attrsOf types.anything;
         default = { };
-        description = "JSON object merged into OpenAI Responses requests before signing and sending them through Fetch.";
+        description = "JSON object merged into OpenAI Responses requests before they are signed and sent as a Fetch.";
+      };
+      responsesModels = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Models the Responses Fetch answers to when /v1/responses is shared with the text routes.";
       };
       assurance = mkOption {
         type = types.enum [
@@ -798,32 +736,14 @@ rec {
       gateway.host
     ]
     ++ optArg "--port" gateway.port
-    ++ optArg "--node-id" gateway.nodeId
-    ++ lib.concatMap (addr: [
-      "--address"
-      addr
-    ]) gateway.nodeAddrs
-    ++ optArg "--retries" gateway.retries
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
-    ++ optArg "--metrics-port" gateway.metricsPort
-    ++ lib.optionals (gateway.offer == null) [
-      "--responses-backend"
-      gateway.responsesBackend
+    ++ lib.optionals (gateway.responsesOverrides != { }) [
+      "--responses-overrides"
+      (builtins.toJSON gateway.responsesOverrides)
     ]
-    ++ [
-      "--responses-proxy-url"
-      gateway.responsesProxyUrl
-      "--responses-proxy-api-key-env"
-      gateway.responsesProxyApiKeyEnv
-      "--responses-fetch-route-service"
-      gateway.responsesFetchRouteService
-      "--responses-fetch-route-method"
-      gateway.responsesFetchRouteMethod
-    ]
-    ++ optArg "--responses-fetch-execution-environment" gateway.responsesFetchExecutionEnvironment
-    ++ lib.optionals (gateway.responsesFetchRequestOverrides != { }) [
-      "--responses-fetch-request-overrides"
-      (builtins.toJSON gateway.responsesFetchRequestOverrides)
+    ++ lib.optionals (gateway.responsesModels != [ ]) [
+      "--responses-model"
+      (lib.concatStringsSep "," gateway.responsesModels)
     ]
     ++ gateway.extraArgs;
 }

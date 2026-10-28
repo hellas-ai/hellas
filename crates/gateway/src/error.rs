@@ -7,8 +7,6 @@ pub enum GatewayError {
     #[error(transparent)]
     Config(#[from] GatewayConfigError),
     #[error(transparent)]
-    Client(#[from] hellas_client::ClientError),
-    #[error(transparent)]
     Work(#[from] crate::WorkGatewayError),
     #[error(transparent)]
     Shutdown(#[from] crate::WorkShutdownError),
@@ -86,4 +84,14 @@ pub enum GatewayConfigError {
     MaxTokens,
     #[error("non-loopback gateway binding requires --allow-remote")]
     RemoteBinding,
+    #[error("the gateway serves no presentation")]
+    NoPresentation,
+    #[error("{0} is served by several presentations without distinct model names")]
+    RouteConflict(String),
+    #[error("several sealed Responses routes; select one resource")]
+    AmbiguousResponses,
+    #[error("backend {0} has no HTTPS Fetch route on its provider")]
+    MissingFetchRoute(String),
+    #[error("backend {0} names a Fetch route its provider's policy does not seal")]
+    FetchRouteMismatch(String),
 }

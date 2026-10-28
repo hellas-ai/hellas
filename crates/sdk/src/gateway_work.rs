@@ -458,7 +458,7 @@ pub trait WorkSource: Send + Sync + Sized + 'static {
     type Error: From<WorkGatewayError> + std::fmt::Display + Send + 'static;
     /// One request, already matched to this source's policies.
     type Request: Send + 'static;
-    fn fetch_providers(&self) -> Vec<iroh::EndpointId>;
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute>;
     /// Matches the request to this source's policies and builds its input.
     fn request(&self, request: WorkRequest) -> Result<Self::Request, Self::Error>;
     /// Runs the request to its verified completion. Work not yet proposed
@@ -471,6 +471,82 @@ pub trait WorkSource: Send + Sync + Sized + 'static {
     fn timeout(&self) -> Duration;
     fn gateway_error(error: Self::Error) -> WorkGatewayError;
     fn shutdown(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>>;
+}
+
+/// The Fetch routes `policy` admits on `provider`, each once.
+pub(crate) fn fetch_routes<'a>(
+    provider: iroh::EndpointId,
+    policies: impl IntoIterator<Item = &'a InvocationPolicy>,
+) -> Vec<hellas_gateway::FetchRoute> {
+    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
+    let mut routes = Vec::new();
+    for policy in policies {
+        for admission in &policy.admissions {
+            let Admission::Fetch { admission } = admission else {
+                continue;
+            };
+            let route = hellas_gateway::FetchRoute {
+                provider,
+                schema: admission.contract.schema(),
+                sealed: match &admission.route {
+                    FetchRoutePolicy::SealedRoute { service, method } => {
+                        Some((service.clone(), method.clone()))
+                    }
+                    FetchRoutePolicy::OpenFetch { .. } => None,
+                },
+            };
+            if !routes.contains(&route) {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// What a gateway serves beyond what its work source admits.
+#[derive(Clone)]
+pub struct GatewayServeOptions {
+    pub server: hellas_gateway::ServerOptions,
+    pub text: Option<hellas_gateway::TextOptions>,
+    pub http: Option<hellas_gateway::HttpGatewayConfig>,
+    /// Merged into Responses requests sent as a Fetch.
+    pub responses_overrides: serde_json::Map<String, serde_json::Value>,
+    /// Models the Responses Fetch answers to; empty means any.
+    pub responses_models: Vec<String>,
+}
+
+/// Serve `work` with the caller's presentations, plus Responses when the
+/// source seals exactly one Responses route. A failed start drains `work`.
+pub async fn serve_gateway(
+    work: Arc<dyn WorkExecutionBackend>,
+    options: GatewayServeOptions,
+) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
+    let responses = match hellas_gateway::ResponsesFetch::from_routes(
+        &work.fetch_routes(),
+        options.responses_overrides,
+        options.responses_models,
+    ) {
+        Ok(responses) => responses,
+        Err(error) => {
+            return match work.drain().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(hellas_gateway::GatewayError::Cleanup {
+                    primary: Box::new(error),
+                    cleanup,
+                }),
+            };
+        }
+    };
+    hellas_gateway::start(hellas_gateway::GatewayOptions {
+        server: options.server,
+        work,
+        presentations: hellas_gateway::Presentations {
+            text: options.text,
+            responses,
+            http: options.http,
+        },
+    })
+    .await
 }
 
 /// One gateway backend: shared admission, output delivery and shutdown over a source.
@@ -531,8 +607,8 @@ impl<S: WorkSource> WorkGateway<S> {
     }
 }
 impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
-    fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
-        self.source.fetch_providers()
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
+        self.source.fetch_routes()
     }
     fn fetch(
         &self,

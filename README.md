@@ -137,11 +137,12 @@ Every gateway requires a private `--gateway-profile FILE` selecting a provisione
 local Auth authority and a bearer credential scoped to `gateway.invoke`.
 See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The
 text routes use the shared Qwen3 model adapter for completions, chat and tool
-calls. The proxy Responses backend retains its explicit upstream semantics.
-A pinned Responses Offer uses `gateway --offer ALIAS --work-profile FILE` and
-the shared SDK Responses gateway; it exposes `/v1/responses` without a
-`--text-model`. See the [HTTP gateway guide](docs/http-gateway.md#responses-grants).
-`--responses-backend` changes only `/v1/responses`.
+calls. One gateway serves every presentation its work source admits: the text
+routes with `--text-model`, `/v1/responses` as a Fetch when the source seals
+one Responses route, and exact HTTPS routes from `--http-fetch-config` or a
+grant's HTTPS resource. A path served by several presentations is split by the
+request's `model`; overlapping models refuse to start. See the
+[HTTP gateway guide](docs/http-gateway.md#responses-grants).
 
 The exposed routes are:
 
@@ -346,64 +347,11 @@ A GPU asset owner uploads verified weights once and execution workers map them
 read-only. Worker replacement retains weights; asset pressure recreates the
 owner. HIP resident sharing requires version 7.15 or newer.
 
-## Inference cache and reproducible agent runs
+## Recording and replaying jobs
 
-The gateway retains its local inference archive: `--output-cache off`, `record`
-(reuse complete successful results and record misses), or `replay-only` (fail
-on misses without execution). Paid completion and payment acknowledgement finish
-before a successful result is recorded. Proxy requests also support recording.
-The executor's separate replay cache and the cache administration RPC/CLI have
-been removed.
-
-The archive uses the existing Hellas store (`--store-dir`, `HELLAS_STORE_DIR`,
-or `~/.hellas/store`). One process owns a writable index. Stop the writer before
-copying a complete store snapshot for offline replay. Recording persists payloads
-and is incompatible with gateway ZDR mode. Agent tool execution is not cached.
-
-```sh
-hellas gateway --output-cache record --responses-backend proxy --wrap opencode
-hellas gateway --output-cache replay-only --responses-backend proxy --wrap opencode
-```
-
-For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
-
-```nix
-let
-  agent = pkgs.hellasLib.agent;
-  inputs = {
-    name = "agent-change";
-    workspace = ./source;
-    prompt = builtins.readFile ./prompt.txt;
-    model = "your-provider-model";
-    hellas = pkgs.hellas.cli;
-    opencode = pkgs.opencode;
-    packages = [ pkgs.rustc pkgs.cargo ]; # tools available to the agent
-    gatewayArgs = [ "--responses-backend" "proxy" ];
-  };
-in {
-  record = agent.mkAgentRecord inputs;
-  result = agent.mkAgentRun (inputs // { cache = ./agent-recordings; });
-}
-```
-
-Run the recorder executable with a writable store directory outside the Nix
-build, with provider credentials in its runtime environment. Stop the writer, copy a complete store snapshot,
-and use it as `cache`. `mkAgentRun` starts a replay-only gateway inside the
-sandbox, runs OpenCode, and returns its resulting workspace. Both phases use
-`/build/workspace`, the same pinned tools/configuration, and an explicit system
-prompt `date` (default `1970-01-01`). Changing inputs can produce a cache miss;
-re-record them instead of giving the build network access. A replay reruns
-tools and is only reproducible when those tools are deterministic too.
-
-The helper uses OpenCode's generic OpenAI Responses client. Its endpoint must
-accept that request shape; the stricter sealed `codex-responses` Fetch contract
-is not a drop-in target. A zero OpenCode exit status alone is not success: the
-runner also requires a completed session and rejects error events.
-
-Recordings and generated files can contain private source or model output.
-Do not put credentials in Nix expressions, and do not publish recordings
-without reviewing them: Nix store contents are normally readable by all local
-users.
+The gateway keeps no inference cache. `hellas_gateway::start` runs over any
+`WorkExecutionBackend`, and text and Fetch events are serializable, so an
+application can record and replay jobs by wrapping its work source.
 
 ## Dependency maintenance
 

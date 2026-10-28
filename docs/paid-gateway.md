@@ -175,12 +175,6 @@ rate. The local age limit cannot guarantee recovery through a partition longer
 than the on-chain response window. Setup and restart catch-up may wait on
 validators; ordinary requests do not perform that work.
 
-The shared `--output-cache record` mode also covers paid inference. Repeating
-an identical recorded request reuses its output without another paid job. A
-recording becomes replayable only after successful completion and payment
-acknowledgement; `--output-cache replay-only` reads it without connecting to
-providers or validators.
-
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
 retained Compute jobs and re-sends payment certificates idempotently. Fetch
@@ -279,11 +273,11 @@ authenticator, the identity's settlement key and a private funding directory. Ap
 `PaidWorkOptions`; the pool validates duplicate providers and journals before opening connections. It owns recovery, admission, per-channel
 serialization and payment tasks. No CLI argument structures are part of its API.
 
-For transparent HTTP, pass this pool to `hellas_gateway::start_http` using
-`HttpGatewayOptions`. Its `paid` field is required. The options contain HTTP
-routes, archive policy, listener authentication and optional process wrapping;
-they have no text model or inference cache settings. Shutting
-down the returned handle drains accepted paid work. Failed startup also drains
+To serve it over HTTP, pass the pool to `hellas_sdk::serve_gateway` with
+`GatewayServeOptions`: listener, authentication and archive policy, and the
+presentations to add (a text model, HTTPS routes). A Responses route the pool's
+providers seal is served too. Shutting down the returned handle drains accepted
+paid work. Failed startup also drains
 recovery tasks. A host using the pool without a gateway must call its
 `WorkExecutionBackend::drain` method when shutting down.
 
