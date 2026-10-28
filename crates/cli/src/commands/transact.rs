@@ -327,116 +327,120 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     ensure!(args.payment > 0, "--payment must be positive");
-    bounded(args.client.timeout, async {
-        let options = args
-            .client
-            .options(&context, args.payment, args.assurance())
-            .await?;
-        let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-        let result = async {
-            let quote = request_paid_quote(
-                &options,
-                &endpoint,
-                &context.settlement,
-                args.client.owner(&context)?.principal(),
-            )
-            .await?;
-            let selected = args
-                .contract
-                .as_ref()
-                .map(|path| -> super::CliResult<hellas_rpc::FetchContract> {
-                    serde_json::from_slice::<hellas_rpc::FetchContract>(
-                        &super::read_bounded_regular_file(
-                            path,
-                            "contract",
-                            hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
-                        )?,
-                    )
-                    .map_err(Into::into)
-                })
-                .transpose()?;
-            let admission = quote
-                .policy
-                .invocation_policy
-                .admissions
-                .iter()
-                .find_map(|a| match a {
-                    hellas_rpc::protocol::invocation::Admission::Fetch { admission }
-                        if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1
-                            && selected
-                                .as_ref()
-                                .is_none_or(|contract| contract == &admission.contract) =>
-                    {
-                        Some(admission)
-                    }
-                    _ => None,
-                })
-                .context(if selected.is_some() {
-                    "selected contract is not admitted. Nothing was paid."
-                } else {
-                    "provider does not admit HTTPS Fetch. Nothing was paid."
-                })?;
-            let contract = &admission.contract;
-            let route = &admission.route;
-            let (service, method) = match route {
-                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch { .. } => {
-                    ("http".into(), "request".into())
+    bounded(
+        args.client.timeout,
+        async {
+            let options = args
+                .client
+                .options(&context, args.payment, args.assurance())
+                .await?;
+            let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
+            let result = async {
+                let quote = request_paid_quote(
+                    &options,
+                    &endpoint,
+                    &context.settlement,
+                    args.client.owner(&context)?.principal(),
+                )
+                .await?;
+                let selected = args
+                    .contract
+                    .as_ref()
+                    .map(|path| -> super::CliResult<hellas_rpc::FetchContract> {
+                        serde_json::from_slice::<hellas_rpc::FetchContract>(
+                            &super::read_bounded_regular_file(
+                                path,
+                                "contract",
+                                hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+                            )?,
+                        )
+                        .map_err(Into::into)
+                    })
+                    .transpose()?;
+                let admission = quote
+                    .policy
+                    .invocation_policy
+                    .admissions
+                    .iter()
+                    .find_map(|a| match a {
+                        hellas_rpc::protocol::invocation::Admission::Fetch { admission }
+                            if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1
+                                && selected
+                                    .as_ref()
+                                    .is_none_or(|contract| contract == &admission.contract) =>
+                        {
+                            Some(admission)
+                        }
+                        _ => None,
+                    })
+                    .context(if selected.is_some() {
+                        "selected contract is not admitted. Nothing was paid."
+                    } else {
+                        "provider does not admit HTTPS Fetch. Nothing was paid."
+                    })?;
+                let contract = &admission.contract;
+                let route = &admission.route;
+                let (service, method) = match route {
+                    hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch {
+                        ..
+                    } => ("http".into(), "request".into()),
+                    hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                        service,
+                        method,
+                    } => (service.clone(), method.clone()),
+                };
+                if args.max_response_bytes.is_none() {
+                    request.max_response_bytes =
+                        (quote.policy.invocation_policy.limits.max_output_bytes / 4 * 3)
+                            .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
+                            as u32;
                 }
-                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                let job = Job::fetch(
+                    args.payment,
+                    contract.clone(),
                     service,
                     method,
-                } => (service.clone(), method.clone()),
-            };
-            if args.max_response_bytes.is_none() {
-                request.max_response_bytes =
-                    (quote.policy.invocation_policy.limits.max_output_bytes / 4 * 3)
-                        .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
-                        as u32;
+                    serde_json::to_vec(&request)?,
+                    args.assurance(),
+                )?;
+                let directory = args.save_job.clone().unwrap_or_else(|| {
+                    args.client
+                        .root(&context)
+                        .join("jobs")
+                        .join(job.digest().to_string())
+                });
+                job.save(&directory)?;
+                eprintln!("job: {}", directory.display());
+                let mut purchase = args.client.purchase(&context, &job, &options).await?;
+                let result = execute(
+                    &args.client,
+                    &context,
+                    &job,
+                    options,
+                    endpoint.clone(),
+                    &mut purchase,
+                )
+                .await?;
+                let body = http_body(&job, &result)?;
+                if let Some(path) = &args.output {
+                    write(path, &body)?;
+                } else {
+                    std::io::stdout().lock().write_all(&body)?;
+                }
+                eprintln!("{}", wording(&args.client.provider, &job, &result));
+                std::io::stdout().lock().flush()?;
+                std::io::stderr().lock().flush()?;
+                purchase.reported()?;
+                Ok(())
             }
-            let job = Job::fetch(
-                args.payment,
-                contract.clone(),
-                service,
-                method,
-                serde_json::to_vec(&request)?,
-                args.assurance(),
-            )?;
-            let directory = args.save_job.clone().unwrap_or_else(|| {
-                args.client
-                    .root(&context)
-                    .join("jobs")
-                    .join(job.digest().to_string())
-            });
-            job.save(&directory)?;
-            eprintln!("job: {}", directory.display());
-            let mut purchase = args.client.purchase(&context, &job, &options).await?;
-            let result = execute(
-                &args.client,
-                &context,
-                &job,
-                options,
-                endpoint.clone(),
-                &mut purchase,
-            )
-            .await?;
-            let body = http_body(&job, &result)?;
-            if let Some(path) = &args.output {
-                write(path, &body)?;
-            } else {
-                std::io::stdout().lock().write_all(&body)?;
-            }
-            eprintln!("{}", wording(&args.client.provider, &job, &result));
-            std::io::stdout().lock().flush()?;
-            std::io::stderr().lock().flush()?;
-            purchase.reported()?;
-            Ok(())
-        }
-        .await;
-        endpoint.close().await;
-        result
-    }, |timeout| {
-        format!("Fetch exceeded {timeout:?}; resume with transact --job and the saved folder")
-    })
+            .await;
+            endpoint.close().await;
+            result
+        },
+        |timeout| {
+            format!("Fetch exceeded {timeout:?}; resume with transact --job and the saved folder")
+        },
+    )
     .await
 }
 

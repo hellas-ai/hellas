@@ -45,7 +45,9 @@ impl ServeArgs {
                     .map(hellas_store::state::records_path_at)
             })
             .or_else(hellas_store::state::records_path)
-            .ok_or_else(|| anyhow::anyhow!("no store location; set HELLAS_STORE_DIR or --store-dir"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no store location; set HELLAS_STORE_DIR or --store-dir")
+            })?;
         executor.content_store = index_content(&self.content_paths, &self.content_roots, &index)?;
         Ok(())
     }

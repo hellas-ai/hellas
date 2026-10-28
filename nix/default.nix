@@ -294,13 +294,13 @@ let
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli;
+        inherit (nativePackages) cli;
         backend = "cuda";
         revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli;
+        inherit (nativePackages) cli;
         backend = "hip";
         revision = self.rev or self.dirtyRev or "unknown";
       };

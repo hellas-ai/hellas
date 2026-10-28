@@ -330,7 +330,8 @@ fn identity_show_holder_accepts_global_identity_path() {
 
 #[test]
 fn serve_accepts_work_config() {
-    let cli = Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
     match cli.command {
         Commands::Serve {
             work_config_file, ..
@@ -354,7 +355,8 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid = Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
+    let paid =
+        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
 
     let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("an identity file that is not one is not a key to settle with");

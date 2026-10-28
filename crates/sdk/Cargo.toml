@@ -69,10 +69,10 @@ async-trait = "0.1"
 base64.workspace = true
 bytes.workspace = true
 catena-lang.workspace = true
-ctor = "1"
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
+ctor = "1"
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }

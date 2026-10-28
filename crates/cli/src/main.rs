@@ -231,7 +231,11 @@ enum Commands {
         queue_size: usize,
         /// Paid terms (TOML) the selected owner approves at startup. Paid
         /// work is sold only with this file.
-        #[arg(long = "paid-work-config", value_name = "FILE", conflicts_with = "await_owner")]
+        #[arg(
+            long = "paid-work-config",
+            value_name = "FILE",
+            conflicts_with = "await_owner"
+        )]
         work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,

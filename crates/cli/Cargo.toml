@@ -7,13 +7,13 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
-[[bin]]
-name = "hellas"
-path = "src/main.rs"
-
 [target.'cfg(unix)'.dependencies]
 hellas-cloud.workspace = true
 libc = "0.2"
+
+[[bin]]
+name = "hellas"
+path = "src/main.rs"
 
 [features]
 default = []
