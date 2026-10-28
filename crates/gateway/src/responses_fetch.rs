@@ -84,7 +84,7 @@ impl ExecutionBackend for FetchBackend {
                 })
                 .map_err(BackendError::from)?;
             Ok(BackendStream::new(
-                events.map(|event| event.map_err(BackendError::from)),
+                events.map(|event| event.map(Into::into).map_err(BackendError::from)),
                 None,
             ))
         })

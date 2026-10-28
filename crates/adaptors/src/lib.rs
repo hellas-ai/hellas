@@ -31,14 +31,14 @@ pub mod wire;
 
 pub use adaptor::{WireAdaptor, WireIngress};
 pub use backend::{
-    BackendError, BackendFuture, BackendRequest, BackendResult, BackendStream, ExecutionBackend,
-    OutputEventStream,
+    BackendError, BackendEvent, BackendEventStream, BackendFuture, BackendRequest, BackendResult,
+    BackendStream, ExecutionBackend,
 };
 pub use error::{AdaptorError, AdaptorResult};
 pub use execution::{
     CanonicalExecution, ContentPart, ExecutionErrorInfo, ExecutionRequest, ExecutionResult, Input,
-    InputItem, Message, ModelRef, OutputItem, ReasoningOptions, ResponseFormat, SamplingOptions,
-    ToolChoice, ToolKind, ToolSpec,
+    InputItem, Message, ModelRef, OutputItem, Provenance, ReasoningOptions, ResponseFormat,
+    SamplingOptions, ToolChoice, ToolKind, ToolSpec,
 };
 // The streaming vocabulary the adaptors produce and consume is protocol
 // surface owned by hellas-rpc (it is committed inside signed fetch
@@ -48,7 +48,7 @@ pub use hellas_rpc::output::{
     AdaptorEvent, CodexCompleted, CodexInputTokenDetails, CodexItemStatus, CodexMessageContent,
     CodexMessagePhase, CodexOutputTokenDetails, CodexReasoningContent, CodexReasoningSummary,
     CodexResponseItem, CodexResponsesEvent, CodexToolSearchArguments, CodexUsage,
-    CodexUsageMetadata, OutputEvent, Provenance, StopReason, StructuredDelta, TextChannel,
+    CodexUsageMetadata, OutputEvent, StopReason, StructuredDelta, TextChannel,
     ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, Usage,
 };
 pub use request::RawRequest;

@@ -64,7 +64,9 @@ fn render_response_accepts_raw_blocks() {
         }),
         stop_reason: StopReason::EndOfText,
         provenance: Some(Provenance {
-            call_commitment: Some("aa".repeat(32)),
+            commitment: Some("aa".repeat(32)),
+            provider: Some("secp256k1:02".into()),
+            transcript: Some("c2lnbmVk".into()),
         }),
         error: None,
     };
@@ -82,7 +84,10 @@ fn render_response_accepts_raw_blocks() {
     assert_eq!(body["type"], "message");
     assert_eq!(body["content"][0]["text"], "done");
     assert_eq!(body["usage"]["input_tokens"], 3);
-    assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
+    assert_eq!(
+        body["hellas"],
+        json!({"commitment": "aa".repeat(32), "provider": "secp256k1:02", "transcript": "c2lnbmVk"})
+    );
 }
 
 #[test]

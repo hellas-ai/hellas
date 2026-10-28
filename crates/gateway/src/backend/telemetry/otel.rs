@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use futures::Stream;
-use hellas_adaptors::{BackendError, BackendRequest, Input, OutputEvent, StopReason};
+use hellas_adaptors::{BackendError, BackendEvent, BackendRequest, Input, OutputEvent, StopReason};
 use tracing::Span;
 
 use opentelemetry::{Array, KeyValue, Value};
@@ -125,9 +125,9 @@ impl Inference {
     pub(crate) fn stream<S>(
         self,
         stream: S,
-    ) -> impl Stream<Item = Result<OutputEvent, BackendError>> + Send
+    ) -> impl Stream<Item = Result<BackendEvent, BackendError>> + Send
     where
-        S: Stream<Item = Result<OutputEvent, BackendError>> + Send + 'static,
+        S: Stream<Item = Result<BackendEvent, BackendError>> + Send + 'static,
     {
         InferenceStream {
             inner: Box::pin(stream),
@@ -253,16 +253,16 @@ struct InferenceStream<S> {
 
 impl<S> Stream for InferenceStream<S>
 where
-    S: Stream<Item = Result<OutputEvent, BackendError>>,
+    S: Stream<Item = Result<BackendEvent, BackendError>>,
 {
-    type Item = Result<OutputEvent, BackendError>;
+    type Item = Result<BackendEvent, BackendError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let span = this.inference.span.clone();
         let _entered = span.enter();
         let next = this.inner.as_mut().poll_next(cx);
         match &next {
-            Poll::Ready(Some(Ok(event))) => this.inference.observe(event),
+            Poll::Ready(Some(Ok(BackendEvent::Output(event)))) => this.inference.observe(event),
             Poll::Ready(Some(Err(error))) => this.inference.fail(error),
             Poll::Ready(None) if !this.inference.terminal => {
                 this.inference.finish_reason("error");

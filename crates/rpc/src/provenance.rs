@@ -1,34 +1,47 @@
-//! Execution provenance — content-addressed identifiers that travel
-//! alongside every gateway/executor RPC.
+//! Execution provenance: the job identity a provider accepted, travelling
+//! alongside every gateway/executor RPC and every gateway HTTP response.
 //!
-//! Wire form: 32-byte digest carried as a `-bin` metadata value in
-//! `hellas_wire::Metadata`. Per the gRPC convention, binary metadata
-//! keys end with `-bin` and the value is raw bytes (decoded as such
-//! by gRPC peers via base64 in HTTP/2 land, but the wire-layer keeps
-//! it raw).
+//! Wire form: the 32-byte commitment is carried as a `-bin` metadata value in
+//! `hellas_wire::Metadata`. Per the gRPC convention, binary metadata keys end
+//! with `-bin` and the value is raw bytes (decoded as such by gRPC peers via
+//! base64 in HTTP/2 land, but the wire-layer keeps it raw). The provider key
+//! is text, in the form [`encode_public_key`] renders.
 
 use std::fmt::Write;
 
 use bytes::Bytes;
+use hellas_auth::PublicKey;
 use hellas_wire::{Metadata, MetadataValue, WireCode, WireStatus};
 use thiserror::Error;
 
-/// Metadata key for the work commitment digest (raw 32 bytes).
+/// Metadata key for the work commitment digest (raw 32 bytes). HTTP
+/// responses carry it as lowercase hex under the same name.
 pub const COMMITMENT_KEY: &str = "x-hellas-commitment-bin";
 
-/// Pre-flight provenance for a single execution. Scheme result commitments
-/// live in signed terminal output events, not in this struct.
+/// Metadata key and HTTP header naming the provider that accepted the work.
+pub const PROVIDER_KEY: &str = "x-hellas-provider";
+
+/// HTTP trailer (a header on a bodyless response) carrying the base64
+/// canonical bytes of the provider-signed transcript.
+pub const TRANSCRIPT_KEY: &str = "x-hellas-transcript";
+
+/// The job identity a provider accepted, known before its first output: the
+/// work id it signed and the key that signs its transcript. Scheme result
+/// commitments live in signed terminal output events, not in this struct.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],
+    pub provider: PublicKey,
 }
 
 impl std::fmt::Display for ExecutionProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.commitment_id {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write!(
+            f,
+            "{} by {}",
+            encode_hex(&self.commitment_id),
+            encode_public_key(&self.provider)
+        )
     }
 }
 
@@ -44,6 +57,8 @@ pub enum ProvenanceError {
     Missing { key: &'static str },
     #[error("provenance metadata key `{key}` is not 32 bytes (got {len})")]
     BadLength { key: &'static str, len: usize },
+    #[error("provenance metadata key `{key}` is not a provider key")]
+    BadKey { key: &'static str },
 }
 
 impl From<ProvenanceError> for WireStatus {
@@ -54,11 +69,41 @@ impl From<ProvenanceError> for WireStatus {
 
 /// Render a 32-byte digest as 64-char lowercase hex (for logging).
 pub fn encode_hex(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
+    lower_hex(bytes)
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 * bytes.len());
     for byte in bytes {
         write!(&mut s, "{byte:02x}").expect("writing to String never fails");
     }
     s
+}
+
+const SECP256K1: &str = "secp256k1";
+const ED25519: &str = "ed25519";
+const P256: &str = "p256";
+
+/// A public key as `<kind>:<lowercase hex of its encoded bytes>`, e.g.
+/// `secp256k1:02…` for a compressed secp256k1 key.
+pub fn encode_public_key(key: &PublicKey) -> String {
+    let kind = match key {
+        PublicKey::Secp256k1(_) => SECP256K1,
+        PublicKey::Ed25519(_) => ED25519,
+        PublicKey::P256(_) => P256,
+    };
+    format!("{kind}:{}", lower_hex(key.bytes()))
+}
+
+/// The key [`encode_public_key`] rendered, if `text` is one.
+pub fn parse_public_key(text: &str) -> Option<PublicKey> {
+    let (kind, hex) = text.split_once(':')?;
+    match kind {
+        SECP256K1 => hellas_auth::hex::parse(hex).ok().map(PublicKey::Secp256k1),
+        ED25519 => hellas_auth::hex::parse(hex).ok().map(PublicKey::Ed25519),
+        P256 => hellas_auth::hex::parse(hex).ok().map(PublicKey::P256),
+        _ => None,
+    }
 }
 
 /// Read a `-bin` 32-byte digest from a wire Metadata map.
@@ -81,19 +126,31 @@ pub fn digest_bytes_from_metadata(
     Ok(out)
 }
 
-/// Read the pre-flight provenance from a wire Metadata map.
+/// Read the accepted job's provenance from a wire Metadata map.
 pub fn read_provenance_metadata(md: &Metadata) -> Result<ExecutionProvenance, ProvenanceError> {
+    let key = PROVIDER_KEY;
+    let provider = md
+        .get(key)
+        .ok_or(ProvenanceError::Missing { key })?
+        .as_text()
+        .and_then(parse_public_key)
+        .ok_or(ProvenanceError::BadKey { key })?;
     Ok(ExecutionProvenance {
         commitment_id: digest_bytes_from_metadata(md, COMMITMENT_KEY)?,
+        provider,
     })
 }
 
-/// Insert pre-flight provenance into a wire Metadata map. Used
+/// Insert the accepted job's provenance into a wire Metadata map. Used
 /// server-side on response headers / trailers.
 pub fn write_provenance_metadata(md: &mut Metadata, prov: &ExecutionProvenance) {
     md.insert(
         COMMITMENT_KEY,
         MetadataValue::Bytes(Bytes::copy_from_slice(&prov.commitment_id)),
+    );
+    md.insert(
+        PROVIDER_KEY,
+        MetadataValue::Text(encode_public_key(&prov.provider).into()),
     );
 }
 
@@ -104,7 +161,30 @@ mod tests {
     fn sample() -> ExecutionProvenance {
         ExecutionProvenance {
             commitment_id: [0xab; 32],
+            provider: PublicKey::Secp256k1([0x02; 33]),
         }
+    }
+
+    #[test]
+    fn public_keys_round_trip_through_their_text_form() {
+        for key in [
+            PublicKey::Secp256k1([0x02; 33]),
+            PublicKey::Ed25519([0x07; 32]),
+            PublicKey::P256([0x03; 33]),
+        ] {
+            let text = encode_public_key(&key);
+            assert_eq!(parse_public_key(&text), Some(key));
+        }
+        assert_eq!(
+            encode_public_key(&PublicKey::Secp256k1([0x02; 33])),
+            format!("secp256k1:{}", "02".repeat(33))
+        );
+        // The kind fixes the length: an Ed25519-length key is not secp256k1.
+        assert_eq!(
+            parse_public_key(&format!("secp256k1:{}", "07".repeat(32))),
+            None
+        );
+        assert_eq!(parse_public_key(&"02".repeat(33)), None);
     }
 
     #[test]
@@ -129,7 +209,15 @@ mod tests {
 
     #[test]
     fn missing_key_reports_which_key() {
-        let md = Metadata::new();
+        let mut md = Metadata::new();
+        assert_eq!(
+            read_provenance_metadata(&md).expect_err("empty metadata must fail"),
+            ProvenanceError::Missing { key: PROVIDER_KEY }
+        );
+        md.insert(
+            PROVIDER_KEY,
+            MetadataValue::Text(encode_public_key(&sample().provider).into()),
+        );
         let err = read_provenance_metadata(&md).expect_err("empty metadata must fail");
         assert_eq!(
             err,
@@ -142,6 +230,10 @@ mod tests {
     #[test]
     fn bad_length_reports_actual_length() {
         let mut md = Metadata::new();
+        md.insert(
+            PROVIDER_KEY,
+            MetadataValue::Text(encode_public_key(&sample().provider).into()),
+        );
         md.insert(
             COMMITMENT_KEY,
             MetadataValue::Bytes(Bytes::from_static(&[0u8; 8])),
