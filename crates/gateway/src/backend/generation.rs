@@ -11,6 +11,8 @@ use super::super::state::PreparedGeneration;
 #[derive(Debug, Clone)]
 pub(super) enum GenerationEvent {
     Delta(String),
+    /// Canonical bytes of the provider-signed transcript.
+    Transcript(Vec<u8>),
     Done(Outcome),
 }
 
@@ -46,7 +48,16 @@ pub(super) fn generation_stream(
         let inner = prepared;
         tokio::pin!(inner);
         while let Some(event) = inner.next().await {
-            match event? {
+            let event = match event? {
+                crate::WorkEvent::Output(event) => event,
+                crate::WorkEvent::Transcript(transcript) => {
+                    yield GenerationEvent::Transcript(transcript);
+                    continue;
+                }
+                // `PreparedGeneration::accept` took the only acceptance.
+                crate::WorkEvent::Accepted(_) => continue,
+            };
+            match event {
                 crate::execution::ExecutionEvent::Chunk { tokens, .. } => {
                     let delta = decoder.push_bytes(&tokens).map_err(|error| GenerationError::Decode(error.into()))?;
                     if !delta.is_empty() {

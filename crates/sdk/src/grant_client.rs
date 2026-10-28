@@ -477,6 +477,8 @@ impl Link {
 pub struct GrantWorkResult {
     pub work_id: Digest,
     pub result: PaidJobResultV1,
+    /// The verified signed transcript; `result.transcript_content` names
+    /// its canonical encoding.
     pub events: Vec<OutputEventEnvelope>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub provider_key: PublicKey,
@@ -744,6 +746,7 @@ impl GrantSession {
             input,
             content,
             progress,
+            None,
             tokio::time::Instant::now() + self.options.timeout,
         )
         .await
@@ -753,13 +756,15 @@ impl GrantSession {
     /// Later events must each arrive within the session timeout, and the whole
     /// delivery within the signed terminal deadline, which the job may use up
     /// to the allowance's `max_job_millis`. Cancellation preserves any signed
-    /// proposal in the journal.
+    /// proposal in the journal. `accepted` hears of the provider's acceptance
+    /// before any output.
     pub async fn run_before(
         &mut self,
         policy_name: &str,
         input: PreparedInvocation,
         content: &InvocationContent,
         progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
         deadline: tokio::time::Instant,
     ) -> Result<GrantWorkResult> {
         if deadline <= tokio::time::Instant::now() {
@@ -775,6 +780,12 @@ impl GrantSession {
             .invocation_policy
             .admit(&input, &self.options.signer.public_key())?;
         let producer = PublicKey::Secp256k1(grant_producer(&self.target.provider)?.to_bytes());
+        if let Some(accepted) = &accepted {
+            accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: *id.as_bytes(),
+                provider: producer,
+            });
+        }
         let mut verifier = StreamVerifier::new(
             input.request.clone(),
             producer,

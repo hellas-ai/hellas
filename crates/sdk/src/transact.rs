@@ -32,6 +32,11 @@ pub enum TransactError {
 }
 type Result<T> = std::result::Result<T, TransactError>;
 
+/// Called once a provider has accepted a job, before any of its output,
+/// with the work id it accepted and its key.
+pub type Accepted =
+    std::sync::Arc<dyn Fn(hellas_rpc::provenance::ExecutionProvenance) + Send + Sync>;
+
 #[derive(Default)]
 pub struct TransactionOptions<'a> {
     pub settle: bool,
@@ -40,6 +45,7 @@ pub struct TransactionOptions<'a> {
     /// instead resume an unpaid matching authorization after interruption.
     pub new_purchase: bool,
     pub progress: Option<PaidProgress>,
+    pub accepted: Option<Accepted>,
     pub proposed: Option<&'a AtomicBool>,
 }
 
@@ -153,6 +159,7 @@ pub async fn transact(
             &content,
             false,
             options.progress,
+            options.accepted,
             options.proposed,
             options.purchase,
         )

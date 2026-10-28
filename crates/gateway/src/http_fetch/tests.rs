@@ -47,12 +47,12 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             }
             let ack = self.ack.clone();
             Ok(Box::pin(async_stream::try_stream! {
-                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
                     status: 200, headers: vec![("content-type".into(), "application/octet-stream".into())],
-                }));
-                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64: "AP8K".into() }));
+                })));
+                yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64: "AP8K".into() })));
                 ack.notified().await;
-                yield OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None };
+                yield WorkEvent::Output(OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None });
             }))
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {

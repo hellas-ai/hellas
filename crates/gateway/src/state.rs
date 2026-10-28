@@ -1,5 +1,5 @@
 //! The text presentation: requests rendered locally into Compute text jobs.
-use super::{TextOptions, WorkExecutionBackend, WorkGatewayError};
+use super::{TextOptions, WorkExecutionBackend};
 use crate::ExecutionEvent;
 use axum::{Router, routing::post};
 use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest};
@@ -36,16 +36,13 @@ pub(super) struct TextState {
     work: Arc<dyn WorkExecutionBackend>,
 }
 
-pub(super) type TextEvents =
-    futures::stream::BoxStream<'static, Result<ExecutionEvent, WorkGatewayError>>;
+pub(super) type TextEvents = crate::WorkOutputStream<ExecutionEvent>;
 
 pub(super) struct PreparedGeneration {
     pub(super) chat: Option<hellas_presentation::chat::ChatTurn>,
     pub(super) prepared: TextEvents,
-    /// Pre-flight provenance the executor committed to. `None` for routes
-    /// whose funded execution starts while the response is streaming;
-    /// in that case headers can't be set and clients must rely on the
-    /// in-band SSE `hellas-provenance` event.
+    /// The job identity the provider accepted, once [`Self::accept`] has
+    /// seen it; `None` for a source that reports no acceptance.
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) presentation: Arc<TextPresentation>,
@@ -125,6 +122,21 @@ impl TextState {
 }
 
 impl PreparedGeneration {
+    /// Wait, within the inference budget, for the provider to accept the
+    /// job, so that its identity can head the response.
+    pub(super) async fn accept(&mut self) -> Result<(), BackendError> {
+        let deadline = self.deadline();
+        self.provenance = tokio::time::timeout_at(deadline, crate::accepted(&mut self.prepared))
+            .await
+            .map_err(|_| {
+                BackendError::failed(format!(
+                    "inference timed out after {}s",
+                    super::timeout_secs_until(deadline)
+                ))
+            })?;
+        Ok(())
+    }
+
     /// Absolute deadline for this generation's stream consumption.
     /// Computed at call time; covers the whole lifecycle from this point on.
     pub(super) fn deadline(&self) -> tokio::time::Instant {

@@ -21,7 +21,7 @@ use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReaso
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{WorkExecutionBackend, WorkFetchRequest};
+use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
 use hellas_adaptors::BackendError;
 
 #[derive(Clone)]
@@ -276,13 +276,16 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     );
     state.routing.observe(selected.backend, status, &headers);
     if parts.method == axum::http::Method::HEAD || status == 204 || status == 304 {
-        let end = events.next().instrument(observed.span.clone()).await;
+        let mut end = events.next().instrument(observed.span.clone()).await;
+        if let Some(Ok(WorkEvent::Transcript(_))) = end {
+            end = events.next().instrument(observed.span.clone()).await;
+        }
         if !matches!(
             end,
-            Some(Ok(OutputEvent::Finished {
+            Some(Ok(WorkEvent::Output(OutputEvent::Finished {
                 stop_reason: StopReason::EndOfText,
                 usage: None
-            }))
+            })))
         ) {
             observed.status(502);
             return error(StatusCode::BAD_GATEWAY, "invalid bodyless HTTP completion");
@@ -302,6 +305,10 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                 tracing::warn!(backend = %name, error = %chain(&failure), "HTTP Fetch stream failed");
                 std::io::Error::other("Fetch stream verification failed")
             })?;
+            let event = match event {
+                WorkEvent::Output(event) => event,
+                WorkEvent::Accepted(_) | WorkEvent::Transcript(_) => continue,
+            };
             match event {
                 OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64 })) => {
                     let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
@@ -346,11 +353,11 @@ async fn open(
         method: method.clone(),
         body: payload,
     })?;
+    let _accepted = super::accepted(&mut stream).await;
     match stream.next().await.transpose()? {
-        Some(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
-            status,
-            headers,
-        }))) if (200..=599).contains(&status) => {
+        Some(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { status, headers },
+        )))) if (200..=599).contains(&status) => {
             hellas_rpc::http_fetch::check_headers(&headers, false)?;
             Ok((status, headers, stream))
         }

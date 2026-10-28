@@ -6,7 +6,7 @@ use crate::execution::Outcome;
 
 use super::super::state::PreparedGeneration;
 use super::generation::{GenerationEvent, generation_stream};
-use super::provenance::{provenance_from_execution, stop_reason_from_runtime, usage};
+use super::provenance::{completed_provenance, stop_reason_from_runtime, usage};
 
 pub(super) fn text_events(
     mut prepared: PreparedGeneration,
@@ -15,12 +15,14 @@ pub(super) fn text_events(
         let prompt_tokens = prepared.prompt_tokens;
         let mut tools = prepared.chat.take().unwrap_or_else(hellas_presentation::chat::ChatTurn::plain);
         let stream_provenance = prepared.provenance.clone();
+        let mut transcript = None;
         let deadline = prepared.deadline();
         let inner = generation_stream(prepared);
         tokio::pin!(inner);
 
         loop {
             match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Transcript(signed)))) => transcript = Some(signed),
                 Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
                     for event in tools.feed(&delta).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
                 }
@@ -37,8 +39,8 @@ pub(super) fn text_events(
                         ?stop_reason,
                         "gateway stream ready"
                     );
-                    if let Some(provenance) = stream_provenance.as_ref().map(provenance_from_execution) {
-                        yield BackendEvent::Provenance(provenance);
+                    if let Some(transcript) = &transcript {
+                        yield BackendEvent::Provenance(completed_provenance(stream_provenance.as_ref(), transcript));
                     }
                     for event in tools.finish(stop_reason_from_runtime(stop_reason)).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
                     yield OutputEvent::Finished {

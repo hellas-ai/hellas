@@ -577,18 +577,21 @@ impl PaidWorkSession {
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
-        self.run_prepared(prepared, content, recover, progress, None, None)
+        self.run_prepared(prepared, content, recover, progress, None, None, None)
             .await
     }
 
-    /// Like `run`, also marking `proposed` before a proposal can leave the process.
+    /// Like `run`, also marking `proposed` before a proposal can leave the process,
+    /// and reporting the provider's acceptance of `prepared` to `accepted`.
     /// A caller using cancellation must continue payment/recovery once it is set.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_prepared(
         &mut self,
         prepared: Option<PreparedInvocation>,
         content: &InvocationContent,
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
         proposed: Option<&AtomicBool>,
         purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -740,6 +743,7 @@ impl PaidWorkSession {
                     &ready,
                     config.poll,
                     None,
+                    None,
                     JobLookup::Retained(work_id),
                     None,
                     None,
@@ -784,6 +788,7 @@ impl PaidWorkSession {
                     &ready,
                     config.poll,
                     progress.as_ref(),
+                    accepted.as_ref(),
                     if recover {
                         JobLookup::New
                     } else {
@@ -923,6 +928,7 @@ async fn execute_paid_job(
     ready: &hellas_channel::model::setup::ReadyChannel,
     poll: Duration,
     progress: Option<&hellas_channel::work::PaidProgress>,
+    accepted: Option<&crate::transact::Accepted>,
     lookup: JobLookup,
     proposed: Option<&AtomicBool>,
     mut purchase: Option<&mut crate::transact::Purchase>,
@@ -1005,6 +1011,12 @@ async fn execute_paid_job(
     };
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.accepting(work_id)?;
+    }
+    if let Some(accepted) = accepted {
+        accepted(hellas_rpc::provenance::ExecutionProvenance {
+            commitment_id: *work_id.as_bytes(),
+            provider: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+        });
     }
     let transcript = if already_collected {
         client
