@@ -15,7 +15,7 @@ libc = "0.2"
 
 [dependencies]
 async-trait = "0.1"
-bincode = "1.3"
+bincode = "3.0"
 catena-lang.workspace = true
 futures-core = { workspace = true }
 futures-util = "0.3"
