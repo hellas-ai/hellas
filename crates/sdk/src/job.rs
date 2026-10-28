@@ -112,12 +112,10 @@ struct ContentFile {
     path: String,
 }
 
-impl Job {
-    pub fn from_input(price: u64, input: JobInput) -> Result<Self> {
-        if price == 0 || price > i64::MAX as u64 {
-            return Err(invalid("payment price must be a positive TOML integer"));
-        }
-        let manifest = match &input {
+impl JobInput {
+    /// Checks the input's own bounds and returns its program manifest.
+    pub fn manifest(&self) -> Result<ProgramManifest> {
+        Ok(match self {
             JobInput::Fetch {
                 contract,
                 service,
@@ -168,7 +166,67 @@ impl Job {
                 .validate()?;
                 manifest
             }
+        })
+    }
+
+    /// Builds the signed invocation for `runner` under `policy`. Paid jobs are
+    /// retained by the provider; grant and local jobs are memory-only.
+    pub fn prepare(
+        &self,
+        manifest: &ProgramManifest,
+        key: &ProducerSigningKey,
+        nonce: [u8; 32],
+        runner: PublicKey,
+        policy: &InvocationPolicy,
+        retain: bool,
+    ) -> Result<PreparedInvocation> {
+        let prepared = match self {
+            JobInput::Fetch {
+                contract,
+                service,
+                method,
+                request,
+                assurance,
+            } => {
+                let events = hellas_rpc::fetch::build_input_events_with_nonce(
+                    service,
+                    method,
+                    request,
+                    contract.manifest_id(),
+                    *assurance,
+                    key,
+                    hellas_rpc::Retention::Ephemeral,
+                    nonce,
+                )?;
+                fetch::prepare(&events, contract, runner, policy.canonical_bytes()?, nonce)?
+            }
+            JobInput::Compute { plan, inputs, .. } => {
+                let input = InvocationInput {
+                    parameters: JsonBytes(plan.canonical_bytes()?),
+                    artifacts: inputs.clone(),
+                };
+                let request = InvocationRequest {
+                    execution_environment: manifest.content_id(),
+                    input: input.content_id()?,
+                    runner_public_key: runner,
+                    nonce,
+                    assurance: Assurance::ProducerSigned,
+                    retain,
+                };
+                PreparedInvocation::new(request, manifest, input, policy.canonical_bytes()?)?
+            }
         };
+        policy.admit(&prepared, &key.public_key())?;
+        Ok(prepared)
+    }
+}
+
+impl Job {
+    pub fn from_input(price: u64, input: JobInput) -> Result<Self> {
+        if price == 0 || price > i64::MAX as u64 {
+            return Err(invalid("payment price must be a positive TOML integer"));
+        }
+        let manifest = input.manifest()?;
         Ok(Self {
             price,
             input,
@@ -312,44 +370,8 @@ impl Job {
         runner: PublicKey,
         policy: &InvocationPolicy,
     ) -> Result<PreparedInvocation> {
-        let prepared = match &self.input {
-            JobInput::Fetch {
-                contract,
-                service,
-                method,
-                request,
-                assurance,
-            } => {
-                let events = hellas_rpc::fetch::build_input_events_with_nonce(
-                    service,
-                    method,
-                    request,
-                    contract.manifest_id(),
-                    *assurance,
-                    key,
-                    hellas_rpc::Retention::Ephemeral,
-                    nonce,
-                )?;
-                fetch::prepare(&events, contract, runner, policy.canonical_bytes()?, nonce)?
-            }
-            JobInput::Compute { plan, inputs, .. } => {
-                let input = InvocationInput {
-                    parameters: JsonBytes(plan.canonical_bytes()?),
-                    artifacts: inputs.clone(),
-                };
-                let request = InvocationRequest {
-                    execution_environment: self.manifest.content_id(),
-                    input: input.content_id()?,
-                    runner_public_key: runner,
-                    nonce,
-                    assurance: self.assurance(),
-                    retain: true,
-                };
-                PreparedInvocation::new(request, &self.manifest, input, policy.canonical_bytes()?)?
-            }
-        };
-        policy.admit(&prepared, &key.public_key())?;
-        Ok(prepared)
+        self.input
+            .prepare(&self.manifest, key, nonce, runner, policy, true)
     }
     pub fn load(root: &Path) -> Result<Self> {
         let directory = hellas_private::ReadDirectory::open(root)?;
