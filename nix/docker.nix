@@ -95,7 +95,10 @@ let
             ++ pkgs.lib.optional cuda compiler
           )
         }"
-        "LD_LIBRARY_PATH=${toolkit}/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
+        # The ROCm toolkit's lib/ carries its own glibc, which would replace the
+        # binary's loader-matched libc and abort at startup; HIP is found via
+        # ROCM_PATH/HIP_PATH instead.
+        "LD_LIBRARY_PATH=${pkgs.lib.optionalString cuda "${toolkit}/lib:"}/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
       ]
       ++ (
         if cuda then
