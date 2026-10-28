@@ -251,7 +251,8 @@ the status that established the longest remaining delay: a 503 remains a 503,
 so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
 concurrency returns 503 with `Retry-After: 1`.
 
-`--metrics-port` exposes these metrics on loopback `/metrics` in all builds.
+`--metrics-port` exposes these metrics at `/metrics`. `--metrics-addr IP`
+selects the interface (default `127.0.0.1`); the response is unauthenticated.
 With `otel`, the same instruments can also be pushed through OTLP.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and

@@ -142,6 +142,7 @@ struct Cli {
     identity: PathBuf,
     passkey: PathBuf,
     metrics_endpoint: Option<String>,
+    metrics_address: Option<String>,
 }
 impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
@@ -152,6 +153,7 @@ impl Cli {
             identity: root.join(name),
             passkey: path,
             metrics_endpoint: None,
+            metrics_address: None,
         }
     }
     fn principal(&self) -> hellas_auth::authority::PrincipalId {
@@ -197,6 +199,11 @@ impl Cli {
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(address) = &self.metrics_address
+            && args.contains(&"--metrics-port")
+        {
+            command.args(["--metrics-addr", address]);
+        }
         if let Some(endpoint) = &self.metrics_endpoint {
             command
                 .env("OTEL_SDK_DISABLED", "false")

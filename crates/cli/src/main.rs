@@ -234,6 +234,9 @@ enum Commands {
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
+        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        metrics_addr: std::net::IpAddr,
         /// Operator graffiti tag (up to 16 bytes, padded/truncated)
         #[arg(long = "graffiti", default_value = "")]
         graffiti: String,
@@ -312,9 +315,12 @@ enum Commands {
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
         #[arg(long)]
         port: Option<u16>,
-        /// Loopback-only Prometheus metrics port (e.g. 9090).
+        /// Prometheus metrics port (e.g. 9090).
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        metrics_addr: std::net::IpAddr,
         /// Fallback max new tokens when request omits max_tokens
         #[arg(
             long = "default-max-tokens",
@@ -504,9 +510,21 @@ async fn async_main() {
         std::process::exit(1);
     }
     let metrics = match &cli.command {
-        Commands::Serve { metrics_port, .. } | Commands::Gateway { metrics_port, .. } => {
-            metrics_port.map(|port| (port, metrics::MetricsBundle::default()))
+        Commands::Serve {
+            metrics_port,
+            metrics_addr,
+            ..
         }
+        | Commands::Gateway {
+            metrics_port,
+            metrics_addr,
+            ..
+        } => metrics_port.map(|port| {
+            (
+                (*metrics_addr, port).into(),
+                metrics::MetricsBundle::default(),
+            )
+        }),
         _ => None,
     };
     let tracer_provider = tracing_config::init_tracing(
@@ -709,6 +727,7 @@ async fn async_main() {
             grant_config_file,
             await_owner,
             metrics_port: _,
+            metrics_addr: _,
             graffiti,
             fetch_config_file,
             check_config: _,
@@ -811,6 +830,7 @@ async fn async_main() {
             host,
             port,
             metrics_port: _,
+            metrics_addr: _,
             default_max_tokens,
             responses_overrides,
             responses_models,
@@ -920,7 +940,7 @@ async fn async_main() {
                 responses_models,
             };
             #[cfg(feature = "otel")]
-            let metrics = metrics.map(|(port, bundle)| {
+            let metrics = metrics.map(|(address, bundle)| {
                 let bundle = match grant_source.as_ref().map(|(_, transport)| transport) {
                     Some(hellas_sdk::grant_client::GrantTransport::Remote(endpoint)) => {
                         let (_, receiver) = tokio::sync::watch::channel(Some(endpoint.clone()));
@@ -928,10 +948,10 @@ async fn async_main() {
                     }
                     _ => bundle,
                 };
-                (port, bundle)
+                (address, bundle)
             });
-            if let Some((port, bundle)) = metrics {
-                metrics::spawn_metrics_server(port, bundle).await?;
+            if let Some((address, bundle)) = metrics {
+                metrics::spawn_metrics_server(address, bundle).await?;
             }
             let gateway = if let Some((session, transport)) = grant_source {
                 hellas_sdk::grant_gateway::GrantServeOptions {

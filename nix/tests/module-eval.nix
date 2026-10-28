@@ -565,6 +565,8 @@ let
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.toml";
           passkey = "/run/hellas/owner.passkey";
+          metricsPort = 9400;
+          metricsAddress = "0.0.0.0";
           queueSize = 0;
           fetchConfigFile = "/run/hellas/fetch.json";
           environmentFile = "/run/hellas/provider.env";
@@ -576,6 +578,7 @@ let
             passkey = "/run/hellas/principal.passkey";
             workProfile = "/run/hellas/work-profile.json";
             metricsPort = 9401;
+            metricsAddress = "::1";
             defaultMaxTokens = 4294967295;
             assurance = "apple-app-attest";
             trustPolicy = "provider";
@@ -665,6 +668,28 @@ in
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-port 9400" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-addr 0.0.0.0" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-addr ::1" gatewayService.serviceConfig.ExecStart;
+    assert (evalGateway { }).config.services.hellas.gateway.metricsAddress == "127.0.0.1";
+    assert (evalProvider { }).config.services.hellas.metricsAddress == "127.0.0.1";
+    assert lib.all
+      (
+        args:
+        !(serveExtraArgsAssertion (evalProvider {
+          extraArgs = args;
+        })).assertion
+        && !(gatewayExtraArgsAssertion (evalGateway {
+          extraArgs = args;
+        })).assertion
+      )
+      [
+        [
+          "--metrics-addr"
+          "0.0.0.0"
+        ]
+        [ "--metrics-addr=0.0.0.0" ]
+      ];
     assert lib.hasInfix "--metrics-port 9401" gatewayService.serviceConfig.ExecStart;
     assert
       !(lib.hasInfix "--metrics-port"

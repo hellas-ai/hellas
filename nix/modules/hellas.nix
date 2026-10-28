@@ -198,6 +198,7 @@ rec {
     "--paid-work-config"
     "--passkey"
     "--metrics-port"
+    "--metrics-addr"
     "--graffiti"
     "--fetch-config"
     "--fetch-max-in-flight"
@@ -206,6 +207,7 @@ rec {
 
   protectedGatewayExtraArgs = [
     "--metrics-port"
+    "--metrics-addr"
     "--paid-work-config"
     "--gateway-profile"
     "--identity"
@@ -474,10 +476,15 @@ rec {
         default = null;
         description = "Maximum number of Fetch executions waiting behind active provider streams.";
       };
+      metricsAddress = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "IP address for unauthenticated metrics. Non-loopback exposes them to the network.";
+      };
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
-        description = "Optional loopback-only Prometheus metrics port.";
+        description = "Optional unauthenticated Prometheus metrics port.";
       };
       assurance = mkOption {
         type = types.enum [
@@ -540,10 +547,15 @@ rec {
         default = 8080;
         description = "HTTP gateway port. Null lets the CLI auto-select.";
       };
+      metricsAddress = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "IP address for unauthenticated metrics. Non-loopback exposes them to the network.";
+      };
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
-        description = "Optional loopback-only Prometheus metrics port.";
+        description = "Optional unauthenticated Prometheus metrics port.";
       };
       offer = mkOption {
         type = types.nullOr types.str;
@@ -697,6 +709,10 @@ rec {
     ++ optArg "--paid-work-config" serve.workConfigFile
     ++ optArg "--passkey" serve.passkey
     ++ optArg "--metrics-port" serve.metricsPort
+    ++ lib.optionals (serve.metricsPort != null) [
+      "--metrics-addr"
+      serve.metricsAddress
+    ]
     ++ [
       "--assurance"
       serve.assurance
@@ -743,6 +759,10 @@ rec {
     ]
     ++ optArg "--port" gateway.port
     ++ optArg "--metrics-port" gateway.metricsPort
+    ++ lib.optionals (gateway.metricsPort != null) [
+      "--metrics-addr"
+      gateway.metricsAddress
+    ]
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
     ++ lib.optionals (gateway.responsesOverrides != { }) [
       "--responses-overrides"

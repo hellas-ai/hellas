@@ -25,9 +25,12 @@ struct OfferHost {
 }
 impl OfferHost {
     async fn start() -> Self {
-        Self::start_with_otlp(None).await
+        Self::start_with_metrics(None, None).await
     }
-    async fn start_with_otlp(metrics_endpoint: Option<String>) -> Self {
+    async fn start_with_metrics(
+        metrics_endpoint: Option<String>,
+        metrics_address: Option<String>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -36,6 +39,8 @@ impl OfferHost {
         let mut client = Cli::new(root, "client", FRIEND_PASSKEY);
         provider.metrics_endpoint = metrics_endpoint.clone();
         client.metrics_endpoint = metrics_endpoint;
+        provider.metrics_address = metrics_address.clone();
+        client.metrics_address = metrics_address;
         assert_eq!(provider.principal(), ROOT.principal());
         assert_eq!(client.principal(), FRIEND.principal());
         for cli in [&provider, &client] {
@@ -529,12 +534,20 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
         (task, endpoint, receive)
     };
     #[cfg(feature = "otel")]
-    let host = OfferHost::start_with_otlp(Some(endpoint)).await;
+    let host = OfferHost::start_with_metrics(Some(endpoint), Some("0.0.0.0".into())).await;
     #[cfg(not(feature = "otel"))]
-    let host = OfferHost::start().await;
+    let host = OfferHost::start_with_metrics(None, Some("0.0.0.0".into())).await;
     let mut gateway = host.gateway().await;
     let http = reqwest::Client::new();
     for url in [&gateway.metrics, &host.metrics] {
+        assert!(
+            url.starts_with("http://0.0.0.0:"),
+            "explicit bind address was ignored: {url}"
+        );
+    }
+    let gateway_metrics = gateway.metrics.replace("0.0.0.0", "127.0.0.1");
+    let serve_metrics = host.metrics.replace("0.0.0.0", "127.0.0.1");
+    for url in [&gateway_metrics, &serve_metrics] {
         let body = http.get(url).send().await.unwrap().text().await.unwrap();
         assert!(
             !body.contains("hellas_gateway_http_requests_total{"),
@@ -557,14 +570,14 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
         response.bytes().await.unwrap();
         for (url, names) in [
             (
-                &gateway.metrics,
+                &gateway_metrics,
                 vec![
                     "hellas_gateway_http_requests_total",
                     "hellas_gateway_http_duration_seconds_count",
                 ],
             ),
             (
-                &host.metrics,
+                &serve_metrics,
                 vec![
                     "hellas_execution_executions_started_total",
                     "hellas_execution_executions_completed_total",

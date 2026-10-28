@@ -515,3 +515,55 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
         );
     }
 }
+
+#[test]
+fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
+    for command in ["serve", "gateway"] {
+        for (args, expected) in [
+            (
+                vec!["hellas", command, "--metrics-port", "9400"],
+                "127.0.0.1",
+            ),
+            (
+                vec![
+                    "hellas",
+                    command,
+                    "--metrics-port",
+                    "9400",
+                    "--metrics-addr",
+                    "0.0.0.0",
+                ],
+                "0.0.0.0",
+            ),
+            (
+                vec![
+                    "hellas",
+                    command,
+                    "--metrics-port",
+                    "9400",
+                    "--metrics-addr",
+                    "::1",
+                ],
+                "::1",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (port, address) = match cli.command {
+                Commands::Serve {
+                    metrics_port,
+                    metrics_addr,
+                    ..
+                }
+                | Commands::Gateway {
+                    metrics_port,
+                    metrics_addr,
+                    ..
+                } => (metrics_port, metrics_addr),
+                _ => unreachable!(),
+            };
+            assert_eq!(port, Some(9400));
+            assert_eq!(address, expected.parse::<std::net::IpAddr>().unwrap());
+        }
+        assert!(Cli::try_parse_from(["hellas", command, "--metrics-addr", "not-an-ip"]).is_err());
+    }
+}

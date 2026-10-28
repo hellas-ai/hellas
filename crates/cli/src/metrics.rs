@@ -19,10 +19,11 @@ impl MetricsBundle {
     }
 }
 
-pub async fn spawn_metrics_server(port: u16, bundle: MetricsBundle) -> std::io::Result<()> {
-    // Metrics carry provider activity and have no authentication. Keep the
-    // surface local; operators can publish it through their monitored host.
-    let listener = tokio::net::TcpListener::bind(metrics_address(port)).await?;
+pub async fn spawn_metrics_server(
+    address: SocketAddr,
+    bundle: MetricsBundle,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
     let addr = listener.local_addr()?;
     let app = axum::Router::new()
         .route("/metrics", axum::routing::get(scrape))
@@ -57,10 +58,6 @@ async fn scrape(
         )
             .into_response(),
     }
-}
-
-fn metrics_address(port: u16) -> SocketAddr {
-    ([127, 0, 0, 1], port).into()
 }
 
 fn encode_metrics(bundle: &MetricsBundle) -> anyhow::Result<String> {
@@ -109,16 +106,4 @@ fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) -> std::fmt::Re
 #[cfg(not(feature = "otel"))]
 fn append_iroh_metrics(_buf: &mut String, _bundle: &MetricsBundle) -> std::fmt::Result {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unauthenticated_metrics_bind_only_to_loopback() {
-        let address = metrics_address(9400);
-        assert!(address.ip().is_loopback());
-        assert_eq!(address.port(), 9400);
-    }
 }

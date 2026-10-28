@@ -32,7 +32,7 @@ pub struct ServeOptions {
     /// Only its presence serves the two work ALPNs and sells paid work.
     pub paid: Option<paid::PaidWork>,
     pub chain_node: super::chain_node::ChainNodeArgs,
-    pub metrics: Option<(u16, crate::metrics::MetricsBundle)>,
+    pub metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     pub graffiti: String,
     pub fetch_config_file: Option<PathBuf>,
     pub fetch_max_in_flight: usize,
@@ -183,10 +183,10 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         .context("failed to start node server")?,
     };
 
-    if let Some((port, bundle)) = options.metrics {
+    if let Some((address, bundle)) = options.metrics {
         #[cfg(feature = "otel")]
         let bundle = bundle.with_iroh(node.provider_endpoint());
-        crate::metrics::spawn_metrics_server(port, bundle).await?;
+        crate::metrics::spawn_metrics_server(address, bundle).await?;
     }
 
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");

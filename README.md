@@ -367,9 +367,11 @@ cargo update --workspace   # update Cargo.lock
 
 `hellas serve --metrics-port 9090` and `hellas gateway --metrics-port 9091`
 serve Prometheus text at `http://127.0.0.1:<port>/metrics`. This unauthenticated
-listener is loopback-only and available in default packages, including Docker.
+listener defaults to loopback. `--metrics-addr IP` explicitly selects another
+interface, including `0.0.0.0` for container scraping.
 NixOS exposes `services.hellas.metricsPort` and
-`services.hellas.gateway.metricsPort`. One-shot commands do not start a metrics
+`services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port
+(default `"127.0.0.1"`). One-shot commands do not start a metrics
 listener. Scrapes collect executor and gateway OpenTelemetry instruments from
 the same meter provider used for optional OTLP push; both can run together.
 OTLP environment opt-outs, including `OTEL_SDK_DISABLED`, leave this explicitly
