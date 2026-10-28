@@ -148,7 +148,11 @@ async fn a_foreign_first_object_and_a_chunk_replayed_under_another_valid_job_sta
     );
     // A different channel can reserve the entire quota: neither rejected
     // first object consumed staging bytes or a proposal slot.
-    let mut probe = UploadStore::memory(Digest::hash(b"other channel"), quota);
+    let mut probe = UploadStore::memory(
+        Digest::hash(b"other channel"),
+        quota,
+        hellas_store::ContentStore::new(),
+    );
     probe
         .stage(
             Digest::hash(b"work"),
@@ -659,7 +663,11 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     )
     .unwrap();
     first.set_quota(quota.clone()).unwrap();
-    let mut second = UploadStore::memory(Digest::hash(b"second"), quota.clone());
+    let mut second = UploadStore::memory(
+        Digest::hash(b"second"),
+        quota.clone(),
+        hellas_store::ContentStore::new(),
+    );
     let bytes = b"0123456789";
     let work = Digest::hash(b"proposal");
     first

@@ -351,13 +351,15 @@ impl std::fmt::Debug for UploadStore {
     }
 }
 impl UploadStore {
-    pub fn memory(channel: Digest, quota: UploadQuota) -> Self {
+    /// A memory-only store. `content` is the provider's held content, which
+    /// ephemeral jobs may read instead of uploading; it is never written.
+    pub fn memory(channel: Digest, quota: UploadQuota, content: ContentStore) -> Self {
         Self {
             files: None,
             channel,
             quota,
             uploads: BTreeMap::new(),
-            content: ContentStore::new(),
+            content,
         }
     }
     pub fn durable(
@@ -370,8 +372,7 @@ impl UploadStore {
             directory: root.join(format!("{stem}.staging")),
             content_root: root.join("content"),
         };
-        let mut store = Self::memory(channel, UploadQuota::default());
-        store.content = content;
+        let mut store = Self::memory(channel, UploadQuota::default(), content);
         store.files = Some(files.clone());
         if files.directory.try_exists()? {
             let mut parts = Vec::new();
@@ -466,7 +467,10 @@ impl UploadStore {
         object: ContentRef,
     ) -> Result<Option<hellas_store::VerifiedFile>, ContentError> {
         let Some(files) = &self.files else {
-            return Ok(None);
+            return self
+                .content
+                .open_verified(object.id().digest(), object.bytes())
+                .map_err(|e| ContentError::Storage(e.to_string()));
         };
         if !self.content.have(object.id().digest()) {
             let path = files
@@ -493,14 +497,12 @@ impl UploadStore {
         object: ContentRef,
         retention: Retention,
     ) -> Result<u64, ContentError> {
-        match retention {
-            Retention::Ephemeral => Ok(object.bytes()),
-            Retention::Retain => Ok(if self.held_file(object)?.is_some() {
-                0
-            } else {
-                object.bytes()
-            }),
-        }
+        let _ = retention;
+        Ok(if self.held_file(object)?.is_some() {
+            0
+        } else {
+            object.bytes()
+        })
     }
     fn reserved_upload(&self, upload: &Upload) -> Result<u64, ContentError> {
         upload
@@ -509,7 +511,7 @@ impl UploadStore {
             .values()
             .try_fold(0u64, |sum, object| {
                 let bytes = match upload {
-                    Upload::Ephemeral(_) => object.bytes(),
+                    Upload::Ephemeral(_) => self.missing_bytes(*object, Retention::Ephemeral)?,
                     Upload::Retained(u) => self
                         .missing_bytes(*object, Retention::Retain)?
                         .max(u.actual_bytes(*object)?),
@@ -650,10 +652,7 @@ impl UploadStore {
             .ok_or(ContentError::Missing)?
             .meta()
             .object(object)?;
-        let held = match self.uploads.get(&work) {
-            Some(Upload::Retained(_)) => self.held_file(object)?.is_some(),
-            _ => false,
-        };
+        let held = self.held_file(object)?.is_some();
         if held {
             return Ok(object.bytes());
         }
@@ -714,7 +713,12 @@ impl UploadStore {
                 return Err(ContentError::Invalid);
             }
             match upload {
-                Upload::Ephemeral(u) => return Ok(u.read(object)?.as_ref().clone()),
+                Upload::Ephemeral(u) => {
+                    if self.held_file(object)?.is_some() {
+                        return self.retained(object);
+                    }
+                    return Ok(u.read(object)?.as_ref().clone());
+                }
                 Upload::Retained(u) => {
                     u.meta.object(object)?;
                     if self.held_file(object)?.is_some() {
@@ -780,7 +784,21 @@ impl UploadStore {
         match retention {
             Retention::Ephemeral => match self.uploads.get(&work) {
                 Some(Upload::Ephemeral(upload)) => {
-                    Ok(InvocationContent::Ephemeral(upload.snapshot(objects)?))
+                    let mut uploaded = Vec::new();
+                    let mut held = false;
+                    for object in objects {
+                        if self.held_file(*object)?.is_some() {
+                            held = true;
+                        } else {
+                            uploaded.push(*object);
+                        }
+                    }
+                    let content = upload.snapshot(&uploaded)?;
+                    Ok(InvocationContent::Ephemeral(if held {
+                        content.with_held(self.content.clone())
+                    } else {
+                        content
+                    }))
                 }
                 _ if objects.is_empty() => {
                     Ok(InvocationContent::Ephemeral(EphemeralContent::default()))
@@ -1016,8 +1034,10 @@ mod tests {
         bytes
     }
     #[test]
-    fn ephemeral_uploads_never_consult_or_write_the_shared_content_store() {
+    fn ephemeral_uploads_read_held_content_but_never_write_it() {
         let root = tempfile::tempdir().unwrap();
+        let held = b"provider-held-weights";
+        let held_object = ContentRef::for_bytes(held);
         let secret = b"customer-private-payload";
         let object = ContentRef::for_bytes(secret);
         let mut store = UploadStore::durable(
@@ -1027,23 +1047,39 @@ mod tests {
             hellas_store::ContentStore::new(),
         )
         .unwrap();
-        store.retain(secret).unwrap();
+        store.retain(held).unwrap();
+        // Held content satisfies an ephemeral job without an upload.
         assert_eq!(
-            store.missing_bytes(object, Retention::Ephemeral).unwrap(),
-            object.bytes()
+            store
+                .missing_bytes(held_object, Retention::Ephemeral)
+                .unwrap(),
+            0
         );
-        assert!(matches!(
-            store.read(id(2), object, Retention::Ephemeral),
-            Err(ContentError::Missing)
-        ));
+        store
+            .declare_closure(
+                id(2),
+                &[held_object, object],
+                100,
+                Retention::Ephemeral,
+                object.bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read(id(2), held_object, Retention::Ephemeral)
+                .unwrap(),
+            held
+        );
+        // Uploaded ephemeral bytes stay in memory and are never published.
         store
             .stage_complete(id(2), object, 100, Retention::Ephemeral, 1024, secret)
             .unwrap();
         assert!(!store.directory().unwrap().exists());
-        assert_eq!(
-            store.read(id(2), object, Retention::Ephemeral).unwrap(),
-            secret
-        );
+        let content = store
+            .invocation_content(id(2), &[held_object, object], Retention::Ephemeral)
+            .unwrap();
+        assert_eq!(content.read(held_object).unwrap().as_slice(), held);
+        assert_eq!(content.read(object).unwrap().as_slice(), secret);
         drop(store);
         let recovered = UploadStore::durable(
             root.path(),
@@ -1053,10 +1089,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            recovered.read(id(2), object, Retention::Ephemeral),
+            recovered.retained(object),
             Err(ContentError::Missing)
         ));
-        assert_eq!(recovered.retained(object).unwrap(), secret);
+        assert_eq!(recovered.retained(held_object).unwrap(), held);
     }
     #[test]
     fn memory_retention_on_a_durable_channel_releases_node_quota_on_drop() {
@@ -1076,7 +1112,7 @@ mod tests {
             .stage(id(3), object, 100, Retention::Ephemeral, 16, 0, &bytes[..3])
             .unwrap();
         assert!(all_bytes(root.path()).is_empty());
-        let mut second = UploadStore::memory(id(2), quota);
+        let mut second = UploadStore::memory(id(2), quota, hellas_store::ContentStore::new());
         assert!(matches!(
             second.stage(id(4), object, 100, Retention::Ephemeral, 16, 0, &[]),
             Err(ContentError::StagingLimit(16))
@@ -1457,7 +1493,7 @@ mod tests {
         store
             .publish_accepted(id(3), bytes, Retention::Retain)
             .unwrap();
-        let mut other = UploadStore::memory(id(4), quota);
+        let mut other = UploadStore::memory(id(4), quota, hellas_store::ContentStore::new());
         let reference = ContentRef::for_bytes(b"elevenbytes");
         assert!(matches!(
             other.stage(id(5), reference, 50, Retention::Ephemeral, 1024, 0, &[]),

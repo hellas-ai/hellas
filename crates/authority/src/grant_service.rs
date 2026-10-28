@@ -80,6 +80,7 @@ pub struct GrantService {
     draining: Arc<tokio::sync::Mutex<()>>,
     addresses: Arc<Vec<String>>,
     upload_quota: hellas_channel::content::UploadQuota,
+    content: hellas_store::ContentStore,
 }
 struct Runtime {
     uploads: BTreeMap<Digest, hellas_channel::content::UploadStore>,
@@ -210,6 +211,12 @@ impl GrantService {
         self.upload_quota = quota;
         self
     }
+    /// The provider's held content, which memory-only grant jobs may read
+    /// instead of uploading. Grant jobs never write to it.
+    pub fn with_content_store(mut self, content: hellas_store::ContentStore) -> Self {
+        self.content = content;
+        self
+    }
     /// Shares this exact writer; the returned interface still requires an
     /// authenticated application caller for every authority mutation.
     pub fn node(&self) -> crate::node::NodeCoordinator {
@@ -294,6 +301,7 @@ impl GrantService {
             draining: Arc::new(tokio::sync::Mutex::new(())),
             addresses: Arc::new(addresses),
             upload_quota: Default::default(),
+            content: hellas_store::ContentStore::new(),
         }
     }
     /// Internal serialized driver access. Public administration verifies its caller.

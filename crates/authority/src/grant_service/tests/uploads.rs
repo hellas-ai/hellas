@@ -159,8 +159,11 @@ async fn an_idle_partial_grant_upload_expires_without_another_request_or_mutatio
     })
     .await;
     assert_no_payload_files(root.path(), &bytes);
-    let mut probe =
-        hellas_channel::content::UploadStore::memory(Digest::hash(b"quota after expiry"), quota);
+    let mut probe = hellas_channel::content::UploadStore::memory(
+        Digest::hash(b"quota after expiry"),
+        quota,
+        hellas_store::ContentStore::new(),
+    );
     let all = vec![0; 1 << 20];
     probe
         .stage(
@@ -279,8 +282,11 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
         .unwrap(),
         GrantRefusalCode::QueueCapacity
     );
-    let mut probe =
-        hellas_channel::content::UploadStore::memory(Digest::hash(b"another channel"), quota);
+    let mut probe = hellas_channel::content::UploadStore::memory(
+        Digest::hash(b"another channel"),
+        quota,
+        hellas_store::ContentStore::new(),
+    );
     let entire_cap = vec![0; paid_bytes.len().max(bytes.len())];
     probe
         .stage(

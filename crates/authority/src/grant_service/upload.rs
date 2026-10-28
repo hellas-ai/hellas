@@ -105,6 +105,7 @@ impl GrantWork {
                 hellas_channel::content::UploadStore::memory(
                     a.channel_id.0,
                     self.service.upload_quota.clone(),
+                    self.service.content.clone(),
                 )
             });
             uploads
