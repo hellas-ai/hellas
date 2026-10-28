@@ -25,20 +25,29 @@ pub use run::{RunArgs, run as run_program};
 #[cfg(test)]
 mod tests;
 
+/// `ENROLLMENT_ID@NODE_ID`, optionally followed by `@IP:PORT`.
 #[derive(Clone, Debug)]
 pub struct Provider {
-    pub id: iroh::EndpointId,
+    pub address: hellas_sdk::client::ProviderAddress,
     pub addresses: Vec<SocketAddr>,
 }
 impl std::str::FromStr for Provider {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (id, address) = value
-            .split_once('@')
-            .map_or((value, None), |(id, a)| (id, Some(a)));
+        let (address, direct) = value
+            .match_indices('@')
+            .nth(1)
+            .map_or((value, None), |(at, _)| {
+                (&value[..at], Some(&value[at + 1..]))
+            });
         Ok(Self {
-            id: id.parse().context("invalid provider node ID")?,
-            addresses: address.map(str::parse).transpose()?.into_iter().collect(),
+            address: address.parse()?,
+            addresses: direct
+                .map(str::parse)
+                .transpose()
+                .context("invalid provider @IP:PORT")?
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -64,7 +73,8 @@ fn duration(value: &str) -> Result<Duration, String> {
 
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
-    /// Provider node ID, optionally followed by @IP:PORT.
+    /// Provider address ENROLLMENT_ID@NODE_ID, as `hellas serve` prints it,
+    /// optionally followed by @IP:PORT.
     #[arg(long)]
     provider: Provider,
     /// Additional direct UDP addresses for the provider.
@@ -206,12 +216,18 @@ impl ClientArgs {
                 )
                 .to_string(),
             )
-            .join(self.provider.id.to_string())
+            .join(self.provider.address.to_string())
             .join(hex::encode(owner.principal().as_bytes()))
             .join(format!("{}.json", job.digest()));
         let mut purchase = Purchase::open(&path, job, self.buy_again)?;
         purchase.reconcile(options).await?;
         Ok(purchase)
+    }
+
+    /// One directory of channel journals per provider address.
+    fn journals(&self, root: &Path) -> PathBuf {
+        root.join("channels")
+            .join(self.provider.address.to_string())
     }
 
     async fn options(
@@ -234,9 +250,9 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: root.join("channels").join(self.provider.id.to_string()),
+            journal_root: self.journals(&root),
             config,
-            provider: self.provider.id,
+            provider: self.provider.address,
             provider_addrs: self
                 .provider
                 .addresses
@@ -563,7 +579,7 @@ fn write(path: &Path, bytes: &[u8]) -> super::CliResult<()> {
 fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
     format!(
         "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} ({})",
-        provider.id,
+        provider.address,
         job.digest(),
         job.manifest().application().evaluator(),
         job.manifest().application().adaptor(),
@@ -575,7 +591,7 @@ fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
         } else {
             format!(
                 "open; `hellas transact --settle --provider {}` closes it",
-                provider.id
+                provider.address
             )
         }
     )

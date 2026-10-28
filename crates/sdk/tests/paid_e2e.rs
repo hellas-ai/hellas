@@ -108,6 +108,90 @@ fn provider_enrollment(identity: &NodeIdentity) -> hellas_rpc::ProviderEnrollmen
     )
 }
 
+/// A valid, root-signed enrollment of the same node that the provider does not present.
+fn other_provider(options: &PaidWorkOptions) -> PaidWorkOptions {
+    let other = enrollment(
+        &ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
+        &ProducerSigningKey::from_secret_bytes([8; 32]).unwrap(),
+        *options.provider.node.as_bytes(),
+        [3; 32],
+    );
+    let address = hellas_sdk::client::ProviderAddress::of(&other).unwrap();
+    assert_eq!(address.node, options.provider.node);
+    assert_ne!(address.enrollment, options.provider.enrollment);
+    PaidWorkOptions {
+        provider: address,
+        ..options.clone()
+    }
+}
+
+/// A buyer addressing another enrollment of this node is refused before it
+/// signs a request, approves funding or writes a channel journal.
+async fn check_other_enrollment_refused(
+    options: &PaidWorkOptions,
+    endpoint: &iroh::Endpoint,
+    owner: Arc<hellas_sdk::client_owner::ClientOwner>,
+    approvals: &Approvals,
+) {
+    let mut elsewhere = other_provider(options);
+    elsewhere.journal_root = options.journal_root.with_file_name("elsewhere-journal");
+    let refused = |error: String| {
+        assert!(error.contains("genesis pin mismatch"), "{error}");
+    };
+    refused(
+        hellas_sdk::paid_client::request_paid_quote(
+            &elsewhere,
+            endpoint,
+            &client_settlement(),
+            FRIEND.principal(),
+        )
+        .await
+        .expect_err("quote from another enrollment")
+        .to_string(),
+    );
+    refused(
+        PaidWorkSession::open(
+            elsewhere.clone(),
+            endpoint.clone(),
+            client_settlement(),
+            owner.clone(),
+        )
+        .await
+        .err()
+        .expect("channel with another enrollment")
+        .to_string(),
+    );
+    let mut gateway = elsewhere.clone();
+    gateway.journal_root = options.journal_root.with_file_name("elsewhere-gateway");
+    let error = hellas_sdk::paid_gateway::PaidGateway::open(
+        hellas_sdk::paid_gateway::PaidGatewayOptions {
+            providers: vec![gateway],
+            max_pending_requests: 1,
+        },
+        NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
+            .unwrap(),
+        owner,
+    )
+    .await
+    .err()
+    .expect("pool with another enrollment");
+    refused(format!("{error:#}"));
+    assert!(
+        approvals.0.lock().unwrap().is_empty(),
+        "another enrollment never reaches funding"
+    );
+    assert!(
+        hellas_channel::work_store::discover_setups(
+            &elsewhere.journal_root,
+            elsewhere.config.chain.network
+        )
+        .await
+        .unwrap()
+        .setups
+        .is_empty()
+    );
+}
+
 fn work_policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![Admission::Fetch {
@@ -496,7 +580,7 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
-                provider: options.provider,
+                provider: options.provider.node,
                 service: "openai".into(),
                 method: "wrong-route".into(),
                 body: BODY.to_vec(),
@@ -511,7 +595,7 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
-                provider: options.provider,
+                provider: options.provider.node,
                 service: "openai".into(),
                 method: "responses".into(),
                 body: oversized.into_bytes(),
@@ -716,7 +800,7 @@ async fn paid_setup(
     let options = PaidWorkOptions {
         config: client_config,
         journal_root: root.path().join("client-journal"),
-        provider: provider.node_id(),
+        provider: hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap(),
         provider_addrs,
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
@@ -738,6 +822,13 @@ async fn paid_setup(
     );
     let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
     assert!(!options.config.journal_root.exists());
+    Box::pin(check_other_enrollment_refused(
+        &options,
+        &endpoint,
+        owner.clone(),
+        &approvals,
+    ))
+    .await;
     let quote = hellas_sdk::paid_client::request_paid_quote(
         &options,
         &endpoint,
@@ -977,6 +1068,25 @@ async fn paid_finish(case: PaidScenario) {
     );
     recovered.shutdown().await;
     drop(recovered);
+    // Restart recovery re-verifies the retained offer against the address.
+    let error = PaidWorkSession::open_retained(
+        other_provider(&options),
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+    )
+    .await
+    .err()
+    .expect("retained channel under another enrollment");
+    assert!(
+        matches!(
+            error,
+            hellas_sdk::paid_client::PaidClientError::RetainedEnrollment(address)
+                if address == other_provider(&options).provider
+        ),
+        "{error}"
+    );
+    assert_eq!(approvals.0.lock().unwrap().len(), 1);
     endpoint.close().await;
     eprintln!("H4 offline recovery complete; running paid job");
     let client_producer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();

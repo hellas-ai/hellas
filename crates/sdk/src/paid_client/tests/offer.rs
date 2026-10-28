@@ -235,7 +235,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             args: PaidWorkOptions {
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),
-                provider: server.id(),
+                provider: crate::test_support::address(server.id()),
                 provider_addrs: server.bound_sockets(),
                 apple_trust: None,
                 assurance: Assurance::ProducerSigned,

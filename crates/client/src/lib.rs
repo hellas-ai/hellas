@@ -18,7 +18,7 @@ pub use error::{ClientError, ClientResult};
 #[cfg(feature = "iroh")]
 pub use iroh::{
     AppleAppAttestTrust, ProviderAddress, ProviderAddressError, ProviderTrustAnchor,
-    RemoteNodeTarget, confidential_open, confidential_open_selected, selected_provider_trust,
+    RemoteNodeTarget, confidential_open,
 };
 
 /// Client capabilities shared by local and transport-specific orchestration.

@@ -31,6 +31,11 @@ impl hellas_rpc::open::OpenHandler for OpenProof {
     }
 }
 
+/// The address of the provider `enrollment(peer)` enrolls.
+pub(crate) fn address(peer: EndpointId) -> hellas_client::ProviderAddress {
+    hellas_client::ProviderAddress::of(&enrollment(peer).0).unwrap()
+}
+
 pub(crate) fn enrollment(peer: EndpointId) -> (ProviderEnrollmentBundle, ProducerSigningKey) {
     let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
