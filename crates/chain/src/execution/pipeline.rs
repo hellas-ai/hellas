@@ -16,6 +16,9 @@ use std::{
 };
 use tokio::sync::watch;
 
+/// Finalized blocks of QMDB history kept behind the active range (decision 51).
+const RETAINED_QMDB_BLOCKS: usize = 256;
+
 pub(crate) type Execution<R> =
     stateful::Stateful<Context, Application, Scheme, Standard<HellasBlock>, R>;
 pub(crate) type Mailbox = stateful::Mailbox<Context, Application>;
@@ -57,15 +60,20 @@ where
             },
             // QMDB must retain the ack window for crash recovery. The archive's
             // independent retention cap keeps the complete archive by default.
+            // QMDB keeps 256 blocks of history so a verified remote read of the
+            // latest certified range survives a prune landing mid-read (decision 51).
+            // Stateful requires marshal to retain at least as many blocks as QMDB.
             prune_config: Some(stateful::PruneConfig {
                 max_pending_acks: NonZeroUsize::MIN,
                 maintenance_interval: NZUsize!(64),
-                retained_marshal_blocks: retention.map_or(0, |n| {
-                    usize::try_from(n.get())
-                        .unwrap_or(usize::MAX)
-                        .saturating_sub(2)
-                }),
-                retained_qmdb_blocks: 0,
+                retained_marshal_blocks: retention
+                    .map_or(0, |n| {
+                        usize::try_from(n.get())
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(2)
+                    })
+                    .max(RETAINED_QMDB_BLOCKS),
+                retained_qmdb_blocks: RETAINED_QMDB_BLOCKS,
             }),
         },
     )
