@@ -53,11 +53,21 @@ struct Record {
     phase: Phase,
 }
 
+struct PurchaseLock(File);
+
+impl Drop for PurchaseLock {
+    fn drop(&mut self) {
+        // A concurrently forked child can retain the open file description
+        // after this one closes, so release the lock itself.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Held from before channel funding until output has been successfully reported.
 /// The lock serializes invocations of the same job, including --buy-again.
 pub struct Purchase {
     path: PathBuf,
-    _lock: File,
+    _lock: PurchaseLock,
     job: [u8; 32],
     price: u64,
     record: Option<Record>,
@@ -69,6 +79,7 @@ impl Purchase {
         hellas_private::create_dir_all_durable(parent)?;
         let lock = hellas_private::open_lock_beside(path)?;
         lock.try_lock().map_err(|_| PurchaseError::Busy)?;
+        let lock = PurchaseLock(lock);
         let record: Option<Record> = match hellas_private::read_bounded_regular_file(path, 4096) {
             Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
