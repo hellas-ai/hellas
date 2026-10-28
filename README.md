@@ -38,7 +38,7 @@ independently of gateway archive settings.
 
 ## Quickstart: sell and buy one job
 
-Person A sells GPU compute on the devnet with a GPU build (`.#cli-catena` or
+Person A sells GPU compute on the devnet with a GPU build (`.#cli` or
 the `hip`/`cuda` image below):
 
 ```sh
@@ -116,6 +116,11 @@ See [paid Work](crates/channel/README.md) for channel configuration and
 For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor's
 request, response and streaming formats. CLI gateways archive payloads by default;
 `--zdr` or `x-hellas-zdr: true` disables application payload persistence.
+
+`--text-model` also runs without a chain: `--local-grant ID` serves this
+node's own configured allowance in process (with the `serve` content and GPU
+flags), and `--offer ALIAS` reaches an allowance on another node you own. Such
+memory-only jobs read weights the provider already holds; they never write them.
 
 `--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
 gateway renders each request as a Compute job from the GGUF's configuration
@@ -226,8 +231,8 @@ cargo run -- \
 
 ## Nix
 
-The main outputs are `.#cli` (network client/node/gateway), `.#cli-catena`
-(x86_64 Linux plus the Catena safe GPU runtime), and `.#cli-validator`.
+The main outputs are `.#cli` (client, node, gateway and the Catena GPU
+runtime) and `.#cli-validator`.
 Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
@@ -441,7 +446,7 @@ continues to accept an exact trace URL. Home Manager and nix-darwin scope
 variables to `hellas`, rather than enabling unrelated applications.
 Home Manager's `programs.hellas.serve` supplies the Darwin user service.
 Direct package users can use `cli.override { otel = true; }` (also
-`cli-catena` and `cli-validator`) and the standard `OTEL_*` environment variables.
+`cli-validator`) and the standard `OTEL_*` environment variables.
 
 One CLI SDK lifecycle owns traces and metrics, including validators. Native
 operations follow the GenAI Development conventions at
