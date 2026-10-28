@@ -287,13 +287,9 @@ impl HttpFetchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::{
-        FetchOutputTranscriptBuilder, encode_fetch_event_payload, encode_fetch_terminal_payload,
-        verify_output_events,
-    };
+    use crate::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
     use crate::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
-    use crate::{Assurance, InputCommitment};
-    use hellas_auth::{Digest, ProducerSigningKey};
+    use hellas_auth::ProducerSigningKey;
 
     fn request() -> HttpFetchRequest {
         HttpFetchRequest {
@@ -311,26 +307,21 @@ mod tests {
     }
     fn output(events: Vec<HttpResponseEvent>) -> crate::fetch::FetchOutput {
         let key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
-        let input = InputCommitment::from_digest(Digest::from_bytes([2; 32]));
-        let mut builder = FetchOutputTranscriptBuilder::new(input, Assurance::ProducerSigned, &key);
-        for event in events {
-            builder
-                .push_event(
+        crate::fetch::FetchOutput::from_authenticated_payloads(
+            key.public_key(),
+            events
+                .into_iter()
+                .map(|event| {
                     encode_fetch_event_payload(&OutputEvent::Adaptor(AdaptorEvent::Http(event)))
-                        .unwrap(),
-                )
-                .unwrap();
-        }
-        let events = builder
-            .finish(
-                encode_fetch_terminal_payload(&OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
+                        .unwrap()
                 })
-                .unwrap(),
-            )
-            .unwrap();
-        verify_output_events(input, Assurance::ProducerSigned, &events).unwrap()
+                .collect(),
+            encode_fetch_terminal_payload(&OutputEvent::Finished {
+                stop_reason: StopReason::EndOfText,
+                usage: None,
+            })
+            .unwrap(),
+        )
     }
     fn head() -> HttpResponseEvent {
         HttpResponseEvent::Head {

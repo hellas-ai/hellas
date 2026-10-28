@@ -23,6 +23,27 @@ pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
+/// Offline seed-100 finality trust bound to the shipped devnet genesis.
+pub const HELLAS_DEVNET_1_TRUST_JSON: &str = include_str!("../networks/hellas-devnet-1/trust.json");
+/// Genesis block payload independently derived from the shipped document.
+pub const HELLAS_DEVNET_1_GENESIS_PAYLOAD: &str =
+    include_str!("../networks/hellas-devnet-1/genesis-payload.hex");
+
+/// Intentionally public software-passkey credentials for the development network.
+pub const HELLAS_DEVNET_1_FAUCET_JSON: &str =
+    include_str!("../networks/hellas-devnet-1/faucet.json");
+
+/// One public development account. Cryptographic consumers validate its key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaucetAccount {
+    pub index: u8,
+    /// Base58-encoded compressed P-256 settlement key.
+    pub address: String,
+    /// Hex-encoded, big-endian 32-byte P-256 secret scalar.
+    pub secret_scalar: String,
+}
+
 /// A network whose genesis document ships inside the binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownNetwork {

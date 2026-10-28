@@ -53,7 +53,6 @@ fn signed_open_response(
     let signature = producer.sign_digest(binding).unwrap();
     (
         ProviderTrustAnchor {
-            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -210,7 +209,6 @@ fn apple_open_response_for_alpn(
     });
     (
         ProviderTrustAnchor {
-            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::AppleAppAttest,
             apple_app_attest: Some(apple),
@@ -244,6 +242,61 @@ fn producer_signed_open_happy_path_verifies() {
     let verified =
         verify_open_response(&trust, &exporter, &nonce, ALPN, ENROLLED_PEER, response).unwrap();
     assert_eq!(verified, expected);
+}
+
+#[test]
+fn selected_software_provider_requires_a_valid_open_from_the_selected_peer() {
+    let exporter = [5; 32];
+    let nonce = [6; 32];
+    let (_, response) = signed_open_response(&exporter, &nonce);
+    let bundle =
+        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
+    let trust = selected_provider_trust(&bundle, Assurance::ProducerSigned, None).unwrap();
+    verify_open_response(
+        &trust,
+        &exporter,
+        &nonce,
+        ALPN,
+        ENROLLED_PEER,
+        response.clone(),
+    )
+    .unwrap();
+    assert!(
+        verify_open_response(
+            &trust,
+            &exporter,
+            &nonce,
+            ALPN,
+            PeerIdentity([0; 32]),
+            response.clone()
+        )
+        .is_err()
+    );
+    assert!(verify_open_response(&trust, &[0; 32], &nonce, ALPN, ENROLLED_PEER, response).is_err());
+    assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
+}
+
+#[test]
+fn selected_apple_provider_keeps_independent_app_and_cdhash_approval() {
+    let (trust, response, _) =
+        apple_open_response(&[5; 32], &[6; 32], 2, Arc::new(TestCounterStore::default()));
+    let bundle =
+        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
+    assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
+    assert!(selected_provider_trust(&bundle, Assurance::ProducerSigned, None).is_err());
+    for wrong_app in [true, false] {
+        let mut bad = trust.clone();
+        let apple = bad.apple_app_attest.as_mut().unwrap();
+        if wrong_app {
+            apple.app_id = "OTHER.app".into();
+        } else {
+            apple.allowed_cd_hashes = vec![[0; 32]];
+        }
+        assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&bad)).is_err());
+    }
+    let approved =
+        selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&trust)).unwrap();
+    verify_open_response(&approved, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).unwrap();
 }
 
 #[test]
@@ -460,8 +513,8 @@ fn paid_services_app_attest_binds_the_exact_connection_and_service() {
 #[cfg(feature = "work")]
 #[test]
 fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
-    use crate::{FetchChunkVerifier, ProducerTrust, UnpinnedOffer};
-    use hellas_work::model::grant::{records::*, *};
+    use crate::UnpinnedOffer;
+    use hellas_authority::model::grant::{records::*, *};
     use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
     let (trust, response, public_key) =
@@ -472,42 +525,26 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         verify_software_enrollment(&bundle).is_err(),
         "platform roots remain provider-only"
     );
-    let client = hellas_work::test_support::principal(1).0;
+    let client = hellas_channel::test_support::principal(1).0;
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-    let route =
-        hellas_work::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
     let policy = GrantPolicy {
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "responses".into(),
         https: None,
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },
-        responses: Some(hellas_work::model::grant::responses::ResponsesResource {
-            model: "fixture".into(),
-            max_output_tokens: 8,
-            settings: Default::default(),
-        }),
-        work: hellas_work::model::profile::WorkPolicy::Fetch {
-            contract: test_responses_contract(),
-            policy: hellas_work::model::fetch::FetchPolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: hellas_work::model::fetch::fetch_route_commitment(
-                    &route.canonical_body_bytes(),
-                )
-                .unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 65536,
-                max_spool_bytes: 131072,
-                max_encoded_result_frame: 131072,
-                max_encoded_prepared_input: 65536,
+        responses: Some(
+            hellas_authority::model::grant::responses::ResponsesResource {
+                model: "fixture".into(),
+                max_output_tokens: 8,
+                settings: Default::default(),
             },
-            route,
-        },
+        ),
+        invocation_policy: hellas_authority::test_support::policy().invocation_policy,
     };
     let offer = SignedOffer::sign(
         Offer {
@@ -560,30 +597,21 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     )
     .unwrap();
     assert_eq!(counters.counters.lock().unwrap().get(&public_key), Some(&2));
-    let input = hellas_rpc::InputCommitment::from_digest(Digest::hash(b"grant input"));
-    let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(
-        &hellas_rpc::output::OutputEvent::Finished {
-            stop_reason: hellas_rpc::output::StopReason::EndOfText,
-            usage: None,
-        },
-    )
-    .unwrap();
-    let events = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
-        input,
-        Assurance::AppleAppAttest,
-        &producer,
-    )
-    .finish(terminal)
-    .unwrap();
-    let mut verifier = FetchChunkVerifier::new(
-        input,
-        pinned.trust().required_assurance,
-        ProducerTrust::keys([verified]),
-    );
-    verifier.verify_terminal(events[0].clone()).unwrap();
+    use hellas_rpc::protocol::invocation::{InvocationRequest, output};
+    let request = InvocationRequest {
+        execution_environment: ContentId::hash(b"grant environment"),
+        input: ContentId::hash(b"grant input"),
+        runner_public_key: producer.public_key(),
+        nonce: [3; 32],
+        assurance: Assurance::AppleAppAttest,
+        retain: false,
+    };
+    let (_, events) = output::OutputStream::new(&request, &producer, 65536)
+        .unwrap()
+        .fail(output::FailureReason::Unavailable)
+        .unwrap();
+    output::verify(&request, &verified, &events, 65536).unwrap();
     assert!(
         verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).is_err()
     );
 }
-
-use hellas_work::test_support::test_responses_contract;

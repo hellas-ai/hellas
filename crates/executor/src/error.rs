@@ -1,11 +1,10 @@
-use hellas_rpc::TokenBytesError;
 use hellas_wire::{WireCode, WireStatus};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
     #[error(transparent)]
-    Backend(#[from] hellas_work::work::BackendFault),
+    Backend(#[from] hellas_channel::work::BackendFault),
     #[error("worker exited without acknowledging completion")]
     Completion(#[source] tokio::sync::oneshot::error::RecvError),
     #[error("executor channel closed")]
@@ -22,16 +21,14 @@ pub enum ExecutorError {
     PolicyDenied(String),
     #[error("invalid token payload: {0}")]
     InvalidTokenPayload(String),
-    #[error(transparent)]
-    TokenBytes(#[from] TokenBytesError),
 }
 impl From<ExecutorError> for WireStatus {
     fn from(err: ExecutorError) -> Self {
         let code = match &err {
             ExecutorError::ResourceExhausted(_) => WireCode::ResourceExhausted,
-            ExecutorError::InvalidInput(_)
-            | ExecutorError::InvalidTokenPayload(_)
-            | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
+            ExecutorError::InvalidInput(_) | ExecutorError::InvalidTokenPayload(_) => {
+                WireCode::InvalidArgument
+            }
             ExecutorError::PolicyDenied(_) => WireCode::PermissionDenied,
             ExecutorError::ContentNotFound(_) => WireCode::NotFound,
             ExecutorError::Completion(_)

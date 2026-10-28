@@ -1,11 +1,11 @@
 use super::*;
+use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_rpc::{Assurance, RootProof};
 use hellas_sdk::{
     GrantProviderOptions, grant_client::UnpinnedOffer,
     grant_gateway::responses::FetchGatewayOptions,
 };
-use hellas_work::model::grant::budget::*;
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicUsize, Ordering},
@@ -157,11 +157,14 @@ async fn tls_fixture(mode: UpstreamMode) -> TlsFixture {
 }
 
 use hellas_auth::authority::{CredentialSecret, GrantId, Revision};
-use hellas_work::model::grant::admin::{WorkControlCommand, WorkControlReply};
-use hellas_work::test_support::{
-    Allowance, Capacity, Node, Rights, TestClock, WAIT,
-    actors::{FRIEND, PROVIDER, ROOT},
-    authority, ids,
+use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
+use {
+    hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
+    hellas_authority::test_support::Node, hellas_authority::test_support::TestClock,
+    hellas_authority::test_support::WAIT, hellas_authority::test_support::authority,
+    hellas_authority::test_support::ids, hellas_channel::test_support::Rights,
+    hellas_channel::test_support::actors::FRIEND, hellas_channel::test_support::actors::PROVIDER,
+    hellas_channel::test_support::actors::ROOT,
 };
 const ROOT_GRANT: GrantId = ids::ROOT_GRANT;
 const ALLOWANCE: GrantId = GrantId([7; 16]);
@@ -229,6 +232,7 @@ impl ResellerBuilder {
                             "responses",
                             responses_resource(),
                             pricing(),
+                            NonZeroU64::new(60_000).unwrap(),
                         )
                         .unwrap(),
                     ],
@@ -241,7 +245,7 @@ impl ResellerBuilder {
         allowance.definition.policies = options().grants.unwrap().policies;
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
         let world = Node::bootstrap(&root.path().join("provider/grants"))
-            .with_network(hellas_work::model::grant::grant_network())
+            .with_network(hellas_authority::model::grant::grant_network())
             .with_provider(provider_bundle.clone())
             .with_clock(clock.clone())
             .with_capacity(Capacity::new(1))
@@ -250,8 +254,8 @@ impl ResellerBuilder {
                 ids::FRIEND_GRANT,
                 Rights::new(authority(), FRIEND)
                     .allow(
-                        hellas_work::grant_service::WORK_EXECUTE,
-                        hellas_work::grant_service::allowance_resource(authority(), ALLOWANCE),
+                        hellas_authority::grant_service::WORK_EXECUTE,
+                        hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
                     )
                     .valid_from(clock.now())
                     .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
@@ -272,9 +276,11 @@ impl ResellerBuilder {
         let provider = start_fetch_provider(options().prepare().await.unwrap())
             .await
             .unwrap();
-        let caller =
-            hellas_work::test_support::session(&provider.administration().unwrap().node(), &secret)
-                .await;
+        let caller = hellas_authority::test_support::session(
+            &provider.administration().unwrap().node(),
+            &secret,
+        )
+        .await;
         let authorization = ROOT_GRANT;
         let admin = provider.administration().unwrap();
         let WorkControlReply::Offers(mut offers) = provider
@@ -297,13 +303,6 @@ impl ResellerBuilder {
         )
         .unwrap()
         .pin(&hellas_sdk::client::ProviderTrustAnchor {
-            allowed_environments: offer
-                .offer()
-                .grant
-                .policies
-                .iter()
-                .map(|p| p.work.allowed_environment())
-                .collect(),
             expected_genesis: provider_bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -315,8 +314,8 @@ impl ResellerBuilder {
             let scope = GrantSpec {
                 authority: caller.authority(),
                 subject: caller.subject(),
-                permissions: [hellas_work::operations::Operation::named(
-                    hellas_work::node::GATEWAY_INVOKE,
+                permissions: [hellas_authority::operations::Operation::named(
+                    hellas_authority::node::GATEWAY_INVOKE,
                 )
                 .unwrap()
                 .permission(caller.authority(), None)
@@ -327,7 +326,7 @@ impl ResellerBuilder {
                 not_before: UnixMillis::now().unwrap_or_default(),
                 expires: UnixMillis(UnixMillis::now().unwrap_or_default().0 + 60_000),
             };
-            let (_, credential) = hellas_work::test_support::credentials::issue_one(
+            let (_, credential) = hellas_authority::test_support::credentials::issue_one(
                 &node,
                 &caller,
                 authorization,
@@ -358,7 +357,7 @@ impl ResellerBuilder {
                         pinned.offer().grant.max_job_millis.get(),
                     ),
                     target: pinned,
-                    principal: hellas_work::test_support::subject_of(client_identity.node_key()),
+                    principal: hellas_channel::test_support::subject_of(client_identity.node_key()),
                     signer: Arc::new(client_identity.node_key().clone()),
                     application: application.clone(),
                     journal_root: root.path().join("client"),
@@ -389,7 +388,7 @@ impl Reseller {
     }
     async fn revoke_application(&self) {
         let node = self.provider.administration().unwrap().node();
-        let caller = hellas_work::test_support::session(&node, &self.administrator).await;
+        let caller = hellas_authority::test_support::session(&node, &self.administrator).await;
         node.revoke_credential(
             &caller,
             ROOT_GRANT,
@@ -451,7 +450,7 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
 /// The provider's self-attested enrollment: a software root, distinct from
 /// its node and transport keys, endorses both.
 fn software_enrollment(identity: &NodeIdentity) -> ProviderEnrollmentBundle {
-    hellas_work::test_support::enrollment(
+    hellas_channel::test_support::enrollment(
         &hellas_auth::ProducerSigningKey::from_secret_bytes([0x55; 32]).unwrap(),
         identity.node_key(),
         *identity.node_id().as_bytes(),
@@ -494,7 +493,7 @@ impl OpenAiFixture {
             resource: ResourceId(hellas_auth::Digest::hash(b"test resource")),
             account: ResourceId(hellas_auth::Digest::hash(b"test account")),
             policy_revision: Revision(1),
-            pricing: hellas_work::model::grant::pricing::Pricing {
+            pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
                 rates: None,
             },
@@ -527,7 +526,7 @@ async fn host_control_starts_the_openai_reseller_factory() {
         .await;
     let secret = world.secret(ROOT);
     let secret = CredentialSecret::from_parts(secret.id(), *secret.expose_secret());
-    let node = hellas_work::node::NodeCoordinator::new(
+    let node = hellas_authority::node::NodeCoordinator::new(
         world.store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
@@ -554,17 +553,17 @@ async fn host_control_starts_the_openai_reseller_factory() {
     host.shutdown().await.unwrap();
 }
 
-fn responses_resource() -> hellas_work::model::grant::responses::ResponsesResource {
-    hellas_work::model::grant::responses::ResponsesResource {
+fn responses_resource() -> hellas_authority::model::grant::responses::ResponsesResource {
+    hellas_authority::model::grant::responses::ResponsesResource {
         model: "fixture".into(),
         max_output_tokens: 8,
         settings: Default::default(),
     }
 }
 
-fn pricing() -> hellas_work::model::grant::pricing::Pricing {
+fn pricing() -> hellas_authority::model::grant::pricing::Pricing {
     use hellas_auth::authority::Revision;
-    use hellas_work::model::grant::pricing::{Pricing, UnitPrice};
+    use hellas_authority::model::grant::pricing::{Pricing, UnitPrice};
     Pricing {
         revision: Revision(1),
         rates: Some(vec![
@@ -586,7 +585,7 @@ type TestControl =
     hellas_rpc::services::host_control::HostControlClientImpl<hellas_sdk::wire::mux::MuxTransport>;
 async fn controlled_host(
     root: &std::path::Path,
-    node: hellas_work::node::NodeCoordinator,
+    node: hellas_authority::node::NodeCoordinator,
     secret: &hellas_auth::authority::CredentialSecret,
     provider: Option<hellas_sdk::node_control::host::ProviderFactory>,
     gateway: Option<(
@@ -619,7 +618,7 @@ async fn controlled_host(
             .to_vec(),
     ];
     trust.alpn_protocols = tls.alpn_protocols.clone();
-    let authority = hellas_work::test_support::session(&node, secret)
+    let authority = hellas_authority::test_support::session(&node, secret)
         .await
         .authority();
     let socket = root.join("control/host.socket");
@@ -647,7 +646,7 @@ async fn controlled_host(
         "localhost".try_into().unwrap(),
         authority,
         secret,
-        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -662,7 +661,7 @@ async fn controlled_gateway(
     gateway: FetchGatewayOptions,
     key: iroh::SecretKey,
     root: &std::path::Path,
-    node: hellas_work::node::NodeCoordinator,
+    node: hellas_authority::node::NodeCoordinator,
     secret: &hellas_auth::authority::CredentialSecret,
 ) -> ControlledGateway {
     let (host, control) = controlled_host(

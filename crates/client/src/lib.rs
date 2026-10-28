@@ -4,32 +4,24 @@
 #[cfg(feature = "iroh")]
 pub mod cache;
 mod error;
-#[cfg(feature = "evaluate")]
-mod evaluate;
-#[cfg(all(feature = "iroh", feature = "evaluate"))]
+#[cfg(feature = "iroh")]
 pub mod execution;
-mod fetch;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 #[cfg(all(feature = "iroh", feature = "work"))]
 mod offer;
+pub mod text;
 #[cfg(feature = "work")]
 pub mod work;
 #[cfg(all(feature = "iroh", feature = "work"))]
 pub use offer::{PinnedOffer, UnpinnedOffer};
 
 pub use error::{ClientError, ClientResult};
-#[cfg(feature = "evaluate")]
-pub use evaluate::{
-    EvaluateChunkVerifier, EvaluateExecutionEvent, EvaluateOutcome,
-    evaluate_input_from_request_commitment, verify_evaluate_work_event,
-};
-pub use fetch::{
-    FetchChunkVerifier, FetchExecutionEvent, FetchOutcome, ProducerTrust, verified_fetch_input,
-    verify_fetch_work_event,
-};
 #[cfg(feature = "iroh")]
-pub use iroh::{AppleAppAttestTrust, ProviderTrustAnchor, RemoteNodeTarget, confidential_open};
+pub use iroh::{
+    AppleAppAttestTrust, ProviderTrustAnchor, RemoteNodeTarget, confidential_open,
+    confidential_open_selected, selected_provider_trust,
+};
 
 /// Client capabilities shared by local and transport-specific orchestration.
 #[derive(Clone)]

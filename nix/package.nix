@@ -61,6 +61,9 @@ let
   crossEnv = lib.optionalAttrs isCross {
     CARGO_BUILD_TARGET = targetTriple;
     "CARGO_TARGET_${rustEnvTarget}_LINKER" = "${stdenv.cc}/bin/${stdenv.cc.targetPrefix}cc";
+    # libffi-sys (via catena-lang) builds libffi with autoconf, whose link test
+    # fails on the static clang toolchain's missing libgcc_eh. Rust links its own unwinder.
+    "CFLAGS_${lib.replaceStrings [ "-" ] [ "_" ] targetTriple}" = "--unwindlib=none";
   };
 
   commonArgs = {
@@ -70,8 +73,9 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catena-lang-0.1.0" = "sha256-RRcjA/oEP6yIa2cbEzcJVS7vtrO95P4y4vfjRPLuJwM=";
-        "commonware-actor-2026.7.0" = "sha256-QP8FPIdAI1B4p0981I2fB9eq91ajQrBAGedGVcV2cVE=";
+        "catena-lang-0.1.0" = "sha256-uPy51L8Khl2F2lwBIzyOYYKCZhLHROf2vTHgqZUyVFE=";
+        "catena-models-0.1.0" = "sha256-t1gYBRB+ceQwXGg49g1ziAeD+eyMcqYA4NnVBWcfQgY=";
+        "commonware-actor-2026.7.0" = "sha256-xbYZBCOHXinf8gdcHCqP161xLZuDy0IflQAg9TCeBtQ=";
       };
     };
     inherit stdenv;
@@ -110,7 +114,7 @@ let
     # stdenv's default stripDebugList only does --strip-debug on bin/;
     # stripAllList promotes it to --strip-all so .symtab goes too.
     stripAllList = [ "bin" ];
-    meta.mainProgram = "hellas-cli";
+    meta.mainProgram = "hellas";
   }
   // crossEnv;
 

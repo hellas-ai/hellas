@@ -4,7 +4,21 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum PaidClientError {
     #[error(transparent)]
-    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
+    Purchase(#[from] crate::transact::PurchaseError),
+    #[error(transparent)]
+    Owner(#[from] crate::client_owner::ClientOwnerError),
+    #[error("no retained open channel with this provider")]
+    NoRetainedChannel,
+    #[error(transparent)]
+    Job(#[from] crate::job::JobError),
+    #[error(
+        "provider charges {quoted} per job; this job says {requested}. Nothing was signed or paid."
+    )]
+    PriceMismatch { quoted: u64, requested: u64 },
+    #[error("provider refused offer request ({0}). Nothing was paid.")]
+    OfferRefused(i32),
+    #[error(transparent)]
+    Offer(#[from] hellas_channel::model::offer::PaidOfferError),
     #[error("invalid paid-work options: {0}")]
     InvalidOptions(&'static str),
     #[error("paid input does not match {0}")]
@@ -15,6 +29,11 @@ pub enum PaidClientError {
     AmbiguousRecovery,
     #[error("payment deadline elapsed during result delivery")]
     PaymentExpired,
+    #[error("invocation {work_id} failed ({reason:?}); nothing was paid")]
+    InvocationFailed {
+        work_id: hellas_auth::Digest,
+        reason: hellas_rpc::protocol::invocation::output::FailureReason,
+    },
     #[error("{stage} deadline overflow")]
     DeadlineOverflow { stage: &'static str },
     #[error("{stage} timed out; journals retain payment state")]
@@ -24,7 +43,7 @@ pub enum PaidClientError {
     #[error("provider identity lock poisoned")]
     ProviderIdentityPoisoned,
     #[error("paid-work setup ended: {0:?}")]
-    SetupEnded(hellas_work::work_open::SetupProgress),
+    SetupEnded(hellas_channel::work_open::SetupProgress),
     #[error("cannot create journal directory {}: {source}", path.display())]
     JournalDirectory {
         path: PathBuf,
@@ -42,31 +61,31 @@ pub enum PaidClientError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
-    WorkSetup(#[from] hellas_work::model::setup::WorkSetupError),
+    WorkSetup(#[from] hellas_channel::model::setup::WorkSetupError),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
-    Endpoint(#[from] hellas_work::work::EndpointError),
+    Endpoint(#[from] hellas_channel::work::EndpointError),
     #[error(transparent)]
-    Propose(#[from] hellas_work::work::ProposeError),
+    Propose(#[from] hellas_channel::work::ProposeError),
     #[error(transparent)]
-    Deliver(#[from] hellas_work::work::DeliverError),
+    Deliver(#[from] hellas_channel::work::DeliverError),
     #[error(transparent)]
-    Payment(#[from] hellas_work::work::PaymentError),
+    Payment(#[from] hellas_channel::work::PaymentError),
     #[error(transparent)]
     Collect(#[from] hellas_client::work::CollectResultError),
     #[error(transparent)]
-    Close(#[from] hellas_work::work_close::CloseError),
+    Close(#[from] hellas_channel::work_close::CloseError),
     #[error(transparent)]
-    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
     #[error(transparent)]
-    Setup(#[from] hellas_work::work_handshake::SetupExchangeError),
+    Setup(#[from] hellas_channel::work_handshake::SetupExchangeError),
     #[error(transparent)]
-    SetupDrive(#[from] hellas_work::work_open::SetupDriveError),
+    SetupDrive(#[from] hellas_channel::work_open::SetupDriveError),
     #[error(transparent)]
-    BlockSource(#[from] hellas_work::work_close::BlockSourceError),
+    BlockSource(#[from] hellas_channel::work_close::BlockSourceError),
     #[error(transparent)]
     Config(#[from] crate::work_config::WorkConfigError),
     #[error(transparent)]

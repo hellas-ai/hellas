@@ -16,10 +16,9 @@ use std::sync::Arc;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
-pub mod provision;
+pub mod paid;
 pub mod work_config;
 
-pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
@@ -28,14 +27,10 @@ pub struct ServeOptions {
     pub port: Option<u16>,
     pub discovery: bool,
     pub queue_size: usize,
-    #[cfg(feature = "evaluate")]
-    pub evaluation: crate::evaluate::ServeArgs,
+    pub native: crate::compute::ServeArgs,
     /// The loaded paid-work configuration, not the path it came from.
-    /// Its presence is still what serves the two work ALPNs; what is new
-    /// is that the node holds the chain cross-check, the validator
-    /// fan-out, the journal root, and the policies it would mount a
-    /// channel with.
-    pub work_config: Option<WorkConfig>,
+    /// Only its presence serves the two work ALPNs and sells paid work.
+    pub paid: Option<paid::PaidWork>,
     pub chain_node: super::chain_node::ChainNodeArgs,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
@@ -68,14 +63,7 @@ pub fn validate_grant_resources(
 fn provider_resources(
     routes: &FetchRouteRegistry,
 ) -> hellas_sdk::grant_provider::ProviderResources<'_> {
-    #[cfg(feature = "evaluate")]
-    {
-        hellas_sdk::grant_provider::ProviderResources::EvaluateAndFetch(routes)
-    }
-    #[cfg(not(feature = "evaluate"))]
-    {
-        hellas_sdk::grant_provider::ProviderResources::Fetch(routes)
-    }
+    hellas_sdk::grant_provider::ProviderResources::ComputeAndFetch(routes)
 }
 
 pub fn validate_provider_config(
@@ -110,7 +98,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     // counter handles into a registry just adds a scrape view on the same
     // underlying state.
     let metrics = Arc::new(ExecutorMetrics::default());
-    let mut executor = ExecutorSpawnConfig::fetch_only(
+    let mut executor = ExecutorSpawnConfig::new(
         Arc::new(options.producer_key),
         options.assurance,
         fetch_routes,
@@ -119,27 +107,19 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     executor.metrics = metrics.clone();
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;
-    #[cfg(feature = "evaluate")]
-    options.evaluation.configure(&mut executor)?;
+    options.native.configure(&mut executor)?;
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every
     // contest, and countersigns new paid channels over the policy that
     // configuration makes. There is no second gate in front of that.
     let mut work_runner = None;
-    if let Some(work) = options.work_config.as_ref() {
-        // A configured route is a promise about durable state, so verify all
-        // of them before the endpoint binds or advertises WorkSetup. This is
-        // intentionally later than parsing: provisioning shares the parser
-        // and is the command that may create the journal named here.
-        work_config::validate_work_routes(work).await?;
+    if let Some(work) = options.paid.as_ref().map(|paid| &paid.chain) {
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
             journal_root = %work.journal_root.display(),
-            routes = work.routes.len(),
             poll_ms = work.poll.as_millis(),
-            min_omit_response_blocks = work.min_omit_response_blocks,
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
             // that can settle nothing, and this is where they find out.
@@ -151,11 +131,9 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
             hellas_sdk::paid_provider::WorkRunnerConfig {
                 network: work.chain.network,
                 journal_root: work.journal_root.clone(),
-                routes: work.routes.clone(),
                 poll: work.poll,
                 max_observation_age: work.max_observation_age,
                 settlement_key: options.settlement_key.clone(),
-                policy: work.provider_policy(),
             },
             chain,
         ));
@@ -185,14 +163,25 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         secret_key: options.secret_key,
         open_identity: options.open_identity,
     };
-    let node = configuration::start_host(
-        provider,
-        options.grants,
-        options.fetch_config_file,
-        options.transport,
-    )
-    .await
-    .context("failed to start node server")?;
+    let node = match &options.paid {
+        Some(paid) => {
+            paid.start(
+                provider,
+                options.grants,
+                options.fetch_config_file,
+                options.transport,
+            )
+            .await?
+        }
+        None => configuration::start_host(
+            provider,
+            options.grants,
+            options.fetch_config_file,
+            options.transport,
+        )
+        .await
+        .context("failed to start node server")?,
+    };
 
     if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();

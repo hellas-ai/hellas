@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "network_id": "hellas-devnet-1",
+  "genesis_sha256": "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17",
+  "epochs": [
+    {
+      "epoch": 0,
+      "start_height": 0,
+      "end_height": null,
+      "threshold_identity": "ad2011b6bc6829fcad8a7bf8bd82146f254cd569836c735017b63c2cf66573e4f7afbe50ccd0332fc0800a4482f3792b"
+    }
+  ]
+}

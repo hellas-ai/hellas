@@ -1,4 +1,4 @@
-use crate::domain::{Coin, Digest, ObjectId, ObjectKind, SettlementKey, Transaction};
+use crate::domain::{Coin, Digest, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use hellas_kernel::Encode as _;
 use hellas_rpc::SubmitTxOutcome;
 use hellas_wire::{WireCode, WireStatus};
@@ -112,6 +112,16 @@ pub struct CoinListing {
     pub coins: Vec<(ObjectId, u64)>,
 }
 
+/// Requested current objects at one finalized root. Missing keys are absent.
+/// Remote clients verify the complete retained operation witness; local clients
+/// hold one coherent database reader for the entire result.
+#[derive(Debug, Clone)]
+pub struct ObjectSnapshot {
+    pub network: hellas_kernel::NetworkId,
+    pub block: LatestBlock,
+    pub objects: std::collections::BTreeMap<ObjectId, Object>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeState {
     pub value: u64,
@@ -174,6 +184,13 @@ pub enum QueryError {
     ChannelClosed,
     #[error("state unavailable: {0}")]
     StateUnavailable(String),
+    #[error("certified state is not yet applied")]
+    NotYetApplied,
+    #[error("chain read remained unavailable for {timeout:?}: {reason}")]
+    ReadUnavailableTimeout {
+        timeout: std::time::Duration,
+        reason: String,
+    },
     #[error("wrong object kind: expected {expected}, found {actual}")]
     WrongObjectKind {
         expected: ObjectKind,
@@ -196,6 +213,13 @@ impl From<QueryError> for WireStatus {
             QueryError::StateUnavailable(message) => {
                 WireStatus::new(WireCode::FailedPrecondition, message)
             }
+            QueryError::NotYetApplied => {
+                WireStatus::new(WireCode::OutOfRange, "certified state is not yet applied")
+            }
+            QueryError::ReadUnavailableTimeout { timeout, reason } => WireStatus::new(
+                WireCode::Unavailable,
+                format!("chain read remained unavailable for {timeout:?}: {reason}"),
+            ),
             QueryError::WrongObjectKind { expected, actual } => WireStatus::new(
                 WireCode::Aborted,
                 wrong_object_kind_message(expected, actual),
@@ -212,9 +236,11 @@ impl From<QueryError> for WireStatus {
 impl From<WireStatus> for QueryError {
     fn from(status: WireStatus) -> Self {
         match status.code() {
-            WireCode::FailedPrecondition | WireCode::OutOfRange => {
+            WireCode::Unavailable | WireCode::ResourceExhausted | WireCode::FailedPrecondition => {
                 QueryError::StateUnavailable(status.message().to_string())
             }
+            // Chain queries reserve OutOfRange for certified state ahead of execution.
+            WireCode::OutOfRange => QueryError::NotYetApplied,
             // Chain RPC reserves Aborted for the versioned wrong-object-kind
             // semantic until a later proto can carry these fields directly.
             WireCode::Aborted => parse_wrong_object_kind(status.message())
@@ -229,6 +255,29 @@ impl From<WireStatus> for QueryError {
 
 /// Transport-agnostic query interface for light clients.
 pub trait LightClient: Clone + Send + Sync + 'static {
+    fn get_operations(
+        &self,
+        _request: hellas_rpc::pb::chain::GetOperationsRequest,
+    ) -> impl Future<Output = Result<hellas_rpc::pb::chain::GetOperationsResponse, QueryError>> + Send
+    {
+        async {
+            Err(QueryError::StateUnavailable(
+                "operation proofs are unavailable".into(),
+            ))
+        }
+    }
+
+    fn get_objects(
+        &self,
+        _keys: Vec<ObjectId>,
+    ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
+        async {
+            Err(QueryError::StateUnavailable(
+                "finalized objects are unavailable".into(),
+            ))
+        }
+    }
+
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send;
 
     fn get_proof(
@@ -262,6 +311,16 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send;
 
+    /// A certified checkpoint whose state the serving node has committed.
+    fn get_applied_finalized_block(
+        &self,
+        _query: FinalizedBlockQuery,
+    ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
+        std::future::ready(Err(QueryError::Remote(
+            "applied finalized checkpoints are not supported".into(),
+        )))
+    }
+
     fn submit_tx(
         &self,
         tx: Transaction,
@@ -292,6 +351,16 @@ pub trait LightClient: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_yet_applied_survives_wire_status_mapping() {
+        let status = WireStatus::from(QueryError::NotYetApplied);
+        assert_eq!(status.code(), WireCode::OutOfRange);
+        assert!(matches!(
+            QueryError::from(status),
+            QueryError::NotYetApplied
+        ));
+    }
 
     #[test]
     fn wrong_kind_survives_wire_status_mapping() {

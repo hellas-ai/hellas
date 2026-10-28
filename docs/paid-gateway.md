@@ -1,32 +1,56 @@
 # Paid gateway
 
-`hellas-cli gateway --paid-work-config /srv/hellas/pool.json` sends token-native
-inference to the configured providers and pays through their real funded work
-channels. Each provider has its own endpoint identity, bond, payment funding,
-and client journals. The gateway prefers idle matching providers and matching
-prompt prefixes, then serializes requests within each channel.
+`hellas --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json
+--text-model qwen3.gguf` renders each text request as a Compute job, sends it
+to the configured providers and pays through their real funded work channels.
+Each provider has its own endpoint identity, bond, payment funding, and client
+journals. The gateway skips busy provider channels and serializes requests
+within each channel. Providers must already hold the GGUF named by the job (for
+example via `hellas store adopt`); the gateway never uploads the weights.
 
-With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its work
-config must select the HTTP Fetch manifest and a matching Fetch route policy;
+With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its paid
+policy must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
 account, so this path never falls back to a different provider or funding source.
 
-The pool file uses the provider's existing `--work-config` policy and chain
-configuration:
+The provider keeps its paid policy in its node authority. A provider started
+with `serve --paid-work-config FILE` has its selected owner (`--passkey`,
+`--faucet` or `--faucet-account N`) approve exactly that file's terms at
+startup, unless the authority already holds them, and delegate the stake its
+offers bond. Paid work is sold only with this file; nothing has a built-in
+default. [`faucet-provider.toml`](examples/faucet-provider.toml) is a complete
+example: price, jobs per channel, channel credit, offer bounds, upload/output
+limits, maximum steps, the execution limit, `compute = true` and an optional
+`[fetch]` section. `--faucet` selects only the owner key from the public
+devnet faucet allocation; it never sets price or limits. Restarts with the same
+file change nothing. A lower stake cap is refused before changing policy if no
+already-delegated coin fits it; use the explicit owner `chain delegate --split`
+path to reshape unused stake first. The saved `admin.json` profile beside the
+provider identity works with the passkey administration commands.
+
+An owner can also set the policy with `hellas admin work
+policy-command.json`, using a `SetPaidPolicy` command with `expected_revision`
+and `policy`. A stale revision or a daily node-key session cannot change it.
+
+Execution limits are A's: a job over the upload limit is refused before it
+runs, and a job that exceeds `execution_timeout_ms` is killed with its worker
+process group and is not paid. Catena jobs run in a separate worker process;
+that isolation is crash/timeout containment, not a sandbox, and there is no
+memory metering. Before paying, the gateway checks that each result is signed
+by the provider and matches this job; Hellas does not re-run it.
+
+The pool selects providers and expected prices. It obtains each policy with
+`RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 
 ```json
 {
-  "trust_store": "/var/lib/hellas-gateway/trust",
   "providers": [
     {
-      "work_config": "/srv/hellas/provider-a-work.json",
+      "chain_config": "/srv/hellas/chain.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
-      "trust_policy": "provider-a",
       "provider_addrs": ["192.0.2.10:31145"],
-      "bond": "PROVIDER_BOND_EDGE_HEX",
-      "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"],
-      "omission_bond": 10
+      "payment": 20
     }
   ],
   "acceptance_blocks": 16,
@@ -37,103 +61,83 @@ configuration:
 }
 ```
 
-Every pool entry selects a previously approved `trust_policy` ID. The caller owns
-`trust_store`; neither an offer nor an execution request can supply replacement pins.
-Optionally include the signed offer emitted by `hellas-cli provision` in `offer`.
-Import checks its network, bond, transport and enrollment against the separately
-approved policy. Empty `provider_addrs` uses the signed offer's address hints.
-An offer by itself does not authorize a provider.
+`chain_config` contains the chain cross-check, six validator URLs, journal root,
+`poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
+client routes. The requester and gateway start no chain node. They authenticate
+remote state against independently configured genesis and consensus pins; relay
+URLs supply transport only. `transact` defaults to the embedded devnet trust
+and `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
+keys are created on first use and retained with the identity.
 
-Approve a locally reviewed policy file before starting the gateway:
+Use `--passkey owner.key`, `--faucet`, or `--faucet-account N` for channel funding.
+A new channel asks for one owner approval over its exact quoted amount: the
+provider's jobs per channel times its price, plus omission reserve and fees.
+At most four eligible owner coins fund one delegated output; change returns
+undelegated to the same owner. The wallet records the signed reshape before
+submission and shares reservations across gateway providers. Later jobs reuse
+the open channel. `transact --settle --provider NODE_ID` closes it and returns unspent funding.
+
+A request without funding coins returns a quote and writes no paid journal. The
+quote states the canonical channel policy, omission collateral and exact funding.
+A funded request proves live coins owned by the client's principal and delegated
+to its settlement key. Their sum must match the quote exactly. The provider
+reserves its own owner-delegated stake within `max_stake_per_client` and
+`max_open_offers`, and creates one live offer per client principal and key.
+The original signed offer, policy and authenticated peer are durable together;
+retries return the same offer and restart requires no route configuration.
+Unanswered offers expire at their bond timeout.
+
+ProducerSigned providers need only the selected endpoint ID. Each live Open
+checks that the enrollment names that transport and verifies the producer proof.
+Apple-attested providers additionally require the existing independent trust store.
+For those entries, add a top-level `trust_store` directory and a per-provider
+`trust_policy` ID. Approve app IDs and release CDHashes independently:
 
 ```sh
-hellas-cli trust --store /var/lib/hellas-gateway/trust approve provider-a \
+hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
   --expected-revision 0 --policy /srv/hellas/provider-a-trust.json \
-  --reason 'Reviewed enrollment and execution contract'
-hellas-cli trust --store /var/lib/hellas-gateway/trust show provider-a
+  --reason 'Reviewed Apple application and release hashes'
 ```
 
-The policy JSON has `provider_genesis` (the independently checked enrollment
-ContentId), `assurance` (0 for producer signatures or 1 for Apple App Attest),
-`environments` (1–32 exact approved manifest ContentIds), and `apple`.
-For software assurance, `apple` can be null. For Apple assurance it is
-`{"app_id":"TEAM.bundle.id","cd_hashes":["64_HEX_DIGITS"]}` with release pins
-obtained independently. The assurance must match the gateway's `--assurance`.
-A contract change requires an explicit approval; merely editing Work configuration
-does not approve its new environment. This approval selects trusted software and
-terms; it does not establish the still-required protected-platform guarantees.
+The existing trust JSON contains `provider_genesis`, `assurance`, and `apple`
+with `app_id` and `cd_hashes`. Missing or mismatched
+Apple approval fails before funding or disclosure. Approval replacement retains
+its revision checks and persistent assertion counters. `transact` accepts
+`--trust-store` and `--trust-policy` for Apple providers; software providers do not
+need them. Grant gateways keep their existing independent approval requirements.
 
-Replacement requires the current `--expected-revision` and an explicit reason.
-The private record stores the revision, approval time and previous policy commitment
-atomically with the pins. It retains the latest approval record, not a full audit
-history. Concurrent stale edits fail. Missing, corrupt, nonprivate or symlinked
-records fail; startup never creates approval. Assertion counters persist independently
-of policy replacement. Restart gateways to load a new approval; existing gateway
-instances retain their startup policy. `paid-work run` uses the same native store
-through required `--trust-store` and `--trust-policy` options. Grant gateways require
-the same selection with `--offer` or `--local`. Approved manifest IDs
-remain in the client anchor and are checked for every new job, including refreshed
-grant policies. Paid options also check them before funding.
-
-Every Work and WorkSetup connection performs Open before disclosing requests, for
-both producer-signed and App Attest policy.
-
-Bond or chain discovery distributes this same signed offer as an off-chain
-artifact. The consumer compares its network and bond to the discovered record;
-the signed proposal and enclosing settlement signature bind the enrollment to
-that bond's maker. Endpoint advertisements alone never establish an enrollment
-pin. Chain validation and finalized funding checks still occur during setup.
-No enrollment data is added to on-chain transactions.
-
-Provision provider bonds with `hellas-cli provision --grant-config grant.json
---client-contact client --client CLIENT_NODE_KEY`; coin values and policy terms
-must agree with the provider work config. The contact alias selects an already
-imported, signature-verified ContactCard in the current authority owner's contact
-directory. Its principal is the client coin owner; `--client` names the separate
-settlement node. The card proves the principal's signature, not that the principal
-controls the selected node. The client checks the bond against its own live
-authority owner and node before countersigning, and chain funding requires that
-owner's coins delegated to that node.
-
-Provider and gateway coin owners come from their current node authority roots.
-The gateway reuses the authority opened by its gateway profile. Standalone
-`provision` and `paid-work run` require `--grant-config` pointing to an explicitly
-bootstrapped authority journal; stop its running writer before opening it offline.
-Payment coins cannot fund two channels. Recovery changes the live owner used for
-new setup; it does not reinterpret existing signed bond terms.
-
-Owners delegate or reclaim coins through the existing global passkey:
+Owners delegate or reclaim coins through the global passkey:
 
 ```sh
-hellas-cli --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
-  --network devnet --node NODE_SETTLEMENT_KEY --coin COIN_ID
-hellas-cli --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
-  --network devnet --coin COIN_ID
+hellas --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
+  --trust ./chain-trust.json --network devnet --node NODE_SETTLEMENT_KEY \
+  --coin COIN_ID --split 12
+hellas --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
+  --trust ./chain-trust.json --network devnet --coin COIN_ID
 ```
 
-`--node` uses the chain's base58 settlement-key spelling; coin IDs are hex.
-Default payouts remain delegated to each party's node. A provider can choose
-`provision --lock-provider-payout` to return its payout to its owner without a
-delegate. The client accepts only its own default delegated payout. An owner-led
-contested exit locks that owner's refund while preserving the other party's payout
-delegation.
-The omission bond must exceed the remaining payment capacity: with 1,000 units
-and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
+`--split VALUE` creates up to three delegated coins of that value and returns the
+remainder undelegated to the owner. The node cannot authorize that owner action.
+`--node` uses base58 settlement keys; coin IDs are hex. Returned provider stake
+stays delegated by default; `offers.redelegate_payout = false` keeps it with the
+owner without delegation. Client payouts remain delegated to their own node.
+
+The omission bond must exceed the payment capacity. At price 20 and ten jobs,
+a capacity of 200 and omission collateral of 201 require 401 units with zero fees
+and reserve. The client checks
 this before signing setup terms or creating a journal.
-The provider's route table must authorize the gateway transport and settlement
-identities. All participants must use the same compatible chain revision.
+The provider verifies the gateway owner's delegated funding and retains the
+first authenticated peer with its offer. All participants must use the same
+compatible chain revision.
 
-Pass the environment, tokenizer, model label, `--default-max-tokens`, and
-`--stop-token` options as for an ordinary gateway. The work policy fixes
-the environment, maximum output tokens and stop IDs; separate payment terms
-fix the price per job. Requests
-may request a shorter output within the configured ceiling. Model presentation
-lives in the shared `hellas-presentation` adapter, usable by clients and the
-gateway. Select `--chat-template qwen3` for chat messages and function tools;
-the adapter binds the input template and output parser to the same offered tools.
-Catena execution receives committed tokens and generation settings.
+Each text job fixes the rendered program, the GGUF weights, the prompt tokens
+and the token budget (`max_tokens`, else `--default-max-tokens`). The
+provider's step loop feeds each emitted token back until that budget, within
+its policy's `max_steps`. The payment terms fix the price per job. Model
+presentation (the Qwen3 chat template and function tools) lives in the shared
+`hellas-presentation` adapter, usable by clients and the gateway.
 
-The provider reserves delivery credit before streaming signed token prefixes.
+The provider reserves delivery credit before streaming signed output prefixes.
 The gateway verifies each prefix as it arrives, then authenticates and journals
 the complete result and obtains the provider's durable payment acknowledgement
 before reporting completion. One open subscription replaces repeated result
@@ -179,7 +183,7 @@ providers or validators.
 
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
-retained Evaluate jobs and re-sends payment certificates idempotently. Fetch
+retained Compute jobs and re-sends payment certificates idempotently. Fetch
 journals omit bodies. A verified delivery recorded before a crash is paid from
 its retained evidence, even when the payload is gone. Jobs without either payload
 or verified delivery retain their credit reservation until the payment deadline;
@@ -189,7 +193,7 @@ may have reached a provider, collection and payment continue despite disconnects
 The pool admits at most `max_pending_requests` queued or running requests (default
 64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
 bounds queueing, recovery, provider fallback, execution and payment together,
-rather than restarting for each provider. Token-native requests skip busy provider
+rather than restarting for each provider. Text requests skip busy provider
 channels; each connection attempt gets at most 10 seconds before trying another
 route within that shared budget. The HTTP paid route uses this same
 configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an
@@ -209,8 +213,7 @@ also require `--allow-remote`; use a trusted network or a TLS reverse proxy.
 
 The NixOS options are `services.hellas.gateway.paidWorkConfig`,
 `paidWorkJournalRoots` (writable client journals), `gatewayProfile`, and
-`authorityJournal` when the authority journal is outside the managed state directory,
-alongside the existing environment and tokenizer options.
+`authorityJournal` when the authority journal is outside the managed state directory.
 
 
 ## Request traces
@@ -238,8 +241,8 @@ Background chain observation uses separate `paid.channel.observe` traces.
 Useful spans include `http.server`, `paid.gateway`, `paid.queue`,
 `paid.executor.stream`, GenAI `chat MODEL` and `text_completion` operations,
 and RPC spans named for their full service/method. RPC method and status are
-attributes. GPU spans report queue wait, first-token latency, cache reuse and
-input/output token counts; HTTP spans report first body delivery, status, byte
+attributes. GenAI spans report first-chunk latency and token counts;
+HTTP spans report first body delivery, status, byte
 count and completion. Spans do not contain prompts, token values, authorization
 headers or tool data. Log events stay in the log sink and are excluded from
 the OTLP span exporter.
@@ -266,41 +269,20 @@ convention, so a failing check still has downloadable traces. Local
 use the Hydra attribute when retaining failure outputs is needed. Public
 packages still build without telemetry by default.
 
-## Prefill and prefix reuse
-
-Every environment commits a fixed generation capacity and prefill chunk size.
-The Qwen example uses capacity 32768 and chunks of 64 tokens to bound temporary
-allocations at long contexts. Build the environment from settings containing
-`[generation]`, `fixed_capacity`, and `prefill_chunk_tokens`; the resulting
-manifest identity binds that schedule as well as the program and weights.
-
-The provider must admit the fixed capacity even for short requests. Catena
-retains at most one prefix checkpoint per GPU worker, capped at 8 GiB and
-charged to the generation's device-memory envelope. The cap bounds that single
-checkpoint, not a collection of conversations. Reuse requires an exact token
-prefix and the same model, capacity and chunk size. State buffers are copied
-independently, so generation cannot mutate the retained checkpoint.
-
-Catena may preserve a compatible checkpoint across requests of at most two
-prefill chunks when its memory budget permits. The gateway conservatively
-clears its affinity hint after short requests; the provider decides actual
-reuse. Worker spans report that observed reuse as
-`gen_ai.usage.cache_read.input_tokens` without recording token values.
-
 ## Embedding
 
 The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Load
 the same pool file with `load_pool_options(path, assurance)`,
-and pass the resulting typed `PaidGatewayOptions` and a `NodeIdentity` to
-`PaidGateway::open`. Applications can also construct the options directly from
-`PaidWorkOptions`; the pool validates duplicate providers, journals and funding
-before opening any connections. It owns recovery, admission, per-channel
+and pass the resulting typed `PaidGatewayOptions`, a `NodeIdentity`, and an
+`Arc<ClientOwner>` to `PaidGateway::open`. Construct the owner with the passkey
+authenticator, the identity's settlement key and a private funding directory. Applications can also construct the options directly from
+`PaidWorkOptions`; the pool validates duplicate providers and journals before opening connections. It owns recovery, admission, per-channel
 serialization and payment tasks. No CLI argument structures are part of its API.
 
 For transparent HTTP, pass this pool to `hellas_gateway::start_http` using
 `HttpGatewayOptions`. Its `paid` field is required. The options contain HTTP
 routes, archive policy, listener authentication and optional process wrapping;
-they have no model, tokenizer, inference cache or Evaluate settings. Shutting
+they have no text model or inference cache settings. Shutting
 down the returned handle drains accepted paid work. Failed startup also drains
 recovery tasks. A host using the pool without a gateway must call its
 `WorkExecutionBackend::drain` method when shutting down.

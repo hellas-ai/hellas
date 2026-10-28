@@ -3,7 +3,9 @@ members = [
     "crates/adaptors",
     "crates/attestation",
     "crates/auth",
+    "crates/authority",
     "crates/chain",
+    "crates/channel",
     "crates/cli",
     "crates/client",
     "crates/cloud",
@@ -20,7 +22,6 @@ members = [
     "crates/store",
     "crates/webauthn",
     "crates/wire",
-    "crates/work",
     "crates/xet",
 ]
 default-members = ["crates/cli"]
@@ -40,21 +41,22 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.23"
 bytes = "1"
-catena-lang = { git = "https://github.com/georgewhewell/catena-lang", rev = "4d90b4b0b53f68352ff2890203d4de00e1214f93", default-features = false }
+catena-lang = { git = "https://github.com/hellas-ai/catena-lang.git", branch = "master", default-features = false }
+catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "2c147f7" }
 cc = "1"
 ciborium = "0.2"
-commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-broadcast = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-codec = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc", default-features = false }
-commonware-consensus = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-cryptography = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc", default-features = false }
-commonware-glue = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-p2p = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-parallel = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-resolver = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-runtime = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-storage = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
-commonware-utils = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "0dd4d0e166b6b10f870dc68d0664b98a42324ddc" }
+commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-broadcast = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-codec = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae", default-features = false }
+commonware-consensus = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-cryptography = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae", default-features = false }
+commonware-glue = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-p2p = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-parallel = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-resolver = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-runtime = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-storage = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-utils = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
 dirs = "7"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3"
@@ -62,7 +64,9 @@ futures-core = "0.3"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
 hellas-auth = { path = "crates/auth", default-features = false }
+hellas-authority = { path = "crates/authority", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
+hellas-channel = { path = "crates/channel", default-features = false }
 hellas-client = { path = "crates/client", default-features = false }
 hellas-cloud = { path = "crates/cloud", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
@@ -78,7 +82,6 @@ hellas-sdk = { path = "crates/sdk", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }
 hellas-webauthn = { path = "crates/webauthn", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
-hellas-work = { path = "crates/work", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
 hex = "0.4"
 iroh = { version = "1", default-features = false }

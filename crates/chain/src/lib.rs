@@ -46,6 +46,10 @@ pub mod relay;
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
+/// The six-validator devnet harness, for this crate's tests and, behind
+/// `test-support`, for other crates' tests.
+#[cfg(all(any(test, feature = "test-support"), feature = "validator"))]
+pub mod test_support;
 #[cfg(feature = "validator")]
 pub mod validator;
 #[cfg(feature = "work-watcher")]
@@ -114,7 +118,7 @@ mod genesis_reexport {
         let selector = "devnet";
         let id = crate::genesis::HELLAS_DEVNET_1_ID;
         let json = crate::genesis::HELLAS_DEVNET_1_JSON;
-        let expected = "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb";
+        let expected = "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17";
         let hex: String = Sha256::digest(json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))

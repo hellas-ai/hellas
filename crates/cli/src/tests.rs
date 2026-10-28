@@ -3,10 +3,6 @@ use super::*;
 #[cfg(unix)]
 mod machines;
 
-const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
-const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";
-const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
-const TEST_CONTENT: &str = "/path/to/model.hex";
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "--trust-store",
     "/state/trust",
@@ -36,36 +32,11 @@ fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 1] {
 }
 
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
-    let local_content: &[&str] = if args.contains(&"--local") {
-        &[
-            "--content",
-            TEST_CONTENT,
-            "--local-grant",
-            "07070707070707070707070707070707",
-        ]
-    } else {
-        &[]
-    };
     Cli::try_parse_from(
-        [
-            "hellas",
-            "gateway",
-            "--environment",
-            TEST_ENVIRONMENT,
-            "--tokenizer",
-            TEST_TOKENIZER,
-        ]
-        .into_iter()
-        .chain(local_content.iter().copied())
-        .chain(args.iter().copied()),
+        ["hellas", "gateway"]
+            .into_iter()
+            .chain(args.iter().copied()),
     )
-}
-
-fn causal_lm_args(command: Commands) -> CausalLmArgs {
-    match command {
-        Commands::Gateway { causal_lm, .. } => causal_lm.expect("causal-LM arguments"),
-        _ => panic!("expected causal-LM command"),
-    }
 }
 
 #[test]
@@ -86,17 +57,19 @@ fn identity_free_commands_reject_global_identity_options() {
             "hellas",
             "--identity",
             "unused.identity",
-            "environment",
-            "inspect",
-            "--environment",
-            "model.environment",
+            "offer",
+            "import",
+            "provider.offer",
+            "--name",
+            "provider",
         ],
         vec![
             "hellas",
-            "environment",
-            "inspect",
-            "--environment",
-            "model.environment",
+            "offer",
+            "import",
+            "provider.offer",
+            "--name",
+            "provider",
             "--software-root",
         ],
     ] {
@@ -188,28 +161,6 @@ fn gateway_accepts_remote_trust_policy() {
 }
 
 #[test]
-fn gateway_accepts_the_optional_environment_pin() {
-    let pinned = causal_lm_args(
-        parse_gateway(&["--manifest-id", TEST_MANIFEST_ID])
-            .unwrap()
-            .command,
-    );
-    assert_eq!(
-        pinned.manifest_id,
-        Some(hellas_rpc::ContentId::from_bytes([0x44; 32]))
-    );
-}
-
-#[test]
-fn gateway_requires_explicit_environment_and_tokenizer() {
-    assert!(Cli::try_parse_from(["hellas", "gateway"]).is_err());
-    assert!(
-        Cli::try_parse_from(["hellas", "gateway", "--environment", TEST_ENVIRONMENT,]).is_err()
-    );
-    assert!(Cli::try_parse_from(["hellas", "gateway", "--tokenizer", TEST_TOKENIZER]).is_err());
-}
-
-#[test]
 fn http_gateway_requires_a_paid_pool() {
     assert!(
         Cli::try_parse_from(["hellas", "gateway", "--http-fetch-config", "/http.json"]).is_err()
@@ -225,25 +176,6 @@ fn http_gateway_requires_a_paid_pool() {
         ])
         .is_ok()
     );
-}
-
-#[test]
-fn gateway_model_is_only_an_optional_api_label() {
-    let args = causal_lm_args(parse_gateway(&["--model", "api-label"]).unwrap().command);
-    assert_eq!(args.model.as_deref(), Some("api-label"));
-    let args = causal_lm_args(parse_gateway(&[]).unwrap().command);
-    assert!(args.model.is_none());
-}
-
-fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    let cli = parse_gateway(args).expect("valid gateway arguments");
-    let Commands::Gateway {
-        responses_backend, ..
-    } = cli.command
-    else {
-        panic!("gateway");
-    };
-    gateway_provider_trust(responses_backend)
 }
 
 #[test]
@@ -310,12 +242,6 @@ fn serve_rejects_software_root_with_apple_assurance() {
         )
         .is_ok()
     );
-}
-
-#[test]
-fn gateway_accepts_explicit_stop_tokens() {
-    let cli = parse_gateway(&["--stop-token", "1,2", "--stop-token", "3"]).unwrap();
-    assert_eq!(causal_lm_args(cli.command).stop_token_ids, vec![1, 2, 3]);
 }
 
 #[test]
@@ -404,222 +330,33 @@ fn identity_show_holder_accepts_global_identity_path() {
 
 #[test]
 fn serve_accepts_work_config() {
-    let cli = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
     match cli.command {
         Commands::Serve {
             work_config_file, ..
         } => assert_eq!(
             work_config_file.as_deref(),
-            Some(std::path::Path::new("/tmp/work.json"))
+            Some(std::path::Path::new("/tmp/work.toml"))
         ),
         _ => panic!("expected serve command"),
     }
 }
 
-/// An offer names every term of the bond it stakes, and the coins it
-/// stakes them with come one flag at a time.
 #[test]
-fn provision_accepts_the_terms_of_one_bond() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "provision",
-        "--work-config",
-        "/tmp/work.json",
-        "--grant-config",
-        "grant.json",
-        "--client-contact",
-        "client",
-        "--client",
-        "02aa",
-        "--stake-coin",
-        "a1",
-        "--stake-coin",
-        "a2",
-        "--bond-timeout",
-        "500",
-        "--timeout-payout",
-        "64",
-        "--max-job-price",
-        "40",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Provision {
-            work_config,
-            client,
-            stake_coin,
-            bond_timeout,
-            timeout_payout,
-            max_job_price,
-            print_bond_only,
-            ..
-        } => {
-            assert_eq!(work_config, PathBuf::from("/tmp/work.json"));
-            assert_eq!(client, "02aa");
-            assert_eq!(stake_coin, vec!["a1".to_string(), "a2".to_string()]);
-            assert_eq!(bond_timeout, 500);
-            assert_eq!(timeout_payout, 64);
-            assert_eq!(max_job_price, 40);
-            assert!(!print_bond_only);
-        }
-        _ => panic!("expected provision command"),
-    }
+fn manual_provisioning_command_is_removed() {
+    assert!(Cli::try_parse_from(["hellas", "provision"]).is_err());
 }
 
-#[test]
-fn provision_accepts_a_bond_only_preview() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "provision",
-        "--work-config",
-        "/tmp/work.json",
-        "--grant-config",
-        "grant.json",
-        "--client-contact",
-        "client",
-        "--client",
-        "02aa",
-        "--stake-coin",
-        "a1",
-        "--bond-timeout",
-        "500",
-        "--timeout-payout",
-        "64",
-        "--max-job-price",
-        "40",
-        "--print-bond-only",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Provision {
-            print_bond_only: true,
-            ..
-        }
-    ));
-}
-
-/// A bond funded by no coin is not one, so the stake is required
-/// rather than defaulted to an empty list.
-#[test]
-fn provision_rejects_an_offer_with_nothing_staked() {
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "provision",
-            "--work-config",
-            "/tmp/work.json",
-            "--grant-config",
-            "grant.json",
-            "--client-contact",
-            "client",
-            "--client",
-            "02aa",
-            "--bond-timeout",
-            "500",
-            "--timeout-payout",
-            "64",
-            "--max-job-price",
-            "40",
-        ])
-        .is_err(),
-        "an offer staking nothing was accepted",
-    );
-}
-
-/// The bond an offer stakes is settled with the key an operator
-/// already made, exactly as a paid `serve` is: the same refusal, and
-/// the same file named by it.
-#[test]
-fn provisioning_an_offer_loads_a_stored_settlement_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("identity");
-    let provision = Cli::try_parse_from([
-        "hellas",
-        "provision",
-        "--work-config",
-        "/tmp/work.json",
-        "--grant-config",
-        "grant.json",
-        "--client-contact",
-        "client",
-        "--client",
-        "02aa",
-        "--stake-coin",
-        "a1",
-        "--bond-timeout",
-        "500",
-        "--timeout-payout",
-        "64",
-        "--max-job-price",
-        "40",
-    ])
-    .unwrap();
-
-    let Err(error) = load_command_identity(&provision.command, Some(&path)) else {
-        panic!("a bond is staked with a key an operator already made");
-    };
-    assert!(
-        format!("{error:#}").contains(&path.display().to_string()),
-        "the refusal does not name the identity file: {error:#}",
-    );
-    assert!(!path.exists(), "no identity was created by the refusal");
-}
-
-/// A node asked to serve paid work loads its settlement identity
-/// before anything binds, and a missing one is a startup failure
-/// naming the file.
-///
-/// The whole point is what it does *not* do: the same `serve`
-/// without a work configuration creates the file, so the refusal
-/// below is this rule and not a loader that always refuses. A node
-/// that minted its own settlement key would advertise two paid ALPNs
-/// as a party nobody has funded — and would say nothing about it.
-#[test]
-fn serving_paid_work_loads_a_stored_settlement_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("identity");
-    let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
-    let unpaid = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-
-    let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
-        panic!("paid work is settled with a key an operator already made");
-    };
-    assert!(
-        format!("{error:#}").contains(&path.display().to_string()),
-        "the refusal does not name the identity file: {error:#}",
-    );
-    assert!(!path.exists(), "no identity was created by the refusal");
-
-    // The key is the identity's own, and the identity is the one on
-    // disk: created here by a `serve` that was asked for no paid
-    // work, and read back by the paid one that would not create it.
-    let created = load_command_identity(&unpaid.command, Some(&path))
-        .expect("a serve with no paid work still creates its transport identity");
-    let loaded = load_command_identity(&paid.command, Some(&path))
-        .expect("the stored identity is what paid work settles with");
-    assert_eq!(
-        identity::settlement_signer(&loaded).unwrap().party_key(),
-        identity::settlement_signer(&created).unwrap().party_key(),
-    );
-    assert_eq!(
-        &identity::settlement_signer(&loaded)
-            .unwrap()
-            .party_key()
-            .to_bytes()[..],
-        loaded.node_key.public_key().bytes(),
-        "the settlement party is the producer identity, not a second key",
-    );
-}
-
-/// An identity file that is there and is not one is the same
-/// startup failure, and names the same file.
+/// An identity file that is there and is not one is a startup
+/// failure naming that file.
 #[test]
 fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+    let paid =
+        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
 
     let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("an identity file that is not one is not a key to settle with");
@@ -732,8 +469,9 @@ fn content_id_parser_round_trips_xet_text_encoding() {
         displayed
     );
 }
+
 #[test]
-fn proxy_cache_needs_no_causal_lm_files() {
+fn proxy_cache_needs_no_model_files() {
     let cli = Cli::try_parse_from([
         "hellas",
         "gateway",
@@ -743,37 +481,7 @@ fn proxy_cache_needs_no_causal_lm_files() {
         "replay-only",
     ])
     .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Gateway {
-            causal_lm: None,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn unfunded_gateway_routes_require_a_work_backend() {
-    assert!(
-        gateway_trust(&["--responses-backend", "proxy"])
-            .unwrap()
-            .is_none()
-    );
-    for args in [
-        vec![],
-        vec![
-            "--responses-backend",
-            "fetch",
-            "--responses-fetch-execution-environment",
-            "a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac",
-        ],
-    ] {
-        let error = gateway_trust(&args).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<hellas_client::ClientError>(),
-            Some(hellas_client::ClientError::FundingRequired)
-        ));
-    }
+    assert!(matches!(cli.command, Commands::Gateway { .. }));
 }
 
 #[test]
@@ -874,6 +582,3 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
         );
     }
 }
-
-#[cfg(feature = "evaluate")]
-mod evaluate;

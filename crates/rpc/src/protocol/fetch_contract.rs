@@ -6,6 +6,9 @@ use super::value::{CanonicalDecodeError, CanonicalDecoder};
 use crate::{Application, ContentId, DagCborEncoder, ProgramManifest};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
+/// Maximum UTF-8 bytes in a signed Fetch route component.
+pub const MAX_FETCH_ROUTE_COMPONENT_BYTES: usize = 256;
+
 pub const FETCH_EVALUATOR: &str = "hellas/fetch-0.0.2";
 const DOMAIN: &str = "hellas.fetch.contract.v1";
 pub const MAX_FETCH_CONTRACT_BYTES: usize = 8 * 1024;

@@ -42,6 +42,9 @@ let
       trap 'rm -rf "$cargo_home"' EXIT
       cp ${config} "$cargo_home/config.toml"
       export CARGO_HOME="$cargo_home"
+      # Native build scripts copy source permissions into OUT_DIR. Keep registry
+      # builds and different read-only vendor snapshots in separate caches.
+      export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
       export CARGO_NET_OFFLINE=${lib.boolToString offline}
       export SQLX_OFFLINE=true
       ${cmd}
@@ -85,7 +88,6 @@ let
         (
           [
             "indexer"
-            "evaluate"
             "otel"
           ]
           ++ lib.optionals isValidatorHost [ "validator" ]
@@ -97,6 +99,7 @@ let
       cargo clippy -p hellas-chain --no-default-features --features client-core --all-targets -- -D warnings
       cargo clippy -p hellas-chain --no-default-features --features proof-verify --all-targets -- -D warnings
       cargo clippy -p hellas-chain --no-default-features --features full-node --all-targets -- -D warnings
+      cargo check -p hellas-chain --no-default-features --features test-support,indexer-api --lib
       cargo check -p hellas-sdk --all-features --all-targets
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
@@ -116,12 +119,27 @@ let
       cargoEnv rustToolchain
     );
     executor = mkCargo "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    # Money-only consumers keep node authority, attestation and compression out
+    # of their production dependency graph. Grant-aware dev fixtures are separate.
+    channel-dependencies = mkCargo "check-channel-dependencies" ''
+      assert_money_graph() {
+        dependencies="$(cargo tree --locked --edges normal,build --prefix none "$@")"
+        if grep -Eq '^(hellas-authority|hellas-attestation|brotli|flate2) v' <<< "$dependencies"; then
+          printf '%s\n' "$dependencies"
+          echo "authority, attestation or compression reached a money-only consumer" >&2
+          exit 1
+        fi
+      }
+      assert_money_graph -p hellas-channel --no-default-features
+      assert_money_graph -p hellas-client --no-default-features --features work
+      assert_money_graph -p hellas-chain --no-default-features --features work-watcher
+    '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
     # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
-    # Work owns canonical paid/grant records, vectors and durable orchestration.
+    # Channel and authority own the canonical records and durable orchestration.
     # Test each complete package so service/method identity pins stay covered.
     rpc-work =
       mkCargo "check-rpc-work"
-        "cargo test -p hellas-rpc --features work && cargo test -p hellas-work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-work --all-targets -- -D warnings"
+        "cargo test -p hellas-rpc --features work && cargo test -p hellas-channel -p hellas-authority && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-channel -p hellas-authority --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The client's paid-work half and the oracle inside it. `work` is off
     # by default on `hellas-client`, so `check-clippy` compiles none of
@@ -180,7 +198,7 @@ let
         (cargoEnv rustToolchain);
     # The settlement watcher's block source: the codec above plus the
     # paid endpoint's journal. It is the only dimension that compiles
-    # `hellas-chain` and `hellas-work` together, so it is the only
+    # `hellas-chain` and `hellas-channel` together, so it is the only
     # one that fails when the two disagree about what a finalized block
     # hands a watcher.
     chain-work-watcher =
@@ -298,7 +316,6 @@ let
   # streams archives for publishing without requiring a Docker daemon.
   // lib.optionalAttrs isValidatorHost {
     cli-validator = "cli-validator";
-    cli-catena = "cli-catena";
   };
 in
 {

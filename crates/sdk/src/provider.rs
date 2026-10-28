@@ -1,9 +1,9 @@
-use hellas_work::model::grant::records::{check_grant_provider, grant_transport};
+use hellas_authority::model::grant::records::{check_grant_provider, grant_transport};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use hellas_attestation::RootProver;
-use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
+use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::signature_wire::signature_to_pb;
@@ -36,9 +36,9 @@ pub enum ProviderError {
     #[error(transparent)]
     GrantConfig(#[from] crate::grant_provider::GrantProviderError),
     #[error(transparent)]
-    Grant(#[from] hellas_work::model::grant::records::GrantError),
+    Grant(#[from] hellas_authority::model::grant::records::GrantError),
     #[error(transparent)]
-    NodeStore(#[from] hellas_work::work_store::grant::NodeStoreError),
+    NodeStore(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("invalid provider settlement key")]
     SettlementKey,
     #[error(transparent)]
@@ -99,38 +99,6 @@ impl<R> FetchProviderOptions<R> {
         if !has_paid_work && !has_grants {
             return Err(ProviderError::FundingRequired);
         }
-        if let Some(paid) = &options.paid_work {
-            let config = &paid.config;
-            use hellas_work::model::{fetch::FetchRoutePolicy as PaidRoute, profile::WorkPolicy};
-            match &config.work_policy {
-                WorkPolicy::Fetch {
-                    policy,
-                    route: PaidRoute::SealedRoute { service, method },
-                    ..
-                } => {
-                    if !options
-                        .routes
-                        .entry(&FetchRoute::new(service, method))
-                        .is_some_and(|entry| {
-                            entry.execution_environment() == policy.allowed_environment
-                        })
-                    {
-                        return Err(ProviderError::MissingPaidRoute);
-                    }
-                }
-                WorkPolicy::Fetch {
-                    policy,
-                    route: PaidRoute::OpenFetch { .. },
-                    ..
-                } => {
-                    if !options.routes.has_environment(policy.allowed_environment) {
-                        return Err(ProviderError::MissingPaidRoute);
-                    }
-                }
-                _ => return Err(ProviderError::WrongPaidPolicy),
-            }
-            crate::work_config::validate_work_routes(config).await?;
-        }
         let assurance = match options.enrollment.genesis.statement.root_kind {
             hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
             hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
@@ -142,7 +110,6 @@ impl<R> FetchProviderOptions<R> {
         let work_config = options
             .paid_work
             .map(|PaidProviderOptions { config, node }| {
-                let policy = config.provider_policy();
                 let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
                     options.identity.node_secret_bytes(),
                 )
@@ -150,11 +117,9 @@ impl<R> FetchProviderOptions<R> {
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
                     network: config.chain.network,
                     journal_root: config.journal_root,
-                    routes: config.routes,
                     poll: config.poll,
                     max_observation_age: config.max_observation_age,
                     settlement_key,
-                    policy,
                 };
                 runner_config.validate()?;
                 Ok::<_, ProviderError>((runner_config, node))
@@ -162,7 +127,7 @@ impl<R> FetchProviderOptions<R> {
             .transpose()?;
         let producer_key = Arc::new(options.identity.node_key().clone());
         let mut executor_config =
-            ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
+            ExecutorSpawnConfig::new(producer_key.clone(), assurance, options.routes);
         executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
         executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
         Ok(ProviderOptions {
@@ -207,7 +172,7 @@ pub struct ProviderGrants {
 #[derive(Clone)]
 pub enum ProviderAuthority {
     Journal { root: PathBuf },
-    Host(crate::node_control::NodeControl),
+    Host(Box<crate::node_control::NodeControl>),
 }
 impl ProviderAuthority {
     fn remote_admission(&self) -> crate::node_control::RemoteControlAdmission {
@@ -223,19 +188,21 @@ impl ProviderGrants {
         &self,
         resources: crate::grant_provider::ProviderResources<'_>,
         provider: &ProviderEnrollmentBundle,
-    ) -> Result<hellas_work::node::NodeCoordinator, ProviderError> {
+    ) -> Result<hellas_authority::node::NodeCoordinator, ProviderError> {
         resources.validate(&self.config.policies)?;
         match &self.authority {
-            ProviderAuthority::Journal { root, .. } => Ok(hellas_work::node::NodeCoordinator::new(
-                hellas_work::work_store::grant::NodeStore::open(
-                    root,
-                    hellas_work::model::grant::grant_network(),
-                    Some(provider.clone()),
-                    hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-                )
-                .await?,
-                Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-            )),
+            ProviderAuthority::Journal { root, .. } => {
+                Ok(hellas_authority::node::NodeCoordinator::new(
+                    hellas_authority::work_store::grant::NodeStore::open(
+                        root,
+                        hellas_authority::model::grant::grant_network(),
+                        Some(provider.clone()),
+                        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+                    )
+                    .await?,
+                    Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+                ))
+            }
             ProviderAuthority::Host(control) => {
                 let node = control.node();
                 node.check_provider(provider).await?;
@@ -284,7 +251,7 @@ impl<R> ProviderOptions<R> {
         self.grants
             .as_mut()
             .ok_or(ProviderError::FundingRequired)?
-            .authority = ProviderAuthority::Host(control);
+            .authority = ProviderAuthority::Host(Box::new(control));
         Ok(self)
     }
 }
@@ -325,7 +292,7 @@ impl IncomingConnection {
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = IDLE_TIMEOUT;
 pub struct ProviderHandle {
     configuration: Option<crate::node_control::configuration::ProviderMetadata>,
-    administration: Option<hellas_work::grant_service::WorkAdministration>,
+    administration: Option<hellas_authority::grant_service::WorkAdministration>,
     router: Option<WorkRouter>,
     discovery: Option<discovery::DiscoveryAdvertiser>,
     stop: Option<oneshot::Sender<()>>,
@@ -372,7 +339,7 @@ impl ProviderHandle {
         self.accept_task.is_finished()
     }
 
-    pub fn administration(&self) -> Option<&hellas_work::grant_service::WorkAdministration> {
+    pub fn administration(&self) -> Option<&hellas_authority::grant_service::WorkAdministration> {
         self.administration.as_ref()
     }
 
@@ -460,8 +427,8 @@ where
     }
     let prepared_grants = match config.grants {
         Some(grants) => {
-            let resources = if config.executor.supports_evaluate() {
-                crate::grant_provider::ProviderResources::EvaluateAndFetch(
+            let resources = if config.executor.supports_compute() {
+                crate::grant_provider::ProviderResources::ComputeAndFetch(
                     &config.executor.fetch_routes,
                 )
             } else {
@@ -473,6 +440,7 @@ where
         None => None,
     };
     let signer = config.executor.producer_key.clone();
+    let content = config.executor.content_store.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
     let remote_control = prepared_grants
         .as_ref()
@@ -484,13 +452,22 @@ where
         remote_control.enabled(),
     );
     let work_mount = MountedWork::with_backend(handle.clone());
-    let setup_mount = MountedSetup::default();
+    let setup_mount = MountedSetup::with_content_store(content);
     let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
     let runner = match config.work {
         Some((work, chain)) => Some(
             WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
                 .await?
-                .on_node(chain),
+                .on_node(
+                    chain,
+                    prepared_grants
+                        .as_ref()
+                        .ok_or(ProviderError::FundingRequired)?
+                        .1
+                        .clone(),
+                    enrollment.clone(),
+                    vec![],
+                ),
         ),
         None => None,
     };
@@ -542,7 +519,7 @@ where
 
     let open_identity = config.open_identity;
     let (grants, administration, admin) = if let Some((grants, store)) = prepared_grants {
-        let service = hellas_work::grant_service::GrantService::from_node(
+        let service = hellas_authority::grant_service::GrantService::from_node(
             store,
             &open_identity.enrollment,
             signer,
@@ -553,14 +530,15 @@ where
                 .map(ToString::to_string)
                 .collect(),
         )
-        .await?;
-        let administration = hellas_work::grant_service::WorkAdministration::new(
+        .await?
+        .with_upload_quota(work_mount.upload_quota());
+        let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.policies,
             grants.config.max_job_millis,
         )?;
         let admin = match grants.authority {
-            ProviderAuthority::Host(control) => Some(control),
+            ProviderAuthority::Host(control) => Some(*control),
             ProviderAuthority::Journal { .. } => None,
         };
         (Some(service), Some(administration), admin)
@@ -871,6 +849,10 @@ pub struct ProviderOpen<R> {
 }
 
 impl<R> ProviderOpen<R> {
+    pub fn enrollment(&self) -> &ProviderEnrollmentBundle {
+        &self.enrollment
+    }
+
     pub fn new(
         signer: Arc<hellas_auth::ProducerSigningKey>,
         enrollment: ProviderEnrollmentBundle,

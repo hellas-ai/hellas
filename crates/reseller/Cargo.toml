@@ -10,11 +10,12 @@ documentation.workspace = true
 [dependencies]
 hellas-adaptors.workspace = true
 hellas-auth.workspace = true
+hellas-authority.workspace = true
+hellas-channel.workspace = true
 hellas-executor.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch", "work"] }
 hellas-sdk.workspace = true
-hellas-work.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,9 +25,10 @@ thiserror.workspace = true
 axum.workspace = true
 futures.workspace = true
 hellas-attestation.workspace = true
+hellas-authority = { workspace = true, features = ["test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-kernel.workspace = true
 hellas-providers = { workspace = true, features = ["test-support"] }
-hellas-work = { workspace = true, features = ["test-support"] }
 iroh.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

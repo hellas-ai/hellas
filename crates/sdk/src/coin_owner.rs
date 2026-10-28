@@ -12,6 +12,8 @@ use hellas_kernel::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoinOwnerError {
+    #[error("channel requires {required} but at most four eligible coins provide {available}")]
+    Insufficient { required: u64, available: u64 },
     #[error(transparent)]
     Query(#[from] QueryError),
     #[error("the chain has no finalized snapshot")]
@@ -20,6 +22,8 @@ pub enum CoinOwnerError {
     Inputs,
     #[error("selected coin is absent from this owner's live coins: {0:?}")]
     Missing(CoinId),
+    #[error("split requires a positive delegated value within the selected balance")]
+    Split,
     #[error("selected coin values overflow")]
     ValueOverflow,
     #[error("chain network does not match the requested signing network")]
@@ -36,6 +40,7 @@ pub struct OwnerReshape {
     owner: Key,
     inputs: List<CoinId, MAX_EDGE_INPUTS>,
     outputs: List<Payout, MAX_EDGE_OUTPUTS>,
+    floor: Option<(u64, [u8; 32])>,
 }
 
 impl OwnerReshape {
@@ -47,6 +52,7 @@ impl OwnerReshape {
         owner: Key,
         selected: &[CoinId],
         delegate: Option<Key>,
+        split: Option<u64>,
     ) -> Result<Self, CoinOwnerError> {
         if selected.is_empty()
             || selected.len() > MAX_EDGE_INPUTS
@@ -57,35 +63,225 @@ impl OwnerReshape {
         {
             return Err(CoinOwnerError::Inputs);
         }
-        if chain.get_consensus_info().await?.network_id != network.as_str() {
+        let snapshot = chain
+            .get_objects(
+                selected
+                    .iter()
+                    .copied()
+                    .map(hellas_chain::domain::coin_object_id)
+                    .collect(),
+            )
+            .await?
+            .ok_or(CoinOwnerError::NoSnapshot)?;
+        if snapshot.network != network {
             return Err(CoinOwnerError::Network);
+        }
+        let mut value = 0_u64;
+        let mut inputs = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_INPUTS];
+        for (slot, id) in inputs.iter_mut().zip(selected) {
+            let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot
+                .objects
+                .get(&hellas_chain::domain::coin_object_id(*id))
+            else {
+                return Err(CoinOwnerError::Missing(*id));
+            };
+            if coin.owner != owner.into() {
+                return Err(CoinOwnerError::Missing(*id));
+            }
+            value = value
+                .checked_add(coin.value)
+                .ok_or(CoinOwnerError::ValueOverflow)?;
+            *slot = *id;
+        }
+        let mut outputs = Vec::new();
+        if let Some(unit) = split {
+            if delegate.is_none() || unit == 0 || unit > value {
+                return Err(CoinOwnerError::Split);
+            }
+            let count = (value / unit).min((MAX_EDGE_OUTPUTS - 1) as u64);
+            for _ in 0..count {
+                outputs.push(Payout::delegated(owner, delegate, unit));
+            }
+            let change = value - count * unit;
+            if change > 0 {
+                outputs.push(Payout::new(owner, change));
+            }
+        } else {
+            outputs.push(Payout::delegated(owner, delegate, value));
+        }
+        let count = outputs.len();
+        let slots = std::array::from_fn(|index| {
+            outputs.get(index).cloned().unwrap_or(Payout::new(owner, 0))
+        });
+        Ok(Self {
+            floor: Some((snapshot.block.height, snapshot.block.payload.into())),
+            network,
+            owner,
+            inputs: List::take(inputs, selected.len()),
+            outputs: List::take(slots, count),
+        })
+    }
+
+    /// Select at most four verified owner coins. Listing entries are discovery
+    /// hints; only objects authenticated at one finalized root authorize value.
+    pub async fn split<C: LightClient>(
+        chain: &C,
+        network: NetworkId,
+        owner: Key,
+        need: u64,
+        delegate: Key,
+    ) -> Result<Self, CoinOwnerError> {
+        Self::split_avoiding(
+            chain,
+            network,
+            owner,
+            need,
+            delegate,
+            &std::collections::BTreeSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn split_avoiding<C: LightClient>(
+        chain: &C,
+        network: NetworkId,
+        owner: Key,
+        need: u64,
+        delegate: Key,
+        reserved: &std::collections::BTreeSet<CoinId>,
+    ) -> Result<Self, CoinOwnerError> {
+        if need == 0 {
+            return Err(CoinOwnerError::Split);
         }
         let listing = chain
             .get_coins_by_owner(owner.into())
             .await?
             .ok_or(CoinOwnerError::NoSnapshot)?;
-        let mut value = 0_u64;
-        let mut inputs = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_INPUTS];
-        for (slot, id) in inputs.iter_mut().zip(selected) {
-            let (_, coin_value) = listing
-                .coins
+        let mut candidates = listing
+            .coins
+            .into_iter()
+            .filter(|(id, _)| !reserved.contains(&CoinId::from_bytes((*id).into())))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut seen = std::collections::BTreeSet::new();
+        candidates.retain(|(id, _)| seen.insert(*id));
+        let mut eligible = Vec::new();
+        for batch in candidates.chunks(32) {
+            let snapshot = chain
+                .get_objects(batch.iter().map(|(id, _)| *id).collect())
+                .await?
+                .ok_or(CoinOwnerError::NoSnapshot)?;
+            if snapshot.network != network {
+                return Err(CoinOwnerError::Network);
+            }
+            eligible.extend(snapshot.objects.into_iter().filter_map(|(id, object)| {
+                let hellas_chain::domain::Object::Coin(coin) = object else {
+                    return None;
+                };
+                (coin.owner == owner.into()
+                    && coin.value > 0
+                    && (coin.delegate.is_none() || coin.delegate == Some(delegate.into())))
+                .then_some((CoinId::from_bytes(id.into()), coin.value))
+            }));
+            eligible.sort_unstable_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| a.0.to_bytes().cmp(&b.0.to_bytes()))
+            });
+            eligible.dedup_by_key(|coin| coin.0);
+            eligible.truncate(hellas_kernel::MAX_PARTY_INPUTS);
+            if eligible
                 .iter()
-                .find(|(coin_id, _)| *coin_id == id.to_bytes().into())
-                .ok_or(CoinOwnerError::Missing(*id))?;
-            value = value
-                .checked_add(*coin_value)
-                .ok_or(CoinOwnerError::ValueOverflow)?;
-            *slot = *id;
+                .fold(0_u64, |sum, coin| sum.saturating_add(coin.1))
+                >= need
+            {
+                break;
+            }
         }
+        let mut selected = Vec::new();
+        let mut covered = 0_u64;
+        for (coin, value) in eligible {
+            if covered >= need {
+                break;
+            }
+            covered = covered
+                .checked_add(value)
+                .ok_or(CoinOwnerError::ValueOverflow)?;
+            selected.push(coin);
+        }
+        if selected.is_empty() {
+            return Err(CoinOwnerError::Insufficient {
+                required: need,
+                available: 0,
+            });
+        }
+        // Discovery can span finalized roots. Re-read every selected input together
+        // before asking the owner to authorize a value or a remainder.
+        let snapshot = chain
+            .get_objects(
+                selected
+                    .iter()
+                    .copied()
+                    .map(hellas_chain::domain::coin_object_id)
+                    .collect(),
+            )
+            .await?
+            .ok_or(CoinOwnerError::NoSnapshot)?;
+        if snapshot.network != network {
+            return Err(CoinOwnerError::Network);
+        }
+        let mut total = 0_u64;
+        for id in &selected {
+            let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot
+                .objects
+                .get(&hellas_chain::domain::coin_object_id(*id))
+            else {
+                return Err(CoinOwnerError::Missing(*id));
+            };
+            if coin.owner != owner.into()
+                || (coin.delegate.is_some() && coin.delegate != Some(delegate.into()))
+            {
+                return Err(CoinOwnerError::Missing(*id));
+            }
+            total = total
+                .checked_add(coin.value)
+                .ok_or(CoinOwnerError::ValueOverflow)?;
+        }
+        if total < need {
+            return Err(CoinOwnerError::Insufficient {
+                required: need,
+                available: total,
+            });
+        }
+        let inputs = List::take(
+            std::array::from_fn(|index| {
+                selected
+                    .get(index)
+                    .copied()
+                    .unwrap_or(CoinId::from_bytes([0; CoinId::LENGTH]))
+            }),
+            selected.len(),
+        );
+        let mut payouts = vec![Payout::delegated(owner, Some(delegate), need)];
+        if total > need {
+            payouts.push(Payout::new(owner, total - need));
+        }
+        let outputs = List::take(
+            std::array::from_fn(|index| {
+                payouts.get(index).copied().unwrap_or(Payout::new(owner, 0))
+            }),
+            payouts.len(),
+        );
         Ok(Self {
             network,
             owner,
-            inputs: List::take(inputs, selected.len()),
-            outputs: List::take(
-                [Payout::delegated(owner, delegate, value); MAX_EDGE_OUTPUTS],
-                1,
-            ),
+            inputs,
+            outputs,
+            floor: Some((snapshot.block.height, snapshot.block.payload.into())),
         })
+    }
+
+    pub(crate) const fn floor(&self) -> Option<(u64, [u8; 32])> {
+        self.floor
     }
 
     #[must_use]
@@ -127,6 +323,7 @@ mod tests {
         let owner = Secp256k1Signer::from_secret_scalar([11; 32]).unwrap();
         let node = Secp256k1Signer::from_secret_scalar([12; 32]).unwrap();
         let plan = OwnerReshape {
+            floor: None,
             network: NetworkId::new("owner-reshape-test").unwrap(),
             owner: owner.party_key(),
             inputs: List::take([CoinId::from_bytes([1; 32]); MAX_EDGE_INPUTS], 1),
@@ -169,7 +366,7 @@ mod tests {
             Digest,
             authority::{AuthorityError, PasskeyAssertion},
         };
-        use hellas_work::authenticator::{Authenticator, PublicKey, kernel_auth};
+        use hellas_authority::authenticator::{Authenticator, PublicKey, kernel_auth};
         struct NativePrompt(hellas_kernel::SoftPasskey);
         #[async_trait::async_trait]
         impl Authenticator for NativePrompt {
@@ -183,6 +380,7 @@ mod tests {
         }
         let owner = NativePrompt(hellas_kernel::SoftPasskey::from_secret_scalar([21; 32]).unwrap());
         let plan = OwnerReshape {
+            floor: None,
             network: NetworkId::new("owner-passkey-test").unwrap(),
             owner: Key::from_bytes(owner.public_key().unwrap().to_compressed()),
             inputs: List::take([CoinId::from_bytes([1; 32]); MAX_EDGE_INPUTS], 1),

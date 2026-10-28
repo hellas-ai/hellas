@@ -25,7 +25,9 @@ use hellas_wire::{ServiceMarker, iroh::IrohTransport};
 use rand::seq::SliceRandom;
 use std::{collections::BTreeMap, sync::Mutex as StdMutex, time::Duration};
 
-pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const MAX_RETRY_DELAY_MS: u64 = 30_000;
 pub(super) const MAX_PEERS: usize = 64;
 type Client = Arc<ChainSyncClientImpl<IrohTransport>>;
 
@@ -296,7 +298,7 @@ impl Network {
                 .map_err(storage)?
                 .map_err(QueryError::from)?;
                 loop {
-                    let response = tokio::time::timeout(Duration::from_secs(20), events.next())
+                    let response = tokio::time::timeout(STREAM_IDLE_TIMEOUT, events.next())
                         .await
                         .map_err(storage)?
                         .ok_or(QueryError::ChannelClosed)?
@@ -343,7 +345,9 @@ pub(super) fn peer(id: iroh::EndpointId) -> PeerId {
     PeerId::from_bytes(*id.as_bytes())
 }
 fn retry_delay(attempt: u32) -> Duration {
-    let cap = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
+    let cap = 250u64
+        .saturating_mul(1u64 << attempt.min(7))
+        .min(MAX_RETRY_DELAY_MS);
     Duration::from_millis(cap / 2 + rand::random::<u64>() % (cap / 2 + 1))
 }
 impl opaque::Fetcher for Network {

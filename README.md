@@ -13,21 +13,15 @@ parse versions, negotiate compatibility, or consult a model/package registry.
 
 ## Execution boundary
 
-The application owns the meaning of its root. The two currently modelled
-shapes intentionally have different trust boundaries:
+The application owns the meaning of its root. The two applications
+intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-gpu-0.0.1`, `causal-lm-0.0.1` | Exact Catena program, entrypoint, content-addressed static objects and borrowed slices, state sizing, vocabulary, capacity, and token-native invocation/result | Model acquisition, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
-| `hellas/fetch-0.0.1`, `codex-responses-0.0.1` or `openai-responses-0.0.2` | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
+| `hellas/catena-9ec3f625170e`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
-For causal LM work, the request and transcript bind the manifest, input token
-IDs, maximum output, explicit stop IDs, output token IDs, and termination.
-`--tokenizer` is a caller-side lens that encodes prompt text and decodes the
-verified IDs; it is not part of the Catena kernel claim. Hellas infers no stop
-tokens from it.
-
-Fetch is different. Its purpose is to attest the exact transformation around a
+Fetch's purpose is to attest the exact transformation around a
 remote request, so structuring and destructuring are inside that application's
 trusted path rather than presentation performed outside it. This proves which
 checks and transformation ran, not that the remote service's claims are true.
@@ -38,64 +32,65 @@ it does not authenticate a running binary. The sealed Responses adaptor sends
 `store=false` upstream and accepts text and client-executed function tools.
 
 Work is the execution protocol for payment-funded channels and owner, principal
-and delegated grants, including `gateway --offer` and sealed Fetch. Ticket execution, shadow verification, public retained-artifact
-retrieval and CacheControl have been removed. Work-side local reproduction
-remains available. Accepted paid inputs and results remain in the channel's
-recovery/evidence journal, independently of gateway archive settings.
+and delegated grants, including `gateway --offer` and sealed Fetch. Accepted
+paid inputs and results remain in the channel's recovery/evidence journal,
+independently of gateway archive settings.
 
-## Causal-LM environments
+## Quickstart: sell and buy one job
 
-Human-readable settings live in [`examples/`](examples/). Their paths are
-local acquisition hints; canonical environment bytes contain only identities,
-lengths, and ABI data.
+Person A sells GPU compute on the devnet with a GPU build (`.#cli-catena` or
+the `hip`/`cuda` image below):
 
 ```sh
-hellas-cli environment build \
-  --program model.hex \
-  --settings examples/smollm2.environment.toml \
-  --out smollm2.environment
-
-hellas-cli environment inspect --environment smollm2.environment
-
-# Prove one environment and all of its referenced content are provider-ready.
-hellas-cli environment verify \
-  --environment smollm2.environment \
-  --content-root /srv/hellas/content \
-  --content-index /var/lib/hellas/content.index
+hellas --faucet serve --paid-work-config docs/examples/faucet-provider.toml
 ```
 
-For `gateway`, the caller selects the environment trust anchor before
-any route starts. By default, the exact local `--environment` file bytes are
-that anchor and the CLI derives their manifest ID. When a manifest ID was
-distributed separately, pass `--manifest-id <CONTENT_ID>`; a file deriving
-a different ID is rejected before network or GPU work. A provider never selects
-either value.
+`--faucet` only selects a key from the devnet genesis faucet allocation. These
+are public development keys; the selected account is retained beside the
+identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
+work is sold only with `--paid-work-config FILE`: at startup the selected owner
+approves exactly that file's terms and delegates the stake its offers bond.
+The example charges 20 per job, ten jobs per channel, and stops execution after
+90 seconds. `serve` prints A's `Node ID`.
 
-A provider indexes ordinary runtime files and can accept any locally
-satisfiable supported environment; it need not register a model name:
+Person B runs no node. With a Catena program `counter.hex`:
+
+```text
+(def program initialize : [] -> (u64 val) = const.u64.0x0000000000000000)
+(def program advance : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
+```
+
+one command builds a job, pays A and prints the result; a second closes the
+channel:
 
 ```sh
-hellas-cli --software-root serve \
-  --work-config /run/hellas/work.json \
-  --content-root /srv/hellas/content
+hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
+  --arg u64:2 --arg u64:3 --returns u64 --payment 20
+hellas --faucet transact --settle --provider NODE_ID
 ```
 
-Work execution strictly decodes the submitted manifest. The first binding opens
-its root by exact local content ID and verifies every declared program/static
-object; later executions for that exact manifest may reuse the immutable verified
-binding without reopening or rehashing those files. Binding does not acquire content. The authorized worker is the final availability and integrity
-boundary: before nonresident content enters the safe runtime, it reopens the
-descriptor and enforces the exact ID and length; an already-resident exact
-mapping is reused. The provider then compiles the Catena source for its visible
-GPU device. Verified static files are lent by descriptor to a bounded
-persistent safe-runtime session, so an already prepared program and weights are
-reused across requests until the session is recycled or the service restarts.
-There is no client-supplied `gfx` target or provider architecture allow-list.
-Providers independently bound compilation with `--gpu-compile-timeout-secs`
-and each complete generation with `--gpu-execution-timeout-secs`; expiry kills
-the isolated worker process group and the next request starts a fresh session.
-`--gpu-max-generation-capacity` is additionally capped at 524288 tokens so a
-token transcripts stay within the canonical artifact size bound.
+B's key approves funding once per channel: A's jobs per channel times its
+price, plus reserve and fees. Later jobs reuse the open channel; `--settle`
+closes it and returns the unspent part. Before paying, B checks that the result
+is signed by A and matches this job. Hellas does not re-run the job, so this
+shows who answered, not that the answer is correct.
+
+`run` writes a job folder and transacts it exactly as `hellas transact
+--job DIR`, the raw command for any application. `hellas fetch URL` does
+the same for a paid HTTPS request. See [jobs](docs/jobs.md) for the folder
+format, multi-step jobs and Fetch.
+
+A compiles the Catena sources for its visible GPU and runs each job in a
+separate worker process group. That isolation is crash/timeout containment,
+not a sandbox: it does not confine what the program can reach, and there is no
+memory metering. A job over A's upload limit is refused before it runs; a job
+that exceeds the execution limit is killed with its worker and is not paid.
+Compilation has no time limit. Sources and weights a job names by content ID
+must be available to A: index local files with `serve --content FILE` or
+`--content-root DIR`, or adopt a HuggingFace cache with `hellas store adopt`.
+Both commands default to the same store (`HELLAS_STORE_DIR` or
+`~/.hellas/store`).
 
 Indexed provider content is an immutable local-cache assumption. Hellas pins
 the verified read-only descriptor and detects path/inode replacement; it does
@@ -112,8 +107,8 @@ claim a different adaptor identity.
 A provider route file contains a `routes` array. Each route has `service`,
 `method`, `destination` and optional `capabilities` (model and output limits).
 The former `callers` field is rejected; the mounted Work channel authorizes jobs.
-Use `serve --fetch-config FILE --work-config FILE` to mount paid execution.
-See [paid Work](crates/work/README.md) for channel configuration and
+Use `serve --fetch-config FILE --paid-work-config FILE` to sell it.
+See [paid Work](crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
 
 ## HTTP gateway
@@ -122,27 +117,26 @@ For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor
 request, response and streaming formats. CLI gateways archive payloads by default;
 `--zdr` or `x-hellas-zdr: true` disables application payload persistence.
 
-The causal-LM gateway requires the same canonical environment and an explicit
-presentation tokenizer. `--model` is only an API response label; when omitted,
-the manifest ID is used.
+`--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
+gateway renders each request as a Compute job from the GGUF's configuration
+and tokenizer and sends it to its paid pool or grant; the weights are not
+uploaded, so providers must already hold that GGUF (see the quickstart). The
+API model label is the file name without its extension.
 
+Buy a single job with [`run`, `transact` or `fetch`](docs/jobs.md).
 Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
-then pass `--paid-work-config POOL` together with `--environment` and
-`--tokenizer`. Local execution requires an explicitly provisioned owner grant.
+then pass `--paid-work-config POOL` together with `--text-model`.
 
 It binds loopback by default; non-loopback listening requires `--allow-remote`.
 Every gateway requires a private `--gateway-profile FILE` selecting a provisioned
 local Auth authority and a bearer credential scoped to `gateway.invoke`.
-See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The causal-LM backend accepts plain text at
-`/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
-model adapter for chat, reasoning and tool calls supported by that model.
-The proxy Responses backend retains its explicit upstream semantics.
+See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The
+text routes use the shared Qwen3 model adapter for completions, chat and tool
+calls. The proxy Responses backend retains its explicit upstream semantics.
 A pinned Responses Offer uses `gateway --offer ALIAS --work-profile FILE` and
-the shared SDK Responses gateway; it exposes `/v1/responses` without a local
-causal-LM environment. See the [HTTP gateway guide](docs/http-gateway.md#responses-grants).
-`--responses-backend` changes only `/v1/responses`; every other
-route remains bound to the causal-LM environment, so `--environment` and
-`--tokenizer` are still required.
+the shared SDK Responses gateway; it exposes `/v1/responses` without a
+`--text-model`. See the [HTTP gateway guide](docs/http-gateway.md#responses-grants).
+`--responses-backend` changes only `/v1/responses`.
 
 The exposed routes are:
 
@@ -153,7 +147,7 @@ POST /v1/chat/completions
 POST /v1/messages
 ```
 
-Monitor discovery and peer health with `hellas-cli monitor --timeout-secs 30`.
+Monitor discovery and peer health with `hellas monitor --timeout-secs 30`.
 
 ## Chain
 
@@ -254,7 +248,8 @@ The NixOS module provisions the matching toolchain and device access:
 ```nix
 services.hellas = {
   enable = true;
-  workConfigFile = "/srv/hellas/work.json";
+  workConfigFile = "/srv/hellas/paid-work.toml"; # passed as --paid-work-config
+  passkey = "/srv/hellas/owner.passkey";
   gpuBackend = "cuda"; # or "hip" / "auto"
   contentRoots = [ "/srv/hellas/content" ];
 };
@@ -269,7 +264,7 @@ Nix expression or in the store. In particular, never interpolate the file as a
 Nix path and never use `builtins.readFile` on it: both operations expose its
 contents during evaluation, before any module assertion or runtime validation
 can protect it. Paid Fetch uses metadata-only journals; see
-[provider retention](crates/work/README.md).
+[provider retention](crates/channel/README.md).
 
 On Darwin, the Home Manager launch agent remains network-only but supports the
 same runtime-secret boundary:
@@ -279,7 +274,8 @@ programs.hellas = {
   enable = true;
   serve = {
     enable = true;
-    workConfigFile = "/Users/alice/.config/hellas/work.json";
+    workConfigFile = "/Users/alice/.config/hellas/paid-work.toml";
+    passkey = "/Users/alice/.config/hellas/owner.passkey";
     fetchConfigFile = "/Users/alice/.config/hellas/fetch.json";
     environmentFile = "/Users/alice/.config/hellas/provider.env";
   };
@@ -360,8 +356,8 @@ copying a complete store snapshot for offline replay. Recording persists payload
 and is incompatible with gateway ZDR mode. Agent tool execution is not cached.
 
 ```sh
-hellas-cli --output-cache record gateway --responses-backend proxy --wrap opencode
-hellas-cli --output-cache replay-only gateway --responses-backend proxy --wrap opencode
+hellas gateway --output-cache record --responses-backend proxy --wrap opencode
+hellas gateway --output-cache replay-only --responses-backend proxy --wrap opencode
 ```
 
 For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
@@ -442,7 +438,7 @@ A configured endpoint enables the feature on the module's default package;
 packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
 HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
 continues to accept an exact trace URL. Home Manager and nix-darwin scope
-variables to `hellas-cli`, rather than enabling unrelated applications.
+variables to `hellas`, rather than enabling unrelated applications.
 Home Manager's `programs.hellas.serve` supplies the Darwin user service.
 Direct package users can use `cli.override { otel = true; }` (also
 `cli-catena` and `cli-validator`) and the standard `OTEL_*` environment variables.

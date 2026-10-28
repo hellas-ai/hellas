@@ -97,7 +97,7 @@ combined with a provider credential; that restriction remains enforced by the
 provider. Private destinations also require its explicit egress opt-in.
 
 ```sh
-hellas-cli --identity ./gateway.identity gateway \
+hellas --identity ./gateway.identity gateway \
   --http-fetch-config ./http-gateway.json \
   --paid-work-config /srv/hellas/paid-pool.json \
   --port 8080 --gateway-profile ./gateway-profile.json
@@ -207,7 +207,7 @@ stateless Responses resource uses the same SDK `grant_gateway::responses::start_
 composition as an embedded host:
 
 ```sh
-hellas-cli gateway --offer ALIAS --grant-policy responses \
+hellas gateway --offer ALIAS --grant-policy responses \
   --trust-store ./trust --trust-policy PROVIDER \
   --work-profile ./work-profile.json --gateway-profile ./gateway-profile.json \
   --port 8080 --zdr

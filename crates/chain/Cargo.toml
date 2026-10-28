@@ -26,6 +26,7 @@ domain = [
 domain-consensus = ["domain", "dep:commonware-consensus"]
 client = ["client-core", "hellas-wire/ws-rustls"]
 client-core = [
+    "dep:futures-util",
     "dep:hellas-rpc",
     "hellas-rpc/chain",
     "dep:commonware-codec",
@@ -147,12 +148,15 @@ validator = [
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
+# The six-validator devnet harness (`test_support::devnet`) other crates'
+# tests run a chain with. No shipped build enables it.
+test-support = ["validator", "dep:tempfile"]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 # The block source a paid endpoint's settlement watcher reads. It is its
 # own feature because a paid endpoint needs both the block codec and the
 # durable work driver, while a chain client that only serves coins has no
 # use for either.
-work-watcher = ["block-view", "dep:hellas-work"]
+work-watcher = ["block-view", "dep:hellas-channel", "dep:tokio"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -179,12 +183,12 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
     "sink",
 ] }
 hellas-auth = { workspace = true, optional = true }
+hellas-channel = { workspace = true, optional = true }
 hellas-genesis = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-private = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
-hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 iroh = { workspace = true, optional = true, features = ["tls-ring"] }
 p256 = { workspace = true, optional = true }
@@ -197,6 +201,7 @@ rand_core = { workspace = true, optional = true }
 redb = { version = "4", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "net",
@@ -215,6 +220,10 @@ commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true
 hellas-auth.workspace = true
+# The consensus tests submit close actions built by the endpoint's own
+# paid-work helpers. Keep that dependency test-only: production chain code
+# only needs it behind the `work-watcher` feature.
+hellas-channel = { workspace = true, features = ["test-support"] }
 # The end-to-end money test signs a payment only after the client's own
 # re-execution reproduced the provider's answer, and that gate — the
 # `Reproducer` seam and the matched/refuted journal transition around it
@@ -228,10 +237,6 @@ hellas-kernel = { workspace = true, features = ["test-support"] }
 # consensus is asked to accept. As a runtime dependency `hellas-rpc`
 # arrives without the work protocol; the settlement suite needs it.
 hellas-rpc = { workspace = true, features = ["work"] }
-# The consensus tests submit close actions built by the endpoint's own
-# paid-work helpers. Keep that dependency test-only: production chain code
-# only needs it behind the `work-watcher` feature.
-hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile = "3"

@@ -33,14 +33,6 @@ pub mod hellas {
         }
     }
 
-    #[cfg(feature = "evaluate")]
-    #[allow(dead_code)]
-    pub mod evaluate {
-        pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/hellas.evaluate.v1.rs"));
-        }
-    }
-
     #[cfg(feature = "chain")]
     #[allow(dead_code)]
     pub mod chain {
@@ -70,12 +62,6 @@ pub mod hellas {
 #[cfg(feature = "execute")]
 pub mod execute {
     pub use crate::pb::hellas::v1::*;
-}
-
-/// Re-exports of `hellas.evaluate.v1`.
-#[cfg(feature = "evaluate")]
-pub mod evaluate {
-    pub use crate::pb::hellas::evaluate::v1::*;
 }
 
 /// Re-exports of `hellas.fetch.v1`.
@@ -173,16 +159,15 @@ mod id_pins {
     #[test]
     fn work_ids_are_stable() {
         use super::services::work::{
-            AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult, Work,
+            AcceptWork, AdmitCertificate, GetStanding, Open, StreamResult, UploadContent, Work,
         };
-        // Session-bound standing removes its redundant request signature,
-        // deliberately rotating GetStanding and Work. Open stays fixed.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x584721e6);
+        // Signed program-root uploads and stream-only result delivery rotate these IDs.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xc910d7a8);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
+        assert_eq!(<UploadContent as MethodMarker>::METHOD_ID, 0x696080b2);
         assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x64b53882);
-        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x74bb099b);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xb2043ac5);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0x6f992f60);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x07db8b8e);
     }
 
@@ -196,10 +181,12 @@ mod id_pins {
     #[cfg(feature = "work")]
     #[test]
     fn work_setup_ids_are_stable() {
-        use super::services::work_setup::{ExchangeSetup, Open, WorkSetup};
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xdfbb90af);
+        use super::services::work_setup::{ExchangeSetup, Open, RequestOffer, WorkSetup};
+        // RequestOffer deliberately rotates the setup service descriptor.
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0fb60b29);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
         assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x14d05693);
+        assert_eq!(<RequestOffer as MethodMarker>::METHOD_ID, 0x97c491fd);
     }
 
     #[cfg(feature = "host-control")]
@@ -246,9 +233,19 @@ mod id_pins {
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {
-        use super::services::light_client::{GetStateRoot, LightClient, SubmitWorkResponse};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x8f06b6cc);
+        use super::services::light_client::{
+            GetAppliedFinalizedBlock, GetOperations, GetStateRoot, LightClient, SubmitWorkResponse,
+            SubscribeFinalized,
+        };
+        // Applied witness checkpoints deliberately rotate the LightClient service.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x001c0b51);
+        assert_eq!(
+            <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
+            0x6d407974
+        );
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
+        assert_eq!(<GetOperations as MethodMarker>::METHOD_ID, 0x2fa2a439);
+        assert_eq!(<SubscribeFinalized as MethodMarker>::METHOD_ID, 0xc0ccad00);
     }
 }

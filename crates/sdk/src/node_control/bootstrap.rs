@@ -1,8 +1,8 @@
 //! One-shot owner bootstrap on the normal, independently pinned node transport.
 //! The pairing secret is delivered through the authenticated machine console.
 use super::*;
+use hellas_authority::work_store::grant::{NodeStore, PreparedBootstrap};
 use hellas_rpc::ProviderEnrollmentBundle;
-use hellas_work::work_store::grant::{NodeStore, PreparedBootstrap};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::Path};
 use subtle::ConstantTimeEq;
@@ -215,7 +215,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_work::test_support::{actors::ROOT, common_node};
+    use {hellas_authority::test_support::common_node, hellas_channel::test_support::actors::ROOT};
     async fn endpoints() -> (iroh::Endpoint, iroh::Endpoint) {
         let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -240,9 +240,9 @@ mod tests {
         invitation
     }
     fn prepared(node: iroh::EndpointId) -> (GrantId, PreparedBootstrap, CredentialSecret) {
-        let root = hellas_work::test_support::ids::ROOT_GRANT;
+        let root = hellas_authority::test_support::ids::ROOT_GRANT;
         let scope = common_node::admin_spec(
-            hellas_work::test_support::authority(),
+            hellas_authority::test_support::authority(),
             ROOT.principal(),
             &[],
             (UnixMillis(0), UnixMillis(u64::MAX)),
@@ -262,7 +262,7 @@ mod tests {
     }
     #[tokio::test]
     async fn bootstrap_accepts_an_external_async_authenticator_assertion() {
-        use hellas_work::authenticator::{Authenticator, PublicKey};
+        use hellas_authority::authenticator::{Authenticator, PublicKey};
         struct Prompt(hellas_kernel::SoftPasskey);
         #[async_trait::async_trait]
         impl Authenticator for Prompt {
@@ -296,7 +296,7 @@ mod tests {
                 &server,
                 &invitation,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             ),
             connect(&client, &invitation, root, approval),
@@ -317,7 +317,7 @@ mod tests {
         assert!(
             NodeStore::bootstrap_prepared(
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 root,
                 approval,
                 None,
@@ -346,7 +346,7 @@ mod tests {
                 &server,
                 &invitation,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             ),
             async {
@@ -382,7 +382,7 @@ mod tests {
                 send.write_all(&bytes).await.unwrap();
                 send.finish().unwrap();
                 assert_eq!(
-                    hellas_work::test_support::within(recv.read_u8())
+                    hellas_authority::test_support::within(recv.read_u8())
                         .await
                         .unwrap(),
                     VERSION
@@ -408,7 +408,7 @@ mod tests {
                 &server,
                 &invitation,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             )
             .await
@@ -430,7 +430,7 @@ mod tests {
                 &server,
                 &invitation,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             ),
             connect(&client, &invitation, root, approval.clone()),
@@ -440,7 +440,7 @@ mod tests {
         let node = NodeCoordinator::new(
             NodeStore::open(
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None,
                 UnixMillis::now().unwrap(),
             )
@@ -455,7 +455,7 @@ mod tests {
         assert!(
             NodeStore::bootstrap_prepared(
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 root,
                 approval,
                 None,
@@ -481,7 +481,7 @@ mod tests {
                 &server,
                 &invitation,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             ),
             async {
@@ -518,7 +518,7 @@ mod tests {
                 &server,
                 &current,
                 directory.path(),
-                hellas_work::test_support::network(),
+                hellas_channel::test_support::network(),
                 None
             ),
             async {
@@ -545,7 +545,7 @@ mod tests {
                     send.write_u32(u32::MAX).await.unwrap();
                     send.flush().await.unwrap();
                     assert!(
-                        hellas_work::test_support::within(recv.read_u8())
+                        hellas_authority::test_support::within(recv.read_u8())
                             .await
                             .is_err()
                     );

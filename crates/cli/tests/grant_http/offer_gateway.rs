@@ -1,6 +1,6 @@
 use super::*;
-use hellas_work::model::grant::records::decode_enrollment;
-use hellas_work::test_support::actors::{FRIEND, ROOT};
+use hellas_authority::model::grant::records::decode_enrollment;
+use hellas_channel::test_support::actors::{FRIEND, ROOT};
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -15,7 +15,7 @@ struct OfferHost {
     reader: hellas_auth::authority::GrantSpec,
     reader_grant: GrantId,
     root_grant: GrantId,
-    signed_offer: hellas_work::model::grant::records::SignedOffer,
+    signed_offer: hellas_authority::model::grant::records::SignedOffer,
     offer: PathBuf,
     id: GrantId,
     work_profile: PathBuf,
@@ -46,7 +46,7 @@ impl OfferHost {
                     hex::encode(provider.principal().as_bytes())
                 ))
                 .join("provider"),
-            hellas_work::model::grant::grant_network(),
+            hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
         )
@@ -75,7 +75,7 @@ impl OfferHost {
         provider
             .run(&["contact", "import", string(&contact), "--name", "client"])
             .await;
-        let grantee = hellas_work::model::grant::records::decode_contact_card(
+        let grantee = hellas_authority::model::grant::records::decode_contact_card(
             &std::fs::read(&contact).unwrap(),
         )
         .unwrap()
@@ -83,20 +83,20 @@ impl OfferHost {
         reader.subject = grantee;
         reader.permissions = [hellas_auth::authority::Permission {
             operation: hellas_auth::authority::OperationId::new(
-                hellas_work::work_store::grant::WORK_ALLOWANCE_READ,
+                hellas_authority::work_store::grant::WORK_ALLOWANCE_READ,
             )
             .unwrap(),
-            resource: hellas_work::node::machine_resource(authority),
+            resource: hellas_authority::node::machine_resource(authority),
         }]
         .into();
         reader.issuance = None;
         let reader_grant = GrantId([4; 16]);
-        let coordinator = hellas_work::node::NodeCoordinator::new(
+        let coordinator = hellas_authority::node::NodeCoordinator::new(
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        let caller = hellas_work::test_support::session(&coordinator, &app_secret).await;
-        let (_, client_secret) = hellas_work::test_support::credentials::issue_one(
+        let caller = hellas_authority::test_support::session(&coordinator, &app_secret).await;
+        let (_, client_secret) = hellas_authority::test_support::credentials::issue_one(
             &coordinator,
             &caller,
             root_grant,
@@ -120,8 +120,7 @@ impl OfferHost {
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
         }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","fetch":{ "contract":hellas_rpc::FetchContract::http().unwrap(),
-            "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),"service":"http","method":"request","max_request_body_bytes":65536,"max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,"max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
+        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":http_invocation_policy(),
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
         let mut node = provider.spawn(
             &[
@@ -208,7 +207,7 @@ impl OfferHost {
             ])
             .await;
         assert!(exported_offer.status.success());
-        let signed_offer = hellas_work::model::grant::records::SignedOffer::decode(
+        let signed_offer = hellas_authority::model::grant::records::SignedOffer::decode(
             &std::fs::read(&offer).unwrap(),
             hellas_auth::authority::UnixMillis(0),
         )
@@ -263,14 +262,6 @@ impl OfferHost {
             serde_json::to_vec(&hellas_sdk::trust_policy::TrustPolicy {
                 provider_genesis: self.signed_offer.offer().provider.content_id(),
                 assurance: hellas_rpc::Assurance::ProducerSigned,
-                environments: self
-                    .signed_offer
-                    .offer()
-                    .grant
-                    .policies
-                    .iter()
-                    .map(|p| p.work.allowed_environment())
-                    .collect(),
                 apple: None,
             })
             .unwrap(),
@@ -480,7 +471,7 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let mut stream = response.bytes_stream();
-    let first = tokio::time::timeout(hellas_work::test_support::WAIT, stream.next())
+    let first = tokio::time::timeout(hellas_authority::test_support::WAIT, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -504,14 +495,15 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     let authority = AuthorityId(Digest::hash(b"CLI controlled HTTP authority"));
     let now = UnixMillis::now().unwrap_or_default();
     let validity = (now, UnixMillis(now.0 + 600_000));
-    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
-        .unwrap()
-        .permission(authority, None)
-        .unwrap();
+    let permission =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+            .unwrap()
+            .permission(authority, None)
+            .unwrap();
     let administrator = common_node::admin_spec(
         authority,
         subject,
-        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
         validity,
         (600_000, 0),
         &[],
@@ -527,9 +519,9 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     };
     let journal = root.join("controlled-authority");
     let root_grant = GrantId([0; 16]);
-    let (store, admin_secret) = hellas_work::work_store::grant::NodeStore::bootstrap(
+    let (store, admin_secret) = hellas_authority::work_store::grant::NodeStore::bootstrap(
         &journal,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
             Ownership::Bootstrap {
@@ -543,12 +535,12 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     )
     .await
     .unwrap();
-    let coordinator = hellas_work::node::NodeCoordinator::new(
+    let coordinator = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
-    let caller = hellas_work::test_support::session(&coordinator, &admin_secret).await;
-    let (_, own) = hellas_work::test_support::credentials::issue_one(
+    let caller = hellas_authority::test_support::session(&coordinator, &admin_secret).await;
+    let (_, own) = hellas_authority::test_support::credentials::issue_one(
         &coordinator,
         &caller,
         root_grant,
@@ -659,7 +651,18 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
-        request.send().await.unwrap().status()
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        if status.is_server_error() {
+            assert_http_response(
+                response,
+                reqwest::StatusCode::OK,
+                &[&process.log, &host.node.log],
+                &host.https,
+            )
+            .await;
+        }
+        status
     };
     assert_eq!(status(None).await, reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(status(Some(&first)).await, reqwest::StatusCode::OK);
@@ -701,8 +704,9 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         authority,
         subject: host.client.principal(),
         permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(authority, host.id),
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(authority, host.id),
         }]
         .into(),
         not_before: now,

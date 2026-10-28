@@ -1,73 +1,67 @@
 use hellas_auth::authority::GrantId;
 use hellas_chain::FinalizedWorkView;
+use hellas_channel::test_support::channel::{
+    client, provider, provider_producer, signer, work_policy,
+};
+use hellas_channel::work::WorkBackend;
+use hellas_channel::work_close::FinalizedBlocks;
+use hellas_channel::work_close::TxSink;
+use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint};
+use hellas_channel::work_open::SetupView;
+use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
-    WorkRefusalCode, WorkRefused, accept_work_response, admit_certificate_response,
-    deliver_result_response, exchange_setup_response,
+    ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
+    accept_work_response, admit_certificate_response, exchange_setup_response,
 };
 use hellas_rpc::services::{work::WorkHandler, work_setup::WorkSetupHandler};
 use hellas_wire::{TransportContext, WireStatus};
-use hellas_work::test_support::paid::{
-    client, identity_artifact, manifest, prompt_tokens, provider, provider_producer, signer,
-    text_execution, text_policy,
-};
-use hellas_work::work::WorkBackend;
-use hellas_work::work_close::FinalizedBlocks;
-use hellas_work::work_close::TxSink;
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_work::work_open::SetupView;
-use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 use crate::work_router::UnmountedWork;
 use futures::StreamExt;
-use hellas_work::test_support::common_node;
+use hellas_authority::test_support::common_node;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hellas_auth::Digest;
-use hellas_auth::{ProducerSigningKey, PublicKey};
+use hellas_auth::ProducerSigningKey;
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
+use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
+use hellas_channel::model::setup::ProviderChannelPolicy;
+use hellas_channel::model::work::{
+    JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PrivateRecord as _,
+    decode_transcript, delivery_request_digest, encode_transcript, next_payment,
+    payment_binding_digest, private_policy_commitment, result_digest, signing_hash, work_id,
+};
+use hellas_channel::work::{BackendFault, WorkRefusal};
+use hellas_channel::work_close::{BlockSourceError, FinalizedWork};
+use hellas_channel::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
+use hellas_channel::work_open::{FinalizedSetup, SetupQuery};
+use hellas_channel::work_store::{
+    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
+};
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-    Funding, Key, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
+    Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
     MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
     RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
 };
 use hellas_rpc::call::WithTrailer;
-use hellas_rpc::protocol::artifacts::{Canonical as _, InputAddressed as _};
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
-use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
+use hellas_rpc::{Assurance, OutputEventEnvelope, SubmitTxOutcome};
 use hellas_wire::{AuthLevel, PeerIdentity};
-use hellas_work::model::bundle::WorkChannelSetupBundleV2;
-use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::ProviderChannelPolicy;
-use hellas_work::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
-    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
-    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
-    work_id,
-};
-use hellas_work::work::{BackendFault, PreparedEvaluateInput, WorkRefusal};
-use hellas_work::work_close::{BlockSourceError, FinalizedWork};
-use hellas_work::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
-use hellas_work::work_open::{FinalizedSetup, SetupQuery};
-use hellas_work::work_store::{
-    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
-};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
 
 use super::super::*;
-use crate::work_config::{WorkRoutes, load_work_config};
 use iroh::SecretKey;
 use tokio::task::JoinHandle;
 
@@ -84,6 +78,15 @@ fn assert_retryable_not_ready(refusal: WorkRefused) {
 struct ContextWitness(Arc<Mutex<Option<TransportContext>>>);
 
 impl WorkSetupHandler for ContextWitness {
+    async fn request_offer(
+        &self,
+        request: hellas_rpc::pb::work::RequestOfferRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        UnmountedWork.request_offer(request, context).await
+    }
+
     fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
@@ -110,6 +113,15 @@ struct ConcurrentDispatchWitness {
 }
 
 impl WorkSetupHandler for ConcurrentDispatchWitness {
+    async fn request_offer(
+        &self,
+        request: hellas_rpc::pb::work::RequestOfferRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        UnmountedWork.request_offer(request, context).await
+    }
+
     fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
@@ -442,8 +454,6 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let dir = temp();
     let first = OfferFixture::first();
     let second = OfferFixture::second();
-    first.seed_provider_offer(dir.path(), admits()).await;
-    second.seed_provider_offer(dir.path(), admits()).await;
 
     let first_secret = 0x71;
     let second_secret = 0x72;
@@ -457,21 +467,22 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             .public()
             .as_bytes(),
     );
+    first
+        .seed_provider_offer(dir.path(), admits(), first_peer)
+        .await;
+    second
+        .seed_provider_offer(dir.path(), admits(), second_peer)
+        .await;
     let setup_mount = MountedSetup::default();
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: dir.path().to_path_buf(),
-            routes: configured_routes(&[
-                (first_peer, first.bond_edge(), first.client().party_key()),
-                (second_peer, second.bond_edge(), second.client().party_key()),
-            ]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy: provider_policy(),
         },
         MountedWork::default(),
         setup_mount.clone(),
@@ -592,30 +603,15 @@ async fn discover_two_route_runner(
     work_mount: &MountedWork,
     setup_mount: &MountedSetup,
 ) -> WorkRunner {
-    let first = OfferFixture::first();
-    let second = OfferFixture::second();
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: root.to_path_buf(),
-            routes: configured_routes(&[
-                (
-                    first_route_peer(),
-                    first.bond_edge(),
-                    first.client().party_key(),
-                ),
-                (
-                    second_route_peer(),
-                    second.bond_edge(),
-                    second.client().party_key(),
-                ),
-            ]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy: provider_policy(),
         },
         work_mount.clone(),
         setup_mount.clone(),
@@ -627,12 +623,95 @@ async fn discover_two_route_runner(
     }
 }
 
+fn upload_messages(
+    mut request: AcceptWorkRequest,
+    exporter: [u8; 32],
+) -> (
+    AcceptWorkRequest,
+    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+) {
+    use hellas_rpc::{
+        ContentRef,
+        protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
+    };
+    let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let key = [OfferFixture::first(), OfferFixture::second()]
+        .into_iter()
+        .find(|offer| offer.descriptor().channel().id() == a.channel_id)
+        .map(|offer| offer.client())
+        .unwrap_or_else(client);
+    let id = hellas_channel::model::work::paid_work_v2_id(network(), a.channel_id, &a);
+    let object = ContentRef::for_bytes(&request.prepared_input);
+    let input = PreparedInvocation::from_canonical_bytes(
+        &request.prepared_input,
+        hellas_channel::content::MAX_CONTENT_BYTES,
+    )
+    .unwrap();
+    let program_manifest = input.manifest().unwrap().canonical_bytes();
+    let program_root = hellas_channel::test_support::channel::program_root(&input);
+    let chunks = request
+        .prepared_input
+        .chunks(CONTENT_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
+            hellas_rpc::pb::work::UploadContentRequest {
+                program_root: program_root.clone(),
+                program_manifest: program_manifest.clone(),
+                route: request.route.clone(),
+                authorization: request.authorization.clone(),
+                client_signature: request.client_signature.clone(),
+                content_id: object.id().as_bytes().to_vec(),
+                total_bytes: object.bytes(),
+                offset,
+                chunk: bytes.to_vec(),
+                chunk_signature: key
+                    .sign(signing_hash(chunk_digest(
+                        a.channel_id,
+                        id,
+                        object,
+                        offset,
+                        bytes,
+                        &exporter,
+                    )))
+                    .as_bytes()
+                    .to_vec(),
+            }
+        })
+        .collect();
+    request.prepared_input = encode_reference(object);
+    (request, chunks)
+}
 async fn accept_mounted_route(
     mount: &MountedWork,
     peer: PeerId,
     request: AcceptWorkRequest,
 ) -> AcceptWorkResponse {
-    let context = vouched_context(peer);
+    let mut context = vouched_context(peer);
+    context.open_exporter = Some([7; 32]);
+    let (request, uploads) = upload_messages(request, [7; 32]);
+    for upload in uploads {
+        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> =
+            match mount.upload_content(upload, context.clone()).await {
+                Ok(response) => response.into(),
+                Err(status) => {
+                    return AcceptWorkResponse {
+                        outcome: Some(accept_work_response::Outcome::Refused(
+                            hellas_rpc::pb::work::WorkRefused {
+                                code: WorkRefusalCode::Unavailable as i32,
+                                reason: status.message.to_string(),
+                                grant: None,
+                            },
+                        )),
+                    };
+                }
+            };
+        if let Some(refusal) = response.response.refused {
+            return AcceptWorkResponse {
+                outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+            };
+        }
+    }
     let response: WithTrailer<AcceptWorkResponse> = mount
         .accept_work(request, context)
         .await
@@ -650,7 +729,9 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
     let first = OfferFixture::first();
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
-    second.seed_provider_offer(dir.path(), admits()).await;
+    second
+        .seed_provider_offer(dir.path(), admits(), second_route_peer())
+        .await;
     let source = RoutedChain::new([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
     let work_mount = MountedWork::default();
     let setup_mount = MountedSetup::default();
@@ -989,16 +1070,6 @@ async fn unmounted_work_refuses_every_method_as_bounded_retryable_not_ready() {
     };
     assert_retryable_not_ready(refusal);
 
-    let delivery: WithTrailer<DeliverResultResponse> = UnmountedWork
-        .deliver_result(DeliverResultRequest::default(), TransportContext::default())
-        .await
-        .unwrap()
-        .into();
-    let Some(deliver_result_response::Outcome::Refused(refusal)) = delivery.response.outcome else {
-        panic!("unmounted Work must refuse delivery")
-    };
-    assert_retryable_not_ready(refusal);
-
     let payment: WithTrailer<AdmitCertificateResponse> = UnmountedWork
         .admit_certificate(
             AdmitCertificateRequest::default(),
@@ -1043,17 +1114,6 @@ fn network() -> NetworkId {
     network
 }
 
-/// A threshold identity consensus accepts: the compressed BLS12-381 G1
-/// generator used by the configuration loader's fixture too.
-fn threshold_identity() -> Vec<u8> {
-    vec![
-        0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9, 0xac,
-        0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f, 0x17, 0x1b,
-        0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a, 0xf0, 0x0a, 0xdb,
-        0x22, 0xc6, 0xbb,
-    ]
-}
-
 fn temp() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hellas-cli-tests");
     if let Err(error) = std::fs::create_dir_all(&root) {
@@ -1094,132 +1154,6 @@ fn vouched_context(peer: PeerId) -> TransportContext {
     }
 }
 
-fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
-    loaded_routes(routes).expect("the route fixture passes the production loader")
-}
-
-fn loaded_routes(
-    routes: &[(PeerId, EdgeId, Key)],
-) -> Result<WorkRoutes, crate::work_config::WorkConfigError> {
-    let route_values: Vec<_> = routes
-        .iter()
-        .map(|(peer, bond, client)| {
-            serde_json::json!({
-                "peer": hex::encode(peer.as_bytes()),
-                "bond": hex::encode(bond.to_bytes()),
-                "client": hex::encode(client.to_bytes()),
-            })
-        })
-        .collect();
-    let value = serde_json::json!({
-        "chain": {
-            "network_id": network().as_str(),
-            "genesis_payload_digest": hex::encode([0x01; 32]),
-            "threshold_identity": hex::encode(threshold_identity()),
-        },
-        "validators": (1..=6)
-            .map(|index| format!("http://127.0.0.1:900{index}"))
-            .collect::<Vec<_>>(),
-        "journal": { "root": "/var/lib/hellas/work" },
-        "routes": route_values,
-        "policies": {
-            "policy_salt": hex::encode(SALT),
-            "channel": {
-                "compute_credit_limit": 40,
-                "delivery_credit_limit": 40,
-            },
-            "execution": {
-                "allowed_environment": hex::encode([0x11; 32]),
-                "generation_policy_digest": hex::encode([0x12; 32]),
-                "identity_source_digest": hex::encode([0x13; 32]),
-                "max_prompt_tokens": 512,
-                "max_new_tokens": 128,
-                "max_stop_token_ids": 4,
-                "max_spool_bytes": 1_048_576_u64,
-                "max_encoded_result_frame": 262_144,
-                "max_encoded_prepared_input": 1_048_576_u64,
-            },
-            "payment": {
-                "dispatch_margin_blocks": 4,
-                "delivery_margin_blocks": 2,
-                "oracle_grace_blocks": 6,
-                "fixed_price": 10,
-            },
-        },
-        "poll_ms": 1,
-        "expected_payment_values": {
-            "value": PAYMENT_VALUE,
-            "reserve": PAYMENT_RESERVE,
-            "close_fees": { "base": 0, "slot": 0, "proof": 0, "lifetime": 0 },
-        },
-        "min_omit_response_blocks": MIN_OMIT_RESPONSE_BLOCKS,
-    });
-    let dir = temp();
-    let path = dir.path().join("routes.json");
-    if let Err(error) = std::fs::write(&path, value.to_string()) {
-        panic!("the route fixture is written: {error}");
-    }
-    load_work_config(&path).map(|config| config.routes)
-}
-
-#[test]
-fn typed_work_routes_match_file_loading_and_allow_multiple_bonds_per_peer() {
-    use crate::work_config::WorkRoute;
-    for entries in [
-        vec![],
-        vec![(first_route_peer(), bond_edge(), client().party_key())],
-        vec![
-            (
-                first_route_peer(),
-                EdgeId::from_bytes([9; 32]),
-                client().party_key(),
-            ),
-            (first_route_peer(), bond_edge(), client().party_key()),
-            (
-                second_route_peer(),
-                EdgeId::from_bytes([8; 32]),
-                client().party_key(),
-            ),
-        ],
-    ] {
-        let typed =
-            WorkRoutes::try_from_iter(entries.iter().map(|&(peer, bond, client)| WorkRoute {
-                peer,
-                bond,
-                client,
-            }))
-            .unwrap();
-        let loaded = loaded_routes(&entries).unwrap();
-        assert_eq!(typed, loaded);
-        assert_eq!(typed.len(), entries.len());
-        assert_eq!(
-            typed.iter().copied().collect::<Vec<_>>(),
-            loaded.iter().copied().collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn typed_work_routes_and_file_loading_refuse_duplicate_bonds() {
-    use crate::work_config::{WorkConfigError, WorkRoute};
-    for other_peer in [first_route_peer(), second_route_peer()] {
-        let entries = [
-            (first_route_peer(), bond_edge(), client().party_key()),
-            (other_peer, bond_edge(), provider().party_key()),
-        ];
-        let typed = WorkRoutes::try_from_iter(entries.map(|(peer, bond, client)| WorkRoute {
-            peer,
-            bond,
-            client,
-        }));
-        assert!(matches!(typed, Err(WorkConfigError::DuplicateBond(bond)) if bond == bond_edge()));
-        let Err(WorkConfigError::File { source, .. }) = loaded_routes(&entries) else {
-            panic!("the file loader must refuse duplicate bonds");
-        };
-        assert!(matches!(*source, WorkConfigError::DuplicateBond(bond) if bond == bond_edge()));
-    }
-}
-
 fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
     let mut slots = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS];
     for (slot, id) in slots.iter_mut().zip(ids) {
@@ -1229,18 +1163,15 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_channel::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(500),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(500),
+        Payout::new(provider().party_key(), 64),
+        40,
+    )
 }
 
 fn bond_funding() -> Funding {
@@ -1252,42 +1183,18 @@ fn payment_funding() -> Funding {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 40,
-        delivery_credit_limit: 40,
-    }
-}
-
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture generation policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity source hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-    }
+    hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
-        omission_bond: OMISSION_BOND,
-    }
+    hellas_channel::test_support::channel::payment_terms_for(
+        bond_edge(),
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        MIN_OMIT_RESPONSE_BLOCKS,
+        MAX_START_VALIDITY_BLOCKS,
+        OMISSION_BOND,
+    )
 }
 
 fn provider_policy() -> ProviderChannelPolicy {
@@ -1296,9 +1203,39 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
+    }
+}
+
+fn recorded_offer(
+    one: WorkChannelSetupBundleV2,
+    peer: PeerId,
+    payment_funding: Funding,
+    policy: ProviderChannelPolicy,
+) -> SetupRecord {
+    let key = provider_producer();
+    let provider = hellas_channel::test_support::enrollment(&key, &key, [0x63; 32], [3; 32]);
+    let offer = hellas_channel::model::offer::SignedPaidOffer::sign(
+        hellas_channel::model::offer::PaidOffer {
+            provider,
+            proposal: one,
+            policy,
+            omission_bond: OMISSION_BOND,
+            payment_funding,
+            addresses: vec![],
+        },
+        &self::provider(),
+    )
+    .unwrap();
+    SetupRecord::Offer {
+        peer: peer.into_bytes(),
+        floor: Some(SetupScan {
+            height: FLOOR,
+            payload: payload_at(FLOOR),
+        }),
+        offer: Box::new(offer),
     }
 }
 
@@ -1365,7 +1302,7 @@ fn payment_edge() -> EdgeId {
 
 /// The channel the retained descriptor names, which is the one the
 /// runner's mount must open.
-fn descriptor() -> hellas_work::model::setup::CloseDescriptor {
+fn descriptor() -> hellas_channel::model::setup::CloseDescriptor {
     match provider_policy().describe_close(payment_edge(), payment_terms()) {
         Ok(descriptor) => descriptor,
         Err(error) => panic!("the fixture close descriptor opens: {error}"),
@@ -1424,9 +1361,12 @@ async fn write_setup_journal(root: &Path) {
             height: FLOOR,
             payload: payload_at(FLOOR),
         },
-        SetupRecord::Bundle {
-            bundle: one.encode(),
-        },
+        recorded_offer(
+            one.clone(),
+            default_route_peer(),
+            payment_funding(),
+            provider_policy(),
+        ),
         SetupRecord::Bundle {
             bundle: two.encode(),
         },
@@ -1456,6 +1396,7 @@ async fn open_channel(root: &Path) -> ChannelStore {
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -1467,26 +1408,8 @@ async fn open_channel(root: &Path) -> ChannelStore {
 
 // ── One job, paid for, and then contested ─────────────────────────
 
-fn evaluate_request() -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [0x9e; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle() -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
+fn bundle() -> PreparedInvocation {
+    hellas_channel::test_support::channel::bundle(0x9e)
 }
 
 fn deadlines() -> JobDeadlines {
@@ -1498,7 +1421,7 @@ fn deadlines() -> JobDeadlines {
 }
 
 fn authorization() -> PaidJobAuthorizationV2 {
-    match propose_authorization(
+    match hellas_channel::job::propose(
         descriptor().channel(),
         &work_policy(),
         &payment_policy(),
@@ -1513,7 +1436,10 @@ fn authorization() -> PaidJobAuthorizationV2 {
 
 /// One complete signed transcript for the fixture request.
 fn answer_transcript() -> Vec<OutputEventEnvelope> {
-    hellas_work::test_support::paid::transcript_for(&evaluate_request(), &[101, 102, 103, 104, 105])
+    hellas_channel::test_support::channel::transcript_for(
+        &bundle().request,
+        &[101, 102, 103, 104, 105],
+    )
 }
 
 /// The executor-side seam in the node proof. The paid gate still
@@ -1527,18 +1453,19 @@ struct AnsweringPaidBackend {
 impl WorkBackend for AnsweringPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    async fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        input: hellas_channel::work::Admitted,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
         assert_eq!(
-            input.evaluate_request().text_execution,
-            evaluate_request().text_execution,
+            input.invocation().request,
+            bundle().request,
             "the paid gate dispatches the request retained in the accepted bundle",
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1576,28 +1503,28 @@ impl BlockingPaidBackend {
 impl WorkBackend for BlockingPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+    {
+        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    async fn evaluate_stream(
+    async fn execute_stream(
         &self,
-        input: PreparedEvaluateInput,
-        progress: hellas_work::work::PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        for event in answer_transcript() {
-            if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
-                progress(event)?;
-            }
+        input: hellas_channel::work::Admitted,
+        progress: hellas_channel::work::PaidProgress,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
+        let transcript = answer_transcript();
+        for event in &transcript[..transcript.len() - 1] {
+            progress(event.clone())?;
         }
-        self.evaluate(input).await
+        self.execute(input).await
     }
 
-    async fn evaluate(
+    async fn execute(
         &self,
-        _input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        _input: hellas_channel::work::Admitted,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
         self.entered.add_permits(1);
         match self.release.acquire().await {
             Ok(permit) => permit.forget(),
@@ -1608,9 +1535,8 @@ impl WorkBackend for BlockingPaidBackend {
 }
 
 async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
-        panic!("the fixture channel record commits: {error}");
-    }
+    // Also stages the declared program content a provider holds after upload.
+    hellas_channel::test_support::channel::commit(store, record).await;
 }
 
 /// The provider journal a process can find after crashing between its
@@ -1625,7 +1551,7 @@ async fn write_accepted_channel(root: &Path) -> Digest {
         ChannelRecord::JobProposed {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: match bundle().encode() {
+            prepared_input: match bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
@@ -1659,7 +1585,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
         ChannelRecord::JobProposed {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: match bundle().encode() {
+            prepared_input: match bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
@@ -1676,7 +1602,13 @@ async fn write_contested_channel(root: &Path) -> StartId {
     .await;
     commit(&mut store, ChannelRecord::JobRunning { work_id: id }).await;
     let transcript = answer_transcript();
-    let result = match terminal_result(&channel, &job, &transcript) {
+    let result = match hellas_channel::job::paid_terminal_result(
+        &channel,
+        &job,
+        &work_policy(),
+        &bundle(),
+        &transcript,
+    ) {
         Ok(result) => result,
         Err(error) => panic!("the fixture result derives: {error}"),
     };
@@ -1703,6 +1635,10 @@ async fn write_contested_channel(root: &Path) -> StartId {
         ChannelRecord::JobTerminated {
             work_id: id,
             outcome: TerminalOutcome::Certified {
+                signed_result: Box::new((
+                    result,
+                    provider().sign(signing_hash(result_digest(&channel, &result))),
+                )),
                 certificate,
                 binding: Box::new(binding),
                 binding_signature: client()
@@ -1735,7 +1671,7 @@ fn channel_snapshot(
     WorkChannelSnapshot::new(
         WorkChannelQuery {
             bond_edge: bond_edge(),
-            payment_edge: payment_edge(),
+            payment_edge: Some(payment_edge()),
             funding: BTreeSet::new(),
         },
         LatestBlock {
@@ -1869,7 +1805,7 @@ fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkCh
     WorkChannelSnapshot::new(
         WorkChannelQuery {
             bond_edge: bond_edge(),
-            payment_edge: payment_edge(),
+            payment_edge: Some(payment_edge()),
             funding: BTreeSet::new(),
         },
         LatestBlock {
@@ -2230,7 +2166,7 @@ impl NodeChain {
             snapshot: WorkChannelSnapshot::new(
                 WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge: payment_edge(),
+                    payment_edge: Some(payment_edge()),
                     funding: BTreeSet::new(),
                 },
                 LatestBlock {
@@ -2301,7 +2237,7 @@ impl SetupView for NodeChain {
         .into_iter()
         .collect();
         if query.bond_edge != bond_edge()
-            || query.payment_edge != payment_edge()
+            || query.payment_edge != Some(payment_edge())
             || query.funding != expected_funding
         {
             return Err(BlockSourceError::new(
@@ -2415,18 +2351,16 @@ impl TxSink for NodeChain {
 
 /// The runner a node starts with: the configured root, the stored
 /// identity, and the policy it was configured with.
-async fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
+async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
 
             journal_root: root.to_path_buf(),
-            routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
-            policy,
         },
         mount.clone(),
         MountedSetup::default(),
@@ -2470,7 +2404,10 @@ fn adjudicated_payment_closes(chain: &TestChain) -> usize {
 }
 
 async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
-    let store = match SetupStore::open(
+    let PaymentAdmission::Admits(policy) = admission else {
+        panic!("admitting fixture policy")
+    };
+    let mut store = SetupStore::open(
         root,
         network(),
         bond_edge(),
@@ -2478,26 +2415,15 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
         &Secp256k1Verifier::new(),
     )
     .await
-    {
-        Ok(store) => store,
-        Err(error) => panic!("the empty provider root opens its first setup: {error}"),
-    };
-    let mut endpoint = SetupEndpoint::new(store, provider(), admission);
-    if let Err(error) = endpoint
-        .arm_scan(SetupScan {
-            height: FLOOR,
-            payload: payload_at(FLOOR),
-        })
+    .unwrap();
+    let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
+    store
+        .commit(
+            recorded_offer(proposed(), peer, payment_funding(), *policy),
+            &Secp256k1Verifier::new(),
+        )
         .await
-    {
-        panic!("the provider arms its finalized floor: {error}");
-    }
-    if let Err(error) = endpoint
-        .propose_bond(network(), bond_funding(), bond_terms())
-        .await
-    {
-        panic!("the provider journals its offer: {error}");
-    }
+        .unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -2533,18 +2459,15 @@ impl OfferFixture {
     }
 
     fn bond_terms(self) -> WorkStakeBondTerms {
-        WorkStakeBondTerms {
-            parties: Parties::new(
+        hellas_channel::test_support::channel::bond_terms_for(
+            Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(self.client().party_key()),
             ),
-            timeout: BlockHeight::new(500),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 40,
-        }
+            BlockHeight::new(500),
+            Payout::new(provider().party_key(), 64),
+            40,
+        )
     }
 
     fn bond_edge(self) -> EdgeId {
@@ -2559,18 +2482,14 @@ impl OfferFixture {
     }
 
     fn payment_terms(self) -> WorkPaymentTerms {
-        WorkPaymentTerms {
-            bond_edge: self.bond_edge(),
-            bond_terms: self.bond_terms(),
-            private_policy_commitment: private_policy_commitment(
-                network(),
-                &SALT,
-                &channel_policy(),
-            ),
-            omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-            start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
-            omission_bond: OMISSION_BOND,
-        }
+        hellas_channel::test_support::channel::payment_terms_for(
+            self.bond_edge(),
+            self.bond_terms(),
+            private_policy_commitment(network(), &SALT, &channel_policy()),
+            MIN_OMIT_RESPONSE_BLOCKS,
+            MAX_START_VALIDITY_BLOCKS,
+            OMISSION_BOND,
+        )
     }
 
     fn payment_edge(self) -> EdgeId {
@@ -2627,7 +2546,7 @@ impl OfferFixture {
         }
     }
 
-    fn descriptor(self) -> hellas_work::model::setup::CloseDescriptor {
+    fn descriptor(self) -> hellas_channel::model::setup::CloseDescriptor {
         match provider_policy().describe_close(self.payment_edge(), self.payment_terms()) {
             Ok(descriptor) => descriptor,
             Err(error) => panic!("the routed close descriptor opens: {error}"),
@@ -2652,9 +2571,16 @@ impl OfferFixture {
                 height: FLOOR,
                 payload: payload_at(FLOOR),
             },
-            SetupRecord::Bundle {
-                bundle: one.encode(),
-            },
+            recorded_offer(
+                one.clone(),
+                if self.client_seed == Self::first().client_seed {
+                    first_route_peer()
+                } else {
+                    second_route_peer()
+                },
+                self.payment_funding(),
+                provider_policy(),
+            ),
             SetupRecord::Bundle {
                 bundle: two.encode(),
             },
@@ -2675,30 +2601,12 @@ impl OfferFixture {
         }
     }
 
-    fn evaluate_request(self) -> EvaluateRequest {
-        EvaluateRequest {
-            text_execution: text_execution().input_id().digest(),
-            runner_public_key: PublicKey::Secp256k1(self.client().party_key().to_bytes()),
-            execution_environment: manifest().content_id(),
-            nonce: [self.client_seed; 32],
-            assurance: Assurance::ProducerSigned,
-            retain: true,
-        }
-    }
-
-    fn prepared_bundle(self) -> PreparedPaidInputV1 {
-        PreparedPaidInputV1::new(
-            &self.evaluate_request(),
-            &manifest(),
-            &text_execution(),
-            &prompt_tokens(),
-            &text_policy(),
-            &identity_artifact(),
-        )
+    fn prepared_bundle(self) -> PreparedInvocation {
+        hellas_channel::test_support::channel::bundle(self.client_seed)
     }
 
     fn authorization(self) -> PaidJobAuthorizationV2 {
-        match propose_authorization(
+        match hellas_channel::job::propose(
             self.descriptor().channel(),
             &work_policy(),
             &payment_policy(),
@@ -2720,7 +2628,7 @@ impl OfferFixture {
             )),
             authorization: authorization.encode(),
             client_signature: self.client().sign(signing_hash(id)).as_bytes().to_vec(),
-            prepared_input: match self.prepared_bundle().encode() {
+            prepared_input: match self.prepared_bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the routed prepared input encodes: {error}"),
             },
@@ -2804,7 +2712,7 @@ impl OfferFixture {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: self.bond_edge(),
-                payment_edge: self.payment_edge(),
+                payment_edge: Some(self.payment_edge()),
                 funding: BTreeSet::new(),
             },
             LatestBlock {
@@ -2825,7 +2733,7 @@ impl OfferFixture {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: self.bond_edge(),
-                payment_edge: self.payment_edge(),
+                payment_edge: Some(self.payment_edge()),
                 funding: BTreeSet::new(),
             },
             LatestBlock {
@@ -2842,8 +2750,11 @@ impl OfferFixture {
         )
     }
 
-    async fn seed_provider_offer(self, root: &Path, admission: PaymentAdmission) {
-        let store = match SetupStore::open(
+    async fn seed_provider_offer(self, root: &Path, admission: PaymentAdmission, peer: PeerId) {
+        let PaymentAdmission::Admits(policy) = admission else {
+            panic!("admitting fixture policy")
+        };
+        let mut store = SetupStore::open(
             root,
             network(),
             self.bond_edge(),
@@ -2851,26 +2762,14 @@ impl OfferFixture {
             &Secp256k1Verifier::new(),
         )
         .await
-        {
-            Ok(store) => store,
-            Err(error) => panic!("the provider route opens its setup: {error}"),
-        };
-        let mut endpoint = SetupEndpoint::new(store, provider(), admission);
-        if let Err(error) = endpoint
-            .arm_scan(SetupScan {
-                height: FLOOR,
-                payload: payload_at(FLOOR),
-            })
+        .unwrap();
+        store
+            .commit(
+                recorded_offer(self.proposed(), peer, self.payment_funding(), *policy),
+                &Secp256k1Verifier::new(),
+            )
             .await
-        {
-            panic!("the provider route arms its finalized floor: {error}");
-        }
-        if let Err(error) = endpoint
-            .propose_bond(network(), self.bond_funding(), self.bond_terms())
-            .await
-        {
-            panic!("the provider route journals its offer: {error}");
-        }
+            .unwrap();
     }
 }
 
@@ -2903,7 +2802,7 @@ fn signed_accept_request() -> AcceptWorkRequest {
         )),
         authorization: authorization.encode(),
         client_signature: client().sign(signing_hash(id)).as_bytes().to_vec(),
-        prepared_input: match bundle().encode() {
+        prepared_input: match bundle().canonical_bytes() {
             Ok(bytes) => bytes,
             Err(error) => panic!("the prepared fixture input encodes: {error}"),
         },
@@ -2928,8 +2827,7 @@ struct RunningPaidNode {
 }
 
 impl RunningPaidNode {
-    async fn start(root: &Path, policy: ProviderChannelPolicy, source: NodeChain) -> Self {
-        let approved_environment = policy.work_policy.allowed_environment();
+    async fn start(root: &Path, source: NodeChain) -> Self {
         let setup_mount = MountedSetup::default();
         let execution_calls = Arc::new(AtomicUsize::new(0));
         let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
@@ -2941,12 +2839,10 @@ impl RunningPaidNode {
                 network: network(),
 
                 journal_root: root.to_path_buf(),
-                routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
 
                 poll: Duration::from_millis(1),
                 max_observation_age: TEST_TIMEOUT,
                 settlement_key: provider(),
-                policy,
             },
             work_mount.clone(),
             setup_mount.clone(),
@@ -2966,7 +2862,6 @@ impl RunningPaidNode {
         let transport_key = SecretKey::from_bytes(&[0x63; 32]);
         let open = test_remote_execution();
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![approved_environment],
             expected_genesis: open.enrollment.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -3126,7 +3021,17 @@ impl RunningPaidNode {
 
     async fn accept_work(&self, request: AcceptWorkRequest) -> AcceptWorkResponse {
         let (transport, connection) = self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
+        let exporter = transport.open_exporter().unwrap();
         let client = WorkClientImpl::new(transport);
+        let (request, uploads) = upload_messages(request, exporter);
+        for upload in uploads {
+            let response = client.upload_content(upload).await.unwrap();
+            if let Some(refusal) = response.refused {
+                return AcceptWorkResponse {
+                    outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+                };
+            }
+        }
         let response = match client.accept_work(request).await {
             Ok(response) => response,
             Err(error) => panic!("Work acceptance reaches the node: {error}"),
@@ -3136,13 +3041,22 @@ impl RunningPaidNode {
         response
     }
 
-    async fn deliver_result(&self, work_id: Digest) -> DeliverResultResponse {
+    /// One streamed delivery attempt: `None` while the provider reports
+    /// its retryable `NotReady`, else the signed terminal and the events.
+    async fn stream_result(
+        &self,
+        work_id: Digest,
+    ) -> Option<(
+        hellas_rpc::pb::work::WorkStreamTerminal,
+        Vec<OutputEventEnvelope>,
+    )> {
+        use hellas_rpc::pb::work::work_stream_event;
         let (transport, connection) = self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
         let exporter = match transport.open_exporter() {
             Ok(exporter) => exporter,
             Err(error) => panic!("the client derives this Work connection's exporter: {error}"),
         };
-        let request = DeliverResultRequest {
+        let request = StreamResultRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 descriptor().channel().id(),
             )),
@@ -3157,13 +3071,39 @@ impl RunningPaidNode {
                 .to_vec(),
         };
         let client = WorkClientImpl::new(transport);
-        let response = match client.deliver_result(request).await {
-            Ok(response) => response,
+        let mut stream = match client.stream_result(request).await {
+            Ok(stream) => stream,
             Err(error) => panic!("Work delivery reaches the node: {error}"),
         };
+        let mut events = Vec::new();
+        let mut delivered = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.unwrap_or_else(|error| panic!("the result stream frames: {error}"));
+            let bytes = match frame.outcome {
+                Some(work_stream_event::Outcome::Prefix(bytes)) => bytes,
+                Some(work_stream_event::Outcome::Terminal(terminal)) => {
+                    let bytes = terminal.terminal_transcript.clone();
+                    delivered = Some(terminal);
+                    bytes
+                }
+                Some(work_stream_event::Outcome::Refused(refusal))
+                    if refusal.code == WorkRefusalCode::NotReady as i32 =>
+                {
+                    break;
+                }
+                outcome => panic!(
+                    "the accepted job remains retryable until its result is ready, got {outcome:?}",
+                ),
+            };
+            match decode_transcript(&bytes, usize::MAX) {
+                Ok(batch) => events.extend(batch),
+                Err(error) => panic!("the delivered transcript decodes: {error}"),
+            }
+        }
+        drop(stream);
         drop(client);
         connection.close(0_u32.into(), b"work delivery complete");
-        response
+        delivered.map(|terminal| (terminal, events))
     }
 
     /// Polls through the wire's retryable `NotReady` until the detached
@@ -3171,30 +3111,21 @@ impl RunningPaidNode {
     async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
         let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
-                let response = self.deliver_result(work_id).await;
-                match response.outcome {
-                    Some(deliver_result_response::Outcome::Delivered(delivered)) => {
-                        break delivered;
-                    }
-                    Some(deliver_result_response::Outcome::Refused(refusal))
-                        if refusal.code == WorkRefusalCode::NotReady as i32 =>
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                    outcome => panic!(
-                        "the accepted job remains retryable until its result is ready, got {outcome:?}",
-                    ),
+                if let Some(delivered) = self.stream_result(work_id).await {
+                    break delivered;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await;
-        let delivered = match delivered {
-            Ok(delivered) => delivered,
-            Err(_) => panic!("the accepted job's result reaches the client"),
+        let Ok((delivered, transcript)) = delivered else {
+            panic!("the accepted job's result reaches the client")
         };
-        let expected = match terminal_result(
+        let expected = match hellas_channel::job::paid_terminal_result(
             descriptor().channel(),
             &authorization(),
+            &work_policy(),
+            &bundle(),
             &answer_transcript(),
         ) {
             Ok(result) => result,
@@ -3215,11 +3146,7 @@ impl RunningPaidNode {
                 .as_bytes(),
             "the result reaches the client with this provider's signature",
         );
-        let budget = usize::try_from(work_policy().max_spool_bytes).unwrap_or(usize::MAX);
-        match decode_transcript(&delivered.transcript, budget) {
-            Ok(transcript) => transcript,
-            Err(error) => panic!("the delivered transcript decodes: {error}"),
-        }
+        transcript
     }
 
     async fn wait_for_mount(&self) {
@@ -3291,7 +3218,7 @@ async fn run_advertised_paid_exchange(
 ) {
     seed_provider_offer(root, PaymentAdmission::Admits(Box::new(policy.clone()))).await;
     let source = NodeChain::new();
-    let node = RunningPaidNode::start(root, policy.clone(), source.clone()).await;
+    let node = RunningPaidNode::start(root, source.clone()).await;
     assert!(
         node.setup_mount
             .service(&node.context(), bond_edge())
@@ -3758,7 +3685,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
         let exporter = [0x5b; 32];
         let mut context = vouched_context(default_route_peer());
         context.open_exporter = Some(exporter);
-        let request = DeliverResultRequest {
+        let request = StreamResultRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 descriptor().channel().id(),
             )),
@@ -3776,17 +3703,24 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .handler(&context, request.route.as_ref())
             .unwrap()
             .expect("restarted channel is mounted");
-        let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
-            TEST_TIMEOUT,
-            handler.deliver_result(request.clone(), context.clone()),
-        )
+        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut stream = handler
+                .stream_result(request.clone(), context.clone())
+                .await
+                .expect("delivery succeeds");
+            let mut last = None;
+            while let Some(event) = stream.next().await {
+                last = Some(event.expect("delivery succeeds").outcome);
+            }
+            last
+        })
         .await
-        .expect("retained result is immediately collectable")
-        .expect("delivery succeeds")
-        .into();
+        .expect("retained result is immediately collectable");
         assert!(matches!(
-            response.response.outcome,
-            Some(deliver_result_response::Outcome::Delivered(_))
+            delivered,
+            Some(Some(
+                hellas_rpc::pb::work::work_stream_event::Outcome::Terminal(_)
+            ))
         ));
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3796,12 +3730,13 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
 
         chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
         assert!(restarted.tick(&chain).await);
-        let response: WithTrailer<DeliverResultResponse> = handler
-            .deliver_result(request, context)
+        let mut stream = handler
+            .stream_result(request, context)
             .await
-            .expect("refusal is answered")
-            .into();
-        let Some(deliver_result_response::Outcome::Refused(refusal)) = response.response.outcome
+            .expect("refusal is answered");
+        let Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
+            outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)),
+        })) = stream.next().await
         else {
             panic!("cached readiness must not release data after a finalized contest");
         };
@@ -3825,7 +3760,7 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
     let exporter = [0x5b; 32];
     let mut context = vouched_context(default_route_peer());
     context.open_exporter = Some(exporter);
-    let request = DeliverResultRequest {
+    let request = StreamResultRequest {
         route: Some(hellas_rpc::pb::work::WorkRoute::payment(
             descriptor().channel().id(),
         )),
@@ -3910,9 +3845,23 @@ async fn the_clock_does_not_starve_the_request_path() {
         panic!("the channel is mounted before the chain is read")
     };
     let answered = tokio::time::timeout(TEST_TIMEOUT, async move {
-        let response = dispatch
-            .accept_work(signed_accept_request(), TransportContext::default())
-            .await?;
+        let context = TransportContext {
+            open_exporter: Some([7; 32]),
+            ..Default::default()
+        };
+        let (request, uploads) = upload_messages(signed_accept_request(), [7; 32]);
+        for upload in uploads {
+            let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = dispatch
+                .upload_content(upload, context.clone())
+                .await?
+                .into();
+            assert!(
+                response.response.refused.is_none(),
+                "{:?}",
+                response.response
+            );
+        }
+        let response = dispatch.accept_work(request, context).await?;
         Ok::<WithTrailer<AcceptWorkResponse>, WireStatus>(response.into())
     })
     .await;
@@ -4109,8 +4058,8 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     );
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -4177,7 +4126,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     let mut context = vouched_context(peer);
     context.open_exporter = Some([0x5b; 32]);
     let id = work_id(first.descriptor().channel(), &first.authorization());
-    let delivery = DeliverResultRequest {
+    let delivery = StreamResultRequest {
         route: Some(WorkRoute::payment(second.descriptor().channel().id())),
         work_id: id.as_bytes().to_vec(),
         client_signature: first
@@ -4190,14 +4139,15 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
             .as_bytes()
             .to_vec(),
     };
-    let response: WithTrailer<DeliverResultResponse> = mounted
-        .deliver_result(delivery, context.clone())
+    let mut delivery = mounted
+        .stream_result(delivery, context.clone())
         .await
-        .unwrap()
-        .into();
+        .unwrap();
     assert!(matches!(
-        response.response.outcome,
-        Some(deliver_result_response::Outcome::Refused(_))
+        delivery.next().await,
+        Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
+            outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(_)),
+        }))
     ));
     let certificate = AdmitCertificateRequest {
         route: Some(WorkRoute::payment(second.descriptor().channel().id())),
@@ -4214,9 +4164,16 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     ));
     let mut unmounted_grant = first.signed_accept_request();
     unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
-    let response = accept_mounted_route(&mounted, peer, unmounted_grant).await;
+    unmounted_grant.prepared_input = hellas_rpc::protocol::content_upload::encode_reference(
+        hellas_rpc::ContentRef::for_bytes(&unmounted_grant.prepared_input),
+    );
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(unmounted_grant, context.clone())
+        .await
+        .unwrap()
+        .into();
     assert!(
-        matches!(response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
+        matches!(response.response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
         if refusal.code == WorkRefusalCode::NotReady as i32)
     );
     for kind in [FundingKind::Unspecified as i32, 99] {
@@ -4243,7 +4200,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
 #[tokio::test]
 async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     use crate::grant_provider::ProviderResources;
-    use hellas_work::model::grant::{budget::*, records::*, *};
+    use hellas_authority::model::grant::{budget::*, records::*, *};
     let root = temp();
     let (enrollment, producer_key) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
@@ -4274,7 +4231,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let id = GrantId([8; 16]);
     let definition = common_node::allowance(
         id,
-        hellas_work::test_support::actors::ROOT.principal(),
+        hellas_channel::test_support::actors::ROOT.principal(),
         vec![GrantPolicy {
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
@@ -4282,9 +4239,9 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             revision: hellas_auth::authority::Revision(1),
             name: "initial".into(),
-            work: work_policy().into(),
+            invocation_policy: work_policy(),
             https: None,
-            pricing: hellas_work::model::grant::pricing::Pricing {
+            pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
                 rates: None,
             },
@@ -4308,9 +4265,9 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "evaluate".into(),
-        work: work_policy().into(),
+        invocation_policy: work_policy(),
         https: None,
-        pricing: hellas_work::model::grant::pricing::Pricing {
+        pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
             rates: None,
         },
@@ -4318,15 +4275,15 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     }];
     for options in [config(), changed, config()] {
         let node = options
-            .open(ProviderResources::EvaluateAndFetch(&routes), &provider)
+            .open(ProviderResources::ComputeAndFetch(&routes), &provider)
             .await
             .unwrap();
-        let caller = hellas_work::test_support::session(&node, &secret).await;
+        let caller = hellas_authority::test_support::session(&node, &secret).await;
         let status = node.status(&caller, GrantId([0; 16])).await.unwrap();
         let machine = status.machine.unwrap();
         assert_eq!(machine.max_in_flight.get(), 2);
         assert_eq!(machine.limits, vec![limit]);
-        let service = hellas_work::grant_service::GrantService::from_node(
+        let service = hellas_authority::grant_service::GrantService::from_node(
             node,
             &provider,
             Arc::new(producer_key.clone()),
@@ -4335,17 +4292,17 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         )
         .await
         .unwrap();
-        let admin = hellas_work::grant_service::WorkAdministration::new(
+        let admin = hellas_authority::grant_service::WorkAdministration::new(
             service,
             options.config.policies,
             options.config.max_job_millis,
         )
         .unwrap();
-        let hellas_work::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
+        let hellas_authority::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
             .execute(
                 &caller,
                 GrantId([0; 16]),
-                hellas_work::model::grant::admin::WorkControlCommand::List,
+                hellas_authority::model::grant::admin::WorkControlCommand::List,
             )
             .await
             .unwrap()
@@ -4361,14 +4318,14 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
 
 #[tokio::test]
 async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
-    use hellas_work::model::{
-        grant,
-        grant::{budget::*, records::*},
-        profile::PreparedWorkInput,
+    use {
+        hellas_authority::grant_service::GrantService,
+        hellas_channel::work::admission::CapacityDomain,
+        hellas_channel::work::admission::WorkPermit,
     };
-    use hellas_work::{
-        grant_service::GrantService,
-        work::admission::{CapacityDomain, WorkPermit},
+    use {
+        hellas_authority::model::grant, hellas_authority::model::grant::budget::*,
+        hellas_authority::model::grant::records::*,
     };
     #[derive(Clone)]
     struct Backend {
@@ -4380,22 +4337,21 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             Ok(WorkPermit::new(
                 domain,
                 self.slots.clone().try_acquire_owned().map_err(|_| {
-                    BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                    BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
                 })?,
             ))
         }
-        async fn evaluate(
+        async fn execute(
             &self,
-            input: PreparedEvaluateInput,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-            let (_, admission) = input.into_parts_and_admission();
-            let _running = admission
-                .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {
-                    self.try_admit(hellas_work::work::admission::CapacityDomain::Gpu)
-                })
+            input: hellas_channel::work::Admitted,
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
+        {
+            let domain = input.capacity_domain();
+            let (_, _, _, admission) = input
+                .reserve(async { self.try_admit(domain) })
                 .await?
-                .dispatch()
-                .await?;
+                .into_parts_and_admission();
+            let _running = admission.dispatch().await?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(answer_transcript())
         }
@@ -4404,7 +4360,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         key: &ProducerSigningKey,
         transport: PeerId,
     ) -> hellas_rpc::ProviderEnrollmentBundle {
-        hellas_work::test_support::enrollment(key, key, transport.into_bytes(), [7; 32])
+        hellas_channel::test_support::enrollment(key, key, transport.into_bytes(), [7; 32])
     }
     let root = temp();
     write_setup_journal(root.path()).await;
@@ -4424,7 +4380,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         .unwrap()
         .unwrap();
     // The paid fixture's runner key doubles as this grant client's node key.
-    let (grantee, grantee_key) = hellas_work::test_support::principal(0x21);
+    let (grantee, grantee_key) = hellas_channel::test_support::principal(0x21);
     let provider_key = provider_producer();
     let network = grant::grant_network();
     let now = hellas_auth::authority::UnixMillis(1_000_000);
@@ -4447,9 +4403,9 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             revision: hellas_auth::authority::Revision(1),
             name: "native".into(),
-            work: work_policy().into(),
+            invocation_policy: work_policy(),
             https: None,
-            pricing: hellas_work::model::grant::pricing::Pricing {
+            pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
                 rates: None,
             },
@@ -4482,9 +4438,11 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     .await;
     let channel = store
         .state()
-        .channel_id(id, hellas_work::test_support::channel_client(grantee))
+        .channel_id(id, hellas_channel::test_support::channel_client(grantee))
         .unwrap();
-    let input = PreparedWorkInput::Evaluate(bundle());
+    // Grant work is memory-only.
+    let mut input = bundle();
+    input.request.retain = false;
     let auth = grant::GrantJobAuthorizationV1 {
         channel_id: channel,
         generation: store.state().generation(id).unwrap(),
@@ -4495,18 +4453,23 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         pricing_revision: store.state().grant(id).unwrap().policies[0]
             .pricing
             .revision,
-        work_policy_digest: store.state().grant(id).unwrap().policies[0]
-            .work
-            .digest(network, channel.0),
-        prepared_input_digest: input.bound_digest(network, channel.0).unwrap(),
+        work_policy_digest: hellas_channel::job::policy_digest(
+            network,
+            channel.0,
+            &store.state().grant(id).unwrap().policies[0].invocation_policy,
+        )
+        .unwrap(),
+        input_content: hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap()),
+        prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
+            network, channel.0, &input,
+        )
+        .unwrap(),
         proposal_nonce: 1,
         acceptance_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 1000),
         terminal_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 5000),
         delivery_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 10000),
-        request_commitment: hellas_rpc::RequestCommitment::from_digest(
-            input.input_commitment().unwrap().digest(),
-        ),
-        environment_commitment: work_policy().allowed_environment,
+        request_commitment: input.request.commitment().unwrap(),
+        environment_commitment: input.request.execution_environment,
     };
     let request = AcceptWorkRequest {
         route: Some(hellas_rpc::pb::work::WorkRoute::grant(channel.0)),
@@ -4516,7 +4479,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             .unwrap()
             .bytes()
             .to_vec(),
-        prepared_input: input.encode().unwrap(),
+        prepared_input: input.canonical_bytes().unwrap(),
     };
     let policies = store.state().grant(id).unwrap().policies.clone();
     let service = GrantService::new(
@@ -4548,6 +4511,24 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     let before_paid = paid.with_state(Channel::checkpoint).await.unwrap();
     let mut context = vouched_context(peer);
     context.open_exporter = Some([7; 32]);
+    let (request, uploads) = hellas_channel::test_support::grant_upload_requests(
+        &request,
+        &grantee_key,
+        network,
+        [7; 32],
+    );
+    for upload in uploads {
+        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = execution
+            .upload_content(upload, context.clone())
+            .await
+            .unwrap()
+            .into();
+        assert!(
+            response.response.refused.is_none(),
+            "{:?}",
+            response.response
+        );
+    }
     let response: WithTrailer<AcceptWorkResponse> = execution
         .accept_work(request.clone(), context.clone())
         .await

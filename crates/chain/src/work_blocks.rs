@@ -2,7 +2,7 @@
 //!
 //! # Why an adapter and not a blanket impl
 //!
-//! The watcher's block source is `hellas_work::work_close::FinalizedBlocks`
+//! The watcher's block source is `hellas_channel::work_close::FinalizedBlocks`
 //! and a light client is `crate::LightClient`. Both are foreign to each
 //! other, so nothing can implement the first for every one of the
 //! second; [`WorkBlocks`] is the one type that owns that pairing. It
@@ -42,13 +42,13 @@
 //! `WorkChannelSnapshot::finalized_setup` is what refuses to produce
 //! one from a snapshot that asked about other coins.
 
-use hellas_kernel::{Terms, Tx};
-use hellas_work::work::WorkService;
-use hellas_work::work_close::{
+use hellas_channel::work::WorkService;
+use hellas_channel::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
     TxSink,
 };
-use hellas_work::work_open::{FinalizedSetup, SetupQuery, SetupView};
+use hellas_channel::work_open::{FinalizedSetup, SetupQuery, SetupView};
+use hellas_kernel::{Terms, Tx};
 
 use crate::SubmitTxOutcome;
 use crate::block_view::FinalizedBlockView;
@@ -58,7 +58,11 @@ use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot}
 
 /// One light client, as a paid endpoint's block source.
 #[derive(Clone, Debug)]
-pub struct WorkBlocks<C>(C);
+pub struct WorkBlocks<C> {
+    client: C,
+    read_retry: Option<(std::time::Duration, std::time::Duration)>,
+    min_height: u64,
+}
 
 /// What one production clock step did for a mounted paid channel.
 #[derive(Debug)]
@@ -107,7 +111,71 @@ impl PaidWorkClockError {
 impl<C: LightClient> WorkBlocks<C> {
     /// Reads finalized blocks for a watcher through `client`.
     pub const fn new(client: C) -> Self {
-        Self(client)
+        Self {
+            client,
+            read_retry: None,
+            min_height: 0,
+        }
+    }
+
+    /// Waits for transiently unavailable setup reads without retrying transactions.
+    #[must_use]
+    pub const fn with_read_retry(
+        mut self,
+        poll: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.read_retry = Some((poll, timeout));
+        self
+    }
+
+    /// A persisted journal must never interpret absence at an earlier root.
+    #[must_use]
+    pub fn with_min_height(mut self, height: u64) -> Self {
+        self.min_height = self.min_height.max(height);
+        self
+    }
+
+    async fn read<T, F, Fut>(&self, mut read: F) -> Result<T, QueryError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, QueryError>>,
+    {
+        let Some((poll, timeout)) = self.read_retry else {
+            return read().await;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_reason = "chain read did not answer".to_owned();
+        loop {
+            let result = tokio::time::timeout_at(deadline, read())
+                .await
+                .map_err(|_| QueryError::ReadUnavailableTimeout {
+                    timeout,
+                    reason: last_reason.clone(),
+                })?;
+            match result {
+                Err(QueryError::StateUnavailable(reason)) => {
+                    last_reason.clone_from(&reason);
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(QueryError::ReadUnavailableTimeout { timeout, reason });
+                    }
+                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll))
+                        .await;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+impl From<QueryError> for BlockSourceError {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::ReadUnavailableTimeout { timeout, reason } => {
+                Self::ReadUnavailableTimeout { timeout, reason }
+            }
+            error => Self::new(error.to_string()),
+        }
     }
 }
 
@@ -118,7 +186,7 @@ impl<C: LightClient> WorkBlocks<C> {
 /// bond terms. One coherent finalized snapshot from `source` decides both
 /// permissionless submissions: the payment close through
 /// [`WorkService::adjudicated_close`], and the bond timeout when that same
-/// read still contains the bond at or beyond its committed horizon.
+/// read still contains the bond after finalized payment closure or at its horizon.
 ///
 /// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
 /// not failures. They leave adjudication absent from the returned advance
@@ -139,17 +207,18 @@ where
         .advance_close(source, source)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let (query, bond_terms) = service
+    let (query, bond_terms, settled_height) = service
         .with_state(|state| {
             let channel = state.channel();
             let payment_terms = channel.payment_terms();
             (
                 WorkChannelQuery {
                     bond_edge: payment_terms.bond_edge,
-                    payment_edge: channel.payment_edge(),
+                    payment_edge: Some(channel.payment_edge()),
                     funding: Default::default(),
                 },
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
+                state.close_settled().map(|settled| settled.height),
             )
         })
         .await
@@ -186,19 +255,24 @@ where
         Err(error) => return Err(PaidWorkClockError::Decision(error)),
     };
 
-    let bond_timeout =
-        if snapshot.bond().is_some() && snapshot.block().height >= bond_terms.timeout().get() {
-            let tx = Tx::timeout_close(bond_edge, &bond_terms)
-                .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
-            Some(
-                source
-                    .submit(tx)
-                    .await
-                    .map_err(PaidWorkClockError::Submission)?,
-            )
-        } else {
-            None
-        };
+    // The journal's finalized close and a snapshot at least that new jointly
+    // prove the lease no longer protects a live payment edge.
+    let payment_closed = settled_height.is_some_and(|height| snapshot.block().height >= height)
+        && snapshot.payment().is_none();
+    let bond_timeout = if snapshot.bond().is_some()
+        && (payment_closed || snapshot.block().height >= bond_terms.timeout().get())
+    {
+        let tx = Tx::timeout_close(bond_edge, &bond_terms)
+            .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
+        Some(
+            source
+                .submit(tx)
+                .await
+                .map_err(PaidWorkClockError::Submission)?,
+        )
+    } else {
+        None
+    };
 
     Ok(PaidWorkClockAdvance {
         snapshot: Some(snapshot),
@@ -230,14 +304,13 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
     ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
         let funding = query.funding;
         let Some(snapshot) = self
-            .0
             .work_channel_snapshot(WorkChannelQuery {
                 bond_edge: query.bond_edge,
                 payment_edge: query.payment_edge,
                 funding: funding.clone(),
             })
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
         else {
             return Ok(None);
         };
@@ -259,13 +332,23 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        self.0.work_channel_snapshot(query).await
+        self.read(|| async {
+            let snapshot = self.client.work_channel_snapshot(query.clone()).await?;
+            if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {
+                return Err(QueryError::StateUnavailable(format!(
+                    "chain is behind persisted journal height {}",
+                    self.min_height
+                )));
+            }
+            Ok(snapshot)
+        })
+        .await
     }
 }
 
 impl<C: LightClient> TxSink for WorkBlocks<C> {
     async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
-        self.0
+        self.client
             .submit_tx(Transaction::Kernel(tx))
             .await
             .map_err(|error| BlockSourceError::new(error.to_string()))
@@ -275,19 +358,34 @@ impl<C: LightClient> TxSink for WorkBlocks<C> {
 impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
         Ok(self
-            .0
-            .get_latest_block()
+            .read(|| async {
+                // A journal floor must stay within the state this source can prove.
+                let latest = self
+                    .client
+                    .get_applied_finalized_block(FinalizedBlockQuery::Latest)
+                    .await?
+                    .map(|block| block.snapshot);
+                if latest.as_ref().map_or(0, |value| value.height) < self.min_height {
+                    return Err(QueryError::StateUnavailable(format!(
+                        "chain is behind persisted journal height {}",
+                        self.min_height
+                    )));
+                }
+                Ok(latest)
+            })
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
             .map(|block| block.height))
     }
 
     async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
         let Some(finalized) = self
-            .0
-            .get_finalized_block(FinalizedBlockQuery::Height(height))
+            .read(|| {
+                self.client
+                    .get_finalized_block(FinalizedBlockQuery::Height(height))
+            })
             .await
-            .map_err(|error| BlockSourceError::new(error.to_string()))?
+            .map_err(BlockSourceError::from)?
         else {
             return Ok(None);
         };
@@ -334,30 +432,31 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    use commonware_consensus::{
+        CertifiableBlock as _,
+        simplex::types::Context,
+        types::{Epoch, Height, Round, View},
+    };
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_runtime::{Handle, Supervisor as _};
-    use hellas_auth::Digest as ProtocolDigest;
+    use commonware_storage::mmr::Location;
+    use commonware_utils::non_empty_range;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
-        Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties, Party, Payout,
-        PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx,
-        WorkPaymentTerms, WorkStakeBondTerms,
+        Funding, List, MAX_PARTY_INPUTS, Move, Parties, Party, Payout, PendingSlot,
+        Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
+        WorkStakeBondTerms,
     };
-    use hellas_rpc::call::WithTrailer;
-    use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-    use hellas_rpc::protocol::ContentId;
-    use hellas_rpc::services::work_setup::WorkSetupHandler;
-    use hellas_wire::TransportContext;
-    use hellas_work::model::setup::{
+
+    use hellas_channel::model::setup::{
         ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
     };
-    use hellas_work::model::work::{
-        EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-    };
-    use hellas_work::work_close::{BlockSourceError, adjudicated_close, close_start};
-    use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-    use hellas_work::work_store::{
+    use hellas_channel::model::work::{PaidChannelPolicyV1, private_policy_commitment};
+    use hellas_channel::test_support::channel::work_policy;
+    use hellas_channel::work_close::{BlockSourceError, adjudicated_close, close_start};
+    use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+    use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+    use hellas_channel::work_store::{
         Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
         SetupStore, WorkStoreError,
     };
@@ -368,7 +467,7 @@ mod tests {
     use crate::domain::{KERNEL_FEES, SettlementKey, TEST_NETWORK, genesis_object_id};
     use crate::execution::store::{UtxoDatabase, utxo_db_config};
     use crate::execution::test_support::{
-        consensus_fixture, finalization, index_block, index_genesis, run_qmdb,
+        consensus_fixture, finalization, index_genesis, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
     use crate::indexer::spawn_archive;
@@ -427,18 +526,15 @@ mod tests {
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
-        WorkStakeBondTerms {
-            parties: Parties::new(
+        hellas_channel::test_support::channel::bond_terms_for(
+            Parties::new(
                 hellas_kernel::PartyKeys::sole(provider().party_key()),
                 hellas_kernel::PartyKeys::sole(client().party_key()),
             ),
-            timeout: BlockHeight::new(HORIZON),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 4,
-        }
+            BlockHeight::new(HORIZON),
+            Payout::new(provider().party_key(), STAKE),
+            4,
+        )
     }
 
     fn bond_funding() -> Funding {
@@ -450,24 +546,7 @@ mod tests {
     }
 
     fn channel_policy() -> PaidChannelPolicyV1 {
-        PaidChannelPolicyV1 {
-            compute_credit_limit: 40,
-            delivery_credit_limit: 40,
-        }
-    }
-
-    fn work_policy() -> EvaluatePolicyV2 {
-        EvaluatePolicyV2 {
-            allowed_environment: ContentId::from_bytes([0x31; 32]),
-            generation_policy_digest: ProtocolDigest::from_bytes([0x32; 32]),
-            identity_source_digest: ProtocolDigest::from_bytes([0x33; 32]),
-            max_prompt_tokens: 512,
-            max_new_tokens: 128,
-            max_stop_token_ids: 4,
-            max_spool_bytes: 1_048_576,
-            max_encoded_result_frame: 262_144,
-            max_encoded_prepared_input: 1_048_576,
-        }
+        hellas_channel::test_support::channel::credit_policy(40, 40)
     }
 
     /// The edge the provider requires the client to fund: the whole
@@ -482,25 +561,21 @@ mod tests {
             network: TEST_NETWORK,
             policy_salt: SALT,
             channel_policy: channel_policy(),
-            work_policy: work_policy().into(),
+            invocation_policy: work_policy(),
             expected_payment_values: expected_values(),
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         }
     }
 
     fn payment_terms() -> WorkPaymentTerms {
-        WorkPaymentTerms {
-            bond_edge: bond_edge(),
-            bond_terms: bond_terms(),
-            private_policy_commitment: private_policy_commitment(
-                TEST_NETWORK,
-                &SALT,
-                &channel_policy(),
-            ),
-            omit_response_blocks: WINDOW,
-            start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-            omission_bond: OMISSION_BOND,
-        }
+        hellas_channel::test_support::channel::payment_terms_for(
+            bond_edge(),
+            bond_terms(),
+            private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
+            WINDOW,
+            hellas_kernel::MAX_START_VALIDITY_BLOCKS,
+            OMISSION_BOND,
+        )
     }
 
     fn payment_edge_of(funding: &Funding) -> EdgeId {
@@ -538,7 +613,7 @@ mod tests {
         /// Nothing else drains this mempool, so everything past it is
         /// what the driver submitted since.
         sealed: usize,
-        _indexer_task: Handle<()>,
+        indexer_task: Handle<()>,
     }
 
     impl Chain {
@@ -579,8 +654,13 @@ mod tests {
                 head: genesis,
                 height: 0,
                 sealed: 0,
-                _indexer_task: task,
+                indexer_task: task,
             }
+        }
+
+        async fn shutdown(self) {
+            self.indexer_task.abort();
+            let _ = self.indexer_task.await;
         }
 
         fn light_client(&self) -> LocalLightClient {
@@ -623,13 +703,28 @@ mod tests {
             .expect("the block executes");
             let merkleized = batches.merkleize().await.expect("state merkleizes");
             let root = merkleized.root();
-            self.database.finalize(merkleized).await;
-
-            let block = index_block(&self.head, root, fresh);
+            let bounds = merkleized.bounds();
+            let block = HellasBlock::new(
+                Context {
+                    round: Round::new(Epoch::zero(), View::new(self.height)),
+                    leader: self.fixture.leaders[0].clone(),
+                    parent: (self.head.context().round.view(), self.head.digest()),
+                },
+                self.head.digest(),
+                Height::new(self.height),
+                self.height,
+                root,
+                crate::UtxoSyncTarget::new(
+                    root,
+                    non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
+                ),
+                fresh,
+            );
             self.indexer
                 .ingest_finalized(block.clone(), finalization(&self.fixture, &block))
                 .await
                 .expect("finalized ingest");
+            self.database.finalize(merkleized).await;
             assert_eq!(
                 self.index.apply_finalized(&block),
                 Ok(ApplyOutcome::Applied)
@@ -675,29 +770,15 @@ mod tests {
             PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
 
-        let proposal = exchange(&service, Vec::new()).await;
-        if let Err(error) = caller.import(&proposal).await {
-            panic!("the client imports the bond proposal: {error}");
-        }
-        caller
-            .arm_scan(scan)
-            .await
-            .expect("the client arms its scan");
-        if let Err(error) = caller
-            .propose_payment(payment_funding, payment_terms())
-            .await
-        {
-            panic!("the client proposes its payment: {error}");
-        }
-        let offered = caller
-            .state()
-            .bundle_bytes()
-            .map(<[u8]>::to_vec)
-            .expect("the client holds revision 2");
-        let countersigned = exchange(&service, offered).await;
-        if let Err(error) = caller.import(&countersigned).await {
-            panic!("the client imports the countersigned payment: {error}");
-        }
+        hellas_channel::test_support::channel::finish_setup(
+            &service,
+            &mut caller,
+            bond_edge(),
+            scan,
+            payment_funding,
+            payment_terms(),
+        )
+        .await;
         assert_eq!(caller.state().revision(), Some(3));
         // Both journals let go of their files, so everything below reads
         // what actually reached the disk.
@@ -705,39 +786,14 @@ mod tests {
         drop(caller);
     }
 
-    /// Offers one revision to the provider's service and returns the
-    /// revision it answers with.
-    async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
-        let answered = WorkSetupHandler::exchange_setup(
-            service,
-            ExchangeSetupRequest {
-                bond_edge: bond_edge().as_bytes().to_vec(),
-                bundle,
-            },
-            TransportContext::default(),
-        )
-        .await
-        .expect("the setup handler answers");
-        let response: WithTrailer<_> = answered.into();
-        match response.response.outcome {
-            Some(Outcome::Advanced(advanced)) => advanced.bundle,
-            other => panic!("expected an advanced revision, got {other:?}"),
-        }
-    }
-
     async fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
-        match SetupStore::open(
+        hellas_channel::test_support::channel::open_setup_store(
             root,
             TEST_NETWORK,
             bond_edge(),
             role,
-            &Secp256k1Verifier::new(),
         )
         .await
-        {
-            Ok(store) => store,
-            Err(error) => panic!("the setup journal opens: {error}"),
-        }
     }
 
     fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -891,7 +947,7 @@ mod tests {
             let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: BTreeSet::new(),
                 })
                 .await
@@ -920,7 +976,7 @@ mod tests {
                 payment_terms: payment_terms(),
                 policy_salt: SALT,
                 channel_policy: channel_policy(),
-                work_policy: work_policy().into(),
+                invocation_policy: work_policy(),
                 expected_payment_values: expected_values(),
             }) {
                 Ok(descriptor) => descriptor,
@@ -932,6 +988,7 @@ mod tests {
             };
             assert_eq!(ready.finalized_height(), snapshot.block().height);
             assert_eq!(ready.settlement().capacity(), FUNDING - OMISSION_BOND);
+            chain.shutdown().await;
         });
     }
 
@@ -1001,7 +1058,7 @@ mod tests {
             let snapshot = blocks
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bond_edge(),
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: BTreeSet::new(),
                 })
                 .await
@@ -1037,6 +1094,7 @@ mod tests {
                 matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
                 "journal-only recovery mounts CloseOnly: {mounted:?}",
             );
+            chain.shutdown().await;
         });
     }
 
@@ -1119,6 +1177,7 @@ mod tests {
                     SetupStateError::SubmittedOpenUnresolved
                 ))
             ));
+            chain.shutdown().await;
         });
     }
 
@@ -1170,6 +1229,7 @@ mod tests {
                     .end(),
                 Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
             );
+            chain.shutdown().await;
         });
     }
 
@@ -1233,6 +1293,7 @@ mod tests {
                 None,
                 "and it recorded no ending it could not act on",
             );
+            chain.shutdown().await;
         });
     }
 
@@ -1263,8 +1324,8 @@ mod tests {
         }
     }
 
-    fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-        hellas_work::model::work::JobPaymentPolicyV2 {
+    fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+        hellas_channel::model::work::JobPaymentPolicyV2 {
             fixed_price: 10,
             dispatch_margin_blocks: 4,
             delivery_margin_blocks: 2,

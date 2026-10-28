@@ -5,12 +5,13 @@ use crate::{
     work_router::{WorkConnection, WorkRouter},
 };
 use hellas_auth::authority::{AuthorityId, CredentialSecret};
+use hellas_rpc::authentication::MAX_AUTHENTICATION_MESSAGE_BYTES;
 use hellas_rpc::pb::work::{FundingKind, WorkRoute};
 use hellas_rpc::services::work::{AcceptWork, Open, Work, WorkClientImpl};
 use hellas_wire::{Dispatcher, Metadata, WireCode};
-use hellas_work::test_support::{assert_err, within};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use {hellas_authority::test_support::within, hellas_channel::test_support::assert_err};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApplicationAttack {
@@ -78,7 +79,6 @@ impl Pair {
         hellas_client::confidential_open::<Open>(
             &self.outgoing,
             &ProviderTrustAnchor {
-                allowed_environments: vec![],
                 expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
                 required_assurance: Assurance::ProducerSigned,
                 apple_app_attest: None,
@@ -203,7 +203,8 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                     let length = recv.read_u16().await.unwrap();
                     let mut challenge = vec![0; usize::from(length)];
                     recv.read_exact(&mut challenge).await.unwrap();
-                    send.write_u16(257).await.unwrap();
+                    let oversize = u16::try_from(MAX_AUTHENTICATION_MESSAGE_BYTES + 1).unwrap();
+                    send.write_u16(oversize).await.unwrap();
                     // No body follows: reject the length without waiting for bytes.
                     recv.read_u8().await.unwrap_err();
                 } else {
@@ -235,11 +236,11 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                         } else {
                             &f.application.credential
                         },
-                        hellas_work::node::SessionKey::Node(
+                        hellas_authority::node::SessionKey::Node(
                             &if attack == ApplicationAttack::Identity {
-                                hellas_work::test_support::actors::STRANGER
+                                hellas_channel::test_support::actors::STRANGER
                             } else {
-                                hellas_work::test_support::actors::ROOT
+                                hellas_channel::test_support::actors::ROOT
                             }
                             .node_key(),
                         ),
@@ -258,11 +259,15 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                         .close(0u32.into(), b"failed authentication");
                 }
             });
-            assert_eq!(
-                server.err().unwrap().code,
-                WireCode::PermissionDenied,
-                "{attack:?}"
-            );
+            let refusal = server.err().unwrap();
+            assert_eq!(refusal.code, WireCode::PermissionDenied, "{attack:?}");
+            if attack == ApplicationAttack::Oversize {
+                assert_eq!(
+                    refusal.message(),
+                    "application authentication failed",
+                    "the frame reader must reject the length before reading the body",
+                );
+            }
             pair.close().await;
         }
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
@@ -335,7 +340,7 @@ async fn revoked_credentials_are_rejected_before_work_body_decoding() {
     let pair = Pair::new().await;
     let server = pair.admit(&router, Some(&f.application)).await;
     let node = f.service.node();
-    let caller = hellas_work::test_support::session(&node, &f.administrator).await;
+    let caller = hellas_authority::test_support::session(&node, &f.administrator).await;
     node.revoke_credential(
         &caller,
         GrantId([0; 16]),
@@ -509,7 +514,6 @@ async fn cancelling_application_authentication_closes_the_uncached_connection() 
             pair.provider.bound_sockets(),
             pair.client.clone(),
             ProviderTrustAnchor {
-                allowed_environments: vec![],
                 expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
                 required_assurance: Assurance::ProducerSigned,
                 apple_app_attest: None,

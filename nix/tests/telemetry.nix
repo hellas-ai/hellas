@@ -66,8 +66,8 @@ pkgs.testers.runNixOSTest (
               for unit in ["hellas.service", "hellas-gateway.service"]:
                   if vm.execute(f"systemctl is-active --quiet {unit}")[0] == 0:
                       shutdown(vm, f"systemctl stop {unit}")
-              shutdown(vm, "pkill -TERM -x hellas-cli || test $? -eq 1")
-              shutdown(vm, "timeout 45 sh -c 'while pgrep -x hellas-cli >/dev/null; do sleep 0.1; done'", timeout=50)
+              shutdown(vm, "pkill -TERM -x hellas || test $? -eq 1")
+              shutdown(vm, "timeout 45 sh -c 'while pgrep -x hellas >/dev/null; do sleep 0.1; done'", timeout=50)
               shutdown(vm, "systemctl stop opentelemetry-collector.service")
               vm.succeed("journalctl -u opentelemetry-collector.service --no-pager > /tmp/collector.log")
               vm.copy_from_machine("/tmp/collector.log", f"traces/{vm.name}")

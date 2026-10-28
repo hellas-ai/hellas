@@ -15,7 +15,7 @@ async fn provider() -> ProviderHandle {
     let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
     let signer = Arc::new(signer);
     start_fetch_provider(ProviderOptions {
-        executor: ExecutorSpawnConfig::fetch_only(
+        executor: ExecutorSpawnConfig::new(
             signer.clone(),
             Assurance::ProducerSigned,
             FetchRouteRegistry::new(),

@@ -25,6 +25,8 @@ message GetOperationsResponse {
 }
 
 service LightClient {
+  rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse);
+  rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
   rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);
@@ -32,6 +34,7 @@ service LightClient {
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
+  rpc GetAppliedFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
   rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
   rpc SubmitWorkResponse(SubmitWorkResponseRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);

@@ -1,14 +1,9 @@
 { self }:
 rec {
   # The ordinary CLI omits OTEL. Modules opt in through the package override.
-  # It carries the network, chain and gateway surfaces. Local Catena execution is the explicit `cli-catena` package.
+  # It carries the network, chain, gateway and local Catena execution surfaces.
   normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
   catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
-  catenaCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-catena;
-  nixosCliPackage =
-    pkgs: if catenaPlatform pkgs then catenaCliPackage pkgs else normalCliPackage pkgs;
-
-  pickCliPackage = normalCliPackage;
 
   renderEnvironment = builtins.mapAttrs (_: toString);
 
@@ -30,7 +25,7 @@ rec {
         paths = [ package ];
         nativeBuildInputs = [ pkgs.makeWrapper ];
         postBuild = ''
-          wrapProgram "$out/bin/hellas-cli" ${
+          wrapProgram "$out/bin/hellas" ${
             lib.concatStringsSep " " (
               lib.mapAttrsToList (
                 name: value: "--set-default ${lib.escapeShellArg name} ${lib.escapeShellArg (toString value)}"
@@ -200,11 +195,8 @@ rec {
     "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
-    "--gpu-max-generation-capacity"
-    "--gpu-max-generation-device-bytes"
-    "--gpu-compile-timeout-secs"
-    "--gpu-execution-timeout-secs"
-    "--work-config"
+    "--paid-work-config"
+    "--passkey"
     "--metrics-port"
     "--graffiti"
     "--fetch-config"
@@ -218,20 +210,11 @@ rec {
     "--identity"
     "--log-file"
     "--assurance"
-    "--environment"
-    "--model"
-    "--content"
-    "--content-root"
-    "--content-index"
-    "--tokenizer"
-    "--chat-template"
-    "--stop-token"
+    "--text-model"
     "--host"
     "--port"
     "--node-id"
-    "--node-addr"
-    "--local"
-    "--queue-size"
+    "--address"
     "--retries"
     "--default-max-tokens"
     "--metrics-port"
@@ -248,7 +231,6 @@ rec {
     "--passkey"
     "--work-profile"
     "--grant-policy"
-    "--local-grant"
   ];
 
   extraArgsAreSafe =
@@ -262,11 +244,7 @@ rec {
     || serve.contentIndex != null
     || serve.gpuBackend != null
     || serve.gpuSessionPrograms != null
-    || serve.gpuSessionAssetBytes != null
-    || serve.gpuMaxGenerationCapacity != null
-    || serve.gpuMaxGenerationDeviceBytes != null
-    || serve.gpuCompileTimeoutSeconds != null
-    || serve.gpuExecutionTimeoutSeconds != null;
+    || serve.gpuSessionAssetBytes != null;
 
   commonOptions =
     {
@@ -362,7 +340,7 @@ rec {
     };
 
   # Serve-daemon options. Reused by NixOS systemd, HM-on-darwin launchd, and
-  # any other future daemon surface. The keys here mirror `hellas-cli serve`'s
+  # any other future daemon surface. The keys here mirror `hellas serve`'s
   # CLI flags one-for-one — see `mkServeArgs` for the binding.
   serveOptions =
     { lib, pkgs }:
@@ -468,24 +446,20 @@ rec {
           separately to bound host RAM. Null uses the CLI default.
         '';
       };
-      gpuMaxGenerationCapacity = mkOption {
-        type = types.nullOr (types.ints.between 1 524288);
-        default = null;
-        description = "Maximum prompt-plus-output token capacity admitted for one GPU generation (at most 524288, so retained output fits the artifact transport). Null uses the CLI default.";
-      };
-      gpuMaxGenerationDeviceBytes = positiveLimitOption "Maximum non-asset device bytes owned or allocated by one GPU generation, including resident state, token staging, outputs, and intermediates. Null uses the CLI default.";
-      gpuCompileTimeoutSeconds = positiveLimitOption "Maximum seconds spent loading and compiling one Catena program. Null uses the CLI default.";
-      gpuExecutionTimeoutSeconds = positiveLimitOption "Maximum seconds for one GPU control operation or complete generation. Null uses the CLI default.";
       workConfigFile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        example = "/var/lib/hellas/work.json";
+        example = "/var/lib/hellas/paid-work.toml";
         description = ''
-          Runtime paid-work configuration passed as --work-config. A paid
-          provider reads an existing identity rather than creating one, so
-          initialize its identity before enabling this option. Keep the file
-          and every journal path it names outside the Nix store.
+          Runtime TOML paid terms passed as --paid-work-config. The owner
+          selected by passkey approves exactly these terms at startup; paid
+          work is sold only with this file. Keep it outside the Nix store.
         '';
+      };
+      passkey = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Private software passkey of the provider's owner, passed as --passkey; required by workConfigFile unless extraArgs selects a faucet account.";
       };
       fetchConfigFile = mkOption {
         type = types.nullOr runtimePath;
@@ -529,7 +503,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas-cli serve`. They may add unsupported harmless switches such as `--software-root`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas serve`. They may add unsupported harmless switches such as `--software-root`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 
@@ -538,7 +512,6 @@ rec {
     let
       inherit (lib) mkEnableOption mkOption types;
       runtimePath = types.strMatching "/.*";
-      u32 = types.ints.between 0 4294967295;
       positiveU32 = types.ints.between 1 4294967295;
     in
     {
@@ -578,17 +551,12 @@ rec {
       nodeId = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Direct target node id. Null enables discovery unless local mode is selected.";
+        description = "Direct target node id. Null enables discovery.";
       };
       nodeAddrs = mkOption {
         type = types.listOf types.str;
         default = [ ];
         description = "Direct UDP address hints for the target node.";
-      };
-      local = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Run an already configured local allowance using workProfile, localGrant and caller trust approval.";
       };
       offer = mkOption {
         type = types.nullOr types.str;
@@ -598,7 +566,7 @@ rec {
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the principal whose allowance local or offer execution uses.";
+        description = "Private software passkey of the principal whose offer allowance execution uses.";
       };
       workProfile = mkOption {
         type = types.nullOr runtimePath;
@@ -610,16 +578,6 @@ rec {
         default = null;
         description = "Select one granted resource by name.";
       };
-      localGrant = mkOption {
-        type = types.nullOr (types.strMatching "[0-9a-f]{32}");
-        default = null;
-        description = "Already configured local allowance ID for local execution.";
-      };
-      queueSize = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = "Maximum number of queued local executions. Zero admits no waiting executions.";
-      };
       retries = mkOption {
         type = types.nullOr types.ints.unsigned;
         default = null;
@@ -630,80 +588,16 @@ rec {
         default = null;
         description = "Fallback max output tokens when a request omits a limit.";
       };
-      causalLmEnvironment = mkOption {
+      textModel = mkOption {
         type = types.nullOr (types.strMatching "/.*");
         default = null;
-        example = "/srv/hellas/environments/smollm2.environment";
+        example = "/srv/hellas/models/qwen3.gguf";
         description = ''
-          Canonical causal-LM environment file passed as --environment. Its
-          exact bytes determine the manifest sent to providers. This is
-          operator-managed runtime data, not a Nix-store artifact.
-          responsesBackend changes only /v1/responses; the gateway's other
-          routes continue to use this environment. Omit this and tokenizer
-          for a proxy-only gateway; native inference requires both.
+          GGUF passed as --text-model and served by the native text routes.
+          Providers must already hold it. This is operator-managed runtime
+          data, not a Nix-store artifact. responsesBackend changes only
+          /v1/responses. Omit it for a proxy-only gateway.
         '';
-      };
-      model = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Optional presentation-only model label returned by HTTP APIs; null uses the manifest ID. It does not enter the execution claim.";
-      };
-      content = mkOption {
-        type = types.listOf (types.strMatching "/.*");
-        default = [ ];
-        example = [ "/srv/hellas/content/model.hex" ];
-        description = "Local content files used only by local execution or verification. Passed as repeatable --content arguments.";
-      };
-      contentRoots = mkOption {
-        type = types.listOf (types.strMatching "/.*");
-        default = [ ];
-        example = [ "/srv/hellas/content" ];
-        description = "Local content trees used only by local execution or verification. Passed as repeatable --content-root arguments.";
-      };
-      contentIndex = mkOption {
-        type = types.nullOr (types.strMatching "/.*");
-        default = null;
-        description = ''
-          Fast-resume index for local content. Null uses the CLI's persistent
-          HOME-relative store state. Valid only with local execution or local
-          verification. Atomic publication needs a writable sibling, so a
-          custom NixOS path must have a dedicated parent outside content and
-          contentRoots. Pre-create it and grant the DynamicUser unit write
-          access through an id-mapped mount, or override the unit to use a
-          dedicated static user that owns it. A group-writable parent alone is
-          insufficient because index files are owner-only. Never chown
-          persistent data to a transient numeric dynamic UID. Keep the path and
-          its ancestors stable and trusted while the service runs.
-        '';
-      };
-      tokenizer = mkOption {
-        type = types.nullOr (types.strMatching "/.*");
-        default = null;
-        example = "/srv/hellas-presentation/smollm2-tokenizer.json";
-        description = ''
-          Application-selected tokenizer JSON. This presentation input is
-          independent of the Catena execution environment and is not covered by
-          the Hellas execution guarantee. Set it together with
-          causalLmEnvironment; omit both for a proxy-only gateway.
-        '';
-      };
-      chatTemplate = mkOption {
-        type = types.nullOr (
-          types.enum [
-            "qwen3"
-            "qwen3.5"
-            "qwen3.6"
-            "smollm2"
-          ]
-        );
-        default = null;
-        description = "Shared text-chat model adapter with thinking disabled and tool-call support. Qwen3 uses JSON tool calls; Qwen3.5 and Qwen3.6 use XML function calls. Null supports plain completions only. Multimodal messages are unsupported.";
-      };
-      stopTokenIds = mkOption {
-        type = types.listOf u32;
-        default = [ ];
-        example = [ 2 ];
-        description = "Caller-selected stop token IDs; none are inferred from the tokenizer or Catena environment.";
       };
       metricsPort = mkOption {
         type = types.nullOr types.port;
@@ -789,7 +683,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas-cli gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 
@@ -821,7 +715,7 @@ rec {
       }
     );
 
-  # `hellas-cli serve ...` argv from a resolved serve cfg. The cfg shape is
+  # `hellas serve ...` argv from a resolved serve cfg. The cfg shape is
   # whatever attrset carries `serveOptions` keys — for NixOS that's the top-
   # level `services.hellas`, for HM-darwin it's `programs.hellas.serve`.
   mkServeArgs =
@@ -856,11 +750,8 @@ rec {
     ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
-    ++ optArg "--gpu-max-generation-capacity" serve.gpuMaxGenerationCapacity
-    ++ optArg "--gpu-max-generation-device-bytes" serve.gpuMaxGenerationDeviceBytes
-    ++ optArg "--gpu-compile-timeout-secs" serve.gpuCompileTimeoutSeconds
-    ++ optArg "--gpu-execution-timeout-secs" serve.gpuExecutionTimeoutSeconds
-    ++ optArg "--work-config" serve.workConfigFile
+    ++ optArg "--paid-work-config" serve.workConfigFile
+    ++ optArg "--passkey" serve.passkey
     ++ optArg "--metrics-port" serve.metricsPort
     ++ [
       "--assurance"
@@ -898,14 +789,10 @@ rec {
     ++ optArg "--passkey" gateway.passkey
     ++ optArg "--work-profile" gateway.workProfile
     ++ optArg "--grant-policy" gateway.grantPolicy
-    ++ optArg "--local-grant" gateway.localGrant
-    ++ optArg "--environment" gateway.causalLmEnvironment
-    ++ optArg "--tokenizer" gateway.tokenizer
-    ++ optArg "--model" gateway.model
+    ++ optArg "--text-model" gateway.textModel
     ++ optArg "--paid-work-config" gateway.paidWorkConfig
     ++ lib.optional gateway.allowRemote "--allow-remote"
     ++ optArg "--gateway-profile" gateway.gatewayProfile
-    ++ optArg "--chat-template" gateway.chatTemplate
     ++ [
       "--host"
       gateway.host
@@ -913,26 +800,11 @@ rec {
     ++ optArg "--port" gateway.port
     ++ optArg "--node-id" gateway.nodeId
     ++ lib.concatMap (addr: [
-      "--node-addr"
+      "--address"
       addr
     ]) gateway.nodeAddrs
-    ++ lib.optionals gateway.local [ "--local" ]
-    ++ optArg "--queue-size" gateway.queueSize
     ++ optArg "--retries" gateway.retries
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
-    ++ lib.concatMap (path: [
-      "--content"
-      path
-    ]) gateway.content
-    ++ lib.concatMap (path: [
-      "--content-root"
-      path
-    ]) gateway.contentRoots
-    ++ optArg "--content-index" gateway.contentIndex
-    ++ lib.concatMap (token: [
-      "--stop-token"
-      (toString token)
-    ]) gateway.stopTokenIds
     ++ optArg "--metrics-port" gateway.metricsPort
     ++ lib.optionals (gateway.offer == null) [
       "--responses-backend"

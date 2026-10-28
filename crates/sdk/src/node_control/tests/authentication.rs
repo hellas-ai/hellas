@@ -68,7 +68,7 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
     let (_send, mut recv, _) = hello(&cc).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(hellas_work::test_support::WAIT, recv.read(&mut [0]))
+    tokio::time::timeout(hellas_authority::test_support::WAIT, recv.read(&mut [0]))
         .await
         .unwrap()
         .unwrap_err();
@@ -90,7 +90,7 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
         .unwrap();
     let (_ce, _se, cc, sc) = pair().await;
     let task = serve(&f.service, sc);
-    hellas_work::test_support::assert_err!(connect_iroh(cc, authority(), &f.secret, hellas_work::node::SessionKey::Passkey(&ROOT.passkey()))
+    hellas_channel::test_support::assert_err!(connect_iroh(cc, authority(), &f.secret, hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()))
             .await, status if status.code() == WireCode::PermissionDenied);
     assert_eq!(
         task.await.unwrap().unwrap_err().code,

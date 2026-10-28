@@ -19,7 +19,7 @@ pub enum GatewayError {
         cleanup: crate::WorkShutdownError,
     },
     #[error(transparent)]
-    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
+    Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("gateway task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error("gateway I/O failed")]
@@ -84,10 +84,6 @@ pub enum GatewayConfigError {
     CredentialAlias,
     #[error("default maximum tokens must be greater than zero")]
     MaxTokens,
-    #[error("causal-LM environment and tokenizer must be supplied together")]
-    TokenizerPair,
-    #[error("Hellas backend requires an environment and tokenizer")]
-    MissingEnvironment,
     #[error("non-loopback gateway binding requires --allow-remote")]
     RemoteBinding,
 }

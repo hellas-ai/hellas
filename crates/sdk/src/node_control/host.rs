@@ -3,7 +3,7 @@
 use super::*;
 use crate::{ProviderControl, ProviderError, ProviderHandle};
 use futures::future::BoxFuture;
-use hellas_work::model::grant::records::grant_transport;
+use hellas_authority::model::grant::records::grant_transport;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -185,6 +185,19 @@ impl HostHandle {
         self.runtime.endpoint.subscribe()
     }
 
+    /// Checked administration over the running provider's existing writer.
+    pub fn administration(
+        &self,
+    ) -> Result<Option<hellas_authority::grant_service::WorkAdministration>, HostError> {
+        Ok(self
+            .runtime
+            .state
+            .lock()
+            .map_err(|_| HostError::Composition)?
+            .work
+            .clone())
+    }
+
     pub async fn shutdown(mut self) -> Result<(), HostError> {
         self.stop.send_replace(true);
         let listener = match self.listener.take() {
@@ -223,7 +236,7 @@ struct State {
     ingress: Option<mpsc::Sender<crate::transport_admission::AdmittedConnection>>,
     provider: Option<ProviderHandle>,
     gateway: Option<hellas_gateway::GatewayHandle>,
-    work: Option<hellas_work::grant_service::WorkAdministration>,
+    work: Option<hellas_authority::grant_service::WorkAdministration>,
     provider_state: RuntimeState,
     gateway_state: RuntimeState,
     /// Why the last start failed, reported to operators while Failed.
@@ -359,7 +372,7 @@ impl Runtime {
     }
     pub(super) fn work(
         &self,
-    ) -> Result<Option<hellas_work::grant_service::WorkAdministration>, WireStatus> {
+    ) -> Result<Option<hellas_authority::grant_service::WorkAdministration>, WireStatus> {
         self.with(|state| state.work.clone())
     }
     pub(super) fn access(&self) -> Result<(hellas_gateway::GatewayAccess, String), WireStatus> {
@@ -744,8 +757,8 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
                 root: config.journal_root,
             },
         };
-        let resources = if provider.executor.supports_evaluate() {
-            crate::grant_provider::ProviderResources::EvaluateAndFetch(
+        let resources = if provider.executor.supports_compute() {
+            crate::grant_provider::ProviderResources::ComputeAndFetch(
                 &provider.executor.fetch_routes,
             )
         } else {

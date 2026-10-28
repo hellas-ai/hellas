@@ -1221,7 +1221,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
 ///
 /// The test above hand-builds its start and its close. This one
 /// calls the endpoint's own two builders — `close_start` and
-/// `adjudicated_close` from `hellas_work::work_close` — and submits
+/// `adjudicated_close` from `hellas_channel::work_close` — and submits
 /// what they return, so an endpoint that derived a window, a
 /// contest identifier, a seal, or a split differently from the
 /// kernel would fail here rather than at a demonstration.
@@ -1232,6 +1232,10 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
 /// `a_paid_job_closes_at_exactly_what_it_earned`.
 #[test]
 fn an_endpoint_built_close_settles_on_a_real_chain() {
+    use hellas_channel::model::work::{
+        PaidChannel, PaidChannelPolicyV1, private_policy_commitment,
+    };
+    use hellas_channel::work_close::{adjudicated_close, close_start, start_body_digest};
     use hellas_kernel::{
         Auth, BlockHeight as KernelHeight, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS,
         MAX_PARTY_INPUTS as INPUTS, Move, Parties, Party, Payout as KernelPayout, PendingSlot,
@@ -1239,8 +1243,6 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
         adjudicated_payouts, parse_pending_close, pending_payment_close_slot,
         work_payment_settlement,
     };
-    use hellas_work::model::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
-    use hellas_work::work_close::{adjudicated_close, close_start, start_body_digest};
 
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;
@@ -1455,6 +1457,10 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
 /// than at a demonstration.
 #[test]
 fn an_endpoint_built_response_forfeits_the_understaters_bond() {
+    use hellas_channel::model::work::{
+        PaidChannel, PaidChannelPolicyV1, private_policy_commitment,
+    };
+    use hellas_channel::work_close::{adjudicated_close, close_response, close_start};
     use hellas_kernel::{
         Auth, BlockHeight as KernelHeight, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS,
         MAX_PARTY_INPUTS as INPUTS, Move, Parties, Party, Payout as KernelPayout, PendingSlot,
@@ -1462,8 +1468,6 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
         adjudicated_payouts, parse_pending_close, pending_payment_close_slot,
         work_payment_settlement,
     };
-    use hellas_work::model::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
-    use hellas_work::work_close::{adjudicated_close, close_response, close_start};
 
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;

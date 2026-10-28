@@ -2,16 +2,16 @@
 use hellas_rpc::pb::work::Refusable;
 
 use crate::paid_provider::{MountedWork, MountedWorkService};
+use hellas_authority::grant_service::{GrantService, GrantWork};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
-    FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
+    ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
+    GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_wire::{TransportContext, WireCode, WireStatus};
-use hellas_work::grant_service::{GrantService, GrantWork};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 mod admission;
@@ -77,6 +77,24 @@ pub(crate) fn not_ready() -> WorkRefused {
 }
 
 impl WorkSetupHandler for UnmountedWork {
+    async fn request_offer(
+        &self,
+        _request: hellas_rpc::pb::work::RequestOfferRequest,
+        _context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        Ok(hellas_rpc::pb::work::RequestOfferResponse {
+            outcome: Some(
+                hellas_rpc::pb::work::request_offer_response::Outcome::Refused(
+                    hellas_rpc::pb::work::OfferRefused {
+                        code: hellas_rpc::pb::work::OfferRefusalCode::NoPolicy as i32,
+                        required: 0,
+                    },
+                ),
+            ),
+        })
+    }
+
     async fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
@@ -103,19 +121,24 @@ impl WorkHandler for UnmountedWork {
         Ok(AcceptWorkResponse::refused(not_ready()))
     }
 
-    async fn deliver_result(
+    async fn upload_content(
         &self,
-        _request: DeliverResultRequest,
+        _request: hellas_rpc::pb::work::UploadContentRequest,
         _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        Ok(DeliverResultResponse::refused(not_ready()))
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        Err::<hellas_rpc::pb::work::UploadContentResponse, _>(WireStatus::new(
+            WireCode::Unavailable,
+            "work channel is not mounted",
+        ))
     }
-
     async fn stream_result(
         &self,
-        _request: DeliverResultRequest,
+        _request: StreamResultRequest,
         _context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         Err(WireStatus::new(
             hellas_wire::WireCode::Unavailable,
             "work authority is not mounted",
@@ -154,15 +177,18 @@ impl WorkHandler for ConnectionWork {
             Handler::Unavailable => wt(UnmountedWork.accept_work(request, context)).await,
         }
     }
-    async fn deliver_result(
+    async fn upload_content(
         &self,
-        request: DeliverResultRequest,
+        request: hellas_rpc::pb::work::UploadContentRequest,
         context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
         match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => wt(service.deliver_result(request, context)).await,
-            Handler::Payment(service) => wt(service.deliver_result(request, context)).await,
-            Handler::Unavailable => wt(UnmountedWork.deliver_result(request, context)).await,
+            Handler::Grants(service) => wt(service.upload_content(request, context)).await,
+            Handler::Payment(service) => wt(service.upload_content(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.upload_content(request, context)).await,
         }
     }
     async fn admit_certificate(
@@ -178,9 +204,9 @@ impl WorkHandler for ConnectionWork {
     }
     async fn stream_result(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+    ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
             Handler::Grants(service) => service.stream_result(request, context).await,
             Handler::Payment(service) => service.stream_result(request, context).await,

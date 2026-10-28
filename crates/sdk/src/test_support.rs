@@ -3,54 +3,51 @@
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_auth::ProducerSigningKey;
+use hellas_channel::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+};
+use hellas_channel::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
+use hellas_channel::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
+use hellas_channel::work_store::{ChannelStore, Role, SetupOrigin};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk,
     RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
+use hellas_rpc::protocol::invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
 use hellas_rpc::{Assurance, Retention};
-use hellas_work::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_work::model::profile::WorkPolicy;
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
-};
-use hellas_work::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_work::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
-use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 
 pub(crate) use crate::test_identity::enrollment;
-use iroh::EndpointId;
 
 pub(crate) async fn authority(
     root: &std::path::Path,
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
-) -> hellas_work::node::NodeCoordinator {
+) -> hellas_authority::node::NodeCoordinator {
     let now = hellas_auth::authority::UnixMillis(1);
     let store = crate::test_node::bootstrap_node(
         root,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         Some(enrollment),
         now,
     )
     .await
     .unwrap();
-    hellas_work::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now))
+    hellas_authority::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now))
 }
 
 pub(crate) const PRICE: u64 = 10;
 
 pub(crate) async fn application_profile(
-    node: &hellas_work::node::NodeCoordinator,
+    node: &hellas_authority::node::NodeCoordinator,
     administrator: &hellas_auth::authority::CredentialSecret,
     subject: hellas_auth::authority::PrincipalId,
     allowance: hellas_auth::authority::GrantId,
 ) -> std::sync::Arc<crate::node_control::profile::ClientProfile> {
     let credential =
         crate::test_node::execution_credential(node, administrator, subject, allowance).await;
-    let caller = hellas_work::test_support::session(node, administrator).await;
+    let caller = hellas_authority::test_support::session(node, administrator).await;
     std::sync::Arc::new(crate::node_control::profile::ClientProfile {
         authority: caller.authority(),
         authorization: crate::test_node::EXECUTION_AUTHORIZATION,
@@ -68,7 +65,8 @@ pub(crate) struct PaidFixture {
     pub ready: ReadyChannel,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
-    pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV2,
+    pub policy: hellas_channel::model::setup::ProviderChannelPolicy,
+    pub proposal: hellas_channel::model::bundle::WorkChannelSetupBundleV2,
 }
 
 pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
@@ -131,29 +129,18 @@ impl PaidFixture {
     }
 
     pub fn new() -> Self {
+        Self::on_network(NetworkId::new("sdk-paid-test").unwrap())
+    }
+
+    pub fn on_network(network: NetworkId) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let network = NetworkId::new("sdk-paid-test").unwrap();
         let payment_id = EdgeId::from_bytes([12; 32]);
         let values = EdgeValues::new(1000, 200, Fees::ZERO);
         let channel_policy = PaidChannelPolicyV1 {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         };
-        let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
-        let work_policy = WorkPolicy::Fetch {
-            contract: test_responses_contract(),
-            policy: FetchPolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 16384,
-                max_spool_bytes: 65536,
-                max_encoded_result_frame: 65536,
-                max_encoded_prepared_input: 65536,
-            },
-            route,
-        };
+        let work_policy = work_policy();
         let bond_terms = WorkStakeBondTerms {
             parties: Parties::new(
                 PartyKeys::sole(signer(2).party_key()),
@@ -178,7 +165,7 @@ impl PaidFixture {
             &funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let proposal = hellas_work::model::bundle::WorkChannelSetupBundleV2::propose_bond(
+        let proposal = hellas_channel::model::bundle::WorkChannelSetupBundleV2::propose_bond(
             network,
             funding,
             bond_terms.clone(),
@@ -205,7 +192,7 @@ impl PaidFixture {
             payment_terms: terms.clone(),
             policy_salt: [9; 32],
             channel_policy,
-            work_policy: work_policy.clone(),
+            invocation_policy: work_policy.clone(),
             expected_payment_values: values,
         })
         .unwrap();
@@ -252,19 +239,26 @@ impl PaidFixture {
                 pending: PendingSlot::Absent,
             })
             .unwrap();
+        let policy = hellas_channel::model::setup::ProviderChannelPolicy {
+            payment_policy: payment_policy(),
+            network,
+            policy_salt: [9; 32],
+            channel_policy,
+            invocation_policy: work_policy,
+            expected_payment_values: values,
+            min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        };
         let config = WorkConfig {
-        payment_policy: payment_policy(),
             chain: ChainCrossCheck { network, genesis: None, genesis_payload_digest: [0; 32].into(), threshold_identity: hex::decode("97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb").unwrap() },
-            validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"), routes: Default::default(),
-            policy_salt: [9; 32], channel_policy, work_policy,
+            validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"),
             poll: std::time::Duration::from_millis(10), max_observation_age: std::time::Duration::from_secs(60),
-            expected_payment_values: values, min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         Self {
             root,
             ready,
             descriptor,
             config,
+            policy,
             proposal,
         }
     }
@@ -275,10 +269,10 @@ impl PaidFixture {
         } else {
             "provider"
         };
-        ChannelStore::open_metadata_only(
+        ChannelStore::open(
             &self.root.path().join(name),
             self.ready.channel().clone(),
-            work_payment_settlement(self.config.expected_payment_values, OMISSION_BOND).unwrap(),
+            work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
             role,
             SetupOrigin {
                 payment_edge: self.ready.channel().payment_edge(),
@@ -286,6 +280,7 @@ impl PaidFixture {
                 payload: [1; 32],
                 parent: [0; 32],
             },
+            hellas_store::ContentStore::new(),
             &Secp256k1Verifier::new(),
         )
         .await
@@ -324,9 +319,16 @@ impl PaidFixture {
         )
         .unwrap();
         JobProposal {
-            prepared_input: PreparedPaidFetchInputV1::new(&events, &test_responses_contract())
-                .unwrap()
-                .into(),
+            prepared_input: hellas_rpc::protocol::invocation::fetch::prepare(
+                &events,
+                &test_responses_contract(),
+                ProducerSigningKey::from_secret_bytes([2; 32])
+                    .unwrap()
+                    .public_key(),
+                work_policy().canonical_bytes().unwrap(),
+                [1; 32],
+            )
+            .unwrap(),
             deadlines: JobDeadlines {
                 acceptance: 50,
                 terminal: 100,
@@ -357,8 +359,33 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     Edge::decode_exact(&bytes).unwrap()
 }
 
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
+/// The metadata-only Fetch policy this fixture's channel admits.
+pub(crate) fn work_policy() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: test_responses_contract(),
+                route: FetchRoutePolicy::sealed_route("openai", "responses").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input: 65536,
+                },
+            },
+        }],
+        limits: Limits {
+            max_upload_bytes: 65536,
+            max_output_bytes: 16384,
+            max_steps: 1,
+            execution_timeout_ms: 60_000,
+        },
+    }
+}
+
+fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
+    hellas_channel::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -366,13 +393,4 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
     }
 }
 
-pub(crate) fn provider_trust(peer: EndpointId) -> hellas_client::ProviderTrustAnchor {
-    hellas_client::ProviderTrustAnchor {
-        allowed_environments: vec![test_responses_contract().manifest_id()],
-        expected_genesis: enrollment(peer).0.content_id(),
-        required_assurance: Assurance::ProducerSigned,
-        apple_app_attest: None,
-    }
-}
-
-use hellas_work::test_support::test_responses_contract;
+use hellas_channel::test_support::test_responses_contract;

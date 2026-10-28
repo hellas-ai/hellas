@@ -8,13 +8,14 @@ pub use hellas_attestation::{AttestationError, Attester, Binding, RootProver};
 pub use hellas_chain::node::{Config as ChainNodeConfig, FullNode};
 pub use hellas_rpc as rpc;
 pub use hellas_wire as wire;
-pub use hellas_work as work;
 
 #[cfg(test)]
-use hellas_work::test_support::common_node as test_node;
+use hellas_authority::test_support::common_node as test_node;
 
 mod counter_store;
 pub use counter_store::FilesystemAssertionCounterStore;
+pub mod client_chain;
+pub mod client_owner;
 pub mod coin_owner;
 pub mod trust_policy;
 
@@ -43,10 +44,10 @@ pub mod paid_provider;
 pub mod work_config;
 pub mod work_router;
 
+pub mod job;
 pub mod paid_client;
+pub mod transact;
 mod work_link;
-
-pub mod work_provision;
 
 #[cfg(test)]
 mod test_support;
@@ -61,7 +62,6 @@ pub mod grant_config;
 pub mod node_control;
 
 mod gateway_work;
-pub use gateway_work::prepare_evaluate;
 pub mod grant_gateway;
 
 mod resource_config;

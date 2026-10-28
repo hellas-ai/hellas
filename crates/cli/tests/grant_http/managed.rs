@@ -1,7 +1,7 @@
 use super::*;
 use hellas_auth::authority as auth;
+use hellas_authority::model::grant::records::decode_enrollment;
 use hellas_sdk::node_control::{bootstrap::Invitation, configuration::*};
-use hellas_work::model::grant::records::decode_enrollment;
 
 struct ManagedWorker {
     root: tempfile::TempDir,
@@ -39,11 +39,7 @@ impl ManagedWorker {
                 "resource":auth::ResourceId(hellas_auth::Digest::hash(b"test resource")),
                 "account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,
                 "pricing":{"revision":1,"rates":null},"name":"glm",
-                "fetch":{"contract":hellas_rpc::FetchContract::http().unwrap(),
-                    "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),
-                    "service":"http","method":"request","max_request_body_bytes":65536,
-                    "max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,
-                    "max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
+                "invocation_policy":http_invocation_policy(),
                 "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],
                     "credential":null,"tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},
                     "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}
@@ -85,10 +81,13 @@ impl ManagedWorker {
         std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
         let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
         let now = auth::UnixMillis::now().unwrap();
-        let extra: Vec<_> = hellas_work::operations::OPERATIONS
+        let extra: Vec<_> = hellas_authority::operations::OPERATIONS
             .iter()
             .filter(|operation| {
-                !matches!(operation.scope, hellas_work::operations::Scope::Allowance)
+                !matches!(
+                    operation.scope,
+                    hellas_authority::operations::Scope::Allowance
+                )
             })
             .map(|operation| {
                 (
@@ -103,7 +102,7 @@ impl ManagedWorker {
             &extra,
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
-            &[hellas_work::grant_service::WORK_EXECUTE],
+            &[hellas_authority::grant_service::WORK_EXECUTE],
         );
         let administrator_file = root.join("administrator.json");
         let scope_file = root.join("scope.json");
@@ -185,8 +184,8 @@ impl ManagedWorker {
             .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
         let subject = owner.principal();
-        let allowance = hellas_work::model::grant::owner_grant_id(
-            hellas_work::model::grant::grant_network(),
+        let allowance = hellas_authority::model::grant::owner_grant_id(
+            hellas_authority::model::grant::grant_network(),
             provider.content_id(),
             subject,
         );
@@ -249,12 +248,7 @@ impl ManagedWorker {
             .run(&["offer", "import", string(&offer), "--name", "worker"])
             .await;
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
-        let trust_root = approve(
-            root,
-            "worker",
-            provider.content_id(),
-            vec![hellas_rpc::FetchContract::http().unwrap().manifest_id()],
-        );
+        let trust_root = approve(root, "worker", provider.content_id());
         Self {
             root: directory,
             owner,
@@ -315,8 +309,14 @@ impl ManagedWorker {
             json!({"messages":[]}),
         )
         .await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert!(response.text().await.unwrap().contains("hello"));
+        let body = assert_http_response(
+            response,
+            reqwest::StatusCode::OK,
+            &[&gateway.log, &self.node.log],
+            &self._upstream,
+        )
+        .await;
+        assert!(body.contains("hello"));
         gateway.stop().await;
     }
 }

@@ -8,8 +8,7 @@ import "hellas/v1/hellas.proto";
 // accounting; prepared inputs and signed results share the execution protocol.
 //
 // Nothing here is hashed. Every digest and every signature in the paid
-// protocol is taken over the canonical private records in
-// `hellas_rpc::protocol::work`, and the `bytes` fields below carry those
+// protocol is taken over canonical private records, and the `bytes` fields below carry those
 // exact encodings. A protobuf re-spelling of an authorization would be a
 // second definition of what both parties signed.
 service Work {
@@ -20,26 +19,17 @@ service Work {
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
 
+  // Exporter-bound signed chunks for the proposal's missing content objects.
+  rpc UploadContent(UploadContentRequest) returns (UploadContentResponse);
+
   // Private grant status and current Offer, bound to this connection. A stale
   // generation may discover the current one; it cannot authorize new work.
   rpc GetStanding(GetStandingRequest) returns (GetStandingResponse);
 
-  // One whole delivery. The client asks for an accepted job's answer,
-  // proving on this connection that it is the client; the provider
-  // answers with the complete signed result and the transcript it was
-  // derived from, or with one refusal code.
-  //
-  // This unary form waits for the durable terminal result. The job's
-  // price is reserved as delivery credit before release; replay returns
-  // the same bytes without a second debit. StreamResult offers signed
-  // prefixes under the same authorization and delivery credit. Use StreamResult
-  // for Fetch responses that do not fit in one wire frame.
-  rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
-
   // Authenticated live output. Delivery credit is durably reserved before
   // the first signed prefix leaves. Payment still requires the complete
   // durable terminal result; a disconnect does not cancel accepted work.
-  rpc StreamResult(DeliverResultRequest) returns (stream WorkStreamEvent);
+  rpc StreamResult(StreamResultRequest) returns (stream WorkStreamEvent);
 
   // One payment. The client sends the certificate it has already signed
   // and the private binding saying which job's result it pays for; the
@@ -68,6 +58,7 @@ service Work {
 // yet, and every setup method answer for one that already does.
 service WorkSetup {
   rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
+  rpc RequestOffer(RequestOfferRequest) returns (RequestOfferResponse);
 
   // One step of the handshake: the caller offers the revision it holds,
   // and is answered with the revision that extends it.
@@ -85,6 +76,52 @@ service WorkSetup {
   // A replay of the same call returns the same bytes and writes
   // nothing: the journal recognises a revision it already holds.
   rpc ExchangeSetup(ExchangeSetupRequest) returns (ExchangeSetupResponse);
+}
+
+message RequestOfferRequest {
+  bytes client_principal = 1;
+  bytes client_key = 2;
+  repeated bytes funding_coins = 3;
+  bytes signature = 4;
+}
+
+message RequestOfferResponse {
+  oneof outcome {
+    Quote quote = 1;
+    OfferGranted granted = 2;
+    OfferRefused refused = 3;
+  }
+}
+
+message Quote {
+  bytes provider_channel_policy = 1;
+  PaymentEdgeValues required = 2;
+  uint64 omission_bond = 3;
+  uint64 funding_value = 4;
+}
+
+message PaymentEdgeValues {
+  uint64 value = 1;
+  uint64 reserve = 2;
+  uint64 base_fee = 3;
+  uint64 slot_fee = 4;
+  uint64 proof_fee = 5;
+  uint64 lifetime_fee = 6;
+}
+
+message OfferGranted { bytes offer = 1; }
+
+message OfferRefused {
+  OfferRefusalCode code = 1;
+  uint64 required = 2;
+}
+
+enum OfferRefusalCode {
+  OFFER_REFUSAL_CODE_UNSPECIFIED = 0;
+  OFFER_REFUSAL_CODE_NO_POLICY = 1;
+  OFFER_REFUSAL_CODE_NEEDS_FUNDING = 2;
+  OFFER_REFUSAL_CODE_NO_STAKE_AVAILABLE = 3;
+  OFFER_REFUSAL_CODE_OFFER_LIMIT = 4;
 }
 
 message ExchangeSetupRequest {
@@ -151,11 +188,30 @@ message AcceptWorkRequest {
   // 64 bytes. The channel key is native by construction, so there is no
   // key-kind discriminator to disagree with the payment terms.
   bytes client_signature = 2;
-  // Canonical `PreparedPaidInputV1`: the inputs the authorization's
-  // `prepared_input_digest` commits to, carried so the provider can
-  // still execute the job it accepted after the quote that produced
-  // them is gone.
+  // Fixed 40-byte ContentRef (content id followed by big-endian length).
+  // The complete prepared input must have been uploaded or already be held.
   bytes prepared_input = 3;
+}
+
+message UploadContentRequest {
+  WorkRoute route = 1;
+  bytes authorization = 2;
+  bytes client_signature = 3;
+  bytes content_id = 4;
+  uint64 total_bytes = 5;
+  uint64 offset = 6;
+  bytes chunk = 7;
+  bytes chunk_signature = 8;
+  // Canonical manifest opening authorization.environment_commitment. Required
+  // before upload bytes can reach durable staging.
+  bytes program_manifest = 9;
+  // Hash opening of manifest.root, validated by the application before staging.
+  bytes program_root = 10;
+}
+message UploadContentResponse {
+  // A zero-byte probe returns the staged offset; total_bytes means have.
+  uint64 next_offset = 1;
+  WorkRefused refused = 2;
 }
 
 message AcceptWorkResponse {
@@ -174,7 +230,7 @@ message WorkAccepted {
   bytes work_id = 2;
 }
 
-message DeliverResultRequest {
+message StreamResultRequest {
   WorkRoute route = 3;
   // The accepted job's `work_id`: the authorization's own digest,
   // exactly 32 bytes. Several jobs may be in flight per channel, so
@@ -197,25 +253,7 @@ message DeliverResultRequest {
   bytes client_signature = 2;
 }
 
-message DeliverResultResponse {
-  oneof outcome {
-    WorkDelivered delivered = 1;
-    WorkRefused refused = 2;
-  }
-}
 
-message WorkDelivered {
-  // Canonical `PaidJobResultV1`, envelope included.
-  bytes result = 1;
-  // The provider's compact secp256k1 signature over the result digest:
-  // exactly 64 bytes.
-  bytes provider_signature = 2;
-  // The signed output events the result summarises, in the encoding
-  // `hellas_rpc::protocol::work::decode_transcript` reads. Nothing
-  // hashes these bytes: the client rebuilds the result from the decoded
-  // events and requires it to be the one above.
-  bytes transcript = 3;
-}
 
 message AdmitCertificateRequest {
   WorkRoute route = 5;
@@ -339,9 +377,8 @@ enum WorkRefusalCode {
 message WorkStreamEvent {
   oneof outcome {
     bytes prefix = 1; // canonical transcript containing signed output events
-    WorkDelivered delivered = 2;
     WorkRefused refused = 3;
-    // Fetch completion after all nonterminal envelopes in prefix frames.
+    // Completion after all nonterminal envelopes in prefix frames.
     // The receiver verifies the assembled transcript against this result.
     WorkStreamTerminal terminal = 4;
   }

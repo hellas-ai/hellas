@@ -28,14 +28,13 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # only include the protocols they use.
 # `execute` gates the shared identity and signed-transcript vocabulary.
 execute = []
-evaluate = ["execute"]
 fetch = ["execute", "dep:serde_json"]
 chain = ["dep:base64ct", "dep:hellas-kernel"]
 swarm = []
 # Host administration. Explicitly mounted behind admin authorization, not
 # included in the ordinary peer-service discovery catalogue.
 host-control = []
-all-protocols = ["swarm", "execute", "evaluate", "fetch", "chain"]
+all-protocols = ["swarm", "execute", "fetch", "chain"]
 # Generated Work and WorkSetup messages use the shared execution vocabulary.
 work = ["execute"]
 

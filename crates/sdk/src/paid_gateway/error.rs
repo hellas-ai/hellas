@@ -3,12 +3,16 @@ use std::{path::PathBuf, time::Duration};
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error(transparent)]
+    Job(#[from] crate::job::JobError),
+    #[error(transparent)]
+    Transaction(Box<crate::transact::TransactError>),
+    #[error(transparent)]
     Gateway(#[from] hellas_gateway::WorkGatewayError),
     #[error("invalid paid pool: {0}")]
     Invalid(&'static str),
     #[error("paid gateway repeats provider {0}")]
     DuplicateProvider(iroh::EndpointId),
-    #[error("no provider policy matches this environment, token limit, and stop token list")]
+    #[error("no provider policy admits this application")]
     NoMatchingPolicy,
     #[error("no eligible paid provider could start this request: {0:?}")]
     ProvidersUnavailable(Vec<String>),
@@ -35,11 +39,6 @@ pub enum PoolError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("invalid {field}: {source}")]
-    Hex {
-        field: &'static str,
-        source: hex::FromHexError,
-    },
     #[error(transparent)]
     Stopped(#[from] super::RequestStopped),
     #[error(transparent)]
@@ -53,15 +52,13 @@ pub enum PoolError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_work::model::work::PaidWorkError),
+    Work(#[from] hellas_channel::model::work::PaidWorkError),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::WorkStoreError),
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error(transparent)]
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]
     FetchPayload(#[from] hellas_rpc::fetch::FetchPayloadError),
-    #[error(transparent)]
-    Evaluate(#[from] hellas_rpc::evaluate::EvaluateProtocolError),
     #[error(transparent)]
     Remote(#[from] hellas_client::ClientError),
 }

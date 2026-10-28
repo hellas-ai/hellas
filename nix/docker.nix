@@ -15,14 +15,14 @@ let
       }
       ''
         mkdir -p "$out/bin"
-        cp "${cli}/bin/hellas-cli" "$out/bin/hellas-cli"
-        chmod u+w "$out/bin/hellas-cli"
-        remove-references-to -t ${rustToolchain} "$out/bin/hellas-cli"
-        chmod 0555 "$out/bin/hellas-cli"
+        cp "${cli}/bin/hellas" "$out/bin/hellas"
+        chmod u+w "$out/bin/hellas"
+        remove-references-to -t ${rustToolchain} "$out/bin/hellas"
+        chmod 0555 "$out/bin/hellas"
       '';
 
   originalEntrypoint = [
-    (if cuda then "${entrypoint}" else "${runtime}/bin/hellas-cli")
+    (if cuda then "${entrypoint}" else "${runtime}/bin/hellas")
     "serve"
     "--port"
     "31145"
@@ -46,7 +46,7 @@ let
       fi
     ''
     + ''
-      exec ${runtime}/bin/hellas-cli "$@"
+      exec ${runtime}/bin/hellas "$@"
     ''
   );
   image = pkgs.dockerTools.streamLayeredImage {
@@ -95,7 +95,10 @@ let
             ++ pkgs.lib.optional cuda compiler
           )
         }"
-        "LD_LIBRARY_PATH=${toolkit}/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
+        # The ROCm toolkit's lib/ carries its own glibc, which would replace the
+        # binary's loader-matched libc and abort at startup; HIP is found via
+        # ROCM_PATH/HIP_PATH instead.
+        "LD_LIBRARY_PATH=${pkgs.lib.optionalString cuda "${toolkit}/lib:"}/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
       ]
       ++ (
         if cuda then

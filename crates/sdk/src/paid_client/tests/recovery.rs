@@ -1,27 +1,21 @@
 use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture, signer};
-use hellas_rpc::fetch::{
-    FetchOutputTranscriptBuilder, encode_fetch_event_payload, encode_fetch_terminal_payload,
-    verify_input_events,
-};
+use hellas_channel::model::work::PrivateRecord as _;
+use hellas_channel::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
+use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
-use hellas_rpc::pb::work::WorkDelivered;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
-use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::work::{
-    BackendFault, ObservationTime, PreparedFetchInput, WorkBackend, run_accepted_work,
-};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 const RESPONSE: &str = "sdk-private-response";
 
-pub(super) struct Backend(AtomicUsize, Arc<tokio::sync::Semaphore>);
+pub(super) struct Backend(pub(super) Arc<AtomicUsize>, Arc<tokio::sync::Semaphore>);
 impl Default for Backend {
     fn default() -> Self {
         Self(
-            AtomicUsize::new(0),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(tokio::sync::Semaphore::new(2)),
         )
     }
@@ -30,51 +24,43 @@ impl Default for Backend {
 impl WorkBackend for Backend {
     fn try_admit(
         &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
-        Ok(hellas_work::work::admission::WorkPermit::new(
+        domain: hellas_channel::work::admission::CapacityDomain,
+    ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+        Ok(hellas_channel::work::admission::WorkPermit::new(
             domain,
             self.1.clone().try_acquire_owned().map_err(|_| {
-                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                BackendFault::from(hellas_channel::work::admission::AdmissionError::Capacity)
             })?,
         ))
     }
-    async fn fetch(
+    async fn execute(
         &self,
-        input: PreparedFetchInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        input: hellas_channel::work::Admitted,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission
-            .reserve(hellas_work::work::admission::CapacityDomain::Fetch, async {
-                self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
-            })
+        let domain = input.capacity_domain();
+        let (prepared, _, _, admission) = input
+            .reserve(async { self.try_admit(domain) })
             .await?
-            .dispatch()
-            .await?;
-        let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
+            .into_parts_and_admission();
+        let _running = admission.dispatch().await?;
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-        let mut output =
-            FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
-        output
-            .push_event(
-                encode_fetch_event_payload(&OutputEvent::TextDelta {
-                    index: 0,
-                    delta: RESPONSE.into(),
-                    channel: TextChannel::Output,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        Ok(output
-            .finish(
-                encode_fetch_terminal_payload(&OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
-                })
-                .unwrap(),
-            )
-            .unwrap())
+        Ok(hellas_rpc::protocol::invocation::fetch::output(
+            &[encode_fetch_event_payload(&OutputEvent::TextDelta {
+                index: 0,
+                delta: RESPONSE.into(),
+                channel: TextChannel::Output,
+            })
+            .unwrap()],
+            &encode_fetch_terminal_payload(&OutputEvent::Finished {
+                stop_reason: StopReason::EndOfText,
+                usage: None,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .sign(&prepared.request, &key, 65536)
+        .unwrap())
     }
 }
 
@@ -96,6 +82,54 @@ fn assert_no_payloads(root: &std::path::Path) {
     }
 }
 
+async fn accept_uploaded_fetch(
+    fixture: &PaidFixture,
+    provider: &hellas_channel::work::WorkService,
+    client: &hellas_channel::work::ClientEndpoint,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let authorization =
+        hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
+            .unwrap();
+    let work = hellas_channel::model::work::work_id(fixture.ready.channel(), &authorization);
+    let bytes = client
+        .state()
+        .job_by_id(work)
+        .unwrap()
+        .prepared_input()
+        .to_vec();
+    let (wire, uploads) = hellas_channel::test_support::channel::input_uploads(
+        fixture.ready.channel(),
+        request,
+        &bytes,
+    );
+    let context = hellas_wire::TransportContext {
+        open_exporter: Some([7; 32]),
+        ..Default::default()
+    };
+    let a = hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
+        .unwrap();
+    let id = hellas_channel::model::work::work_id(fixture.ready.channel(), &a);
+    for mut upload in uploads {
+        upload.chunk_signature = signer(1)
+            .sign(hellas_channel::model::work::signing_hash(
+                hellas_rpc::protocol::content_upload::chunk_digest(
+                    a.channel_id,
+                    id,
+                    a.input_content,
+                    upload.offset,
+                    &upload.chunk,
+                    &[7; 32],
+                ),
+            ))
+            .as_bytes()
+            .to_vec();
+        let response = provider.upload(&upload, &context).await.unwrap();
+        assert!(response.refused.is_none(), "{response:?}");
+    }
+    provider.accept(&wire).await
+}
+
 #[tokio::test]
 async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -103,34 +137,39 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         let provider = fixture.provider().await;
         let mut client = fixture.client().await;
         let request = client.propose(&fixture.proposal()).await.unwrap();
-        let lost = client
-            .accepted(&provider.accept(&request).await)
-            .await
-            .unwrap();
+        let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
+        let lost = client.accepted(&response).await.unwrap();
         let request = client.propose(&fixture.proposal()).await.unwrap();
-        let delivered = client
-            .accepted(&provider.accept(&request).await)
-            .await
-            .unwrap();
+        let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
+        let delivered = client.accepted(&response).await.unwrap();
         assert_ne!(lost, delivered);
         let backend = Backend::default();
         run_accepted_work(&provider, &fixture.ready, &backend, delivered)
             .await
             .unwrap();
-        let request = client.request_delivery(delivered, &[8; 32]).unwrap();
-        let result = provider.deliver(&request, &[8; 32]).await.unwrap();
-        client
-            .receive(
-                delivered,
-                &fixture.ready,
-                &WorkDelivered {
-                    result: result.result.encode(),
-                    provider_signature: result.signature.as_bytes().to_vec(),
-                    transcript: result.transcript,
+        let (transport, server) =
+            hellas_channel::test_support::transport::transport_pair_without_write_authority(
+                hellas_wire::TransportContext {
+                    open_exporter: Some([8; 32]),
+                    ..Default::default()
                 },
-            )
-            .await
-            .unwrap();
+                hellas_wire::TransportContext {
+                    open_exporter: Some([8; 32]),
+                    ..Default::default()
+                },
+            );
+        let serving = hellas_channel::test_support::channel::serve_work(server, provider.clone());
+        hellas_channel::work::fetch_result_stream(
+            transport,
+            &mut client,
+            &fixture.ready,
+            delivered,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        serving.abort();
+        client.verified(delivered).await.unwrap();
         // Crash after verified delivery, before creating any payment certificate.
         assert!(client.state().last_payment().is_none());
         drop(client);
@@ -145,7 +184,6 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![fixture.config.work_policy.allowed_environment()],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -209,25 +247,21 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 .await
                 .unwrap();
             let mut session = PaidWorkSession {
-                chain: SessionChain::Constructed,
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),
                     provider: server.id(),
                     provider_addrs: server.bound_sockets(),
-                    provider_trust: trust.clone(),
-                    bond: fixture.descriptor.bond_edge(),
-                    payment_funding: Funding::new(
-                        hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                        hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                    ),
-                    omission_bond: 601,
+                    apple_trust: None,
+                    assurance: Assurance::ProducerSigned,
+                    expected_price: PRICE,
                     acceptance_blocks: 50,
                     terminal_blocks: 100,
                     payment_blocks: 200,
-                    timeout: Duration::from_secs(5),
+                    timeout: Some(Duration::from_secs(5)),
                 },
                 descriptor: fixture.descriptor.clone(),
+                policy: fixture.policy.clone(),
                 dialer: ProviderDialer::new(
                     server.id(),
                     server.bound_sockets(),
@@ -238,7 +272,18 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 observer: None,
                 needs_recovery: true,
             };
-            assert!(session.run(None, true, None).await.unwrap().is_none());
+            assert!(
+                session
+                    .run(
+                        None,
+                        &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                        true,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(!session.needs_recovery);
             assert_eq!(
                 provider

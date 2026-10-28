@@ -12,13 +12,12 @@ fn policy() -> TrustPolicy {
     TrustPolicy {
         provider_genesis: ContentId::from_bytes([1; 32]),
         assurance: Assurance::ProducerSigned,
-        environments: vec![ContentId::from_bytes([2; 32])],
         apple: None,
     }
 }
 
 #[test]
-fn resolution_never_creates_or_learns_approval_and_checks_exact_execution_terms() {
+fn resolution_never_creates_or_learns_approval_and_checks_exact_assurance() {
     let temporary = tempfile::tempdir().unwrap();
     let directory = temporary.path().join("trust");
     let store = TrustPolicyStore::new(&directory);
@@ -40,25 +39,10 @@ fn resolution_never_creates_or_learns_approval_and_checks_exact_execution_terms(
     assert_eq!(first.revision, 1);
     assert_eq!(first.previous, None);
     let trust = store
-        .resolve_environment(
-            "provider",
-            policy.assurance,
-            policy.environments[0],
-            counters(&store),
-        )
+        .resolve("provider", policy.assurance, counters(&store))
         .unwrap();
     assert_eq!(trust.expected_genesis, policy.provider_genesis);
     assert!(trust.apple_app_attest.is_none());
-    assert!(
-        store
-            .resolve_environment(
-                "provider",
-                policy.assurance,
-                ContentId::from_bytes([3; 32]),
-                counters(&store)
-            )
-            .is_err()
-    );
     assert!(
         store
             .resolve("provider", Assurance::AppleAppAttest, counters(&store),)
@@ -139,12 +123,6 @@ fn approval_validation_bounds_pins_ids_and_audit_before_writing() {
         assert!(store.approve(id, 0, policy(), "reviewed".into()).is_err());
     }
     let mut invalid_policies = vec![];
-    let mut p = policy();
-    p.environments.clear();
-    invalid_policies.push(p);
-    let mut p = policy();
-    p.environments.push(p.environments[0]);
-    invalid_policies.push(p);
     let mut p = policy();
     p.assurance = Assurance::AppleAppAttest;
     invalid_policies.push(p);

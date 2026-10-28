@@ -44,8 +44,6 @@ pub mod cache;
 pub mod call;
 #[cfg(feature = "chain")]
 pub mod edge_index;
-#[cfg(feature = "evaluate")]
-pub mod evaluate;
 #[cfg(feature = "execute")]
 pub mod execution_event;
 #[cfg(feature = "fetch")]
@@ -77,20 +75,17 @@ pub use tokens::{
 
 pub use protocol::{
     APPLE_APP_ATTEST, AppleAppAttestEnrollment, Application, ApplicationError, Assurance,
-    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CanonicalizationId, CausalLmEnvironment,
-    CausalLmEnvironmentError, CausalLmGenerationSchedule, ContentId, ContentRef,
-    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Evaluate,
-    EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema,
-    InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
-    InputTranscriptBuilder, JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
-    MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
-    OPEN_PROVIDER_ROLE, Operation, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope,
-    OutputTranscriptBuilder, PlatformCredential, PlatformEnrollment, ProgramManifest,
-    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
-    RequestCommitment, Retention, RootKind, RootProof, SchemeId, SignedInputEvent,
-    SignedOutputEvent, SignedProviderGenesis, StaticSlice, StreamId, StreamVerifyError,
-    canonical_dag_cbor, decode_dag_cbor, input_genesis, open_proof_binding, output_genesis,
-    scheme_id, verify_input_event_envelopes, verify_output_event_continuation,
+    CanonicalizationId, ContentId, ContentRef, DagCborDecodeError, DagCborDecoder,
+    DagCborEncodeError, DagCborEncoder, EventCommitment, FETCH_EVALUATOR, FetchContract,
+    FetchEgress, FetchSchema, InputCommitment, InputEventBody, InputEventBodyParts,
+    InputEventEnvelope, InputTranscriptBuilder, JsonBytes, MAX_APPLICATION_ID_BYTES,
+    OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, Operation,
+    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
+    PlatformCredential, PlatformEnrollment, ProgramManifest, ProviderEnrollmentBundle,
+    ProviderGenesisDecodeError, ProviderGenesisStatement, RequestCommitment, Retention, RootKind,
+    RootProof, SchemeId, SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StreamId,
+    StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, input_genesis, open_proof_binding,
+    output_genesis, scheme_id, verify_input_event_envelopes, verify_output_event_continuation,
     verify_output_event_envelopes,
 };
 pub use protocol::{commitment, digest, retention, tags, value};

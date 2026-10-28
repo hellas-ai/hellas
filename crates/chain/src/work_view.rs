@@ -26,21 +26,15 @@
 //! its payload argument as a finalized *floor* and reads the
 //! then-current database root, which is a different question.
 //!
-//! # What it does not do
-//!
-//! It does not authenticate the objects. In this milestone's trusted
-//! mode the endpoint and the chain process share a trust boundary, and
-//! the values here are unproved database replies. `finalization` proves
-//! that a quorum finalized *the block*; it says nothing about whether an
-//! object field in the reply belongs to that block's state. Nothing here
-//! may be described as an authenticated object read until the RPC
-//! carries membership and nonmembership proofs against the verified
-//! state root.
+//! Local readers hold one database snapshot. Remote readers verify a complete
+//! retained operation witness against the certified state root before deriving
+//! current values or absence. A block certificate alone cannot authenticate
+//! arbitrary object fields returned beside it.
 //!
 //! # What it does not decide
 //!
 //! Whether the channel is usable. This module reports what is there;
-//! `hellas_work::model::setup` decides what that means. The shape
+//! `hellas_channel::model::setup` decides what that means. The shape
 //! of the two registry answers is not decided here either: the kernel's
 //! own [`parse_bond_lease`] and [`parse_pending_close`] are called, so
 //! an endpoint and a close cannot disagree about what a slot holds.
@@ -73,10 +67,31 @@ pub struct WorkChannelQuery {
     /// The tag-4 work-stake bond insuring the channel.
     pub bond_edge: EdgeId,
     /// The tag-2 payment edge work is paid from.
-    pub payment_edge: EdgeId,
+    pub payment_edge: Option<EdgeId>,
     /// Coins whose liveness is to be read at the same block as the
     /// objects above.
     pub funding: BTreeSet<CoinId>,
+}
+
+impl WorkChannelQuery {
+    #[cfg(feature = "client-core")]
+    pub(crate) fn object_keys(
+        &self,
+        network: hellas_kernel::NetworkId,
+    ) -> Vec<crate::domain::ObjectId> {
+        use crate::domain::{coin_object_id, edge_object_id, registry_chunk_object_id};
+        use hellas_kernel::{bond_lease_slots, pending_payment_close_slot};
+        let mut keys = vec![edge_object_id(self.bond_edge)];
+        keys.extend(bond_lease_slots(network, self.bond_edge).map(registry_chunk_object_id));
+        if let Some(payment) = self.payment_edge {
+            keys.push(edge_object_id(payment));
+            keys.push(registry_chunk_object_id(pending_payment_close_slot(
+                network, payment,
+            )));
+        }
+        keys.extend(self.funding.iter().copied().map(coin_object_id));
+        keys
+    }
 }
 
 /// Everything one paid work channel is decided from, at one finalized
@@ -99,6 +114,70 @@ pub struct WorkChannelSnapshot {
 }
 
 impl WorkChannelSnapshot {
+    #[cfg(feature = "client-core")]
+    pub(crate) fn from_objects(
+        network: hellas_kernel::NetworkId,
+        query: WorkChannelQuery,
+        snapshot: crate::light_client::ObjectSnapshot,
+    ) -> Result<Self, QueryError> {
+        if snapshot.network != network {
+            return Err(QueryError::Remote("object witness network differs".into()));
+        }
+        use crate::domain::{
+            Object, ObjectKind, coin_object_id, edge_object_id, registry_chunk_object_id,
+        };
+        use hellas_kernel::{bond_lease_slots, pending_payment_close_slot};
+        let edge = |id| match snapshot.objects.get(&edge_object_id(id)).copied() {
+            Some(Object::Edge(edge)) => Ok(Some(edge)),
+            None => Ok(None),
+            Some(object) => Err(QueryError::WrongObjectKind {
+                expected: ObjectKind::Edge,
+                actual: object.kind(),
+            }),
+        };
+        let bond = edge(query.bond_edge)?;
+        let payment = query.payment_edge.map(edge).transpose()?.flatten();
+        let [first, second] = bond_lease_slots(network, query.bond_edge);
+        let registry = |id| match snapshot.objects.get(&registry_chunk_object_id(id)).copied() {
+            Some(Object::RegistryChunk(chunk)) => Ok(Some(chunk)),
+            None => Ok(None),
+            Some(object) => Err(QueryError::WrongObjectKind {
+                expected: ObjectKind::RegistryChunk,
+                actual: object.kind(),
+            }),
+        };
+        let leases = [registry(first)?, registry(second)?];
+        let pending = query
+            .payment_edge
+            .map(|id| registry(pending_payment_close_slot(network, id)))
+            .transpose()?
+            .flatten();
+        let mut live = BTreeSet::new();
+        for id in &query.funding {
+            match snapshot.objects.get(&coin_object_id(*id)) {
+                Some(Object::Coin(_)) => {
+                    live.insert(*id);
+                }
+                None => {}
+                Some(object) => {
+                    return Err(QueryError::WrongObjectKind {
+                        expected: ObjectKind::Coin,
+                        actual: object.kind(),
+                    });
+                }
+            }
+        }
+        Ok(Self::new(
+            query,
+            snapshot.block,
+            bond,
+            payment,
+            leases,
+            pending,
+            live,
+        ))
+    }
+
     /// Assembles one snapshot from objects a caller has already read at
     /// one block.
     ///
@@ -180,7 +259,9 @@ impl WorkChannelSnapshot {
     /// contest, or something that is neither.
     #[must_use]
     pub fn pending(&self) -> PendingSlot {
-        parse_pending_close(self.pending_slot, self.query.payment_edge)
+        self.query.payment_edge.map_or(PendingSlot::Absent, |edge| {
+            parse_pending_close(self.pending_slot, edge)
+        })
     }
 
     /// Returns which of the coins the query named are still live at this
@@ -232,8 +313,8 @@ impl WorkChannelSnapshot {
     /// is the cursor, and `ReadyChannel::check_caught_up` is where the
     /// two are compared.
     #[must_use]
-    pub fn observed_channel(&self) -> hellas_work::model::setup::ObservedChannel<'_> {
-        hellas_work::model::setup::ObservedChannel {
+    pub fn observed_channel(&self) -> hellas_channel::model::setup::ObservedChannel<'_> {
+        hellas_channel::model::setup::ObservedChannel {
             height: self.block.height,
             bond: self.bond(),
             payment: self.payment(),
@@ -255,8 +336,8 @@ impl WorkChannelSnapshot {
     pub fn finalized_setup(
         &self,
         funding: &BTreeSet<CoinId>,
-    ) -> Option<hellas_work::work_open::FinalizedSetup> {
-        Some(hellas_work::work_open::FinalizedSetup {
+    ) -> Option<hellas_channel::work_open::FinalizedSetup> {
+        Some(hellas_channel::work_open::FinalizedSetup {
             height: self.block.height,
             bond: self.bond,
             payment: self.payment,
@@ -288,6 +369,21 @@ pub trait FinalizedWorkView: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send;
 }
 
+#[cfg(feature = "client-core")]
+impl FinalizedWorkView for crate::client::RemoteLightClient {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        use crate::LightClient as _;
+        let network = self.pinned_network()?;
+        self.get_objects(query.object_keys(network))
+            .await?
+            .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,7 +404,7 @@ mod tests {
     fn query() -> WorkChannelQuery {
         WorkChannelQuery {
             bond_edge: bond(),
-            payment_edge: payment(),
+            payment_edge: Some(payment()),
             funding: BTreeSet::new(),
         }
     }
@@ -395,7 +491,7 @@ mod tests {
         // different bond. Only the query moves.
         let other = WorkChannelQuery {
             bond_edge: EdgeId::from_bytes([0x99; EdgeId::LENGTH]),
-            payment_edge: payment(),
+            payment_edge: Some(payment()),
             funding: BTreeSet::new(),
         };
         let elsewhere =

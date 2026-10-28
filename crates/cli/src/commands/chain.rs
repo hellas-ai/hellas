@@ -1,4 +1,4 @@
-use hellas_work::authenticator::{Authenticator, kernel_auth};
+use hellas_authority::authenticator::{Authenticator, kernel_auth};
 use std::time::Duration;
 use std::{
     fs,
@@ -43,6 +43,9 @@ pub enum ChainCommand {
         /// Secp256k1 node settlement key (base58)
         #[arg(long)]
         node: SettlementKey,
+        /// Create up to three delegated coins of this value, leaving undelegated change.
+        #[arg(long)]
+        split: Option<u64>,
     },
     /// Reclaim selected coins without a delegate using the global owner passkey
     Sweep(OwnerCoinArgs),
@@ -358,16 +361,16 @@ pub enum ValidatorCommand {
     },
 }
 
-pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResult {
+pub async fn run(command: ChainCommand, owner: Option<&hellas_kernel::SoftPasskey>) -> CliResult {
     match command {
-        ChainCommand::Delegate { coins, node } => {
+        ChainCommand::Delegate { coins, node, split } => {
             anyhow::ensure!(
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
                 "delegate must be a valid secp256k1 node key"
             );
-            run_owner_coins(coins, Some(node.into_kernel()), passkey_path).await
+            run_owner_coins(coins, Some(node.into_kernel()), split, owner).await
         }
-        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, passkey_path).await,
+        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, None, owner).await,
         ChainCommand::Query {
             rpc,
             trust,
@@ -386,9 +389,11 @@ pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResul
 async fn run_owner_coins(
     args: OwnerCoinArgs,
     delegate: Option<hellas_kernel::Key>,
-    passkey_path: Option<&Path>,
+    split: Option<u64>,
+    owner: Option<&hellas_kernel::SoftPasskey>,
 ) -> CliResult {
-    let owner = passkey(passkey_path.context("chain delegate/sweep requires --passkey")?)?;
+    let owner =
+        owner.context("chain delegate/sweep requires --passkey, --faucet or --faucet-account")?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
     let network = selected_network(&args.network, args.genesis.clone())?;
     let client =
@@ -399,6 +404,7 @@ async fn run_owner_coins(
         hellas_kernel::Key::from_bytes(owner.public_key()?.to_compressed()),
         selected.as_slice(),
         delegate,
+        split,
     )
     .await?;
     let output_ids = plan.output_ids();
@@ -696,38 +702,7 @@ async fn connect_with_verified_snapshots(
     Ok(client.with_consensus_verifier(verifier))
 }
 
-pub(super) fn pinned_consensus_verifier(
-    trust: &hellas_chain::genesis::TrustDocument,
-    genesis_json: &[u8],
-    reported: &hellas_chain::ConsensusInfo,
-) -> CliResult<hellas_chain::ConsensusVerifier> {
-    hellas_chain::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)?;
-    anyhow::ensure!(
-        trust.epochs.len() == 1
-            && trust.epochs[0].epoch == 0
-            && trust.epochs[0].end_height.is_none(),
-        "RPC snapshot verification requires one open epoch starting at zero"
-    );
-    let genesis: Genesis = serde_json::from_slice(genesis_json)?;
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: trust.network_id.clone(),
-        threshold_identity: hex::decode(&trust.epochs[0].threshold_identity)?,
-        validators: genesis
-            .validators
-            .iter()
-            .map(|v| v.public_key.clone())
-            .collect(),
-    };
-    anyhow::ensure!(
-        reported.network_id == pinned.network_id
-            && reported.threshold_identity == pinned.threshold_identity,
-        "endpoint consensus identity differs from the authenticated trust document"
-    );
-    Ok(hellas_chain::ConsensusVerifier::new(
-        &pinned,
-        hellas_chain::genesis_digest(&genesis),
-    )?)
-}
+pub(super) use hellas_sdk::client_chain::pinned_consensus_verifier;
 
 /// Resolves the network to sign for, and refuses if the node on the
 /// other end is not on it.
@@ -1071,7 +1046,7 @@ mod tests {
         let trust = hellas_chain::genesis::TrustDocument {
             schema_version: 1,
             network_id: hellas_chain::genesis::HELLAS_DEVNET_1_ID.into(),
-            genesis_sha256: "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb"
+            genesis_sha256: "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17"
                 .into(),
             epochs: vec![hellas_chain::genesis::TrustEpoch {
                 epoch: 0,
@@ -1136,6 +1111,7 @@ mod tests {
     async fn delegate_rejects_an_invalid_node_before_network_or_owner_access() {
         let error = run(
             ChainCommand::Delegate {
+                split: None,
                 coins: OwnerCoinArgs {
                     rpc: "invalid".into(),
                     network: "devnet".into(),
@@ -1195,7 +1171,7 @@ mod signer {
     //! material is read only from the file paths supplied to the chain commands;
     //! no command accepts a scalar value directly.
 
-    use hellas_work::authenticator::{Authenticator, kernel_auth};
+    use hellas_authority::authenticator::{Authenticator, kernel_auth};
     use std::{fs, path::Path};
 
     use anyhow::{Context as _, Result, anyhow};

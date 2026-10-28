@@ -1,20 +1,24 @@
 use super::*;
 use hellas_auth::authority::Revision;
+use hellas_authority::model::grant::budget::*;
+use hellas_authority::model::grant::records::{GrantDef, Offer};
+use hellas_authority::test_support::TestClock;
+use hellas_authority::work_store::grant::NodeStore;
 use hellas_rpc::pb::work::GrantRefusal;
 use hellas_rpc::{Assurance, Retention};
 use hellas_wire::{MethodMarker, ServiceMarker, StreamTransport};
-use hellas_work::model::grant::records::{GrantDef, Offer};
-use hellas_work::model::{fetch::*, grant::budget::*};
-use hellas_work::test_support::TestClock;
-use hellas_work::test_support::{WAIT, assert_err, definition, network, policy};
-use hellas_work::work_store::grant::NodeStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
+use {
+    hellas_authority::test_support::WAIT, hellas_authority::test_support::definition,
+    hellas_authority::test_support::policy, hellas_channel::test_support::assert_err,
+    hellas_channel::test_support::network,
+};
 mod connections;
 
-pub use hellas_work::test_support::principal;
+pub use hellas_channel::test_support::principal;
 pub fn provider_enrollment(seed: u8) -> ProviderEnrollmentBundle {
-    hellas_work::test_support::software_enrollment(
+    hellas_channel::test_support::software_enrollment(
         seed,
         *iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes(),
     )
@@ -39,13 +43,6 @@ pub fn pinned_offer(grant: GrantDef, addresses: Vec<String>) -> PinnedOffer {
     UnpinnedOffer::decode(&signed.encode().unwrap(), UnixMillis(1000))
         .unwrap()
         .pin(&ProviderTrustAnchor {
-            allowed_environments: signed
-                .offer()
-                .grant
-                .policies
-                .iter()
-                .map(|p| p.work.allowed_environment())
-                .collect(),
             expected_genesis: provider.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -92,7 +89,7 @@ async fn setup(
     (store, secret)
 }
 
-use hellas_work::test_support::backend::{Backend, Completion, Reply};
+use hellas_channel::test_support::backend::{Backend, Completion, Reply};
 fn backend(slots: Arc<Semaphore>, calls: Arc<AtomicUsize>) -> Backend {
     Backend {
         slots,
@@ -109,6 +106,7 @@ struct Fixture {
     administrator: hellas_auth::authority::CredentialSecret,
     clock: TestClock,
     calls: Arc<AtomicUsize>,
+    grant: GrantDef,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -117,7 +115,7 @@ impl Fixture {
     async fn with_grant(grant: GrantDef) -> Self {
         let root = tempfile::tempdir().unwrap();
         let (subject, allowance) = (principal(1).0, grant.id);
-        let (store, secret) = setup(&root.path().join("provider"), grant).await;
+        let (store, secret) = setup(&root.path().join("provider"), grant.clone()).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let backend = backend(Arc::new(Semaphore::new(2)), calls.clone());
         let clock = TestClock::default();
@@ -139,11 +137,12 @@ impl Fixture {
             administrator: secret,
             clock,
             calls,
+            grant,
         }
     }
     fn options(&self) -> GrantSessionOptions {
         GrantSessionOptions {
-            target: pinned_offer(definition(GrantId([1; 16]), principal(1).0), vec![]),
+            target: pinned_offer(self.grant.clone(), vec![]),
             principal: principal(1).0,
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
@@ -161,10 +160,8 @@ impl Fixture {
         .await
         .unwrap()
     }
-    fn input(&self) -> PreparedWorkInput {
-        self.input_for_contract(&test_responses_contract())
-    }
-    fn input_for_contract(&self, contract: &hellas_rpc::FetchContract) -> PreparedWorkInput {
+    fn input(&self) -> PreparedInvocation {
+        let contract = &test_responses_contract();
         let events = hellas_rpc::fetch::build_input_events_with_retention(
             "openai",
             "responses",
@@ -175,9 +172,21 @@ impl Fixture {
             Retention::Ephemeral,
         )
         .unwrap();
-        PreparedPaidFetchInputV1::new(&events, contract)
-            .unwrap()
-            .into()
+        hellas_rpc::protocol::invocation::fetch::prepare(
+            &events,
+            contract,
+            hellas_auth::PublicKey::Secp256k1(
+                hellas_authority::model::grant::records::grant_producer(&provider_enrollment(2))
+                    .unwrap()
+                    .to_bytes(),
+            ),
+            self.grant.policies[0]
+                .invocation_policy
+                .canonical_bytes()
+                .unwrap(),
+            [1; 32],
+        )
+        .unwrap()
     }
 }
 #[tokio::test]
@@ -190,6 +199,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
         .run(
             "responses",
             f.input(),
+            &InvocationContent::Ephemeral(Default::default()),
             Some(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -237,13 +247,22 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             resource_id: policy().resource,
             resource_revision: policy().revision,
             pricing_revision: policy().pricing.revision,
-            work_policy_digest: policy().work.digest(network(), channel.0),
-            prepared_input_digest: input.bound_digest(network(), channel.0).unwrap(),
+            work_policy_digest: hellas_channel::job::policy_digest(
+                network(),
+                channel.0,
+                &policy().invocation_policy,
+            )
+            .unwrap(),
+            input_content: hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap()),
+            prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
+                network(),
+                channel.0,
+                &input,
+            )
+            .unwrap(),
             proposal_nonce: 1,
             acceptance_deadline_ms: UnixMillis(2000),
-            request_commitment: RequestCommitment::from_digest(
-                input.input_commitment().unwrap().digest(),
-            ),
+            request_commitment: input.request.commitment().unwrap(),
             environment_commitment: test_responses_contract().manifest_id(),
             terminal_deadline_ms: UnixMillis(4000),
             delivery_deadline_ms: UnixMillis(5000),
@@ -260,20 +279,20 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 .node()
                 .authenticate_session(
                     &f.application.credential,
-                    hellas_work::node::SessionKey::Node(&principal(1).1),
+                    hellas_authority::node::SessionKey::Node(&principal(1).1),
                 )
                 .await
                 .unwrap();
-            let response = f
-                .service
-                .for_caller(caller, f.application.authorization)
-                .accept(&AcceptWorkRequest {
-                    route: Some(WorkRoute::grant(channel.0)),
-                    authorization: a.encode(),
-                    client_signature: signature.bytes().to_vec(),
-                    prepared_input: input.encode().unwrap(),
-                })
-                .await;
+            let work = f.service.for_caller(caller, f.application.authorization);
+            let request = AcceptWorkRequest {
+                route: Some(WorkRoute::grant(channel.0)),
+                authorization: a.encode(),
+                client_signature: signature.bytes().to_vec(),
+                prepared_input: input.canonical_bytes().unwrap(),
+            };
+            let response =
+                hellas_authority::test_support::accept_grant(&work, &request, &principal(1).1)
+                    .await;
             assert!(matches!(
                 response.outcome,
                 Some(accept_work_response::Outcome::Accepted(_))
@@ -282,7 +301,14 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
         drop(session); // Crash after proposal fsync, possibly after provider acceptance.
         let mut resumed = f.session().await;
         assert!(matches!(
-            resumed.run("responses", f.input(), None).await,
+            resumed
+                .run(
+                    "responses",
+                    f.input(),
+                    &InvocationContent::Ephemeral(Default::default()),
+                    None
+                )
+                .await,
             Err(GrantClientError::RecoveryRequired)
         ));
         assert!(matches!(
@@ -359,7 +385,15 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
         crate::grant_client::GrantSession::open(options, GrantTransport::Remote(client.clone()))
             .await
             .unwrap();
-    let result = session.run("responses", f.input(), None).await.unwrap();
+    let result = session
+        .run(
+            "responses",
+            f.input(),
+            &InvocationContent::Ephemeral(Default::default()),
+            None,
+        )
+        .await
+        .unwrap();
     assert_eq!(result.events.len(), 2);
     session.shutdown().await.unwrap();
     f.service.drain().await.unwrap();
@@ -372,16 +406,23 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
 #[tokio::test]
 async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
     let mut definition = definition(GrantId([1; 16]), principal(1).0);
-    let WorkPolicy::Fetch { policy, .. } = &mut definition.policies[0].work else {
+    let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+        &mut definition.policies[0].invocation_policy.admissions[0]
+    else {
         unreachable!()
     };
-    policy.max_spool_bytes = 32 << 20;
+    admission.limits.max_spool_bytes = 32 << 20;
     let f = Fixture::with_grant(definition).await;
     let mut session = f.session().await;
     for _ in 0..3 {
         assert_eq!(
             session
-                .run("responses", f.input(), None)
+                .run(
+                    "responses",
+                    f.input(),
+                    &InvocationContent::Ephemeral(Default::default()),
+                    None
+                )
                 .await
                 .unwrap()
                 .events
@@ -402,7 +443,15 @@ async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
 async fn recovered_metadata_is_bound_to_the_requested_job_channel_and_provider() {
     let f = Fixture::new().await;
     let mut session = f.session().await;
-    let output = session.run("responses", f.input(), None).await.unwrap();
+    let output = session
+        .run(
+            "responses",
+            f.input(),
+            &InvocationContent::Ephemeral(Default::default()),
+            None,
+        )
+        .await
+        .unwrap();
     let channel = session.store().channel().id;
     let target = GrantTarget::from_offer(&f.options().target).unwrap();
     let signature = principal(2)
@@ -553,52 +602,4 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
     }
 }
 
-use hellas_work::test_support::test_responses_contract;
-
-#[tokio::test]
-async fn current_grant_cannot_disclose_a_new_contract_without_independent_client_approval() {
-    let contract = hellas_rpc::FetchContract::new(
-        "independent-responses-1",
-        hellas_rpc::FetchSchema::StatelessResponsesV1,
-        "independent-driver-1",
-        hellas_rpc::FetchEgress::FixedHttps("https://example.com/responses".into()),
-    )
-    .unwrap();
-    let mut revised = definition(GrantId([1; 16]), principal(1).0);
-    let WorkPolicy::Fetch {
-        contract: selected,
-        policy,
-        ..
-    } = &mut revised.policies[0].work
-    else {
-        panic!("Fetch fixture");
-    };
-    *selected = contract.clone();
-    policy.allowed_environment = contract.manifest_id();
-    let f = Fixture::with_grant(revised.clone()).await;
-    let mut session = f.session().await;
-    let denied = session
-        .run("responses", f.input_for_contract(&contract), None)
-        .await
-        .err()
-        .expect("unapproved contract must be denied");
-    assert!(
-        denied.to_string().contains("not independently approved"),
-        "{denied}"
-    );
-    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(session.store().next_nonce().unwrap(), 1);
-    assert!(session.store().book().pending_proposal().is_none());
-    drop(session);
-    let mut options = f.options();
-    options.target = pinned_offer(revised, vec![]);
-    let mut approved = GrantSession::open(options, GrantTransport::Local(f.service.clone()))
-        .await
-        .unwrap();
-    approved
-        .run("responses", f.input_for_contract(&contract), None)
-        .await
-        .unwrap();
-    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    approved.shutdown().await.unwrap();
-}
+use hellas_channel::test_support::test_responses_contract;

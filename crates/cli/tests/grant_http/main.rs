@@ -1,12 +1,9 @@
 #![cfg(unix)]
 mod contact;
-#[cfg(feature = "evaluate")]
-mod local_evaluate;
 mod managed;
-mod native_owner;
 mod offer_gateway;
 
-use hellas_work::test_support::common_node;
+use hellas_authority::test_support::common_node;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
@@ -54,8 +51,13 @@ impl Https {
             while let Ok((socket, _)) = listener.accept().await {
                 let (acceptor, count, release) = (acceptor.clone(), count.clone(), release.clone());
                 tokio::spawn(async move {
-                    let Ok(mut socket) = acceptor.accept(socket).await else {
-                        return;
+                    let address = socket.local_addr();
+                    let mut socket = match acceptor.accept(socket).await {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            eprintln!("upstream TLS handshake at {address:?} failed: {error:?}");
+                            return;
+                        }
                     };
                     let mut headers = vec![];
                     while !headers.ends_with(b"\r\n\r\n") && headers.len() < 32768 {
@@ -173,7 +175,7 @@ impl Cli {
         path
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hellas-cli"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hellas"));
         // These commands use no node identity and refuse `--identity`.
         if !matches!(
             args,
@@ -188,13 +190,10 @@ impl Cli {
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
-            .env("RUST_LOG", "hellas_gateway=info")
+            .env("RUST_LOG", "warn,hellas_gateway=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        if cfg!(feature = "evaluate") && matches!(args.first(), Some(&"serve" | &"gateway")) {
-            command.arg("--store-dir").arg(self.root.join("store"));
-        }
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
@@ -266,7 +265,7 @@ fn string(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 use hellas_auth::authority::GrantId;
-use hellas_work::model::grant::{admin::*, budget::*};
+use hellas_authority::model::grant::{admin::*, budget::*};
 
 fn request_file(root: &Path, command: &impl serde::Serialize) -> PathBuf {
     let path = root.join("work-command.json");
@@ -399,8 +398,12 @@ async fn issue_work_profile_at(
         authority: profile.authority,
         subject,
         permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(profile.authority, allowance),
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(
+                profile.authority,
+                allowance,
+            ),
         }]
         .into(),
         not_before: now,
@@ -446,62 +449,22 @@ async fn issue_work_profile_at(
         &hellas_sdk::node_control::profile::read_credential(&output).unwrap(),
     )
 }
-/// A Work credential for `subject` on `allowance`, held by `holder`, issued
-/// through the checked node API by the passkey session of `administrator`'s
-/// subject.
-async fn execution_credential(
-    node: &hellas_work::node::NodeCoordinator,
-    administrator: &hellas_auth::authority::CredentialSecret,
-    subject: hellas_auth::authority::PrincipalId,
-    allowance: GrantId,
-    holder: hellas_auth::authority::CredentialHolder,
-) -> hellas_auth::authority::CredentialSecret {
-    use hellas_auth::authority as auth;
-    let caller = hellas_work::test_support::session(node, administrator).await;
-    let root = GrantId([0; 16]);
-    let scope = auth::GrantSpec {
-        authority: caller.authority(),
-        subject,
-        permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
-            resource: hellas_work::grant_service::allowance_resource(caller.authority(), allowance),
-        }]
-        .into(),
-        not_before: auth::UnixMillis(1000),
-        expires: auth::UnixMillis(u64::MAX),
-        delegation_depth: 0,
-        issuance: None,
-    };
-    node.grant(
-        &caller,
-        auth::GrantCommand::Issue {
-            authorization: root,
-            id: common_node::EXECUTION_AUTHORIZATION,
-            spec: scope.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    hellas_work::test_support::credentials::issue_one(node, &caller, root, scope, holder)
-        .await
-        .unwrap()
-        .1
-}
 /// An HTTP authority whose administrator issues the gateway a separate
 /// bearer credential; the bootstrap credential is never the bearer.
 async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     use hellas_auth::{Digest, authority::*};
     let authority = AuthorityId(Digest::hash(b"CLI HTTP authority"));
-    let subject = hellas_work::test_support::actors::OPERATOR.principal();
+    let subject = hellas_channel::test_support::actors::OPERATOR.principal();
     let now = UnixMillis::now().unwrap_or_default();
-    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
-        .unwrap()
-        .permission(authority, None)
-        .unwrap();
+    let permission =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+            .unwrap()
+            .permission(authority, None)
+            .unwrap();
     let administrator = common_node::admin_spec(
         authority,
         subject,
-        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
         (now, UnixMillis(now.0 + 600_000)),
         (600_000, 0),
         &[],
@@ -517,9 +480,9 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     };
     let journal = root.join("gateway-authority");
     let root_grant = GrantId([0; 16]);
-    let (store, admin) = hellas_work::work_store::grant::NodeStore::bootstrap(
+    let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
         &journal,
-        hellas_work::model::grant::grant_network(),
+        hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
             Ownership::Bootstrap {
@@ -533,12 +496,12 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     )
     .await
     .unwrap();
-    let node = hellas_work::node::NodeCoordinator::new(
+    let node = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
-    let caller = hellas_work::test_support::session(&node, &admin).await;
-    let (_, credential) = hellas_work::test_support::credentials::issue_one(
+    let caller = hellas_authority::test_support::session(&node, &admin).await;
+    let (_, credential) = hellas_authority::test_support::credentials::issue_one(
         &node,
         &caller,
         root_grant,
@@ -570,13 +533,36 @@ fn gateway_client(token: &str) -> reqwest::Client {
         .build()
         .unwrap()
 }
-/// Record an independent caller approval of one provider and its environments.
-fn approve(
-    root: &Path,
-    name: &str,
-    provider_genesis: hellas_rpc::ContentId,
-    environments: Vec<hellas_rpc::ContentId>,
-) -> PathBuf {
+/// The HTTP Fetch invocation policy the grant resource fixtures admit.
+fn http_invocation_policy() -> hellas_rpc::protocol::invocation::InvocationPolicy {
+    use hellas_rpc::protocol::invocation::{
+        Admission, InvocationPolicy, Limits,
+        fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
+    };
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: hellas_rpc::FetchContract::http().unwrap(),
+                route: FetchRoutePolicy::sealed_route("http", "request").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 65536,
+                    max_output_events: 256,
+                    max_spool_bytes: 262144,
+                    max_encoded_result_frame: 262144,
+                    max_encoded_prepared_input: 262144,
+                },
+            },
+        }],
+        limits: Limits {
+            max_upload_bytes: 262144,
+            max_output_bytes: 65536,
+            max_steps: 1,
+            execution_timeout_ms: 10_000,
+        },
+    }
+}
+/// Record an independent caller approval of one provider.
+fn approve(root: &Path, name: &str, provider_genesis: hellas_rpc::ContentId) -> PathBuf {
     let trust_root = root.join(format!("{name}-trust"));
     hellas_sdk::trust_policy::TrustPolicyStore::new(&trust_root)
         .approve(
@@ -585,7 +571,6 @@ fn approve(
             hellas_sdk::trust_policy::TrustPolicy {
                 provider_genesis,
                 assurance: hellas_rpc::Assurance::ProducerSigned,
-                environments,
                 apple: None,
             },
             "independent test approval".into(),
@@ -595,4 +580,34 @@ fn approve(
 }
 async fn post(client: &reqwest::Client, url: &str, body: Value) -> reqwest::Response {
     client.post(url).json(&body).send().await.unwrap()
+}
+
+async fn assert_http_response(
+    response: reqwest::Response,
+    expected: reqwest::StatusCode,
+    logs: &[&Path],
+    upstream: &Https,
+) -> String {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    if status != expected {
+        let logs: Vec<_> = logs
+            .iter()
+            .map(|path| {
+                format!(
+                    "{}:\n{}",
+                    path.display(),
+                    std::fs::read_to_string(path).unwrap()
+                )
+            })
+            .collect();
+        panic!(
+            "HTTP {status}, expected {expected}\nheaders: {headers:?}\nbody: {body}\nupstream {}: {} requests\n{}",
+            upstream.origin,
+            upstream.calls.load(Ordering::SeqCst),
+            logs.join("\n")
+        );
+    }
+    body
 }

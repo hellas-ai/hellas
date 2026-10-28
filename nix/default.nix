@@ -66,6 +66,7 @@ let
     [advisories]
     ignore = [
       { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
+      { id = "RUSTSEC-2025-0141", reason = "Transitive through upstream catena-lang; bincode 1.3.3 is final and no safe upgrade is available." },
     ]
 
     [licenses]
@@ -86,12 +87,21 @@ let
       "Unlicense",
       "Zlib",
     ]
+    # catena-models is hellas-ai's own crate and declares no license.
+    exceptions = [
+      { crate = "catena-models", allow = ["LicenseRef-hellas-ai"] },
+    ]
+
+    [[licenses.clarify]]
+    crate = "catena-models"
+    expression = "LicenseRef-hellas-ai"
+    license-files = []
 
     [bans]
     multiple-versions = "allow"
 
     [sources]
-    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/georgewhewell/catena-lang"]
+    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/hellas-ai/catena-lang", "https://github.com/hellas-ai/catena-models"]
   '';
   denyCommand = "cargo deny --config ${denyConfig} check";
 
@@ -201,22 +211,7 @@ let
           buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
         }
       ) { };
-    }
-    # Do not advertise the safe local GPU runtime on platforms where the
-    # packaged provider toolchain is not yet supported.
-    //
-      lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
-        {
-          cli-catena = lib.makeOverridable (
-            {
-              otel ? false,
-            }:
-            pkgSpec.mkHellasPackage {
-              buildNoDefaultFeatures = true;
-              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
-            }
-          ) { };
-        };
+    };
 
   crossTargets = {
     # The store's replacement-resistant file identity uses Unix device,
@@ -299,13 +294,13 @@ let
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli-catena;
+        inherit (nativePackages) cli;
         backend = "cuda";
         revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli-catena;
+        inherit (nativePackages) cli;
         backend = "hip";
         revision = self.rev or self.dirtyRev or "unknown";
       };
@@ -313,8 +308,7 @@ let
       nixosTests = lib.optionalAttrs isX86_64Linux (
         import ./tests {
           inherit self pkgs lib;
-          package = nativePackages.cli-catena;
-          networkPackage = nativePackages.cli;
+          package = nativePackages.cli;
           validatorPackage = nativePackages.cli-validator;
         }
       );
@@ -371,7 +365,10 @@ let
           '';
         };
         rocm = pkgs.mkShellNoCC {
-          packages = devShellPackages ++ [ pkgs.hellasLib.rocmToolkit ];
+          # The toolkit is reached through PATH/ROCM_PATH only. As a package its lib/
+          # (which carries its own glibc) would enter NIX_LDFLAGS and every
+          # binary's RUNPATH, aborting Nix-built programs at startup.
+          packages = devShellPackages;
           shellHook = envShellHook + ''
             # hipcc's setup selects its clang as the host C compiler. That
             # compiler emits newer LLVM LTO objects which this Rust toolchain's
@@ -385,7 +382,7 @@ let
             export HIP_CLANG_PATH=${pkgs.hellasLib.rocmToolkit}/bin
             export DEVICE_LIB_PATH=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode
             export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode"
-            export LD_LIBRARY_PATH=${pkgs.hellasLib.rocmToolkit}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+            export PATH=$PATH:${pkgs.hellasLib.rocmToolkit}/bin
           '';
         };
       };
@@ -479,7 +476,7 @@ let
   }
   // lib.optionalAttrs isX86_64Linux {
     # Validators are deployed only on x86; ARM workers build the client/node CLI.
-    inherit (nativePackages) cli-catena cli-validator;
+    inherit (nativePackages) cli-validator;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
     inherit (linuxOutputs.packages) docker;
@@ -574,7 +571,7 @@ in
       pkgs.runCommand "hellas-cli-windows-smoke"
         {
           requiredSystemFeatures = [ "wsl" ];
-          exe = "${windowsPackages.cli}/bin/hellas-cli.exe";
+          exe = "${windowsPackages.cli}/bin/hellas.exe";
         }
         ''
           cd /

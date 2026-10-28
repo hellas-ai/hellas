@@ -1,9 +1,7 @@
 use super::{PaidWorkOptions, PoolError, Result};
 use crate::trust_policy::TrustPolicyStore;
 use crate::work_config::load_work_config;
-use hellas_kernel::{CoinId, EdgeId, Funding, List, MAX_PARTY_INPUTS};
 use hellas_rpc::Assurance;
-use hellas_work::model::grant::records::grant_transport;
 use iroh::EndpointId;
 use serde::Deserialize;
 use std::{
@@ -37,9 +35,9 @@ impl PaidGatewayOptions {
         }
         let mut journals = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
-        let mut funding = BTreeSet::new();
         for provider in &self.providers {
-            if provider.timeout.is_zero()
+            provider.validate()?;
+            if provider.timeout.is_none_or(|timeout| timeout.is_zero())
                 || provider.acceptance_blocks == 0
                 || provider.terminal_blocks == 0
                 || provider.payment_blocks == 0
@@ -59,22 +57,6 @@ impl PaidGatewayOptions {
             if !endpoints.insert(provider.provider) {
                 return Err(PoolError::DuplicateProvider(provider.provider));
             }
-            let coins = provider
-                .payment_funding
-                .maker()
-                .iter()
-                .chain(provider.payment_funding.taker().iter())
-                .collect::<Vec<_>>();
-            if coins.is_empty() {
-                return Err(PoolError::Invalid("paid provider needs payment coins"));
-            }
-            for coin in coins {
-                if !funding.insert(*coin) {
-                    return Err(PoolError::Invalid(
-                        "a payment coin cannot fund two provider channels or appear twice",
-                    ));
-                }
-            }
         }
         Ok(())
     }
@@ -85,7 +67,7 @@ impl PaidGatewayOptions {
 pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
-        hellas_work::work_store::journal::MAX_RECORD_BYTES,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
     )
     .map_err(|source| PoolError::Read {
         path: path.into(),
@@ -95,60 +77,44 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
         path: path.into(),
         source,
     })?;
-    if !file.trust_store.is_absolute() {
-        return Err(PoolError::Invalid("trust_store must be absolute"));
-    }
-    let trust_store = TrustPolicyStore::new(file.trust_store);
     let providers = file
         .providers
         .into_iter()
         .map(|p| {
-            if !p.work_config.is_absolute() {
-                return Err(PoolError::Invalid("work_config must be absolute"));
+            if !p.chain_config.is_absolute() {
+                return Err(PoolError::Invalid("chain_config must be absolute"));
             }
-            if p.payment_coins.is_empty() || p.payment_coins.len() > MAX_PARTY_INPUTS {
-                return Err(PoolError::Invalid("payment_coins must name 1 to 4 coins"));
-            }
-            let coins = p
-                .payment_coins
-                .iter()
-                .map(|value| fixed("payment_coins", value).map(CoinId::from_bytes))
-                .collect::<Result<Vec<_>>>()?;
-            let config = load_work_config(&p.work_config)?;
-            let provider_trust = trust(&p, assurance, &config, &trust_store)?;
-            let provider_addrs = if p.provider_addrs.is_empty() {
-                match &p.offer {
-                    Some(signed) => signed
-                        .offer()
-                        .addresses
-                        .iter()
-                        .map(|a| {
-                            a.parse()
-                                .map_err(|_| PoolError::Invalid("paid offer address"))
-                        })
-                        .collect::<Result<_>>()?,
-                    None => vec![],
+            let config = load_work_config(&p.chain_config)?;
+            let apple_trust = match (&file.trust_store, &p.trust_policy) {
+                (Some(directory), Some(id)) if directory.is_absolute() => {
+                    Some(TrustPolicyStore::new(directory).resolve(
+                        id,
+                        assurance,
+                        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
+                            p.journal_root.join("apple-counters"),
+                        )),
+                    )?)
                 }
-            } else {
-                p.provider_addrs
+                (None, None) if assurance == Assurance::ProducerSigned => None,
+                _ => {
+                    return Err(PoolError::Invalid(
+                        "Apple providers require an absolute trust_store and approved trust_policy",
+                    ));
+                }
             };
+            let provider_addrs = p.provider_addrs;
             Ok(PaidWorkOptions {
                 config,
                 journal_root: p.journal_root,
                 provider: p.provider,
                 provider_addrs,
-                provider_trust,
-                bond: EdgeId::from_bytes(fixed("bond", &p.bond)?),
-                payment_funding: Funding::new(
-                    crate::work_config::coin_list(&coins)
-                        .ok_or(PoolError::Invalid("payment_coins must name 1 to 4 coins"))?,
-                    List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
-                ),
-                omission_bond: p.omission_bond,
+                apple_trust,
+                assurance,
+                expected_price: p.payment,
                 acceptance_blocks: file.acceptance_blocks,
                 terminal_blocks: file.terminal_blocks,
                 payment_blocks: file.payment_blocks,
-                timeout: Duration::from_secs(file.timeout_secs),
+                timeout: Some(Duration::from_secs(file.timeout_secs)),
             })
         })
         .collect::<Result<_>>()?;
@@ -160,50 +126,10 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
     Ok(options)
 }
 
-fn trust(
-    p: &ProviderFile,
-    assurance: Assurance,
-    config: &crate::work_config::WorkConfig,
-    store: &TrustPolicyStore,
-) -> Result<hellas_client::ProviderTrustAnchor> {
-    let trust = store.resolve_environment(
-        &p.trust_policy,
-        assurance,
-        config.work_policy.allowed_environment(),
-        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-            p.journal_root.join("apple-counters"),
-        )),
-    )?;
-    if let Some(signed) = &p.offer {
-        signed
-            .check()
-            .map_err(|_| PoolError::Invalid("paid offer signature or bond is invalid"))?;
-        let offer = signed.offer();
-        if offer.proposal.network() != config.chain.network
-            || offer.proposal.bond_edge().to_bytes() != fixed::<32>("bond", &p.bond)?
-            || grant_transport(&offer.provider)
-                .map_err(|_| PoolError::Invalid("paid offer transport"))?
-                != *p.provider.as_bytes()
-        {
-            return Err(PoolError::Invalid(
-                "paid offer differs from the configured network, bond or provider",
-            ));
-        }
-        trust.verify_enrollment(&offer.provider).map_err(|_| {
-            PoolError::Invalid("paid offer enrollment does not satisfy the provider trust policy")
-        })?;
-    }
-    Ok(trust)
-}
-
-fn fixed<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
-    hellas_auth::hex::parse(value).map_err(|source| PoolError::Hex { field, source })
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolFile {
-    trust_store: PathBuf,
+    trust_store: Option<PathBuf>,
     providers: Vec<ProviderFile>,
     #[serde(default = "acceptance_blocks")]
     acceptance_blocks: u64,
@@ -235,89 +161,47 @@ const fn max_pending_requests() -> usize {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderFile {
-    work_config: PathBuf,
+    chain_config: PathBuf,
     journal_root: PathBuf,
     provider: EndpointId,
     #[serde(default)]
     provider_addrs: Vec<SocketAddr>,
-    bond: String,
-    payment_coins: Vec<String>,
-    omission_bond: u64,
-    trust_policy: String,
-    offer: Option<Box<hellas_work::model::offer::SignedPaidOffer>>,
+    payment: u64,
+    trust_policy: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{PaidFixture, enrollment, signer};
-    use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
-
+    fn provider() -> serde_json::Value {
+        serde_json::json!({"chain_config":"/config/chain.json", "journal_root":"/state/client", "provider":iroh::SecretKey::from_bytes(&[4;32]).public(),
+            "payment":10})
+    }
     #[test]
-    fn imported_offer_requires_independent_approval_and_checks_network_bond_transport_and_assurance()
-     {
-        let fixture = PaidFixture::new();
-        let peer = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let provider = enrollment(peer).0;
-        let signed = SignedPaidOffer::sign(
-            PaidOffer {
-                provider: provider.clone(),
-                proposal: fixture.proposal.clone(),
-                addresses: vec![],
-            },
-            &signer(2),
-        )
-        .unwrap();
-        let value = serde_json::json!({
-            "work_config": "/config/work.json", "journal_root": "/state/client", "provider": peer,
-            "bond": hex::encode(fixture.proposal.bond_edge().to_bytes()), "payment_coins": [hex::encode([1; 32])],
-            "omission_bond": 601, "offer": signed, "trust_policy": "provider",
-        });
-        let entry: ProviderFile = serde_json::from_value(value.clone()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let store = TrustPolicyStore::new(directory.path());
-        assert!(trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err());
-        let mut policy = crate::trust_policy::TrustPolicy {
-            provider_genesis: hellas_rpc::ContentId::from_bytes([0; 32]),
-            assurance: Assurance::ProducerSigned,
-            environments: vec![fixture.config.work_policy.allowed_environment()],
-            apple: None,
-        };
-        store
-            .approve("provider", 0, policy.clone(), "independent pin".into())
-            .unwrap();
-        assert!(trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err());
-        policy.provider_genesis = provider.content_id();
-        store
-            .approve("provider", 1, policy, "reviewed provider pin".into())
-            .unwrap();
-        assert_eq!(
-            trust(&entry, Assurance::ProducerSigned, &fixture.config, &store)
-                .unwrap()
-                .expected_genesis,
-            provider.content_id()
-        );
-        assert!(trust(&entry, Assurance::AppleAppAttest, &fixture.config, &store).is_err());
-        let mut other_network = fixture.config.clone();
-        other_network.chain.network = hellas_kernel::NetworkId::new("other-network").unwrap();
-        assert!(trust(&entry, Assurance::ProducerSigned, &other_network, &store).is_err());
-        for (field, replacement) in [
-            ("bond", serde_json::json!(hex::encode([7; 32]))),
-            (
-                "provider",
-                serde_json::json!(iroh::SecretKey::from_bytes(&[8; 32]).public()),
-            ),
+    fn software_pool_selects_node_and_price_without_a_policy_or_offer_copy() {
+        let entry: ProviderFile = serde_json::from_value(provider()).unwrap();
+        assert_eq!(entry.payment, 10);
+        assert!(entry.trust_policy.is_none());
+        for field in [
+            "offer",
+            "work_config",
+            "bond",
+            "omission_bond",
+            "payment_coins",
         ] {
-            let mut altered = value.clone();
-            altered[field] = replacement;
-            let entry = serde_json::from_value(altered).unwrap();
+            let mut value = provider();
+            value[field] = serde_json::json!({});
             assert!(
-                trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err(),
-                "{field}"
+                serde_json::from_value::<ProviderFile>(value).is_err(),
+                "removed {field}"
             );
         }
-        let mut no_pin = value;
-        no_pin.as_object_mut().unwrap().remove("trust_policy");
-        assert!(serde_json::from_value::<ProviderFile>(no_pin).is_err());
+    }
+    #[test]
+    fn apple_pool_can_name_an_existing_independent_approval() {
+        let mut value = provider();
+        value["trust_policy"] = "reviewed-apple".into();
+        let entry: ProviderFile = serde_json::from_value(value).unwrap();
+        assert_eq!(entry.trust_policy.as_deref(), Some("reviewed-apple"));
     }
 }

@@ -122,7 +122,7 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
     ] {
         let output = tokio::time::timeout(
             Duration::from_secs(30),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas"))
                 .args([
                     "machines",
                     "--credential-source",

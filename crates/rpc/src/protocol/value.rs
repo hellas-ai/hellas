@@ -241,6 +241,17 @@ impl<'a> CanonicalDecoder<'a> {
         }
     }
 
+    pub fn map_exact(&mut self, expected: u64) -> Result<(), CanonicalDecodeError> {
+        let actual = self.read_len(5)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(CanonicalDecodeError::new(format!(
+                "expected map length {expected}, got {actual}"
+            )))
+        }
+    }
+
     pub fn array_len(&mut self) -> Result<usize, CanonicalDecodeError> {
         let len = usize::try_from(self.read_len(4)?)
             .map_err(|_| CanonicalDecodeError::new("array length exceeds usize range"))?;

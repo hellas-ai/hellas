@@ -1,5 +1,5 @@
 use hellas_auth::authority::{AuthorityInspection, InspectionQuery};
-use hellas_work::{model::grant::grant_network, test_support::Node};
+use hellas_authority::{model::grant::grant_network, test_support::Node};
 use std::process::Command;
 
 #[tokio::test]
@@ -18,7 +18,7 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
         .await;
     let expected = world.store.state().authority().revision();
     let invoke = || {
-        Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+        Command::new(env!("CARGO_BIN_EXE_hellas"))
             .args(["admin", "inspect-offline", "--journal"])
             .arg(&root)
             .arg(&query)
@@ -33,8 +33,8 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
         String::from_utf8_lossy(&locked.stderr)
     );
     drop(world);
-    let journal = hellas_work::work_store::journal::Journal::path(&root, "grants");
-    let sidecars_before = hellas_work::test_support::all_files(&root);
+    let journal = hellas_channel::work_store::journal::Journal::path(&root, "grants");
+    let sidecars_before = hellas_channel::test_support::all_files(&root);
     let before = std::fs::read(&journal).unwrap();
     let output = invoke();
     assert!(
@@ -45,5 +45,8 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
     let view: AuthorityInspection = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(view.revision, expected);
     assert_eq!(std::fs::read(journal).unwrap(), before);
-    assert_eq!(hellas_work::test_support::all_files(&root), sidecars_before);
+    assert_eq!(
+        hellas_channel::test_support::all_files(&root),
+        sidecars_before
+    );
 }

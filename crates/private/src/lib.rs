@@ -13,7 +13,7 @@ pub use secrets::{MAX_SECRET_BYTES, SecretError, SecretStore};
 
 mod regular;
 pub use regular::{
-    ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
+    ReadDirectory, ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
     read_bounded_regular_file, read_private_bounded,
 };
 
@@ -37,6 +37,20 @@ use windows as imp;
 /// reparse point (Windows). `NotFound` passes through unchanged.
 pub fn open_nofollow(path: &Path) -> io::Result<File> {
     imp::open_nofollow(path)
+}
+
+/// Opens an existing private staging file for bounded upload append without following links.
+/// Providers do not serve on Windows, so provider upload staging is Unix-only.
+pub fn open_nofollow_rw(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        imp::open_nofollow_rw(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Whether `file` is a regular file that only this user can reach.

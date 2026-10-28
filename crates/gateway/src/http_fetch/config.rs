@@ -60,7 +60,8 @@ pub(super) fn public_tls() -> HttpTls {
 }
 
 impl HttpGatewayConfig {
-    pub(super) fn validate(&self) -> crate::GatewayResult<()> {
+    /// Checks routes and backend limits using the same validation as [`super::start_http`].
+    pub fn validate(&self) -> crate::GatewayResult<()> {
         if self.routes.is_empty() == self.backends.is_empty() {
             return Err(crate::GatewayConfigError::RouteMode.into());
         }

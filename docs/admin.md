@@ -25,15 +25,15 @@ Online commands take a private `--profile` file. With `--passkey` the session is
 passkey session; without it, the node key of `--identity` opens a daily session:
 
 ```sh
-hellas-cli --identity node.identity admin --profile operator.json status
-hellas-cli --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
-hellas-cli --identity node.identity admin --profile operator.json work allowance.json
-hellas-cli --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
-hellas-cli --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
+hellas --identity node.identity admin --profile operator.json status
+hellas --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
+hellas --identity node.identity admin --profile operator.json work allowance.json
+hellas --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
+hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
 `status` requires `host.status` on this authority's host resource. `set-capacity`
@@ -43,6 +43,17 @@ for example `[{"meter":"Requests","window":"Day","amount":100}]`; an explicit `[
 removes budget limits. Changes preserve counters, reservations and outstanding work,
 so removing and restoring a limit cannot reset usage. Revision zero initializes a
 provider whose machine has not been configured. `status` includes the current limits.
+`work` also accepts `SetPaidPolicy { expected_revision, policy }` to set the
+provider's price, execution limits and automatic-offer bounds. It requires the
+authority owner's passkey session and `work.paid.configure` on the machine
+resource. The node generates the policy salt and retains the original terms
+with each signed offer; changing the standing policy does not alter open channels.
+`serve --paid-work-config FILE` approves a file's policy this way at startup; see
+the [paid gateway guide](paid-gateway.md). The provider runs each Catena job in a
+separate worker process. That isolation is crash/timeout containment, not a
+sandbox, and there is no memory metering. Requesters pay only for a result
+signed by this provider that matches their job; Hellas does not re-run it.
+
 `grant` accepts the
 Auth crate's `GrantCommand` JSON, including its explicit authorization grant and
 any required revision. Grant issuance and credential scope both bound the action;
@@ -56,7 +67,7 @@ table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
 credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
-the device that will hold it. `hellas-cli --identity node.identity identity
+the device that will hold it. `hellas --identity node.identity identity
 show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
 the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The client prepares the credential using the
@@ -92,7 +103,7 @@ Any other enrollment is refused with `FailedPrecondition` (`provider already bou
 and a malformed or unverifiable one with `InvalidArgument`. There is no unbind. The
 command prints the bound enrollment's content ID.
 
-`work` accepts [WorkControlCommand](../crates/work/src/model/grant/admin.rs) JSON. It selects resources from
+`work` accepts [WorkControlCommand](../crates/authority/src/model/grant/admin.rs) JSON. It selects resources from
 the daemon's validated catalogue and uses the profile's authorization grant.
 These operations require distinct rights on this authority's Work machine resource:
 
@@ -119,11 +130,12 @@ table below is checked against the implementation by the Work tests.
 | `work.generation.reset` | Work machine | Provider |
 | `work.resource.configure` | Work machine | Provider |
 | `work.resource.repair` | Work machine | Provider |
+| `work.paid.configure` | Work machine | Provider |
 | `work.execute` | Selected allowance | Provider |
 <!-- operations:end -->
 
 Configure machine capacity first, then explicit account, pool and subject budgets
-with `ConfigureBudget`. Its [BudgetDef](../crates/work/src/model/grant/budget.rs)
+with `ConfigureBudget`. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
 names a node, its parent, the new revision, limits and maximum concurrent jobs.
 An account is an Auth resource ID and has the machine as parent. A pool has a stable
 16-byte ID and an account parent. A subject node is the pair `(pool, principal)`;
@@ -140,8 +152,8 @@ an explicit `resource` ID, `account` ID and positive `revision`. Both IDs use Au
 exactly one. `Catalogue` returns the durable configuration through checked inspection.
 Configuration returns only the changed resource ID and revision.
 
-Each Fetch policy carries a required `contract` descriptor alongside its exact
-`allowed_environment` manifest ID. The descriptor selects a compiled request/result
+Each Fetch admission in a resource's `invocation_policy` carries a required
+`contract` descriptor. The descriptor selects a compiled request/result
 schema and commits the adapter, driver and egress terms. For example, the current
 reseller Responses contract is:
 
@@ -167,8 +179,9 @@ Its request and authentication clients share the same proxy/CA/redirect policy;
 refresh errors discard upstream descriptions before logging or persistence. These
 path protections do not establish signed-platform privacy or vendor retention policy.
 
-`work prepare-fetch --contract FILE` reads this JSON descriptor and includes its
-canonical bytes with the signed request. Provider policy and input must commit the
+`hellas fetch` selects the HTTPS contract from the provider quote and includes its
+canonical bytes with the signed request. `--contract FILE` selects that exact
+descriptor explicitly; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
 same descriptor. The gateway's `--responses-fetch-execution-environment` accepts the
 exact manifest ID. Ordinary clients select descriptors from resource policy, without
 linking the reseller implementation. Missing descriptors and old bundle shapes deny.
@@ -303,11 +316,11 @@ An access bundle shares allowances with one contact device: one signed offer per
 allowance, the authority ID, the contact's Auth grant ID, the credential subject,
 the node key of the contact's device, the credential ID and secret, the expiry and
 an optional provider label of at most 64 bytes. It contains no provider trust; the
-contact still approves a trust policy with `hellas-cli trust` before running work.
+contact still approves a trust policy with `hellas trust` before running work.
 
 ```sh
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
-hellas-cli --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
+hellas --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
 ```
 
 `export-bundle` takes `--allowance` once per shared allowance, at most 16. The
@@ -353,8 +366,8 @@ Work inspection and standing queries calculate current windows without writing c
 ticks. Existing spending and reservations are preserved.
 
 ```sh
-hellas-cli --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
-hellas-cli --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
+hellas --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
 
 Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
@@ -420,10 +433,6 @@ usage results also quarantine it. Spending and quarantine survive restart and re
 policy revisions. The OpenAI `0.0.2` contract preserves verified overruns for settlement;
 the old contract identity is rejected. Input-token budgets remain unsupported for
 these resources until a conservative input bound exists.
-
-Local evaluation uses `gateway --local --local-grant ID` to select an already
-configured allowance with a `local` policy. It never creates an owner grant or
-changes the selected allowance's policy while opening the gateway.
 
 Provisioning uses the client-side `machines --credential-source FILE
 --provider-config FILE create --spec FILE` command, with matching `list` and
@@ -503,19 +512,16 @@ A standalone `NodeControl` without a host supervisor leaves lifecycle operations
 unmounted; constructing the composed host supplies their implementation.
 
 
-Caller trust for paid and grant execution is configured separately with `hellas-cli trust`.
+Caller trust for paid and grant execution is configured separately with `hellas trust`.
 `approve` requires a reviewed policy file, expected revision (zero for creation) and
-reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer` or `--local`) select
+reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer`) select
 `--trust-store` and `--trust-policy`; imported offers cannot replace the approved pins.
 See [paid gateway trust configuration](paid-gateway.md) for the file format and
 replacement procedure. This does not grant provider administration rights.
 
-Approved manifest IDs remain attached to the client session. Refreshed standing may
-change a resource's current policy, but every new job must still use an approved
-execution manifest before its proposal or payload is sent. Review and approve a new
-contract explicitly, then restart the gateway to use the updated caller policy.
+Restart the gateway to use an updated caller policy.
 Nix gateway services use `trustStore`, `trustPolicy`, `workProfile` and the
-principal's `passkey` file, plus `offer` or `local`/`localGrant`.
+principal's `passkey` file, plus `offer`.
 Provision these private files for the service user before startup; Nix declarations
 do not approve trust or create grants.
 

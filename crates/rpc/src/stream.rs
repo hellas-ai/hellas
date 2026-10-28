@@ -286,7 +286,7 @@ mod tests {
         let (events, _) = builder.finish().unwrap();
         let mut pb = input_event_to_pb(&events[0]);
         pb.body.as_mut().unwrap().previous_event = input_genesis(
-            scheme_id(Operation::Evaluate, Assurance::ProducerSigned),
+            scheme_id(Operation::Invoke, Assurance::ProducerSigned),
             &caller.public_key(),
         )
         .as_bytes()
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(
             decoded.event().body().previous_event(),
             input_genesis(
-                scheme_id(Operation::Evaluate, Assurance::ProducerSigned),
+                scheme_id(Operation::Invoke, Assurance::ProducerSigned),
                 &caller.public_key(),
             )
         );

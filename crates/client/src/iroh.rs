@@ -8,8 +8,7 @@ use hellas_attestation::{
 use hellas_auth::{Digest, PublicKey};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::{
-    AppleAppAttestEnrollment, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR,
-    CausalLmEnvironment, ContentId, PlatformCredential, PlatformEnrollment, ProgramManifest,
+    AppleAppAttestEnrollment, Assurance, ContentId, PlatformCredential, PlatformEnrollment,
     ProviderEnrollmentBundle, RootKind, RootProof,
 };
 use hellas_wire::iroh::IrohTransport;
@@ -99,23 +98,10 @@ impl Eq for AppleAppAttestTrust {}
 pub struct ProviderTrustAnchor {
     pub expected_genesis: ContentId,
     pub required_assurance: Assurance,
-    /// Caller-approved execution manifests. Discovery does not grant execution.
-    pub allowed_environments: Vec<ContentId>,
     pub apple_app_attest: Option<AppleAppAttestTrust>,
 }
 
 impl ProviderTrustAnchor {
-    /// Check each job, including resources revised after initial discovery.
-    pub fn verify_environment(&self, environment: ContentId) -> ClientResult<()> {
-        if self.allowed_environments.len() > 32 || !self.allowed_environments.contains(&environment)
-        {
-            return Err(ClientError::protocol(
-                "execution manifest is not independently approved",
-            ));
-        }
-        Ok(())
-    }
-
     /// Verify reusable enrollment evidence, without advancing a live assertion
     /// counter. Every remote connection must additionally authenticate Open.
     pub fn verify_enrollment(&self, bundle: &ProviderEnrollmentBundle) -> ClientResult<()> {
@@ -307,6 +293,82 @@ pub async fn confidential_open<M>(
 where
     M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
 {
+    let (exporter, nonce, peer, response) = request_open::<M>(transport).await?;
+    verify_open_response(
+        trust,
+        &exporter,
+        &nonce,
+        <M::Service as ServiceMarker>::ALPN.as_bytes(),
+        peer,
+        response,
+    )
+}
+
+/// A paid caller selects the transport identity. Apple software approval remains
+/// independently pinned; software providers need no separate enrollment pin.
+pub async fn confidential_open_selected<M>(
+    transport: &IrohTransport,
+    assurance: Assurance,
+    apple: Option<&ProviderTrustAnchor>,
+) -> ClientResult<(ProviderEnrollmentBundle, ProviderTrustAnchor)>
+where
+    M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
+{
+    let (exporter, nonce, peer, response) = request_open::<M>(transport).await?;
+    let bundle = ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis)
+        .map_err(|e| ClientError::source("invalid selected provider enrollment", e))?;
+    let trust = selected_provider_trust(&bundle, assurance, apple)?;
+    verify_open_response(
+        &trust,
+        &exporter,
+        &nonce,
+        <M::Service as ServiceMarker>::ALPN.as_bytes(),
+        peer,
+        response,
+    )?;
+    Ok((bundle, trust))
+}
+
+pub fn selected_provider_trust(
+    bundle: &ProviderEnrollmentBundle,
+    assurance: Assurance,
+    apple: Option<&ProviderTrustAnchor>,
+) -> ClientResult<ProviderTrustAnchor> {
+    let trust = match bundle.genesis.statement.root_kind {
+        RootKind::Software if assurance == Assurance::ProducerSigned => ProviderTrustAnchor {
+            expected_genesis: bundle.content_id(),
+            required_assurance: assurance,
+            apple_app_attest: None,
+        },
+        RootKind::Software => {
+            return Err(ClientError::protocol(
+                "Apple assurance requires an attested provider",
+            ));
+        }
+        RootKind::SecureEnclave => {
+            let trust = apple
+                .filter(|trust| trust.apple_app_attest.is_some())
+                .ok_or_else(|| {
+                    ClientError::protocol("Apple provider requires independent software approval")
+                })?;
+            if trust.required_assurance != assurance {
+                return Err(ClientError::protocol(
+                    "Apple approval assurance differs from request",
+                ));
+            }
+            trust.clone()
+        }
+    };
+    trust.verify_enrollment(bundle)?;
+    Ok(trust)
+}
+
+async fn request_open<M>(
+    transport: &IrohTransport,
+) -> ClientResult<([u8; 32], [u8; 32], PeerIdentity, OpenResponse)>
+where
+    M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
+{
     let context = transport.context();
     let exporter = context.open_exporter.ok_or_else(|| {
         ClientError::protocol("live QUIC connection did not expose a confidential-open exporter")
@@ -324,14 +386,7 @@ where
     )
     .await
     .map_err(|status| ClientError::wire("provider declined confidential open", status))?;
-    verify_open_response(
-        trust,
-        &exporter,
-        &nonce,
-        <M::Service as ServiceMarker>::ALPN.as_bytes(),
-        peer,
-        response,
-    )
+    Ok((exporter, nonce, peer, response))
 }
 
 fn verify_open_response(
@@ -448,51 +503,6 @@ fn verify_open_response(
         }
     }?;
     Ok(producer_key)
-}
-
-pub fn validate_causal_lm_environment(
-    expected_manifest_id: ContentId,
-    program_manifest: &[u8],
-    environment: &[u8],
-) -> ClientResult<CausalLmEnvironment> {
-    let environment = CausalLmEnvironment::from_canonical_bytes(environment)
-        .map_err(|source| ClientError::source("invalid canonical causal-LM environment", source))?;
-    validate_causal_lm_manifest(
-        expected_manifest_id,
-        program_manifest,
-        environment.content_id(),
-    )?;
-    Ok(environment)
-}
-fn validate_causal_lm_manifest(
-    expected_manifest_id: ContentId,
-    program_manifest: &[u8],
-    expected_root: ContentId,
-) -> ClientResult<()> {
-    let manifest = ProgramManifest::from_canonical_bytes(program_manifest)
-        .map_err(|source| ClientError::source("invalid canonical program manifest", source))?;
-    let manifest_id = manifest.content_id();
-    if manifest_id != expected_manifest_id {
-        return Err(ClientError::protocol(format!(
-            "program manifest does not match caller pin: expected {expected_manifest_id}, got {manifest_id}"
-        )));
-    }
-    if manifest.application().evaluator() != CATENA_GPU_EVALUATOR
-        || manifest.application().adaptor() != CAUSAL_LM_ADAPTOR
-    {
-        return Err(ClientError::protocol(format!(
-            "Evaluate requires ({CATENA_GPU_EVALUATOR}, {CAUSAL_LM_ADAPTOR}), got ({:?}, {:?})",
-            manifest.application().evaluator(),
-            manifest.application().adaptor()
-        )));
-    }
-    if manifest.root() != expected_root {
-        return Err(ClientError::protocol(format!(
-            "causal-LM environment does not match manifest root: expected {}, got {expected_root}",
-            manifest.root(),
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -33,27 +33,16 @@ use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use self::state::GatewayState;
 
 pub use archive::ArchiveOptions;
-pub use execution::{
-    CausalLmExecutionEnvironment, ExecutionEvent, Outcome, PreparedExecution, StopReason,
-};
+pub use execution::{ExecutionEvent, Outcome, StopReason};
 pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, HttpRoute, RoutingError, start_http};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
-
-/// Token-native input handed to a funded Work client.
-pub struct WorkExecutionRequest {
-    pub environment: hellas_rpc::CausalLmEnvironment,
-    pub input_ids: Vec<u32>,
-    pub max_new_tokens: u32,
-    pub stop_token_ids: Vec<u32>,
-}
 
 /// A Fetch pinned to one funded provider by the HTTP account router.
 pub struct WorkFetchRequest {
@@ -71,7 +60,7 @@ pub enum WorkGatewayError {
     Denied(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("resource allowance exhausted: {0}")]
     Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Work backend does not support HTTP Fetch")]
+    #[error("Work backend does not support this application")]
     Unsupported,
     #[error("provider {0} has no HTTP Fetch resource")]
     Provider(EndpointId),
@@ -115,19 +104,19 @@ pub trait WorkExecutionBackend: Send + Sync {
         Err(WorkGatewayError::Unsupported)
     }
 
+    /// Run a rendered text job on a provider admitting Compute. Emitted
+    /// tokens arrive as authenticated prefixes, then the durable completion.
+    fn generate(
+        &self,
+        _job: hellas_client::text::TextJob,
+    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
+        Err(WorkGatewayError::Unsupported)
+    }
+
     /// End-to-end budget, including queued time, advertised to HTTP consumers.
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(300)
     }
-
-    /// Reject incompatible policies before opening a channel. The returned
-    /// operation may stop on HTTP cancellation before a proposal is released;
-    /// afterwards it retains responsibility for collection and funding obligations.
-    /// Prefixes are authenticated as they arrive; completion is durably recorded.
-    fn execute(
-        &self,
-        request: WorkExecutionRequest,
-    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError>;
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>>;
@@ -171,16 +160,9 @@ pub struct GatewayOptions {
     /// Fixed presentation label returned to API clients. It is not sent to an
     /// executor and cannot select trusted execution content.
     pub model_name: String,
-    /// Strict canonical Catena causal-LM manifest and locally checked root
-    /// metadata, bound to an independent caller pin.
-    pub causal_lm: Option<CausalLmExecutionEnvironment>,
-    /// Application-selected tokenizer used only before and after execution.
-    /// It is not part of the Catena environment or Hellas execution claim.
-    pub tokenizer: Option<PathBuf>,
-    /// Explicit local chat format; plain completions remain plain text.
-    pub chat_template: Option<hellas_presentation::ChatTemplate>,
-    /// Application-selected stop IDs sent explicitly with every request.
-    pub stop_token_ids: Vec<u32>,
+    /// Qwen3 GGUF whose rendered program, weights and tokenizer serve the
+    /// text routes; providers must already hold the file.
+    pub text_model: Option<std::path::PathBuf>,
     pub metrics_port: Option<u16>,
     pub responses_backend: ResponsesBackend,
     pub responses_proxy_url: String,
@@ -308,13 +290,6 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     let app = app.layer(access::BearerLayer::new(bearer.clone()));
 
     info!("timeout: {}s", state.inference_timeout.as_secs());
-    if let Some(causal_lm) = state.causal_lm.as_ref() {
-        info!(
-            model = %state.model_name,
-            program_manifest = %causal_lm.manifest_id(),
-            "using configured causal-LM environment"
-        );
-    }
 
     let mut gateway = launch_gateway(
         app,
@@ -581,12 +556,6 @@ mod paid_shutdown_tests {
         fail: bool,
     }
     impl WorkExecutionBackend for Backend {
-        fn execute(
-            &self,
-            _: WorkExecutionRequest,
-        ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
-            unreachable!("shutdown does not submit new work")
-        }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
             Box::pin(async {
                 self.drained.store(true, Ordering::Relaxed);

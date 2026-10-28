@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[macro_use]
 extern crate tracing;
 
@@ -6,14 +8,14 @@ use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "evaluate")]
-mod evaluate;
+mod compute;
 
 mod commands;
 mod identity;
 #[cfg(unix)]
 mod machines;
 mod metrics;
+mod owner;
 mod platform_hardening;
 mod tracing_config;
 
@@ -36,38 +38,12 @@ fn validate_serve_assurance(
     }
 }
 
-/// Loads the identity this command runs under, creating one only where
-/// creating one is what the operator asked for.
-///
-/// Identity queries read the file and create nothing as a side effect: doing
-/// so could race with a running service's own creator. Paid-work commands also read
-/// an existing identity: providers, provisioning, the operator client, and
-/// gateways configured with a paid provider pool. They sign with the stored
-/// identity's key, so the key must be one an operator already made —
-/// `identity init` is where it comes from. Minting one here would give
-/// the node a settlement party nobody has funded and no bond names, and
-/// the first symptom would be a channel that cannot be opened.
-///
-/// # Errors
-///
-/// Whatever the identity file's own loader says, which names the file it
-/// could not read.
+/// Providers and existing authority operations read their identity; requester
+/// commands create a local signing identity on first use.
 fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
 ) -> anyhow::Result<identity::LocalIdentity> {
-    let settles_paid_work = matches!(
-        command,
-        Commands::Serve {
-            work_config_file: Some(_),
-            ..
-        } | Commands::Provision { .. }
-            | Commands::PaidWork { .. }
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
-    );
     let grant_identity = matches!(
         command,
         Commands::Admin(_)
@@ -76,11 +52,7 @@ fn load_command_identity(
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
     );
-    #[cfg(feature = "evaluate")]
-    let grant_identity = grant_identity
-        || matches!(command, Commands::Gateway { evaluation, .. } if evaluation.local);
     let read_only = grant_identity
-        || settles_paid_work
         || matches!(
             command,
             Commands::Identity {
@@ -114,17 +86,6 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     }
 }
 
-/// Execution requires an explicit Work backend; proxy mode has no Hellas peer.
-fn gateway_provider_trust(
-    responses_backend: GatewayResponsesBackend,
-) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    if responses_backend != GatewayResponsesBackend::Proxy {
-        return Err(hellas_client::ClientError::FundingRequired.into());
-    }
-    Ok(None)
-}
-
-/// Caller-selected trust policy for commands that execute on a remote provider.
 #[derive(Args)]
 struct RemoteTrustArgs {
     /// Assurance required for remote execution.
@@ -159,39 +120,6 @@ impl RemoteTrustArgs {
     }
 }
 
-/// One canonical causal-LM route and its untrusted text-presentation boundary.
-#[derive(Args)]
-struct CausalLmArgs {
-    /// Canonical causal-LM environment root. Without --manifest-id, these
-    /// local file bytes are the trust anchor and determine the exact manifest.
-    #[arg(long = "environment", value_name = "FILE")]
-    environment: PathBuf,
-
-    /// Optional caller-selected manifest ContentId for --environment. When
-    /// supplied, the file must derive exactly this ID before any route starts.
-    #[arg(
-        long = "manifest-id",
-        value_name = "CONTENT_ID",
-        value_parser = parse_content_id_hex
-    )]
-    manifest_id: Option<hellas_rpc::ContentId>,
-
-    /// Presentation-only model label. It defaults to the derived manifest ID
-    /// and never enters the manifest, quote, or trusted executor input.
-    #[arg(long = "model", value_name = "NAME")]
-    model: Option<String>,
-
-    /// Tokenizer JSON used only for local text presentation. It is not part of
-    /// the Hellas execution guarantee.
-    #[arg(long = "tokenizer", value_name = "PATH")]
-    tokenizer: PathBuf,
-
-    /// Caller-selected stop token ID. Repeat or comma-separate. No stop tokens
-    /// are inferred from the tokenizer or causal-LM environment.
-    #[arg(long = "stop-token", value_delimiter = ',')]
-    stop_token_ids: Vec<u32>,
-}
-
 #[derive(Parser)]
 #[command(name = "hellas")]
 #[command(version)]
@@ -206,11 +134,8 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
-    /// The software passkey of the principal this command acts for: a file of
-    /// 32 raw bytes or 64 hex digits. Contacts, offers, grant data, gateway
-    /// allowances and passkey administration sessions use it.
-    #[arg(long, global = true)]
-    passkey: Option<PathBuf>,
+    #[command(flatten)]
+    owner: owner::OwnerArgs,
 
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
@@ -287,9 +212,8 @@ enum Commands {
     Admin(commands::admin::AdminArgs),
     /// Run the RPC server
     Serve {
-        #[cfg(feature = "evaluate")]
         #[command(flatten)]
-        evaluation: evaluate::ServeArgs,
+        native: compute::ServeArgs,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -305,9 +229,13 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid-work configuration. Its presence serves WorkSetup and Work;
-        /// Work remains retryably not ready until the configured state mounts.
-        #[arg(long = "work-config")]
+        /// Paid terms (TOML) the selected owner approves at startup. Paid
+        /// work is sold only with this file.
+        #[arg(
+            long = "paid-work-config",
+            value_name = "FILE",
+            conflicts_with = "await_owner"
+        )]
         work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
@@ -349,18 +277,12 @@ enum Commands {
     ///
     /// Every route requires `Authorization: Bearer <token>`. Use
     /// --gateway-profile to select its provisioned Auth authority and credential.
-    /// Hellas routes use the configured causal-LM environment; the shared
-    /// model adapter handles text and tool calls using --tokenizer and
-    /// --chat-template.
-    #[command(
-        mut_arg("environment", |arg| arg
-            .required(false)
-            .required_unless_present_any(["responses_backend", "http_fetch_config", "offer"])
-            .required_if_eq("responses_backend", "hellas")
-            .requires("tokenizer")),
-        mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
-    )]
+    /// Hellas routes run --text-model as paid Compute jobs; the shared model
+    /// adapter handles text and tool calls with the GGUF's tokenizer.
     Gateway {
+        /// Qwen3 GGUF served by the text routes. Providers must already hold it.
+        #[arg(long, value_name = "FILE")]
+        text_model: Option<PathBuf>,
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
         output_cache: hellas_rpc::cache::CachePolicy,
@@ -378,7 +300,7 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         work_profile: Option<PathBuf>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "text_model"])]
         #[arg(requires = "paid_work_config")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
@@ -390,21 +312,14 @@ enum Commands {
         /// Pay a pool of providers using durable on-chain funded work channels.
         #[arg(long = "paid-work-config", value_name = "FILE")]
         paid_work_config: Option<PathBuf>,
-        #[command(flatten)]
-        chain_node: commands::chain_node::ChainNodeArgs,
         /// Private profile selecting the local HTTP authority and scoped credential.
         #[arg(long = "gateway-profile", value_name = "FILE")]
         gateway_profile: Option<PathBuf>,
         /// Allow a non-loopback listener using the provisioned gateway authority.
         #[arg(long)]
         allow_remote: bool,
-        /// Explicit local text-chat template.
-        #[arg(long = "chat-template", value_name = "TEMPLATE")]
-        chat_template: Option<hellas_presentation::ChatTemplate>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
-        #[command(flatten)]
-        causal_lm: Option<CausalLmArgs>,
         /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -418,9 +333,6 @@ enum Commands {
         #[arg(long = "address", value_delimiter = ',')]
         #[arg(requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        #[cfg(feature = "evaluate")]
-        #[command(flatten)]
-        evaluation: evaluate::GatewayArgs,
         /// Max execution retries on failure (discovery mode)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
@@ -478,11 +390,12 @@ enum Commands {
         #[arg(long = "address", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
-    /// Inspect or run the durable paid-work client path.
-    PaidWork {
-        #[command(subcommand)]
-        command: commands::paid_work::PaidWorkCommand,
-    },
+    /// Execute a reusable job folder, or settle its provider channels.
+    Transact(commands::transact::TransactArgs),
+    /// Buy an HTTPS Fetch using the same job and payment path.
+    Fetch(commands::transact::FetchArgs),
+    /// Buy one call of a Catena program using the same job and payment path.
+    Run(commands::transact::RunArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -490,11 +403,6 @@ enum Commands {
         store_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: commands::store::StoreCommand,
-    },
-    /// Build or inspect canonical causal-LM environments.
-    Environment {
-        #[command(subcommand)]
-        command: commands::environment::EnvironmentCommand,
     },
     /// Query or run Hellas chain components
     Chain {
@@ -510,55 +418,6 @@ enum Commands {
     CodexAuth {
         #[command(subcommand)]
         command: CodexAuthCommand,
-    },
-    /// Make one of this provider's bond offers, so its client has something to
-    /// answer
-    ///
-    /// A node serves `WorkSetup` from the setup journals under its work
-    /// root and creates none, so a fresh provider offers nothing however
-    /// well it is configured. This signs one bond and journals it, and
-    /// returns only once the runner's own replay of that journal finds
-    /// it. A root may hold several offers only when their configured routes,
-    /// bonds, and every staked coin are pairwise disjoint.
-    Provision {
-        #[command(flatten)]
-        chain_node: commands::chain_node::ChainNodeArgs,
-        /// The paid-work configuration this offer is made under
-        #[arg(long = "work-config")]
-        work_config: PathBuf,
-        /// Existing node grant configuration; its authority must already be bootstrapped.
-        #[arg(long = "grant-config")]
-        grant_config: PathBuf,
-        /// Alias of an already imported, verified client contact.
-        #[arg(long)]
-        client_contact: String,
-        /// The client node signer this bond names as taker, hex-encoded.
-        #[arg(long = "client")]
-        client: String,
-        /// Return the provider's stake without delegating it back to this node.
-        #[arg(long)]
-        lock_provider_payout: bool,
-        /// A coin this provider stakes, hex-encoded. Repeat it for each
-        /// coin; the stake is the provider's alone, so none of these is
-        /// the client's.
-        #[arg(long = "stake-coin", required = true)]
-        stake_coin: Vec<String>,
-        /// Height the bond expires at, which is also the admission
-        /// horizon of the channel it insures
-        #[arg(long = "bond-timeout")]
-        bond_timeout: u64,
-        /// What the bond's timeout returns to this provider. Consensus
-        /// requires it to be the staked edge's close value exactly, and
-        /// refuses the open otherwise.
-        #[arg(long = "timeout-payout")]
-        timeout_payout: u64,
-        /// The largest job price this bond covers
-        #[arg(long = "max-job-price")]
-        max_job_price: u64,
-        /// Print the bond edge using the existing authority and contact,
-        /// before opening paid-work journals or connecting to validators.
-        #[arg(long = "print-bond-only")]
-        print_bond_only: bool,
     },
     /// Discover peers and log network events
     Monitor {
@@ -589,7 +448,6 @@ fn validate_identity_options(
             command: commands::contributions::OfferCommand::Import { .. },
         } => Some("offer import"),
         Commands::Store { .. } => Some("store"),
-        Commands::Environment { .. } => Some("environment"),
         Commands::Serve {
             check_config: true, ..
         } => Some("serve --check-config"),
@@ -624,16 +482,6 @@ fn validate_identity_options(
                     | IdentityCommand::ShowHolder
                     | IdentityCommand::ExportEnrollment { .. },
             }
-            | Commands::Serve {
-                work_config_file: Some(_),
-                ..
-            }
-            | Commands::Provision { .. }
-            | Commands::PaidWork { .. }
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
     );
     if software_root && reads_existing_identity {
         return Err(
@@ -649,12 +497,11 @@ fn main() {
     // must run before Tokio creates worker threads and before clap, tracing,
     // or any stdout-producing command so the child speaks only Catena's worker
     // protocol on stdout.
-    #[cfg(feature = "evaluate")]
-    match catena_lang::safe_gpu::run_worker_if_requested() {
+    match hellas_executor::child_main() {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
-            eprintln!("error: failed to start Catena GPU worker: {error}");
+            eprintln!("error: failed to start Catena worker: {error}");
             std::process::exit(1);
         }
     }
@@ -726,6 +573,33 @@ async fn async_main() {
         return;
     }
 
+    // A selected faucet account stays with this identity across restarts.
+    let persistent_owner = matches!(
+        &cli.command,
+        Commands::Serve { .. }
+            | Commands::Transact(_)
+            | Commands::Fetch(_)
+            | Commands::Run(_)
+            | Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
+            }
+    );
+    let owner = match if persistent_owner {
+        cli.owner.load_persistent(cli.identity.as_deref())
+    } else {
+        cli.owner.load()
+    } {
+        Ok(owner) => owner,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    let passkey = owner
+        .as_ref()
+        .map(|key| key as &dyn hellas_authority::authenticator::Authenticator);
+
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {
             CodexAuthCommand::Login { auth_path } => {
@@ -783,14 +657,6 @@ async fn async_main() {
             command: commands::contributions::OfferCommand::Import { .. },
         }) => {
             let result: anyhow::Result<()> = async {
-                let passkey = cli
-                    .passkey
-                    .as_deref()
-                    .map(commands::chain::passkey)
-                    .transpose()?;
-                let passkey = passkey
-                    .as_ref()
-                    .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
                 match command {
                     Commands::Contact { command } => {
                         commands::contributions::contact(command, passkey).await
@@ -818,21 +684,12 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Environment { command } => {
-            let result = commands::environment::run(command).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         command => command,
     };
 
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command, cli.passkey.as_deref()).await;
+            let result = commands::chain::run(command, owner.as_ref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -853,21 +710,6 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
-    let passkey = match cli
-        .passkey
-        .as_deref()
-        .map(commands::chain::passkey)
-        .transpose()
-    {
-        Ok(passkey) => passkey,
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-    };
-    let passkey = passkey
-        .as_ref()
-        .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
             cli.software_root,
@@ -889,8 +731,7 @@ async fn async_main() {
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
         Commands::Serve {
-            #[cfg(feature = "evaluate")]
-            evaluation,
+            native,
             assurance,
             port,
             no_discovery,
@@ -911,11 +752,19 @@ async fn async_main() {
             // ALPNs and then have nothing to mount behind them.
             match work_config_file
                 .as_deref()
-                .map(commands::serve::load_work_config)
+                .map(|path| {
+                    commands::serve::paid::PaidWork::load(
+                        path,
+                        identity::provider_root(cli.identity.as_deref())?,
+                        owner.clone().ok_or_else(|| {
+                            anyhow::anyhow!("--paid-work-config requires --passkey, --faucet or --faucet-account")
+                        })?,
+                    )
+                })
                 .transpose()
             {
-                Err(error) => Err(error.into()),
-                Ok(work_config) => {
+                Err(error) => Err(error),
+                Ok(paid) => {
                     async {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
@@ -956,9 +805,8 @@ async fn async_main() {
                             port,
                             discovery: !no_discovery,
                             queue_size,
-                            #[cfg(feature = "evaluate")]
-                            evaluation,
-                            work_config,
+                            native,
+                            paid,
                             chain_node,
                             grants,
                             metrics_port,
@@ -978,47 +826,8 @@ async fn async_main() {
                 }
             }
         }
-        Commands::Provision {
-            chain_node,
-            work_config,
-            grant_config,
-            client_contact,
-            client,
-            lock_provider_payout,
-            stake_coin,
-            bond_timeout,
-            timeout_payout,
-            max_job_price,
-            print_bond_only,
-        } => match commands::serve::load_work_config(&work_config) {
-            Err(error) => Err(error.into()),
-            Ok(work_config) => async {
-                let authority = identity::open_authority(
-                    &grant_config, passkey.map(commands::contributions::principal).transpose()?,
-                ).await?;
-                let contact = commands::contributions::load_contact(authority.owner().await?, &client_contact)?;
-                commands::serve::run_provision(commands::serve::ProvisionOptions {
-                    work_config,
-                    // The bond is staked by the party this node already
-                    // settles as, taken from the identity loaded above
-                    // and never made here.
-                    settlement_key: identity::settlement_signer(&local_identity)?,
-                    provider: local_identity.enrollment.clone(),
-                    addresses: Vec::new(),
-                    client: contact,
-                    client_node: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
-                    redelegate_payout: !lock_provider_payout,
-                    stake_coins: stake_coin.iter().map(|coin| {
-                        commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
-                    }).collect::<anyhow::Result<_>>()?,
-                    bond_timeout,
-                    timeout_payout,
-                    max_job_price,
-                }, print_bond_only, chain_node, authority)
-                .await
-            }.await
-        },
         Commands::Gateway {
+            text_model,
             output_cache,
             store_dir,
             offer,
@@ -1028,18 +837,13 @@ async fn async_main() {
             archive_dir,
             zdr,
             paid_work_config,
-            chain_node,
             gateway_profile,
             allow_remote,
-            chat_template,
             remote_trust,
-            causal_lm,
             host,
             port,
             node_id,
             node_addrs,
-            #[cfg(feature = "evaluate")]
-            evaluation,
             retries,
             default_max_tokens,
             metrics_port,
@@ -1054,37 +858,10 @@ async fn async_main() {
             wrap_args,
         } => {
             async {
-                #[cfg(feature = "evaluate")]
-                let local_content = causal_lm.as_ref().map(|args| evaluation.content(args, store_dir.as_deref()));
                 let cache_options =
                     commands::gateway_cache::options(output_cache, store_dir.clone())?;
-                let (
-                    loaded_environment,
-                    model_name,
-                    tokenizer,
-                    stop_token_ids,
-                ) = if let Some(CausalLmArgs {
-                    environment,
-                    manifest_id,
-                    model,
-                    tokenizer,
-                    stop_token_ids,
-                }) = causal_lm
-                {
-                    let loaded_environment =
-                        commands::llm::load_environment(&environment, manifest_id)?;
-                    let model_name = model.unwrap_or_else(|| {
-                        loaded_environment.execution().manifest_id().to_string()
-                    });
-                    (
-                        Some(loaded_environment.into_execution()),
-                        model_name,
-                        Some(tokenizer),
-                        stop_token_ids,
-                    )
-                } else {
-                    (None, String::new(), None, Vec::new())
-                };
+                let model_name = text_model.as_deref().and_then(Path::file_stem)
+                    .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
                 let assurance = remote_trust.assurance;
                 let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
                     .transpose()?.map(std::sync::Arc::new);
@@ -1102,20 +879,10 @@ async fn async_main() {
                     Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
                         hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
                 } else { None };
-                #[cfg(feature = "evaluate")]
-                let (grant_source, grant_policy) = if evaluation.local && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    anyhow::ensure!(responses_backend == GatewayResponsesBackend::Hellas, "--local requires the Hellas execution backend");
-                    anyhow::ensure!(grant_policy.as_deref().is_none_or(|name| name == "local"), "the local resource is named local");
-                    anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
-                    (Some(commands::grant_gateway::local::prepare(
-                        local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
-                        &local_identity, commands::contributions::require_principal(passkey)?, work_application()?, remote_trust.load()?,
-                    ).await?), Some("local".into()))
-                } else { (grant_source, grant_policy) };
                 if let Some((session, _)) = grant_source.as_ref()
                     && hellas_sdk::grant_gateway::responses::selected_policy(&session.target, grant_policy.as_deref())?.is_some()
                 {
-                    anyhow::ensure!(paid_work_config.is_none() && loaded_environment.is_none(), "Responses grants require their own Fetch gateway");
+                    anyhow::ensure!(paid_work_config.is_none(), "Responses grants require their own Fetch gateway");
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
                     anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
                     let hellas_sdk::node_control::profile::GatewayHost { access, control, .. } = hellas_sdk::node_control::profile::GatewayProfile::load(
@@ -1151,19 +918,20 @@ async fn async_main() {
                         "token-native paid work uses producer-signed assurance");
                     Some(hellas_sdk::paid_gateway::load_pool_options(path, assurance)?)
                 } else { None };
-                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: _ } = hellas_sdk::node_control::profile::GatewayProfile::load(
                     gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
                 ).await?;
-                let mut chain_shutdown = None;
                 let paid_work = if let Some(options) = paid_options {
-                    let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
-                    chain_shutdown = Some(node.clone());
+                    let passkey = owner.clone().ok_or_else(|| anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account"))?;
+                    let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
+                        std::sync::Arc::new(passkey), identity::settlement_signer(&local_identity)?.party_key(),
+                        &identity::funding_root(cli.identity.as_deref())?,
+                    )?);
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
                             options,
                             hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
-                            node,
-                            authority,
+                            payer,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
@@ -1177,13 +945,7 @@ async fn async_main() {
                 let paid_work = grant_gateway.as_ref().map(|backend| backend.clone() as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>).or(paid_work);
                 let shutdown = paid_work.clone();
                 let result = async {
-                let provider_trust = if paid_work.is_some()
-                    || output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly
-                {
-                    None
-                } else {
-                    gateway_provider_trust(responses_backend)?
-                };
+                let provider_trust = None;
                 let archive = hellas_gateway::ArchiveOptions {
                     directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
                     zdr,
@@ -1191,9 +953,9 @@ async fn async_main() {
                 let http_config = if let Some(path) = http_fetch_config {
                     let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
                     Some(serde_json::from_slice(&bytes)?)
-                } else if loaded_environment.is_none() {
+                } else {
                     grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
-                } else { None };
+                };
                 let served = async {
                 if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
@@ -1211,17 +973,14 @@ async fn async_main() {
                     paid_work,
                     access: gateway_access,
             allow_remote,
-                    chat_template,
-                    host,
+                            host,
                     port,
                     node_id,
                     node_addrs,
                     retries,
                     default_max_tokens,
                     model_name,
-                    causal_lm: loaded_environment,
-                    tokenizer,
-                    stop_token_ids,
+                    text_model,
                     metrics_port,
                     responses_backend: responses_backend.into(),
                     responses_proxy_url,
@@ -1249,9 +1008,6 @@ async fn async_main() {
                 if let Some(backend) = shutdown {
                     result = result.and(backend.drain().await.map_err(anyhow::Error::from));
                 }
-                if let Some(node) = chain_shutdown {
-                    result = result.and(node.shutdown().await.map_err(anyhow::Error::from));
-                }
                 result
             }
             .await
@@ -1260,28 +1016,21 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::PaidWork { command } => match identity::settlement_signer(&local_identity) {
-            Ok(settlement_key) => async {
-                commands::paid_work::run(
-                    command,
-                    secret_key,
-                    settlement_key,
-                    local_identity.node_key.clone(),
-                    passkey.map(commands::contributions::principal).transpose()?,
-                )
-                .await
-            }.await,
-            Err(error) => Err(error),
-        },
+        Commands::Transact(args) => async {
+            commands::transact::run(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
+        Commands::Fetch(args) => async {
+            commands::transact::fetch(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
+        Commands::Run(args) => async {
+            commands::transact::run_program(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
+        }.await,
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(unix)]
         Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
-        }
-        Commands::Environment { .. } => {
-            unreachable!("environment commands handled before identity load")
         }
         Commands::Identity { command } => match command {
             IdentityCommand::Init => Ok(()),

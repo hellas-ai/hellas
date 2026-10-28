@@ -3,14 +3,14 @@ use crate::{
     grant_client::{GrantSessionOptions, GrantTransport, PinnedOffer},
     grant_gateway::GrantGateway,
 };
+use hellas_authority::model::grant::records::grant_transport;
 use hellas_gateway::GatewayHandle;
-use hellas_work::model::grant::records::grant_transport;
-use hellas_work::model::{
-    fetch::FetchRoutePolicy,
-    grant::records::{GrantError, GrantPolicy},
-    profile::WorkPolicy,
-};
 use std::sync::Arc;
+use {
+    hellas_authority::model::grant::records::GrantError,
+    hellas_authority::model::grant::records::GrantPolicy,
+    hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchGatewayError {
@@ -52,7 +52,7 @@ pub fn selected_policy<'a>(
         .filter(|p| name.is_none_or(|name| name == p.name));
     let response = |p: &&GrantPolicy| {
         p.https.is_none()
-            && matches!(&p.work, WorkPolicy::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1)
+            && p.invocation_policy.admissions.iter().any(|a| matches!(a, Admission::Fetch { admission } if admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1))
     };
     let Some(policy) = candidates.clone().find(response) else {
         return Ok(None);
@@ -70,13 +70,22 @@ pub async fn start_fetch(
 ) -> Result<GatewayHandle, FetchGatewayError> {
     let policy = selected_policy(&options.session.target, options.policy.as_deref())?
         .ok_or(GrantError::OutOfScope)?;
-    let WorkPolicy::Fetch {
-        route: FetchRoutePolicy::SealedRoute { service, method },
-        ..
-    } = &policy.work
-    else {
-        return Err(GrantError::OutOfScope.into());
-    };
+    let (service, method) = policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .find_map(|a| match a {
+            Admission::Fetch { admission }
+                if admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
+            {
+                match &admission.route {
+                    FetchRoutePolicy::SealedRoute { service, method } => Some((service, method)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .ok_or(GrantError::OutOfScope)?;
     let (name, service, method) = (policy.name.clone(), service.clone(), method.clone());
     let provider =
         iroh::EndpointId::from_bytes(&grant_transport(&options.session.target.offer().provider)?)?;

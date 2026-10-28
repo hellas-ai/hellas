@@ -218,7 +218,7 @@ fn input_event_field_mutations_are_rejected() {
     let mutations: Mutations<InputEventBodyParts> = vec![
         (
             "scheme",
-            Box::new(|p| p.scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned)),
+            Box::new(|p| p.scheme = scheme_id(Operation::Invoke, Assurance::ProducerSigned)),
         ),
         ("sequence", Box::new(|p| p.sequence += 1)),
         (
@@ -254,7 +254,7 @@ fn output_event_field_mutations_are_rejected() {
     let mutations: Mutations<OutputEventBodyParts> = vec![
         (
             "scheme",
-            Box::new(|p| p.scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned)),
+            Box::new(|p| p.scheme = scheme_id(Operation::Invoke, Assurance::ProducerSigned)),
         ),
         (
             "input",
@@ -494,7 +494,7 @@ fn input_event_commitment_vector_pinned() {
 #[test]
 fn input_and_output_signature_preimages_cannot_meet() {
     let signer = key(1);
-    let scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned);
+    let scheme = scheme_id(Operation::Invoke, Assurance::ProducerSigned);
     let previous_event = EventCommitment::from_canonical_bytes(b"shared previous");
     let payload = Digest::hash(b"shared payload");
     let canonicalization = canon("shared.canonicalizer");

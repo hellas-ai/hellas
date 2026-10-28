@@ -117,9 +117,9 @@ let
     set -eu
     umask 077
     printf '%s' ${gatewayAuthority.passkey} > ./operator.passkey
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity --software-root identity init
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity identity show-holder > ./holder.json
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity --passkey ./operator.passkey \
+    ${package}/bin/hellas --identity ./bootstrap.identity --software-root identity init
+    ${package}/bin/hellas --identity ./bootstrap.identity identity show-holder > ./holder.json
+    ${package}/bin/hellas --identity ./bootstrap.identity --passkey ./operator.passkey \
       admin bootstrap \
       --root-grant 00000000000000000000000000000000 --journal ./http-authority \
       --administrator ${pkgs.writeText "gateway-admin.json" (builtins.toJSON gatewayAuthority.administrator)} \
@@ -192,7 +192,7 @@ let
       import time
       import tomllib
 
-      cli = "${validatorPackage}/bin/hellas-cli"
+      cli = "${validatorPackage}/bin/hellas"
       trust_args = "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
       follower_api = "http://127.0.0.1:31247/api/v1/blocks"
@@ -291,16 +291,14 @@ in
         (mkBaseNode package)
         {
           systemd.tmpfiles.rules = [
-            # The test creates its Catena program and canonical environments
-            # after the VM has booted.  Keeping only an empty runtime root here
-            # proves the provider did not receive a model/environment through
-            # Nix evaluation or the store.
+            # Keeping only an empty runtime root here proves the provider did
+            # not receive a model through Nix evaluation or the store.
             "d /srv/hellas-content 0755 root root -"
           ];
           systemd.services.hellas-monitor = {
             environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
             serviceConfig = {
-              ExecStart = "${package}/bin/hellas-cli --identity /tmp/hellas-monitor.key monitor";
+              ExecStart = "${package}/bin/hellas --identity /tmp/hellas-monitor.key monitor";
               KillSignal = "SIGINT";
               StandardOutput = "file:/tmp/hellas-monitor.log";
               StandardError = "inherit";
@@ -319,10 +317,6 @@ in
             gpuSessionPrograms = 3;
             gpuSessionAssetBytes = 1073741824;
             memoryMaxBytes = 1879048192;
-            gpuMaxGenerationCapacity = 4096;
-            gpuMaxGenerationDeviceBytes = 536870912;
-            gpuCompileTimeoutSeconds = 600;
-            gpuExecutionTimeoutSeconds = 900;
             fetchMaxInFlight = 2;
             fetchQueueSize = 3;
             graffiti = "e2e-discovery";
@@ -337,48 +331,7 @@ in
       machine.wait_for_unit("hellas.service")
       machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
 
-      # Materialize three previously unknown environments entirely at VM
-      # runtime. All canonical roots are adopted from the configured content
-      # root on restart. The admitted case has both its program and weights;
-      # the two refusal cases independently omit one of them.
-      machine.succeed(
-          "systemctl stop hellas.service; "
-          "install -d -m 0755 /var/lib/hellas-e2e; "
-          "nonce=$(tr -d - < /proc/sys/kernel/random/uuid); "
-          "printf 'not-valid-catena-%s\\n' \"$nonce\" > /srv/hellas-content/arbitrary.hex; "
-          "printf 'also-not-valid-catena-%s\\n' \"$nonce\" > /var/lib/hellas-e2e/missing.hex; "
-          "printf 'runtime-only-weights-%s' \"$nonce\" > /srv/hellas-content/weights.bin; "
-          "printf 'missing-runtime-weights-%s' \"$nonce\" > /var/lib/hellas-e2e/missing-weights.bin; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/srv/hellas-content/weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/environment.toml; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/var/lib/hellas-e2e/missing-weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/missing-static.toml; "
-          "printf '%s\\n' "
-          "'{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Whitespace\"},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"hello\":0,\"world\":1,\"<unk>\":2},\"unk_token\":\"<unk>\"}}' "
-          "> /var/lib/hellas-e2e/tokenizer.json; "
-          "${package}/bin/hellas-cli environment build "
-          "--program /srv/hellas-content/arbitrary.hex "
-          "--settings /var/lib/hellas-e2e/environment.toml "
-          "--out /srv/hellas-content/arbitrary.environment; "
-          "${package}/bin/hellas-cli environment build "
-          "--program /var/lib/hellas-e2e/missing.hex "
-          "--settings /var/lib/hellas-e2e/environment.toml "
-          "--out /srv/hellas-content/missing-program.environment; "
-          "${package}/bin/hellas-cli environment build "
-          "--program /srv/hellas-content/arbitrary.hex "
-          "--settings /var/lib/hellas-e2e/missing-static.toml "
-          "--out /srv/hellas-content/missing-static.environment; "
-          "chmod 0444 /srv/hellas-content/* /var/lib/hellas-e2e/*; "
-          "chmod 0555 /srv/hellas-content; "
-          "systemctl start hellas.service"
-      )
-      machine.wait_for_unit("hellas.service")
-      machine.succeed("test -s /var/lib/hellas/content-index.bin")
-
-      # Readiness remains a local content check, independent of execution funding.
-      verifier = "${package}/bin/hellas-cli environment verify --content-root /srv/hellas-content --content-index /var/lib/hellas-e2e/verify-index.bin"
-      machine.succeed(f"{verifier} --environment /srv/hellas-content/arbitrary.environment")
-      for missing in ["missing-program", "missing-static"]:
-          machine.fail(f"{verifier} --environment /srv/hellas-content/{missing}.environment")
-      machine.fail("${package}/bin/hellas-cli llm --help")
+      machine.fail("${package}/bin/hellas llm --help")
 
       unit = machine.succeed(
           "systemctl show hellas.service "
@@ -392,10 +345,6 @@ in
       assert "MemoryMax=1879048192" in unit
       assert "MemorySwapMax=0" in unit
       assert "OOMPolicy=kill" in unit
-      assert "--gpu-max-generation-capacity 4096" in unit
-      assert "--gpu-max-generation-device-bytes 536870912" in unit
-      assert "--gpu-compile-timeout-secs 600" in unit
-      assert "--gpu-execution-timeout-secs 900" in unit
       assert "TMPDIR=/run/hellas" in unit
       machine.succeed(
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.oom.group)\" = 1"
@@ -466,8 +415,7 @@ in
       unit = gateway.succeed("systemctl show hellas-gateway.service --property=Environment --property=ExecStart")
       assert "--responses-backend proxy" in unit
       assert "--responses-proxy-url http://127.0.0.1:18080/v1/responses" in unit
-      assert "--environment" not in unit
-      assert "--tokenizer" not in unit
+      assert "--text-model" not in unit
       assert "TMPDIR=/var/cache/hellas-gateway" not in unit
       gateway.wait_for_open_port(${toString gatewayPort})
       gateway.wait_until_succeeds("test -e /var/lib/hellas-gateway/probed")

@@ -499,10 +499,8 @@ fn special_addresses_never_qualify_as_public_egress() {
 #[tokio::test]
 async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     use hellas_auth::ProducerSigningKey;
-    use hellas_rpc::fetch::{
-        FetchOutputTranscriptBuilder, build_input_events_with_retention, verify_input_events,
-        verify_output_events,
-    };
+    use hellas_rpc::fetch::{build_input_events_with_retention, verify_input_events};
+    use hellas_rpc::protocol::invocation::{InvocationRequest, fetch, output};
     use hellas_rpc::{Assurance, Retention};
     const SECRET: &str = "Bearer provider-only-demo-key";
     let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
@@ -573,17 +571,32 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         ProjectedFetch::Terminal(bytes) => bytes,
         _ => panic!("terminal"),
     };
-    let mut output =
-        FetchOutputTranscriptBuilder::new(input.input_commitment, input.assurance, &seller);
-    for event in projected {
-        let ProjectedFetch::Event(bytes) = event else {
-            panic!("event")
-        };
-        output.push_event(bytes).unwrap();
-    }
-    let output_events = output.finish(terminal).unwrap();
-    let verified =
-        verify_output_events(input.input_commitment, input.assurance, &output_events).unwrap();
+    let events = projected
+        .into_iter()
+        .map(|event| {
+            let ProjectedFetch::Event(bytes) = event else {
+                panic!("event")
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+    let invocation = InvocationRequest {
+        execution_environment: input.execution_environment,
+        input: hellas_rpc::ContentId::hash(b"provider secret fixture"),
+        runner_public_key: seller.public_key(),
+        nonce: [7; 32],
+        assurance: input.assurance,
+        retain: false,
+    };
+    let output_events = fetch::output(&events, &terminal)
+        .unwrap()
+        .sign(&invocation, &seller, 1024)
+        .unwrap();
+    let verified = fetch::decode_output(
+        &output::verify(&invocation, &seller.public_key(), &output_events, 1 << 20).unwrap(),
+        &seller.public_key(),
+    )
+    .unwrap();
     let delivered =
         hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &verified).unwrap();
     assert_eq!(delivered.body, b"upstream response");

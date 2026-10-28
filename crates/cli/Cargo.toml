@@ -11,17 +11,14 @@ documentation.workspace = true
 hellas-cloud.workspace = true
 libc = "0.2"
 
+[[bin]]
+name = "hellas"
+path = "src/main.rs"
+
 [features]
 default = []
 test-support = ["hellas-cloud/test-support"]
 
-# Local model execution additionally compiles Catena and the native evaluator.
-evaluate = [
-    "dep:catena-lang",
-    "dep:commonware-runtime",
-    "hellas-gateway/evaluate",
-    "hellas-executor/evaluate",
-]
 indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
 
@@ -47,19 +44,19 @@ anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 base64.workspace = true
-catena-lang = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
-commonware-runtime = { workspace = true, optional = true }
 futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
+hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "client",
     "proof-verify",
     "work-watcher",
 ] }
-hellas-client = { workspace = true, features = ["iroh", "work", "evaluate"] }
+hellas-channel = { workspace = true }
+hellas-client = { workspace = true, features = ["iroh", "work"] }
 hellas-executor = { workspace = true, default-features = false }
 hellas-gateway.workspace = true
 hellas-kernel = { workspace = true, default-features = false, features = [
@@ -82,7 +79,6 @@ hellas-wire = { workspace = true, features = [
     "discovery-dht",
     "discovery-mdns",
 ] }
-hellas-work = { workspace = true }
 hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
@@ -110,9 +106,12 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
-hellas-chain = { workspace = true, features = ["client"] }
+commonware-cryptography.workspace = true
+commonware-runtime.workspace = true
+hellas-authority = { workspace = true, features = ["test-support"] }
+hellas-chain = { workspace = true, features = ["client", "test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
-hellas-work = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [

@@ -25,6 +25,14 @@ use tokio::sync::watch;
 pub(crate) mod replication;
 pub(crate) mod transport;
 pub use transport::FullNode;
+
+/// One bounded ChainSync recovery cycle: idle subscription, maximum retry,
+/// connection and subscription establishment.
+pub const RECOVERY_TIMEOUT: std::time::Duration = replication::STREAM_IDLE_TIMEOUT
+    .saturating_add(std::time::Duration::from_millis(
+        replication::MAX_RETRY_DELAY_MS,
+    ))
+    .saturating_add(replication::TIMEOUT.saturating_mul(2));
 #[cfg(feature = "validator")]
 pub(crate) use transport::serve_validator_archive;
 
@@ -95,6 +103,8 @@ impl Config {
 
 #[derive(Default)]
 pub(crate) struct Readiness {
+    #[cfg(feature = "test-support")]
+    pub(crate) read_attempts: AtomicU64,
     seen: AtomicU64,
     pub(crate) applied: AtomicU64,
     observed: AtomicBool,
@@ -110,6 +120,8 @@ impl Readiness {
         Ok(())
     }
     pub(crate) fn check(&self) -> Result<(), QueryError> {
+        #[cfg(feature = "test-support")]
+        self.read_attempts.fetch_add(1, Ordering::AcqRel);
         self.running()?;
         if !self.observed.load(Ordering::Acquire)
             || self.applied.load(Ordering::Acquire) < self.seen.load(Ordering::Acquire)

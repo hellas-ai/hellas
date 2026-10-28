@@ -13,10 +13,13 @@ futures = { workspace = true }
 futures-core = { workspace = true }
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth = { workspace = true }
+hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "full-node",
+    "proof-verify",
     "work-watcher",
 ] }
+hellas-channel = { workspace = true }
 hellas-client = { workspace = true, features = ["iroh", "work"] }
 hellas-executor = { workspace = true, default-features = false }
 hellas-gateway = { workspace = true }
@@ -32,6 +35,7 @@ hellas-rpc = { workspace = true, features = [
     "work",
     "host-control",
 ] }
+hellas-store.workspace = true
 hellas-wire = { workspace = true, features = [
     "mux",
     "iroh",
@@ -39,7 +43,6 @@ hellas-wire = { workspace = true, features = [
     "tls",
     "discovery-mdns",
 ] }
-hellas-work = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true, features = ["tls-ring"] }
 iroh-mdns-address-lookup = { workspace = true }
@@ -56,6 +59,7 @@ subtle = "2"
 tempfile = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
+toml.workspace = true
 tracing = { workspace = true }
 url = { version = "2" }
 zeroize = { version = "1.9" }
@@ -64,10 +68,15 @@ zeroize = { version = "1.9" }
 async-trait = "0.1"
 base64.workspace = true
 bytes.workspace = true
+catena-lang.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
-hellas-work = { workspace = true, features = ["test-support"] }
+ctor = "1"
+hellas-authority = { workspace = true, features = ["test-support"] }
+hellas-chain = { workspace = true, features = ["test-support"] }
+hellas-channel = { workspace = true, features = ["test-support"] }
+libloading = "0.9"
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [
@@ -80,4 +89,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
 ] }
+tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true

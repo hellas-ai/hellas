@@ -1,0 +1,24 @@
+event: response.created
+data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"queued"},"sequence_number":0,"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"in_progress"},"sequence_number":1,"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"in_progress","type":"function_call"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"city\":","item_id":"call-fixture","output_index":0,"sequence_number":3,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\"Zürich\"}","item_id":"call-fixture","output_index":0,"sequence_number":4,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"city\":\"Zürich\"}","item_id":"call-fixture","output_index":0,"sequence_number":5,"type":"response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"city\":\"Zürich\"}","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"completed","type":"function_call"},"output_index":0,"sequence_number":6,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[{"arguments":"{\"city\":\"Zürich\"}","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}},"sequence_number":7,"type":"response.completed"}
+

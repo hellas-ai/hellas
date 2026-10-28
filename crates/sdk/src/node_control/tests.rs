@@ -7,52 +7,54 @@ mod lifecycle;
 mod local;
 mod remote;
 mod sessions;
-use hellas_rpc::authentication::{decode_challenge, encode_response};
-use hellas_rpc::protocol::value::decode_dag_cbor;
-use hellas_work::model::grant::budget::{Limit, Meter, Window};
-use hellas_work::test_support::{
-    Actor,
-    actors::{OPERATOR, ROOT},
-    ids::ROOT_GRANT,
-};
-use hellas_work::{
+use hellas_authority::model::grant::budget::{Limit, Meter, Window};
+use hellas_authority::{
     node::{HOST_STATUS, WORK_CAPACITY_CONFIGURE, host_resource, machine_resource},
     work_store::grant::NodeStore,
 };
+use hellas_rpc::authentication::{decode_challenge, encode_response};
+use hellas_rpc::protocol::value::decode_dag_cbor;
 use iroh::{
     Endpoint, EndpointAddr, SecretKey, TransportAddr,
     endpoint::{RecvStream, SendStream, presets},
 };
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use {
+    hellas_authority::test_support::ids::ROOT_GRANT, hellas_channel::test_support::Actor,
+    hellas_channel::test_support::actors::OPERATOR, hellas_channel::test_support::actors::ROOT,
+};
 
 fn authority() -> AuthorityId {
-    hellas_work::test_support::authority()
+    hellas_authority::test_support::authority()
 }
 fn scope(actor: Actor) -> GrantSpec {
     let authority = authority();
-    hellas_work::test_support::common_node::admin_spec(
+    hellas_authority::test_support::common_node::admin_spec(
         authority,
         actor.principal(),
         &[
             (HOST_STATUS, host_resource(authority)),
             (
-                hellas_work::node::HOST_PROVIDER_CONFIGURE,
+                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
                 host_resource(authority),
             ),
             (
-                hellas_work::node::HOST_GATEWAY_CONFIGURE,
+                hellas_authority::node::HOST_GATEWAY_CONFIGURE,
                 host_resource(authority),
             ),
             (
-                hellas_work::node::HOST_GATEWAY_ACCESS,
+                hellas_authority::node::HOST_GATEWAY_ACCESS,
                 host_resource(authority),
             ),
             (
-                hellas_work::node::HOST_PROVIDER_BIND,
+                hellas_authority::node::HOST_PROVIDER_BIND,
                 host_resource(authority),
             ),
-            (hellas_work::node::GATEWAY_INVOKE, host_resource(authority)),
+            (
+                hellas_authority::node::GATEWAY_INVOKE,
+                host_resource(authority),
+            ),
             (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
         ],
         (UnixMillis(1000), UnixMillis(1_000_000)),
@@ -68,7 +70,7 @@ struct Fixture {
 }
 async fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
-    let world = hellas_work::test_support::Node::bootstrap(directory.path())
+    let world = hellas_authority::test_support::Node::bootstrap(directory.path())
         .with_provider(crate::test_support::provider_enrollment())
         .build()
         .await;

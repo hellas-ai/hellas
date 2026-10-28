@@ -172,7 +172,7 @@ async fn codex_requests_and_refresh_reject_operator_interception() {
             module_path!(),
             "::codex_requests_and_refresh_reject_operator_interception"
         )
-        .trim_start_matches("hellas_cli::"),
+        .trim_start_matches("hellas::"),
         2,
         |url| async move {
             let dir = tempfile::tempdir().unwrap();

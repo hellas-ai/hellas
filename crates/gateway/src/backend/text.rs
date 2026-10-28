@@ -25,7 +25,7 @@ pub(super) fn text_events(
                     for event in tools.feed(&delta).map_err(|error| BackendError::failed(error.to_string()))? { yield event; }
                 }
                 Ok(Some(Ok(GenerationEvent::Done(Outcome::Completed {
-                    total_tokens,
+                    output_tokens,
                     stop_reason,
                     text_artifact,
                     ..
@@ -33,7 +33,7 @@ pub(super) fn text_events(
                     info!(
                         %text_artifact,
                         provenance = ?stream_provenance,
-                        total_tokens,
+                        output_tokens,
                         ?stop_reason,
                         "gateway stream ready"
                     );
@@ -43,7 +43,7 @@ pub(super) fn text_events(
                     for event in tools.finish(stop_reason_from_runtime(stop_reason)).map_err(|error| BackendError::failed(error.to_string()))? { yield event; }
                     yield OutputEvent::Finished {
                         stop_reason: if tools.called() { hellas_adaptors::StopReason::ToolCall } else { stop_reason_from_runtime(stop_reason) },
-                        usage: Some(usage(prompt_tokens, total_tokens)),
+                        usage: Some(usage(prompt_tokens, output_tokens)),
                     };
                     return;
                 }
