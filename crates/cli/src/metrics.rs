@@ -7,12 +7,10 @@ use tracing::info;
 #[derive(Default)]
 pub struct MetricsBundle {
     pub registry: prometheus::Registry,
-    #[cfg(feature = "otel")]
     iroh: Option<tokio::sync::watch::Receiver<Option<iroh::Endpoint>>>,
 }
 
 impl MetricsBundle {
-    #[cfg(feature = "otel")]
     pub fn with_iroh(mut self, iroh: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>) -> Self {
         self.iroh = Some(iroh);
         self
@@ -66,7 +64,6 @@ fn encode_metrics(bundle: &MetricsBundle) -> anyhow::Result<String> {
     Ok(buf)
 }
 
-#[cfg(feature = "otel")]
 fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) -> std::fmt::Result {
     let Some(iroh) = bundle.iroh.as_ref() else {
         return Ok(());
@@ -100,10 +97,5 @@ fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) -> std::fmt::Re
             buf.push('\n');
         }
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "otel"))]
-fn append_iroh_metrics(_buf: &mut String, _bundle: &MetricsBundle) -> std::fmt::Result {
     Ok(())
 }

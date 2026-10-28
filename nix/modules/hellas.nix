@@ -292,7 +292,7 @@ rec {
         type = types.bool;
         default = cfg.endpoint != null || cfg.collectorEndpoint != null;
         defaultText = lib.literalExpression "otel.endpoint != null || otel.collectorEndpoint != null";
-        description = "Compile in OpenTelemetry and enable the configured exporters. Off when no endpoint is configured. The default package disables Hellas telemetry exporters.";
+        description = "Compile in metrics and OpenTelemetry export. Off when no endpoint is configured; set true explicitly for local metrics without OTLP. Custom packages must be built with the otel feature.";
       };
       collectorEndpoint = mkOption {
         type = types.nullOr types.str;
@@ -484,7 +484,7 @@ rec {
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
-        description = "Optional unauthenticated Prometheus metrics port.";
+        description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
       assurance = mkOption {
         type = types.enum [
@@ -555,7 +555,7 @@ rec {
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
-        description = "Optional unauthenticated Prometheus metrics port.";
+        description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
       offer = mkOption {
         type = types.nullOr types.str;
@@ -678,6 +678,7 @@ rec {
     {
       lib,
       serve,
+      otel,
     }:
     let
       optArg =
@@ -708,8 +709,9 @@ rec {
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
     ++ optArg "--passkey" serve.passkey
-    ++ optArg "--metrics-port" serve.metricsPort
-    ++ lib.optionals (serve.metricsPort != null) [
+    ++ lib.optionals (otel.enable && serve.metricsPort != null) [
+      "--metrics-port"
+      (toString serve.metricsPort)
       "--metrics-addr"
       serve.metricsAddress
     ]
@@ -727,6 +729,7 @@ rec {
     {
       lib,
       gateway,
+      otel,
     }:
     let
       optArg =
@@ -758,8 +761,9 @@ rec {
       gateway.host
     ]
     ++ optArg "--port" gateway.port
-    ++ optArg "--metrics-port" gateway.metricsPort
-    ++ lib.optionals (gateway.metricsPort != null) [
+    ++ lib.optionals (otel.enable && gateway.metricsPort != null) [
+      "--metrics-port"
+      (toString gateway.metricsPort)
       "--metrics-addr"
       gateway.metricsAddress
     ]

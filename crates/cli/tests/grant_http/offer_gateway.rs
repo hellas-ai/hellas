@@ -8,6 +8,7 @@ struct OfferHost {
     provider: Cli,
     client: Cli,
     node: Process,
+    #[cfg(feature = "otel")]
     metrics: String,
     socket: PathBuf,
     provider_profile: PathBuf,
@@ -136,7 +137,9 @@ impl OfferHost {
         let mut node = provider.spawn(
             &[
                 "serve",
+                #[cfg(feature = "otel")]
                 "--metrics-port",
+                #[cfg(feature = "otel")]
                 "0",
                 "--no-discovery",
                 "--fetch-config",
@@ -147,6 +150,7 @@ impl OfferHost {
             "provider.log",
         );
         node.wait_for("RPC server running.").await;
+        #[cfg(feature = "otel")]
         let metrics = node
             .wait_for("prometheus metrics server listening on ")
             .await;
@@ -252,6 +256,7 @@ impl OfferHost {
             provider,
             client,
             node,
+            #[cfg(feature = "otel")]
             metrics,
             socket,
             provider_profile,
@@ -307,7 +312,9 @@ impl OfferHost {
         let mut process = self.client.spawn(
             &[
                 "gateway",
+                #[cfg(feature = "otel")]
                 "--metrics-port",
+                #[cfg(feature = "otel")]
                 "0",
                 "--offer",
                 "lan",
@@ -328,11 +335,13 @@ impl OfferHost {
             "gateway.log",
         );
         let address = process.wait_for("gateway listening on ").await;
+        #[cfg(feature = "otel")]
         let metrics = process
             .wait_for("prometheus metrics server listening on ")
             .await;
         Gateway {
             process,
+            #[cfg(feature = "otel")]
             metrics,
             url: format!("http://{address}/v1/chat/completions"),
             http: gateway_client(&token),
@@ -344,6 +353,7 @@ impl OfferHost {
 }
 struct Gateway {
     process: Process,
+    #[cfg(feature = "otel")]
     metrics: String,
     url: String,
     http: reqwest::Client,
@@ -510,9 +520,9 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     host.stop().await;
 }
 
+#[cfg(feature = "otel")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_scrape_observes_gateway_and_serve_work() {
-    #[cfg(feature = "otel")]
     let (collector, endpoint, mut exports) = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
@@ -533,10 +543,7 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (task, endpoint, receive)
     };
-    #[cfg(feature = "otel")]
     let host = OfferHost::start_with_metrics(Some(endpoint), Some("0.0.0.0".into())).await;
-    #[cfg(not(feature = "otel"))]
-    let host = OfferHost::start_with_metrics(None, Some("0.0.0.0".into())).await;
     let mut gateway = host.gateway().await;
     let http = reqwest::Client::new();
     for url in [&gateway.metrics, &host.metrics] {
@@ -599,7 +606,6 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
                     "missing {name}={count}: {body}"
                 );
             }
-            #[cfg(feature = "otel")]
             {
                 assert!(
                     body.lines()
@@ -619,7 +625,6 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
     }
     gateway.process.stop().await;
     host.stop().await;
-    #[cfg(feature = "otel")]
     {
         // Check the real protobuf push stream, after shutdown has flushed both
         // providers, as well as the two pulls above.

@@ -517,6 +517,7 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
 }
 
 #[test]
+#[cfg(feature = "otel")]
 fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
     for command in ["serve", "gateway"] {
         for (args, expected) in [
@@ -565,5 +566,18 @@ fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
             assert_eq!(address, expected.parse::<std::net::IpAddr>().unwrap());
         }
         assert!(Cli::try_parse_from(["hellas", command, "--metrics-addr", "not-an-ip"]).is_err());
+    }
+}
+
+#[test]
+#[cfg(not(feature = "otel"))]
+fn metrics_flags_require_the_otel_build() {
+    for command in ["serve", "gateway"] {
+        for (flag, value) in [("--metrics-port", "9400"), ("--metrics-addr", "0.0.0.0")] {
+            let error = Cli::try_parse_from(["hellas", command, flag, value])
+                .err()
+                .expect("metrics flag must be absent");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 }

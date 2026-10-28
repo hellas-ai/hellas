@@ -178,7 +178,7 @@ guarantee of a complete durable record. There is no automatic archive pruning.
 
 Archive failures emit a `hellas_archive` warning with the operation, I/O error
 kind and OS error code, without payloads, credentials, paths or raw error text.
-`hellas.gateway.archive.failures` counts failures by `archive.stage`
+With `otel`, `hellas.gateway.archive.failures` counts failures by `archive.stage`
 (`prepare`, `request`, `response_head`, `response_body`, `finish`) and `error.type`.
 The Prometheus name is `hellas_gateway_archive_failures_total`. Successful HTTP
 responses remain successful in request telemetry even when their archive fails;
@@ -251,9 +251,10 @@ the status that established the longest remaining delay: a 503 remains a 503,
 so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
 concurrency returns 503 with `Retry-After: 1`.
 
-`--metrics-port` exposes these metrics at `/metrics`. `--metrics-addr IP`
-selects the interface (default `127.0.0.1`); the response is unauthenticated.
-With `otel`, the same instruments can also be pushed through OTLP.
+An `otel` build exposes these metrics at `/metrics` when `--metrics-port` is set.
+`--metrics-addr IP` selects the interface (default `127.0.0.1`); the response is
+unauthenticated. The same instruments can also be pushed through OTLP.
+Default builds omit both metrics flags and the instrumentation.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.

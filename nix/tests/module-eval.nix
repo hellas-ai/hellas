@@ -80,6 +80,11 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway.extraArgs may not override" assertion.message
     ) (throw "missing gateway extraArgs assertion") evaluation.config.assertions;
+  metricsFeatureAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "metrics ports require otel.enable" assertion.message
+    ) (throw "missing metrics feature assertion") evaluation.config.assertions;
   trustPairAssertion =
     evaluation:
     lib.findFirst (
@@ -565,6 +570,7 @@ let
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.toml";
           passkey = "/run/hellas/owner.passkey";
+          otel.enable = true;
           metricsPort = 9400;
           metricsAddress = "0.0.0.0";
           queueSize = 0;
@@ -668,6 +674,22 @@ in
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+    assert
+      !(metricsFeatureAssertion (evalProvider {
+        metricsPort = 9400;
+      })).assertion;
+    assert
+      !(metricsFeatureAssertion (evalGateway {
+        metricsPort = 9401;
+      })).assertion;
+    assert
+      !(lib.hasInfix "--metrics-"
+        (evalProvider { metricsPort = 9400; }).config.systemd.services.hellas.serviceConfig.ExecStart
+      );
+    assert
+      !(lib.hasInfix "--metrics-"
+        (evalGateway { metricsPort = 9401; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
+      );
     assert lib.hasInfix "--metrics-port 9400" service.serviceConfig.ExecStart;
     assert lib.hasInfix "--metrics-addr 0.0.0.0" service.serviceConfig.ExecStart;
     assert lib.hasInfix "--metrics-addr ::1" gatewayService.serviceConfig.ExecStart;

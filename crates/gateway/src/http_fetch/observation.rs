@@ -7,17 +7,24 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub(super) struct Metrics {
+    #[cfg(feature = "otel")]
     requests: opentelemetry::metrics::Counter<u64>,
+    #[cfg(feature = "otel")]
     duration: opentelemetry::metrics::Histogram<f64>,
+    #[cfg(feature = "otel")]
     first_byte: opentelemetry::metrics::Histogram<f64>,
+    #[cfg(feature = "otel")]
     tokens: opentelemetry::metrics::Counter<u64>,
 }
 
 impl Metrics {
     pub(super) fn new() -> Self {
+        #[cfg(feature = "otel")]
         let meter = opentelemetry::global::meter("hellas.gateway.http_fetch");
         Self {
+            #[cfg(feature = "otel")]
             requests: meter.u64_counter("hellas.gateway.http.requests").build(),
+            #[cfg(feature = "otel")]
             duration: meter
                 .f64_histogram("hellas.gateway.http.duration")
                 .with_unit("s")
@@ -26,6 +33,7 @@ impl Metrics {
                     128., 300.,
                 ])
                 .build(),
+            #[cfg(feature = "otel")]
             first_byte: meter
                 .f64_histogram("hellas.gateway.http.time_to_first_byte")
                 .with_unit("s")
@@ -33,6 +41,7 @@ impl Metrics {
                     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2., 4., 8., 16., 32., 64.,
                 ])
                 .build(),
+            #[cfg(feature = "otel")]
             tokens: meter
                 .u64_counter("hellas.gateway.http.tokens")
                 .with_unit("{token}")
@@ -49,14 +58,20 @@ pub(super) struct Observation {
     bytes: u64,
     first_byte: Option<f64>,
     usage: UsageDecoder,
+    #[cfg(feature = "otel")]
     backend: Option<String>,
+    #[cfg(feature = "otel")]
     model: Option<String>,
+    #[cfg(feature = "otel")]
     route: String,
+    #[cfg(feature = "otel")]
     metrics: Metrics,
 }
 
 impl Observation {
     pub(super) fn new(metrics: &Metrics, route: &str) -> Self {
+        #[cfg(not(feature = "otel"))]
+        let _ = (metrics, route);
         Self {
             span: hellas_rpc::request_span!(target: "hellas_request", "http.fetch",
                 otel.kind = "client", http.route = route,
@@ -78,16 +93,23 @@ impl Observation {
             bytes: 0,
             first_byte: None,
             usage: UsageDecoder::default(),
+            #[cfg(feature = "otel")]
             backend: None,
+            #[cfg(feature = "otel")]
             model: None,
+            #[cfg(feature = "otel")]
             route: route.into(),
+            #[cfg(feature = "otel")]
             metrics: metrics.clone(),
         }
     }
     pub(super) fn backend(&mut self, name: &str, affinity: &'static str) {
         self.span.record("hellas.backend", name);
         self.span.record("hellas.routing.affinity", affinity);
-        self.backend = Some(name.into());
+        #[cfg(feature = "otel")]
+        {
+            self.backend = Some(name.into());
+        }
     }
     pub(super) fn bind_response(&mut self, binding: Option<super::routing::ResponseBinding>) {
         self.usage.observe(binding.map(|binding| {
@@ -97,7 +119,10 @@ impl Observation {
     pub(super) fn model(&mut self, model: Option<&str>) {
         if let Some(model) = model {
             self.span.record("gen_ai.request.model", model);
-            self.model = Some(model.into());
+            #[cfg(feature = "otel")]
+            {
+                self.model = Some(model.into());
+            }
         }
     }
     pub(super) fn status(&mut self, status: u16) {
@@ -155,6 +180,7 @@ impl Drop for Observation {
                 },
             );
         }
+        #[cfg(feature = "otel")]
         {
             use opentelemetry::KeyValue;
             let mut labels = vec![

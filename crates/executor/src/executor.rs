@@ -1,7 +1,6 @@
-use crate::{
-    ExecutorError, ExecutorMetrics, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch,
-    catena,
-};
+#[cfg(feature = "otel")]
+use crate::ExecutorMetrics;
+use crate::{ExecutorError, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch, catena};
 use futures_util::StreamExt;
 use hellas_auth::ProducerSigningKey;
 use hellas_channel::{
@@ -46,6 +45,7 @@ impl Default for GpuConfig {
 #[derive(Clone)]
 pub struct ExecutorSpawnConfig {
     pub queue_capacity: usize,
+    #[cfg(feature = "otel")]
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
     pub assurance: Assurance,
@@ -63,6 +63,7 @@ impl ExecutorSpawnConfig {
     ) -> Self {
         Self {
             queue_capacity: hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
+            #[cfg(feature = "otel")]
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key,
             assurance,
@@ -146,12 +147,15 @@ impl ExecutorHandle {
         input: Admitted<PreparedInvocation>,
         progress: Option<PaidProgress>,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        #[cfg(feature = "otel")]
         let name = match input.capacity_domain() {
             CapacityDomain::Gpu => "compute",
             CapacityDomain::Fetch => "fetch",
         };
+        #[cfg(feature = "otel")]
         self.inner.config.metrics.record_execution_started(name);
         let result = self.run(input, progress).await;
+        #[cfg(feature = "otel")]
         self.inner
             .config
             .metrics

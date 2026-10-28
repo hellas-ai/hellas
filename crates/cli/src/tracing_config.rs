@@ -16,18 +16,21 @@ mod telemetry;
 
 pub struct TracerGuard {
     traces: telemetry::TracerGuard,
+    #[cfg(feature = "otel")]
     metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
 }
 
 impl TracerGuard {
     pub fn shutdown(self) {
         self.traces.shutdown();
+        #[cfg(feature = "otel")]
         if let Err(error) = self.metrics.shutdown() {
             eprintln!("warning: failed to flush metrics: {error}");
         }
     }
 }
 
+#[cfg(feature = "otel")]
 fn build_meter_provider(
     registry: Option<&prometheus::Registry>,
 ) -> opentelemetry_sdk::metrics::SdkMeterProvider {
@@ -55,6 +58,7 @@ fn build_meter_provider(
     builder.build()
 }
 
+#[cfg(feature = "otel")]
 fn otlp_resource() -> opentelemetry_sdk::Resource {
     let resource = opentelemetry_sdk::Resource::builder().build();
     // Keep the CLI's fallback name without overriding the standard resource
@@ -127,7 +131,7 @@ where
 /// both OTLP signals.
 /// No endpoint or explicit exporter means no network telemetry by default.
 /// Local scraping, when requested with `--metrics-port`, uses the same meter
-/// provider independently of these OTLP switches and the `otel` feature.
+/// provider independently of these OTLP switches. Both require the `otel` build.
 ///
 /// The SDK handles common and signal-specific OTLP headers/timeouts,
 /// `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER` and
@@ -135,9 +139,11 @@ where
 /// in the local fmt/file sinks; only span metadata is exported as traces.
 pub fn init_tracing(
     log_file: Option<&Path>,
-    metrics: Option<&prometheus::Registry>,
+    #[cfg(feature = "otel")] metrics: Option<&prometheus::Registry>,
 ) -> TracerGuard {
+    #[cfg(feature = "otel")]
     let meter_provider = build_meter_provider(metrics);
+    #[cfg(feature = "otel")]
     opentelemetry::global::set_meter_provider(meter_provider.clone());
     let (filter_layer, filter_handle) = reload::Layer::new(base_env_filter());
     let _ = LOG_FILTER.set(filter_handle);
@@ -178,6 +184,7 @@ pub fn init_tracing(
 
     TracerGuard {
         traces: install_with_otel(registry),
+        #[cfg(feature = "otel")]
         metrics: meter_provider,
     }
 }

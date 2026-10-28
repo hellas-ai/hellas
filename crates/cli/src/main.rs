@@ -13,6 +13,7 @@ mod commands;
 mod identity;
 #[cfg(unix)]
 mod machines;
+#[cfg(feature = "otel")]
 mod metrics;
 mod owner;
 mod platform_hardening;
@@ -231,9 +232,11 @@ enum Commands {
         /// Wait for one owner pairing if uninitialized; use this directory for node state.
         #[arg(long, num_args = 0..=1, default_missing_value = ".")]
         await_owner: Option<PathBuf>,
+        #[cfg(feature = "otel")]
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
+        #[cfg(feature = "otel")]
         /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
@@ -315,9 +318,11 @@ enum Commands {
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
         #[arg(long)]
         port: Option<u16>,
+        #[cfg(feature = "otel")]
         /// Prometheus metrics port (e.g. 9090).
         #[arg(long)]
         metrics_port: Option<u16>,
+        #[cfg(feature = "otel")]
         /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
@@ -509,6 +514,7 @@ async fn async_main() {
         eprintln!("error: failed to harden provider process: {err}");
         std::process::exit(1);
     }
+    #[cfg(feature = "otel")]
     let metrics = match &cli.command {
         Commands::Serve {
             metrics_port,
@@ -529,6 +535,7 @@ async fn async_main() {
     };
     let tracer_provider = tracing_config::init_tracing(
         cli.log_file.as_deref(),
+        #[cfg(feature = "otel")]
         metrics.as_ref().map(|(_, bundle)| &bundle.registry),
     );
     if let Commands::Trust(args) = cli.command {
@@ -726,8 +733,10 @@ async fn async_main() {
             chain_node,
             grant_config_file,
             await_owner,
-            metrics_port: _,
-            metrics_addr: _,
+            #[cfg(feature = "otel")]
+                metrics_port: _,
+            #[cfg(feature = "otel")]
+                metrics_addr: _,
             graffiti,
             fetch_config_file,
             check_config: _,
@@ -796,6 +805,7 @@ async fn async_main() {
                             paid,
                             chain_node,
                             grants,
+                            #[cfg(feature = "otel")]
                             metrics,
                             graffiti,
                             fetch_config_file,
@@ -829,8 +839,10 @@ async fn async_main() {
             remote_trust,
             host,
             port,
-            metrics_port: _,
-            metrics_addr: _,
+            #[cfg(feature = "otel")]
+                metrics_port: _,
+            #[cfg(feature = "otel")]
+                metrics_addr: _,
             default_max_tokens,
             responses_overrides,
             responses_models,
@@ -950,6 +962,7 @@ async fn async_main() {
                 };
                 (address, bundle)
             });
+            #[cfg(feature = "otel")]
             if let Some((address, bundle)) = metrics {
                 metrics::spawn_metrics_server(address, bundle).await?;
             }
