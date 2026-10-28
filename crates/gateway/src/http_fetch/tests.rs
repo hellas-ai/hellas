@@ -274,3 +274,56 @@ fn extension_headers_and_duplicates_survive_but_connection_tokens_do_not() {
     assert_eq!(response.len(), 2);
     assert_eq!(response["location"], "/next");
 }
+
+#[test]
+fn a_provider_sealing_several_https_routes_needs_the_route_named() {
+    struct Sealed(iroh::EndpointId);
+    impl WorkExecutionBackend for Sealed {
+        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+            ["a", "b"]
+                .into_iter()
+                .map(|method| crate::FetchRoute {
+                    provider: self.0,
+                    schema: hellas_rpc::FetchSchema::HttpV1,
+                    sealed: Some(("http".into(), method.into())),
+                })
+                .collect()
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let work = Arc::new(Sealed(iroh::SecretKey::from_bytes(&[13; 32]).public()));
+    let config = |route: serde_json::Value| -> HttpGatewayConfig {
+        let mut value = serde_json::json!({"routes": [{
+            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
+        }]});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(route.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    };
+    assert!(matches!(
+        router(config(serde_json::json!({})), work.clone()),
+        Err(crate::GatewayError::Config(
+            crate::GatewayConfigError::AmbiguousFetchRoute(_)
+        ))
+    ));
+    assert!(
+        router(
+            config(serde_json::json!({"service": "http", "method": "b"})),
+            work.clone()
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        router(
+            config(serde_json::json!({"service": "http", "method": "c"})),
+            work
+        ),
+        Err(crate::GatewayError::Config(
+            crate::GatewayConfigError::FetchRouteMismatch(_)
+        ))
+    ));
+}

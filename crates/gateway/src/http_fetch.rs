@@ -64,28 +64,18 @@ pub(super) fn router(
         .into_iter()
         .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
         .collect();
-    let providers: Vec<_> = routes.iter().map(|route| route.provider).collect();
+    let mut providers = Vec::new();
+    for route in &routes {
+        if !providers.contains(&route.provider) {
+            providers.push(route.provider);
+        }
+    }
     let routing = Arc::new(routing::Routing::new(&config, &providers)?);
     let named = config.service.clone().zip(config.method.clone());
     let fetch_routes = routing
         .backends
         .iter()
-        .map(|backend| {
-            let sealed = routes
-                .iter()
-                .find(|route| route.provider == backend.provider)
-                .map(|route| route.sealed.clone());
-            match (sealed, &named) {
-                (Some(Some(sealed)), Some(named)) if &sealed != named => Err(
-                    crate::GatewayConfigError::FetchRouteMismatch(backend.name.clone()),
-                ),
-                (Some(Some(sealed)), _) => Ok(sealed),
-                (Some(None), Some(named)) => Ok(named.clone()),
-                _ => Err(crate::GatewayConfigError::MissingFetchRoute(
-                    backend.name.clone(),
-                )),
-            }
-        })
+        .map(|backend| fetch_route(&routes, backend, named.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut paths = std::collections::BTreeMap::<String, Option<Vec<String>>>::new();
     for backend in &routing.backends {
@@ -112,6 +102,37 @@ pub(super) fn router(
         .map(|(path, models)| (path, models.unwrap_or_default()))
         .collect();
     Ok((app.with_state(state), paths))
+}
+
+/// The one Fetch route a backend uses on its provider. A provider may seal
+/// several HTTPS routes; the configuration then names one of them.
+fn fetch_route(
+    routes: &[crate::FetchRoute],
+    backend: &routing::Backend,
+    named: Option<&(String, String)>,
+) -> Result<(String, String), crate::GatewayConfigError> {
+    let mut sealed = Vec::new();
+    let mut open = false;
+    for route in routes
+        .iter()
+        .filter(|route| route.provider == backend.provider)
+    {
+        match &route.sealed {
+            Some(route) => sealed.push(route),
+            None => open = true,
+        }
+    }
+    let name = || backend.name.clone();
+    match (named, sealed.as_slice()) {
+        (Some(named), sealed) if sealed.contains(&named) || (open && sealed.is_empty()) => {
+            Ok(named.clone())
+        }
+        (Some(_), _) if !open => Err(crate::GatewayConfigError::FetchRouteMismatch(name())),
+        (Some(named), _) => Ok(named.clone()),
+        (None, [one]) => Ok((*one).clone()),
+        (None, []) => Err(crate::GatewayConfigError::MissingFetchRoute(name())),
+        (None, _) => Err(crate::GatewayConfigError::AmbiguousFetchRoute(name())),
+    }
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {

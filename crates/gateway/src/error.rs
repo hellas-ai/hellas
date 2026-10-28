@@ -94,4 +94,6 @@ pub enum GatewayConfigError {
     MissingFetchRoute(String),
     #[error("backend {0} names a Fetch route its provider's policy does not seal")]
     FetchRouteMismatch(String),
+    #[error("backend {0}'s provider seals several HTTPS routes; name one with service and method")]
+    AmbiguousFetchRoute(String),
 }
