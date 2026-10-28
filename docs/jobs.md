@@ -7,13 +7,18 @@ transaction. Requesters run no node: they keep local signing keys and
 wallet/channel metadata, and chain reads use authenticated validator RPCs.
 
 ```sh
-hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20 --save-job ./add
-hellas --faucet transact --job ./add --provider NODE_ID@127.0.0.1:9000 -o ./result
-hellas --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
+hellas --faucet transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
+hellas --faucet fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --payment 20 \
   --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
+
+`--provider` takes the address `hellas serve` prints: the content ID of the
+provider's enrollment bundle and the node ID it binds, optionally followed by
+`@IP:PORT`. Quotes, funding, payment and every reconnect refuse a provider that
+presents any other enrollment, before anything is signed or funded.
 
 `--faucet` only selects a key from the devnet genesis faucet allocation and
 retains it beside the identity; `--faucet-account N` selects one explicitly,
@@ -166,7 +171,7 @@ nonce and completion state. It contains no request or response payload.
 If payment succeeded but output was lost before reporting, retry prints
 `already paid (work …, price …), result lost` and refuses another charge.
 `--buy-again` explicitly buys another result. It preserves the identity of an
-unfinished unpaid purchase. `transact --settle --provider NODE_ID` still closes
+unfinished unpaid purchase. `transact --settle --provider ENROLLMENT_ID@NODE_ID` still closes
 the original channel. After finalized payment closure, the provider reclaims its
 bond stake, freeing the per-client allowance for another channel. While that
 reclaim is still pending, a fresh channel is refused before another owner

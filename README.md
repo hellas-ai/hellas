@@ -51,7 +51,9 @@ identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
 work is sold only with `--paid-work-config FILE`: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
 The example charges 20 per job, ten jobs per channel, and stops execution after
-90 seconds. `serve` prints A's `Node ID`.
+90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
+content ID of A's enrollment and the node it binds. B learns it from A out of
+band and every paid connection must present exactly that enrollment.
 
 Person B runs no node. With a Catena program `counter.hex`:
 
@@ -65,9 +67,9 @@ one command builds a job, pays A and prints the result; a second closes the
 channel:
 
 ```sh
-hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20
-hellas --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 B's key approves funding once per channel: A's jobs per channel times its

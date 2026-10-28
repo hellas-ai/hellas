@@ -152,6 +152,12 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
     let chain = work_runner.as_ref().map(|(_, chain)| chain.clone());
     let node_id = options.secret_key.public();
+    let address = hellas_sdk::client::ProviderAddress::of(options.open_identity.enrollment())?;
+    anyhow::ensure!(
+        address.node == node_id,
+        "provider enrollment names node {}, not this node {node_id}",
+        address.node
+    );
     let provider = hellas_sdk::ProviderOptions {
         port: options.port,
         executor,
@@ -194,7 +200,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
 
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");
 
-    eprintln!("Node ID:      {node_id}");
+    eprintln!("Provider:     {address}");
     print_qr(&add_url);
     eprintln!("Explorer:     {add_url}");
 

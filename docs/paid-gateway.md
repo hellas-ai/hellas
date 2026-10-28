@@ -48,7 +48,7 @@ The pool selects providers and expected prices. It obtains each policy with
     {
       "chain_config": "/srv/hellas/chain.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
-      "provider": "PROVIDER_ENDPOINT_ID",
+      "provider": "ENROLLMENT_ID@NODE_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "payment": 20
     }
@@ -75,7 +75,7 @@ provider's jobs per channel times its price, plus omission reserve and fees.
 At most four eligible owner coins fund one delegated output; change returns
 undelegated to the same owner. The wallet records the signed reshape before
 submission and shares reservations across gateway providers. Later jobs reuse
-the open channel. `transact --settle --provider NODE_ID` closes it and returns unspent funding.
+the open channel. `transact --settle --provider ENROLLMENT_ID@NODE_ID` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -87,9 +87,12 @@ The original signed offer, policy and authenticated peer are durable together;
 retries return the same offer and restart requires no route configuration.
 Unanswered offers expire at their bond timeout.
 
-ProducerSigned providers need only the selected endpoint ID. Each live Open
-checks that the enrollment names that transport and verifies the producer proof.
-Apple-attested providers additionally require the existing independent trust store.
+`provider` is the address `hellas serve` prints: the content ID of the
+provider's enrollment bundle and the node ID it binds. Each live Open checks
+that the provider presents exactly that enrollment, that it names the live
+transport, and verifies the producer proof; a retained channel whose offer names
+another enrollment is refused on restart. Apple-attested providers additionally
+require the existing independent trust store.
 For those entries, add a top-level `trust_store` directory and a per-provider
 `trust_policy` ID. Approve app IDs and release CDHashes independently:
 
@@ -100,7 +103,8 @@ hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
 ```
 
 The existing trust JSON contains `provider_genesis`, `assurance`, and `apple`
-with `app_id` and `cd_hashes`. Missing or mismatched
+with `app_id` and `cd_hashes`; `provider_genesis` must equal the address's
+enrollment ID. Missing or mismatched
 Apple approval fails before funding or disclosure. Approval replacement retains
 its revision checks and persistent assertion counters. `transact` accepts
 `--trust-store` and `--trust-policy` for Apple providers; software providers do not
