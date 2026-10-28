@@ -20,10 +20,6 @@ pub enum PoolError {
     RecoveryTimeout,
     #[error("paid provider connection exceeded its {0:?} limit")]
     ConnectionTimeout(Duration),
-    #[error("paid output consumer is too slow; accepted work continues settlement")]
-    SlowConsumer,
-    #[error("{0}")]
-    MissingOutput(&'static str),
     #[error("paid provider {provider}: {source}")]
     Provider {
         provider: iroh::EndpointId,
@@ -41,8 +37,6 @@ pub enum PoolError {
     },
     #[error(transparent)]
     Stopped(#[from] super::RequestStopped),
-    #[error(transparent)]
-    Busy(#[from] hellas_gateway::WorkGatewayBusy),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

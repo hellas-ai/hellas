@@ -551,3 +551,82 @@ mod task_tests {
     }
 }
 
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use futures::StreamExt;
+    use hellas_channel::work_store::journal::MAX_RECORD_BYTES;
+
+    type TestRequester = Requester<OutputEvent, WorkGatewayError>;
+
+    #[test]
+    fn the_largest_possible_completion_fits_the_output_budget() {
+        // The terminal `Done(Completed)` is one channel message carrying the
+        // whole transcript, and a transcript is capped at `MAX_RECORD_BYTES`.
+        // `emit` must therefore charge it at most that, plus the single
+        // per-message `OUTPUT_EVENT_OVERHEAD`, or a completion the protocol
+        // permits cannot be delivered at all: `try_acquire_many_owned` fails,
+        // `overflow` latches, and the caller is told its reader is too slow
+        // for work it has already paid for.
+        //
+        // This is the invariant that a per-contained-event overhead broke.
+        // Multiplying the overhead by event count makes the charge unbounded
+        // with respect to `MAX_RECORD_BYTES` -- ~8000 small events exceeded
+        // the budget on their own -- so no value of `OUTPUT_BUFFER_BYTES`
+        // could satisfy this assertion.
+        let worst_case = MAX_RECORD_BYTES.saturating_add(OUTPUT_EVENT_OVERHEAD);
+        assert!(
+            worst_case <= OUTPUT_BUFFER_BYTES,
+            "a maximal completion charges {worst_case} against a {OUTPUT_BUFFER_BYTES} budget",
+        );
+    }
+
+    fn text(delta: &str) -> OutputEvent {
+        OutputEvent::TextDelta {
+            index: 0,
+            delta: delta.into(),
+            channel: hellas_rpc::output::TextChannel::Output,
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
+        let (requester, mut response) = TestRequester::new();
+        let budget = requester.budget.clone();
+        // Retained output can arrive in one burst before HTTP gets a poll.
+        for position in 0..128 {
+            requester.emit(Ok(text(&position.to_string())));
+        }
+        drop(requester);
+        let mut count = 0;
+        while let Some(event) = response.next().await {
+            event.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 128);
+        assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
+    }
+
+    #[tokio::test]
+    async fn slow_reader_gets_an_error_without_blocking_payment() {
+        let (requester, mut response) = TestRequester::new();
+        // A stalled reader cannot retain more than the byte budget, and the
+        // synchronous producer callback still returns without waiting on it.
+        let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();
+        for _ in 0..3 {
+            requester.emit(Ok(text(&"x".repeat(half))));
+        }
+        assert_eq!(requester.budget.available_permits(), 0);
+        assert!(
+            response
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("too slow")
+        );
+        assert!(requester.is_closed());
+        assert!(response.next().await.is_none());
+    }
+}
