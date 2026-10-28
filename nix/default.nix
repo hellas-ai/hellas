@@ -365,7 +365,10 @@ let
           '';
         };
         rocm = pkgs.mkShellNoCC {
-          packages = devShellPackages ++ [ pkgs.hellasLib.rocmToolkit ];
+          # The toolkit is reached through PATH/ROCM_PATH only. As a package its lib/
+          # (which carries its own glibc) would enter NIX_LDFLAGS and every
+          # binary's RUNPATH, aborting Nix-built programs at startup.
+          packages = devShellPackages;
           shellHook = envShellHook + ''
             # hipcc's setup selects its clang as the host C compiler. That
             # compiler emits newer LLVM LTO objects which this Rust toolchain's
@@ -379,7 +382,7 @@ let
             export HIP_CLANG_PATH=${pkgs.hellasLib.rocmToolkit}/bin
             export DEVICE_LIB_PATH=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode
             export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode"
-            export LD_LIBRARY_PATH=${pkgs.hellasLib.rocmToolkit}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+            export PATH=$PATH:${pkgs.hellasLib.rocmToolkit}/bin
           '';
         };
       };

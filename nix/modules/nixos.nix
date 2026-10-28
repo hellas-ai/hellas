@@ -71,21 +71,22 @@ let
       cudaToolkit
       pkgs.cudaPackages.backendStdenv.cc
     ];
+  # The ROCm toolkit's lib/ carries its own glibc, which would replace the
+  # binary's loader-matched libc; HIP is found via ROCM_PATH/HIP_PATH instead.
+  gpuLibraryPath =
+    lib.optionals useCuda [
+      "${cudaToolkit}/lib"
+      "/run/opengl-driver/lib"
+    ]
+    ++ lib.optional (cfg.environment ? LD_LIBRARY_PATH) (toString cfg.environment.LD_LIBRARY_PATH);
   gpuEnvironment =
-    lib.optionalAttrs useHip (builtins.removeAttrs rocmEnvironment [ "LD_LIBRARY_PATH" ])
+    lib.optionalAttrs useHip rocmEnvironment
     // lib.optionalAttrs useCuda {
       CUDA_PATH = cudaToolkit;
       NVCC_CCBIN = "${pkgs.cudaPackages.backendStdenv.cc}/bin/c++";
     }
-    // {
-      LD_LIBRARY_PATH = lib.concatStringsSep ":" (
-        lib.optional useHip "${rocmToolkit}/lib"
-        ++ lib.optionals useCuda [
-          "${cudaToolkit}/lib"
-          "/run/opengl-driver/lib"
-        ]
-        ++ lib.optional (cfg.environment ? LD_LIBRARY_PATH) (toString cfg.environment.LD_LIBRARY_PATH)
-      );
+    // lib.optionalAttrs (gpuLibraryPath != [ ]) {
+      LD_LIBRARY_PATH = lib.concatStringsSep ":" gpuLibraryPath;
     };
   rocmEnvironment = {
     ROCM_PATH = rocmToolkit;
@@ -93,11 +94,6 @@ let
     HIP_CLANG_PATH = "${rocmToolkit}/bin";
     DEVICE_LIB_PATH = "${rocmToolkit}/amdgcn/bitcode";
     HIP_FLAGS = "--rocm-path=${rocmToolkit} --rocm-device-lib-path=${rocmToolkit}/amdgcn/bitcode";
-    LD_LIBRARY_PATH =
-      "${rocmToolkit}/lib"
-      + lib.optionalString (
-        cfg.environment ? LD_LIBRARY_PATH
-      ) ":${toString cfg.environment.LD_LIBRARY_PATH}";
   };
   outsideStorePath = hellas.runtimePathIsOutsideStore lib;
   outsideStoreString = hellas.runtimeStringIsOutsideStore lib;
