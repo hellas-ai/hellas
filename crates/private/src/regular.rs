@@ -68,50 +68,7 @@ impl ReadDirectory {
                 "path must stay inside the selected folder",
             ));
         }
-        #[cfg(target_os = "linux")]
-        let file = {
-            use std::ffi::CString;
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-            let directory = &self._root;
-            let name = CString::new(spelling)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            #[repr(C)]
-            struct OpenHow {
-                flags: u64,
-                mode: u64,
-                resolve: u64,
-            }
-            let how = OpenHow {
-                flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
-                mode: 0,
-                resolve: libc::RESOLVE_BENEATH
-                    | libc::RESOLVE_NO_SYMLINKS
-                    | libc::RESOLVE_NO_MAGICLINKS,
-            };
-            let handle = loop {
-                // SAFETY: the live directory fd, terminated name, and correctly
-                // sized open_how are valid; no creation flag needs a mode.
-                let fd = unsafe {
-                    libc::syscall(
-                        libc::SYS_openat2,
-                        directory.as_raw_fd(),
-                        name.as_ptr(),
-                        &how,
-                        std::mem::size_of::<OpenHow>(),
-                    )
-                };
-                if fd >= 0 {
-                    // SAFETY: openat2 returned a new descriptor owned only here.
-                    break unsafe { std::fs::File::from_raw_fd(fd as i32) };
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            };
-            reopen_regular_path_handle(relative, &handle)?
-        };
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(unix)]
         let file = {
             use std::{
                 ffi::CString,
