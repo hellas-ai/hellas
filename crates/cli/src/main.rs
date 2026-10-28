@@ -48,6 +48,10 @@ fn load_command_identity(
         command,
         Commands::Admin(_)
             | Commands::Gateway { offer: Some(_), .. }
+            | Commands::Gateway {
+                local_grant: Some(_),
+                ..
+            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
@@ -286,9 +290,13 @@ enum Commands {
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
         output_cache: hellas_rpc::cache::CachePolicy,
-        /// Content and output cache state (default: HELLAS_STORE_DIR or ~/.hellas/store).
-        #[arg(long)]
-        store_dir: Option<PathBuf>,
+        /// Content store, output cache, and with --local-grant the local GPU executor.
+        #[command(flatten)]
+        native: compute::ServeArgs,
+        /// Run this node's own, already configured allowance in process: no
+        /// chain and no remote provider.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config", "node_id", "http_fetch_config"])]
+        local_grant: Option<String>,
         /// Use a private Offer previously verified by `offer import`.
         #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "responses_backend", "http_fetch_config"])]
         #[arg(conflicts_with = "paid_work_config")]
@@ -472,6 +480,10 @@ fn validate_identity_options(
     let reads_existing_identity = matches!(
         command,
         Commands::Gateway { offer: Some(_), .. }
+            | Commands::Gateway {
+                local_grant: Some(_),
+                ..
+            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
@@ -829,7 +841,8 @@ async fn async_main() {
         Commands::Gateway {
             text_model,
             output_cache,
-            store_dir,
+            native,
+            local_grant,
             offer,
             grant_policy,
             work_profile,
@@ -859,7 +872,7 @@ async fn async_main() {
         } => {
             async {
                 let cache_options =
-                    commands::gateway_cache::options(output_cache, store_dir.clone())?;
+                    commands::gateway_cache::options(output_cache, native.store_dir.clone())?;
                 let model_name = text_model.as_deref().and_then(Path::file_stem)
                     .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
                 let assurance = remote_trust.assurance;
@@ -879,6 +892,16 @@ async fn async_main() {
                     Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
                         hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
                 } else { None };
+                let grant_source = match local_grant.as_deref() {
+                    Some(grant) if output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly => {
+                        anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
+                        Some(commands::grant_gateway::local::prepare(
+                            grant, native, &local_identity, commands::contributions::require_principal(passkey)?,
+                            work_application()?, remote_trust.load()?,
+                        ).await?)
+                    }
+                    _ => grant_source,
+                };
                 if let Some((session, _)) = grant_source.as_ref()
                     && hellas_sdk::grant_gateway::responses::selected_policy(&session.target, grant_policy.as_deref())?.is_some()
                 {
@@ -912,7 +935,7 @@ async fn async_main() {
                     anyhow::ensure!(
                         node_id.is_none()
                             && responses_backend == GatewayResponsesBackend::Hellas,
-                        "--paid-work-config requires remote Hellas execution without --local, --node-id, or a Responses override",
+                        "--paid-work-config requires remote Hellas execution without --node-id or a Responses override",
                     );
                     anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                         "token-native paid work uses producer-signed assurance");
@@ -954,7 +977,7 @@ async fn async_main() {
                     let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
                     Some(serde_json::from_slice(&bytes)?)
                 } else {
-                    grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
+                    grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?.flatten()
                 };
                 let served = async {
                 if let Some(config) = http_config {
