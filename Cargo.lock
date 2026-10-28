@@ -3265,6 +3265,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "catena-lang",
+ "ctor",
  "futures-core",
  "futures-util",
  "hellas-auth",

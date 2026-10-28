@@ -45,6 +45,7 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
+ctor = "1"
 hellas-channel = { workspace = true, features = ["test-support"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }

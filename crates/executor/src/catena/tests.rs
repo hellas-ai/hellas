@@ -361,3 +361,158 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
 fn super_module() -> &'static RuntimeModule {
     module()
 }
+
+// SafeRuntime and the compile child re-execute this test binary.
+#[ctor::ctor(unsafe)]
+fn catena_child() {
+    if super::child_main().unwrap() {
+        std::process::exit(0);
+    }
+}
+
+const SPIN: &str = r#"(theory type nat {
+(arr spin-fold.end : 0 -> 1)
+(arr spin-fold.index : 0 -> 1)
+})
+(theory program type {
+(arr meta.spin-fold.end : 1 -> spin-fold.end)
+})
+(def program spin-add : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
+(def program spin-multiply : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.* :.forget))
+(def program spin-step : {(u64 val) ({({spin-fold.index u32} :) ({(u64 val) ({(({spin-fold.index spin-fold.end} prop.Less) |-) (prop.Truth |-)} *)} *)} *)} -> ({(u64 val) (prop.Truth |-)} *)
+= ([factor pair.]
+  ([.pair] *.elim [index rest.])
+  ([.rest] *.elim [total proofs.])
+  ([.proofs] *.elim [less truth.])
+  ([.less] unsafe.discard unit.elim)
+  ([.index] stdlib.numeric.to_u64 :.forget [i.])
+  ({({[.total] [.factor]} spin-multiply) [.i]} spin-add [next.])
+  ({[.next] [.truth]} *.intro)))
+(def program spin : {(u64 val) (u32 val)} -> (u64 val)
+= ([factor steps.]
+  ({[.factor]} partial.spin-step.1 [callback.])
+  ({[.steps] (unit.intro meta.spin-fold.end)} smolcat.value.named_at [end.])
+  ({[.end] const.u64.0x0000000000000000 [.callback] core.truth} core.fold.bounded [result proof.])
+  ([.proof] unsafe.discard unit.elim)
+  [.result]))
+"#;
+
+/// Manual Strix evidence (plan-v4 §6 GPU variant, 8c): an unseen program
+/// compiled by the compile child runs in a SafeRuntime worker (41 → 42); a
+/// 2³²-step fold is cancelled, its worker process is gone, and the next job
+/// succeeds on a respawned worker. Run on a gfx1151 host from the repo root.
+/// It uses the `.#rocm` toolkit from the default shell, without
+/// `LD_LIBRARY_PATH`, because that toolkit's `lib` ships its own glibc:
+///
+/// ```sh
+/// R=$(nix eval --raw .#devShells.x86_64-linux.rocm --apply 's: toString (builtins.filter (p: p.name == "hellas-rocm-toolkit") s.nativeBuildInputs)') && nix develop -c env -u LD_LIBRARY_PATH ROCM_PATH=$R bash -c "PATH=\$PATH:$R/bin cargo test -p hellas-executor --lib catena::tests::hip_unseen_program_and_kill_respawn -- --ignored --nocapture"
+/// ```
+#[test]
+#[ignore = "needs a HIP device; run manually on Strix"]
+fn hip_unseen_program_and_kill_respawn() {
+    use super::{Cancellation, pool::Pool};
+    use std::time::{Duration, Instant};
+
+    let dialect = GpuDialect::Hip;
+    let exe = std::env::current_exe().unwrap();
+    let compile = |source: &str| {
+        compile::compile_cancellable(
+            &[source.to_owned()],
+            &exe,
+            &Cancellation::default(),
+            hellas_rpc::Retention::Ephemeral,
+            dialect,
+        )
+        .unwrap()
+    };
+    let increment = compile(
+        "(def program increment : (u64 val) -> (u64 val) = ({_ const.u64.0x0000000000000001} {smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))\n",
+    );
+    let spin = compile(SPIN);
+    let limits = Limits {
+        execution_timeout_ms: 60_000,
+        ..limits()
+    };
+    let single = |entry: &str, args: Vec<Arg>| Plan {
+        calls: vec![Call {
+            entry: entry.into(),
+            args,
+            bind: vec![Bind::Name("answer".into())],
+        }],
+        step: None,
+        outputs: vec![Declared {
+            slot: "answer".into(),
+            kind: OutputKind::Scalar(ValueKind::U64),
+        }],
+    };
+    let pool = Pool::new(1, 4).unwrap();
+    let run = |module: &RuntimeModule, plan: &Plan, lease: &mut super::pool::Lease| {
+        driver::execute(
+            lease,
+            module,
+            &environment(),
+            &BTreeMap::new(),
+            plan,
+            &limits,
+            &Assets::new(0, dialect),
+            &InvocationContent::Retained(ContentStore::new()),
+            |_| Ok(()),
+        )
+    };
+    let timeout = Duration::from_millis(limits.execution_timeout_ms);
+    let add_one = single("increment", vec![Arg::U64(41)]);
+
+    let mut lease = pool.lease(&increment, timeout).unwrap();
+    let done = run(&increment, &add_one, &mut lease).unwrap();
+    assert_eq!(done.outputs["answer"], 42u64.to_le_bytes());
+    let first = lease.pid().unwrap();
+    drop(lease);
+    println!("increment(41) = 42 on worker pid {first}");
+
+    // Load the spin artifact on the warm worker first, so the cancel below
+    // lands inside the running fold rather than in the HIP module load.
+    const FACTOR: u64 = 6364136223846793005;
+    let mut lease = pool.lease(&spin, timeout).unwrap();
+    let done = run(
+        &spin,
+        &single("spin", vec![Arg::U64(FACTOR), Arg::U32(3)]),
+        &mut lease,
+    )
+    .unwrap();
+    assert_eq!(done.outputs["answer"], FACTOR.wrapping_add(2).to_le_bytes());
+    assert_eq!(lease.pid(), Some(first));
+    drop(lease);
+
+    let mut lease = pool.lease(&spin, timeout).unwrap();
+    let cancel = lease.cancellation();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+    });
+    let start = Instant::now();
+    let spun = run(
+        &spin,
+        &single("spin", vec![Arg::U64(FACTOR), Arg::U32(u32::MAX)]),
+        &mut lease,
+    );
+    let elapsed = start.elapsed();
+    killer.join().unwrap();
+    assert_eq!(lease.pid(), Some(first), "spin ran on the warm worker");
+    let error = spun.unwrap_err();
+    drop(lease);
+    assert!(elapsed < Duration::from_secs(5), "cancel took {elapsed:?}");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{first}")).exists(),
+        "cancelled worker {first} survived"
+    );
+    println!("spin cancelled after {elapsed:?}: {error}; worker {first} gone");
+
+    let mut lease = pool.lease(&increment, timeout).unwrap();
+    let done = run(&increment, &add_one, &mut lease).unwrap();
+    assert_eq!(done.outputs["answer"], 42u64.to_le_bytes());
+    let next = lease.pid().unwrap();
+    assert_ne!(next, first);
+    println!("increment(41) = 42 on respawned worker pid {next}");
+}
