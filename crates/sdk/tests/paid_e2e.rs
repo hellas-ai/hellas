@@ -192,6 +192,55 @@ async fn check_other_enrollment_refused(
     );
 }
 
+/// A job naming a contract the provider's policy does not admit: the
+/// provider's own contract under another driver.
+fn other_contract_job() -> hellas_sdk::job::Job {
+    let admitted = test_responses_contract();
+    let other = hellas_rpc::FetchContract::new(
+        admitted.adaptor(),
+        admitted.schema(),
+        "openai-responses-driver-9.9.9",
+        admitted.egress().clone(),
+    )
+    .unwrap();
+    assert_ne!(other, admitted);
+    hellas_sdk::job::Job::fetch(
+        PRICE,
+        other,
+        "openai".into(),
+        "responses".into(),
+        BODY.to_vec(),
+        Assurance::ProducerSigned,
+    )
+    .unwrap()
+}
+
+/// The buyer's named contract is checked against the quoted, retained and
+/// recovered policy before any funding approval.
+async fn check_other_contract_refused(
+    options: &PaidWorkOptions,
+    endpoint: &iroh::Endpoint,
+    owner: Arc<hellas_sdk::client_owner::ClientOwner>,
+    approvals: &Approvals,
+) {
+    let funded = approvals.0.lock().unwrap().len();
+    let error = PaidWorkSession::open_for_job(
+        options.clone(),
+        endpoint.clone(),
+        client_settlement(),
+        owner,
+        &other_contract_job(),
+    )
+    .await
+    .err()
+    .expect("a job under a contract the policy does not admit");
+    assert!(
+        matches!(error, hellas_sdk::paid_client::PaidClientError::Job(_)),
+        "{error}"
+    );
+    assert_eq!(approvals.0.lock().unwrap().len(), funded);
+}
+
 fn work_policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![Admission::Fetch {
@@ -829,6 +878,17 @@ async fn paid_setup(
         &approvals,
     ))
     .await;
+    let mut fresh = options.clone();
+    fresh.journal_root = options
+        .journal_root
+        .with_file_name("other-contract-journal");
+    Box::pin(check_other_contract_refused(
+        &fresh,
+        &endpoint,
+        owner.clone(),
+        &approvals,
+    ))
+    .await;
     let quote = hellas_sdk::paid_client::request_paid_quote(
         &options,
         &endpoint,
@@ -1087,6 +1147,13 @@ async fn paid_finish(case: PaidScenario) {
         "{error}"
     );
     assert_eq!(approvals.0.lock().unwrap().len(), 1);
+    Box::pin(check_other_contract_refused(
+        &options,
+        &endpoint,
+        owner.clone(),
+        &approvals,
+    ))
+    .await;
     endpoint.close().await;
     eprintln!("H4 offline recovery complete; running paid job");
     let client_producer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();

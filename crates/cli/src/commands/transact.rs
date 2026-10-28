@@ -139,9 +139,11 @@ pub struct FetchArgs {
     data: Option<String>,
     #[arg(long)]
     max_response_bytes: Option<u32>,
-    /// Explicit selection of the provider's admitted Fetch contract.
-    #[arg(long, value_name = "FILE")]
-    contract: Option<PathBuf>,
+    /// The Fetch contract this request must run under: `http`, the HTTPS
+    /// contract built into this release, or an exact contract JSON file. It is
+    /// never taken from the provider's quote.
+    #[arg(long, value_name = "http|FILE")]
+    contract: String,
     /// DER trust anchor; repeat for private HTTPS roots.
     #[arg(long = "tls-root", value_name = "FILE")]
     tls_roots: Vec<PathBuf>,
@@ -342,6 +344,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
+    let contract = args.contract()?;
     ensure!(args.payment > 0, "--payment must be positive");
     bounded(
         args.client.timeout,
@@ -359,20 +362,6 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     args.client.owner(&context)?.principal(),
                 )
                 .await?;
-                let selected = args
-                    .contract
-                    .as_ref()
-                    .map(|path| -> super::CliResult<hellas_rpc::FetchContract> {
-                        serde_json::from_slice::<hellas_rpc::FetchContract>(
-                            &super::read_bounded_regular_file(
-                                path,
-                                "contract",
-                                hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
-                            )?,
-                        )
-                        .map_err(Into::into)
-                    })
-                    .transpose()?;
                 let admission = quote
                     .policy
                     .invocation_policy
@@ -380,21 +369,13 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     .iter()
                     .find_map(|a| match a {
                         hellas_rpc::protocol::invocation::Admission::Fetch { admission }
-                            if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1
-                                && selected
-                                    .as_ref()
-                                    .is_none_or(|contract| contract == &admission.contract) =>
+                            if admission.contract == contract =>
                         {
                             Some(admission)
                         }
                         _ => None,
                     })
-                    .context(if selected.is_some() {
-                        "selected contract is not admitted. Nothing was paid."
-                    } else {
-                        "provider does not admit HTTPS Fetch. Nothing was paid."
-                    })?;
-                let contract = &admission.contract;
+                    .context("provider does not admit the named contract. Nothing was paid.")?;
                 let route = &admission.route;
                 let (service, method) = match route {
                     hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch {
@@ -461,6 +442,23 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
 }
 
 impl FetchArgs {
+    /// The named HTTPS contract; checked before any provider is contacted.
+    fn contract(&self) -> super::CliResult<hellas_rpc::FetchContract> {
+        let contract = match self.contract.as_str() {
+            "http" => hellas_rpc::FetchContract::http()?,
+            path => serde_json::from_slice(&super::read_bounded_regular_file(
+                Path::new(path),
+                "contract",
+                hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+            )?)?,
+        };
+        ensure!(
+            contract.schema() == hellas_rpc::FetchSchema::HttpV1,
+            "hellas fetch requires an http_v1 contract"
+        );
+        Ok(contract)
+    }
+
     fn assurance(&self) -> Assurance {
         if self.assurance == "apple-app-attest" {
             Assurance::AppleAppAttest

@@ -27,6 +27,9 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
     if !extra.contains(&"--max-response-bytes") {
         args.extend(["--max-response-bytes", "4096"]);
     }
+    if !extra.contains(&"--contract") {
+        args.extend(["--contract", "http"]);
+    }
     args.extend_from_slice(extra);
     let crate::Commands::Fetch(args) = crate::Cli::try_parse_from(args).unwrap().command else {
         panic!("Fetch");
@@ -51,6 +54,8 @@ fn provider_is_named_only_by_its_enrollment_and_node() {
                 "https://example.test",
                 "--payment",
                 "1",
+                "--contract",
+                "http",
                 "--provider",
                 &invalid,
             ],
@@ -119,6 +124,60 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         vec!["127.0.0.1:1234".parse::<SocketAddr>().unwrap()]
     );
     assert!(fetch_args(&["--faucet"]).client.timeout.is_none());
+}
+
+#[test]
+fn fetch_runs_only_under_a_contract_the_buyer_names() {
+    let id = provider();
+    let error = crate::Cli::try_parse_from([
+        "hellas",
+        "fetch",
+        "https://example.test/path",
+        "--provider",
+        &id,
+        "--payment",
+        "20",
+    ])
+    .err()
+    .expect("a Fetch without a named contract");
+    assert!(error.to_string().contains("--contract"), "{error}");
+    assert_eq!(
+        fetch_args(&[]).contract().unwrap(),
+        hellas_rpc::FetchContract::http().unwrap()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let http = root.path().join("http.json");
+    std::fs::write(
+        &http,
+        serde_json::to_vec(&hellas_rpc::FetchContract::http().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let http = http.display().to_string();
+    assert_eq!(
+        fetch_args(&["--contract", &http]).contract().unwrap(),
+        hellas_rpc::FetchContract::http().unwrap()
+    );
+    let responses = root.path().join("responses.json");
+    std::fs::write(
+        &responses,
+        serde_json::to_vec(
+            &hellas_rpc::FetchContract::new(
+                "openai-responses-0.0.3",
+                hellas_rpc::FetchSchema::StatelessResponsesV1,
+                "openai-responses-driver-0.0.2",
+                hellas_rpc::protocol::fetch_contract::FetchEgress::FixedHttps(
+                    "https://api.openai.com/v1/responses".into(),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let responses = responses.display().to_string();
+    assert!(fetch_args(&["--contract", &responses]).contract().is_err());
+    let missing = root.path().join("missing.json").display().to_string();
+    assert!(fetch_args(&["--contract", &missing]).contract().is_err());
 }
 
 #[test]

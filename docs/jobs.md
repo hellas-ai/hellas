@@ -11,7 +11,7 @@ hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entr
   --arg u64:2 --arg u64:3 --returns u64 --payment 20 --save-job ./add
 hellas --faucet transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
 hellas --faucet fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --payment 20 \
-  --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
+  --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
 hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
@@ -145,8 +145,11 @@ assurance = "producer-signed"
 ```
 
 Use the exact evaluator/adaptor pair from the contract's manifest. The Fetch
-helper saves that pair and the admitted contract from the provider's quote;
-`--contract FILE` explicitly selects the same contract. `request.json` is an
+helper requires `--contract`: `http`, the HTTPS contract built into this
+release, or an exact contract file. It saves that contract and its pair, and
+never takes the contract from the provider's quote; a quote, retained channel or
+recovered request whose policy does not admit the job's contract is refused
+before funding or payment. `request.json` is an
 `HttpFetchRequest` or the selected service's JSON input. For HTTPS, the helper
 supports `-X METHOD`, repeated `-H 'Name: value'`, `--data @FILE`, and
 `--max-response-bytes N`. Without an explicit cap, it uses the provider's
