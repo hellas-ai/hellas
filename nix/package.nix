@@ -61,6 +61,9 @@ let
   crossEnv = lib.optionalAttrs isCross {
     CARGO_BUILD_TARGET = targetTriple;
     "CARGO_TARGET_${rustEnvTarget}_LINKER" = "${stdenv.cc}/bin/${stdenv.cc.targetPrefix}cc";
+    # libffi-sys (via catena-lang) builds libffi with autoconf, whose link test
+    # fails on the static clang toolchain's missing libgcc_eh. Rust links its own unwinder.
+    "CFLAGS_${lib.replaceStrings [ "-" ] [ "_" ] targetTriple}" = "--unwindlib=none";
   };
 
   commonArgs = {
