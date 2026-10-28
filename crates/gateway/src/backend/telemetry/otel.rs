@@ -141,6 +141,7 @@ impl Inference {
             BackendError::Denied(_) => "access_denied",
             BackendError::Quota(_) => "quota_exhausted",
             BackendError::Busy(_) => "busy",
+            BackendError::Conflict(_) => "conflict",
             BackendError::Timeout(_) => "timeout",
             BackendError::Unavailable(_) => "provider_unavailable",
             BackendError::Failed(_) => "backend_error",

@@ -214,6 +214,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                 BackendError::Denied(_) => "grant access refused",
                 BackendError::Quota(_) => "resource allowance exhausted",
                 BackendError::Busy(_) => "Work Fetch is busy; retry later",
+                BackendError::Conflict(_) => "conflicting request",
                 BackendError::Timeout(_) => "authenticated Fetch timed out",
                 BackendError::Unavailable(_) | BackendError::Failed(_) => {
                     "authenticated Fetch failed"

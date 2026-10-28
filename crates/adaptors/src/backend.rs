@@ -377,6 +377,8 @@ pub enum BackendError {
     Quota(String),
     #[error("backend busy: {0}")]
     Busy(String),
+    #[error("backend conflict: {0}")]
+    Conflict(String),
     #[error("backend timed out: {0}")]
     Timeout(String),
     #[error("backend unavailable: {0}")]

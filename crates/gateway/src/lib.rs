@@ -108,6 +108,7 @@ pub(crate) fn backend_status(error: &BackendError) -> StatusCode {
         BackendError::Denied(_) => StatusCode::FORBIDDEN,
         BackendError::Quota(_) => StatusCode::TOO_MANY_REQUESTS,
         BackendError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        BackendError::Conflict(_) => StatusCode::CONFLICT,
         BackendError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
         BackendError::Unavailable(_) => StatusCode::BAD_GATEWAY,
         BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
