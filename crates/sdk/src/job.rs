@@ -219,6 +219,31 @@ impl JobInput {
         policy.admit(&prepared, &key.public_key())?;
         Ok(prepared)
     }
+
+    /// The content the provider reads; a Fetch carries none.
+    pub fn content(&self) -> InvocationContent {
+        match self {
+            JobInput::Compute { content, .. } => content.clone(),
+            JobInput::Fetch { .. } => InvocationContent::Ephemeral(EphemeralContent::default()),
+        }
+    }
+
+    /// Whether `policy` admits this input within the provider's upload bound.
+    /// Nothing is signed with the requester's identity.
+    pub fn admits(&self, policy: &InvocationPolicy, retain: bool) -> Result<()> {
+        let manifest = self.manifest()?;
+        // The all-255 nonce measures the largest encoding; the throwaway key
+        // authorizes nothing.
+        let key = ProducerSigningKey::generate();
+        let prepared =
+            self.prepare(&manifest, &key, [255; 32], key.public_key(), policy, retain)?;
+        if prepared.canonical_bytes()?.len() as u64 > policy.limits.max_upload_bytes {
+            return Err(invalid(
+                "prepared input exceeds the provider's upload limit. Nothing was paid.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Job {
@@ -285,10 +310,7 @@ impl Job {
         self.manifest.clone()
     }
     pub fn content(&self) -> InvocationContent {
-        match &self.input {
-            JobInput::Compute { content, .. } => content.clone(),
-            JobInput::Fetch { .. } => InvocationContent::Ephemeral(EphemeralContent::default()),
-        }
+        self.input.content()
     }
     /// Check the quoted application before asking the owner to fund anything.
     pub fn check_policy(
@@ -301,19 +323,7 @@ impl Job {
                 policy.payment_policy.fixed_price, self.price
             )));
         }
-        // The all-255 nonce measures the largest encoding; the throwaway key
-        // authorizes nothing with the requester's identity.
-        let key = ProducerSigningKey::generate();
-        let prepared =
-            self.prepare(&key, [255; 32], key.public_key(), &policy.invocation_policy)?;
-        if prepared.canonical_bytes()?.len() as u64
-            > policy.invocation_policy.limits.max_upload_bytes
-        {
-            return Err(invalid(
-                "prepared input exceeds the provider's upload limit. Nothing was paid.",
-            ));
-        }
-        Ok(())
+        self.input.admits(&policy.invocation_policy, true)
     }
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let bytes = match &self.input {
