@@ -2,7 +2,6 @@ use axum::{
     body::{Bytes, HttpBody},
     http::HeaderMap,
 };
-use futures::StreamExt;
 use hellas_auth::authority::UnixMillis;
 use serde_json::json;
 use std::{
@@ -165,19 +164,23 @@ async fn archive_response(
         }
         return axum::response::Response::from_parts(parts, body);
     }
-    let mut source = body.into_data_stream();
+    // Forward every frame, so a body's trailers reach the client; only
+    // data is archived.
+    let mut source = body;
     let mut archive = Some(archive);
-    let stream: futures::stream::BoxStream<'static, Result<Bytes, io::Error>> =
+    let stream: futures::stream::BoxStream<'static, Result<http_body::Frame<Bytes>, io::Error>> =
         Box::pin(async_stream::try_stream! {
-            while let Some(bytes) = source.next().await {
-                let bytes = bytes.map_err(|_| io::Error::other("response stream failed"))?;
-                if let Some(exchange) = archive.as_mut()
-                    && let Err(error) = exchange.chunk(&bytes).await
+            use http_body_util::BodyExt as _;
+            while let Some(frame) = source.frame().await {
+                let frame = frame.map_err(|_| io::Error::other("response stream failed"))?;
+                if let Some(bytes) = frame.data_ref()
+                    && let Some(exchange) = archive.as_mut()
+                    && let Err(error) = exchange.chunk(bytes).await
                 {
                     policy.failed("response_body", &error);
                     archive = None;
                 }
-                yield bytes;
+                yield frame;
             }
             if let Some(mut exchange) = archive
                 && let Err(error) = exchange.finish().await
@@ -185,7 +188,7 @@ async fn archive_response(
                 policy.failed("finish", &error);
             }
         });
-    axum::response::Response::from_parts(parts, Body::from_stream(stream))
+    axum::response::Response::from_parts(parts, Body::new(http_body_util::StreamBody::new(stream)))
 }
 
 pub(super) fn prepare(path: &Path) -> io::Result<()> {

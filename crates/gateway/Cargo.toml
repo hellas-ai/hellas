@@ -31,6 +31,8 @@ hellas-presentation.workspace = true
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch"] }
 hellas-wire = { workspace = true, features = ["iroh"] }
+http-body = "1"
+http-body-util = "0.1"
 httpdate = "1"
 iroh.workspace = true
 libc = "0.2"
