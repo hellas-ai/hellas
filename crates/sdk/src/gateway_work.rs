@@ -1,6 +1,15 @@
-//! Funding-independent gateway input preparation and bounded output delivery.
-use futures::stream::BoxStream;
+//! One gateway backend over any source of work. A paid pool and a grant
+//! session differ only in how they fund and run one request; input
+//! preparation, admission, streamed output and shutdown are shared here.
+use futures::{future::BoxFuture, stream::BoxStream};
+use hellas_gateway::{
+    ExecutionEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy, WorkGatewayError,
+    WorkOutputStream, WorkShutdownError,
+};
+use hellas_rpc::output::OutputEvent;
+use hellas_rpc::protocol::invocation::output::{ArtifactChunk, ArtifactPrefix, InvocationOutput};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_channel::work_store::journal::MAX_RECORD_BYTES;
@@ -171,7 +180,7 @@ pub fn response_stream<E: Send + 'static, X: Send + 'static>(
 /// Owns accepted tasks until their futures physically terminate. Drain polls the
 /// handles in place so dropping a drain future cannot detach unfinished work.
 #[derive(Default)]
-pub(crate) struct WorkTasks {
+pub struct WorkTasks {
     state: std::sync::Mutex<TaskState>,
     draining: tokio::sync::Mutex<()>,
 }
@@ -250,6 +259,230 @@ impl WorkTasks {
     }
 }
 
+/// Gateway events derived from one invocation's signed output.
+pub trait GatewayEvent: serde::Serialize + Send + Sized + 'static {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError>;
+    fn completed(
+        output: &InvocationOutput,
+        provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError>;
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(OUTPUT_BUFFER_BYTES, |bytes| bytes.len())
+    }
+}
+impl GatewayEvent for OutputEvent {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError> {
+        fetch_prefix(chunk, pending)
+    }
+    fn completed(
+        output: &InvocationOutput,
+        provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError> {
+        fetch_terminal(output, provider)
+    }
+}
+impl GatewayEvent for ExecutionEvent {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError> {
+        text_prefix(chunk, pending)
+    }
+    fn completed(
+        output: &InvocationOutput,
+        _provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError> {
+        text_terminal(output)
+    }
+}
+
+/// A verified completion and the provider key that signed it.
+pub struct Completed {
+    pub output: InvocationOutput,
+    pub provider: hellas_auth::PublicKey,
+}
+
+/// The listening side of one accepted request.
+pub struct Requester<E, X> {
+    sender: mpsc::Sender<BufferedEvent<E, X>>,
+    overflow: watch::Sender<bool>,
+    budget: Arc<Semaphore>,
+}
+impl<E, X> Clone for Requester<E, X> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            overflow: self.overflow.clone(),
+            budget: self.budget.clone(),
+        }
+    }
+}
+impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
+    pub(crate) fn new() -> (Self, BoxStream<'static, Result<E, X>>)
+    where
+        X: From<WorkGatewayError>,
+    {
+        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (overflow, overflow_receiver) = watch::channel(false);
+        let requester = Self {
+            sender,
+            overflow,
+            budget: Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES)),
+        };
+        (
+            requester,
+            response_stream(receiver, overflow_receiver, || {
+                X::from(WorkGatewayError::Execution(Box::new(
+                    std::io::Error::other(
+                        "gateway output consumer is too slow; accepted work continues",
+                    ),
+                )))
+            }),
+        )
+    }
+    pub(crate) fn emit(&self, event: Result<E, X>) {
+        let bytes = match &event {
+            Ok(event) => event.bytes(),
+            Err(error) => error.to_string().len(),
+        };
+        emit(&self.sender, &self.overflow, &self.budget, event, bytes);
+    }
+    /// Signed prefixes, decoded and delivered as they arrive.
+    pub(crate) fn progress(&self) -> hellas_channel::work::PaidProgress {
+        let requester = self.clone();
+        let state = std::sync::Mutex::new((ArtifactPrefix::default(), Vec::new()));
+        Arc::new(move |envelope| {
+            use hellas_channel::work::BackendFault;
+            let mut state = state.lock().map_err(|_| {
+                BackendFault::caused_by(std::io::Error::other("prefix lock poisoned"))
+            })?;
+            let (prefix, pending) = &mut *state;
+            let chunk = prefix.push(&envelope).map_err(BackendFault::caused_by)?;
+            for event in E::prefix(chunk, pending).map_err(BackendFault::caused_by)? {
+                requester.emit(Ok(event));
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await
+    }
+}
+
+/// How one source funds and runs gateway requests.
+pub trait WorkSource: Send + Sync + Sized + 'static {
+    type Error: From<WorkGatewayError> + std::fmt::Display + Send + 'static;
+    /// One request, already matched to this source's policies.
+    type Request: Send + 'static;
+    fn fetch_providers(&self) -> Vec<iroh::EndpointId>;
+    fn fetch_request(&self, request: WorkFetchRequest) -> Result<Self::Request, Self::Error>;
+    fn job_request(&self, input: crate::job::JobInput) -> Result<Self::Request, Self::Error>;
+    /// Runs the request to its verified completion. Work not yet proposed
+    /// stops when the requester disconnects; proposed work runs to completion.
+    fn run<E: GatewayEvent>(
+        self: Arc<Self>,
+        request: Self::Request,
+        requester: Requester<E, Self::Error>,
+    ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>>;
+    fn timeout(&self) -> Duration;
+    fn gateway_error(error: Self::Error) -> WorkGatewayError;
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>>;
+}
+
+/// One gateway backend: shared admission, output delivery and shutdown over a source.
+pub struct WorkGateway<S> {
+    pub(crate) source: Arc<S>,
+    pub(crate) admission: Arc<Semaphore>,
+    tasks: WorkTasks,
+}
+impl<S: WorkSource> WorkGateway<S> {
+    pub(crate) fn new(source: S, max_pending: usize) -> Self {
+        Self {
+            source: Arc::new(source),
+            admission: Arc::new(Semaphore::new(max_pending)),
+            tasks: WorkTasks::default(),
+        }
+    }
+    pub(crate) fn submit<E: GatewayEvent>(
+        &self,
+        request: S::Request,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<BoxStream<'static, Result<E, S::Error>>, S::Error> {
+        if self.admission.is_closed() {
+            return Err(WorkGatewayError::from(WorkGatewayBusy).into());
+        }
+        let (requester, stream) = Requester::<E, S::Error>::new();
+        let source = self.source.clone();
+        self.tasks
+            .spawn(async move {
+                let _permit = permit;
+                match source.run(request, requester.clone()).await {
+                    Ok(Some(completed)) => requester.emit(
+                        E::completed(&completed.output, &completed.provider).map_err(Into::into),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => requester.emit(Err(error)),
+                }
+            })
+            .map_err(|busy| S::Error::from(busy.into()))?;
+        Ok(stream)
+    }
+    fn request<E: GatewayEvent>(
+        &self,
+        request: impl FnOnce(&S) -> Result<S::Request, S::Error>,
+    ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
+        use futures::StreamExt as _;
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WorkGatewayBusy)?;
+        let request = request(&self.source).map_err(S::gateway_error)?;
+        let stream = self
+            .submit::<E>(request, Some(permit))
+            .map_err(S::gateway_error)?;
+        Ok(Box::pin(
+            stream.map(|event| event.map_err(S::gateway_error)),
+        ))
+    }
+}
+impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
+    fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
+        self.source.fetch_providers()
+    }
+    fn fetch(
+        &self,
+        request: WorkFetchRequest,
+    ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
+        self.request(|source| source.fetch_request(request))
+    }
+    fn generate(
+        &self,
+        job: hellas_client::text::TextJob,
+    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
+        self.request(|source| {
+            source.job_request(crate::job::JobInput::Compute {
+                environment: job.environment,
+                plan: job.plan,
+                inputs: job.inputs,
+                content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
+            })
+        })
+    }
+    fn timeout(&self) -> Duration {
+        self.source.timeout()
+    }
+    fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {
+        self.admission.close();
+        self.tasks.close();
+        Box::pin(async move {
+            let tasks = self.tasks.drain().await;
+            let source = self.source.shutdown().await;
+            tasks.and(source)
+        })
+    }
+}
+
 #[cfg(test)]
 mod task_tests {
     use super::WorkTasks;
@@ -317,3 +550,4 @@ mod task_tests {
         assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
     }
 }
+

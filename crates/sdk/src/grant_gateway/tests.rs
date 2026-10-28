@@ -3,8 +3,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
+use hellas_gateway::WorkExecutionBackend;
+use hellas_rpc::output::OutputEvent;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
 use std::sync::atomic::Ordering;
+use tokio::sync::Semaphore;
 use {
     hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
     hellas_authority::test_support::chat_resource, hellas_authority::test_support::ids,
@@ -219,7 +222,7 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
-            provider: self.gateway.provider,
+            provider: self.gateway.source.provider,
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
@@ -481,7 +484,15 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         .build()
         .await;
     fixture.result(None).await.unwrap();
-    let channel = fixture.gateway.session.lock().await.store().channel().id;
+    let channel = fixture
+        .gateway
+        .source
+        .session
+        .lock()
+        .await
+        .store()
+        .channel()
+        .id;
     let state = fixture.host.world.snapshot().await;
     let terminals: Vec<_> = state
         .channel(channel)

@@ -62,6 +62,7 @@ pub mod grant_config;
 pub mod node_control;
 
 mod gateway_work;
+pub use gateway_work::WorkGateway;
 pub mod grant_gateway;
 
 mod resource_config;
