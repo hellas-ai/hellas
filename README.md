@@ -313,6 +313,11 @@ nix run .#check-kernel-models
 nix run .#check-kernel-model-verify
 ```
 
+`nix run .#check` runs the PR lints and unit tests. Full chain tests, VM tests,
+portable binaries and container builds belong to chain releases. See
+[checks and chain releases](docs/releases.md) for promotion from `master` to
+`devnet` and deployment through infra.
+
 ## Docker
 
 The default `docker` output is a network-only node image. It contains no local Catena or

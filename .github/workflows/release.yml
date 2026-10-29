@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [devnet]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Release checks
+    runs-on: shared
+    steps:
+      - name: Require a chain release branch
+        run: test "$GITHUB_REF" = refs/heads/devnet
+      - uses: actions/checkout@v4
+      - name: Full release checks
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: nix run --accept-flake-config .#check-release
+
+  build-smoke-matrix:
+    needs: checks
+    runs-on: shared
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        name: Enumerate smoke builds
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#ci.x86_64-linux.builds' --apply '
+              builds: {
+                include = builtins.attrValues (
+                  builtins.mapAttrs (name: attr: { inherit name attr; }) builds
+                );
+              }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-smoke:
+    needs: build-smoke-matrix
+    runs-on: shared
+    name: build:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-smoke-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: nix build .#${{ matrix.attr }}
+        id: build
+        run: |
+          output=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths '.#packages.x86_64-linux.${{ matrix.attr }}')
+          echo "output=$output" >> "$GITHUB_OUTPUT"
+      - name: Package portable binaries and WASM
+        if: startsWith(matrix.name, 'static-') || matrix.name == 'hellas-rpc-wasm'
+        env:
+          BUILD_NAME: ${{ matrix.name }}
+          BUILD_OUTPUT: ${{ steps.build.outputs.output }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_NAME" = hellas-rpc-wasm ]; then
+            test -s "$BUILD_OUTPUT/lib/libhellas_rpc.rlib"
+          else
+            test -x "$BUILD_OUTPUT/bin/hellas"
+          fi
+          mkdir artifacts
+          tar --dereference -C "$BUILD_OUTPUT" -czf "artifacts/hellas-$BUILD_NAME-$GITHUB_SHA.tar.gz" .
+          cd artifacts
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(matrix.name, 'static-') || matrix.name == 'hellas-rpc-wasm'
+        with:
+          name: hellas-${{ matrix.name }}
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  # VM tests reuse the release packages built above.
+  # nixosTests run in QEMU VMs. They depend on the same package derivations
+  # the build-smoke stage built, so this stage reuses them via the nix store
+  # — no rebuilds.
+
+  e2e-matrix:
+    needs: build-smoke
+    runs-on: shared
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        name: Enumerate nixosTests
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#nixosTests.x86_64-linux' --apply '
+              tests: { include = map (name: { inherit name; }) (builtins.attrNames tests); }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    needs: e2e-matrix
+    runs-on: shared
+    name: e2e:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.e2e-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: nix build .#nixosTests.x86_64-linux.${{ matrix.name }}
+        run: nix build --accept-flake-config --print-build-logs --no-link '.#nixosTests.x86_64-linux.${{ matrix.name }}'
+
+  # Build archives with read-only permissions. No registry login, Docker daemon,
+  # or provider credential is needed.
+  images:
+    needs: checks
+    runs-on: shared
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [network, cuda, hip]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build node images
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          mkdir images
+          attr=docker
+          if [ "$BACKEND" != network ]; then
+            attr="$attr-$BACKEND"
+          fi
+          stream=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths ".#packages.x86_64-linux.$attr")
+          "$stream" | gzip -1 > "images/$BACKEND.tar.gz"
+          cd images
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: images-${{ matrix.backend }}
+          path: images/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  # Publishing consumes image archives only, on a fresh hosted runner. The job
+  # never checks out or executes PR scripts with the package-write token.
+  publish-images:
+    needs: [images, build-smoke, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [network, cuda, hip]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: images-${{ matrix.backend }}
+          path: images
+      - name: Verify and load archives
+        working-directory: images
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS
+          for archive in ./*.tar.gz; do
+            docker load --input "$archive"
+          done
+      - name: Publish commit-tagged images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          config_dir=$(mktemp -d)
+          export DOCKER_CONFIG="$config_dir"
+          trap 'rm -rf "$config_dir"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          prefix="sha-$GITHUB_SHA"
+          flavor="$BACKEND"
+          source="ghcr.io/hellas-ai/hellas:$flavor"
+          target="$repository:$prefix-$flavor"
+          docker tag "$source" "$target"
+          docker push "$target"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$target")
+          [[ "$digest" == "$repository@sha256:"* ]]
+          printf '%s: %s\n\nPull by digest: %s\n\n' "$flavor" "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"

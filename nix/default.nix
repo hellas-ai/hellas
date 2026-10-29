@@ -402,6 +402,14 @@ let
       '';
 
   hydraLints = {
+    actions = mkHydraSourceCheck {
+      name = "check-actions";
+      inputs = [
+        pkgs.actionlint
+        pkgs.shellcheck
+      ];
+      command = "actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml";
+    };
     "no-catgrad-lock" = noCatgradLock;
 
     sort = mkHydraSourceCheck {
@@ -468,40 +476,26 @@ let
       '';
     };
 
-    wasm-rpc = hellasRpcWasm;
   };
 
-  hydraPackages = {
-    inherit (nativePackages) cli;
-  }
-  // lib.optionalAttrs isX86_64Linux {
-    # Validators are deployed only on x86; ARM workers build the client/node CLI.
-    inherit (nativePackages) cli-validator;
-    static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
-    static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
-    inherit (linuxOutputs.packages) docker;
-    "hellas-rpc-wasm" = hellasRpcWasm;
+  hydraUnit = nativePkg.mkHellasPackage {
+    pname = "hellas-check-unit";
+    cargoBuildType = "debug";
+    buildPhase = ''
+      runHook preBuild
+      ${ci.unitTestCommand}
+      runHook postBuild
+    '';
+    doCheck = false;
+    installPhase = ''
+      mkdir -p "$out"
+      touch "$out/passed"
+    '';
   };
-
-  # Hydra understands nix-support/failed: retain VM diagnostics as build
-  # products while still marking the check (and required aggregate) failed.
-  # Ordinary nixosTests/checks keep their nonzero exit status on failure.
-  hydraE2e = lib.mapAttrs (
-    _: test:
-    if test ? overrideTestDerivation then
-      test.overrideTestDerivation { succeedOnFailure = true; }
-    else
-      test
-  ) (linuxOutputs.nixosTests or { });
 
   hydraRequired = pkgs.releaseTools.aggregate {
     name = "hellas-required";
-    constituents = [
-      defaultDevShell
-    ]
-    ++ lib.attrValues hydraLints
-    ++ lib.attrValues hydraPackages
-    ++ lib.attrValues hydraE2e;
+    constituents = [ hydraUnit ] ++ lib.attrValues hydraLints;
   };
 in
 {
@@ -518,7 +512,17 @@ in
     check = {
       type = "app";
       program = lib.getExe ci.checkAll;
-      meta.description = "Run local checks and dependency audits";
+      meta.description = "Run PR lints and unit tests";
+    };
+    check-lints = {
+      type = "app";
+      program = lib.getExe ci.checkLints;
+      meta.description = "Run PR lints";
+    };
+    check-release = {
+      type = "app";
+      program = lib.getExe ci.checkRelease;
+      meta.description = "Run the full release test and feature-check suite";
     };
     fix = {
       type = "app";
@@ -548,15 +552,15 @@ in
   # Data exposed for local matrix runners:
   #   .checks -> { name -> derivation }
   #   .builds -> { name -> attrPath }
-  ci = { inherit (ci) checks builds; };
+  ci = {
+    checks = ci.mergeChecks;
+    releaseChecks = ci.checks;
+    inherit (ci) builds;
+  };
 
-  # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
-  checks =
-    (linuxOutputs.nixosTests or { })
-    // kernel.buildChecks
-    // {
-      "no-catgrad-lock" = noCatgradLock;
-    };
+  checks = hydraLints // {
+    unit = hydraUnit;
+  };
   nixosTests = linuxOutputs.nixosTests or { };
 
   # Evaluated by a separate, non-reporting Hydra jobset (infra
@@ -587,12 +591,8 @@ in
   };
 
   hydraJobs = {
-    devShell = defaultDevShell;
     lints = hydraLints;
-    packages = hydraPackages;
+    unit = hydraUnit;
     required = hydraRequired;
-  }
-  // lib.optionalAttrs isX86_64Linux {
-    e2e = hydraE2e;
   };
 }
