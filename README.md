@@ -317,6 +317,12 @@ nix run .#check-kernel-models
 nix run .#check-kernel-model-verify
 ```
 
+`nix run .#check` runs the PR lints and unit tests. CLI, GPU execution and
+consensus have independent Hydra release jobsets for their heavier tests and
+artifacts. See [checks and releases](docs/releases.md) for promotion and
+deployment through infra. `devnet` tracks chain rollout; it does not trigger
+CLI or GPU releases.
+
 ## Docker
 
 The default `docker` output is a network-only node image. It contains no local Catena or

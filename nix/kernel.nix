@@ -206,7 +206,8 @@ let
       ]
       ++ lib.optionals needsJvm [ pkgs.temurin-bin ];
       text = ''
-        repo_root="$(git rev-parse --show-toplevel)"
+        # Hydra unpacks a source archive without .git and invokes from its root.
+        repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
         cd "$repo_root/crates/kernel"
         ${lib.optionalString needsJvm ''
           export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
@@ -283,7 +284,6 @@ let
   # Compares semantic content only: quint stamps a wall-clock time into
   # `#meta`, so a byte-wise diff could never pass.
   freshnessCommand = crate: models: ''
-    repo_root="$(git rev-parse --show-toplevel)"
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     committed="$repo_root/crates/${crate}/models/traces"

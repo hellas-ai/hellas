@@ -68,9 +68,16 @@ let
     ++ pkgs.stdenv.initialPath
     ++ workspaceNativeBuildInputs;
 
+  unitTestCommand = builtins.readFile ./unit-tests.sh;
+
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
+    actions = mk "check-actions" "actionlint .github/workflows/*.yml" [
+      pkgs.actionlint
+      pkgs.shellcheck
+    ];
+    unit = mkCargo "check-unit" unitTestCommand (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
@@ -152,6 +159,12 @@ let
     client-work =
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # Compile each shipped model program for CUDA and HIP and compare it with
+    # upstream. These CPU compiler checks belong to CLI/GPU release validation.
+    model-programs =
+      mkCargo "check-model-programs"
+        "cargo test --locked -p hellas-client --features models --lib shipped_"
         (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
     http-fetch =
@@ -285,6 +298,26 @@ let
     )
     // extraChecks;
 
+  lintNames = [
+    "actions"
+    "cargo-sources"
+    "fmt"
+    "clippy"
+    "sort"
+    "taplo"
+    "buf"
+    "deny"
+    "deadnix"
+    "statix"
+    "nixfmt"
+    "channel-dependencies"
+    "xet-no-alloc"
+  ];
+  lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;
+  mergeChecks = lintChecks // {
+    inherit (checks) unit;
+  };
+
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
@@ -294,7 +327,7 @@ let
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };
 
-  # `nix run .#check` runs every gating check.
+  # Merge checks and release checks share the same individual commands.
   # `nix run .#fix`   runs the auto-fix variants.
   mkAggregate =
     name: pkgList:
@@ -322,8 +355,15 @@ let
   };
 in
 {
-  inherit checks fixes;
+  inherit
+    checks
+    fixes
+    mergeChecks
+    unitTestCommand
+    ;
   builds = ciBuilds;
-  checkAll = mkAggregate "check-all" (lib.attrValues checks);
+  checkAll = mkAggregate "check-all" (lib.attrValues mergeChecks);
+  checkLints = mkAggregate "check-lints" (lib.attrValues lintChecks);
+  checkRelease = mkAggregate "check-release" (lib.attrValues checks);
   fixAll = mkAggregate "fix-all" (lib.attrValues fixes);
 }
