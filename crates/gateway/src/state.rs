@@ -1,6 +1,6 @@
 //! The text presentation: requests rendered locally into Compute text jobs.
 use super::{TextOptions, WorkExecutionBackend, WorkGatewayError};
-use crate::ExecutionEvent;
+use crate::ComputeEvent;
 use axum::{Router, routing::post};
 use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest};
 use hellas_client::model::ModelPackage;
@@ -37,7 +37,7 @@ pub(super) struct TextState {
 }
 
 pub(super) type TextEvents =
-    futures::stream::BoxStream<'static, Result<ExecutionEvent, WorkGatewayError>>;
+    futures::stream::BoxStream<'static, Result<ComputeEvent, WorkGatewayError>>;
 
 pub(super) struct PreparedGeneration {
     pub(super) chat: Option<hellas_presentation::chat::ChatTurn>,
@@ -115,7 +115,7 @@ impl TextState {
             })?;
         Ok(PreparedGeneration {
             chat,
-            prepared: self.work.generate(job)?,
+            prepared: self.work.run(job)?,
             provenance: None,
             prompt_tokens,
             presentation: self.presentation.clone(),

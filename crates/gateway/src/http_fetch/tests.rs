@@ -24,11 +24,10 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
                 sealed: Some(("http".into(), "request".into())),
             }]
         }
-        fn generate(
+        fn run(
             &self,
             _: hellas_client::model::ComputeJob,
-        ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
-        {
+        ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             unreachable!("HTTP must use Fetch")
         }
         fn fetch(

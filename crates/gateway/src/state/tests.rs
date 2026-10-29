@@ -21,7 +21,7 @@ async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
 
 #[tokio::test]
 async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
-    use crate::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend};
+    use crate::{ComputeEvent, WorkExecutionBackend};
     use futures::StreamExt;
     use hellas_rpc::protocol::invocation::Artifact;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,10 +31,10 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: Arc<tokio::sync::Notify>,
     }
     impl WorkExecutionBackend for Paid {
-        fn generate(
+        fn run(
             &self,
             job: hellas_client::model::ComputeJob,
-        ) -> Result<crate::WorkOutputStream<ExecutionEvent>, crate::WorkGatewayError> {
+        ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 job.inputs,
@@ -47,19 +47,21 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
             assert_eq!(job.plan.step.unwrap().stop.max_steps, 1);
             let payment_ack = self.payment_ack.clone();
             Ok(Box::pin(async_stream::try_stream! {
-                yield ExecutionEvent::Chunk {
-                    position: 1,
-                    tokens: hellas_rpc::encode_token_ids(&[1]),
-                };
+                yield ComputeEvent::Output(hellas_rpc::protocol::invocation::output::ArtifactChunk { name: "emitted".into(), format: "catena.u64le.v1".into(), offset: 0, bytes: hellas_rpc::JsonBytes(1u64.to_le_bytes().to_vec()) });
                 // Match the paid backend contract: an authenticated prefix is
                 // available before durable payment, but its terminal is not.
                 payment_ack.notified().await;
-                yield ExecutionEvent::Done(Outcome::Completed {
-                    output_tokens: 1,
-                    stop_reason: StopReason::MaxNewTokens,
-                    text_artifact: hellas_auth::Digest::from_bytes([7; 32]),
-                    output_events: Vec::new(),
-                });
+                yield ComputeEvent::Done {
+                    output: hellas_rpc::protocol::invocation::output::InvocationOutput {
+                        outcome: hellas_rpc::protocol::invocation::output::Outcome::Succeeded,
+                        artifacts: vec![Artifact::new("emitted", "catena.u64le.v1", 1u64.to_le_bytes().to_vec())],
+                        metadata: hellas_rpc::JsonBytes(hellas_rpc::canonical_dag_cbor(&hellas_rpc::protocol::invocation::compute::RunMetadata {
+                            steps: 1, stop: Some(hellas_rpc::protocol::invocation::compute::StopReason::MaxSteps)
+                        }).unwrap()),
+                    },
+                    provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap().public_key(),
+                };
+
             }))
         }
 
@@ -77,7 +79,13 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
     .await;
     let mut live = state.prepare_ids(vec![0], 1, None).unwrap();
     let prefix = live.prepared.next().await.unwrap().unwrap();
-    assert!(matches!(prefix, ExecutionEvent::Chunk { position: 1, .. }));
+    assert!(matches!(
+        prefix,
+        ComputeEvent::Output(hellas_rpc::protocol::invocation::output::ArtifactChunk {
+            offset: 0,
+            ..
+        })
+    ));
     let terminal = {
         let terminal = live.prepared.next();
         tokio::pin!(terminal);
@@ -85,10 +93,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack.notify_one();
         terminal.await.unwrap().unwrap()
     };
-    assert!(matches!(
-        terminal,
-        ExecutionEvent::Done(Outcome::Completed { .. })
-    ));
+    assert!(matches!(terminal, ComputeEvent::Done { .. }));
     assert!(live.prepared.next().await.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -100,11 +105,10 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         fn timeout(&self) -> Duration {
             Duration::from_secs(17)
         }
-        fn generate(
+        fn run(
             &self,
             _: hellas_client::model::ComputeJob,
-        ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
-        {
+        ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             Err(crate::WorkGatewayBusy.into())
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {

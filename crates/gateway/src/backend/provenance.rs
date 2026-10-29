@@ -1,5 +1,5 @@
-use crate::execution::StopReason as RuntimeStopReason;
 use hellas_adaptors::{Provenance, StopReason, Usage};
+use hellas_rpc::protocol::invocation::compute::StopReason as RuntimeStopReason;
 use hellas_rpc::provenance::{ExecutionProvenance, encode_hex};
 
 pub(super) fn provenance_from_execution(provenance: &ExecutionProvenance) -> Provenance {
@@ -19,7 +19,7 @@ pub(super) fn usage(input_tokens: u32, output_tokens: u64) -> Usage {
 
 pub(super) fn stop_reason_from_runtime(stop_reason: RuntimeStopReason) -> StopReason {
     match stop_reason {
-        RuntimeStopReason::StopToken(_) => StopReason::EndOfText,
-        RuntimeStopReason::MaxNewTokens => StopReason::MaxOutputTokens,
+        RuntimeStopReason::Matched(_) => StopReason::EndOfText,
+        RuntimeStopReason::MaxSteps => StopReason::MaxOutputTokens,
     }
 }

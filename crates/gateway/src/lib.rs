@@ -26,7 +26,6 @@ use axum::{Json, Router};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
-use hellas_client::execution;
 use iroh::EndpointId;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -37,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
-pub use execution::{ExecutionEvent, Outcome, StopReason};
+pub use hellas_rpc::compute_event::ComputeEvent;
 pub use http_fetch::{HttpGatewayConfig, HttpRoute, RoutingError};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -146,12 +145,12 @@ pub trait WorkExecutionBackend: Send + Sync {
         Err(WorkGatewayError::Unsupported)
     }
 
-    /// Run a rendered text job on a provider admitting Compute. Emitted
-    /// tokens arrive as authenticated prefixes, then the durable completion.
-    fn generate(
+    /// Run a rendered job on a provider admitting Compute. Authenticated
+    /// emitted values and named outputs precede the durable completion.
+    fn run(
         &self,
         _job: hellas_client::model::ComputeJob,
-    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
+    ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
