@@ -3,7 +3,7 @@ use super::{TextOptions, WorkExecutionBackend, WorkGatewayError};
 use crate::ExecutionEvent;
 use axum::{Router, routing::post};
 use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest};
-use hellas_client::text::TextPackage;
+use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::{error::Error as StdError, sync::Arc};
@@ -32,7 +32,7 @@ pub(super) struct TextState {
     pub(super) model_name: String,
     pub(super) inference_timeout: Duration,
     presentation: Arc<TextPresentation>,
-    text: Arc<TextPackage>,
+    text: Arc<ModelPackage>,
     work: Arc<dyn WorkExecutionBackend>,
 }
 
@@ -64,7 +64,7 @@ impl TextState {
         let (text, presentation) =
             tokio::task::spawn_blocking(move || -> Result<_, Box<dyn StdError + Send + Sync>> {
                 Ok((
-                    TextPackage::open(&path)?,
+                    ModelPackage::open(&path)?,
                     TextPresentation::from_gguf(&path)?
                         .with_chat_template(Some(ChatTemplate::Qwen3)),
                 ))

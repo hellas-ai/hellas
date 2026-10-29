@@ -3,7 +3,7 @@ use super::*;
 /// The tiny Qwen3 GGUF the client text package tests render.
 fn text_model() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../client/src/text/package/mini-qwen3.gguf")
+        .join("../client/src/model/package/mini-qwen3.gguf")
 }
 
 async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
@@ -33,7 +33,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
     impl WorkExecutionBackend for Paid {
         fn generate(
             &self,
-            job: hellas_client::text::TextJob,
+            job: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<ExecutionEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
@@ -102,7 +102,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         }
         fn generate(
             &self,
-            _: hellas_client::text::TextJob,
+            _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
         {
             Err(crate::WorkGatewayBusy.into())

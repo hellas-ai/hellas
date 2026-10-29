@@ -21,7 +21,7 @@ use std::{collections::BTreeMap, fs::File, path::Path};
 const PROMPT: &str = "prompt";
 const WEIGHTS: &str = "weights";
 
-pub struct TextPackage {
+pub struct ModelPackage {
     config: ModelConfig,
     environment: Environment,
     content: EphemeralContent,
@@ -29,7 +29,7 @@ pub struct TextPackage {
 }
 
 /// One generation request, ready for `Job::compute`.
-pub struct TextJob {
+pub struct ComputeJob {
     pub environment: Environment,
     pub plan: Plan,
     pub inputs: Vec<Artifact>,
@@ -38,7 +38,7 @@ pub struct TextJob {
     pub content: EphemeralContent,
 }
 
-impl TextPackage {
+impl ModelPackage {
     pub fn open(path: &Path) -> Result<Self> {
         let header = gguf::read_header(&mut File::open(path)?)?;
         let config = read_gguf_model_config(path)?;
@@ -92,7 +92,12 @@ impl TextPackage {
     }
 
     /// Stops are the caller's ids plus the GGUF end-of-sequence id.
-    pub fn render_job(&self, prompt_ids: &[u64], max_new: u64, stops: &[u64]) -> Result<TextJob> {
+    pub fn render_job(
+        &self,
+        prompt_ids: &[u64],
+        max_new: u64,
+        stops: &[u64],
+    ) -> Result<ComputeJob> {
         let prompt = u64::try_from(prompt_ids.len())?;
         ensure!(
             prompt > 0 && max_new > 0,
@@ -163,7 +168,7 @@ impl TextPackage {
             }),
             outputs: vec![],
         };
-        Ok(TextJob {
+        Ok(ComputeJob {
             environment: self.environment.clone(),
             plan,
             inputs: vec![Artifact::new(

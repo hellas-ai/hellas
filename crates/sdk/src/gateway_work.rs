@@ -618,7 +618,7 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
     }
     fn generate(
         &self,
-        job: hellas_client::text::TextJob,
+        job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
         self.request(WorkRequest::Compute(JobInput::Compute {
             environment: job.environment,

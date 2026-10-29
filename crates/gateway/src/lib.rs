@@ -150,7 +150,7 @@ pub trait WorkExecutionBackend: Send + Sync {
     /// tokens arrive as authenticated prefixes, then the durable completion.
     fn generate(
         &self,
-        _job: hellas_client::text::TextJob,
+        _job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }

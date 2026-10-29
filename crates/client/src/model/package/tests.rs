@@ -1,12 +1,26 @@
 use super::*;
 
 fn fixture() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/text/package/mini-qwen3.gguf")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/package/mini-qwen3.gguf")
+}
+
+#[test]
+fn canonical_qwen3_job_bytes_are_stable() {
+    let package = ModelPackage::open(&fixture()).unwrap();
+    let job = package.render_job(&[2, 1], 2, &[0, 0]).unwrap();
+    assert_eq!(
+        job.environment.canonical_bytes().unwrap(),
+        include_bytes!("qwen3-environment.cbor")
+    );
+    assert_eq!(
+        job.plan.canonical_bytes().unwrap(),
+        include_bytes!("qwen3-plan.cbor")
+    );
 }
 
 #[test]
 fn tiny_gguf_renders_the_complete_qwen3_step_job() {
-    let package = TextPackage::open(&fixture()).unwrap();
+    let package = ModelPackage::open(&fixture()).unwrap();
     let job = package.render_job(&[2, 1], 2, &[0, 0]).unwrap();
 
     let [source] = job.environment.sources[..] else {
@@ -112,7 +126,7 @@ fn tiny_gguf_renders_the_complete_qwen3_step_job() {
 
 #[test]
 fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
-    let package = TextPackage::open(&fixture()).unwrap();
+    let package = ModelPackage::open(&fixture()).unwrap();
     assert!(package.render_job(&[], 1, &[]).is_err());
     assert!(package.render_job(&[2], 0, &[]).is_err());
     assert!(package.render_job(&[2], 128, &[]).is_err());

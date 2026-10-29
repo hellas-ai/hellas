@@ -6,9 +6,9 @@ mod error;
 pub mod execution;
 #[cfg(feature = "iroh")]
 pub mod iroh;
+pub mod model;
 #[cfg(all(feature = "iroh", feature = "work"))]
 mod offer;
-pub mod text;
 #[cfg(feature = "work")]
 pub mod work;
 #[cfg(all(feature = "iroh", feature = "work"))]

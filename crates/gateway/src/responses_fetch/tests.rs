@@ -31,7 +31,7 @@ impl WorkExecutionBackend for RecordedFetch {
 
     fn generate(
         &self,
-        _: hellas_client::text::TextJob,
+        _: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
