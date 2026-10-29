@@ -278,6 +278,9 @@ enum Commands {
         /// Converted Whisper package served at /v1/audio/transcriptions.
         #[arg(long, value_name = "DIR")]
         audio_model: Option<PathBuf>,
+        /// Converted Flux2 Klein package served at /v1/images/generations.
+        #[arg(long, value_name = "DIR")]
+        image_model: Option<PathBuf>,
         /// Content store, and with --local-grant the local GPU executor.
         #[command(flatten)]
         native: compute::ServeArgs,
@@ -374,6 +377,15 @@ enum Commands {
     },
     /// Transcribe one WAV with a client-rendered Whisper job on a paid provider.
     Transcribe(commands::transact::TranscribeArgs),
+    /// Convert a local distilled Flux2 Klein 4B snapshot into client metadata and provider assets.
+    ConvertFlux {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+    },
+    /// Generate one PNG with a client-rendered Flux job on a paid provider.
+    Image(commands::transact::ImageArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -586,6 +598,7 @@ async fn async_main() {
             | Commands::Fetch(_)
             | Commands::Run(_)
             | Commands::Transcribe(_)
+            | Commands::Image(_)
             | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
@@ -678,6 +691,28 @@ async fn async_main() {
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
                 std::process::exit(1);
+            }
+            return;
+        }
+        Commands::ConvertFlux { checkpoint, output } => {
+            let result = hellas_client::model::flux::convert_flux(&checkpoint, &output);
+            tracer_provider.shutdown();
+            match result {
+                Ok(assets) => {
+                    for asset in assets {
+                        println!(
+                            "{}: {} ({} bytes), {}",
+                            asset.name,
+                            asset.object.id(),
+                            asset.object.bytes(),
+                            output.join(format!("{}.bin", asset.name)).display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    std::process::exit(1);
+                }
             }
             return;
         }
@@ -858,6 +893,7 @@ async fn async_main() {
         Commands::Gateway {
             text_model,
             audio_model,
+            image_model,
             native,
             local_grant,
             offer,
@@ -976,6 +1012,16 @@ async fn async_main() {
                             .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
                         model,
                         default_max_tokens: default_max_tokens as usize,
+                    },
+                ));
+            }
+            if let Some(model) = image_model {
+                models.push(hellas_gateway::ModelOptions::Flux(
+                    hellas_gateway::ImageOptions {
+                        model_name: model
+                            .file_name()
+                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                        model,
                     },
                 ));
             }
@@ -1120,7 +1166,23 @@ async fn async_main() {
             }
             .await
         }
-        Commands::ConvertWhisper { .. } => unreachable!("conversion handled before identity load"),
+        Commands::Image(args) => {
+            async {
+                commands::transact::image(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::ConvertWhisper { .. } | Commands::ConvertFlux { .. } => {
+            unreachable!("conversion handled before identity load")
+        }
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),

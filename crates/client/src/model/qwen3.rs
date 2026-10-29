@@ -61,7 +61,9 @@ impl Qwen3 {
         }
         let indexed = hellas_store::ContentStore::new().index(path)?;
         let mut content = EphemeralContent::default();
-        let source = content.insert(catena::generated_model_source_for(&config)?.into_bytes());
+        let source = content.insert(
+            super::program::render(&catena::generated_model_source_for(&config)?)?.into_bytes(),
+        );
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
@@ -76,10 +78,6 @@ impl Qwen3 {
             content,
             views,
         })
-    }
-
-    pub fn environment(&self) -> &Environment {
-        &self.environment
     }
 
     /// Stops are the caller's ids plus the GGUF end-of-sequence id.

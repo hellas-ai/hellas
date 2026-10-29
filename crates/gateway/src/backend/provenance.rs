@@ -2,6 +2,20 @@ use hellas_adaptors::{Provenance, StopReason, Usage};
 use hellas_rpc::protocol::invocation::compute::StopReason as RuntimeStopReason;
 use hellas_rpc::provenance::{ExecutionProvenance, encode_hex, encode_public_key};
 
+pub(crate) fn json_response(
+    status: axum::http::StatusCode,
+    mut body: serde_json::Value,
+    accepted: Option<&ExecutionProvenance>,
+    transcript: Option<&[u8]>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(transcript) = transcript {
+        body["hellas"] = serde_json::to_value(completed_provenance(accepted, transcript))
+            .expect("provenance serializes");
+    }
+    (status, axum::Json(body)).into_response()
+}
+
 /// The provenance of a completed job: its accepted identity, if the source
 /// reported one, and the base64 canonical bytes of its signed transcript.
 pub(crate) fn completed_provenance(

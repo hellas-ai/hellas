@@ -18,12 +18,47 @@ const SOURCE: &str = r#"(def program initialize : [] -> (u64 val) = const.u64.0x
 (def program advance : {(u64 val) (u64 val)} -> (u64 val)
 = ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
 "#;
+fn complete_sources(source: &str) -> Vec<String> {
+    catena_lang::stdlib::core_sources()
+        .map(|s| -> &str { s })
+        .chain(std::iter::once(source))
+        .map(str::to_owned)
+        .collect()
+}
 fn module() -> &'static RuntimeModule {
     static MODULE: OnceLock<RuntimeModule> = OnceLock::new();
     MODULE.get_or_init(|| {
-        compile::compile_sources(&[SOURCE.to_owned()], catena_lang::codegen::GpuDialect::Hip)
-            .unwrap()
+        compile::compile_sources(&complete_sources(SOURCE), GpuDialect::Hip).unwrap()
     })
+}
+
+#[test]
+fn provider_requires_the_program_to_ship_its_stdlib() {
+    let dialect = GpuDialect::Hip;
+    let complete = complete_sources(SOURCE);
+    let missing = vec![SOURCE.to_owned()];
+    assert!(compile::compile_sources(&missing, dialect).is_err());
+    assert!(compile::compile_sources(&complete, dialect).is_ok());
+    let exe = std::env::current_exe().unwrap();
+    for retention in [
+        hellas_rpc::Retention::Ephemeral,
+        hellas_rpc::Retention::Retain,
+    ] {
+        let compile = |sources: &[String]| {
+            compile::compile_cancellable(
+                sources,
+                &exe,
+                &super::Cancellation::default(),
+                retention,
+                dialect,
+            )
+        };
+        assert!(compile(&missing).is_err(), "missing stdlib: {retention:?}");
+        assert!(
+            compile(&complete).is_ok(),
+            "complete program: {retention:?}"
+        );
+    }
 }
 fn limits() -> Limits {
     Limits {
@@ -419,7 +454,7 @@ fn hip_unseen_program_and_kill_respawn() {
     let exe = std::env::current_exe().unwrap();
     let compile = |source: &str| {
         compile::compile_cancellable(
-            &[source.to_owned()],
+            &complete_sources(source),
             &exe,
             &Cancellation::default(),
             hellas_rpc::Retention::Ephemeral,

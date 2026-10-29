@@ -50,23 +50,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
     bounded(
         args.client.timeout,
         async {
-            let options = args
-                .client
-                .options(&context, job.price(), job.assurance())
-                .await?;
-            let mut purchase = args.client.purchase(&context, &job, &options).await?;
-            let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-            let result = execute(
-                &args.client,
-                &context,
-                &job,
-                options,
-                endpoint.clone(),
-                &mut purchase,
-            )
-            .await;
-            endpoint.close().await;
-            let result = result?;
+            let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
             if let Some(directory) = &args.output {
                 save_outputs(directory, &job, &result)?;
             }

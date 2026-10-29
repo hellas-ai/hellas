@@ -410,7 +410,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "383a70f2e0c87e6b9e709091e6aacfc6fa3165e8a45a8be8024e8e3eaf24ca15"
+        "180465f544bfab32a46238c63a9113c5c29c5b59e46ee9a6381e27d49a9381c8"
     );
 
     let other = channel_on(
@@ -1316,12 +1316,11 @@ fn payment_binding_digest_binds_every_field() {
 /// `work.rs` streams into the allocation-free single-chunk hasher. If the
 /// domain, the network's length prefix, the channel argument, or the
 /// envelope-plus-body order in this file disagreed with the module's, the
-/// two would not meet here. The first two preimages were also hashed
-/// outside this workspace with `b3sum --keyed`, twice: once under the Xet
-/// DATA key and once under the zero key. The third — the payment binding,
-/// which this profile added — was not; its pinned value is this
-/// workspace's own, and what it catches is a later change to the layout
-/// rather than a disagreement with an outside implementation.
+/// two would not meet here. The channel preimage was also hashed outside
+/// this workspace with `b3sum --keyed`, twice: once under the Xet DATA key
+/// and once under the zero key. The current result and payment-binding
+/// pins are this workspace's own; they catch later changes to the layout
+/// or committed values rather than disagreement with an outside implementation.
 #[test]
 fn digest_preimages_are_reproducible_by_hand() {
     let channel = channel();
@@ -1353,7 +1352,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 139);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "cb3111b193c16e52f54d851f9f7eafbb873413de95b5e4e0bb925b29abe93328"
+        "40df2ef04546aff628f5eeea22eca28e0bea06d2c384701c0c87324b3cfa4dc2"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round

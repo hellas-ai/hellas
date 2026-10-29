@@ -1,5 +1,9 @@
 //! Model families render the same opaque program-and-bytes Compute contract.
-use super::{qwen3::Qwen3, whisper::Whisper};
+use super::{
+    flux::{Flux, Image, ImageRequest},
+    qwen3::Qwen3,
+    whisper::Whisper,
+};
 use anyhow::{Result, bail, ensure};
 use hellas_channel::content::EphemeralContent;
 use hellas_rpc::protocol::invocation::{
@@ -12,6 +16,7 @@ use std::path::Path;
 enum Family {
     Qwen3(Box<Qwen3>),
     Whisper(Box<Whisper>),
+    Flux(Box<Flux>),
 }
 
 pub struct ModelPackage {
@@ -19,6 +24,7 @@ pub struct ModelPackage {
 }
 
 pub enum ModelRequest<'a> {
+    Image(ImageRequest<'a>),
     Text {
         prompt_ids: &'a [u64],
         max_new: u64,
@@ -45,34 +51,35 @@ pub struct ComputeJob {
 pub enum ModelResponse {
     Tokens(Vec<u32>),
     Transcription(super::whisper::Transcription),
+    Image(Image),
 }
 
 impl ModelPackage {
-    /// A Qwen3 GGUF, or a Whisper directory created by `convert_whisper`.
+    /// A Qwen3 GGUF, or a converted Whisper or Flux package directory.
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
-            family: if path.is_dir() {
+            family: if path.join("model_index.json").is_file() {
+                Family::Flux(Box::new(Flux::open(path)?))
+            } else if path.is_dir() {
                 Family::Whisper(Box::new(Whisper::open(path)?))
             } else {
                 Family::Qwen3(Box::new(Qwen3::open(path)?))
             },
         })
     }
-    pub fn environment(&self) -> &Environment {
-        match &self.family {
-            Family::Qwen3(model) => model.environment(),
-            Family::Whisper(model) => model.environment(),
-        }
+    pub fn is_image(&self) -> bool {
+        matches!(self.family, Family::Flux(_))
     }
     /// Maximum generated tokens when this is a transcription model.
     pub fn transcription_capacity(&self) -> Option<usize> {
         match &self.family {
             Family::Whisper(model) => Some(model.transcription_capacity()),
-            Family::Qwen3(_) => None,
+            Family::Qwen3(_) | Family::Flux(_) => None,
         }
     }
     pub fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
+            (Family::Flux(model), ModelRequest::Image(request)) => model.render_job(request),
             (
                 Family::Qwen3(model),
                 ModelRequest::Text {
@@ -99,6 +106,7 @@ impl ModelPackage {
             output.outcome
         );
         match &self.family {
+            Family::Flux(_) => Ok(ModelResponse::Image(Image::decode(output)?)),
             Family::Whisper(model) => Ok(ModelResponse::Transcription(model.decode(output)?)),
             Family::Qwen3(_) => {
                 let artifact = output

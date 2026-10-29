@@ -202,7 +202,8 @@ impl Whisper {
             "derived weight file has wrong length"
         );
         let mut content = EphemeralContent::default();
-        let source = content.insert(graph::bundle(&config, false)?.into_bytes());
+        let source =
+            content.insert(super::program::render(&graph::bundle(&config, false)?)?.into_bytes());
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
@@ -222,9 +223,6 @@ impl Whisper {
     }
     pub fn transcription_capacity(&self) -> usize {
         self.config.max_target_positions - 4
-    }
-    pub fn environment(&self) -> &Environment {
-        &self.environment
     }
     pub fn render_job(
         &self,

@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 pub const FORMAT: &str = "hellas.job.v1";
-const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+// Model plans name hundreds of weight views; their TOML exceeds 64 KiB.
+const MAX_DOCUMENT_BYTES: usize = 1 << 20;
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     #[error("invalid job: {0}")]
@@ -537,8 +538,19 @@ impl Job {
                 }
                 let mut object_files = Vec::new();
                 for (i, object) in objects.into_values().enumerate() {
+                    let bytes = match content.read(object) {
+                        Err(hellas_channel::content::ContentError::Missing)
+                            if !environment
+                                .sources
+                                .iter()
+                                .any(|source| source.id() == object.id()) =>
+                        {
+                            continue;
+                        }
+                        result => result?,
+                    };
                     let path = format!("object-{i}.bin");
-                    write(&path, &content.read(object)?)?;
+                    write(&path, &bytes)?;
                     object_files.push(ContentFile { object, path });
                 }
                 doc.compute = Some(ComputeFiles {
@@ -549,7 +561,11 @@ impl Job {
                 });
             }
         }
-        write("job.toml", toml::to_string_pretty(&doc)?.as_bytes())?;
+        let document = toml::to_string_pretty(&doc)?;
+        if document.len() > MAX_DOCUMENT_BYTES {
+            return Err(invalid("job.toml exceeds document limit"));
+        }
+        write("job.toml", document.as_bytes())?;
         Ok(())
     }
 }
