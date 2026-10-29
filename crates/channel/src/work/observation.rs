@@ -34,36 +34,67 @@ impl ObservationTime {
 #[derive(Debug, Default)]
 pub(super) struct Observation {
     height: Option<u64>,
-    confirmed: Option<(ObservationTime, Duration)>,
+    freshness: Freshness,
+}
+
+#[derive(Debug, Default)]
+enum Freshness {
+    #[default]
+    Stale,
+    Fresh(ObservationTime, Duration),
+    Unavailable,
 }
 
 impl Observation {
     pub(super) fn confirm(&mut self, height: u64, started: ObservationTime, max_age: Duration) {
         if self.height.is_none_or(|previous| height > previous) {
             self.height = Some(height);
-            self.confirmed = Some((started, max_age));
+            self.freshness = Freshness::Fresh(started, max_age);
         }
     }
 
     pub(super) fn check(&self) -> Result<(), EndpointError> {
-        if self
-            .confirmed
-            .is_some_and(|(started, max_age)| started.elapsed().is_some_and(|age| age < max_age))
-        {
-            Ok(())
-        } else {
-            Err(EndpointError::ObservationStale)
+        match self.freshness {
+            Freshness::Fresh(started, max_age)
+                if started.elapsed().is_some_and(|age| age < max_age) =>
+            {
+                Ok(())
+            }
+            Freshness::Unavailable => Err(EndpointError::NotAdmitting),
+            _ => Err(EndpointError::ObservationStale),
         }
     }
 
     pub(super) fn suspend(&mut self) {
-        self.confirmed = None;
+        if !matches!(self.freshness, Freshness::Unavailable) {
+            self.freshness = Freshness::Stale;
+        }
+    }
+
+    pub(super) fn reject(&mut self, height: u64) {
+        self.height = Some(self.height.map_or(height, |previous| previous.max(height)));
+        self.freshness = Freshness::Unavailable;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finalized_denial_survives_suspend_and_older_readiness() {
+        let mut observation = Observation::default();
+        let age = Duration::from_secs(5);
+        observation.confirm(10, ObservationTime::now(), age);
+        observation.reject(20);
+        observation.suspend();
+        for height in [15, 20] {
+            observation.confirm(height, ObservationTime::now(), age);
+            assert_eq!(observation.check(), Err(EndpointError::NotAdmitting));
+        }
+        observation.confirm(21, ObservationTime::now(), age);
+        assert!(observation.check().is_ok());
+    }
 
     #[test]
     fn an_unreadable_clock_cannot_establish_freshness() {

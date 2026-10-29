@@ -103,6 +103,24 @@ impl ProviderEndpoint {
             Err(DeliverError::NoResult {
                 phase: JobPhase::Running | JobPhase::Streaming,
             }) => {}
+            Err(DeliverError::Endpoint(EndpointError::ObservationStale)) => {
+                // Authentication has succeeded. The held decision may refuse an
+                // expired job while stale, but cannot authorize plaintext release.
+                let work_id =
+                    work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
+                let job = self
+                    .state()
+                    .job_by_id(work_id)
+                    .ok_or(DeliverError::NoSuchJob)?;
+                self.ready
+                    .as_ref()
+                    .ok_or(EndpointError::NotAdmitting)?
+                    .check_releasable(
+                        self.state().cursor().0,
+                        job.authorization().terminal_deadline,
+                    )?;
+                return Err(EndpointError::ObservationStale.into());
+            }
             Err(error) => return Err(error),
         }
         let ready = self.admitting()?.clone();
@@ -139,17 +157,34 @@ impl WorkService {
         &self,
         request: &StreamResultRequest,
         exporter: &[u8; 32],
-    ) -> Result<(), DeliverError> {
-        let mut endpoint = self
-            .endpoint
-            .lock_owned()
+    ) -> Result<AdmissionFacts, DeliverError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let mut endpoint = self
+                .endpoint
+                .lock_owned()
+                .await
+                .map_err(|_| EndpointError::Poisoned)?;
+            let (request, exporter) = (request.clone(), *exporter);
+            // A started SQLite append outlives its RPC. Acquire first to bound detached tasks.
+            let reserved = tokio::spawn(async move {
+                endpoint.reserve_stream(&request, &exporter).await?;
+                let work_id =
+                    work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
+                endpoint.job_facts(work_id)
+            })
             .await
-            .map_err(|_| EndpointError::Poisoned)?;
-        let (request, exporter) = (request.clone(), *exporter);
-        // A started SQLite append outlives its RPC. Acquire first to bound detached tasks.
-        tokio::spawn(async move { endpoint.reserve_stream(&request, &exporter).await })
-            .await
-            .map_err(|_| DeliverError::Endpoint(EndpointError::Poisoned))?
+            .map_err(|_| DeliverError::Endpoint(EndpointError::Poisoned))?;
+            match reserved {
+                Err(DeliverError::Endpoint(EndpointError::ObservationStale)) => {
+                    // Keep this stream's position; every wake rechecks its authorization.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), changed).await;
+                }
+                result => return result,
+            }
+        }
     }
     async fn check_stream_release(
         &self,
@@ -158,6 +193,7 @@ impl WorkService {
     ) -> Result<(), WireStatus> {
         self.reserve_stream_durably(request, exporter)
             .await
+            .map(|_| ())
             .map_err(|error| WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()))
     }
     pub(super) fn publish_progress(
@@ -207,8 +243,8 @@ impl WorkService {
             let mut position = 0;
             loop {
                 let changed = service.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
-                match service.reserve_stream_durably(&request, &exporter).await {
-                    Ok(()) => {},
+                let facts = match service.reserve_stream_durably(&request, &exporter).await {
+                    Ok(facts) => facts,
                     Err(DeliverError::NoResult { phase: JobPhase::HalfSigned | JobPhase::Accepted | JobPhase::Running | JobPhase::Streaming }) => {
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), changed).await;
                         continue;
@@ -219,10 +255,6 @@ impl WorkService {
                             grant: None, code: refusal.code.code() as i32, reason: refusal.reason,
                         })) }); return;
                     }
-                }
-                let facts = match service.endpoint().await.and_then(|endpoint| endpoint.job_facts(work_id).map_err(|_| EndpointError::NotAdmitting)) {
-                    Ok(facts) => facts,
-                    Err(error) => { yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string())); return; }
                 };
                 match service.retained_delivery(&request, &context).await {
                     Ok(delivery) => {
@@ -504,6 +536,330 @@ mod tests {
             JobPhase::Streaming
         );
         assert_eq!(store.state().cursor().0, fixture::CURSOR + 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum PauseAt {
+        Loop,
+        LiveBatch,
+        Retained,
+    }
+
+    #[derive(Clone, Copy)]
+    enum AfterPause {
+        Resume,
+        Expire,
+        Close,
+    }
+
+    async fn paused_stream(pause_at: PauseAt, after: AfterPause) {
+        use crate::test_support::channel as fixture;
+        use base64::Engine as _;
+        use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+        use hellas_rpc::protocol::invocation::{Admission, fetch};
+        use std::time::Duration;
+
+        let provider_root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let mut policy = fixture::fetch_policy();
+        let Admission::Fetch { admission } = &mut policy.admissions[0] else {
+            unreachable!();
+        };
+        admission.limits.max_encoded_result_frame = 8192;
+        let descriptor = fixture::descriptor_with(policy.clone());
+        let ready = fixture::ready_of(&descriptor, fixture::CURSOR);
+        let mut input = fixture::fetch_bundle(1);
+        input.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
+        let provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(
+                provider_root.path(),
+                &ready,
+                Role::Provider,
+                fixture::CURSOR,
+            )
+            .await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let proposal = client
+            .propose(&JobProposal {
+                prepared_input: input.clone(),
+                deadlines: fixture::deadlines(),
+            })
+            .await
+            .unwrap();
+        let service = WorkService::new(provider);
+        let response = fixture::accept_uploaded_client(&service, &client, &proposal).await;
+        let work = client.accepted(&response).await.unwrap();
+        service.begin_run(work, &ready).await.unwrap();
+        let facts = service.endpoint().await.unwrap().job_facts(work).unwrap();
+        service
+            .observe_ready(
+                ready.clone(),
+                ObservationTime::now(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let payloads = [
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                status: 200,
+                headers: vec![],
+            })),
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body {
+                base64: base64::engine::general_purpose::STANDARD.encode(vec![7; 96]),
+            })),
+        ]
+        .iter()
+        .map(|event| hellas_rpc::fetch::encode_fetch_event_payload(event).unwrap())
+        .collect::<Vec<_>>();
+        let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
+            stop_reason: StopReason::EndOfText,
+            usage: None,
+        })
+        .unwrap();
+        let transcript = fetch::output(&payloads, &terminal)
+            .unwrap()
+            .sign(&input.request, &fixture::provider_producer(), 8)
+            .unwrap();
+        let prefixes = &transcript[..transcript.len() - 1];
+        assert!(prefix_batches(prefixes, facts.max_encoded_result_frame).count() > 1);
+        match pause_at {
+            PauseAt::Retained => {
+                service.record_result(work, &transcript).await.unwrap();
+            }
+            PauseAt::Loop | PauseAt::LiveBatch => {
+                let initial = if matches!(pause_at, PauseAt::Loop) {
+                    &prefixes[..1]
+                } else {
+                    prefixes
+                };
+                for event in initial {
+                    service
+                        .publish_progress(work, &facts, event.clone())
+                        .unwrap();
+                }
+            }
+        }
+        let mut stream = service.result_stream(
+            client.request_delivery(work, &[7; 32]).unwrap(),
+            TransportContext {
+                open_exporter: Some([7; 32]),
+                ..Default::default()
+            },
+        );
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            first.outcome,
+            Some(work_stream_event::Outcome::Prefix(_))
+        ));
+        service.suspend().await.unwrap();
+        if !matches!(pause_at, PauseAt::Retained) {
+            // Completion may be persisted while stale, but it must not be released.
+            service.record_result(work, &transcript).await.unwrap();
+        }
+        let mut frames = vec![first];
+        let next = stream.next();
+        tokio::pin!(next);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut next)
+                .await
+                .is_err(),
+            "stale observation must expose neither plaintext nor a terminal refusal"
+        );
+        service
+            .observe_ready(
+                ready.clone(),
+                ObservationTime::now(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut next)
+                .await
+                .is_err(),
+            "rereading the old finalized height must not restore freshness"
+        );
+
+        let height = if matches!(after, AfterPause::Expire) {
+            fixture::deadlines().terminal - 1
+        } else {
+            fixture::CURSOR + 1
+        };
+        let mut driver = service.drive().unwrap();
+        for height in fixture::CURSOR + 1..=height {
+            driver
+                .observe_finalized(&FinalizedWork {
+                    height,
+                    parent: fixture::payload_at(height - 1),
+                    payload: fixture::payload_at(height),
+                    txs: if matches!(after, AfterPause::Close) {
+                        vec![hellas_kernel::Tx::move_action(
+                            hellas_kernel::Move::StartPaymentClose(
+                                crate::work_close::close_start(
+                                    ready.channel(),
+                                    hellas_kernel::Party::Maker,
+                                    fixture::CURSOR,
+                                    None,
+                                    &fixture::client(),
+                                )
+                                .unwrap(),
+                            ),
+                        )]
+                    } else {
+                        vec![]
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        drop(driver);
+        if matches!(after, AfterPause::Resume) {
+            service
+                .observe_ready(
+                    fixture::ready_of(&descriptor, height),
+                    ObservationTime::now(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap();
+        }
+        let resumed = tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .expect("finalized progress must wake the same stream")
+            .unwrap();
+        if !matches!(after, AfterPause::Resume) {
+            match resumed {
+                Ok(WorkStreamEvent {
+                    outcome: Some(work_stream_event::Outcome::Refused(refusal)),
+                }) => {
+                    assert_eq!(
+                        refusal.code,
+                        if matches!(after, AfterPause::Expire) {
+                            WorkRefusalCode::Expired as i32
+                        } else {
+                            WorkRefusalCode::Declined as i32
+                        }
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(error.code, hellas_wire::WireCode::Unavailable);
+                    if matches!(after, AfterPause::Expire) {
+                        assert!(error.to_string().contains("delivery"), "{error}");
+                    }
+                }
+                other => panic!("ended stream released output: {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(
+                service
+                    .with_state(|state| state.ledger().credited_cumulative())
+                    .await
+                    .unwrap(),
+                0
+            );
+            return;
+        }
+        frames.push(resumed.unwrap());
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.unwrap());
+        }
+        let mut received = Vec::new();
+        let mut completed = None;
+        for frame in frames {
+            let bytes = match frame.outcome.unwrap() {
+                work_stream_event::Outcome::Prefix(bytes) => {
+                    assert!(completed.is_none(), "prefix after terminal");
+                    bytes
+                }
+                work_stream_event::Outcome::Terminal(end) => {
+                    assert!(completed.is_none(), "duplicate terminal");
+                    let bytes = end.terminal_transcript.clone();
+                    completed = Some(end);
+                    bytes
+                }
+                other => panic!("unexpected resumed frame: {other:?}"),
+            };
+            received.extend(decode_transcript(&bytes, facts.max_spool_bytes as usize).unwrap());
+        }
+        assert_eq!(received, transcript, "no skipped or replayed envelopes");
+        let completed = completed.expect("exactly one terminal");
+        client
+            .receive_stream(
+                work,
+                &ready,
+                &ResultTranscript {
+                    result: completed.result,
+                    provider_signature: completed.provider_signature,
+                    transcript: encode_transcript(&received).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        client.verified(work).await.unwrap();
+        let payment = client.pay(work).await.unwrap();
+        let credited = service.credit(&payment).await;
+        assert_eq!(
+            client.acknowledged(work, &credited).unwrap(),
+            fixture::PRICE
+        );
+        assert_eq!(
+            service.credit(&payment).await,
+            credited,
+            "payment is idempotent"
+        );
+        service
+            .with_state(|state| {
+                assert_eq!(state.ledger().credited_cumulative(), fixture::PRICE);
+                assert_eq!(state.jobs().count(), 0);
+                assert!(matches!(
+                    state.terminal_by_id(work).unwrap().outcome,
+                    TerminalOutcome::Certified { .. }
+                ));
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.state().terminal_by_id(work).unwrap().outcome,
+            TerminalOutcome::Certified { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_live_stream_pauses_at_loop_admission_and_settles_once() {
+        paused_stream(PauseAt::Loop, AfterPause::Resume).await;
+    }
+
+    #[tokio::test]
+    async fn stale_live_stream_pauses_between_batches_and_settles_once() {
+        paused_stream(PauseAt::LiveBatch, AfterPause::Resume).await;
+    }
+
+    #[tokio::test]
+    async fn stale_retained_stream_pauses_between_frames_and_settles_once() {
+        paused_stream(PauseAt::Retained, AfterPause::Resume).await;
+    }
+
+    #[tokio::test]
+    async fn stale_stream_still_expires_at_its_signed_delivery_deadline() {
+        for pause_at in [PauseAt::Loop, PauseAt::LiveBatch, PauseAt::Retained] {
+            paused_stream(pause_at, AfterPause::Expire).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_stream_stops_at_a_journaled_close_before_readiness_refresh() {
+        for pause_at in [PauseAt::Loop, PauseAt::LiveBatch, PauseAt::Retained] {
+            paused_stream(pause_at, AfterPause::Close).await;
+        }
     }
 
     #[test]

@@ -3736,16 +3736,28 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .expect("refusal is answered");
         let Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
             outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)),
-        })) = stream.next().await
+        })) = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+            .await
+            .expect("a finalized contest terminates delivery")
         else {
             panic!("cached readiness must not release data after a finalized contest");
         };
-        assert_retryable_not_ready(refusal);
+        assert_eq!(refusal.code, WorkRefusalCode::Unavailable as i32);
+        assert!(stream.next().await.is_none());
     });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_result_stream_stops_when_a_contest_finalizes() {
+    open_result_stream_stops(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_result_stream_stops_when_the_observer_shuts_down() {
+    open_result_stream_stops(true).await;
+}
+
+async fn open_result_stream_stops(shutdown: bool) {
     let dir = temp();
     write_setup_journal(dir.path()).await;
     let work_id = write_accepted_channel(dir.path()).await;
@@ -3778,7 +3790,10 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
         .handler(&context, request.route.as_ref())
         .unwrap()
         .unwrap();
-    let mut stream = handler.stream_result(request, context).await.unwrap();
+    let mut stream = handler
+        .stream_result(request, context.clone())
+        .await
+        .unwrap();
     let first = tokio::time::timeout(TEST_TIMEOUT, stream.next())
         .await
         .unwrap()
@@ -3789,10 +3804,29 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
         Some(hellas_rpc::pb::work::work_stream_event::Outcome::Prefix(_))
     ));
 
-    chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
-    assert!(runner.tick(&chain).await);
+    let next = stream.next();
+    tokio::pin!(next);
+    if shutdown {
+        mount
+            .service(&context, descriptor().channel().id())
+            .unwrap()
+            .unwrap()
+            .suspend()
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut next)
+                .await
+                .is_err(),
+            "transient suspension pauses the open stream"
+        );
+        mount.clear_all().await.unwrap();
+    } else {
+        chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        assert!(runner.tick(&chain).await);
+    }
     backend.finish();
-    let next = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+    let next = tokio::time::timeout(TEST_TIMEOUT, &mut next)
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");

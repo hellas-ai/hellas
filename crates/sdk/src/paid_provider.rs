@@ -464,7 +464,7 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Aborts accepted jobs, then suspends every channel before releasing its mount. Cancellation retains
+    /// Aborts accepted jobs, then stops every channel before releasing its mount. Cancellation retains
     /// the mounts so shutdown can resume; namespace changes serialize with draining.
     pub async fn clear_all(&self) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
@@ -484,8 +484,8 @@ impl MountedWork {
             )
         };
         for service in channels {
-            let suspended = service.suspend().await.map_err(MountError::from);
-            result = result.and(suspended);
+            let stopped = service.stop().await.map_err(MountError::from);
+            result = result.and(stopped);
         }
         let mut held = match self.mounted.lock() {
             Ok(held) => held,
@@ -718,7 +718,15 @@ impl DrivenChannel {
         if snapshot.query() != &query {
             return Err(PaidProviderError::WrongSnapshot);
         }
-        let ready = descriptor.check_ready(&snapshot.observed_channel())?;
+        let ready = match descriptor.check_ready(&snapshot.observed_channel()) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.service
+                    .observe_unavailable(snapshot.block().height)
+                    .await?;
+                return Err(error.into());
+            }
+        };
         let cursor = self.service.with_state(|state| state.cursor().0).await?;
         if ready.check_caught_up(cursor).is_err() {
             self.service
