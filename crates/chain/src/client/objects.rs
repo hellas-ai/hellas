@@ -15,6 +15,11 @@ use std::collections::BTreeMap;
 
 type StateOperation = Operation<mmr::Family, ObjectId, Object>;
 
+pub(super) struct View {
+    target: crate::UtxoSyncTarget,
+    objects: BTreeMap<ObjectId, Object>,
+}
+
 fn invalid(message: impl std::fmt::Display) -> QueryError {
     QueryError::Remote(format!("invalid finalized object witness: {message}"))
 }
@@ -29,6 +34,9 @@ pub(super) async fn read(
         ));
     }
     let keys: BTreeSet<_> = keys.into_iter().collect();
+    // Clones share one verified view, including reads for previously unseen keys.
+    // Serialize refreshes so concurrent wallet and channel reads reuse the work.
+    let mut view = client.objects.lock().await;
     let Some(finalized) = client
         .get_applied_finalized_block(FinalizedBlockQuery::Latest)
         .await?
@@ -40,15 +48,32 @@ pub(super) async fn read(
     if target.root != finalized.snapshot.state_root {
         return Err(invalid("state root differs from the certified sync target"));
     }
-    let start = *target.range.start();
+    let floor = *target.range.start();
     let count = *target.range.end();
-    if start >= count {
+    if floor >= count {
         return Err(invalid("empty operation witness"));
     }
+    let start = match view.as_ref() {
+        Some(previous) => {
+            let end = *previous.target.range.end();
+            if floor < *previous.target.range.start() || count < end {
+                return Err(invalid("operation witness moved backward"));
+            }
+            if count == end && target != previous.target {
+                return Err(invalid("conflicting operation witness at the same size"));
+            }
+            if count > end && target.root == previous.target.root {
+                return Err(invalid("operation witness grew without changing root"));
+            }
+            if end < floor { floor } else { end }
+        }
+        None => floor,
+    };
     // Any-QMDB authenticates history, rather than a key's latest value. Reading
     // its entire certified retained interval also proves absence and prevents an
     // old, individually valid update from masquerading as a current object.
-    // Only requested keys and four bounded wire ranges are retained in memory.
+    // Later finalized targets extend the same append-only log. Verify its entire
+    // new suffix, or bootstrap again if pruning has overtaken the cached cursor.
     let ranges = stream::iter((start..count).step_by(64))
         .map(|start| {
             let client = client.clone();
@@ -94,31 +119,54 @@ pub(super) async fn read(
         })
         .buffered(4);
     futures_util::pin_mut!(ranges);
-    let mut objects = BTreeMap::new();
+    // Stage changes until every proof and the terminal floor have been checked.
+    // Errors and cancellation leave the previous verified view intact.
+    let mut changes = BTreeMap::new();
     let mut last_floor = None;
     while let Some(operations) = ranges.next().await {
         for operation in operations? {
             last_floor = match operation {
                 StateOperation::Update(update) => {
-                    if keys.contains(&update.0) {
-                        objects.insert(update.0, update.1);
-                    }
+                    changes.insert(update.0, Some(update.1));
                     None
                 }
                 StateOperation::Delete(key) => {
-                    objects.remove(&key);
+                    changes.insert(key, None);
                     None
                 }
                 StateOperation::CommitFloor(_, floor) => Some(*floor),
             };
         }
     }
-    if last_floor != Some(start) {
+    if start < count && last_floor != Some(floor) {
         return Err(invalid("terminal inactivity floor"));
     }
+    if start == floor {
+        *view = Some(View {
+            target: target.clone(),
+            objects: BTreeMap::new(),
+        });
+    }
+    let view = view
+        .as_mut()
+        .expect("a verified initial interval creates the view");
+    for (key, object) in changes {
+        match object {
+            Some(object) => {
+                view.objects.insert(key, object);
+            }
+            None => {
+                view.objects.remove(&key);
+            }
+        }
+    }
+    view.target = target.clone();
     Ok(Some(ObjectSnapshot {
         network: client.pinned_network()?,
         block: finalized.snapshot,
-        objects,
+        objects: keys
+            .into_iter()
+            .filter_map(|key| view.objects.get(&key).cloned().map(|object| (key, object)))
+            .collect(),
     }))
 }
