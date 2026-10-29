@@ -178,6 +178,88 @@ fn compute_folder_round_trip_binds_environment_plan_and_price() {
     );
 }
 
+#[test]
+fn compute_folder_preserves_provider_held_assets_without_uploading_them() {
+    use compute::{Environment, NamedAsset};
+    let mut content = EphemeralContent::default();
+    let source = content.insert(b"self-contained source".to_vec());
+    let local = content.insert(b"caller-owned asset".to_vec());
+    let external = hellas_rpc::ContentRef::for_bytes(b"provider-held weights");
+    let environment = Environment {
+        sources: vec![source],
+        assets: vec![
+            NamedAsset {
+                name: "local".into(),
+                object: local,
+            },
+            NamedAsset {
+                name: "external".into(),
+                object: external,
+            },
+        ],
+    };
+    content.insert(environment.canonical_bytes().unwrap());
+    let job = Job::compute(
+        20,
+        environment,
+        hellas_channel::test_support::channel::plan(),
+        vec![],
+        InvocationContent::Ephemeral(content),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    job.save(directory.path()).unwrap();
+    let loaded = Job::load(directory.path()).unwrap();
+    assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
+    assert_eq!(loaded.digest(), job.digest());
+    let JobInput::Compute { content, .. } = loaded.input() else {
+        panic!()
+    };
+    assert_eq!(
+        content.read(source).unwrap().as_slice(),
+        b"self-contained source"
+    );
+    assert_eq!(
+        content.read(local).unwrap().as_slice(),
+        b"caller-owned asset"
+    );
+    assert!(matches!(
+        content.read(external),
+        Err(hellas_channel::content::ContentError::Missing)
+    ));
+}
+
+#[test]
+fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
+    use compute::{Environment, NamedAsset};
+    let source = hellas_rpc::ContentRef::for_bytes(b"required source");
+    for missing_source in [true, false] {
+        let mut content = EphemeralContent::default();
+        if !missing_source {
+            content.insert(b"required source".to_vec());
+        }
+        let asset = content.insert(b"present asset".to_vec());
+        let environment = Environment {
+            sources: vec![source],
+            assets: vec![NamedAsset {
+                name: "weights".into(),
+                object: hellas_rpc::ContentRef::new(asset.id(), asset.bytes() + 1),
+            }],
+        };
+        content.insert(environment.canonical_bytes().unwrap());
+        let job = Job::compute(
+            20,
+            environment,
+            hellas_channel::test_support::channel::plan(),
+            vec![],
+            InvocationContent::Ephemeral(content),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        assert!(job.save(directory.path()).is_err());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn directory_reads_stay_with_the_selected_inode_after_its_name_is_replaced() {

@@ -537,8 +537,19 @@ impl Job {
                 }
                 let mut object_files = Vec::new();
                 for (i, object) in objects.into_values().enumerate() {
+                    let bytes = match content.read(object) {
+                        Err(hellas_channel::content::ContentError::Missing)
+                            if !environment
+                                .sources
+                                .iter()
+                                .any(|source| source.id() == object.id()) =>
+                        {
+                            continue;
+                        }
+                        result => result?,
+                    };
                     let path = format!("object-{i}.bin");
-                    write(&path, &content.read(object)?)?;
+                    write(&path, &bytes)?;
                     object_files.push(ContentFile { object, path });
                 }
                 doc.compute = Some(ComputeFiles {
