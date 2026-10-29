@@ -61,6 +61,21 @@ fn flux_reference_checks_seeded_noise() {
 }
 
 #[test]
+fn seeded_noise_matches_the_upstream_reference() {
+    // Captured by flux_reference_checks_seeded_noise against catena-models
+    // 2c147f7: native seed 42 and this noise produced identical 512x512 PNGs.
+    let bytes: Vec<_> = noise(42, 512, 512)
+        .unwrap()
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    assert_eq!(
+        ContentRef::for_bytes(&bytes).id().to_string(),
+        "0ee0ebb8264354c91be5a9b439e84df37b3a3a926b580390311a81e9c7238089",
+    );
+}
+
+#[test]
 fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     let package = ModelPackage::open(&fixture()).unwrap();
     let request = request();
