@@ -85,3 +85,63 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn whisper_plan_validates_against_the_compiled_bundle() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
+        let package = ModelPackage::open(&path).unwrap();
+        let mut job = package
+            .render_job(&ModelRequest::Transcription {
+                samples: &[0.; 400],
+                language: Some("en"),
+                max_new_tokens: 4,
+            })
+            .unwrap();
+        let source =
+            String::from_utf8((*job.content.read(job.environment.sources[0]).unwrap()).clone())
+                .unwrap();
+        let module = hellas_executor::catena::compile::compile_sources(
+            &[source],
+            catena_lang::codegen::GpuDialect::Hip,
+        )
+        .unwrap();
+        let mut content = job.content.clone();
+        let inputs = job
+            .inputs
+            .iter()
+            .map(|a| (a.name.clone(), content.insert(a.bytes.as_bytes().to_vec())))
+            .collect();
+        content.insert(std::fs::read(path.join("weights.bf16")).unwrap());
+        let content = InvocationContent::Ephemeral(content);
+        let limits = hellas_rpc::protocol::invocation::Limits {
+            max_upload_bytes: 4 << 20,
+            max_output_bytes: 1 << 20,
+            max_steps: 64,
+            execution_timeout_ms: 90000,
+        };
+        hellas_executor::catena::validate::validate(
+            &module,
+            &job.environment,
+            &inputs,
+            &job.plan,
+            &limits,
+            &content,
+        )
+        .unwrap();
+        job.plan.calls[0].args[0] = hellas_rpc::protocol::invocation::compute::Arg::U64(0);
+        assert!(
+            hellas_executor::catena::validate::validate(
+                &module,
+                &job.environment,
+                &inputs,
+                &job.plan,
+                &limits,
+                &content
+            )
+            .is_err()
+        );
+    }
+}

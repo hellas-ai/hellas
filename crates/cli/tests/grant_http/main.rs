@@ -1,6 +1,7 @@
 #![cfg(unix)]
 mod contact;
 mod local_text;
+mod local_whisper;
 mod managed;
 mod offer_gateway;
 

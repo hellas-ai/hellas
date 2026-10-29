@@ -105,6 +105,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+catena-lang.workspace = true
 ciborium.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
