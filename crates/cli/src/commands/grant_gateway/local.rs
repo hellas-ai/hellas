@@ -52,7 +52,7 @@ pub async fn prepare(
     )?
     .with_content_store(content);
     let transport = GrantTransport::Local(service);
-    let timeout = Duration::from_secs(90);
+    let control_timeout = Duration::from_secs(90);
     let target = GrantTarget {
         network: grant_network(),
         grant,
@@ -66,7 +66,7 @@ pub async fn prepare(
         &transport,
         &trust,
         &application,
-        timeout,
+        control_timeout,
     )
     .await?;
     Ok((
@@ -76,7 +76,7 @@ pub async fn prepare(
             signer,
             application,
             journal_root: crate::commands::contributions::client_journal_root(&principal)?,
-            timeout,
+            control_timeout,
         },
         transport,
     ))

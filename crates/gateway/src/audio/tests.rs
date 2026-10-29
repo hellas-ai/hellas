@@ -16,16 +16,19 @@ use tower::ServiceExt;
 struct Fake {
     calls: AtomicUsize,
     timeout: Option<std::time::Duration>,
+    delay: Option<std::time::Duration>,
+    started: tokio::sync::Notify,
 }
 impl WorkExecutionBackend for Fake {
-    fn timeout(&self) -> std::time::Duration {
-        self.timeout.unwrap_or(std::time::Duration::from_secs(30))
+    fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout
     }
     fn run(
         &self,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
         assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
         assert!(job.plan.step.is_none());
         for source in &job.environment.sources {
@@ -66,7 +69,7 @@ impl WorkExecutionBackend for Fake {
                 .unwrap(),
             ),
         };
-        Ok(Box::pin(futures::stream::iter([
+        let events = [
             Ok(ComputeEvent::Output(chunk)),
             Ok(ComputeEvent::Done {
                 output,
@@ -74,7 +77,14 @@ impl WorkExecutionBackend for Fake {
                     .unwrap()
                     .public_key(),
             }),
-        ])))
+        ];
+        let delay = self.delay;
+        Ok(Box::pin(async_stream::stream! {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            for event in events { yield event; }
+        }))
     }
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
         Box::pin(async { Ok(()) })
@@ -263,6 +273,7 @@ async fn expired_preparation_never_submits_work() {
     let fake = Arc::new(Fake {
         calls: AtomicUsize::new(0),
         timeout: Some(std::time::Duration::ZERO),
+        ..Default::default()
     });
     let app = app(&["tiny"], fake.clone()).await;
     let response = app
@@ -271,4 +282,30 @@ async fn expired_preparation_never_submits_work() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn audio_waits_without_a_client_deadline_but_keeps_explicit_budgets() {
+    for timeout in [None, Some(std::time::Duration::from_secs(5))] {
+        let fake = Arc::new(Fake {
+            timeout,
+            delay: Some(std::time::Duration::from_secs(600)),
+            ..Default::default()
+        });
+        let app = app(&["tiny"], fake.clone()).await;
+        let response =
+            tokio::spawn(app.oneshot(request(&[("model", b"tiny"), ("file", &wav(16000, 160))])));
+        fake.started.notified().await;
+        tokio::time::pause();
+        let response = response.await.unwrap().unwrap();
+        tokio::time::resume();
+        assert_eq!(
+            response.status(),
+            if timeout.is_some() {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::OK
+            }
+        );
+    }
 }

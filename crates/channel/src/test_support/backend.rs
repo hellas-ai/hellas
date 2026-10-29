@@ -107,6 +107,8 @@ pub struct Backend {
     pub queued: Option<Arc<Notify>>,
     pub started: Arc<Notify>,
     pub finish: Completion,
+    /// Hold the first output after notifying `started`.
+    pub first: Option<Completion>,
     /// Released once before each prefix after the first.
     pub pace: Option<Completion>,
     pub cancelled: Arc<Notify>,
@@ -125,6 +127,7 @@ impl Default for Backend {
             started: Arc::new(Notify::new()),
             finish: Completion::Notified(Arc::new(Notify::new())),
             pace: None,
+            first: None,
             cancelled: Arc::new(Notify::new()),
             stop_on_cancel: false,
             reply: Reply::text("private-grant-result", 1),
@@ -162,6 +165,10 @@ impl WorkBackend for Backend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(inspect) = &self.inspect_content {
             inspect(&prepared, &content);
+        }
+        if let Some(first) = &self.first {
+            self.started.notify_one();
+            first.wait().await;
         }
         let mut stream = invocation_output::OutputStream::new(
             &prepared.request,

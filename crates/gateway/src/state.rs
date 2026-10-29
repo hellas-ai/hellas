@@ -30,7 +30,7 @@ pub(super) struct TextState {
     pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
     pub(super) model_name: String,
-    pub(super) inference_timeout: Duration,
+    pub(super) inference_timeout: Option<Duration>,
     presentation: Arc<TextPresentation>,
     text: Arc<ModelPackage>,
     work: Arc<dyn WorkExecutionBackend>,
@@ -49,7 +49,7 @@ pub(super) struct PreparedGeneration {
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) presentation: Arc<TextPresentation>,
-    pub(super) inference_timeout: Duration,
+    pub(super) inference_timeout: Option<Duration>,
 }
 
 impl TextState {
@@ -131,8 +131,9 @@ impl TextState {
 impl PreparedGeneration {
     /// Absolute deadline for this generation's stream consumption.
     /// Computed at call time; covers the whole lifecycle from this point on.
-    pub(super) fn deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::now() + self.inference_timeout
+    pub(super) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.inference_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout)
     }
 }
 

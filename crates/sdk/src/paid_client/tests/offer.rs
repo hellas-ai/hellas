@@ -295,7 +295,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 signer: Arc::new(principal(1).1),
                 application,
                 journal_root: fixture.root.path().join("grant-client"),
-                timeout: Duration::from_secs(5),
+                control_timeout: Duration::from_secs(5),
             },
             GrantTransport::Remote(client_endpoint.clone()),
         )
@@ -328,6 +328,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 "responses",
                 grant_input,
                 &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                None,
                 None,
             )
             .await

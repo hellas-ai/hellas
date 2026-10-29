@@ -155,9 +155,9 @@ pub trait WorkExecutionBackend: Send + Sync {
         Err(WorkGatewayError::Unsupported)
     }
 
-    /// End-to-end budget, including queued time, advertised to HTTP consumers.
-    fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(300)
+    /// An explicit end-to-end budget, including queued time, if the source has one.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        None
     }
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
@@ -366,7 +366,9 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         hellas_rpc::telemetry::http::trace_request,
     ));
     let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    info!("timeout: {}s", work.timeout().as_secs());
+    if let Some(timeout) = work.timeout() {
+        info!("timeout: {}s", timeout.as_secs());
+    }
 
     launch_gateway(
         app,
@@ -579,13 +581,15 @@ fn now_unix() -> i64 {
     (UnixMillis::now().unwrap_or_default().0 / 1_000) as i64
 }
 
-/// How many seconds remain until `deadline`, clamped to at least one
-/// second so timeout error messages don't report `0s`.
-fn timeout_secs_until(deadline: tokio::time::Instant) -> u64 {
-    deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .as_secs()
-        .max(1)
+/// Wait without a client deadline unless the work source explicitly supplies one.
+async fn before_deadline<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
+        None => Ok(future.await),
+    }
 }
 
 #[cfg(test)]

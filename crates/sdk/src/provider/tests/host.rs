@@ -74,9 +74,8 @@ impl Host {
             signer: Arc::new(FRIEND.node_key()),
             application: self.application.clone(),
             journal_root: self.root.path().join("client"),
-            // A job deadline below the grant limit leaves room for the client
-            // monotonic clock while the injected provider clock stays fixed.
-            timeout: std::time::Duration::from_secs(5),
+            // Control calls stay bounded independently of the signed job limit.
+            control_timeout: std::time::Duration::from_secs(5),
         }
     }
     pub async fn gateway_access(&self) -> hellas_gateway::GatewayAccess {

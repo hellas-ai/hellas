@@ -402,7 +402,7 @@ pub trait WorkSource: Send + Sync + Sized + 'static {
         request: Self::Request,
         requester: Requester<E, Self::Error>,
     ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>>;
-    fn timeout(&self) -> Duration;
+    fn timeout(&self) -> Option<Duration>;
     fn gateway_error(error: Self::Error) -> WorkGatewayError;
     fn shutdown(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>>;
 }
@@ -561,7 +561,7 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
             content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
         }))
     }
-    fn timeout(&self) -> Duration {
+    fn timeout(&self) -> Option<Duration> {
         self.source.timeout()
     }
     fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {

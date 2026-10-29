@@ -131,10 +131,13 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     let Some(file) = file else {
         return bad("file field is required");
     };
-    let deadline = tokio::time::Instant::now() + state.work.timeout();
+    let deadline = state
+        .work
+        .timeout()
+        .map(|timeout| tokio::time::Instant::now() + timeout);
     let package = state.package.clone();
     let max_new_tokens = state.options.default_max_tokens;
-    let job = match tokio::time::timeout_at(
+    let job = match crate::before_deadline(
         deadline,
         tokio::task::spawn_blocking(move || {
             let samples = wav::decode(&file)?;
@@ -157,7 +160,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
             );
         }
     };
-    if tokio::time::Instant::now() >= deadline {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
         return json_error(
             StatusCode::GATEWAY_TIMEOUT,
             "transcription preparation timed out",
@@ -168,7 +171,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
         Err(error) => return work_error(error),
     };
     loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
+        match crate::before_deadline(deadline, stream.next()).await {
             Ok(Some(Ok(ComputeEvent::Output(_)))) => {}
             Ok(Some(Ok(ComputeEvent::Done { output, .. }))) => {
                 return match state.package.decode(&output) {

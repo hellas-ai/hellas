@@ -147,9 +147,8 @@ impl Fixture {
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
             journal_root: self.root.path().join("client"),
-            // A job deadline below the grant limit leaves room for the client
-            // monotonic clock while the injected provider clock stays fixed.
-            timeout: std::time::Duration::from_secs(5),
+            // Control calls stay bounded independently of the signed job limit.
+            control_timeout: std::time::Duration::from_secs(5),
         }
     }
     async fn session(&self) -> crate::grant_client::GrantSession {
@@ -204,6 +203,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })),
+            None,
         )
         .await
         .unwrap();
@@ -306,7 +306,8 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                     "responses",
                     f.input(),
                     &InvocationContent::Ephemeral(Default::default()),
-                    None
+                    None,
+                    None,
                 )
                 .await,
             Err(GrantClientError::RecoveryRequired)
@@ -391,6 +392,7 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
             f.input(),
             &InvocationContent::Ephemeral(Default::default()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -421,7 +423,8 @@ async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
                     "responses",
                     f.input(),
                     &InvocationContent::Ephemeral(Default::default()),
-                    None
+                    None,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -448,6 +451,7 @@ async fn recovered_metadata_is_bound_to_the_requested_job_channel_and_provider()
             "responses",
             f.input(),
             &InvocationContent::Ephemeral(Default::default()),
+            None,
             None,
         )
         .await
@@ -603,3 +607,77 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
 }
 
 use hellas_channel::test_support::test_responses_contract;
+
+#[tokio::test]
+async fn stalled_transport_setup_keeps_its_control_timeout() {
+    use hellas_rpc::services::work::{Open, Work};
+    let f = Fixture::new().await;
+    let provider = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&[2; 32]))
+        .alpns(vec![Work::ALPN.as_bytes().to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let mut options = f.options();
+    options.target = pinned_offer(
+        options.target.offer().grant.clone(),
+        provider
+            .addr()
+            .ip_addrs()
+            .map(ToString::to_string)
+            .collect(),
+    );
+    let journal = options.journal_root.clone();
+    let opening = tokio::spawn(GrantSession::open(
+        options,
+        GrantTransport::Remote(client.clone()),
+    ));
+    let connection = hellas_authority::test_support::within(async {
+        provider.accept().await.unwrap().await.unwrap()
+    })
+    .await;
+    let transport = IrohTransport::new(connection);
+    let inbound = hellas_authority::test_support::within(transport.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inbound.method_id, Open::METHOD_ID);
+    // Keep Open unanswered: timing out job execution is not needed to bound setup.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), opening)
+        .await
+        .expect("control deadline must end stalled setup")
+        .unwrap();
+    tokio::time::resume();
+    assert_err!(result, GrantClientError::Timeout);
+    assert!(!journal.exists());
+    drop(inbound);
+    client.close().await;
+    provider.close().await;
+}
+
+#[tokio::test]
+async fn stalled_local_transport_setup_keeps_its_control_timeout() {
+    let f = Fixture::new().await;
+    let node = f.service.node();
+    let held = hellas_authority::test_support::hold_writer(&node).await;
+    tokio::time::pause();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        GrantSession::open(f.options(), GrantTransport::Local(f.service.clone())),
+    )
+    .await
+    .expect("control deadline must end stalled local authentication");
+    tokio::time::resume();
+    assert_err!(result, GrantClientError::Timeout);
+    drop(held);
+}

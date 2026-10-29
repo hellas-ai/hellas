@@ -360,7 +360,7 @@ impl ResellerBuilder {
                 },
                 policy: None,
                 session: hellas_sdk::grant_client::GrantSessionOptions {
-                    timeout: std::time::Duration::from_millis(
+                    control_timeout: std::time::Duration::from_millis(
                         pinned.offer().grant.max_job_millis.get(),
                     ),
                     target: pinned,

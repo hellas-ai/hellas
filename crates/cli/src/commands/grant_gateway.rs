@@ -17,6 +17,6 @@ pub fn session(
         signer: Arc::new(identity.node_key.clone()),
         application,
         journal_root: super::contributions::client_journal_root(&client)?,
-        timeout: Duration::from_secs(90),
+        control_timeout: Duration::from_secs(90),
     })
 }

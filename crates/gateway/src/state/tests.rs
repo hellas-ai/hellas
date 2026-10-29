@@ -102,8 +102,8 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
 async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     struct Busy;
     impl crate::WorkExecutionBackend for Busy {
-        fn timeout(&self) -> Duration {
-            Duration::from_secs(17)
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(17))
         }
         fn run(
             &self,
@@ -116,7 +116,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         }
     }
     let state = open(Arc::new(Busy)).await;
-    assert_eq!(state.inference_timeout, Duration::from_secs(17));
+    assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
         .prepare_ids(vec![0], 1, None)
         .err()

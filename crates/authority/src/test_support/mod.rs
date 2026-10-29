@@ -468,3 +468,8 @@ pub use hellas_channel::test_support::{
     network, node_key, passkey, passkey_of, principal, software_enrollment, subject_of,
     test_responses_contract, transport, upload_failure,
 };
+
+/// Hold the node writer to exercise cancellation and deadlines under contention.
+pub async fn hold_writer(node: &crate::node::NodeCoordinator) -> impl Drop + '_ {
+    node.writer().await.unwrap()
+}

@@ -13,10 +13,7 @@ use hellas_authority::model::grant::records::{
 };
 use hellas_gateway::{WorkGatewayBusy, WorkGatewayError};
 use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,16 +24,11 @@ pub enum GrantGatewayError {
     NoMatchingPolicy,
     #[error("several granted resources match; select --grant-policy explicitly")]
     AmbiguousPolicy,
-    #[error("queued request exceeded its time budget")]
-    QueueTimeout,
     #[error("grant provider transport is invalid")]
     Transport,
 }
 fn error(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Execution(Box::new(e))
-}
-fn queue_timeout() -> WorkGatewayError {
-    WorkGatewayError::Timeout(Box::new(GrantGatewayError::QueueTimeout))
 }
 fn rejected(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Rejected(Box::new(e))
@@ -114,7 +106,6 @@ pub struct GrantSource {
     policy: Option<String>,
     provider: iroh::EndpointId,
     signer: Arc<ProducerSigningKey>,
-    timeout: Duration,
     assurance: hellas_rpc::Assurance,
     endpoint: Option<iroh::Endpoint>,
 }
@@ -130,7 +121,6 @@ impl GrantGateway {
     ) -> Result<Arc<Self>, WorkGatewayError> {
         let assurance = options.target.trust().required_assurance;
         let signer = options.signer.clone();
-        let timeout = options.timeout;
         let provider = iroh::EndpointId::from_bytes(
             &grant_transport(&options.target.offer().provider).map_err(error)?,
         )
@@ -150,11 +140,10 @@ impl GrantGateway {
         };
         // Recover the single unresolved acceptance before admitting fresh work.
         // Lost bodies can only be resolved after their signed acceptance window.
-        let deadline = Instant::now() + timeout;
         loop {
             match session.recover().await {
                 Ok(_) => break,
-                Err(GrantClientError::RecoveryTooEarly) if Instant::now() < deadline => {
+                Err(GrantClientError::RecoveryTooEarly) => {
                     tokio::time::sleep(Duration::from_millis(250)).await
                 }
                 Err(e) => {
@@ -184,7 +173,6 @@ impl GrantGateway {
                 policy,
                 provider,
                 signer,
-                timeout,
                 assurance,
                 endpoint,
             },
@@ -368,21 +356,23 @@ impl WorkSource for GrantSource {
         (name, input): (String, JobInput),
         requester: Requester<E, WorkGatewayError>,
     ) -> BoxFuture<'static, Result<Option<Completed>, WorkGatewayError>> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
         Box::pin(async move {
-            let mut session = tokio::time::timeout_at(deadline, self.session.lock())
-                .await
-                .map_err(|_| queue_timeout())?;
+            let mut session = tokio::select! {
+                biased;
+                _ = requester.closed() => return Ok(None),
+                session = self.session.lock() => session,
+            };
             if requester.is_closed() {
                 return Err(WorkGatewayBusy.into());
             }
-            tokio::time::timeout_at(deadline, async {
-                session.recover().await?;
-                session.refresh().await
-            })
-            .await
-            .map_err(|_| queue_timeout())?
-            .map_err(client_error)?;
+            tokio::select! {
+                biased;
+                _ = requester.closed() => return Ok(None),
+                recovered = async {
+                    session.recover().await?;
+                    session.refresh().await
+                } => { recovered.map_err(client_error)?; }
+            }
             // Scope changes may refresh the named policy; they never move the
             // request to another one.
             let offer = session.offer();
@@ -406,16 +396,27 @@ impl WorkSource for GrantSource {
             if requester.is_closed() {
                 return Err(WorkGatewayBusy.into());
             }
-            let output = session
-                .run_before(
-                    &name,
-                    prepared,
-                    &input.content(),
-                    Some(requester.progress()),
-                    deadline,
-                )
-                .await
-                .map_err(client_error)?;
+            let proposed = std::sync::atomic::AtomicBool::new(false);
+            let content = input.content();
+            let operation = session.run(
+                &name,
+                prepared,
+                &content,
+                Some(requester.progress()),
+                Some(&proposed),
+            );
+            tokio::pin!(operation);
+            let output = tokio::select! {
+                biased;
+                _ = requester.closed() => {
+                    if !proposed.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    operation.await
+                }
+                output = &mut operation => output,
+            }
+            .map_err(client_error)?;
             Ok(Some(Completed {
                 output: output.output,
                 provider: output.provider_key,
@@ -423,8 +424,8 @@ impl WorkSource for GrantSource {
         })
     }
 
-    fn timeout(&self) -> Duration {
-        self.timeout
+    fn timeout(&self) -> Option<Duration> {
+        None
     }
 
     fn gateway_error(error: WorkGatewayError) -> WorkGatewayError {

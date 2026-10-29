@@ -67,7 +67,7 @@ mod tests {
             presentation: Arc::new(
                 hellas_presentation::TextPresentation::from_gguf(&path).unwrap(),
             ),
-            inference_timeout: std::time::Duration::from_secs(5),
+            inference_timeout: Some(std::time::Duration::from_secs(5)),
         });
         tokio::pin!(stream);
         let mut text = String::new();

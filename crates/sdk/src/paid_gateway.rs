@@ -570,12 +570,14 @@ impl WorkSource for PaidPool {
         )
     }
 
-    fn timeout(&self) -> Duration {
-        self.providers
-            .iter()
-            .map(|provider| request_timeout(&provider.args))
-            .max()
-            .unwrap_or_default()
+    fn timeout(&self) -> Option<Duration> {
+        Some(
+            self.providers
+                .iter()
+                .map(|provider| request_timeout(&provider.args))
+                .max()
+                .unwrap_or_default(),
+        )
     }
 
     fn gateway_error(error: PoolError) -> WorkGatewayError {
