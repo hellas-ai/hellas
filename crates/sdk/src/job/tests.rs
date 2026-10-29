@@ -243,7 +243,10 @@ fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
             sources: vec![source],
             assets: vec![NamedAsset {
                 name: "weights".into(),
-                object: hellas_rpc::ContentRef::new(asset.id(), asset.bytes() + 1),
+                object: hellas_rpc::ContentRef::new(
+                    asset.id(),
+                    asset.bytes() + u64::from(!missing_source),
+                ),
             }],
         };
         content.insert(environment.canonical_bytes().unwrap());
@@ -256,8 +259,66 @@ fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
         )
         .unwrap();
         let directory = tempfile::tempdir().unwrap();
-        assert!(job.save(directory.path()).is_err());
+        let error = job.save(directory.path()).unwrap_err();
+        if missing_source {
+            assert!(matches!(
+                error,
+                JobError::Content(hellas_channel::content::ContentError::Missing)
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                JobError::Content(hellas_channel::content::ContentError::Hash)
+            ));
+        }
     }
+}
+
+#[test]
+fn large_compute_plan_folders_round_trip_with_bounded_documents() {
+    let mut content = EphemeralContent::default();
+    let source = content.insert(b"complete program".to_vec());
+    let environment = compute::Environment {
+        sources: vec![source],
+        assets: vec![],
+    };
+    content.insert(environment.canonical_bytes().unwrap());
+    let plan = compute::Plan {
+        calls: vec![compute::Call {
+            entry: "many-arguments".into(),
+            args: (0..4096).map(compute::Arg::U64).collect(),
+            bind: vec![],
+        }],
+        step: None,
+        outputs: vec![],
+    };
+    let job = Job::compute(
+        20,
+        environment,
+        plan,
+        vec![],
+        InvocationContent::Ephemeral(content),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    job.save(directory.path()).unwrap();
+    let path = directory.path().join("job.toml");
+    assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024);
+    assert_eq!(
+        Job::load(directory.path()).unwrap().canonical_bytes(),
+        job.canonical_bytes()
+    );
+    std::fs::write(path, vec![b' '; MAX_DOCUMENT_BYTES + 1]).unwrap();
+    assert!(Job::load(directory.path()).is_err());
+    let mut oversized = job.input().clone();
+    let JobInput::Compute { plan, .. } = &mut oversized else {
+        panic!()
+    };
+    plan.calls[0].args = vec![compute::Arg::U64(0); MAX_DOCUMENT_BYTES / 16];
+    let oversized = Job::from_input(20, oversized).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    assert!(oversized.save(directory.path()).is_err());
+    assert!(!directory.path().join("job.toml").exists());
 }
 
 #[cfg(unix)]

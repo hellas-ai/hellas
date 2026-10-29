@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 pub const FORMAT: &str = "hellas.job.v1";
-const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+// Model plans name hundreds of weight views; their TOML exceeds 64 KiB.
+const MAX_DOCUMENT_BYTES: usize = 1 << 20;
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     #[error("invalid job: {0}")]
@@ -560,7 +561,11 @@ impl Job {
                 });
             }
         }
-        write("job.toml", toml::to_string_pretty(&doc)?.as_bytes())?;
+        let document = toml::to_string_pretty(&doc)?;
+        if document.len() > MAX_DOCUMENT_BYTES {
+            return Err(invalid("job.toml exceeds document limit"));
+        }
+        write("job.toml", document.as_bytes())?;
         Ok(())
     }
 }
