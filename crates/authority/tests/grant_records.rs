@@ -250,6 +250,24 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
 }
 
 #[test]
+fn legacy_https_offer_preserves_canonical_bytes_and_signature() {
+    // Captured from the legacy signer, not constructed using the current policy types.
+    let bytes = include_bytes!("fixtures/legacy-https-offer.cbor");
+    assert_eq!(
+        ContentId::hash(bytes).to_string(),
+        "407ab41916d8b50b93e8bb85e088a8ef6284c464db4103534f77144644659d41"
+    );
+    let signed = SignedOffer::decode(bytes, UnixMillis(1000)).unwrap();
+    assert_eq!(signed.encode().unwrap(), bytes);
+    assert_eq!(
+        signed.offer().provider.content_id(),
+        software_enrollment(1, [1; 32]).content_id()
+    );
+    let https = signed.offer().grant.policies[0].https.as_ref().unwrap();
+    assert_eq!(https.paths, ["/v1/chat/completions"]);
+}
+
+#[test]
 fn duplicate_request_fields_cannot_bypass_a_token_cap() {
     let resource = resource();
     for body in [

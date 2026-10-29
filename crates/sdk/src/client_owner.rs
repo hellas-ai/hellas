@@ -441,6 +441,18 @@ mod tests {
     fn provider(n: u8) -> iroh::EndpointId {
         iroh::SecretKey::from_bytes(&[n; 32]).public()
     }
+    #[test]
+    fn legacy_signed_funding_record_decodes_and_verifies() {
+        let bytes = include_bytes!("../tests/fixtures/legacy-funding.json");
+        let record: Record = serde_json::from_slice(bytes).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let owner = ClientOwner::new(Arc::new(Approval::new()), delegate(), root.path()).unwrap();
+        let (_, actual_provider, _) = owner.decode(&record).unwrap();
+        assert_eq!(actual_provider, provider(3));
+        assert_eq!(record.need, 200);
+        assert!(matches!(record.state, FundingState::Pending));
+        assert_eq!(serde_json::to_vec(&record).unwrap(), bytes);
+    }
     async fn sealing<T>(devnet: &mut Devnet, work: impl Future<Output = T>) -> T {
         tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(2), async {
             tokio::pin!(work);

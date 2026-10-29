@@ -554,6 +554,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn legacy_proposal_and_acceptance_frames_decode() {
+        let proposal = include_bytes!("../../../tests/fixtures/legacy-grant/proposal.cbor");
+        let acceptance = include_bytes!("../../../tests/fixtures/legacy-grant/acceptance.cbor");
+        for (bytes, is_proposal) in [(proposal.as_slice(), true), (acceptance.as_slice(), false)] {
+            let frame: Frame = decode(bytes).unwrap();
+            assert_eq!(frame.namespace, NAMESPACE);
+            assert_eq!(matches!(frame.change, Change::Proposed { .. }), is_proposal);
+            assert!(is_proposal || matches!(frame.change, Change::Accepted { .. }));
+            assert_eq!(encode(&frame).unwrap(), bytes);
+        }
+    }
+
     impl GrantClientStore {
         pub(crate) async fn pause_next_statement(
             &mut self,

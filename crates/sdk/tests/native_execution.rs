@@ -21,6 +21,8 @@ mod automatic;
 mod gateway;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
+#[path = "native_execution/grant.rs"]
+mod grant;
 
 use std::sync::Arc;
 use std::time::Duration;

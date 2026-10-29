@@ -339,6 +339,36 @@ impl Purchase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_purchase_records_decode() {
+        for (bytes, phase) in [
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/running.json").as_slice(),
+                Phase::Running,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/paying.json").as_slice(),
+                Phase::Paying,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/paid.json").as_slice(),
+                Phase::Paid,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/reported.json").as_slice(),
+                Phase::Reported,
+            ),
+        ] {
+            let record: Record = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(record.phase, phase);
+            assert_eq!(record.price, 20);
+            assert_eq!(record.nonce, 3);
+            assert_eq!(record.work, (phase != Phase::Running).then_some([7; 32]));
+            assert_eq!(serde_json::to_vec(&record).unwrap(), bytes);
+        }
+    }
+
     fn job() -> Job {
         Job::fetch(20, hellas_rpc::FetchContract::http().unwrap(), "http".into(), "request".into(), br#"{"url":"https://example.test/private-input-sentinel","method":"GET","tls":{"roots":{"mode":"web_pki"}},"max_response_bytes":4096}"#.to_vec(), hellas_rpc::Assurance::ProducerSigned).unwrap()
     }
