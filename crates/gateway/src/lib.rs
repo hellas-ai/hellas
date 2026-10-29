@@ -8,6 +8,7 @@ mod archive;
 mod audio;
 mod backend;
 mod compose;
+mod compute;
 mod dispatch;
 mod error;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};

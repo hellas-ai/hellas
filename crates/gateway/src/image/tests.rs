@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ComputeEvent, WorkEvent};
 use axum::body::Body;
 use hellas_rpc::{
     JsonBytes,

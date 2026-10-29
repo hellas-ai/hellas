@@ -1,8 +1,5 @@
 //! Image preparation and PNG encoding stay on the caller's side of Compute.
-use super::{
-    ComputeEvent, GatewayError, GatewayResult, ImageOptions, WorkEvent, WorkExecutionBackend,
-    json_error,
-};
+use super::{GatewayError, GatewayResult, ImageOptions, WorkExecutionBackend, json_error};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
@@ -11,7 +8,6 @@ use axum::{
     routing::post,
 };
 use base64::Engine as _;
-use futures::StreamExt;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 use std::sync::Arc;
 
@@ -140,67 +136,49 @@ async fn handle(
     if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
         return json_error(StatusCode::GATEWAY_TIMEOUT, "image preparation timed out");
     }
-    let mut stream = match state.work.run(job) {
-        Ok(stream) => stream,
-        Err(error) => {
-            let error: hellas_adaptors::BackendError = error.into();
-            return json_error(super::backend_status(&error), error.to_string());
+    let crate::compute::Completion {
+        output,
+        accepted,
+        transcript,
+    } = crate::compute::collect(
+        state.work.as_ref(),
+        job,
+        deadline,
+        "image generation timed out",
+    )
+    .await;
+    let (status, body) = match output {
+        Ok(output) => {
+            let package = state.package.clone();
+            let png = tokio::task::spawn_blocking(
+                move || -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+                    let ModelResponse::Image(image) = package.decode(&output)? else {
+                        return Err("unexpected model response".into());
+                    };
+                    image.png(width, height).map_err(Into::into)
+                },
+            );
+            match crate::before_deadline(deadline, png).await {
+                Ok(Ok(Ok(png))) => (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        "data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(png)}],
+                    }),
+                ),
+                Ok(Ok(Err(error))) => error_body(StatusCode::BAD_GATEWAY, error.to_string()),
+                Ok(Err(error)) => error_body(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+                Err(_) => error_body(StatusCode::GATEWAY_TIMEOUT, "image encoding timed out"),
+            }
         }
+        Err((status, message)) => error_body(status, message),
     };
-    let mut accepted = None;
-    let mut transcript = None;
-    let (status, mut body) = loop {
-        match crate::before_deadline(deadline, stream.next()).await {
-            Ok(Some(Ok(WorkEvent::Accepted(value)))) => accepted = Some(value),
-            Ok(Some(Ok(WorkEvent::Transcript(value)))) => transcript = Some(value),
-            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Output(_))))) => {}
-            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Done { output, .. })))) => {
-                let package = state.package.clone();
-                let png = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-                        let ModelResponse::Image(image) = package.decode(&output)? else {
-                            return Err("unexpected model response".into());
-                        };
-                        image.png(width, height).map_err(Into::into)
-                    },
-                );
-                break match crate::before_deadline(deadline, png).await {
-                    Ok(Ok(Ok(png))) => (
-                        StatusCode::OK,
-                        serde_json::json!({
-                            "created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                            "data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(png)}],
-                        }),
-                    ),
-                    Ok(Ok(Err(error))) => error_body(StatusCode::BAD_GATEWAY, error.to_string()),
-                    Ok(Err(error)) => {
-                        error_body(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-                    }
-                    Err(_) => error_body(StatusCode::GATEWAY_TIMEOUT, "image encoding timed out"),
-                };
-            }
-            Ok(Some(Err(error))) => {
-                let error: hellas_adaptors::BackendError = error.into();
-                break error_body(super::backend_status(&error), error.to_string());
-            }
-            Ok(None) => {
-                break error_body(
-                    StatusCode::BAD_GATEWAY,
-                    "execution stream ended without terminal outcome",
-                );
-            }
-            Err(_) => break error_body(StatusCode::GATEWAY_TIMEOUT, "image generation timed out"),
-        }
-    };
-    if let Some(transcript) = transcript {
-        body["hellas"] = serde_json::to_value(crate::backend::provenance::completed_provenance(
-            accepted.as_ref(),
-            &transcript,
-        ))
-        .expect("provenance serializes");
-    }
-    use axum::response::IntoResponse;
-    let mut response = (status, Json(body)).into_response();
+    let mut response = crate::backend::provenance::json_response(
+        status,
+        body,
+        accepted.as_ref(),
+        transcript.as_deref(),
+    );
     if let Some(accepted) = accepted {
         response.extensions_mut().insert(accepted);
     }

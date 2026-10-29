@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ComputeEvent, WorkEvent};
 use crate::{ModelOptions, Presentations, WorkGatewayError, WorkOutputStream, WorkShutdownError};
 use axum::body::Body;
 use hellas_rpc::{
