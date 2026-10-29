@@ -16,7 +16,9 @@ nix run .#check-release  # all test, feature and model-checking checks locally
 The unit suite includes library and CLI command tests, chain codecs and proof
 verification, the pure kernel tests and canonical payment vectors. Live chain
 tests, four SDK scenarios that start validator networks, paid end-to-end tests,
-full Whisper compilation and CLI process tests belong to release validation.
+full Qwen3/Whisper/Flux compilation and CLI process tests belong to release
+validation. `check-model-programs` compiles shipped and upstream programs for
+both CUDA and HIP and compares them; CLI and GPU releases require this check.
 The unit commands are shared with Hydra in `nix/unit-tests.sh`.
 
 ## Independent component releases

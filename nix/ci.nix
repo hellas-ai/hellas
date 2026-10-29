@@ -160,6 +160,12 @@ let
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
+    # Compile each shipped model program for CUDA and HIP and compare it with
+    # upstream. These CPU compiler checks belong to CLI/GPU release validation.
+    model-programs =
+      mkCargo "check-model-programs"
+        "cargo test --locked -p hellas-client --features models --lib shipped_"
+        (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
     http-fetch =
       mkCargo "check-http-fetch"

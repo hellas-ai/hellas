@@ -43,6 +43,7 @@ let
         "cli"
         "cloud"
         "client-work"
+        "model-programs"
         "http-fetch"
         "rpc-work"
         "sdk-paid-work"
@@ -70,6 +71,7 @@ let
       checks = [
         "executor"
         "client-work"
+        "model-programs"
         "http-fetch"
       ];
       artifacts = {
