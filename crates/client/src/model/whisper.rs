@@ -220,6 +220,9 @@ impl Whisper {
             views,
         })
     }
+    pub fn transcription_capacity(&self) -> usize {
+        self.config.max_target_positions - 4
+    }
     pub fn environment(&self) -> &Environment {
         &self.environment
     }

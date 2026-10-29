@@ -28,15 +28,26 @@ pub(crate) async fn router(
     work: &Arc<dyn WorkExecutionBackend>,
 ) -> GatewayResult<Router> {
     let mut claims = Vec::new();
-    if let Some(text) = &presentations.text {
-        let state = Arc::new(state::TextState::open(text, work.clone()).await?);
-        let router = state::router(state);
-        for path in state::PATHS {
-            claims.push(Claim {
-                path: path.into(),
-                models: vec![text.model_name.clone()],
-                router: router.clone(),
-            });
+    for model in &presentations.models {
+        match model {
+            super::ModelOptions::Text(text) => {
+                let state = Arc::new(state::TextState::open(text, work.clone()).await?);
+                let router = state::router(state);
+                for path in state::PATHS {
+                    claims.push(Claim {
+                        path: path.into(),
+                        models: vec![text.model_name.clone()],
+                        router: router.clone(),
+                    });
+                }
+            }
+            super::ModelOptions::Whisper(audio) => {
+                claims.push(Claim {
+                    path: super::audio::PATH.into(),
+                    models: vec![audio.model_name.clone()],
+                    router: super::audio::router(audio, work.clone()).await?,
+                });
+            }
         }
     }
     if let Some(responses) = &presentations.responses {
@@ -87,7 +98,8 @@ pub(crate) async fn router(
         let by_model = Arc::new(by_model);
         app = app.route(
             &path,
-            axum::routing::any(move |request: Request| split(by_model.clone(), request)),
+            axum::routing::any(move |request: Request| split(by_model.clone(), request))
+                .layer(axum::extract::DefaultBodyLimit::max(request_limit(&path))),
         );
     }
     Ok(app)
@@ -95,16 +107,35 @@ pub(crate) async fn router(
 
 /// Requests on a shared path go to the presentation serving their model.
 async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Response {
+    let limit = request_limit(request.uri().path());
     let (parts, body) = request.into_parts();
-    let Ok(body) =
-        axum::body::to_bytes(body, hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES).await
-    else {
+    let Ok(body) = axum::body::to_bytes(body, limit).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let model = http_fetch::affinity::decoded_body(&parts.headers, &body)
-        .ok()
-        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-        .and_then(|value| value.get("model")?.as_str().map(str::to_owned));
+    let model = if parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| {
+            h.split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("multipart/form-data"))
+        }) {
+        match super::audio::multipart_model(Request::from_parts(
+            parts.clone(),
+            Body::from(body.clone()),
+        ))
+        .await
+        {
+            Ok(model) => Some(model),
+            Err(response) => return response,
+        }
+    } else {
+        http_fetch::affinity::decoded_body(&parts.headers, &body)
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|value| value.get("model")?.as_str().map(str::to_owned))
+    };
     let Some(router) = model.and_then(|model| models.get(&model).cloned()) else {
         return json_error(
             StatusCode::NOT_FOUND,
@@ -123,3 +154,12 @@ async fn serve(router: Router, request: Request) -> Response {
 
 #[cfg(test)]
 mod tests;
+
+/// The route budget applies before archival, model splitting and extraction.
+pub(super) fn request_limit(path: &str) -> usize {
+    if path == super::audio::PATH {
+        super::audio::MAX_REQUEST_BYTES
+    } else {
+        hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES
+    }
+}

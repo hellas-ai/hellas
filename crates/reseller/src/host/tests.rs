@@ -353,7 +353,7 @@ impl ResellerBuilder {
                         wrap: None,
                         wrap_args: Vec::new(),
                     },
-                    text: None,
+                    models: Vec::new(),
                     http: None,
                     responses_overrides: Default::default(),
                     responses_models: Vec::new(),

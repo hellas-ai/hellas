@@ -129,7 +129,7 @@ impl Host {
                     wrap: None,
                     wrap_args: vec![],
                 },
-                text: None,
+                models: Vec::new(),
                 http: None,
                 responses_overrides: Default::default(),
                 responses_models: Vec::new(),

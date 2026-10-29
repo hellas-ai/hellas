@@ -441,7 +441,7 @@ pub(crate) fn fetch_routes<'a>(
 #[derive(Clone)]
 pub struct GatewayServeOptions {
     pub server: hellas_gateway::ServerOptions,
-    pub text: Option<hellas_gateway::TextOptions>,
+    pub models: Vec<hellas_gateway::ModelOptions>,
     pub http: Option<hellas_gateway::HttpGatewayConfig>,
     /// Merged into Responses requests sent as a Fetch.
     pub responses_overrides: serde_json::Map<String, serde_json::Value>,
@@ -475,7 +475,7 @@ pub async fn serve_gateway(
         server: options.server,
         work,
         presentations: hellas_gateway::Presentations {
-            text: options.text,
+            models: options.models,
             responses,
             http: options.http,
         },

@@ -269,6 +269,9 @@ enum Commands {
         /// Qwen3 GGUF served by the text routes. Providers must already hold it.
         #[arg(long, value_name = "FILE")]
         text_model: Option<PathBuf>,
+        /// Converted Whisper package served at /v1/audio/transcriptions.
+        #[arg(long, value_name = "DIR")]
+        audio_model: Option<PathBuf>,
         /// Content store, and with --local-grant the local GPU executor.
         #[command(flatten)]
         native: compute::ServeArgs,
@@ -813,6 +816,7 @@ async fn async_main() {
         }
         Commands::Gateway {
             text_model,
+            audio_model,
             native,
             local_grant,
             offer,
@@ -915,6 +919,21 @@ async fn async_main() {
                 model,
                 default_max_tokens,
             });
+            let mut models: Vec<_> = text
+                .into_iter()
+                .map(hellas_gateway::ModelOptions::Text)
+                .collect();
+            if let Some(model) = audio_model {
+                models.push(hellas_gateway::ModelOptions::Whisper(
+                    hellas_gateway::AudioOptions {
+                        model_name: model
+                            .file_name()
+                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                        model,
+                        default_max_tokens: default_max_tokens as usize,
+                    },
+                ));
+            }
             let serve = hellas_sdk::GatewayServeOptions {
                 server: hellas_gateway::ServerOptions {
                     access,
@@ -930,7 +949,7 @@ async fn async_main() {
                     wrap,
                     wrap_args,
                 },
-                text,
+                models,
                 http,
                 responses_overrides: responses_overrides.unwrap_or_default(),
                 responses_models,

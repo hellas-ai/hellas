@@ -42,7 +42,7 @@ pub enum GatewayError {
     },
     #[error("wrapped command exited with status {0}")]
     WrappedCommand(ExitStatus),
-    #[error("text presentation failed: {0}")]
+    #[error("model presentation failed: {0}")]
     Presentation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Routing(#[from] crate::RoutingError),
@@ -80,7 +80,7 @@ pub enum GatewayConfigError {
     DuplicateRoute,
     #[error("use a provider credential alias for authentication")]
     CredentialAlias,
-    #[error("default maximum tokens must be greater than zero")]
+    #[error("default maximum tokens must be positive and fit the model capacity")]
     MaxTokens,
     #[error("non-loopback gateway binding requires --allow-remote")]
     RemoteBinding,

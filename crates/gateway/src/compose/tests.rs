@@ -52,7 +52,7 @@ fn presentations(
     }))
     .unwrap();
     Presentations {
-        text: None,
+        models: Vec::new(),
         responses: ResponsesFetch::from_routes(
             &work.fetch_routes(),
             Default::default(),

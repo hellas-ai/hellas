@@ -88,10 +88,11 @@ pub(crate) async fn record(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let (parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
-        Ok(body) => body,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
+    let body =
+        match axum::body::to_bytes(body, super::compose::request_limit(parts.uri.path())).await {
+            Ok(body) => body,
+            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        };
     if ephemeral {
         // Decide retention on the decoded body: a compressed store=true must
         // not slip past this check onto a retaining upstream.

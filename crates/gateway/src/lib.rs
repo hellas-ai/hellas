@@ -5,6 +5,7 @@ mod access;
 pub use access::GatewayAccess;
 mod anthropic;
 mod archive;
+mod audio;
 mod backend;
 mod compose;
 mod dispatch;
@@ -211,11 +212,25 @@ pub struct GatewayOptions {
 pub struct Presentations {
     /// OpenAI chat, completions and Responses, and Anthropic messages,
     /// rendered locally into Compute text jobs.
-    pub text: Option<TextOptions>,
+    pub models: Vec<ModelOptions>,
     /// OpenAI Responses forwarded as a Fetch to one sealed route.
     pub responses: Option<ResponsesFetch>,
     /// Exact HTTP routes forwarded as HTTPS Fetches, with account routing.
     pub http: Option<HttpGatewayConfig>,
+}
+
+#[derive(Clone)]
+pub enum ModelOptions {
+    Text(TextOptions),
+    Whisper(AudioOptions),
+}
+
+#[derive(Clone)]
+pub struct AudioOptions {
+    /// Converted Whisper package directory, used only by the client.
+    pub model: PathBuf,
+    pub model_name: String,
+    pub default_max_tokens: usize,
 }
 
 #[derive(Clone)]

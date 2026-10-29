@@ -64,6 +64,13 @@ impl ModelPackage {
             Family::Whisper(model) => model.environment(),
         }
     }
+    /// Maximum generated tokens when this is a transcription model.
+    pub fn transcription_capacity(&self) -> Option<usize> {
+        match &self.family {
+            Family::Whisper(model) => Some(model.transcription_capacity()),
+            Family::Qwen3(_) => None,
+        }
+    }
     pub fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
             (

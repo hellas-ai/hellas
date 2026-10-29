@@ -8,6 +8,48 @@ journals. The gateway skips busy provider channels and serializes requests
 within each channel. Providers must already hold the GGUF named by the job (for
 example via `hellas store adopt`); the gateway never uploads the weights.
 
+Whisper uses the same Compute work source. Convert a downloaded multilingual
+80-mel Whisper checkpoint once on the client (the checkpoint directory contains
+`config.json`, `generation_config.json`, `tokenizer.json`, and `model.safetensors`):
+
+```sh
+hellas convert-whisper --checkpoint /models/whisper-tiny-original --output /models/whisper-tiny
+```
+
+The resulting `weights.bf16` is the only model asset a provider holds; supply it
+through the ordinary content store or `serve --content /models/whisper-tiny/weights.bf16`.
+Providers need no renderer, tokenizer, preprocessing code, or preinstalled program.
+The converted directory and its metadata stay on the client. An existing gateway
+configuration can add `--audio-model /models/whisper-tiny` alongside `--text-model`.
+The directory name (`whisper-tiny` here) is its HTTP model name. The same option
+works with a paid pool, `--offer` for an owned remote node, or `--local-grant` with
+`--content /models/whisper-tiny/weights.bf16` on a supported local GPU.
+
+```sh
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  -F model=whisper-tiny -F file=@speech.wav -F language=en -F response_format=json
+```
+
+The route accepts mono/stereo WAV up to 30 seconds and 32 MiB, resamples 8–192 kHz
+audio to 16 kHz on the client, and returns `{"text":"..."}` or plain text with
+`response_format=text`. Language is optional; the program detects it when omitted.
+`--default-max-tokens` bounds transcription tokens and must fit the model's decoder.
+The audio route has its own body limit, including archival and multipart model
+splitting. Ordinary JSON routes retain their existing limit. HTTP format options
+and multipart fields are validated before submitting work.
+
+For a single paid job without an HTTP server:
+
+```sh
+hellas --passkey owner.key transcribe --provider NODE_ID \
+  --model /models/whisper-tiny --audio speech.wav --language en --payment 20
+```
+
+This saves the rendered job before submission, uses the existing transaction and
+payment journals, and prints decoded text. Both commands ship the same rendered
+program and numeric inputs; weight conversion never happens on the provider.
+
 With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its paid
 policy must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
