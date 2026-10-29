@@ -65,13 +65,13 @@ hound = { version = "3.5", optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 rand.workspace = true
-safetensors = { version = "0.7", optional = true }
+safetensors = { version = "0.8", optional = true }
 serde.workspace = true
 serde_ipld_dagcbor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
-tokenizers = { version = "0.22", default-features = false, features = [
+tokenizers = { version = "0.23", default-features = false, features = [
     "onig",
 ], optional = true }
 tokio = { workspace = true, optional = true }
