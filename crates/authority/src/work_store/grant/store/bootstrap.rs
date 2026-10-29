@@ -224,6 +224,8 @@ impl NodeStore {
         hellas_private::sync_directory(staging.path())?;
         #[cfg(test)]
         bootstrap_crash_point("staged");
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::pause_bootstrap_commit().await;
         // Windows cannot rename over even an empty directory. Removing only an
         // empty destination is safe: no authority exists there, and a concurrent
         // committed initialization makes remove_dir fail rather than replacing it.

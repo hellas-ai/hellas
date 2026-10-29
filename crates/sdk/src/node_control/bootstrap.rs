@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 const MAX_PAIRING_ATTEMPTS: usize = 8;
 const MAX_HANDSHAKES: usize = 16;
@@ -136,6 +136,9 @@ pub async fn accept(
         if now.0 >= invitation.expires.0 {
             return Err(denied());
         }
+        // Admission ends the client's handshake deadline. Accepted writes must
+        // still finish if the client disconnects before either reply arrives.
+        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.write_all(&[VERSION])).await;
         let store = NodeStore::bootstrap_prepared(
             directory,
             network,
@@ -162,13 +165,14 @@ pub async fn accept(
 
 /// Only verifiers cross the wire. Save the corresponding credential before this
 /// call; after a lost reply authenticate normally and inspect its exact ID.
+/// Connecting and admission are bounded; durable completion inherits the caller's deadline.
 pub async fn connect(
     endpoint: &iroh::Endpoint,
     invitation: &Invitation,
     root: GrantId,
     approval: PreparedBootstrap,
 ) -> Result<(), WireStatus> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (_close, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let now = UnixMillis::now().map_err(|_| unavailable())?;
         if now.0 >= invitation.expires.0 || invitation.addresses.len() > 16 {
             return Err(denied());
@@ -181,7 +185,7 @@ pub async fn connect(
             .connect(address, HostControl::ALPN.as_bytes())
             .await
             .map_err(|_| denied())?;
-        let _close = CloseConnection(Some(connection.clone()));
+        let close = CloseConnection(Some(connection.clone()));
         let (mut send, mut recv) = connection.open_bi().await.map_err(|_| denied())?;
         let request = Request {
             pairing: invitation.pairing,
@@ -198,18 +202,20 @@ pub async fn connect(
             .map_err(|_| unavailable())?;
         send.write_all(&bytes).await.map_err(|_| unavailable())?;
         send.finish().map_err(|_| unavailable())?;
-        if tokio::time::timeout(HANDSHAKE_TIMEOUT, recv.read_u8())
-            .await
-            .map_err(|_| unavailable())?
-            .map_err(|_| unavailable())?
-            != VERSION
-        {
+        if recv.read_u8().await.map_err(|_| unavailable())? != VERSION {
             return Err(denied());
         }
-        Ok(())
+        Ok((close, recv))
     })
     .await
-    .map_err(|_| unavailable())?
+    .map_err(|_| unavailable())??;
+    #[cfg(test)]
+    tests::commit_wait_started();
+    // Admission is not success: only the second reply confirms publication.
+    if recv.read_u8().await.map_err(|_| unavailable())? != VERSION {
+        return Err(denied());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,6 +266,128 @@ mod tests {
         let (approval, secret) = approval.prepare(Some(*node.as_bytes())).unwrap();
         (root, approval, secret)
     }
+    tokio::task_local! {
+        static COMMIT_WAIT: Arc<tokio::sync::Notify>;
+    }
+
+    pub(super) fn commit_wait_started() {
+        let _ = COMMIT_WAIT.try_with(|ready| ready.notify_one());
+    }
+
+    #[tokio::test]
+    async fn slow_bootstrap_commit_outlives_handshake_timeout() {
+        use hellas_authority::test_support::BOOTSTRAP_COMMIT_PAUSE;
+        let directory = tempfile::tempdir().unwrap();
+        let (server, client) = endpoints().await;
+        let invitation = invitation(&server);
+        let (root, approval, secret) = prepared(server.id());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let (accepted, connected) = tokio::join!(
+            BOOTSTRAP_COMMIT_PAUSE.scope(
+                (entered.clone(), release.clone()),
+                accept(
+                    &server,
+                    &invitation,
+                    directory.path(),
+                    hellas_channel::test_support::network(),
+                    None,
+                ),
+            ),
+            async {
+                let connecting = COMMIT_WAIT.scope(
+                    waiting.clone(),
+                    connect(&client, &invitation, root, approval),
+                );
+                tokio::pin!(connecting);
+                tokio::select! {
+                    result = &mut connecting => panic!("completed before publication: {result:?}"),
+                    () = async {
+                        entered.notified().await;
+                        waiting.notified().await;
+                    } => {}
+                }
+                // Both the real store and the client are at the commit boundary.
+                tokio::time::pause();
+                tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+                assert!(futures::poll!(&mut connecting).is_pending());
+                tokio::time::resume();
+                release.notify_one();
+                hellas_authority::test_support::within(connecting).await
+            },
+        );
+        accepted.unwrap();
+        connected.unwrap();
+        let node = NodeCoordinator::new(
+            NodeStore::open(
+                directory.path(),
+                hellas_channel::test_support::network(),
+                None,
+                UnixMillis::now().unwrap(),
+            )
+            .await
+            .unwrap(),
+            Arc::new(|| UnixMillis::now().unwrap()),
+        );
+        node.authenticate_session(&secret, SessionKey::Passkey(&ROOT.passkey()))
+            .await
+            .unwrap();
+        drop(node);
+        server.close().await;
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn unreachable_bootstrap_is_bounded_by_handshake_timeout() {
+        let (server, client) = endpoints().await;
+        let mut invitation = invitation(&server);
+        // A bound but unread UDP socket silently drops the connection attempt.
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        invitation.addresses = vec![sink.local_addr().unwrap()];
+        let (root, approval, _) = prepared(server.id());
+        tokio::time::pause();
+        let started = Instant::now();
+        let error = connect(&client, &invitation, root, approval)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), WireCode::Unavailable);
+        // Tokio rounds timer expiry up to its next millisecond tick.
+        assert!(started.elapsed() <= HANDSHAKE_TIMEOUT + Duration::from_millis(1));
+        tokio::time::resume();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn silent_bootstrap_is_bounded_by_handshake_timeout() {
+        let (server, client) = endpoints().await;
+        let invitation = invitation(&server);
+        let (root, approval, _) = prepared(server.id());
+        let connecting = connect(&client, &invitation, root, approval);
+        tokio::pin!(connecting);
+        let (_connection, _send) = tokio::select! {
+            result = &mut connecting => panic!("completed before the server received the request: {result:?}"),
+            streams = async {
+                let connection = server.accept().await.unwrap().accept().unwrap().await.unwrap();
+                let (send, mut recv) = connection.accept_bi().await.unwrap();
+                let bytes = recv.read_to_end(MAX_BOOTSTRAP_BYTES + 5).await.unwrap();
+                assert_eq!(bytes[0], VERSION);
+                (connection, send)
+            } => streams,
+        };
+        tokio::time::pause();
+        // Include the timer wheel's rounding tick, not another protocol deadline.
+        tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_millis(1)).await;
+        let std::task::Poll::Ready(result) = futures::poll!(&mut connecting) else {
+            panic!("silent server exceeded the handshake deadline");
+        };
+        assert_eq!(result.unwrap_err().code(), WireCode::Unavailable);
+        tokio::time::resume();
+        client.close().await;
+        server.close().await;
+    }
+
     #[tokio::test]
     async fn bootstrap_accepts_an_external_async_authenticator_assertion() {
         use hellas_authority::authenticator::{Authenticator, PublicKey};
@@ -381,6 +509,7 @@ mod tests {
                 send.write_u32(bytes.len() as u32).await.unwrap();
                 send.write_all(&bytes).await.unwrap();
                 send.finish().unwrap();
+                assert_eq!(recv.read_u8().await.unwrap(), VERSION);
                 assert_eq!(
                     hellas_authority::test_support::within(recv.read_u8())
                         .await
