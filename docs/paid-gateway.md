@@ -39,6 +39,16 @@ that isolation is crash/timeout containment, not a sandbox, and there is no
 memory metering. Before paying, the gateway checks that each result is signed
 by the provider and matches this job; Hellas does not re-run it.
 
+Compute terms should allow at least 4 MiB of upload for Whisper. The faucet
+example uses `max_upload_bytes = 4194304`; provider and grant limits are explicit
+terms, with no implicit runtime default. Whisper ships roughly 0.47–0.85 MB of
+rendered program, 960,000 bytes of log-mel features, and three F32 vocabulary
+masks (622,380 bytes for a 51,865-token model). The allowance also covers input
+metadata. The client includes the program with every job; a provider may deduplicate
+received sources by content ID, but never needs a preinstalled model program.
+Weights remain a separate ordinary content-addressed asset.
+
+
 The pool selects providers and expected prices. It obtains each policy with
 `RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 
