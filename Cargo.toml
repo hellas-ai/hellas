@@ -95,8 +95,10 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "reqwest-blocking-client",
     "reqwest-rustls",
 ] }
+opentelemetry-prometheus = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+prometheus = { version = "0.14", default-features = false }
 prometheus-client = "0.25"
 rand = "0.10"
 rand_core = "0.10"

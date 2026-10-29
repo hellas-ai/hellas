@@ -7,6 +7,7 @@ mod fetch_policy;
 mod fetch_projection;
 mod fetch_provider;
 mod fetch_registry;
+#[cfg(feature = "otel")]
 mod metrics;
 
 pub use catena::child_main;
@@ -28,4 +29,5 @@ pub use fetch_provider::{
 pub use fetch_registry::{
     DuplicateFetchRoute, FetchRouteBindingError, FetchRouteEntry, FetchRouteRegistry,
 };
+#[cfg(feature = "otel")]
 pub use metrics::ExecutorMetrics;

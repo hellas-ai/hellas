@@ -3,12 +3,9 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Holds the OTLP providers (when the `otel` feature is on) so the CLI
-/// can flush spans and metrics on shutdown. With the feature off this is a zero-sized type
-/// and `shutdown()` is a no-op.
+/// Flushes the optional OTLP trace provider on shutdown.
 pub struct TracerGuard {
     provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-    meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
 impl TracerGuard {
@@ -17,11 +14,6 @@ impl TracerGuard {
             && let Err(err) = provider.shutdown()
         {
             eprintln!("warning: failed to flush traces: {err}");
-        }
-        if let Some(provider) = self.meter_provider
-            && let Err(err) = provider.shutdown()
-        {
-            eprintln!("warning: failed to flush metrics: {err}");
         }
     }
 }
@@ -39,15 +31,10 @@ where
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    let resource = otlp_resource();
-    let (otel_layer, provider) = build_otlp_layer::<S>(resource.clone());
-    let meter_provider = build_otlp_meter_provider(resource);
+    let (otel_layer, provider) = build_otlp_layer::<S>(super::otlp_resource());
     registry.with(otel_layer).init();
 
-    TracerGuard {
-        provider,
-        meter_provider,
-    }
+    TracerGuard { provider }
 }
 
 fn build_otlp_layer<S>(
@@ -95,46 +82,7 @@ where
     (Some(layer), Some(provider))
 }
 
-fn build_otlp_meter_provider(
-    resource: opentelemetry_sdk::Resource,
-) -> Option<opentelemetry_sdk::metrics::SdkMeterProvider> {
-    if !otlp_signal_enabled("METRICS") {
-        return None;
-    }
-    let exporter = match opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .build()
-    {
-        Ok(exporter) => exporter,
-        Err(_) => {
-            eprintln!("warning: failed to build OTLP metric exporter; check OTEL configuration");
-            return None;
-        }
-    };
-    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_periodic_exporter(exporter)
-        .with_resource(resource)
-        .build();
-    opentelemetry::global::set_meter_provider(provider.clone());
-    Some(provider)
-}
-
-fn otlp_resource() -> opentelemetry_sdk::Resource {
-    let resource = opentelemetry_sdk::Resource::builder().build();
-    // Keep the CLI's fallback name without overriding the standard resource
-    // detectors' OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES precedence.
-    if resource.get(&opentelemetry::Key::new("service.name"))
-        == Some(opentelemetry::Value::from("unknown_service"))
-    {
-        opentelemetry_sdk::Resource::builder()
-            .with_service_name("hellas-node")
-            .build()
-    } else {
-        resource
-    }
-}
-
-fn otlp_signal_enabled(signal: &str) -> bool {
+pub(super) fn otlp_signal_enabled(signal: &str) -> bool {
     if std::env::var("OTEL_SDK_DISABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
         return false;
     }

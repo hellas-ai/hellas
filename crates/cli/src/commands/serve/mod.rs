@@ -2,8 +2,7 @@ use crate::commands::CliResult;
 use anyhow::{Context, bail};
 use hellas_auth::ProducerSigningKey;
 use hellas_executor::{
-    ExecutorMetrics, ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy,
-    FetchRouteRegistry,
+    ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
@@ -32,7 +31,8 @@ pub struct ServeOptions {
     /// Only its presence serves the two work ALPNs and sells paid work.
     pub paid: Option<paid::PaidWork>,
     pub chain_node: super::chain_node::ChainNodeArgs,
-    pub metrics_port: Option<u16>,
+    #[cfg(feature = "otel")]
+    pub metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     pub graffiti: String,
     pub fetch_config_file: Option<PathBuf>,
     pub fetch_max_in_flight: usize,
@@ -94,17 +94,12 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         Some(path) => load_fetch_config(path)?,
         None => FetchRouteRegistry::default(),
     };
-    // Counters live in the executor and are mutated inline; cloning the
-    // counter handles into a registry just adds a scrape view on the same
-    // underlying state.
-    let metrics = Arc::new(ExecutorMetrics::default());
     let mut executor = ExecutorSpawnConfig::new(
         Arc::new(options.producer_key),
         options.assurance,
         fetch_routes,
     );
     executor.queue_capacity = options.queue_size;
-    executor.metrics = metrics.clone();
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;
     options.native.configure(&mut executor)?;
@@ -189,13 +184,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         .context("failed to start node server")?,
     };
 
-    if let Some(metrics_port) = options.metrics_port {
-        let mut registry = prometheus_client::registry::Registry::default();
-        metrics.register_with(&mut registry);
-        let bundle = crate::metrics::MetricsBundle::new(Arc::new(registry));
+    #[cfg(feature = "otel")]
+    if let Some((address, bundle)) = options.metrics {
         #[cfg(feature = "otel")]
         let bundle = bundle.with_iroh(node.provider_endpoint());
-        crate::metrics::spawn_metrics_server(metrics_port, bundle);
+        crate::metrics::spawn_metrics_server(address, bundle).await?;
     }
 
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");

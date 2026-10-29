@@ -1,6 +1,6 @@
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// No telemetry providers are compiled without the `otel` feature.
+/// Trace export is compiled only with the `otel` feature.
 pub struct TracerGuard;
 
 impl TracerGuard {

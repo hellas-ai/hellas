@@ -251,6 +251,11 @@ the status that established the longest remaining delay: a 503 remains a 503,
 so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
 concurrency returns 503 with `Retry-After: 1`.
 
+An `otel` build exposes these metrics at `/metrics` when `--metrics-port` is set.
+`--metrics-addr IP` selects the interface (default `127.0.0.1`); the response is
+unauthenticated. The same instruments can also be pushed through OTLP.
+Default builds omit both metrics flags and the instrumentation.
+
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.
 `hellas.backend` and `gen_ai.request.model` identify configured backend/model
