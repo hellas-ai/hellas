@@ -710,6 +710,37 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
 }
 
 #[tokio::test]
+async fn stopped_observer_blocks_new_money_but_preserves_retransmission() {
+    for paid in [false, true] {
+        let mut fixture = checked_job().await;
+        fixture
+            .service
+            .observe_ready(
+                fixture.ready.clone(),
+                hellas_channel::work::ObservationTime::now(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let request = fixture.client.pay(fixture.id).await.unwrap();
+        let accepted = if paid {
+            Some(admit_response(&fixture.service, request.clone()).await)
+        } else {
+            None
+        };
+        fixture.service.stop().await.unwrap();
+        let response = admit_response(&fixture.service, request).await;
+        if let Some(accepted) = accepted {
+            assert!(matches!(accepted.outcome, Some(AdmitOutcome::Paid(_))));
+            assert_eq!(response, accepted);
+        } else {
+            assert_eq!(refusal_of(&response), WorkRefusalCode::NotReady);
+            assert_nothing_credited(&fixture.service, "observer has stopped").await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn client_close_recovery_does_not_require_new_work_readiness() {
     let mut fixture = checked_job().await;
     fixture.client.pay(fixture.id).await.unwrap();

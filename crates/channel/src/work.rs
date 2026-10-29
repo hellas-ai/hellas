@@ -637,13 +637,15 @@ impl ProviderEndpoint {
     ///
     /// # Errors
     ///
-    /// [`EndpointError::NotAdmitting`] when no readiness decision is
-    /// held. Nothing about a close reaches this.
+    /// [`EndpointError::NotAdmitting`] when readiness is unavailable,
+    /// and [`EndpointError::ObservationStale`]
+    /// while awaiting fresh finalized progress.
     fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
+        let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
         if let Some(observation) = &self.observation {
             observation.check()?;
         }
-        self.ready.as_ref().ok_or(EndpointError::NotAdmitting)
+        Ok(ready)
     }
 
     /// Takes a fresh readiness decision, and admits new work under it.
@@ -1134,6 +1136,9 @@ impl ProviderEndpoint {
                     }
                 })
         })?;
+        if self.state().is_closing() {
+            return Err(EndpointError::NotAdmitting.into());
+        }
         let admitted = self.admitting()?.clone();
         let ready = ready.unwrap_or(&admitted);
         let Some((result, signature)) = job.result() else {
@@ -2358,6 +2363,8 @@ impl ChannelDriver<'_> {
             .map_err(|_| CatchUpError::Busy)?;
         self.readable_cursor(&endpoint)?;
         endpoint.observe_finalized(block).await?;
+        drop(endpoint);
+        self.service.changed.notify_waiters();
         Ok(())
     }
 
@@ -2583,6 +2590,32 @@ impl WorkService {
             .observation
             .get_or_insert_with(Observation::default)
             .confirm(height, started, max_age);
+        drop(endpoint);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Withdraws release permission after a coherent finalized readiness denial.
+    /// The last policy remains available for recording completed upstream work.
+    pub async fn observe_unavailable(&self, height: u64) -> Result<(), EndpointError> {
+        self.endpoint()
+            .await?
+            .observation
+            .get_or_insert_with(Observation::default)
+            .reject(height);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Ends admission and delivery after accepted work and the observer have stopped.
+    pub async fn stop(&self) -> Result<(), EndpointError> {
+        let mut endpoint = self.endpoint().await?;
+        let height = endpoint.state().cursor().0;
+        endpoint.ready = None;
+        endpoint
+            .observation
+            .get_or_insert_with(Observation::default)
+            .reject(height);
         drop(endpoint);
         self.changed.notify_waiters();
         Ok(())
