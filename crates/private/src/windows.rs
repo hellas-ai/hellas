@@ -217,9 +217,10 @@ impl OwnerOnly {
     }
 }
 
-pub(super) fn open_nofollow(path: &Path) -> io::Result<File> {
+pub(super) fn open_nofollow(path: &Path, writable: bool) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
+        .write(writable)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     // With FILE_FLAG_OPEN_REPARSE_POINT a link is opened as itself; refuse it

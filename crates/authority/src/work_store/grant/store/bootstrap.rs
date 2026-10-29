@@ -305,7 +305,7 @@ fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError
         {
             continue;
         }
-        let Ok(file) = hellas_private::open_regular_file_nofollow(&entry.path().join(MARKER))
+        let Ok(file) = hellas_private::open_regular_file_nofollow_rw(&entry.path().join(MARKER))
         else {
             continue;
         };
@@ -376,7 +376,7 @@ fn read_marker(
     network: NetworkId,
 ) -> Result<(IdentityLock, Marker), NodeStoreError> {
     let path = directory.join(MARKER);
-    let identity_lock = match hellas_private::open_regular_file(&path) {
+    let identity_lock = match hellas_private::open_regular_file_rw(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(NodeStoreError::Uninitialized);

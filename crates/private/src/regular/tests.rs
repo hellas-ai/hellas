@@ -51,7 +51,8 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
     let replacement = dir.join("replacement");
     std::os::unix::fs::symlink("/dev/null", &replacement).expect("device symlink");
     std::fs::rename(&replacement, &link).expect("replace link");
-    let mut held = reopen_regular_path_handle(&link, &path_handle).expect("reopen held inode");
+    let mut held =
+        reopen_regular_path_handle(&link, &path_handle, false).expect("reopen held inode");
     read.clear();
     held.read_to_end(&mut read).expect("read held inode");
     assert_eq!(read, content);
@@ -124,4 +125,70 @@ fn bounded_reader_distinguishes_overflow_from_a_decoder_failure_at_the_limit() {
     let corrupt = read_bounded(BadEof(io::Cursor::new(b"1234")), 4).unwrap_err();
     assert_eq!(corrupt.kind(), io::ErrorKind::UnexpectedEof);
     assert!(!corrupt.get_ref().unwrap().is::<ReadLimit>());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_regular_opens_preserve_content_and_inode_safety() {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    let directory = tempfile::tempdir().unwrap();
+    let journal = directory.path().join("journal");
+    let mut lock = crate::open_lock_beside(&journal).unwrap();
+    lock.write_all(b"lock").unwrap();
+    drop(lock);
+    let mut reopened = crate::open_lock_beside(&journal).unwrap();
+    reopened.write_all(b"L").unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("journal.lock")).unwrap(),
+        b"Lock"
+    );
+    drop(reopened);
+    let path = directory.path().join("marker");
+    std::fs::write(&path, b"identity").unwrap();
+    let link = directory.path().join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let mut file = open_regular_file_rw(&link).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"identity", "opening must not truncate");
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(b"I").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"Identity");
+    file.try_lock().unwrap();
+    let other = open_regular_file_nofollow_rw(&path).unwrap();
+    assert!(matches!(
+        other.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(open_regular_file_nofollow_rw(&link).is_err());
+    drop(other);
+    drop(file);
+    let handle = open_path_handle(&link).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+    let mut pinned = reopen_regular_path_handle(&link, &handle, true).unwrap();
+    pinned.write_all(b"i").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"identity");
+    assert!(open_regular_file_rw(&link).is_err());
+    assert!(open_regular_file_nofollow_rw(Path::new("/dev/null")).is_err());
+    let fifo = directory.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        assert!(open_regular_file_rw(&fifo).is_err());
+        assert!(open_regular_file_nofollow_rw(&fifo).is_err());
+        sent.send(()).unwrap();
+    });
+    received
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("special files must not block");
+    let missing = directory.path().join("missing");
+    assert!(open_regular_file_rw(&missing).is_err());
+    assert!(!missing.exists());
 }
