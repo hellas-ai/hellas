@@ -60,7 +60,8 @@ let
       # Keep that test dependency explicit: writeShellApplication otherwise
       # gives Cargo a deliberately minimal PATH.
       pkgs.coreutils
-      pkgs.stdenv.cc
+      # Release builds export CC=clang through the shared clang stdenv.
+      pkgs.clangStdenv.cc
     ]
     # Native build scripts run in this deliberately minimal wrapper too.
     # Catena's libffi-sys configure step needs the ordinary stdenv shell and
