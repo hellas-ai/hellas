@@ -313,8 +313,11 @@ impl Whisper {
         let values: Vec<_> = artifact
             .bytes
             .as_bytes()
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(u64::from_le_bytes)
             .collect();
         let (count, language, status) = (usize::try_from(values[0])?, values[1], values[2]);
         ensure!(

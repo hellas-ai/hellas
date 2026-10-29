@@ -54,7 +54,7 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response 
     json_error(error.status(), error.body_text())
 }
 
-pub(super) async fn multipart_model(request: Request) -> Result<String, Response> {
+pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Response>> {
     let mut form = Multipart::from_request(request, &())
         .await
         .map_err(IntoResponse::into_response)?;
@@ -62,11 +62,11 @@ pub(super) async fn multipart_model(request: Request) -> Result<String, Response
     while let Some(field) = form.next_field().await.map_err(multipart_error)? {
         if field.name() == Some("model") {
             if model.is_some() {
-                return Err(bad("duplicate model field"));
+                return Err(bad("duplicate model field").into());
             }
             let bytes = field.bytes().await.map_err(multipart_error)?;
             if bytes.len() > 256 {
-                return Err(bad("model name too long"));
+                return Err(bad("model name too long").into());
             }
             model = Some(
                 std::str::from_utf8(&bytes)
@@ -77,7 +77,7 @@ pub(super) async fn multipart_model(request: Request) -> Result<String, Response
     }
     model
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| bad("model field is required"))
+        .ok_or_else(|| bad("model field is required").into())
 }
 
 async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Response {

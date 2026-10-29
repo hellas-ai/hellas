@@ -18,7 +18,12 @@ fn checkpoint(dir: &Path) {
                     safetensors::Dtype::F32,
                     (0..elements)
                         .flat_map(|n| {
-                            [1f32, 1.00390625, 1.01171875, f32::from_bits(0x7f800001)][n % 4]
+                            [
+                                1f32,
+                                f32::from_bits(0x3f808000),
+                                f32::from_bits(0x3f818000),
+                                f32::from_bits(0x7f800001),
+                            ][n % 4]
                                 .to_le_bytes()
                         })
                         .collect::<Vec<_>>(),

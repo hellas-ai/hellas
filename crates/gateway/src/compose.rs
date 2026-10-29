@@ -128,7 +128,7 @@ async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Respo
         .await
         {
             Ok(model) => Some(model),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     } else {
         http_fetch::affinity::decoded_body(&parts.headers, &body)

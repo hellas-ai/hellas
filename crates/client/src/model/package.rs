@@ -10,8 +10,8 @@ use hellas_rpc::protocol::invocation::{
 use std::path::Path;
 
 enum Family {
-    Qwen3(Qwen3),
-    Whisper(Whisper),
+    Qwen3(Box<Qwen3>),
+    Whisper(Box<Whisper>),
 }
 
 pub struct ModelPackage {
@@ -52,9 +52,9 @@ impl ModelPackage {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             family: if path.is_dir() {
-                Family::Whisper(Whisper::open(path)?)
+                Family::Whisper(Box::new(Whisper::open(path)?))
             } else {
-                Family::Qwen3(Qwen3::open(path)?)
+                Family::Qwen3(Box::new(Qwen3::open(path)?))
             },
         })
     }
@@ -114,8 +114,12 @@ impl ModelPackage {
                 let tokens = artifact
                     .bytes
                     .as_bytes()
-                    .chunks_exact(8)
-                    .map(|b| u32::try_from(u64::from_le_bytes(b.try_into().unwrap())))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u64::from_le_bytes)
+                    .map(u32::try_from)
                     .collect::<Result<_, _>>()?;
                 Ok(ModelResponse::Tokens(tokens))
             }
