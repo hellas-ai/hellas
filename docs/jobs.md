@@ -67,7 +67,7 @@ program signature before calling it.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-9ec3f625170e"
+evaluator = "hellas/catena-d116170a7e66"
 adaptor = "compute-0.0.1"
 
 [payment]

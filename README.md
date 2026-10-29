@@ -18,7 +18,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-9ec3f625170e`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-d116170a7e66`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
