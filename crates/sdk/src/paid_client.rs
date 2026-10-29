@@ -309,6 +309,7 @@ impl PaidWorkSession {
             settlement_key,
             owner,
             OpenIntent::Any,
+            None,
         ))
     }
 
@@ -325,6 +326,7 @@ impl PaidWorkSession {
             settlement_key,
             owner,
             OpenIntent::Retained,
+            None,
         ))
     }
 
@@ -342,7 +344,28 @@ impl PaidWorkSession {
             settlement_key,
             owner,
             OpenIntent::Job(Box::new(job.clone())),
+            None,
         ))
+    }
+
+    /// A gateway limits provider reachability separately from owner funding and
+    /// chain finality. The enclosing request still bounds the whole opening.
+    pub(crate) async fn open_for_gateway(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        owner: Arc<ClientOwner>,
+        connection_timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_inner(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            OpenIntent::Any,
+            Some(connection_timeout),
+        )
+        .await
     }
 
     async fn open_inner(
@@ -351,6 +374,7 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
         intent: OpenIntent,
+        connection_timeout: Option<Duration>,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
@@ -370,28 +394,32 @@ impl PaidWorkSession {
                 source,
             }
         })?;
-        let (store, signed) = match offer::retained_offer(
+        let retained = offer::retained_offer(
             &args.journal_root,
             config.chain.network,
             args.provider,
             &chain,
         )
-        .await?
-        {
+        .await?;
+        let reconnect = retained.is_some();
+        let (store, signed) = match retained {
             Some(retained) => retained,
             None if matches!(intent, OpenIntent::Retained) => {
                 return Err(PaidClientError::NoRetainedChannel);
             }
             None => {
-                let signed = offer::obtain_offer(
-                    &args,
-                    &endpoint,
-                    &settlement_key,
-                    &owner,
-                    &remote,
-                    intent.job(),
+                let quote = within(
+                    connection_timeout,
+                    "paid provider connection",
+                    request_paid_quote(&args, &endpoint, &settlement_key, owner.principal()),
                 )
                 .await?;
+                if let Some(job) = intent.job() {
+                    job.check_policy(&quote.policy)?;
+                }
+                let signed =
+                    offer::fund_offer(&args, &endpoint, &settlement_key, &owner, &remote, quote)
+                        .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,
@@ -449,6 +477,15 @@ impl PaidWorkSession {
         dialer.require_producer(hellas_auth::PublicKey::Secp256k1(
             bundle.bond_terms().parties.maker().signer().to_bytes(),
         ))?;
+        // A retained gateway route must be reachable before it occupies the
+        // request. Direct journal recovery/settlement can remain offline.
+        if reconnect && let Some(timeout) = connection_timeout {
+            within(Some(timeout), "paid provider connection", async {
+                dialer.setup().await?;
+                Ok(())
+            })
+            .await?;
+        }
         if setup.state().scan_armed().is_none() {
             setup.arm_scan(finalized_floor(&chain).await?).await?;
         }

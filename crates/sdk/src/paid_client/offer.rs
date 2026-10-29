@@ -181,25 +181,15 @@ pub async fn request_paid_quote(
     }
 }
 
-pub(super) async fn obtain_offer(
+pub(super) async fn fund_offer(
     args: &PaidWorkOptions,
     endpoint: &Endpoint,
     signer: &Secp256k1Signer,
     owner: &crate::client_owner::ClientOwner,
     chain: &RemoteLightClient,
-    job: Option<&crate::job::Job>,
+    quote: PaidQuote,
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
-    let connection = OfferConnection::open(args, endpoint).await?;
-    let quote = match connection.request(args, signer, principal, None).await? {
-        Outcome::Quote(quote) => check_quote(args, quote)?,
-        Outcome::Refused(refused) => return Err(PaidClientError::OfferRefused(refused.code)),
-        _ => return Err(PaidClientError::InputMismatch("expected quote")),
-    };
-    if let Some(job) = job {
-        job.check_policy(&quote.policy)?;
-    }
-    drop(connection);
     let funding = owner
         .fund(
             chain,

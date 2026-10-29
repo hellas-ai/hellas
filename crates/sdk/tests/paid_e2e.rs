@@ -17,6 +17,8 @@ fn catena_child() {
 
 #[path = "paid_e2e/automatic.rs"]
 mod automatic;
+#[path = "paid_e2e/gateway.rs"]
+mod gateway;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
 
@@ -351,7 +353,7 @@ fn addresses(provider: &hellas_sdk::ProviderHandle) -> Vec<std::net::SocketAddr>
 }
 
 #[derive(Default)]
-struct Approvals(std::sync::Mutex<Vec<Digest>>);
+struct Approvals(std::sync::Mutex<Vec<Digest>>, tokio::sync::Notify);
 #[async_trait::async_trait]
 impl hellas_authority::authenticator::Authenticator for Approvals {
     fn public_key(
@@ -364,6 +366,7 @@ impl hellas_authority::authenticator::Authenticator for Approvals {
         challenge: Digest,
     ) -> Result<auth::PasskeyAssertion, auth::AuthorityError> {
         self.0.lock().unwrap().push(challenge);
+        self.1.notify_one();
         hellas_authority::authenticator::Authenticator::assert(&FRIEND.passkey(), challenge).await
     }
 }
@@ -670,7 +673,7 @@ fn setup_reports_a_typed_error_if_remote_proofs_stay_unavailable() {
     run(|runtime| paid_scenario(runtime, true));
 }
 
-struct PaidScenario {
+struct PaidScenario<S = PaidWorkSession> {
     identity: NodeIdentity,
     root: tempfile::TempDir,
     devnet: Devnet,
@@ -685,7 +688,7 @@ struct PaidScenario {
     options: PaidWorkOptions,
     prepared_input: PreparedInvocation,
     quote: hellas_sdk::paid_client::PaidQuote,
-    session: PaidWorkSession,
+    session: S,
 }
 
 fn paid_scenario(
@@ -699,10 +702,7 @@ fn paid_scenario(
     })
 }
 
-async fn paid_setup(
-    runtime: commonware_runtime::tokio::Context,
-    never_catches_up: bool,
-) -> Option<PaidScenario> {
+async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenario<()> {
     let root = tempfile::tempdir().unwrap();
     let identity = provider_identity();
     let now = UnixMillis(1);
@@ -756,7 +756,7 @@ async fn paid_setup(
         .unwrap();
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
-    let mut relays = remote::Relays::start(&devnet).await;
+    let relays = remote::Relays::start(&devnet).await;
     let (provider, _) = start_provider(
         root.path(),
         config.clone(),
@@ -916,6 +916,46 @@ async fn paid_setup(
         approvals.0.lock().unwrap().is_empty(),
         "discovery never approves money"
     );
+    PaidScenario {
+        identity,
+        root,
+        devnet,
+        provider_node,
+        provider,
+        relays,
+        approvals,
+        owner,
+        client_home,
+        client_transport,
+        endpoint,
+        options,
+        prepared_input,
+        quote,
+        session: (),
+    }
+}
+
+async fn paid_setup(
+    runtime: commonware_runtime::tokio::Context,
+    never_catches_up: bool,
+) -> Option<PaidScenario> {
+    let PaidScenario {
+        identity,
+        root,
+        mut devnet,
+        provider_node,
+        provider,
+        mut relays,
+        approvals,
+        owner,
+        client_home,
+        client_transport,
+        endpoint,
+        options,
+        prepared_input,
+        quote,
+        session: (),
+    } = paid_fixture(runtime).await;
     let mut options = options;
     if never_catches_up {
         options.timeout = Some(Duration::from_millis(250));

@@ -288,23 +288,19 @@ impl PaidPool {
                 continue;
             }
             if session.is_none() {
-                let opened = connect_before_deadline(
-                    requester,
-                    streamed,
-                    deadline,
-                    PROVIDER_CONNECTION_TIMEOUT,
-                    async {
-                        PaidWorkSession::open(
-                            provider.args.clone(),
-                            self.endpoint.clone(),
-                            self.settlement_key.clone(),
-                            self.owner.clone(),
-                        )
-                        .await
-                        .map_err(PoolError::from)
-                    },
-                )
-                .await;
+                let opened = before_proposal(requester, streamed, deadline, |_| async {
+                    PaidWorkSession::open_for_gateway(
+                        provider.args.clone(),
+                        self.endpoint.clone(),
+                        self.settlement_key.clone(),
+                        self.owner.clone(),
+                        PROVIDER_CONNECTION_TIMEOUT,
+                    )
+                    .await
+                    .map_err(PoolError::from)
+                })
+                .await
+                .and_then(|result| result);
                 match opened {
                     Ok(opened) => *session = Some(opened),
                     Err(error) => {
@@ -612,24 +608,6 @@ pub enum RequestStopped {
     Deadline,
 }
 
-// A route's short connection allowance is recoverable by trying another
-// provider; only the enclosing request deadline or disconnect is terminal.
-async fn connect_before_deadline<T, E: GatewayEvent>(
-    requester: &Requester<E, PoolError>,
-    cancel_on_disconnect: bool,
-    deadline: tokio::time::Instant,
-    connection_timeout: Duration,
-    connection: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    let connection_deadline = deadline.min(tokio::time::Instant::now() + connection_timeout);
-    before_proposal(requester, cancel_on_disconnect, deadline, |_| async {
-        tokio::time::timeout_at(connection_deadline, connection)
-            .await
-            .map_err(|_| PoolError::ConnectionTimeout(connection_timeout))?
-    })
-    .await?
-}
-
 /// Cancel an unproposed HTTP operation without interrupting work whose
 /// proposal signature may already have reached a provider.
 async fn before_proposal<T, F: std::future::Future<Output = T>, E: GatewayEvent>(
@@ -825,7 +803,7 @@ mod tests {
         assert!(shared.validate().is_ok());
     }
 
-    async fn test_pool(
+    pub(super) async fn test_pool(
         fixture: &crate::test_support::PaidFixture,
         policy: ProviderChannelPolicy,
     ) -> PaidPool {
@@ -1097,40 +1075,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_timeout_allows_fallback_within_the_request_deadline() {
-        let (sender, _receiver) = Requester::<FetchEvent, PoolError>::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let failed = connect_before_deadline(
-            &sender,
-            true,
-            deadline,
-            Duration::from_millis(10),
-            std::future::pending::<Result<()>>(),
-        )
-        .await
-        .unwrap_err();
-        assert!(!matches!(failed, PoolError::Stopped(_)));
-        assert_eq!(
-            connect_before_deadline(&sender, true, deadline, Duration::from_millis(10), async {
-                Ok("second provider")
-            },)
-            .await
-            .unwrap(),
-            "second provider"
-        );
-        let expired = connect_before_deadline(
-            &sender,
-            true,
-            tokio::time::Instant::now(),
-            Duration::from_secs(10),
-            async { Ok(()) },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(expired, PoolError::Stopped(_)));
-    }
-
-    #[tokio::test]
     async fn previous_proposal_does_not_authorize_disconnected_next_operation() {
         let (sender, receiver) = Requester::<FetchEvent, PoolError>::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -1204,3 +1148,7 @@ mod tests {
         assert!(!started.load(Ordering::Relaxed));
     }
 }
+
+#[cfg(test)]
+#[path = "paid_gateway/connection_tests.rs"]
+mod connection_tests;
