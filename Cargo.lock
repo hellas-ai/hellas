@@ -3315,6 +3315,8 @@ dependencies = [
  "hellas-private",
  "hellas-rpc",
  "hellas-wire",
+ "http-body",
+ "http-body-util",
  "httpdate",
  "iroh",
  "libc",

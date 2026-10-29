@@ -1,4 +1,8 @@
 //! HTTP bytes over authenticated Fetch, without translating vendor schemas.
+//!
+//! The provider's acceptance heads the response as `x-hellas-commitment-bin`
+//! and `x-hellas-provider`; the base64 signed transcript trails the body as
+//! `x-hellas-transcript` (a header on a bodyless response).
 pub(crate) mod affinity;
 mod config;
 mod observation;
@@ -18,10 +22,12 @@ use axum::{
 };
 use futures::StreamExt;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+use hellas_rpc::provenance::{ExecutionProvenance, TRANSCRIPT_KEY};
+use http_body::Frame;
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{WorkExecutionBackend, WorkFetchRequest};
+use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
 use hellas_adaptors::BackendError;
 
 #[derive(Clone)]
@@ -223,7 +229,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     let result = open(&state, selected.backend, backend.provider, payload)
         .instrument(observed.span.clone())
         .await;
-    let (status, headers, mut events) = match result {
+    let (accepted, status, headers, mut events) = match result {
         Ok(value) => value,
         Err(failure) => {
             let error = match failure {
@@ -276,32 +282,50 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     );
     state.routing.observe(selected.backend, status, &headers);
     if parts.method == axum::http::Method::HEAD || status == 204 || status == 304 {
-        let end = events.next().instrument(observed.span.clone()).await;
+        let mut end = events.next().instrument(observed.span.clone()).await;
+        let mut transcript = None;
+        if let Some(Ok(WorkEvent::Transcript(signed))) = end {
+            transcript = Some(transcript_value(&signed));
+            end = events.next().instrument(observed.span.clone()).await;
+        }
         if !matches!(
             end,
-            Some(Ok(OutputEvent::Finished {
+            Some(Ok(WorkEvent::Output(OutputEvent::Finished {
                 stop_reason: StopReason::EndOfText,
                 usage: None
-            }))
+            })))
         ) {
             observed.status(502);
             return error(StatusCode::BAD_GATEWAY, "invalid bodyless HTTP completion");
         }
         observed.complete();
+        // Without a body there is nowhere to trail it; the head waited for it.
+        if let Some(transcript) = transcript {
+            headers.insert(TRANSCRIPT_KEY, transcript);
+        }
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::from_u16(status).unwrap();
         *response.headers_mut() = std::mem::take(&mut headers);
-        return attributed(response, &backend.name);
+        return provenanced(attributed(response, &backend.name), accepted);
     }
     let name = backend.name.clone();
     let stream = async_stream::try_stream! {
         let _permit = permit;
         let mut size = 0usize;
+        let mut transcript = None;
         while let Some(event) = events.next().instrument(observed.span.clone()).await {
             let event = event.map_err(|failure| {
                 tracing::warn!(backend = %name, error = %chain(&failure), "HTTP Fetch stream failed");
                 std::io::Error::other("Fetch stream verification failed")
             })?;
+            let event = match event {
+                WorkEvent::Output(event) => event,
+                WorkEvent::Transcript(signed) => {
+                    transcript = Some(transcript_value(&signed));
+                    continue;
+                }
+                WorkEvent::Accepted(_) => continue,
+            };
             match event {
                 OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64 })) => {
                     let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
@@ -314,10 +338,13 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                         continue;
                     }
                     observed.chunk(&bytes);
-                    yield Bytes::from(bytes);
+                    yield Frame::data(Bytes::from(bytes));
                 }
                 OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None } => {
                     observed.complete();
+                    if let Some(transcript) = transcript.take() {
+                        yield Frame::trailers(HeaderMap::from_iter([(axum::http::HeaderName::from_static(TRANSCRIPT_KEY), transcript)]));
+                    }
                     return;
                 }
                 _ => Err(std::io::Error::other("unexpected HTTP Fetch event"))?,
@@ -325,20 +352,49 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         }
         Err(std::io::Error::other("HTTP Fetch ended without verified completion"))?;
     };
-    let stream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
+    let stream: futures::stream::BoxStream<'static, Result<Frame<Bytes>, std::io::Error>> =
         Box::pin(stream);
-    let mut response = Response::new(Body::from_stream(stream));
+    // Announce the trailer: HTTP/1.1 sends it to clients that accept
+    // trailers (`TE: trailers`).
+    headers.insert(
+        axum::http::header::TRAILER,
+        HeaderValue::from_static(TRANSCRIPT_KEY),
+    );
+    let mut response = Response::new(Body::new(http_body_util::StreamBody::new(stream)));
     *response.status_mut() = StatusCode::from_u16(status).unwrap();
     *response.headers_mut() = headers;
-    attributed(response, &backend.name)
+    provenanced(attributed(response, &backend.name), accepted)
 }
+
+/// The accepted job's identity, for the provenance layer to render as headers.
+fn provenanced(mut response: Response, accepted: Option<ExecutionProvenance>) -> Response {
+    if let Some(accepted) = accepted {
+        response.extensions_mut().insert(accepted);
+    }
+    response
+}
+
+/// The signed transcript as a header value: base64 of its canonical bytes.
+fn transcript_value(transcript: &[u8]) -> HeaderValue {
+    use base64::Engine as _;
+    HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(transcript))
+        .expect("base64 is always a valid header value")
+}
+
+/// The provider's acceptance, if reported, and the upstream response head.
+type Opened = (
+    Option<ExecutionProvenance>,
+    u16,
+    Vec<(String, String)>,
+    super::WorkFetchStream,
+);
 
 async fn open(
     state: &HttpState,
     backend: usize,
     provider: iroh::EndpointId,
     payload: Vec<u8>,
-) -> Result<(u16, Vec<(String, String)>, super::WorkFetchStream), HttpOpenError> {
+) -> Result<Opened, HttpOpenError> {
     let (service, method) = &state.fetch_routes[backend];
     let mut stream = state.paid.fetch(WorkFetchRequest {
         provider,
@@ -346,13 +402,13 @@ async fn open(
         method: method.clone(),
         body: payload,
     })?;
+    let accepted = super::accepted(&mut stream).await;
     match stream.next().await.transpose()? {
-        Some(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
-            status,
-            headers,
-        }))) if (200..=599).contains(&status) => {
+        Some(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { status, headers },
+        )))) if (200..=599).contains(&status) => {
             hellas_rpc::http_fetch::check_headers(&headers, false)?;
-            Ok((status, headers, stream))
+            Ok((accepted, status, headers, stream))
         }
         _ => Err(HttpOpenError::MissingHead),
     }

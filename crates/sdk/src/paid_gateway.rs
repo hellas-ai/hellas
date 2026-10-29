@@ -245,6 +245,7 @@ impl PaidPool {
         let recovery = occupied.is_none();
         let streamed = !recovery;
         let progress = requester.progress();
+        let accepted = requester.accepted();
         let mut provider_errors = Vec::new();
         let last = candidates.len() - 1;
         for (index, (provider, route, input)) in candidates.into_iter().enumerate() {
@@ -355,6 +356,7 @@ impl PaidPool {
                 .transpose()?;
             let signer = self.producer_key.clone();
             let on_progress = streamed.then(|| progress.clone());
+            let on_accepted = streamed.then(|| accepted.clone());
             let result = before_proposal(requester, streamed, deadline, |proposed| async move {
                 match job {
                     Some(job) => crate::transact::transact(
@@ -364,6 +366,7 @@ impl PaidPool {
                         crate::transact::TransactionOptions {
                             new_purchase: true,
                             progress: on_progress,
+                            accepted: on_accepted,
                             proposed: Some(&proposed),
                             ..Default::default()
                         },
@@ -564,6 +567,7 @@ impl WorkSource for PaidPool {
                 Ok(result?.map(|output| Completed {
                     output: output.output,
                     provider: output.provider_key,
+                    transcript: output.transcript,
                 }))
             }
             .instrument(span),

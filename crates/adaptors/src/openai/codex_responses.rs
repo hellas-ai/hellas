@@ -92,6 +92,9 @@ impl WireAdaptor for CodexResponsesAdaptor {
         ))
     }
 
+    /// Codex events carry no `hellas` object.
+    fn attest(&self, _state: &mut Self::StreamState, _provenance: crate::Provenance) {}
+
     fn render_stream_event(
         &self,
         _request: &Self::ParsedRequest,

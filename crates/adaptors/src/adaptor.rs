@@ -1,6 +1,6 @@
 use crate::{
-    AdaptorResult, ExecutionRequest, ExecutionResult, OutputEvent, RawRequest, RenderContext,
-    WireResponse, WireStreamEvent,
+    AdaptorResult, ExecutionRequest, ExecutionResult, OutputEvent, Provenance, RawRequest,
+    RenderContext, WireResponse, WireStreamEvent,
 };
 
 pub trait WireAdaptor {
@@ -41,6 +41,10 @@ pub trait WireAdaptor {
         state: &mut Self::StreamState,
         event: OutputEvent,
     ) -> AdaptorResult<Vec<WireStreamEvent>>;
+
+    /// Record provenance for the job; events rendered after it carry it.
+    /// The fields it names replace those recorded before.
+    fn attest(&self, state: &mut Self::StreamState, provenance: Provenance);
 }
 
 pub trait WireIngress: WireAdaptor {

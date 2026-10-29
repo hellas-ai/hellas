@@ -5,6 +5,7 @@ use axum::{
     http::{Request, StatusCode},
     routing::post,
 };
+use futures::StreamExt;
 use tower::ServiceExt;
 
 fn policy(directory: &Path) -> Policy {
@@ -231,6 +232,31 @@ async fn unavailable_archive_preserves_errors_and_recovers_on_the_next_request()
             );
         }
     }
+}
+
+/// Archiving reads a response's data, but the client still gets its
+/// trailers: the HTTPS presentation's signed transcript travels in one.
+#[tokio::test]
+async fn archived_responses_keep_their_trailers() {
+    use http_body_util::BodyExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let archive = exchange(root.path()).await;
+    let directory = archive.directory.clone();
+    let trailers = HeaderMap::from_iter([(
+        axum::http::HeaderName::from_static("x-hellas-transcript"),
+        axum::http::HeaderValue::from_static("c2lnbmVk"),
+    )]);
+    let frames = futures::stream::iter([
+        Ok::<_, io::Error>(http_body::Frame::data(Bytes::from_static(b"body"))),
+        Ok(http_body::Frame::trailers(trailers.clone())),
+    ]);
+    let response =
+        axum::response::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+    let response = archive_response(policy(root.path()), archive, response).await;
+    let collected = response.into_body().collect().await.unwrap();
+    assert_eq!(collected.trailers(), Some(&trailers));
+    assert_eq!(collected.to_bytes(), "body");
+    assert_eq!(metadata(&directory)["complete"], true);
 }
 
 #[tokio::test]

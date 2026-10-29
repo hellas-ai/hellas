@@ -1,5 +1,6 @@
 //! Tower middleware that lifts `ExecutionProvenance` from response extensions
-//! into `x-hellas-*` HTTP response headers.
+//! into the `x-hellas-commitment-bin` (hex) and `x-hellas-provider` HTTP
+//! response headers.
 //!
 //! Handlers stay free of header-attachment boilerplate: they insert the
 //! typed values into `response.extensions_mut()` and this layer renders
@@ -12,7 +13,8 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response};
 use futures::future::BoxFuture;
 use hellas_rpc::provenance::{
-    COMMITMENT_KEY as COMMITMENT_HEADER, ExecutionProvenance, encode_hex,
+    COMMITMENT_KEY as COMMITMENT_HEADER, ExecutionProvenance, PROVIDER_KEY as PROVIDER_HEADER,
+    encode_hex, encode_public_key,
 };
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -63,19 +65,20 @@ where
 fn apply_provenance_headers(response: &mut Response<Body>) {
     let extensions = response.extensions().clone();
     if let Some(prov) = extensions.get::<ExecutionProvenance>() {
-        response
-            .headers_mut()
-            .insert(commitment_header(), header_value(&prov.commitment_id));
+        let headers = response.headers_mut();
+        headers.insert(
+            HeaderName::from_static(COMMITMENT_HEADER),
+            header_value(encode_hex(&prov.commitment_id)),
+        );
+        headers.insert(
+            HeaderName::from_static(PROVIDER_HEADER),
+            header_value(encode_public_key(&prov.provider)),
+        );
     }
 }
 
-fn commitment_header() -> HeaderName {
-    HeaderName::from_static(COMMITMENT_HEADER)
-}
-
-fn header_value(bytes: &[u8; 32]) -> HeaderValue {
-    HeaderValue::from_str(&encode_hex(bytes))
-        .expect("64-char lowercase hex is always a valid header value")
+fn header_value(text: String) -> HeaderValue {
+    HeaderValue::from_str(&text).expect("lowercase hex text is always a valid header value")
 }
 
 #[cfg(test)]
@@ -98,6 +101,7 @@ mod tests {
     fn applies_commitment_header_when_present() {
         let prov = ExecutionProvenance {
             commitment_id: [0xab; 32],
+            provider: hellas_auth::PublicKey::Secp256k1([0x02; 33]),
         };
         let mut response = build_response_with_extensions(Some(prov.clone()));
         apply_provenance_headers(&mut response);
@@ -108,6 +112,13 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("ab".repeat(32).as_str())
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(PROVIDER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("secp256k1:{}", "02".repeat(33)).as_str())
+        );
     }
 
     #[test]
@@ -115,6 +126,7 @@ mod tests {
         let mut response = build_response_with_extensions(None);
         apply_provenance_headers(&mut response);
         assert!(!response.headers().contains_key(COMMITMENT_HEADER));
+        assert!(!response.headers().contains_key(PROVIDER_HEADER));
     }
 
     /// End-to-end: dispatch a request through an axum `Router` wrapped with
@@ -130,6 +142,7 @@ mod tests {
         async fn handler() -> Response<Body> {
             let prov = ExecutionProvenance {
                 commitment_id: [0x12; 32],
+                provider: hellas_auth::PublicKey::Secp256k1([0x03; 33]),
             };
             let mut response = Response::new(Body::empty());
             response.extensions_mut().insert(prov);
@@ -145,6 +158,10 @@ mod tests {
         assert_eq!(
             response.headers().get(COMMITMENT_HEADER).unwrap(),
             &"12".repeat(32)
+        );
+        assert_eq!(
+            response.headers().get(PROVIDER_HEADER).unwrap(),
+            &format!("secp256k1:{}", "03".repeat(33))
         );
     }
 }

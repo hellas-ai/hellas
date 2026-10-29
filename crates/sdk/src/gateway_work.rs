@@ -5,8 +5,8 @@ use crate::job::{JobError, JobInput};
 use futures::{future::BoxFuture, stream::BoxStream};
 use hellas_authority::model::grant::resource::HttpsResource;
 use hellas_gateway::{
-    ExecutionEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy, WorkGatewayError,
-    WorkOutputStream, WorkShutdownError,
+    ExecutionEvent, WorkEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy,
+    WorkGatewayError, WorkOutputStream, WorkShutdownError,
 };
 use hellas_rpc::http_fetch::HttpFetchRequest;
 use hellas_rpc::output::OutputEvent;
@@ -134,7 +134,6 @@ pub(crate) fn text_terminal(
         output_tokens: metadata.steps,
         stop_reason,
         text_artifact: emitted.content_id().map_err(output_error)?.digest(),
-        output_events: Vec::new(),
     }))
 }
 
@@ -297,15 +296,31 @@ impl GatewayEvent for ExecutionEvent {
     }
 }
 
-/// A verified completion and the provider key that signed it.
+/// A verified completion, the provider key that signed it, and the
+/// canonical bytes of the signed transcript it was verified from.
 pub struct Completed {
     pub output: InvocationOutput,
     pub provider: hellas_auth::PublicKey,
+    pub transcript: Vec<u8>,
 }
+
+/// What one event charges against the requester's output budget.
+fn event_bytes<E: GatewayEvent>(event: &WorkEvent<E>) -> usize {
+    match event {
+        WorkEvent::Accepted(provenance) => {
+            std::mem::size_of_val(&provenance.commitment_id) + provenance.provider.bytes().len()
+        }
+        WorkEvent::Output(event) => event.bytes(),
+        WorkEvent::Transcript(transcript) => transcript.len(),
+    }
+}
+
+/// What a requester's consumer reads: work events, or the source's failure.
+pub type RequestStream<E, X> = BoxStream<'static, Result<WorkEvent<E>, X>>;
 
 /// The listening side of one accepted request.
 pub struct Requester<E, X> {
-    sender: mpsc::Sender<BufferedEvent<E, X>>,
+    sender: mpsc::Sender<BufferedEvent<WorkEvent<E>, X>>,
     overflow: watch::Sender<bool>,
     budget: Arc<Semaphore>,
 }
@@ -319,7 +334,7 @@ impl<E, X> Clone for Requester<E, X> {
     }
 }
 impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
-    pub(crate) fn new() -> (Self, BoxStream<'static, Result<E, X>>)
+    pub(crate) fn new() -> (Self, RequestStream<E, X>)
     where
         X: From<WorkGatewayError>,
     {
@@ -341,12 +356,17 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
             }),
         )
     }
-    pub(crate) fn emit(&self, event: Result<E, X>) {
+    pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
         let bytes = match &event {
-            Ok(event) => event.bytes(),
+            Ok(event) => event_bytes(event),
             Err(error) => error.to_string().len(),
         };
         emit(&self.sender, &self.overflow, &self.budget, event, bytes);
+    }
+    /// Reports the provider's acceptance as it happens, before any output.
+    pub(crate) fn accepted(&self) -> crate::transact::Accepted {
+        let requester = self.clone();
+        Arc::new(move |provenance| requester.emit(Ok(WorkEvent::Accepted(provenance))))
     }
     /// Signed prefixes, decoded and delivered as they arrive.
     pub(crate) fn progress(&self) -> hellas_channel::work::PaidProgress {
@@ -360,7 +380,7 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
             let (prefix, pending) = &mut *state;
             let chunk = prefix.push(&envelope).map_err(BackendFault::caused_by)?;
             for event in E::prefix(chunk, pending).map_err(BackendFault::caused_by)? {
-                requester.emit(Ok(event));
+                requester.emit(Ok(WorkEvent::Output(event)));
             }
             Ok(())
         })
@@ -567,7 +587,7 @@ impl<S: WorkSource> WorkGateway<S> {
         &self,
         request: S::Request,
         permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<BoxStream<'static, Result<E, S::Error>>, S::Error> {
+    ) -> Result<RequestStream<E, S::Error>, S::Error> {
         if self.admission.is_closed() {
             return Err(WorkGatewayError::from(WorkGatewayBusy).into());
         }
@@ -577,9 +597,14 @@ impl<S: WorkSource> WorkGateway<S> {
             .spawn(async move {
                 let _permit = permit;
                 match source.run(request, requester.clone()).await {
-                    Ok(Some(completed)) => requester.emit(
-                        E::completed(&completed.output, &completed.provider).map_err(Into::into),
-                    ),
+                    Ok(Some(completed)) => {
+                        requester.emit(Ok(WorkEvent::Transcript(completed.transcript.clone())));
+                        requester.emit(
+                            E::completed(&completed.output, &completed.provider)
+                                .map(WorkEvent::Output)
+                                .map_err(Into::into),
+                        )
+                    }
                     Ok(None) => {}
                     Err(error) => requester.emit(Err(error)),
                 }
@@ -719,20 +744,20 @@ mod output_tests {
 
     #[test]
     fn the_largest_possible_completion_fits_the_output_budget() {
-        // The terminal `Done(Completed)` is one channel message carrying the
-        // whole transcript, and a transcript is capped at `MAX_RECORD_BYTES`.
-        // `emit` must therefore charge it at most that, plus the single
-        // per-message `OUTPUT_EVENT_OVERHEAD`, or a completion the protocol
-        // permits cannot be delivered at all: `try_acquire_many_owned` fails,
-        // `overflow` latches, and the caller is told its reader is too slow
-        // for work it has already paid for.
+        // The signed transcript is one channel message, capped at
+        // `MAX_RECORD_BYTES`. `emit` must therefore charge it at most that,
+        // plus the single per-message `OUTPUT_EVENT_OVERHEAD`, or a
+        // completion the protocol permits cannot be delivered at all:
+        // `try_acquire_many_owned` fails, `overflow` latches, and the caller
+        // is told its reader is too slow for work it has already paid for.
         //
         // This is the invariant that a per-contained-event overhead broke.
         // Multiplying the overhead by event count makes the charge unbounded
         // with respect to `MAX_RECORD_BYTES` -- ~8000 small events exceeded
         // the budget on their own -- so no value of `OUTPUT_BUFFER_BYTES`
         // could satisfy this assertion.
-        let worst_case = MAX_RECORD_BYTES.saturating_add(OUTPUT_EVENT_OVERHEAD);
+        let transcript = WorkEvent::<OutputEvent>::Transcript(vec![0; MAX_RECORD_BYTES]);
+        let worst_case = event_bytes(&transcript).saturating_add(OUTPUT_EVENT_OVERHEAD);
         assert!(
             worst_case <= OUTPUT_BUFFER_BYTES,
             "a maximal completion charges {worst_case} against a {OUTPUT_BUFFER_BYTES} budget",
@@ -753,7 +778,7 @@ mod output_tests {
         let budget = requester.budget.clone();
         // Retained output can arrive in one burst before HTTP gets a poll.
         for position in 0..128 {
-            requester.emit(Ok(text(&position.to_string())));
+            requester.emit(Ok(WorkEvent::Output(text(&position.to_string()))));
         }
         drop(requester);
         let mut count = 0;
@@ -772,7 +797,7 @@ mod output_tests {
         // synchronous producer callback still returns without waiting on it.
         let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();
         for _ in 0..3 {
-            requester.emit(Ok(text(&"x".repeat(half))));
+            requester.emit(Ok(WorkEvent::Output(text(&"x".repeat(half)))));
         }
         assert_eq!(requester.budget.available_permits(), 0);
         assert!(

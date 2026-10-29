@@ -15,7 +15,6 @@ pub enum TextOutcome {
         output_tokens: u64,
         stop_reason: TextStop,
         text_artifact: Digest,
-        output_events: Vec<crate::OutputEventEnvelope>,
     },
     Failed {
         position: u64,

@@ -62,7 +62,9 @@ fn render_response_uses_completion_shape() {
         }),
         stop_reason: StopReason::EndOfText,
         provenance: Some(Provenance {
-            call_commitment: Some("aa".repeat(32)),
+            commitment: Some("aa".repeat(32)),
+            provider: Some("secp256k1:02".into()),
+            transcript: Some("c2lnbmVk".into()),
         }),
         error: None,
     };
@@ -80,7 +82,10 @@ fn render_response_uses_completion_shape() {
     assert_eq!(body["object"], "text_completion");
     assert_eq!(body["choices"][0]["text"], " world");
     assert_eq!(body["usage"]["total_tokens"], 3);
-    assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
+    assert_eq!(
+        body["hellas"],
+        json!({"commitment": "aa".repeat(32), "provider": "secp256k1:02", "transcript": "c2lnbmVk"})
+    );
 }
 
 #[test]
@@ -134,7 +139,7 @@ fn render_stream_events_carry_provenance_in_chunks() {
         .render_stream_event(
             &request,
             &mut state,
-            OutputEvent::Provenance(Provenance {
+            OutputEvent::Provenance(hellas_rpc::output::Provenance {
                 call_commitment: Some("aa".repeat(32)),
             }),
         )
@@ -160,7 +165,7 @@ fn render_stream_events_carry_provenance_in_chunks() {
         .render_stream_event(
             &request,
             &mut state,
-            OutputEvent::Provenance(Provenance {
+            OutputEvent::Provenance(hellas_rpc::output::Provenance {
                 call_commitment: Some("aa".repeat(32)),
             }),
         )

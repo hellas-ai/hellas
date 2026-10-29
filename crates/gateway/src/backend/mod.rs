@@ -5,7 +5,7 @@ use hellas_adaptors::{
 };
 
 mod generation;
-mod provenance;
+pub(crate) mod provenance;
 #[cfg_attr(feature = "otel", path = "telemetry/otel.rs")]
 #[cfg_attr(not(feature = "otel"), path = "telemetry/noop.rs")]
 pub(crate) mod telemetry;
@@ -29,7 +29,7 @@ impl ExecutionBackend for GatewayBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let mut inference = telemetry::Inference::new(&request, &self.state.inference_metrics);
-            let prepared = match stateless(request.raw.value()).and_then(|()| {
+            let mut prepared = match stateless(request.raw.value()).and_then(|()| {
                 inference
                     .span
                     .in_scope(|| self.state.prepare_wire_execution(&request.execution))
@@ -40,6 +40,10 @@ impl ExecutionBackend for GatewayBackend {
                     return Err(error);
                 }
             };
+            if let Err(error) = prepared.accept().await {
+                inference.fail(&error);
+                return Err(error);
+            }
             inference.response_model(&request.execution.canonical.model.name);
             let initial_provenance = prepared
                 .provenance

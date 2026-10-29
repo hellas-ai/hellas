@@ -115,8 +115,36 @@ pub(crate) fn backend_status(error: &BackendError) -> StatusCode {
     }
 }
 
-pub type WorkOutputStream<E> = futures::stream::BoxStream<'static, Result<E, WorkGatewayError>>;
+/// One event of accepted work, as a source reports it to presentations.
+#[derive(Clone, Debug)]
+pub enum WorkEvent<E> {
+    /// The provider accepted the job. Reported once, before any output.
+    Accepted(hellas_rpc::provenance::ExecutionProvenance),
+    /// Authenticated output: prefixes, then the terminal.
+    Output(E),
+    /// Canonical bytes of the provider-signed transcript, reported once the
+    /// job has completed, just before its terminal output.
+    Transcript(Vec<u8>),
+}
+
+pub type WorkOutputStream<E> =
+    futures::stream::BoxStream<'static, Result<WorkEvent<E>, WorkGatewayError>>;
 pub type WorkFetchStream = WorkOutputStream<hellas_rpc::output::OutputEvent>;
+
+/// The acceptance at the head of `events`, if the source reports one; any
+/// other first event stays at the head.
+pub(crate) async fn accepted<E: Send + 'static>(
+    events: &mut WorkOutputStream<E>,
+) -> Option<hellas_rpc::provenance::ExecutionProvenance> {
+    use futures::StreamExt as _;
+    let first = events.next().await?;
+    if let Ok(WorkEvent::Accepted(provenance)) = first {
+        return Some(provenance);
+    }
+    let rest = std::mem::replace(events, Box::pin(futures::stream::empty()));
+    *events = Box::pin(futures::stream::once(std::future::ready(first)).chain(rest));
+    None
+}
 
 /// Work admission capacity is exhausted or the backend is shutting down.
 #[derive(Debug, thiserror::Error)]
@@ -140,14 +168,16 @@ pub trait WorkExecutionBackend: Send + Sync {
         Vec::new()
     }
 
-    /// Authenticated prefixes, then durable completion. After proposal the
-    /// backend owns collection and funding obligations across disconnects.
+    /// The provider's acceptance, authenticated prefixes, the signed
+    /// transcript, then durable completion. After proposal the backend owns
+    /// collection and funding obligations across disconnects.
     fn fetch(&self, _request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
-    /// Run a rendered text job on a provider admitting Compute. Emitted
-    /// tokens arrive as authenticated prefixes, then the durable completion.
+    /// Run a rendered text job on a provider admitting Compute. After the
+    /// provider's acceptance, emitted tokens arrive as authenticated
+    /// prefixes, then the signed transcript and the durable completion.
     fn generate(
         &self,
         _job: hellas_client::text::TextJob,
