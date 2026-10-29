@@ -44,7 +44,7 @@ let
   ]
   ++ hellas.mkServeArgs {
     inherit lib;
-    inherit (cfg) serve;
+    inherit (cfg) serve otel;
   };
   serveProgramArguments =
     if cfg.serve.environmentFile == null then
@@ -145,6 +145,10 @@ in
 
     (mkIf (cfg.enable || cfg.serve.enable) {
       assertions = [
+        {
+          assertion = cfg.serve.metricsPort == null || cfg.otel.enable;
+          message = "programs.hellas.serve metrics ports require otel.enable and a package built with the otel feature.";
+        }
         {
           assertion = hellas.extraArgsAreSafe lib hellas.protectedServeExtraArgs cfg.serve.extraArgs;
           message = "programs.hellas.serve.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";

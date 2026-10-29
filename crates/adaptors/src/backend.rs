@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 
+use crate::execution::merge_provenance;
 use crate::{
     ExecutionErrorInfo, ExecutionRequest, ExecutionResult, OutputEvent, OutputItem, Provenance,
     RawRequest, StructuredDelta, TextChannel, ToolCallStart,
@@ -13,7 +14,21 @@ use crate::{
 
 pub type BackendResult<T> = Result<T, BackendError>;
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = BackendResult<T>> + Send + 'a>>;
-pub type OutputEventStream = Pin<Box<dyn Stream<Item = BackendResult<OutputEvent>> + Send>>;
+pub type BackendEventStream = Pin<Box<dyn Stream<Item = BackendResult<BackendEvent>> + Send>>;
+
+/// One event of a backend's stream: signed output, or provenance the
+/// gateway vouches for, which responses rendered after it carry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackendEvent {
+    Output(OutputEvent),
+    Provenance(Provenance),
+}
+
+impl From<OutputEvent> for BackendEvent {
+    fn from(event: OutputEvent) -> Self {
+        Self::Output(event)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendRequest {
@@ -32,14 +47,15 @@ pub trait ExecutionBackend {
 }
 
 pub struct BackendStream {
-    pub events: OutputEventStream,
-    pub initial_provenance: Option<crate::Provenance>,
+    pub events: BackendEventStream,
+    /// Provenance known before the first event, for response headers.
+    pub initial_provenance: Option<Provenance>,
 }
 
 impl BackendStream {
     pub fn new(
-        events: impl Stream<Item = BackendResult<OutputEvent>> + Send + 'static,
-        initial_provenance: Option<crate::Provenance>,
+        events: impl Stream<Item = BackendResult<BackendEvent>> + Send + 'static,
+        initial_provenance: Option<Provenance>,
     ) -> Self {
         Self {
             events: Box::pin(events),
@@ -53,7 +69,14 @@ impl BackendStream {
         let mut provenance = self.initial_provenance.take();
 
         while let Some(event) = self.events.next().await {
-            match event? {
+            let event = match event? {
+                BackendEvent::Output(event) => event,
+                BackendEvent::Provenance(next) => {
+                    merge_provenance(&mut provenance, next);
+                    continue;
+                }
+            };
+            match event {
                 OutputEvent::TextDelta {
                     index,
                     delta,
@@ -71,7 +94,7 @@ impl BackendStream {
                     ));
                 }
                 OutputEvent::Usage(next) => usage = Some(next),
-                OutputEvent::Provenance(next) => merge_provenance(&mut provenance, next),
+                OutputEvent::Provenance(next) => merge_provenance(&mut provenance, next.into()),
                 OutputEvent::Error { message, code } => {
                     return Ok(ExecutionResult {
                         output: output.finish(),
@@ -226,17 +249,6 @@ struct CollectedToolCall {
     arguments: Option<JsonValue>,
 }
 
-fn merge_provenance(current: &mut Option<Provenance>, next: Provenance) {
-    match current {
-        Some(current) => {
-            if next.call_commitment.is_some() {
-                current.call_commitment = next.call_commitment;
-            }
-        }
-        None => *current = Some(next),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,8 +284,15 @@ mod tests {
                     index: 1,
                     arguments: json!({"query": "tea"}),
                 })),
-                Ok(OutputEvent::Provenance(Provenance {
-                    call_commitment: Some("call".to_string()),
+                Ok(OutputEvent::Provenance(hellas_rpc::output::Provenance {
+                    call_commitment: Some("signed".to_string()),
+                })),
+            ])
+            .map(|event| event.map(BackendEvent::from))
+            .chain(stream::iter([
+                Ok(BackendEvent::Provenance(Provenance {
+                    transcript: Some("dHJhbnNjcmlwdA==".to_string()),
+                    ..Provenance::default()
                 })),
                 Ok(OutputEvent::Finished {
                     stop_reason: crate::StopReason::EndOfText,
@@ -282,20 +301,26 @@ mod tests {
                         output_tokens: Some(2),
                         total_tokens: Some(5),
                     }),
-                }),
-            ]),
+                }
+                .into()),
+            ])),
             Some(Provenance {
-                call_commitment: Some("call".to_string()),
+                commitment: Some("call".to_string()),
+                provider: Some("secp256k1:02".to_string()),
+                transcript: None,
             }),
         );
 
         let result = futures_executor::block_on(stream.collect()).unwrap();
 
         assert_eq!(result.stop_reason, crate::StopReason::EndOfText);
+        // Each later source replaces only the fields it names.
         assert_eq!(
             result.provenance,
             Some(Provenance {
-                call_commitment: Some("call".to_string()),
+                commitment: Some("signed".to_string()),
+                provider: Some("secp256k1:02".to_string()),
+                transcript: Some("dHJhbnNjcmlwdA==".to_string()),
             })
         );
         assert_eq!(
@@ -335,9 +360,11 @@ mod tests {
                     message: "provider failed".to_string(),
                     code: Some("upstream_error".to_string()),
                 }),
-            ]),
+            ])
+            .map(|event| event.map(BackendEvent::from)),
             Some(Provenance {
-                call_commitment: Some("call".to_string()),
+                commitment: Some("call".to_string()),
+                ..Provenance::default()
             }),
         );
 
@@ -361,7 +388,8 @@ mod tests {
         assert_eq!(
             result.provenance,
             Some(Provenance {
-                call_commitment: Some("call".to_string()),
+                commitment: Some("call".to_string()),
+                ..Provenance::default()
             })
         );
     }
@@ -377,6 +405,12 @@ pub enum BackendError {
     Quota(String),
     #[error("backend busy: {0}")]
     Busy(String),
+    #[error("backend conflict: {0}")]
+    Conflict(String),
+    #[error("backend timed out: {0}")]
+    Timeout(String),
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
     #[error("backend failed: {0}")]
     Failed(String),
 }

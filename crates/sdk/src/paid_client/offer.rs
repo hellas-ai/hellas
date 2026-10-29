@@ -13,13 +13,15 @@ pub struct PaidQuote {
 
 struct OfferConnection {
     transport: hellas_wire::iroh::IrohTransport,
-    provider: hellas_rpc::ProviderEnrollmentBundle,
 }
 
 impl OfferConnection {
+    /// Dials the addressed node and refuses any enrollment other than the
+    /// addressed one before a request is signed or disclosed.
     async fn open(args: &PaidWorkOptions, endpoint: &Endpoint) -> Result<Self> {
+        let trust = args.trust()?;
         let address = EndpointAddr::from_parts(
-            args.provider,
+            args.provider.node,
             args.provider_addrs.iter().copied().map(TransportAddr::Ip),
         );
         let connection = endpoint
@@ -29,24 +31,15 @@ impl OfferConnection {
             )
             .await
             .map_err(|source| PaidClientError::Connect {
-                provider: args.provider,
+                provider: args.provider.node,
                 source,
             })?;
         let transport = hellas_wire::iroh::IrohTransport::new(connection);
-        let (provider, _) = hellas_client::confidential_open_selected::<
-            hellas_rpc::services::work_setup::Open,
-        >(&transport, args.assurance, args.apple_trust.as_ref())
+        hellas_client::confidential_open::<hellas_rpc::services::work_setup::Open>(
+            &transport, &trust,
+        )
         .await?;
-        if hellas_authority::model::grant::records::grant_transport(&provider)
-            .map_err(|_| PaidClientError::ProviderIdentityChanged)?
-            != *args.provider.as_bytes()
-        {
-            return Err(PaidClientError::ProviderIdentityChanged);
-        }
-        Ok(Self {
-            transport,
-            provider,
-        })
+        Ok(Self { transport })
     }
 
     async fn request(
@@ -77,7 +70,7 @@ impl OfferConnection {
             .ok_or(PaidClientError::MissingState("offer exporter"))?;
         let digest = request_digest(
             args.config.chain.network,
-            self.provider.content_id(),
+            args.provider.enrollment,
             &request,
             &exporter,
         );
@@ -117,18 +110,13 @@ impl OfferConnection {
     }
 }
 
-fn check_quote(
-    args: &PaidWorkOptions,
-    quote: Quote,
-    provider: &hellas_rpc::ProviderEnrollmentBundle,
-) -> Result<PaidQuote> {
+fn check_quote(args: &PaidWorkOptions, quote: Quote) -> Result<PaidQuote> {
     let policy: ProviderChannelPolicy = hellas_rpc::protocol::value::decode_canonical_bounded(
         &quote.provider_channel_policy,
         hellas_authority::model::grant::records::MAX_OFFER_BYTES,
     )
     .map_err(|_| PaidClientError::InputMismatch("quote encoding"))?;
     check_policy(args, &policy, quote.omission_bond)?;
-    hellas_client::selected_provider_trust(provider, args.assurance, args.apple_trust.as_ref())?;
     let required = quote
         .required
         .ok_or(PaidClientError::MissingState("quoted edge values"))?;
@@ -187,46 +175,32 @@ pub async fn request_paid_quote(
     args.validate()?;
     let connection = OfferConnection::open(args, endpoint).await?;
     match connection.request(args, signer, owner, None).await? {
-        Outcome::Quote(quote) => check_quote(args, quote, &connection.provider),
+        Outcome::Quote(quote) => check_quote(args, quote),
         Outcome::Refused(refused) => Err(PaidClientError::OfferRefused(refused.code)),
         _ => Err(PaidClientError::InputMismatch("expected quote")),
     }
 }
 
-pub(super) async fn obtain_offer(
+pub(super) async fn fund_offer(
     args: &PaidWorkOptions,
     endpoint: &Endpoint,
     signer: &Secp256k1Signer,
     owner: &crate::client_owner::ClientOwner,
     chain: &RemoteLightClient,
-    job: Option<&crate::job::Job>,
+    quote: PaidQuote,
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
-    let connection = OfferConnection::open(args, endpoint).await?;
-    let quote = match connection.request(args, signer, principal, None).await? {
-        Outcome::Quote(quote) => check_quote(args, quote, &connection.provider)?,
-        Outcome::Refused(refused) => return Err(PaidClientError::OfferRefused(refused.code)),
-        _ => return Err(PaidClientError::InputMismatch("expected quote")),
-    };
-    if let Some(job) = job {
-        job.check_policy(&quote.policy)?;
-    }
-    let quoted_provider = connection.provider.clone();
-    drop(connection);
     let funding = owner
         .fund(
             chain,
             args.config.chain.network,
-            args.provider,
+            args.provider.node,
             quote.funding_value,
             args.config.poll,
             super::read_timeout(args.timeout),
         )
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;
-    if connection.provider != quoted_provider {
-        return Err(PaidClientError::ProviderIdentityChanged);
-    }
     let offer = match connection
         .request(args, signer, principal, Some(&funding))
         .await?
@@ -236,7 +210,7 @@ pub(super) async fn obtain_offer(
         _ => return Err(PaidClientError::InputMismatch("expected funded offer")),
     };
     if offer.offer().payment_funding != funding
-        || offer.offer().provider != connection.provider
+        || offer.offer().provider.content_id() != args.provider.enrollment
         || offer.offer().policy != quote.policy
         || offer.offer().omission_bond != quote.omission_bond
     {
@@ -250,7 +224,7 @@ pub(crate) async fn retained_offer<
 >(
     journal_root: &std::path::Path,
     network: hellas_kernel::NetworkId,
-    provider: EndpointId,
+    provider: hellas_client::ProviderAddress,
     chain: &WorkBlocks<C>,
 ) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
     let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
@@ -283,7 +257,7 @@ pub(crate) async fn retained_offer<
         };
         if hellas_authority::model::grant::records::grant_transport(&offer.offer().provider)
             .map_err(|_| PaidClientError::ProviderIdentityChanged)?
-            != *provider.as_bytes()
+            != *provider.node.as_bytes()
         {
             continue;
         }
@@ -326,6 +300,9 @@ pub(crate) async fn retained_offer<
                 continue;
             }
         }
+        if offer.offer().provider.content_id() != provider.enrollment {
+            return Err(PaidClientError::RetainedEnrollment(provider));
+        }
         if retained.is_some() {
             return Err(PaidClientError::AmbiguousRecovery);
         }
@@ -340,7 +317,7 @@ pub(crate) async fn retained_offer<
 pub async fn retained_paid_policy(
     config: &WorkConfig,
     journal_root: &std::path::Path,
-    provider: EndpointId,
+    provider: hellas_client::ProviderAddress,
     timeout: Option<Duration>,
 ) -> Result<Option<(ProviderChannelPolicy, hellas_rpc::Assurance)>> {
     config.clone().validate()?;

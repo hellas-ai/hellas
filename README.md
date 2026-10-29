@@ -38,7 +38,7 @@ independently of gateway archive settings.
 
 ## Quickstart: sell and buy one job
 
-Person A sells GPU compute on the devnet with a GPU build (`.#cli-catena` or
+Person A sells GPU compute on the devnet with a GPU build (`.#cli` or
 the `hip`/`cuda` image below):
 
 ```sh
@@ -51,7 +51,9 @@ identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
 work is sold only with `--paid-work-config FILE`: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
 The example charges 20 per job, ten jobs per channel, and stops execution after
-90 seconds. `serve` prints A's `Node ID`.
+90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
+content ID of A's enrollment and the node it binds. B learns it from A out of
+band and every paid connection must present exactly that enrollment.
 
 Person B runs no node. With a Catena program `counter.hex`:
 
@@ -65,9 +67,9 @@ one command builds a job, pays A and prints the result; a second closes the
 channel:
 
 ```sh
-hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20
-hellas --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 B's key approves funding once per channel: A's jobs per channel times its
@@ -117,6 +119,11 @@ For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor
 request, response and streaming formats. CLI gateways archive payloads by default;
 `--zdr` or `x-hellas-zdr: true` disables application payload persistence.
 
+`--text-model` also runs without a chain: `--local-grant ID` serves this
+node's own configured allowance in process (with the `serve` content and GPU
+flags), and `--offer ALIAS` reaches an allowance on another node you own. Such
+memory-only jobs read weights the provider already holds; they never write them.
+
 `--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
 gateway renders each request as a Compute job from the GGUF's configuration
 and tokenizer and sends it to its paid pool or grant; the weights are not
@@ -132,11 +139,12 @@ Every gateway requires a private `--gateway-profile FILE` selecting a provisione
 local Auth authority and a bearer credential scoped to `gateway.invoke`.
 See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The
 text routes use the shared Qwen3 model adapter for completions, chat and tool
-calls. The proxy Responses backend retains its explicit upstream semantics.
-A pinned Responses Offer uses `gateway --offer ALIAS --work-profile FILE` and
-the shared SDK Responses gateway; it exposes `/v1/responses` without a
-`--text-model`. See the [HTTP gateway guide](docs/http-gateway.md#responses-grants).
-`--responses-backend` changes only `/v1/responses`.
+calls. One gateway serves every presentation its work source admits: the text
+routes with `--text-model`, `/v1/responses` as a Fetch when the source seals
+one Responses route, and exact HTTPS routes from `--http-fetch-config` or a
+grant's HTTPS resource. A path served by several presentations is split by the
+request's `model`; overlapping models refuse to start. See the
+[HTTP gateway guide](docs/http-gateway.md#responses-grants).
 
 The exposed routes are:
 
@@ -226,8 +234,8 @@ cargo run -- \
 
 ## Nix
 
-The main outputs are `.#cli` (network client/node/gateway), `.#cli-catena`
-(x86_64 Linux plus the Catena safe GPU runtime), and `.#cli-validator`.
+The main outputs are `.#cli` (client, node, gateway and the Catena GPU
+runtime) and `.#cli-validator`.
 Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
@@ -341,64 +349,11 @@ A GPU asset owner uploads verified weights once and execution workers map them
 read-only. Worker replacement retains weights; asset pressure recreates the
 owner. HIP resident sharing requires version 7.15 or newer.
 
-## Inference cache and reproducible agent runs
+## Recording and replaying jobs
 
-The gateway retains its local inference archive: `--output-cache off`, `record`
-(reuse complete successful results and record misses), or `replay-only` (fail
-on misses without execution). Paid completion and payment acknowledgement finish
-before a successful result is recorded. Proxy requests also support recording.
-The executor's separate replay cache and the cache administration RPC/CLI have
-been removed.
-
-The archive uses the existing Hellas store (`--store-dir`, `HELLAS_STORE_DIR`,
-or `~/.hellas/store`). One process owns a writable index. Stop the writer before
-copying a complete store snapshot for offline replay. Recording persists payloads
-and is incompatible with gateway ZDR mode. Agent tool execution is not cached.
-
-```sh
-hellas gateway --output-cache record --responses-backend proxy --wrap opencode
-hellas gateway --output-cache replay-only --responses-backend proxy --wrap opencode
-```
-
-For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
-
-```nix
-let
-  agent = pkgs.hellasLib.agent;
-  inputs = {
-    name = "agent-change";
-    workspace = ./source;
-    prompt = builtins.readFile ./prompt.txt;
-    model = "your-provider-model";
-    hellas = pkgs.hellas.cli;
-    opencode = pkgs.opencode;
-    packages = [ pkgs.rustc pkgs.cargo ]; # tools available to the agent
-    gatewayArgs = [ "--responses-backend" "proxy" ];
-  };
-in {
-  record = agent.mkAgentRecord inputs;
-  result = agent.mkAgentRun (inputs // { cache = ./agent-recordings; });
-}
-```
-
-Run the recorder executable with a writable store directory outside the Nix
-build, with provider credentials in its runtime environment. Stop the writer, copy a complete store snapshot,
-and use it as `cache`. `mkAgentRun` starts a replay-only gateway inside the
-sandbox, runs OpenCode, and returns its resulting workspace. Both phases use
-`/build/workspace`, the same pinned tools/configuration, and an explicit system
-prompt `date` (default `1970-01-01`). Changing inputs can produce a cache miss;
-re-record them instead of giving the build network access. A replay reruns
-tools and is only reproducible when those tools are deterministic too.
-
-The helper uses OpenCode's generic OpenAI Responses client. Its endpoint must
-accept that request shape; the stricter sealed `codex-responses` Fetch contract
-is not a drop-in target. A zero OpenCode exit status alone is not success: the
-runner also requires a completed session and rejects error events.
-
-Recordings and generated files can contain private source or model output.
-Do not put credentials in Nix expressions, and do not publish recordings
-without reviewing them: Nix store contents are normally readable by all local
-users.
+The gateway keeps no inference cache. `hellas_gateway::start` runs over any
+`WorkExecutionBackend`, and text and Fetch events are serializable, so an
+application can record and replay jobs by wrapping its work source.
 
 ## Dependency maintenance
 
@@ -410,14 +365,31 @@ cargo outdated --workspace --root-deps-only  # outdated deps
 cargo update --workspace   # update Cargo.lock
 ```
 
-### Optional OpenTelemetry
+### Optional metrics and OpenTelemetry
 
-The `otel` Cargo feature is opt-in across the CLI (including Fetch, node,
-gateway, indexer and validator commands). Default Nix packages, including
-public musl builds, disable Hellas telemetry exporters. Request instrumentation
-uses shared enabled/no-op implementations; ordinary operational logs remain.
-Transitive dependencies still include metrics collection and telemetry SDK crates;
-disabling `otel` does not remove those dependencies.
+The default-off `otel` Cargo feature enables metrics and OTLP export across the
+CLI. Default packages, including public musl and Docker builds, omit the metrics
+server, `--metrics-port`/`--metrics-addr`, and gateway/executor instruments.
+Dependencies may still collect their own telemetry independently. Use an `otel`
+build (`cli.override { otel = true; }` or the `docker-otel` image) for metrics.
+
+With that build, `hellas serve --metrics-port 9090` and
+`hellas gateway --metrics-port 9091` serve Prometheus text at
+`http://127.0.0.1:<port>/metrics`. This unauthenticated listener defaults to
+loopback. `--metrics-addr IP` explicitly selects another interface, including
+`0.0.0.0` for container scraping. One-shot commands do not start a metrics server.
+Scrapes collect executor and gateway instruments from the same meter provider
+used for optional OTLP push; both can run together. OTLP environment opt-outs,
+including `OTEL_SDK_DISABLED`, leave the requested local listener active.
+Iroh endpoint metrics share the response for serve and remote-grant gateways;
+paid-pool gateways do not expose their private endpoint.
+
+NixOS exposes `services.hellas.metricsPort` and
+`services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port
+(default `"127.0.0.1"`). Set `services.hellas.otel.enable = true` to select the
+feature-enabled default package, even for local scraping without a collector.
+Metrics ports require this setting; custom packages must also enable `otel`.
+Chain validators retain their separate `--metrics-bind-address` spelling.
 
 The exported NixOS, nix-darwin and Home Manager modules share `otel` options:
 
@@ -434,14 +406,14 @@ programs.hellas.otel.collectorEndpoint = "http://127.0.0.1:4318";
 ```
 
 A configured endpoint enables the feature on the module's default package;
-`otel.enable = false` explicitly selects the build without telemetry. Custom
+`otel.enable = false` selects the build without metrics or OTLP export. Custom
 packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
 HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
 continues to accept an exact trace URL. Home Manager and nix-darwin scope
 variables to `hellas`, rather than enabling unrelated applications.
 Home Manager's `programs.hellas.serve` supplies the Darwin user service.
 Direct package users can use `cli.override { otel = true; }` (also
-`cli-catena` and `cli-validator`) and the standard `OTEL_*` environment variables.
+`cli-validator`) and the standard `OTEL_*` environment variables.
 
 One CLI SDK lifecycle owns traces and metrics, including validators. Native
 operations follow the GenAI Development conventions at

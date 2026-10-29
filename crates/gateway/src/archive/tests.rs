@@ -5,16 +5,14 @@ use axum::{
     http::{Request, StatusCode},
     routing::post,
 };
+use futures::StreamExt;
 use tower::ServiceExt;
 
 fn policy(directory: &Path) -> Policy {
-    Policy::new(
-        ArchiveOptions {
-            directory: directory.into(),
-            zdr: false,
-        },
-        false,
-    )
+    Policy::new(ArchiveOptions {
+        directory: directory.into(),
+        zdr: false,
+    })
 }
 
 async fn exchange(directory: &Path) -> Exchange {
@@ -33,20 +31,17 @@ fn metadata(directory: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(directory.join("metadata.json")).unwrap()).unwrap()
 }
 
-fn router(directory: &Path, required: bool, cache_enabled: bool) -> Router {
+fn router(directory: &Path, required: bool) -> Router {
     Router::new()
         .route(
             "/v1/test",
             post(|body: Bytes| async move { (StatusCode::TOO_MANY_REQUESTS, body) }),
         )
         .layer(axum::middleware::from_fn_with_state(
-            Policy::new(
-                ArchiveOptions {
-                    directory: directory.into(),
-                    zdr: required,
-                },
-                cache_enabled,
-            ),
+            Policy::new(ArchiveOptions {
+                directory: directory.into(),
+                zdr: required,
+            }),
             record,
         ))
 }
@@ -56,7 +51,7 @@ async fn archives_errors_by_default_without_auth_headers_and_zdr_leaves_no_paylo
     let root = tempfile::tempdir().unwrap();
     let archive = root.path().join("archive");
     prepare(&archive).unwrap();
-    let app = router(&archive, false, false);
+    let app = router(&archive, false);
     let response = app
         .clone()
         .oneshot(
@@ -116,7 +111,7 @@ async fn archives_errors_by_default_without_auth_headers_and_zdr_leaves_no_paylo
 #[tokio::test]
 async fn cancellation_leaves_an_incomplete_archive() {
     let root = tempfile::tempdir().unwrap();
-    let response = router(root.path(), false, false)
+    let response = router(root.path(), false)
         .oneshot(
             Request::post("/v1/test")
                 .body(Body::from("cancelled"))
@@ -136,16 +131,15 @@ async fn cancellation_leaves_an_incomplete_archive() {
 }
 
 #[tokio::test]
-async fn zdr_rejects_ambiguous_flags_retain_and_enabled_replay_before_disk_writes() {
+async fn zdr_rejects_ambiguous_flags_and_retain_before_disk_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("must-not-exist");
-    for (required, cache, header, body) in [
-        (false, false, "yes", "{}"),
-        (true, false, "false", "{}"),
-        (false, true, "true", "{}"),
-        (false, false, "true", "{\"store\":true}"),
+    for (required, header, body) in [
+        (false, "yes", "{}"),
+        (true, "false", "{}"),
+        (false, "true", "{\"store\":true}"),
     ] {
-        let response = router(&path, required, cache)
+        let response = router(&path, required)
             .oneshot(
                 Request::post("/v1/test")
                     .header("x-hellas-zdr", header)
@@ -157,7 +151,7 @@ async fn zdr_rejects_ambiguous_flags_retain_and_enabled_replay_before_disk_write
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!path.exists());
     }
-    let response = router(&path, true, false)
+    let response = router(&path, true)
         .oneshot(
             Request::post("/v1/test")
                 .body(Body::from("private"))
@@ -183,7 +177,7 @@ async fn zdr_rejects_compressed_store_true_before_forwarding() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(b"{\"store\":true}").unwrap();
     let body = encoder.finish().unwrap();
-    let response = router(&path, true, false)
+    let response = router(&path, true)
         .oneshot(
             Request::post("/v1/test")
                 .header("content-encoding", "gzip")
@@ -208,7 +202,7 @@ async fn unavailable_archive_preserves_errors_and_recovers_on_the_next_request()
     let archive = root.path().join("unavailable");
     std::fs::write(&archive, b"not a directory").unwrap();
     policy(&archive).prepare(); // Startup must also remain available.
-    let app = router(&archive, false, false);
+    let app = router(&archive, false);
     for recovered in [false, true] {
         if recovered {
             std::fs::remove_file(&archive).unwrap();
@@ -238,6 +232,31 @@ async fn unavailable_archive_preserves_errors_and_recovers_on_the_next_request()
             );
         }
     }
+}
+
+/// Archiving reads a response's data, but the client still gets its
+/// trailers: the HTTPS presentation's signed transcript travels in one.
+#[tokio::test]
+async fn archived_responses_keep_their_trailers() {
+    use http_body_util::BodyExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let archive = exchange(root.path()).await;
+    let directory = archive.directory.clone();
+    let trailers = HeaderMap::from_iter([(
+        axum::http::HeaderName::from_static("x-hellas-transcript"),
+        axum::http::HeaderValue::from_static("c2lnbmVk"),
+    )]);
+    let frames = futures::stream::iter([
+        Ok::<_, io::Error>(http_body::Frame::data(Bytes::from_static(b"body"))),
+        Ok(http_body::Frame::trailers(trailers.clone())),
+    ]);
+    let response =
+        axum::response::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+    let response = archive_response(policy(root.path()), archive, response).await;
+    let collected = response.into_body().collect().await.unwrap();
+    assert_eq!(collected.trailers(), Some(&trailers));
+    assert_eq!(collected.to_bytes(), "body");
+    assert_eq!(metadata(&directory)["complete"], true);
 }
 
 #[tokio::test]

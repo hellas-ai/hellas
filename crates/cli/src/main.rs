@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate tracing;
 
-use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
@@ -14,6 +13,7 @@ mod commands;
 mod identity;
 #[cfg(unix)]
 mod machines;
+#[cfg(feature = "otel")]
 mod metrics;
 mod owner;
 mod platform_hardening;
@@ -48,6 +48,10 @@ fn load_command_identity(
         command,
         Commands::Admin(_)
             | Commands::Gateway { offer: Some(_), .. }
+            | Commands::Gateway {
+                local_grant: Some(_),
+                ..
+            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
@@ -66,23 +70,6 @@ fn load_command_identity(
         identity::load_existing(path)
     } else {
         identity::load_or_create(path)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum GatewayResponsesBackend {
-    Hellas,
-    Proxy,
-    Fetch,
-}
-
-impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
-    fn from(value: GatewayResponsesBackend) -> Self {
-        match value {
-            GatewayResponsesBackend::Hellas => Self::Hellas,
-            GatewayResponsesBackend::Proxy => Self::Proxy,
-            GatewayResponsesBackend::Fetch => Self::Fetch,
-        }
     }
 }
 
@@ -245,9 +232,14 @@ enum Commands {
         /// Wait for one owner pairing if uninitialized; use this directory for node state.
         #[arg(long, num_args = 0..=1, default_missing_value = ".")]
         await_owner: Option<PathBuf>,
+        #[cfg(feature = "otel")]
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
+        #[cfg(feature = "otel")]
+        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        metrics_addr: std::net::IpAddr,
         /// Operator graffiti tag (up to 16 bytes, padded/truncated)
         #[arg(long = "graffiti", default_value = "")]
         graffiti: String,
@@ -283,15 +275,18 @@ enum Commands {
         /// Qwen3 GGUF served by the text routes. Providers must already hold it.
         #[arg(long, value_name = "FILE")]
         text_model: Option<PathBuf>,
-        /// Inference reuse policy; record mode fails requests if cache writes fail.
-        #[arg(long, default_value = "off")]
-        output_cache: hellas_rpc::cache::CachePolicy,
-        /// Content and output cache state (default: HELLAS_STORE_DIR or ~/.hellas/store).
-        #[arg(long)]
-        store_dir: Option<PathBuf>,
+        /// Converted Whisper package served at /v1/audio/transcriptions.
+        #[arg(long, value_name = "DIR")]
+        audio_model: Option<PathBuf>,
+        /// Content store, and with --local-grant the local GPU executor.
+        #[command(flatten)]
+        native: compute::ServeArgs,
+        /// Run this node's own, already configured allowance in process: no
+        /// chain and no remote provider.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config"])]
+        local_grant: Option<String>,
         /// Use a private Offer previously verified by `offer import`.
-        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "responses_backend", "http_fetch_config"])]
-        #[arg(conflicts_with = "paid_work_config")]
+        #[arg(long, value_name = "ALIAS", conflicts_with = "paid_work_config")]
         offer: Option<String>,
         /// Select one resource when the Offer includes several matching policies.
         #[arg(long)]
@@ -299,9 +294,9 @@ enum Commands {
         /// Private application credential, authority and Work authorization grant.
         #[arg(long, value_name = "FILE")]
         work_profile: Option<PathBuf>,
-        /// Serve exact HTTP routes through paid HTTPS Fetch.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "text_model"])]
-        #[arg(requires = "paid_work_config")]
+        /// Serve exact HTTP routes through HTTPS Fetch. A grant with an HTTPS
+        /// resource supplies its own routes.
+        #[arg(long, value_name = "FILE")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
         #[arg(long, value_name = "DIRECTORY")]
@@ -326,16 +321,14 @@ enum Commands {
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
         #[arg(long)]
         port: Option<u16>,
-        /// Direct target node id (omit to use discovery)
+        #[cfg(feature = "otel")]
+        /// Prometheus metrics port (e.g. 9090).
         #[arg(long)]
-        node_id: Option<EndpointId>,
-        /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "address", value_delimiter = ',')]
-        #[arg(requires = "node_id")]
-        node_addrs: Vec<SocketAddr>,
-        /// Max execution retries on failure (discovery mode)
-        #[arg(long = "retries", default_value_t = 2)]
-        retries: usize,
+        metrics_port: Option<u16>,
+        #[cfg(feature = "otel")]
+        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        metrics_addr: std::net::IpAddr,
         /// Fallback max new tokens when request omits max_tokens
         #[arg(
             long = "default-max-tokens",
@@ -343,38 +336,14 @@ enum Commands {
             value_parser = clap::value_parser!(u32).range(1..)
         )]
         default_max_tokens: u32,
-        /// Prometheus metrics port (e.g. 9090)
-        #[arg(long = "metrics-port")]
-        metrics_port: Option<u16>,
-        /// Backend used only for /v1/responses; other gateway APIs are unchanged.
-        #[arg(long = "responses-backend", value_enum, default_value_t = GatewayResponsesBackend::Hellas)]
-        responses_backend: GatewayResponsesBackend,
-        /// Upstream endpoint used when --responses-backend=proxy.
-        #[arg(
-            long = "responses-proxy-url",
-            default_value = "https://api.openai.com/v1/responses"
-        )]
-        responses_proxy_url: String,
-        /// Environment variable holding the bearer token for --responses-backend=proxy.
-        #[arg(long = "responses-proxy-api-key-env", default_value = "OPENAI_API_KEY")]
-        responses_proxy_api_key_env: String,
-        /// Fetch route service used when --responses-backend=fetch.
-        #[arg(long = "responses-fetch-route-service", default_value = "codex")]
-        responses_fetch_route_service: String,
-        /// Fetch route method used when --responses-backend=fetch.
-        #[arg(long = "responses-fetch-route-method", default_value = "responses")]
-        responses_fetch_route_method: String,
-        /// Exact Fetch contract ProgramManifest ContentId expected from the provider route.
-        #[arg(
-            long = "responses-fetch-execution-environment",
-            required_if_eq("responses_backend", "fetch"),
-            value_parser = parse_content_id_hex
-        )]
-        responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
-        /// JSON object merged into OpenAI Responses requests before signing
-        /// and sending them through Fetch.
-        #[arg(long = "responses-fetch-request-overrides", value_parser = parse_json_object)]
-        responses_fetch_request_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+        /// JSON object merged into OpenAI Responses requests before they are
+        /// signed and sent as a Fetch.
+        #[arg(long = "responses-overrides", value_parser = parse_json_object)]
+        responses_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Models the Responses Fetch answers to when /v1/responses is shared
+        /// with other routes. Repeat or use commas.
+        #[arg(long = "responses-model", value_delimiter = ',')]
+        responses_models: Vec<String>,
         /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
         #[arg(long = "wrap")]
         wrap: Option<String>,
@@ -396,6 +365,15 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
+    /// Convert a local published Whisper checkpoint into a client model package.
+    ConvertWhisper {
+        #[arg(long, value_name = "DIR")]
+        checkpoint: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+    },
+    /// Transcribe one WAV with a client-rendered Whisper job on a paid provider.
+    Transcribe(commands::transact::TranscribeArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -472,6 +450,10 @@ fn validate_identity_options(
     let reads_existing_identity = matches!(
         command,
         Commands::Gateway { offer: Some(_), .. }
+            | Commands::Gateway {
+                local_grant: Some(_),
+                ..
+            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
@@ -544,7 +526,30 @@ async fn async_main() {
         eprintln!("error: failed to harden provider process: {err}");
         std::process::exit(1);
     }
-    let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
+    #[cfg(feature = "otel")]
+    let metrics = match &cli.command {
+        Commands::Serve {
+            metrics_port,
+            metrics_addr,
+            ..
+        }
+        | Commands::Gateway {
+            metrics_port,
+            metrics_addr,
+            ..
+        } => metrics_port.map(|port| {
+            (
+                (*metrics_addr, port).into(),
+                metrics::MetricsBundle::default(),
+            )
+        }),
+        _ => None,
+    };
+    let tracer_provider = tracing_config::init_tracing(
+        cli.log_file.as_deref(),
+        #[cfg(feature = "otel")]
+        metrics.as_ref().map(|(_, bundle)| &bundle.registry),
+    );
     if let Commands::Trust(args) = cli.command {
         let result = commands::trust::run(args);
         tracer_provider.shutdown();
@@ -580,6 +585,7 @@ async fn async_main() {
             | Commands::Transact(_)
             | Commands::Fetch(_)
             | Commands::Run(_)
+            | Commands::Transcribe(_)
             | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
@@ -675,6 +681,25 @@ async fn async_main() {
             }
             return;
         }
+        Commands::ConvertWhisper { checkpoint, output } => {
+            let result = hellas_client::model::whisper::convert_whisper(&checkpoint, &output);
+            tracer_provider.shutdown();
+            match result {
+                Ok(object) => println!(
+                    "weights: {} ({} bytes), {}",
+                    object.id(),
+                    object.bytes(),
+                    output
+                        .join(hellas_client::model::whisper::WEIGHTS_FILE)
+                        .display()
+                ),
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Commands::Store { command, store_dir } => {
             let result = commands::store::run(command, store_dir).await;
             tracer_provider.shutdown();
@@ -740,7 +765,10 @@ async fn async_main() {
             chain_node,
             grant_config_file,
             await_owner,
-            metrics_port,
+            #[cfg(feature = "otel")]
+                metrics_port: _,
+            #[cfg(feature = "otel")]
+                metrics_addr: _,
             graffiti,
             fetch_config_file,
             check_config: _,
@@ -809,7 +837,8 @@ async fn async_main() {
                             paid,
                             chain_node,
                             grants,
-                            metrics_port,
+                            #[cfg(feature = "otel")]
+                            metrics,
                             graffiti,
                             fetch_config_file,
                             fetch_max_in_flight,
@@ -828,8 +857,9 @@ async fn async_main() {
         }
         Commands::Gateway {
             text_model,
-            output_cache,
-            store_dir,
+            audio_model,
+            native,
+            local_grant,
             offer,
             grant_policy,
             work_profile,
@@ -842,189 +872,255 @@ async fn async_main() {
             remote_trust,
             host,
             port,
-            node_id,
-            node_addrs,
-            retries,
+            #[cfg(feature = "otel")]
+                metrics_port: _,
+            #[cfg(feature = "otel")]
+                metrics_addr: _,
             default_max_tokens,
-            metrics_port,
-            responses_backend,
-            responses_proxy_url,
-            responses_proxy_api_key_env,
-            responses_fetch_route_service,
-            responses_fetch_route_method,
-            responses_fetch_execution_environment,
-            responses_fetch_request_overrides,
+            responses_overrides,
+            responses_models,
             wrap,
             wrap_args,
-        } => {
-            async {
-                let cache_options =
-                    commands::gateway_cache::options(output_cache, store_dir.clone())?;
-                let model_name = text_model.as_deref().and_then(Path::file_stem)
-                    .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-                let assurance = remote_trust.assurance;
-                let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
-                    .transpose()?.map(std::sync::Arc::new);
-                let work_application = || application.clone().ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"));
-                let grant_target = if let Some(name) = offer.as_deref() {
-                    let client = commands::contributions::require_principal(passkey)?;
-                    let offer = commands::contributions::load_offer(&client, name)?;
-                    Some(hellas_sdk::grant_client::UnpinnedOffer::decode(
-                        &offer.encode()?,  hellas_auth::authority::UnixMillis(0),
-                    )?.pin(&remote_trust.load()?)?)
-                } else { None };
-                let grant_source = if let Some(target) = grant_target
-                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
-                    Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
-                        hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
-                } else { None };
-                if let Some((session, _)) = grant_source.as_ref()
-                    && hellas_sdk::grant_gateway::responses::selected_policy(&session.target, grant_policy.as_deref())?.is_some()
-                {
-                    anyhow::ensure!(paid_work_config.is_none(), "Responses grants require their own Fetch gateway");
-                    anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
-                    anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
-                    let hellas_sdk::node_control::profile::GatewayHost { access, control, .. } = hellas_sdk::node_control::profile::GatewayProfile::load(
-                        gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
-                    ).await?;
-                    let (session, transport) = grant_source.ok_or_else(|| anyhow::anyhow!("Responses grants require a transport"))?;
-                    let gateway = hellas_sdk::grant_gateway::responses::start_fetch(
-                        hellas_sdk::grant_gateway::responses::FetchGatewayOptions {
-                            access, host, port, allow_remote, wrap, wrap_args,
-                            archive: hellas_gateway::ArchiveOptions {
-                                directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?, zdr,
-                            },
-                            session,
-                            policy: grant_policy,
-                            request_overrides: responses_fetch_request_overrides.unwrap_or_default(),
-                        }, transport
-                    ).await?;
-                    let result = hellas_gateway::wait_for_shutdown(gateway).await.map_err(anyhow::Error::from);
-                    return match control {
-                        Some(control) => result.and(control.shutdown().await.map_err(anyhow::Error::from)),
-                        None => result,
-                    };
-                }
-                let paid_options = if let Some(path) = paid_work_config.as_ref()
-                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
-                {
-                    anyhow::ensure!(
-                        node_id.is_none()
-                            && responses_backend == GatewayResponsesBackend::Hellas,
-                        "--paid-work-config requires remote Hellas execution without --local, --node-id, or a Responses override",
-                    );
-                    anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
-                        "token-native paid work uses producer-signed assurance");
-                    Some(hellas_sdk::paid_gateway::load_pool_options(path, assurance)?)
-                } else { None };
-                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: _ } = hellas_sdk::node_control::profile::GatewayProfile::load(
-                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
-                ).await?;
-                let paid_work = if let Some(options) = paid_options {
-                    let passkey = owner.clone().ok_or_else(|| anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account"))?;
-                    let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
-                        std::sync::Arc::new(passkey), identity::settlement_signer(&local_identity)?.party_key(),
-                        &identity::funding_root(cli.identity.as_deref())?,
-                    )?);
-                    Some(
-                        hellas_sdk::paid_gateway::PaidGateway::open(
-                            options,
-                            hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
-                            payer,
-                        ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
+        } => async {
+            let assurance = remote_trust.assurance;
+            let application = work_profile
+                .as_deref()
+                .map(hellas_sdk::node_control::profile::ClientProfile::load)
+                .transpose()?
+                .map(std::sync::Arc::new);
+            let work_application = || {
+                application
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
+            };
+            let grant_source = if let Some(name) = offer.as_deref() {
+                let client = commands::contributions::require_principal(passkey)?;
+                let offer = commands::contributions::load_offer(&client, name)?;
+                let target = hellas_sdk::grant_client::UnpinnedOffer::decode(
+                    &offer.encode()?,
+                    hellas_auth::authority::UnixMillis(0),
+                )?
+                .pin(&remote_trust.load()?)?;
+                anyhow::ensure!(
+                    assurance == target.trust().required_assurance,
+                    "requested assurance differs from the pinned grant provider"
+                );
+                Some((
+                    commands::grant_gateway::session(
+                        target,
+                        &local_identity,
+                        client,
+                        work_application()?,
+                    )?,
+                    hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?,
+                ))
+            } else if let Some(grant) = local_grant.as_deref() {
+                anyhow::ensure!(
+                    assurance == hellas_rpc::Assurance::ProducerSigned,
+                    "local Work requires producer-signed assurance"
+                );
+                Some(
+                    commands::grant_gateway::local::prepare(
+                        grant,
+                        native,
+                        &local_identity,
+                        commands::contributions::require_principal(passkey)?,
+                        work_application()?,
+                        remote_trust.load()?,
                     )
-                } else {
-                    None
-                };
-
-                anyhow::ensure!(grant_policy.is_none() || offer.is_some() || grant_source.is_some(), "--grant-policy requires a remote or local allowance");
-                let grant_gateway = if let Some((session, transport)) = grant_source {
-                    Some(hellas_sdk::grant_gateway::GrantGateway::open(session, transport, grant_policy).await?)
-                } else { None };
-                let paid_work = grant_gateway.as_ref().map(|backend| backend.clone() as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>).or(paid_work);
-                let shutdown = paid_work.clone();
-                let result = async {
-                let provider_trust = None;
-                let archive = hellas_gateway::ArchiveOptions {
-                    directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
-                    zdr,
-                };
-                let http_config = if let Some(path) = http_fetch_config {
-                    let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
-                    Some(serde_json::from_slice(&bytes)?)
-                } else {
-                    grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
-                };
-                let served = async {
-                if let Some(config) = http_config {
-                    anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
-                        "HTTP routes archive exchanges; inference replay must be off");
-                    anyhow::ensure!(metrics_port.is_none(), "HTTP Fetch exports OpenTelemetry metrics; --metrics-port is unsupported");
-                    return hellas_gateway::run_http(hellas_gateway::HttpGatewayOptions {
-                        config,
-                        paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires a Work backend"))?,
-                        archive, access: gateway_access, allow_remote, host, port, wrap, wrap_args,
-                    }).await.map_err(anyhow::Error::from);
-                }
-                hellas_gateway::run(hellas_gateway::GatewayOptions {
-                    archive,
-                    output_cache: cache_options,
-                    paid_work,
-                    access: gateway_access,
-            allow_remote,
-                            host,
+                    .await?,
+                )
+            } else {
+                None
+            };
+            anyhow::ensure!(
+                grant_policy.is_none() || grant_source.is_some(),
+                "--grant-policy requires a remote or local allowance"
+            );
+            let hellas_sdk::node_control::profile::GatewayHost {
+                access, control, ..
+            } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                gateway_profile.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--gateway-profile is required to serve HTTP")
+                })?,
+            )
+            .await?;
+            let http = http_fetch_config
+                .map(
+                    |path| -> anyhow::Result<hellas_gateway::HttpGatewayConfig> {
+                        let bytes = commands::read_bounded_regular_file(
+                            &path,
+                            "HTTP gateway config",
+                            4 << 20,
+                        )?;
+                        Ok(serde_json::from_slice(&bytes)?)
+                    },
+                )
+                .transpose()?;
+            let text = text_model.map(|model| hellas_gateway::TextOptions {
+                model_name: model
+                    .file_stem()
+                    .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned()),
+                model,
+                default_max_tokens,
+            });
+            let mut models: Vec<_> = text
+                .into_iter()
+                .map(hellas_gateway::ModelOptions::Text)
+                .collect();
+            if let Some(model) = audio_model {
+                models.push(hellas_gateway::ModelOptions::Whisper(
+                    hellas_gateway::AudioOptions {
+                        model_name: model
+                            .file_name()
+                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                        model,
+                        default_max_tokens: default_max_tokens as usize,
+                    },
+                ));
+            }
+            let serve = hellas_sdk::GatewayServeOptions {
+                server: hellas_gateway::ServerOptions {
+                    access,
+                    archive: hellas_gateway::ArchiveOptions {
+                        directory: archive_dir
+                            .map(Ok)
+                            .unwrap_or_else(identity::default_gateway_archive_path)?,
+                        zdr,
+                    },
+                    allow_remote,
+                    host,
                     port,
-                    node_id,
-                    node_addrs,
-                    retries,
-                    default_max_tokens,
-                    model_name,
-                    text_model,
-                    metrics_port,
-                    responses_backend: responses_backend.into(),
-                    responses_proxy_url,
-                    responses_proxy_api_key_env,
-                    responses_fetch_route_service,
-                    responses_fetch_route_method,
-                    responses_fetch_execution_environment,
-                    responses_fetch_request_overrides: responses_fetch_request_overrides
-                        .unwrap_or_default(),
-                    provider_trust,
-                    producer_key: local_identity.node_key,
-                    assurance,
-                    secret_key,
                     wrap,
                     wrap_args,
-                })
-                .await.map_err(anyhow::Error::from)
-                }.await;
-                match control {
-                    Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
-                    None => served,
-                }
-                }.await;
-                let mut result = result;
-                if let Some(backend) = shutdown {
-                    result = result.and(backend.drain().await.map_err(anyhow::Error::from));
-                }
-                result
+                },
+                models,
+                http,
+                responses_overrides: responses_overrides.unwrap_or_default(),
+                responses_models,
+            };
+            #[cfg(feature = "otel")]
+            let metrics = metrics.map(|(address, bundle)| {
+                let bundle = match grant_source.as_ref().map(|(_, transport)| transport) {
+                    Some(hellas_sdk::grant_client::GrantTransport::Remote(endpoint)) => {
+                        let (_, receiver) = tokio::sync::watch::channel(Some(endpoint.clone()));
+                        bundle.with_iroh(receiver)
+                    }
+                    _ => bundle,
+                };
+                (address, bundle)
+            });
+            #[cfg(feature = "otel")]
+            if let Some((address, bundle)) = metrics {
+                metrics::spawn_metrics_server(address, bundle).await?;
             }
-            .await
+            let gateway = if let Some((session, transport)) = grant_source {
+                hellas_sdk::grant_gateway::GrantServeOptions {
+                    serve,
+                    session,
+                    policy: grant_policy,
+                }
+                .start(transport)
+                .await?
+            } else if let Some(path) = paid_work_config.as_ref() {
+                anyhow::ensure!(
+                    serve.http.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
+                    "token-native paid work uses producer-signed assurance"
+                );
+                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                let passkey = owner.clone().ok_or_else(|| {
+                    anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
+                })?;
+                let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
+                    std::sync::Arc::new(passkey),
+                    identity::settlement_signer(&local_identity)?.party_key(),
+                    &identity::funding_root(cli.identity.as_deref())?,
+                )?);
+                let paid = hellas_sdk::paid_gateway::PaidGateway::open(
+                    options,
+                    hellas_sdk::NodeIdentity::from_secret_bytes(
+                        secret_key.to_bytes(),
+                        local_identity.node_key.to_secret_bytes(),
+                    )?,
+                    payer,
+                )
+                .await?;
+                hellas_sdk::serve_gateway(paid, serve).await?
+            } else {
+                anyhow::bail!(
+                    "the gateway needs a work source: --local-grant, --offer or --paid-work-config"
+                );
+            };
+            let served = hellas_gateway::wait_for_shutdown(gateway)
+                .await
+                .map_err(anyhow::Error::from);
+            match control {
+                Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
+                None => served,
+            }
         }
+        .await,
         Commands::Rpc {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::Transact(args) => async {
-            commands::transact::run(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
-        }.await,
-        Commands::Fetch(args) => async {
-            commands::transact::fetch(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
-        }.await,
-        Commands::Run(args) => async {
-            commands::transact::run_program(args, commands::transact::Context::new(&local_identity, owner.as_ref(), cli.identity.as_deref())?).await
-        }.await,
+        Commands::Transact(args) => {
+            async {
+                commands::transact::run(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Fetch(args) => {
+            async {
+                commands::transact::fetch(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Run(args) => {
+            async {
+                commands::transact::run_program(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Transcribe(args) => {
+            async {
+                commands::transact::transcribe(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::ConvertWhisper { .. } => unreachable!("conversion handled before identity load"),
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
@@ -1038,7 +1134,9 @@ async fn async_main() {
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)
             }
-            IdentityCommand::ShowHolder => commands::identity::show_holder(&local_identity.node_key),
+            IdentityCommand::ShowHolder => {
+                commands::identity::show_holder(&local_identity.node_key)
+            }
             IdentityCommand::ExportEnrollment { out } => {
                 commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())
             }

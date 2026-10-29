@@ -3,7 +3,6 @@ let
   rocm = import ../rocm.nix { inherit pkgs nix-strix-halo; };
 in
 {
-  agent = import ./agent.nix { inherit pkgs; };
   apiFlavor = {
     anthropic = "anthropic-messages";
     openai = "openai-completions";

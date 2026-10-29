@@ -7,8 +7,6 @@ pub enum GatewayError {
     #[error(transparent)]
     Config(#[from] GatewayConfigError),
     #[error(transparent)]
-    Client(#[from] hellas_client::ClientError),
-    #[error(transparent)]
     Work(#[from] crate::WorkGatewayError),
     #[error(transparent)]
     Shutdown(#[from] crate::WorkShutdownError),
@@ -44,7 +42,7 @@ pub enum GatewayError {
     },
     #[error("wrapped command exited with status {0}")]
     WrappedCommand(ExitStatus),
-    #[error("text presentation failed: {0}")]
+    #[error("model presentation failed: {0}")]
     Presentation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Routing(#[from] crate::RoutingError),
@@ -82,8 +80,20 @@ pub enum GatewayConfigError {
     DuplicateRoute,
     #[error("use a provider credential alias for authentication")]
     CredentialAlias,
-    #[error("default maximum tokens must be greater than zero")]
+    #[error("default maximum tokens must be positive and fit the model capacity")]
     MaxTokens,
     #[error("non-loopback gateway binding requires --allow-remote")]
     RemoteBinding,
+    #[error("the gateway serves no presentation")]
+    NoPresentation,
+    #[error("{0} is served by several presentations without distinct model names")]
+    RouteConflict(String),
+    #[error("several sealed Responses routes; select one resource")]
+    AmbiguousResponses,
+    #[error("backend {0} has no HTTPS Fetch route on its provider")]
+    MissingFetchRoute(String),
+    #[error("backend {0} names a Fetch route its provider's policy does not seal")]
+    FetchRouteMismatch(String),
+    #[error("backend {0}'s provider seals several HTTPS routes; name one with service and method")]
+    AmbiguousFetchRoute(String),
 }

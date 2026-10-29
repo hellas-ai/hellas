@@ -74,9 +74,8 @@ impl Host {
             signer: Arc::new(FRIEND.node_key()),
             application: self.application.clone(),
             journal_root: self.root.path().join("client"),
-            // A job deadline below the grant limit leaves room for the client
-            // monotonic clock while the injected provider clock stays fixed.
-            timeout: std::time::Duration::from_secs(5),
+            // Control calls stay bounded independently of the signed job limit.
+            control_timeout: std::time::Duration::from_secs(5),
         }
     }
     pub async fn gateway_access(&self) -> hellas_gateway::GatewayAccess {
@@ -114,21 +113,28 @@ impl Host {
     pub async fn responses_options(
         &self,
         addresses: Vec<String>,
-    ) -> crate::grant_gateway::responses::FetchGatewayOptions {
-        crate::grant_gateway::responses::FetchGatewayOptions {
-            access: self.gateway_access().await,
-            archive: hellas_gateway::ArchiveOptions {
-                directory: self.root.path().join("archive"),
-                zdr: true,
+    ) -> crate::grant_gateway::GrantServeOptions {
+        crate::grant_gateway::GrantServeOptions {
+            serve: crate::GatewayServeOptions {
+                server: hellas_gateway::ServerOptions {
+                    access: self.gateway_access().await,
+                    archive: hellas_gateway::ArchiveOptions {
+                        directory: self.root.path().join("archive"),
+                        zdr: true,
+                    },
+                    host: "127.0.0.1".into(),
+                    port: Some(0),
+                    allow_remote: false,
+                    wrap: None,
+                    wrap_args: vec![],
+                },
+                models: Vec::new(),
+                http: None,
+                responses_overrides: Default::default(),
+                responses_models: Vec::new(),
             },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
             session: self.options(addresses),
             policy: None,
-            request_overrides: Default::default(),
         }
     }
     /// The real provider dispatch loop, with a deterministic backend and pinned proof.

@@ -1,6 +1,19 @@
-//! Funding-independent gateway input preparation and bounded output delivery.
-use futures::stream::BoxStream;
+//! One gateway backend over any source of work. A paid pool and a grant
+//! session differ only in how they fund and run one request; input
+//! preparation, admission, streamed output and shutdown are shared here.
+use crate::job::{JobError, JobInput};
+use futures::{future::BoxFuture, stream::BoxStream};
+use hellas_authority::model::grant::resource::HttpsResource;
+use hellas_gateway::{
+    ComputeEvent, WorkEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy,
+    WorkGatewayError, WorkOutputStream, WorkShutdownError,
+};
+use hellas_rpc::http_fetch::HttpFetchRequest;
+use hellas_rpc::output::OutputEvent;
+use hellas_rpc::protocol::invocation::output::{ArtifactChunk, ArtifactPrefix, InvocationOutput};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_channel::work_store::journal::MAX_RECORD_BYTES;
@@ -101,7 +114,7 @@ pub fn response_stream<E: Send + 'static, X: Send + 'static>(
 /// Owns accepted tasks until their futures physically terminate. Drain polls the
 /// handles in place so dropping a drain future cannot detach unfinished work.
 #[derive(Default)]
-pub(crate) struct WorkTasks {
+pub struct WorkTasks {
     state: std::sync::Mutex<TaskState>,
     draining: tokio::sync::Mutex<()>,
 }
@@ -180,6 +193,441 @@ impl WorkTasks {
     }
 }
 
+/// Gateway events derived from one invocation's signed output.
+pub trait GatewayEvent: serde::Serialize + Send + Sized + 'static {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError>;
+    fn completed(
+        output: &InvocationOutput,
+        provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError>;
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(OUTPUT_BUFFER_BYTES, |bytes| bytes.len())
+    }
+}
+impl GatewayEvent for OutputEvent {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError> {
+        fetch_prefix(chunk, pending)
+    }
+    fn completed(
+        output: &InvocationOutput,
+        provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError> {
+        fetch_terminal(output, provider)
+    }
+}
+impl GatewayEvent for ComputeEvent {
+    fn bytes(&self) -> usize {
+        // These events are held as Rust buffers, never JSON. Decimal JSON
+        // expansion would reject a valid transcript + full output completion.
+        match self {
+            ComputeEvent::Output(chunk) => chunk
+                .name
+                .capacity()
+                .saturating_add(chunk.format.capacity())
+                .saturating_add(chunk.bytes.0.capacity()),
+            ComputeEvent::Done { output, .. } => output.artifacts.iter().fold(
+                output.metadata.0.capacity().saturating_add(
+                    output
+                        .artifacts
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<
+                            hellas_rpc::protocol::invocation::Artifact,
+                        >()),
+                ),
+                |bytes, artifact| {
+                    bytes
+                        .saturating_add(artifact.name.capacity())
+                        .saturating_add(artifact.format.capacity())
+                        .saturating_add(artifact.bytes.0.capacity())
+                },
+            ),
+        }
+    }
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError> {
+        let _ = pending;
+        Ok(vec![ComputeEvent::Output(chunk)])
+    }
+    fn completed(
+        output: &InvocationOutput,
+        provider: &hellas_auth::PublicKey,
+    ) -> Result<Self, WorkGatewayError> {
+        Ok(ComputeEvent::Done {
+            output: output.clone(),
+            provider: *provider,
+        })
+    }
+}
+
+/// A verified completion, the provider key that signed it, and the
+/// canonical bytes of the signed transcript it was verified from.
+pub struct Completed {
+    pub output: InvocationOutput,
+    pub provider: hellas_auth::PublicKey,
+    pub transcript: Vec<u8>,
+}
+
+/// What one event charges against the requester's output budget.
+fn event_bytes<E: GatewayEvent>(event: &WorkEvent<E>) -> usize {
+    match event {
+        WorkEvent::Accepted(provenance) => {
+            std::mem::size_of_val(&provenance.commitment_id) + provenance.provider.bytes().len()
+        }
+        WorkEvent::Output(event) => event.bytes(),
+        WorkEvent::Transcript(transcript) => transcript.len(),
+    }
+}
+
+/// What a requester's consumer reads: work events, or the source's failure.
+pub type RequestStream<E, X> = BoxStream<'static, Result<WorkEvent<E>, X>>;
+
+/// The listening side of one accepted request.
+pub struct Requester<E, X> {
+    sender: mpsc::Sender<BufferedEvent<WorkEvent<E>, X>>,
+    overflow: watch::Sender<bool>,
+    budget: Arc<Semaphore>,
+}
+impl<E, X> Clone for Requester<E, X> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            overflow: self.overflow.clone(),
+            budget: self.budget.clone(),
+        }
+    }
+}
+impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
+    pub(crate) fn new() -> (Self, RequestStream<E, X>)
+    where
+        X: From<WorkGatewayError>,
+    {
+        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (overflow, overflow_receiver) = watch::channel(false);
+        let requester = Self {
+            sender,
+            overflow,
+            budget: Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES)),
+        };
+        (
+            requester,
+            response_stream(receiver, overflow_receiver, || {
+                X::from(WorkGatewayError::Execution(Box::new(
+                    std::io::Error::other(
+                        "gateway output consumer is too slow; accepted work continues",
+                    ),
+                )))
+            }),
+        )
+    }
+    pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
+        let bytes = match &event {
+            Ok(event) => event_bytes(event),
+            Err(error) => error.to_string().len(),
+        };
+        emit(&self.sender, &self.overflow, &self.budget, event, bytes);
+    }
+    /// Reports the provider's acceptance as it happens, before any output.
+    pub(crate) fn accepted(&self) -> crate::transact::Accepted {
+        let requester = self.clone();
+        Arc::new(move |provenance| requester.emit(Ok(WorkEvent::Accepted(provenance))))
+    }
+    /// Signed prefixes, decoded and delivered as they arrive.
+    pub(crate) fn progress(&self) -> hellas_channel::work::PaidProgress {
+        let requester = self.clone();
+        let state = std::sync::Mutex::new((ArtifactPrefix::default(), Vec::new()));
+        Arc::new(move |envelope| {
+            use hellas_channel::work::BackendFault;
+            let mut state = state.lock().map_err(|_| {
+                BackendFault::caused_by(std::io::Error::other("prefix lock poisoned"))
+            })?;
+            let (prefix, pending) = &mut *state;
+            let chunk = prefix.push(&envelope).map_err(BackendFault::caused_by)?;
+            for event in E::prefix(chunk, pending).map_err(BackendFault::caused_by)? {
+                requester.emit(Ok(WorkEvent::Output(event)));
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await
+    }
+}
+
+/// What HTTP asks for, before any source has matched it to a policy.
+pub enum WorkRequest {
+    /// Pinned to one provider by the HTTP account router; the contract comes
+    /// from the admitting policy.
+    Fetch(WorkFetchRequest),
+    /// A complete program input; any admitting provider may run it.
+    Compute(JobInput),
+}
+
+impl WorkRequest {
+    /// The provider this request must run on, if it names one.
+    pub fn pinned(&self) -> Option<iroh::EndpointId> {
+        match self {
+            WorkRequest::Fetch(request) => Some(request.provider),
+            WorkRequest::Compute(_) => None,
+        }
+    }
+
+    /// The one input `policy` admits for this request. A Fetch tries each
+    /// Fetch contract of `policy`; an HTTPS body is first repaired under
+    /// `https`. Two admitting contracts are refused, never chosen between.
+    pub fn admitted(
+        &self,
+        policy: &InvocationPolicy,
+        https: Option<&HttpsResource>,
+        assurance: hellas_rpc::Assurance,
+        retain: bool,
+    ) -> Result<JobInput, JobError> {
+        let request = match self {
+            WorkRequest::Compute(input) => {
+                input.admits(policy, retain)?;
+                return Ok(input.clone());
+            }
+            WorkRequest::Fetch(request) => request,
+        };
+        let mut contracts = Vec::new();
+        for admission in &policy.admissions {
+            if let Admission::Fetch { admission } = admission
+                && !contracts.contains(&admission.contract)
+            {
+                contracts.push(admission.contract.clone());
+            }
+        }
+        let mut admitted = None;
+        let mut refusal = None;
+        for contract in contracts {
+            let body = match https {
+                Some(https) if contract.schema() == hellas_rpc::FetchSchema::HttpV1 => {
+                    let mut http = HttpFetchRequest::decode(&request.body)
+                        .map_err(|e| JobError::Invalid(e.to_string()))?;
+                    https
+                        .prepare(&mut http)
+                        .map_err(|e| JobError::Invalid(e.to_string()))?;
+                    serde_json::to_vec(&http)?
+                }
+                _ => request.body.clone(),
+            };
+            let input = JobInput::Fetch {
+                contract,
+                service: request.service.clone(),
+                method: request.method.clone(),
+                request: body,
+                assurance,
+            };
+            match input.admits(policy, retain) {
+                Ok(()) if admitted.is_some() => {
+                    return Err(JobError::Invalid(
+                        "several Fetch contracts admit this request".into(),
+                    ));
+                }
+                Ok(()) => admitted = Some(input),
+                Err(error) => refusal = Some(error),
+            }
+        }
+        admitted.ok_or_else(|| {
+            refusal.unwrap_or_else(|| JobError::Invalid("the policy admits no Fetch".into()))
+        })
+    }
+}
+
+/// How one source funds and runs gateway requests.
+pub trait WorkSource: Send + Sync + Sized + 'static {
+    type Error: From<WorkGatewayError> + std::fmt::Display + Send + 'static;
+    /// One request, already matched to this source's policies.
+    type Request: Send + 'static;
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute>;
+    /// Matches the request to this source's policies and builds its input.
+    fn request(&self, request: WorkRequest) -> Result<Self::Request, Self::Error>;
+    /// Runs the request to its verified completion. Work not yet proposed
+    /// stops when the requester disconnects; proposed work runs to completion.
+    fn run<E: GatewayEvent>(
+        self: Arc<Self>,
+        request: Self::Request,
+        requester: Requester<E, Self::Error>,
+    ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>>;
+    fn timeout(&self) -> Option<Duration>;
+    fn gateway_error(error: Self::Error) -> WorkGatewayError;
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>>;
+}
+
+/// The Fetch routes `policy` admits on `provider`, each once.
+pub(crate) fn fetch_routes<'a>(
+    provider: iroh::EndpointId,
+    policies: impl IntoIterator<Item = &'a InvocationPolicy>,
+) -> Vec<hellas_gateway::FetchRoute> {
+    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
+    let mut routes = Vec::new();
+    for policy in policies {
+        for admission in &policy.admissions {
+            let Admission::Fetch { admission } = admission else {
+                continue;
+            };
+            let route = hellas_gateway::FetchRoute {
+                provider,
+                schema: admission.contract.schema(),
+                sealed: match &admission.route {
+                    FetchRoutePolicy::SealedRoute { service, method } => {
+                        Some((service.clone(), method.clone()))
+                    }
+                    FetchRoutePolicy::OpenFetch { .. } => None,
+                },
+            };
+            if !routes.contains(&route) {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// What a gateway serves beyond what its work source admits.
+#[derive(Clone)]
+pub struct GatewayServeOptions {
+    pub server: hellas_gateway::ServerOptions,
+    pub models: Vec<hellas_gateway::ModelOptions>,
+    pub http: Option<hellas_gateway::HttpGatewayConfig>,
+    /// Merged into Responses requests sent as a Fetch.
+    pub responses_overrides: serde_json::Map<String, serde_json::Value>,
+    /// Models the Responses Fetch answers to; empty means any.
+    pub responses_models: Vec<String>,
+}
+
+/// Serve `work` with the caller's presentations, plus Responses when the
+/// source seals exactly one Responses route. A failed start drains `work`.
+pub async fn serve_gateway(
+    work: Arc<dyn WorkExecutionBackend>,
+    options: GatewayServeOptions,
+) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
+    let responses = match hellas_gateway::ResponsesFetch::from_routes(
+        &work.fetch_routes(),
+        options.responses_overrides,
+        options.responses_models,
+    ) {
+        Ok(responses) => responses,
+        Err(error) => {
+            return match work.drain().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(hellas_gateway::GatewayError::Cleanup {
+                    primary: Box::new(error),
+                    cleanup,
+                }),
+            };
+        }
+    };
+    hellas_gateway::start(hellas_gateway::GatewayOptions {
+        server: options.server,
+        work,
+        presentations: hellas_gateway::Presentations {
+            models: options.models,
+            responses,
+            http: options.http,
+        },
+    })
+    .await
+}
+
+/// One gateway backend: shared admission, output delivery and shutdown over a source.
+pub struct WorkGateway<S> {
+    pub(crate) source: Arc<S>,
+    pub(crate) admission: Arc<Semaphore>,
+    tasks: WorkTasks,
+}
+impl<S: WorkSource> WorkGateway<S> {
+    pub(crate) fn new(source: S, max_pending: usize) -> Self {
+        Self {
+            source: Arc::new(source),
+            admission: Arc::new(Semaphore::new(max_pending)),
+            tasks: WorkTasks::default(),
+        }
+    }
+    pub(crate) fn submit<E: GatewayEvent>(
+        &self,
+        request: S::Request,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<RequestStream<E, S::Error>, S::Error> {
+        if self.admission.is_closed() {
+            return Err(WorkGatewayError::from(WorkGatewayBusy).into());
+        }
+        let (requester, stream) = Requester::<E, S::Error>::new();
+        let source = self.source.clone();
+        self.tasks
+            .spawn(async move {
+                let _permit = permit;
+                match source.run(request, requester.clone()).await {
+                    Ok(Some(completed)) => {
+                        requester.emit(Ok(WorkEvent::Transcript(completed.transcript.clone())));
+                        requester.emit(
+                            E::completed(&completed.output, &completed.provider)
+                                .map(WorkEvent::Output)
+                                .map_err(Into::into),
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(error) => requester.emit(Err(error)),
+                }
+            })
+            .map_err(|busy| S::Error::from(busy.into()))?;
+        Ok(stream)
+    }
+    fn request<E: GatewayEvent>(
+        &self,
+        request: WorkRequest,
+    ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
+        use futures::StreamExt as _;
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WorkGatewayBusy)?;
+        let request = self.source.request(request).map_err(S::gateway_error)?;
+        let stream = self
+            .submit::<E>(request, Some(permit))
+            .map_err(S::gateway_error)?;
+        Ok(Box::pin(
+            stream.map(|event| event.map_err(S::gateway_error)),
+        ))
+    }
+}
+impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
+        self.source.fetch_routes()
+    }
+    fn fetch(
+        &self,
+        request: WorkFetchRequest,
+    ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
+        self.request(WorkRequest::Fetch(request))
+    }
+    fn run(
+        &self,
+        job: hellas_client::model::ComputeJob,
+    ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
+        self.request(WorkRequest::Compute(JobInput::Compute {
+            environment: job.environment,
+            plan: job.plan,
+            inputs: job.inputs,
+            content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
+        }))
+    }
+    fn timeout(&self) -> Option<Duration> {
+        self.source.timeout()
+    }
+    fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {
+        self.admission.close();
+        self.tasks.close();
+        Box::pin(async move {
+            let tasks = self.tasks.drain().await;
+            let source = self.source.shutdown().await;
+            tasks.and(source)
+        })
+    }
+}
+
 #[cfg(test)]
 mod task_tests {
     use super::WorkTasks;
@@ -245,5 +693,229 @@ mod task_tests {
         assert!(futures::poll!(&mut draining).is_pending());
         release.send(()).unwrap();
         assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use futures::StreamExt;
+    use hellas_channel::work_store::journal::MAX_RECORD_BYTES;
+
+    type TestRequester = Requester<OutputEvent, WorkGatewayError>;
+
+    #[test]
+    fn compute_preserves_named_buffers_and_raw_emissions() {
+        let mut pending = Vec::new();
+        for (name, offset) in [("transcription", 0), ("transcription", 3), ("emitted", 0)] {
+            let chunk = ArtifactChunk {
+                name: name.into(),
+                format: "catena.bytes.v1".into(),
+                offset,
+                bytes: hellas_rpc::JsonBytes(vec![0, 255, 17]),
+            };
+            let events = ComputeEvent::prefix(chunk.clone(), &mut pending).unwrap();
+            assert!(matches!(&events[..], [ComputeEvent::Output(output)] if output == &chunk));
+        }
+        // Emissions are values, not necessarily u32 tokenizer ids; chunk
+        // boundaries may split a value. Only the presentation interprets them.
+        let bytes = u64::MAX.to_le_bytes();
+        for (offset, bytes) in [(0, &bytes[..3]), (3, &bytes[3..])] {
+            let events = ComputeEvent::prefix(
+                ArtifactChunk {
+                    name: "emitted".into(),
+                    format: "catena.u64le.v1".into(),
+                    offset,
+                    bytes: hellas_rpc::JsonBytes(bytes.to_vec()),
+                },
+                &mut pending,
+            )
+            .unwrap();
+            assert!(matches!(&events[..], [ComputeEvent::Output(chunk)]
+                if chunk.name == "emitted" && chunk.format == "catena.u64le.v1" && chunk.offset == offset && chunk.bytes.as_bytes() == bytes));
+        }
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn compute_completion_preserves_buffers_failure_and_provider() {
+        use hellas_rpc::protocol::invocation::{
+            Artifact,
+            compute::RunMetadata,
+            output::{FailureReason, Outcome},
+        };
+        let provider = hellas_auth::ProducerSigningKey::from_secret_bytes([17; 32])
+            .unwrap()
+            .public_key();
+        let mut output = InvocationOutput {
+            outcome: Outcome::Succeeded,
+            artifacts: vec![Artifact::new(
+                "transcription",
+                "catena.bytes.v1",
+                vec![1, 2, 3],
+            )],
+            metadata: hellas_rpc::JsonBytes(
+                hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                    steps: 0,
+                    stop: None,
+                })
+                .unwrap(),
+            ),
+        };
+        for failed in [false, true] {
+            if failed {
+                output.outcome = Outcome::Failed(FailureReason::Execution);
+                output.metadata = hellas_rpc::JsonBytes(Vec::new());
+            }
+            let event = ComputeEvent::completed(&output, &provider).unwrap();
+            assert!(
+                matches!(event, ComputeEvent::Done { output: actual, provider: signer }
+                if actual == output && signer == provider)
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_possible_completion_fits_the_output_budget() {
+        // The signed transcript is one channel message, capped at
+        // `MAX_RECORD_BYTES`. `emit` must therefore charge it at most that,
+        // plus the single per-message `OUTPUT_EVENT_OVERHEAD`, or a
+        // completion the protocol permits cannot be delivered at all:
+        // `try_acquire_many_owned` fails, `overflow` latches, and the caller
+        // is told its reader is too slow for work it has already paid for.
+        //
+        // This is the invariant that a per-contained-event overhead broke.
+        // Multiplying the overhead by event count makes the charge unbounded
+        // with respect to `MAX_RECORD_BYTES` -- ~8000 small events exceeded
+        // the budget on their own -- so no value of `OUTPUT_BUFFER_BYTES`
+        // could satisfy this assertion.
+        let transcript = WorkEvent::<OutputEvent>::Transcript(vec![0; MAX_RECORD_BYTES]);
+        let worst_case = event_bytes(&transcript).saturating_add(OUTPUT_EVENT_OVERHEAD);
+        assert!(
+            worst_case <= OUTPUT_BUFFER_BYTES,
+            "a maximal completion charges {worst_case} against a {OUTPUT_BUFFER_BYTES} budget",
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_compute_transcript_and_full_output_fit_together() {
+        use hellas_rpc::protocol::invocation::{
+            Artifact, InvocationRequest,
+            compute::RunMetadata,
+            output::{self, Outcome},
+        };
+        let key = hellas_auth::ProducerSigningKey::from_secret_bytes([19; 32]).unwrap();
+        let request = InvocationRequest {
+            execution_environment: hellas_rpc::ContentId::hash(b"compute source"),
+            input: hellas_rpc::ContentId::hash(b"compute input"),
+            runner_public_key: key.public_key(),
+            nonce: [3; 32],
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            retain: false,
+        };
+        // A no-step buffer may be called emitted and need not contain u32 IDs.
+        let output = InvocationOutput {
+            outcome: Outcome::Succeeded,
+            artifacts: vec![Artifact::new(
+                "emitted",
+                "catena.bytes.v1",
+                vec![255; 1_700_000],
+            )],
+            metadata: hellas_rpc::JsonBytes(
+                hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                    steps: 0,
+                    stop: None,
+                })
+                .unwrap(),
+            ),
+        };
+        let envelopes = output
+            .sign(&request, &key, output::MAX_CHUNK_BYTES)
+            .unwrap();
+        let transcript = hellas_channel::model::work::encode_transcript(&envelopes).unwrap();
+        assert!(transcript.len() <= MAX_RECORD_BYTES);
+        assert_eq!(
+            output::verify(&request, &key.public_key(), &envelopes, MAX_RECORD_BYTES).unwrap(),
+            output
+        );
+        let accepted = hellas_rpc::provenance::ExecutionProvenance {
+            commitment_id: [23; 32],
+            provider: key.public_key(),
+        };
+        let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
+        requester.accepted()(accepted.clone());
+        assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Accepted(actual) if actual == accepted)
+        );
+        let progress = requester.progress();
+        for envelope in &envelopes[..envelopes.len() - 1] {
+            progress(envelope.clone()).unwrap();
+            assert!(
+                matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Output(chunk)) if chunk.name == "emitted" && chunk.bytes.as_bytes().iter().all(|b| *b == 255))
+            );
+        }
+        // submit queues both synchronously; the consumer cannot poll between them.
+        requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
+        requester.emit(Ok(WorkEvent::Output(
+            ComputeEvent::completed(&output, &key.public_key()).unwrap(),
+        )));
+        drop(progress);
+        drop(requester);
+        assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript)
+        );
+        assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Done { output: actual, provider }) if actual == output && provider == key.public_key())
+        );
+        assert!(response.next().await.is_none());
+    }
+
+    fn text(delta: &str) -> OutputEvent {
+        OutputEvent::TextDelta {
+            index: 0,
+            delta: delta.into(),
+            channel: hellas_rpc::output::TextChannel::Output,
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
+        let (requester, mut response) = TestRequester::new();
+        let budget = requester.budget.clone();
+        // Retained output can arrive in one burst before HTTP gets a poll.
+        for position in 0..128 {
+            requester.emit(Ok(WorkEvent::Output(text(&position.to_string()))));
+        }
+        drop(requester);
+        let mut count = 0;
+        while let Some(event) = response.next().await {
+            event.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 128);
+        assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
+    }
+
+    #[tokio::test]
+    async fn slow_reader_gets_an_error_without_blocking_payment() {
+        let (requester, mut response) = TestRequester::new();
+        // A stalled reader cannot retain more than the byte budget, and the
+        // synchronous producer callback still returns without waiting on it.
+        let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();
+        for _ in 0..3 {
+            requester.emit(Ok(WorkEvent::Output(text(&"x".repeat(half)))));
+        }
+        assert_eq!(requester.budget.available_permits(), 0);
+        assert!(
+            response
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("too slow")
+        );
+        assert!(requester.is_closed());
+        assert!(response.next().await.is_none());
     }
 }

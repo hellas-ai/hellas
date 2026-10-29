@@ -4,10 +4,11 @@ use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
 use hellas_adaptors::{
-    AdaptorError, BackendError, BackendRequest, ExecutionBackend, OutputEvent, Provenance,
-    RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse, WireStreamEvent,
+    AdaptorError, BackendError, BackendEvent, BackendRequest, ExecutionBackend, OutputEvent,
+    Provenance, RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse,
+    WireStreamEvent,
 };
-use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::provenance::{ExecutionProvenance, parse_public_key};
 
 use super::{json_error, sse_data, sse_event_data, sse_response};
 
@@ -116,21 +117,7 @@ where
         let mut state = adaptor.initial_state(&parsed, context);
 
         if let Some(provenance) = stream_provenance {
-            match render_events(adaptor.render_stream_event(
-                &parsed,
-                &mut state,
-                OutputEvent::Provenance(provenance),
-            )) {
-                Ok(events) => {
-                    for event in events {
-                        yield Ok(event);
-                    }
-                }
-                Err(event) => {
-                    yield Ok(event);
-                    return;
-                }
-            }
+            adaptor.attest(&mut state, provenance);
         }
 
         match render_events(adaptor.render_stream_start(&parsed, &mut state)) {
@@ -147,7 +134,8 @@ where
 
         while let Some(event) = output_events.next().await {
             match event {
-                Ok(output) => {
+                Ok(BackendEvent::Provenance(provenance)) => adaptor.attest(&mut state, provenance),
+                Ok(BackendEvent::Output(output)) => {
                     match render_events(adaptor.render_stream_event(&parsed, &mut state, output)) {
                         Ok(events) => {
                             for event in events {
@@ -185,14 +173,7 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
 }
 
 fn backend_error(surface: &str, error: BackendError) -> Response {
-    let status = match error {
-        BackendError::Rejected(_) => StatusCode::BAD_REQUEST,
-        BackendError::Denied(_) => StatusCode::FORBIDDEN,
-        BackendError::Quota(_) => StatusCode::TOO_MANY_REQUESTS,
-        BackendError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
-        BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    json_error(status, format!("{surface}: {error}"))
+    json_error(super::backend_status(&error), format!("{surface}: {error}"))
 }
 
 pub(super) fn wire_response(response: WireResponse) -> Result<Response, String> {
@@ -274,17 +255,27 @@ fn render_error_events<A: WireAdaptor>(
     }
 }
 
-fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenance>) {
+/// Hand the accepted job's identity to the provenance layer, which renders
+/// it as response headers.
+pub(super) fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenance>) {
     let Some(provenance) = provenance else {
         return;
     };
-    if let Some(call) = provenance
-        .call_commitment
+    let commitment = provenance
+        .commitment
         .as_deref()
-        .and_then(|value| decode_hex_32("call commitment", value))
-    {
+        .and_then(|value| decode_hex_32("commitment", value));
+    let provider = provenance.provider.as_deref().and_then(|value| {
+        let key = parse_public_key(value);
+        if key.is_none() {
+            warn!("invalid provenance provider key");
+        }
+        key
+    });
+    if let (Some(commitment_id), Some(provider)) = (commitment, provider) {
         response.extensions_mut().insert(ExecutionProvenance {
-            commitment_id: call,
+            commitment_id,
+            provider,
         });
     }
 }

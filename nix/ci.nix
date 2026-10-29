@@ -103,7 +103,10 @@ let
       cargo check -p hellas-sdk --all-features --all-targets
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
-    cli = mkCargo "check-cli" "cargo test -p hellas-cli" (cargoEnv rustToolchain);
+    cli = mkCargo "check-cli" ''
+      cargo test -p hellas-cli
+      cargo test -p hellas-cli --features otel --test grant_http metrics_scrape_observes_gateway_and_serve_work
+    '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
       cargo test -p hellas-cloud
       cargo test -p hellas-cli

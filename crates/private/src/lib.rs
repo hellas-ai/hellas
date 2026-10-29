@@ -13,8 +13,9 @@ pub use secrets::{MAX_SECRET_BYTES, SecretError, SecretStore};
 
 mod regular;
 pub use regular::{
-    ReadDirectory, ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
-    read_bounded_regular_file, read_private_bounded,
+    ReadDirectory, ReadLimit, open_regular_file, open_regular_file_nofollow,
+    open_regular_file_nofollow_rw, open_regular_file_rw, read_bounded, read_bounded_regular_file,
+    read_private_bounded,
 };
 
 use std::fs::File;
@@ -36,7 +37,7 @@ use windows as imp;
 /// Opens `path` for reading without following a final symlink (Unix) or
 /// reparse point (Windows). `NotFound` passes through unchanged.
 pub fn open_nofollow(path: &Path) -> io::Result<File> {
-    imp::open_nofollow(path)
+    imp::open_nofollow(path, false)
 }
 
 /// Opens an existing private staging file for bounded upload append without following links.
@@ -148,7 +149,7 @@ pub fn open_lock_beside(path: &Path) -> io::Result<File> {
     let path = Path::new(&name);
     match imp::create_private_new(path) {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            open_regular_file_nofollow(path)
+            open_regular_file_nofollow_rw(path)
         }
         result => result,
     }

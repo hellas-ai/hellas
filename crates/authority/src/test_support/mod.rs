@@ -12,6 +12,22 @@ use {
         fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
     },
 };
+tokio::task_local! {
+    /// Pause this task's bootstrap after staging is durable, before publication.
+    /// The first notification announces the pause; the second releases it.
+    pub static BOOTSTRAP_COMMIT_PAUSE: (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
+}
+
+pub(crate) async fn pause_bootstrap_commit() {
+    if let Ok((entered, release)) = BOOTSTRAP_COMMIT_PAUSE.try_with(Clone::clone) {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
 pub fn budget() -> BudgetNode {
     BudgetNode::Subject {
         pool: common_node::POOL,
@@ -468,3 +484,8 @@ pub use hellas_channel::test_support::{
     network, node_key, passkey, passkey_of, principal, software_enrollment, subject_of,
     test_responses_contract, transport, upload_failure,
 };
+
+/// Hold the node writer to exercise cancellation and deadlines under contention.
+pub async fn hold_writer(node: &crate::node::NodeCoordinator) -> impl Drop + '_ {
+    node.writer().await.unwrap()
+}

@@ -8,6 +8,52 @@ journals. The gateway skips busy provider channels and serializes requests
 within each channel. Providers must already hold the GGUF named by the job (for
 example via `hellas store adopt`); the gateway never uploads the weights.
 
+Whisper uses the same Compute work source. Convert a downloaded multilingual
+80-mel Whisper checkpoint once on the client (the checkpoint directory contains
+`config.json`, `generation_config.json`, `tokenizer.json`, and `model.safetensors`):
+
+```sh
+hellas convert-whisper --checkpoint /models/whisper-tiny-original --output /models/whisper-tiny
+```
+
+The resulting `weights.bf16` is the only model asset a provider holds; supply it
+through the ordinary content store or `serve --content /models/whisper-tiny/weights.bf16`.
+Providers need no renderer, tokenizer, preprocessing code, or preinstalled program.
+The converted directory and its metadata stay on the client. An existing gateway
+configuration can add `--audio-model /models/whisper-tiny` alongside `--text-model`.
+The directory name (`whisper-tiny` here) is its HTTP model name. The same option
+works with a paid pool, `--offer` for an owned remote node, or `--local-grant` with
+`--content /models/whisper-tiny/weights.bf16` on a supported local GPU.
+
+```sh
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  -F model=whisper-tiny -F file=@speech.wav -F language=en -F response_format=json
+```
+
+The route accepts mono/stereo WAV up to 30 seconds and 32 MiB, resamples 8–192 kHz
+audio to 16 kHz on the client, and returns `{"text":"..."}` or plain text with
+`response_format=text`. Language is optional; the program detects it when omitted.
+`--default-max-tokens` bounds transcription tokens and must fit the model's decoder.
+The audio route has its own body limit, including archival and multipart model
+splitting. Ordinary JSON routes retain their existing limit. HTTP format options
+and multipart fields are validated before submitting work.
+Responses identify the accepted job and provider in `x-hellas-commitment-bin` and
+`x-hellas-provider`. JSON includes the signed transcript in its `hellas` object;
+plain text carries it in the `x-hellas-transcript` trailer (HTTP/1.1 clients must
+send `TE: trailers` to receive trailers).
+
+For a single paid job without an HTTP server:
+
+```sh
+hellas --passkey owner.key transcribe --provider ENROLLMENT_ID@NODE_ID \
+  --model /models/whisper-tiny --audio speech.wav --language en --payment 20
+```
+
+This saves the rendered job before submission, uses the existing transaction and
+payment journals, and prints decoded text. Both commands ship the same rendered
+program and numeric inputs; weight conversion never happens on the provider.
+
 With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its paid
 policy must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
@@ -39,6 +85,16 @@ that isolation is crash/timeout containment, not a sandbox, and there is no
 memory metering. Before paying, the gateway checks that each result is signed
 by the provider and matches this job; Hellas does not re-run it.
 
+Compute terms should allow at least 4 MiB of upload for Whisper. The faucet
+example uses `max_upload_bytes = 4194304`; provider and grant limits are explicit
+terms, with no implicit runtime default. Whisper ships roughly 0.47–0.85 MB of
+rendered program, 960,000 bytes of log-mel features, and three F32 vocabulary
+masks (622,380 bytes for a 51,865-token model). The allowance also covers input
+metadata. The client includes the program with every job; a provider may deduplicate
+received sources by content ID, but never needs a preinstalled model program.
+Weights remain a separate ordinary content-addressed asset.
+
+
 The pool selects providers and expected prices. It obtains each policy with
 `RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 
@@ -48,7 +104,7 @@ The pool selects providers and expected prices. It obtains each policy with
     {
       "chain_config": "/srv/hellas/chain.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
-      "provider": "PROVIDER_ENDPOINT_ID",
+      "provider": "ENROLLMENT_ID@NODE_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "payment": 20
     }
@@ -75,7 +131,7 @@ provider's jobs per channel times its price, plus omission reserve and fees.
 At most four eligible owner coins fund one delegated output; change returns
 undelegated to the same owner. The wallet records the signed reshape before
 submission and shares reservations across gateway providers. Later jobs reuse
-the open channel. `transact --settle --provider NODE_ID` closes it and returns unspent funding.
+the open channel. `transact --settle --provider ENROLLMENT_ID@NODE_ID` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -87,9 +143,12 @@ The original signed offer, policy and authenticated peer are durable together;
 retries return the same offer and restart requires no route configuration.
 Unanswered offers expire at their bond timeout.
 
-ProducerSigned providers need only the selected endpoint ID. Each live Open
-checks that the enrollment names that transport and verifies the producer proof.
-Apple-attested providers additionally require the existing independent trust store.
+`provider` is the address `hellas serve` prints: the content ID of the
+provider's enrollment bundle and the node ID it binds. Each live Open checks
+that the provider presents exactly that enrollment, that it names the live
+transport, and verifies the producer proof; a retained channel whose offer names
+another enrollment is refused on restart. Apple-attested providers additionally
+require the existing independent trust store.
 For those entries, add a top-level `trust_store` directory and a per-provider
 `trust_policy` ID. Approve app IDs and release CDHashes independently:
 
@@ -100,7 +159,8 @@ hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
 ```
 
 The existing trust JSON contains `provider_genesis`, `assurance`, and `apple`
-with `app_id` and `cd_hashes`. Missing or mismatched
+with `app_id` and `cd_hashes`; `provider_genesis` must equal the address's
+enrollment ID. Missing or mismatched
 Apple approval fails before funding or disclosure. Approval replacement retains
 its revision checks and persistent assertion counters. `transact` accepts
 `--trust-store` and `--trust-policy` for Apple providers; software providers do not
@@ -175,12 +235,6 @@ rate. The local age limit cannot guarantee recovery through a partition longer
 than the on-chain response window. Setup and restart catch-up may wait on
 validators; ordinary requests do not perform that work.
 
-The shared `--output-cache record` mode also covers paid inference. Repeating
-an identical recorded request reuses its output without another paid job. A
-recording becomes replayable only after successful completion and payment
-acknowledgement; `--output-cache replay-only` reads it without connecting to
-providers or validators.
-
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
 retained Compute jobs and re-sends payment certificates idempotently. Fetch
@@ -225,8 +279,10 @@ accept complete URLs instead. Give these services distinct `OTEL_SERVICE_NAME`
 values. Validators require both `validator` and `otel`. Sampling honors the
 upstream sampled flag; `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
 `OTEL_TRACES_SAMPLER_ARG` controls new root traces. Default packages omit the
-Hellas telemetry exporters; transitive dependencies still include metrics and SDK
-crates. Nix module `otel` options select enabled builds.
+metrics server, gateway/executor instruments and OTLP exporters. The `otel`
+build also enables `serve` and `gateway --metrics-port` scraping, with an optional
+`--metrics-addr IP` (default loopback, unauthenticated). Transitive dependencies
+still include metrics and SDK crates. Nix module `otel` options select enabled builds.
 
 The gateway accepts W3C `traceparent`/`tracestate` headers and returns
 `traceparent` plus `x-hellas-trace-id` for trace lookup. Without an incoming
@@ -267,7 +323,7 @@ Hydra retains these outputs on test failure using its `nix-support/failed`
 convention, so a failing check still has downloadable traces. Local
 `nix build .#nixosTests.x86_64-linux.<name>` keeps the usual failing exit status;
 use the Hydra attribute when retaining failure outputs is needed. Public
-packages still build without telemetry by default.
+packages still build without metrics or OTLP export by default.
 
 ## Embedding
 
@@ -279,11 +335,11 @@ authenticator, the identity's settlement key and a private funding directory. Ap
 `PaidWorkOptions`; the pool validates duplicate providers and journals before opening connections. It owns recovery, admission, per-channel
 serialization and payment tasks. No CLI argument structures are part of its API.
 
-For transparent HTTP, pass this pool to `hellas_gateway::start_http` using
-`HttpGatewayOptions`. Its `paid` field is required. The options contain HTTP
-routes, archive policy, listener authentication and optional process wrapping;
-they have no text model or inference cache settings. Shutting
-down the returned handle drains accepted paid work. Failed startup also drains
+To serve it over HTTP, pass the pool to `hellas_sdk::serve_gateway` with
+`GatewayServeOptions`: listener, authentication and archive policy, and the
+presentations to add (a text model, HTTPS routes). A Responses route the pool's
+providers seal is served too. Shutting down the returned handle drains accepted
+paid work. Failed startup also drains
 recovery tasks. A host using the pool without a gateway must call its
 `WorkExecutionBackend::drain` method when shutting down.
 

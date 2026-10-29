@@ -148,6 +148,10 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
         )])
     }
 
+    fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {
+        crate::execution::merge_provenance(&mut state.provenance, provenance);
+    }
+
     fn render_stream_event(
         &self,
         _request: &Self::ParsedRequest,
@@ -212,7 +216,7 @@ impl WireAdaptor for OpenAiChatCompletionsAdaptor {
                 Ok(Vec::new())
             }
             OutputEvent::Provenance(provenance) => {
-                state.provenance = Some(provenance);
+                self.attest(state, provenance.into());
                 Ok(Vec::new())
             }
             OutputEvent::Error { message, code } => Ok(vec![WireStreamEvent::json(

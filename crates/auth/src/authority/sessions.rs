@@ -185,10 +185,17 @@ impl AuthenticatedSession {
         binding: Digest,
         now: UnixMillis,
     ) -> Result<&'a AuthenticatedCaller, AuthorityError> {
+        let caller = self.bound_caller(binding)?;
+        authority.check_caller(caller, now)?;
+        Ok(caller)
+    }
+
+    /// Original actor evidence on this transport, without current authorization.
+    /// Use only to identify owned state for cleanup; protected work must authenticate.
+    pub fn bound_caller(&self, binding: Digest) -> Result<&AuthenticatedCaller, AuthorityError> {
         if binding != self.binding {
             return Err(AuthorityError::Credential);
         }
-        authority.check_caller(&self.caller, now)?;
         Ok(&self.caller)
     }
 

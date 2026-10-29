@@ -1,5 +1,7 @@
 #![cfg(unix)]
 mod contact;
+mod local_text;
+mod local_whisper;
 mod managed;
 mod offer_gateway;
 
@@ -140,6 +142,8 @@ struct Cli {
     root: PathBuf,
     identity: PathBuf,
     passkey: PathBuf,
+    metrics_endpoint: Option<String>,
+    metrics_address: Option<String>,
 }
 impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
@@ -149,6 +153,8 @@ impl Cli {
             root: root.into(),
             identity: root.join(name),
             passkey: path,
+            metrics_endpoint: None,
+            metrics_address: None,
         }
     }
     fn principal(&self) -> hellas_auth::authority::PrincipalId {
@@ -190,10 +196,23 @@ impl Cli {
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
-            .env("RUST_LOG", "warn,hellas_gateway=info")
+            .env("RUST_LOG", "warn,hellas_gateway=info,hellas::metrics=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(address) = &self.metrics_address
+            && args.contains(&"--metrics-port")
+        {
+            command.args(["--metrics-addr", address]);
+        }
+        if let Some(endpoint) = &self.metrics_endpoint {
+            command
+                .env("OTEL_SDK_DISABLED", "false")
+                .env("OTEL_TRACES_EXPORTER", "none")
+                .env("OTEL_METRICS_EXPORTER", "otlp")
+                .env("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", endpoint)
+                .env("OTEL_METRIC_EXPORT_INTERVAL", "100");
+        }
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
@@ -448,6 +467,51 @@ async fn issue_work_profile_at(
         profile.authority,
         &hellas_sdk::node_control::profile::read_credential(&output).unwrap(),
     )
+}
+/// A Work credential for `subject` on `allowance`, held by `holder`, issued
+/// through the checked node API by the passkey session of `administrator`'s
+/// subject.
+async fn execution_credential(
+    node: &hellas_authority::node::NodeCoordinator,
+    administrator: &hellas_auth::authority::CredentialSecret,
+    subject: hellas_auth::authority::PrincipalId,
+    allowance: GrantId,
+    holder: hellas_auth::authority::CredentialHolder,
+) -> hellas_auth::authority::CredentialSecret {
+    use hellas_auth::authority as auth;
+    let caller = hellas_authority::test_support::session(node, administrator).await;
+    let root = GrantId([0; 16]);
+    let scope = auth::GrantSpec {
+        authority: caller.authority(),
+        subject,
+        permissions: [auth::Permission {
+            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
+                .unwrap(),
+            resource: hellas_authority::grant_service::allowance_resource(
+                caller.authority(),
+                allowance,
+            ),
+        }]
+        .into(),
+        not_before: auth::UnixMillis(1000),
+        expires: auth::UnixMillis(u64::MAX),
+        delegation_depth: 0,
+        issuance: None,
+    };
+    node.grant(
+        &caller,
+        auth::GrantCommand::Issue {
+            authorization: root,
+            id: common_node::EXECUTION_AUTHORIZATION,
+            spec: scope.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    hellas_authority::test_support::credentials::issue_one(node, &caller, root, scope, holder)
+        .await
+        .unwrap()
+        .1
 }
 /// An HTTP authority whose administrator issues the gateway a separate
 /// bearer credential; the bootstrap credential is never the bearer.

@@ -203,7 +203,7 @@ attest those properties.
 ## Responses grants
 
 After importing an Offer and approving its provider trust policy, a sealed
-stateless Responses resource uses the same SDK `grant_gateway::responses::start_fetch`
+stateless Responses resource is served by the same SDK `grant_gateway::GrantServeOptions`
 composition as an embedded host:
 
 ```sh
@@ -216,8 +216,9 @@ hellas gateway --offer ALIAS --grant-policy responses \
 The Work profile authorizes the provider allowance; the gateway profile admits
 local HTTP callers. Requests use `/v1/responses`, authenticated by the scoped
 HTTP credential. The Offer determines the sealed route and environment. Ambiguous
-Offers require `--grant-policy`; inference caching and `--metrics-port` are
-unsupported. Archive/ZDR, `--allow-remote`, request overrides and `--wrap` use the
+Offers require `--grant-policy`. With `--text-model` as well, `/v1/responses` is
+split by model: `--responses-model` names the models the Fetch answers to.
+Archive/ZDR, `--allow-remote`, `--responses-overrides` and `--wrap` use the
 shared gateway behavior. Shutdown drains accepted Work and closes its endpoint.
 
 ## Limits and telemetry
@@ -249,6 +250,11 @@ delta seconds and HTTP dates are accepted. Requests during cooldown receive
 the status that established the longest remaining delay: a 503 remains a 503,
 so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
 concurrency returns 503 with `Retry-After: 1`.
+
+An `otel` build exposes these metrics at `/metrics` when `--metrics-port` is set.
+`--metrics-addr IP` selects the interface (default `127.0.0.1`); the response is
+unauthenticated. The same instruments can also be pushed through OTLP.
+Default builds omit both metrics flags and the instrumentation.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.

@@ -40,8 +40,8 @@ impl core::fmt::Display for SubmitTxOutcome {
 }
 
 pub mod authentication;
-pub mod cache;
 pub mod call;
+pub mod compute_event;
 #[cfg(feature = "chain")]
 pub mod edge_index;
 #[cfg(feature = "execute")]

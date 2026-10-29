@@ -179,11 +179,12 @@ Its request and authentication clients share the same proxy/CA/redirect policy;
 refresh errors discard upstream descriptions before logging or persistence. These
 path protections do not establish signed-platform privacy or vendor retention policy.
 
-`hellas fetch` selects the HTTPS contract from the provider quote and includes its
-canonical bytes with the signed request. `--contract FILE` selects that exact
-descriptor explicitly; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
-same descriptor. The gateway's `--responses-fetch-execution-environment` accepts the
-exact manifest ID. Ordinary clients select descriptors from resource policy, without
+`hellas fetch` runs only under the HTTPS contract its caller names with
+`--contract`: `http`, the contract built into the release, or an exact
+descriptor file. It never takes the contract from the provider's quote; a quote
+that does not admit the named contract is refused before funding. The signed
+request includes the contract's canonical bytes; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
+same descriptor. Ordinary clients select descriptors from resource policy, without
 linking the reseller implementation. Missing descriptors and old bundle shapes deny.
 
 Every resource also requires a `pricing` block. For example, this fragment rates a
@@ -484,8 +485,8 @@ an authenticated local control listener and a bounded lifecycle supervisor. Prov
 core reseller crate for Gate's vendor relay, preserving its injected App Attest
 prover and enrollment. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
-it cannot open a second journal. Responses gateway options must use the same
-writer and the SDK `responses::start_fetch` composition.
+it cannot open a second journal. A gateway over a grant uses the same writer and
+`grant_gateway::GrantServeOptions::into_factory`.
 
 `SetProviderState` and `SetGatewayState` carry an `authorization` grant and require
 `host.provider.configure` and `host.gateway.configure`, respectively. Their

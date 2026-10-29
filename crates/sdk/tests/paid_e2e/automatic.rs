@@ -490,13 +490,13 @@ async fn connect_offer(client: &Endpoint, provider: &Provider) -> IrohTransport 
         .await
         .unwrap();
     let transport = IrohTransport::new(connection);
-    hellas_client::confidential_open_selected::<hellas_rpc::services::work_setup::Open>(
-        &transport,
-        Assurance::ProducerSigned,
-        None,
-    )
-    .await
-    .unwrap();
+    let trust = hellas_client::ProviderAddress::of(&provider.enrollment)
+        .unwrap()
+        .trust(Assurance::ProducerSigned, None)
+        .unwrap();
+    hellas_client::confidential_open::<hellas_rpc::services::work_setup::Open>(&transport, &trust)
+        .await
+        .unwrap();
     transport
 }
 
@@ -642,7 +642,7 @@ async fn compute_and_settle(
         )),
     );
     setup
-        .import_offer(*options.provider.as_bytes(), original.clone())
+        .import_offer(*options.provider.node.as_bytes(), original.clone())
         .await
         .unwrap();
     drop(setup);
@@ -1835,7 +1835,7 @@ async fn finish(case: Box<Case>) {
     let options = PaidWorkOptions {
         config: config.clone(),
         journal_root: root.path().join("client"),
-        provider: provider.endpoint.id(),
+        provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,
         apple_trust: None,

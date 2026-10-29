@@ -29,8 +29,18 @@ iroh = [
 # payable. Off by default because it pulls the consensus kernel into a
 # client that may only want to fetch.
 work = ["dep:hellas-kernel", "dep:hellas-channel"]
-# Client-side text package: renders Qwen3 Compute jobs from a GGUF file.
-text = ["work", "dep:anyhow", "dep:catena-models", "dep:hellas-store"]
+# Client-side model package: renders Compute jobs from model files.
+models = [
+    "work",
+    "dep:anyhow",
+    "dep:catena-models",
+    "dep:hellas-store",
+    "dep:safetensors",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:tempfile",
+    "dep:hound",
+]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
@@ -51,12 +61,19 @@ hellas-kernel = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire.workspace = true
+hound = { version = "3.5", optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 rand.workspace = true
+safetensors = { version = "0.7", optional = true }
 serde.workspace = true
 serde_ipld_dagcbor = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
+tokenizers = { version = "0.22", default-features = false, features = [
+    "onig",
+], optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 

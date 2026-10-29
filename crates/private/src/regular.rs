@@ -180,17 +180,32 @@ fn pinned_windows_file(path: &Path) -> io::Result<std::fs::File> {
 /// the resulting descriptor. That rejects stable special files but cannot
 /// close an adversarial replacement race as Linux does.
 pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
-    open_regular_file_impl(path)
+    open_regular_file_impl(path, false)
+}
+
+/// Open an existing regular file for reading and writing without truncation.
+/// Writable descriptors support exclusive advisory locks on NFS.
+pub fn open_regular_file_rw(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_file_impl(path, true)
 }
 
 /// Open a regular configuration file while refusing a final symlink/reparse
 /// point. Unlike `open_nofollow`, a FIFO cannot block this operation. Linux
 /// retains the descriptor-first type check used by `open_regular_file`.
 pub fn open_regular_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_file_nofollow_impl(path, false)
+}
+
+/// Open an existing regular file read/write, refusing final links and truncation.
+pub fn open_regular_file_nofollow_rw(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_file_nofollow_impl(path, true)
+}
+
+fn open_regular_file_nofollow_impl(path: &Path, writable: bool) -> io::Result<std::fs::File> {
     #[cfg(target_os = "linux")]
     {
         let handle = open_path_handle_flags(path, libc::O_NOFOLLOW)?;
-        reopen_regular_path_handle(path, &handle)
+        reopen_regular_path_handle(path, &handle, writable)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -202,11 +217,12 @@ pub fn open_regular_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
             use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .read(true)
+                .write(writable)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(path)?
         };
         #[cfg(not(unix))]
-        let file = crate::open_nofollow(path)?;
+        let file = crate::imp::open_nofollow(path, writable)?;
         if !file.metadata()?.is_file() {
             return Err(not_a_regular_file(path));
         }
@@ -222,9 +238,9 @@ fn not_a_regular_file(path: &Path) -> io::Error {
 }
 
 #[cfg(target_os = "linux")]
-fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_file_impl(path: &Path, writable: bool) -> io::Result<std::fs::File> {
     let path_handle = open_path_handle(path)?;
-    reopen_regular_path_handle(path, &path_handle)
+    reopen_regular_path_handle(path, &path_handle, writable)
 }
 
 /// Acquires an inode reference without invoking the target's file operations.
@@ -263,6 +279,7 @@ fn open_path_handle_flags(path: &Path, extra_flags: i32) -> io::Result<std::fs::
 fn reopen_regular_path_handle(
     path: &Path,
     path_handle: &std::fs::File,
+    writable: bool,
 ) -> io::Result<std::fs::File> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -274,7 +291,10 @@ fn reopen_regular_path_handle(
 
     let descriptor_path = Path::new("/proc/self/fd").join(path_handle.as_raw_fd().to_string());
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_CLOEXEC);
+    options
+        .read(true)
+        .write(writable)
+        .custom_flags(libc::O_CLOEXEC);
     let file = options.open(&descriptor_path).map_err(|source| {
         // Once the held descriptor has been fstat-ed successfully, ENOENT can
         // only mean procfs cannot provide the safe reopen. Do not report the
@@ -310,7 +330,7 @@ fn reopen_regular_path_handle(
 
 /// Best available fallback where `O_PATH` plus descriptor reopen is absent.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_file_impl(path: &Path, writable: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let expected = std::fs::metadata(path)?;
@@ -321,6 +341,7 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
+        .write(writable)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     let file = options.open(path)?;
     let actual = file.metadata()?;
@@ -337,13 +358,13 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
 /// hashed -- the guarantee the Unix paths approximate with identity checks
 /// (fastresume's Windows identity is deliberately weak; see there).
 #[cfg(not(unix))]
-fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_file_impl(path: &Path, writable: bool) -> io::Result<std::fs::File> {
     let expected = std::fs::metadata(path)?;
     if !expected.file_type().is_file() {
         return Err(not_a_regular_file(path));
     }
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(writable);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;

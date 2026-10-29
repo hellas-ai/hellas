@@ -24,13 +24,6 @@ fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
     );
 }
 
-fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 1] {
-    [(
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        hellas_rpc::ContentId::from_bytes([9; 32]),
-    )]
-}
-
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(
         ["hellas", "gateway"]
@@ -161,24 +154,6 @@ fn gateway_accepts_remote_trust_policy() {
 }
 
 #[test]
-fn http_gateway_requires_a_paid_pool() {
-    assert!(
-        Cli::try_parse_from(["hellas", "gateway", "--http-fetch-config", "/http.json"]).is_err()
-    );
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "gateway",
-            "--http-fetch-config",
-            "/http.json",
-            "--paid-work-config",
-            "/pool.json"
-        ])
-        .is_ok()
-    );
-}
-
-#[test]
 fn gateway_rejects_address_without_node_id() {
     let result = parse_gateway(&["--address", "127.0.0.1:31145"]);
 
@@ -270,39 +245,24 @@ fn gateway_wrap_args_require_wrap() {
 }
 
 #[test]
-fn gateway_fetch_backend_accepts_exact_contract_id() {
-    for (spelling, expected) in fetch_environment_cases() {
-        let cli = parse_gateway(&[
-            "--responses-backend",
-            "fetch",
-            "--responses-fetch-route-service",
-            "codex",
-            "--responses-fetch-route-method",
-            "responses",
-            "--responses-fetch-execution-environment",
-            spelling,
-            "--responses-fetch-request-overrides",
-            r#"{"store":false}"#,
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Gateway {
-                responses_backend,
-                responses_fetch_route_service,
-                responses_fetch_route_method,
-                responses_fetch_execution_environment,
-                responses_fetch_request_overrides,
-                ..
-            } => {
-                assert_eq!(responses_backend, GatewayResponsesBackend::Fetch);
-                assert_eq!(responses_fetch_route_service, "codex");
-                assert_eq!(responses_fetch_route_method, "responses");
-                assert_eq!(responses_fetch_execution_environment, Some(expected));
-                assert_eq!(responses_fetch_request_overrides.unwrap()["store"], false);
-            }
-            _ => panic!("expected gateway command"),
-        }
-    }
+fn gateway_responses_fetch_takes_overrides_and_its_models() {
+    let cli = parse_gateway(&[
+        "--responses-overrides",
+        r#"{"store":false}"#,
+        "--responses-model",
+        "gpt-x,gpt-y",
+    ])
+    .unwrap();
+    let Commands::Gateway {
+        responses_overrides,
+        responses_models,
+        ..
+    } = cli.command
+    else {
+        panic!("expected gateway command");
+    };
+    assert_eq!(responses_overrides.unwrap()["store"], false);
+    assert_eq!(responses_models, ["gpt-x", "gpt-y"]);
 }
 
 #[test]
@@ -462,29 +422,6 @@ fn codex_auth_import_accepts_paths() {
 }
 
 #[test]
-fn content_id_parser_round_trips_xet_text_encoding() {
-    let displayed = "87d327b23e941d6932610a282834a2d7d5edd761fe0a1b948e5f0d7ca73392ca";
-    assert_eq!(
-        parse_content_id_hex(displayed).unwrap().to_string(),
-        displayed
-    );
-}
-
-#[test]
-fn proxy_cache_needs_no_model_files() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "gateway",
-        "--responses-backend",
-        "proxy",
-        "--output-cache",
-        "replay-only",
-    ])
-    .unwrap();
-    assert!(matches!(cli.command, Commands::Gateway { .. }));
-}
-
-#[test]
 fn retired_commands_are_not_exposed() {
     for command in ["llm", "fetch", "artifact", "output-cache"] {
         assert!(Cli::try_parse_from(["hellas", command]).is_err());
@@ -539,12 +476,8 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
     assert_eq!(work_profile.as_deref(), Some(Path::new("/work.json")));
     assert_eq!(gateway_profile.as_deref(), Some(Path::new("/gateway.json")));
     for args in [
-        vec!["--responses-backend", "proxy"],
-        vec![
-            "--node-id",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ],
-        vec!["--http-fetch-config", "/http.json"],
+        vec!["--paid-work-config", "/pool.json"],
+        vec!["--local-grant", "00000000000000000000000000000000"],
     ] {
         let mut argv = vec!["hellas", "gateway", "--offer", "lan-model"];
         argv.extend(args);
@@ -580,5 +513,71 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
             ])
             .is_err()
         );
+    }
+}
+
+#[test]
+#[cfg(feature = "otel")]
+fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
+    for command in ["serve", "gateway"] {
+        for (args, expected) in [
+            (
+                vec!["hellas", command, "--metrics-port", "9400"],
+                "127.0.0.1",
+            ),
+            (
+                vec![
+                    "hellas",
+                    command,
+                    "--metrics-port",
+                    "9400",
+                    "--metrics-addr",
+                    "0.0.0.0",
+                ],
+                "0.0.0.0",
+            ),
+            (
+                vec![
+                    "hellas",
+                    command,
+                    "--metrics-port",
+                    "9400",
+                    "--metrics-addr",
+                    "::1",
+                ],
+                "::1",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (port, address) = match cli.command {
+                Commands::Serve {
+                    metrics_port,
+                    metrics_addr,
+                    ..
+                }
+                | Commands::Gateway {
+                    metrics_port,
+                    metrics_addr,
+                    ..
+                } => (metrics_port, metrics_addr),
+                _ => unreachable!(),
+            };
+            assert_eq!(port, Some(9400));
+            assert_eq!(address, expected.parse::<std::net::IpAddr>().unwrap());
+        }
+        assert!(Cli::try_parse_from(["hellas", command, "--metrics-addr", "not-an-ip"]).is_err());
+    }
+}
+
+#[test]
+#[cfg(not(feature = "otel"))]
+fn metrics_flags_require_the_otel_build() {
+    for command in ["serve", "gateway"] {
+        for (flag, value) in [("--metrics-port", "9400"), ("--metrics-addr", "0.0.0.0")] {
+            let error = Cli::try_parse_from(["hellas", command, flag, value])
+                .err()
+                .expect("metrics flag must be absent");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 }

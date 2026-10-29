@@ -1,5 +1,7 @@
 use super::*;
-use crate::{ExecutionEvent, WorkFetchStream, WorkOutputStream, WorkShutdownError};
+use crate::{
+    ComputeEvent, WorkEvent, WorkFetchStream, WorkGatewayError, WorkOutputStream, WorkShutdownError,
+};
 use hellas_rpc::output::{
     OutputEvent, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd, ToolCallStart, Usage,
 };
@@ -8,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct RecordedFetch {
     request: Value,
-    events: Vec<OutputEvent>,
+    events: Vec<WorkEvent<OutputEvent>>,
     calls: AtomicUsize,
 }
 
@@ -27,10 +29,10 @@ impl WorkExecutionBackend for RecordedFetch {
         )))
     }
 
-    fn generate(
+    fn run(
         &self,
-        _: hellas_client::text::TextJob,
-    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
+        _: hellas_client::model::ComputeJob,
+    ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
@@ -65,15 +67,18 @@ fn finished(stop_reason: StopReason) -> OutputEvent {
 async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected: &[u8]) {
     let work = Arc::new(RecordedFetch {
         request: request.clone(),
-        events,
+        events: events.into_iter().map(WorkEvent::Output).collect(),
         calls: AtomicUsize::new(0),
     });
     let backend = FetchBackend {
         work: work.clone(),
-        provider: provider(),
-        service: "openai".into(),
-        method: "responses".into(),
-        overrides: Map::new(),
+        options: crate::ResponsesFetch {
+            provider: provider(),
+            service: "openai".into(),
+            method: "responses".into(),
+            overrides: serde_json::Map::new(),
+            models: Vec::new(),
+        },
     };
     let adaptor = OpenAiResponsesAdaptor;
     let (parsed, request) = super::super::dispatch::parse_backend_request(
@@ -162,4 +167,79 @@ async fn limited_fetch_sse_bytes() {
         include_bytes!("../../tests/fixtures/fetch/limited.sse"),
     )
     .await;
+}
+
+/// Responses over Fetch names the accepted job and its provider in headers
+/// and on `response.created`, and hands over the signed transcript on
+/// `response.completed` or in the body.
+#[tokio::test]
+async fn responses_carry_provenance_at_start_and_end() {
+    use base64::Engine as _;
+    use hellas_rpc::provenance::{COMMITMENT_KEY, ExecutionProvenance, PROVIDER_KEY};
+    use tower::ServiceExt as _;
+
+    let transcript = b"provider-signed transcript".to_vec();
+    let commitment = "6b".repeat(32);
+    let key = format!("secp256k1:{}", "03".repeat(33));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&transcript);
+    let start = json!({"commitment": commitment, "provider": key});
+    let end = json!({"commitment": commitment, "provider": key, "transcript": encoded});
+    for stream in [false, true] {
+        let request = json!({"model": "fixture", "input": "hello", "stream": stream});
+        let work = Arc::new(RecordedFetch {
+            request: json!({"model": "fixture", "input": "hello", "stream": true, "store": false}),
+            events: vec![
+                WorkEvent::Accepted(ExecutionProvenance {
+                    commitment_id: [0x6b; 32],
+                    provider: hellas_auth::PublicKey::Secp256k1([0x03; 33]),
+                }),
+                WorkEvent::Output(text("Hello", TextChannel::Output)),
+                WorkEvent::Transcript(transcript.clone()),
+                WorkEvent::Output(finished(StopReason::EndOfText)),
+            ],
+            calls: AtomicUsize::new(0),
+        });
+        let app = router(
+            crate::ResponsesFetch {
+                provider: provider(),
+                service: "openai".into(),
+                method: "responses".into(),
+                overrides: serde_json::Map::new(),
+                models: Vec::new(),
+            },
+            work,
+        )
+        .layer(crate::provenance_layer::ProvenanceLayer);
+        let response = app
+            .oneshot(
+                axum::http::Request::post(PATH)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()[COMMITMENT_KEY], commitment.as_str());
+        assert_eq!(response.headers()[PROVIDER_KEY], key.as_str());
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        if !stream {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["hellas"], end);
+            continue;
+        }
+        let events = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events[0]["type"], "response.created");
+        assert_eq!(events[0]["response"]["hellas"], start);
+        let last = events.last().unwrap();
+        assert_eq!(last["type"], "response.completed");
+        assert_eq!(last["response"]["hellas"], end);
+    }
 }

@@ -1,42 +1,27 @@
 use std::sync::Arc;
-use tracing::Instrument;
 
 use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
 };
 
 mod generation;
-mod provenance;
+pub(crate) mod provenance;
 #[cfg_attr(feature = "otel", path = "telemetry/otel.rs")]
 #[cfg_attr(not(feature = "otel"), path = "telemetry/noop.rs")]
 pub(crate) mod telemetry;
 mod text;
 
 use self::text::text_events;
-use super::state::{GatewayState, PreparedGeneration};
+use super::state::TextState;
 
 #[derive(Clone)]
 pub(super) struct GatewayBackend {
-    state: Arc<GatewayState>,
+    state: Arc<TextState>,
 }
 
 impl GatewayBackend {
-    pub(super) fn new(state: Arc<GatewayState>) -> Self {
+    pub(super) fn new(state: Arc<TextState>) -> Self {
         Self { state }
-    }
-
-    async fn prepare(&self, request: &BackendRequest) -> Result<PreparedGeneration, BackendError> {
-        let retention = retention_from_json(request.raw.value())?;
-        self.state
-            .prepare_wire_execution(&request.execution, retention)
-            .await
-            .map_err(|err| match err.status {
-                axum::http::StatusCode::FORBIDDEN => BackendError::Denied(err.message),
-                axum::http::StatusCode::TOO_MANY_REQUESTS => BackendError::Quota(err.message),
-                axum::http::StatusCode::SERVICE_UNAVAILABLE => BackendError::Busy(err.message),
-                status if status.is_client_error() => BackendError::rejected(err.message),
-                _ => BackendError::failed(err.message),
-            })
     }
 }
 
@@ -44,17 +29,21 @@ impl ExecutionBackend for GatewayBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let mut inference = telemetry::Inference::new(&request, &self.state.inference_metrics);
-            let prepared = match self
-                .prepare(&request)
-                .instrument(inference.span.clone())
-                .await
-            {
+            let mut prepared = match stateless(request.raw.value()).and_then(|()| {
+                inference
+                    .span
+                    .in_scope(|| self.state.prepare_wire_execution(&request.execution))
+            }) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     inference.fail(&error);
                     return Err(error);
                 }
             };
+            if let Err(error) = prepared.accept().await {
+                inference.fail(&error);
+                return Err(error);
+            }
             inference.response_model(&request.execution.canonical.model.name);
             let initial_provenance = prepared
                 .provenance
@@ -68,35 +57,57 @@ impl ExecutionBackend for GatewayBackend {
     }
 }
 
-use hellas_rpc::Retention;
-use serde_json::{Map as JsonMap, Value as JsonValue};
-pub(super) fn retention_from_json(value: &JsonValue) -> Result<Retention, BackendError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| BackendError::rejected("request body must be a JSON object"))?;
-    retention_from_json_object(object)
-}
-fn retention_from_json_object(
-    object: &JsonMap<String, JsonValue>,
-) -> Result<Retention, BackendError> {
-    match object.get("store") {
-        None => Ok(Retention::Ephemeral),
-        Some(JsonValue::Bool(store)) => Ok(Retention::from_retain(*store)),
-        Some(_) => Err(BackendError::rejected("`store` must be a boolean")),
+/// Text jobs keep nothing between requests: a request may neither ask for its
+/// response to be stored nor continue one the gateway never kept.
+fn stateless(body: &serde_json::Value) -> Result<(), BackendError> {
+    match body.get("store") {
+        None | Some(serde_json::Value::Bool(false)) => {}
+        Some(serde_json::Value::Bool(true)) => {
+            return Err(BackendError::rejected(
+                "this gateway keeps no responses; `store` must be false",
+            ));
+        }
+        Some(_) => return Err(BackendError::rejected("`store` must be a boolean")),
     }
+    if ["previous_response_id", "conversation"]
+        .iter()
+        .any(|field| body.get(field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(BackendError::Conflict(
+            "unknown or expired server-side continuation; resend full context".into(),
+        ));
+    }
+    Ok(())
 }
 
-fn execution_error(error: hellas_client::ClientError) -> BackendError {
-    if let hellas_client::ClientError::External(ref source) = error
-        && let Some(work) = source.downcast_ref::<crate::WorkGatewayError>()
-    {
-        return match work {
-            crate::WorkGatewayError::Rejected(_) => BackendError::rejected(work.to_string()),
-            crate::WorkGatewayError::Denied(_) => BackendError::Denied(work.to_string()),
-            crate::WorkGatewayError::Quota(_) => BackendError::Quota(work.to_string()),
-            crate::WorkGatewayError::Busy(_) => BackendError::Busy(work.to_string()),
-            _ => BackendError::failed(work.to_string()),
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn text_requests_may_not_store_or_continue_server_side_state() {
+        for body in [
+            json!({}),
+            json!({"store": false}),
+            json!({"previous_response_id": null}),
+        ] {
+            stateless(&body).unwrap();
+        }
+        for body in [json!({"store": true}), json!({"store": "no"})] {
+            assert!(matches!(stateless(&body), Err(BackendError::Rejected(_))));
+        }
+        for body in [
+            json!({"previous_response_id": "resp_1"}),
+            json!({"conversation": "conv_1"}),
+        ] {
+            let error = stateless(&body).unwrap_err();
+            assert!(matches!(error, BackendError::Conflict(_)));
+            assert_eq!(
+                crate::backend_status(&error),
+                axum::http::StatusCode::CONFLICT
+            );
+            assert!(error.to_string().contains("resend full context"));
+        }
     }
-    BackendError::failed(error.to_string())
 }

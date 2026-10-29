@@ -32,7 +32,8 @@ omission_bond = 201
 redelegate_payout = true
 
 [limits]
-max_upload_bytes = 1048576
+# Includes a freshly shipped Whisper program, log-mel features and token masks.
+max_upload_bytes = 4194304
 max_output_bytes = 1048576
 max_steps = 64
 execution_timeout_ms = 90000

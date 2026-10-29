@@ -1,16 +1,12 @@
 //! Reusable Hellas client orchestration. The optional `local` backend embeds
 //! an executor; transport-neutral verification does not depend on that backend.
 
-#[cfg(feature = "iroh")]
-pub mod cache;
 mod error;
 #[cfg(feature = "iroh")]
-pub mod execution;
-#[cfg(feature = "iroh")]
 pub mod iroh;
+pub mod model;
 #[cfg(all(feature = "iroh", feature = "work"))]
 mod offer;
-pub mod text;
 #[cfg(feature = "work")]
 pub mod work;
 #[cfg(all(feature = "iroh", feature = "work"))]
@@ -19,8 +15,8 @@ pub use offer::{PinnedOffer, UnpinnedOffer};
 pub use error::{ClientError, ClientResult};
 #[cfg(feature = "iroh")]
 pub use iroh::{
-    AppleAppAttestTrust, ProviderTrustAnchor, RemoteNodeTarget, confidential_open,
-    confidential_open_selected, selected_provider_trust,
+    AppleAppAttestTrust, ProviderAddress, ProviderAddressError, ProviderTrustAnchor,
+    RemoteNodeTarget, confidential_open,
 };
 
 /// Client capabilities shared by local and transport-specific orchestration.

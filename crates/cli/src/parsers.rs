@@ -1,10 +1,5 @@
 //! Argument parsers for the CLI's clap definitions.
 
-pub(crate) fn parse_content_id_hex(s: &str) -> Result<hellas_rpc::ContentId, String> {
-    s.parse()
-        .map_err(|error| format!("invalid ContentId: {error}"))
-}
-
 pub(crate) fn parse_positive_usize(s: &str) -> Result<usize, String> {
     usize::try_from(parse_positive_u64(s)?)
         .map_err(|_| "invalid positive integer: number too large to fit in target type".to_string())

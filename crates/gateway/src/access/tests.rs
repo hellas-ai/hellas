@@ -13,7 +13,8 @@ use {
 const HTTP_ACCESS: GrantId = GrantId([104; 16]);
 
 pub(crate) struct Fixture {
-    pub(crate) root: tempfile::TempDir,
+    /// Keeps the authority's store alive for the fixture's lifetime.
+    _root: tempfile::TempDir,
     pub(crate) access: GatewayAccess,
     admin: CredentialSecret,
     clock: TestClock,
@@ -82,7 +83,7 @@ impl Fixture {
             .await
             .unwrap();
         Self {
-            root,
+            _root: root,
             access,
             admin,
             clock,

@@ -1,0 +1,1 @@
+{"model_type":"whisper","d_model":2,"num_mel_bins":80,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":1,"decoder_attention_heads":1,"encoder_ffn_dim":4,"decoder_ffn_dim":4,"max_source_positions":1500,"max_target_positions":8,"vocab_size":8,"decoder_start_token_id":4,"eos_token_id":3,"activation_function":"gelu"}

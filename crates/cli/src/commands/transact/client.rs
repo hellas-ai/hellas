@@ -122,9 +122,9 @@ pub(super) async fn config(args: &ClientArgs, root: &Path) -> CliResult<WorkConf
 pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()> {
     let root = args.root(context);
     let config = config(args, &root).await?;
-    let journals = root.join("channels").join(args.provider.id.to_string());
+    let journals = args.journals(&root);
     if !journals.exists() {
-        println!("no open channels with {}", args.provider.id);
+        println!("no open channels with {}", args.provider.address);
         return Ok(());
     }
     let owner = args.owner(context)?;
@@ -134,7 +134,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         while let Some((policy, assurance)) = hellas_sdk::paid_client::retained_paid_policy(
             &config,
             &journals,
-            args.provider.id,
+            args.provider.address,
             args.timeout,
         )
         .await?
@@ -160,7 +160,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
             println!("settled channel {channel}: provider payout {}", result?);
             closed += 1;
         }
-        println!("settled {closed} channels with {}", args.provider.id);
+        println!("settled {closed} channels with {}", args.provider.address);
         Ok(())
     }
     .await;

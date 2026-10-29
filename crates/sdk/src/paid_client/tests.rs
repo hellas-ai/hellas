@@ -20,7 +20,7 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
     let args = PaidWorkOptions {
         config,
         journal_root: journal_root.clone(),
-        provider: SecretKey::generate().public(),
+        provider: crate::test_support::address(SecretKey::generate().public()),
         provider_addrs: vec![],
         assurance: Assurance::ProducerSigned,
         apple_trust: None,

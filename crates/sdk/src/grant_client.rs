@@ -245,9 +245,9 @@ pub struct GrantSessionOptions {
     pub signer: Arc<ProducerSigningKey>,
     pub application: Arc<ClientProfile>,
     pub journal_root: PathBuf,
-    /// Bounds each wait: standing, admission and the first delivered event
-    /// together, then each later event. Signed job terms bound the total.
-    pub timeout: Duration,
+    /// Bounds connection/control calls and terminal-delivery grace.
+    /// Compilation and result waits are bounded only by signed job terms.
+    pub control_timeout: Duration,
 }
 pub enum GrantTransport {
     Remote(Endpoint),
@@ -278,36 +278,38 @@ enum SessionTransport {
 impl SessionTransport {
     /// The remote session lasts at least `need` unless a fresh one cannot.
     async fn connect(&self, timeout: Duration, need: Duration) -> Result<Link> {
-        match self {
-            Self::Remote(link) => {
-                let (transport, expires) = tokio::time::timeout(timeout, link.work_for(need))
-                    .await
-                    .map_err(|_| GrantClientError::Timeout)?
-                    .map_err(GrantClientError::from)?;
-                Ok(Link::Remote(transport, expires))
-            }
-            Self::Local {
-                service,
-                application,
-                signer,
-            } => {
-                let caller = service
-                    .node()
-                    .authenticate_session(
-                        &application.credential,
-                        hellas_authority::node::SessionKey::Node(signer),
-                    )
-                    .await?;
-                if caller.authority() != application.authority {
-                    return Err(GrantError::Audience.into());
+        tokio::time::timeout(timeout, async {
+            match self {
+                Self::Remote(link) => {
+                    let (transport, expires) =
+                        link.work_for(need).await.map_err(GrantClientError::from)?;
+                    Ok(Link::Remote(transport, expires))
                 }
-                Ok(Link::Local(
-                    service.for_caller(caller, application.authorization),
-                    rand::random(),
-                ))
+                Self::Local {
+                    service,
+                    application,
+                    signer,
+                } => {
+                    let caller = service
+                        .node()
+                        .authenticate_session(
+                            &application.credential,
+                            hellas_authority::node::SessionKey::Node(signer),
+                        )
+                        .await?;
+                    if caller.authority() != application.authority {
+                        return Err(GrantError::Audience.into());
+                    }
+                    Ok(Link::Local(
+                        service.for_caller(caller, application.authorization),
+                        rand::random(),
+                    ))
+                }
+                Self::Closed => Err(GrantClientError::Closed),
             }
-            Self::Closed => Err(GrantClientError::Closed),
-        }
+        })
+        .await
+        .map_err(|_| GrantClientError::Timeout)?
     }
 }
 enum Link {
@@ -477,6 +479,8 @@ impl Link {
 pub struct GrantWorkResult {
     pub work_id: Digest,
     pub result: PaidJobResultV1,
+    /// The verified signed transcript; `result.transcript_content` names
+    /// its canonical encoding.
     pub events: Vec<OutputEventEnvelope>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub provider_key: PublicKey,
@@ -500,7 +504,7 @@ pub struct GrantSession {
 }
 impl GrantSession {
     pub async fn open(options: GrantSessionOptions, transport: GrantTransport) -> Result<Self> {
-        if options.timeout.is_zero() {
+        if options.control_timeout.is_zero() {
             return Err(GrantError::Signature.into());
         }
         let client = ChannelClient {
@@ -515,8 +519,11 @@ impl GrantSession {
             &options.application,
             &options.signer,
         )?;
-        let link = transport.connect(options.timeout, options.timeout).await?;
-        let standing = Self::query_standing(&target, client, options.timeout, &link).await?;
+        let link = transport
+            .connect(options.control_timeout, options.control_timeout)
+            .await?;
+        let standing =
+            Self::query_standing(&target, client, options.control_timeout, &link).await?;
         let offer = standing.offer;
         let channel = offer.offer().channel(client);
         let path = options.journal_root.join(hex::encode(channel.0.as_bytes()));
@@ -563,7 +570,7 @@ impl GrantSession {
     }
     async fn link(&self) -> Result<Link> {
         self.transport
-            .connect(self.options.timeout, self.options.timeout)
+            .connect(self.options.control_timeout, self.options.control_timeout)
             .await
     }
     async fn query_standing(
@@ -611,7 +618,7 @@ impl GrantSession {
         let standing = Self::query_standing(
             &self.target,
             self.store.channel().client,
-            self.options.timeout,
+            self.options.control_timeout,
             &link,
         )
         .await?;
@@ -663,7 +670,7 @@ impl GrantSession {
         };
         let link = self.link().await?;
         let response = tokio::time::timeout(
-            self.options.timeout,
+            self.options.control_timeout,
             link.accept(
                 request,
                 id,
@@ -732,49 +739,29 @@ impl GrantSession {
             None => Err(GrantProtocolError::AcceptanceOutcome.into()),
         }
     }
+    /// Mark proposal persistence before cancellation could abandon its recovery.
     pub async fn run(
         &mut self,
         policy_name: &str,
         input: PreparedInvocation,
         content: &InvocationContent,
         progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<GrantWorkResult> {
-        self.run_before(
-            policy_name,
-            input,
-            content,
-            progress,
-            tokio::time::Instant::now() + self.options.timeout,
-        )
-        .await
-    }
-
-    /// `deadline` bounds standing, acceptance and the first delivered event.
-    /// Later events must each arrive within the session timeout, and the whole
-    /// delivery within the signed terminal deadline, which the job may use up
-    /// to the allowance's `max_job_millis`. Cancellation preserves any signed
-    /// proposal in the journal.
-    pub async fn run_before(
-        &mut self,
-        policy_name: &str,
-        input: PreparedInvocation,
-        content: &InvocationContent,
-        progress: Option<PaidProgress>,
-        deadline: tokio::time::Instant,
-    ) -> Result<GrantWorkResult> {
-        if deadline <= tokio::time::Instant::now() {
-            return Err(GrantClientError::Timeout);
-        }
         let (policy, id, mut stream, finish_by) =
-            tokio::time::timeout_at(deadline, self.admit(policy_name, &input, content))
-                .await
-                .map_err(|_| GrantClientError::Timeout)??;
+            self.admit(policy_name, &input, content, proposed).await?;
         let channel = self.store.channel().id;
-        let idle = self.options.timeout;
         let facts = policy
             .invocation_policy
             .admit(&input, &self.options.signer.public_key())?;
         let producer = PublicKey::Secp256k1(grant_producer(&self.target.provider)?.to_bytes());
+        if let Some(accepted) = &accepted {
+            accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: *id.as_bytes(),
+                provider: producer,
+            });
+        }
         let mut verifier = StreamVerifier::new(
             input.request.clone(),
             producer,
@@ -784,12 +771,8 @@ impl GrantSession {
         let mut captured_bytes = 9u64;
         let mut captured_heap = 0u64;
         let (signed, events, output) = tokio::time::timeout_at(finish_by, async {
-            let mut next_by = deadline;
-            while let Some(event) = tokio::time::timeout_at(next_by, stream.next())
-                .await
-                .map_err(|_| GrantClientError::Timeout)?
-            {
-                next_by = tokio::time::Instant::now() + idle;
+            // Compute may remain silent throughout compilation and execution.
+            while let Some(event) = stream.next().await {
                 let event = event?;
                 use prost::Message;
                 if event.encoded_len() as u64 > u64::from(facts.max_encoded_result_frame) {
@@ -856,7 +839,7 @@ impl GrantSession {
                                     .map_err(GrantClientError::from)?,
                             ),
                         };
-                        if tokio::time::timeout_at(next_by, stream.next())
+                        if tokio::time::timeout(self.options.control_timeout, stream.next())
                             .await
                             .map_err(|_| GrantClientError::Timeout)?
                             .transpose()?
@@ -905,13 +888,14 @@ impl GrantSession {
     }
 
     /// Propose, have accepted and open delivery. The returned instant bounds
-    /// the delivery by the signed terminal deadline plus one idle period for
+    /// the delivery by the signed terminal deadline plus bounded grace for
     /// the provider to report the terminal state.
     async fn admit(
         &mut self,
         policy_name: &str,
         input: &PreparedInvocation,
         content: &InvocationContent,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(
         GrantPolicy,
         Digest,
@@ -945,12 +929,12 @@ impl GrantSession {
             .0
             .checked_add(self.offer.offer().grant.max_job_millis.get())
             .ok_or(GrantError::Malformed)?;
-        let idle = self.options.timeout;
+        let grace = self.options.control_timeout;
         let link = self
             .transport
             .connect(
-                idle,
-                Duration::from_millis(terminal.saturating_sub(now.0)) + idle,
+                self.options.control_timeout,
+                Duration::from_millis(terminal.saturating_sub(now.0)) + grace,
             )
             .await?;
         // Work must end, and report its terminal state, before the session
@@ -958,7 +942,7 @@ impl GrantSession {
         let terminal = link.expires().map_or(terminal, |expires| {
             let carried = expires
                 .saturating_duration_since(tokio::time::Instant::now())
-                .saturating_sub(idle)
+                .saturating_sub(grace)
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
             terminal.min(now.0.saturating_add(carried))
@@ -967,8 +951,9 @@ impl GrantSession {
         if span == 0 {
             return Err(GrantError::Expired.into());
         }
-        let finish_by =
-            tokio::time::Instant::now() + Duration::from_millis(span) + self.options.timeout;
+        let finish_by = tokio::time::Instant::now()
+            + Duration::from_millis(span)
+            + self.options.control_timeout;
         let channel = self.store.channel().id;
         let prepared = input.canonical_bytes()?;
         let a = GrantJobAuthorizationV1 {
@@ -999,6 +984,10 @@ impl GrantSession {
                 terminal.checked_add(300_000).ok_or(GrantError::Malformed)?,
             ),
         };
+        // Cancellation after this point must retain or recover the proposal.
+        if let Some(proposed) = proposed {
+            proposed.store(true, std::sync::atomic::Ordering::Release);
+        }
         let signature = self
             .store
             .propose(&self.offer, a, input, &self.options.signer, now)
@@ -1016,7 +1005,7 @@ impl GrantSession {
             )),
         };
         let response = tokio::time::timeout(
-            self.options.timeout,
+            self.options.control_timeout,
             link.accept(request, id, Some((input, content)), &self.options.signer),
         )
         .await
@@ -1027,7 +1016,7 @@ impl GrantSession {
             work_id: id.as_bytes().to_vec(),
             client_signature: Vec::new(),
         };
-        let stream = tokio::time::timeout(self.options.timeout, link.stream(delivery))
+        let stream = tokio::time::timeout(self.options.control_timeout, link.stream(delivery))
             .await
             .map_err(|_| GrantClientError::Timeout)??;
         Ok((policy, id, stream, finish_by))

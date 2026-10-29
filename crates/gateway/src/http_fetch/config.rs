@@ -8,8 +8,12 @@ use std::collections::BTreeMap;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpGatewayConfig {
-    pub service: String,
-    pub method: String,
+    /// The Fetch route, when a provider's policy does not seal one. A sealed
+    /// route is taken from the policy; naming a different one is an error.
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
     #[serde(default)]
     pub routes: Vec<HttpRoute>,
     #[serde(default)]
@@ -60,7 +64,7 @@ pub(super) fn public_tls() -> HttpTls {
 }
 
 impl HttpGatewayConfig {
-    /// Checks routes and backend limits using the same validation as [`super::start_http`].
+    /// Checks routes and backend limits, as the gateway does before it starts.
     pub fn validate(&self) -> crate::GatewayResult<()> {
         if self.routes.is_empty() == self.backends.is_empty() {
             return Err(crate::GatewayConfigError::RouteMode.into());

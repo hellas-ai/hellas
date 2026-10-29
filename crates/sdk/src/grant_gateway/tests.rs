@@ -3,8 +3,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
+use hellas_gateway::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
+use hellas_rpc::output::OutputEvent;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
 use std::sync::atomic::Ordering;
+use tokio::sync::Semaphore;
 use {
     hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
     hellas_authority::test_support::chat_resource, hellas_authority::test_support::ids,
@@ -43,10 +46,15 @@ struct FixtureBuilder {
     transport: TransportMode,
     inspect: Option<fn(&hellas_rpc::fetch::FetchInput)>,
     paced_chunks: usize,
+    hold_first: bool,
     max_job_millis: Option<u64>,
 }
 impl FixtureBuilder {
     /// Body chunks, and the usage chunk after them, each wait for `backend.pace`.
+    fn hold_first(mut self) -> Self {
+        self.hold_first = true;
+        self
+    }
     fn paced(mut self, chunks: usize) -> Self {
         self.paced_chunks = chunks;
         self
@@ -108,6 +116,9 @@ impl FixtureBuilder {
             slots: Arc::new(Semaphore::new(2)),
             finish: self.completion,
             pace,
+            first: self
+                .hold_first
+                .then(|| Completion::Permits(Arc::new(Semaphore::new(0)))),
             reply: Reply::events(events),
             inspect: self.inspect,
             ..Backend::default()
@@ -154,6 +165,7 @@ impl Fixture {
             transport: TransportMode::Local,
             inspect: None,
             paced_chunks: 0,
+            hold_first: false,
             max_job_millis: None,
         }
     }
@@ -175,19 +187,24 @@ impl Fixture {
     async fn http(&self) -> Http {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
-        let server = hellas_gateway::start_http(hellas_gateway::HttpGatewayOptions {
-            config: self.gateway.http_config().unwrap(),
-            paid: self.gateway.clone(),
-            archive: hellas_gateway::ArchiveOptions {
-                directory: self.host.root.path().join("archive"),
-                zdr: true,
+        let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+            server: hellas_gateway::ServerOptions {
+                archive: hellas_gateway::ArchiveOptions {
+                    directory: self.host.root.path().join("archive"),
+                    zdr: true,
+                },
+                host: "127.0.0.1".into(),
+                port: Some(0),
+                access,
+                allow_remote: false,
+                wrap: None,
+                wrap_args: vec![],
             },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access,
-            allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
+            work: self.gateway.clone(),
+            presentations: hellas_gateway::Presentations {
+                http: self.gateway.http_config().unwrap(),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -219,7 +236,7 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
-            provider: self.gateway.provider,
+            provider: self.gateway.source.provider,
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
@@ -229,11 +246,74 @@ impl Fixture {
         let mut stream = self.gateway.fetch(self.request(cap))?;
         let mut terminal = false;
         while let Some(event) = stream.next().await {
-            terminal |= event?.terminal().is_some();
+            terminal |= matches!(event?, WorkEvent::Output(event) if event.terminal().is_some());
         }
         assert!(terminal);
         Ok(())
     }
+}
+
+/// The gateway names the accepted work and its provider before any output,
+/// and hands over the transcript that provider signed: every envelope
+/// verifies under the announced key, and the bytes are exactly those the
+/// provider's signed result for that work id names.
+#[tokio::test]
+async fn delivered_transcripts_verify_against_the_accepting_provider() {
+    let fixture = Fixture::builder().build().await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = within(stream.next()).await {
+        events.push(event.unwrap());
+    }
+    let WorkEvent::Accepted(accepted) = &events[0] else {
+        panic!("acceptance must precede output")
+    };
+    assert!(matches!(
+        &events[1],
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
+    ));
+    let [
+        ..,
+        WorkEvent::Transcript(transcript),
+        WorkEvent::Output(terminal),
+    ] = events.as_slice()
+    else {
+        panic!("the transcript must precede the terminal")
+    };
+    assert!(terminal.terminal().is_some());
+    let provider = grant_runner(&fixture.gateway.source.offer).unwrap();
+    assert_eq!(accepted.provider, provider);
+
+    let envelopes = hellas_channel::model::work::decode_transcript(
+        transcript,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+    )
+    .unwrap();
+    assert!(!envelopes.is_empty());
+    for envelope in &envelopes {
+        envelope.verify(&provider).unwrap();
+    }
+    let stranger = ProducerSigningKey::from_secret_bytes([9; 32])
+        .unwrap()
+        .public_key();
+    assert!(envelopes[0].verify(&stranger).is_err());
+
+    let session = fixture.gateway.source.session.lock().await;
+    let job = session
+        .store()
+        .book()
+        .job_by_id(hellas_auth::Digest::from_bytes(accepted.commitment_id))
+        .expect("the commitment names the accepted job");
+    let (result, _) = job.result().expect("the provider signed a result");
+    assert_eq!(result.work_id.as_bytes(), &accepted.commitment_id);
+    assert_eq!(
+        hellas_rpc::ContentRef::for_bytes(transcript),
+        result.transcript_content
+    );
+    drop(session);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -242,7 +322,7 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.http_config().unwrap();
+    let config = fixture.gateway.http_config().unwrap().unwrap();
     assert_eq!(config.routes[0].max_response_bytes, 4096);
     assert_eq!(config.routes[0].tls, fixture.template.tls);
     fixture.result(None).await.unwrap();
@@ -254,6 +334,10 @@ async fn resource_repair_precedes_client_signing() {
 async fn disconnected_consumers_do_not_abandon_accepted_work() {
     let fixture = Fixture::builder().hold_completion().build().await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
     // Admission includes durable writes. Wait for the producer's progress before
     // testing its delivery; the finish gate remains closed throughout this check.
     let first = tokio::select! {
@@ -266,7 +350,9 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     .unwrap();
     assert!(matches!(
         first,
-        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { .. }))
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
     ));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     drop(stream);
@@ -410,10 +496,9 @@ async fn revoked_credentials_close_cached_sessions_before_refusing_reconnection(
     fixture.shutdown().await;
 }
 
-/// The 5 s session timeout bounds admission and each wait between chunks;
-/// a stream that keeps producing may run to the signed `max_job_millis`.
+/// Control timeouts do not bound a stream within its signed job terms.
 #[tokio::test]
-async fn streams_outlast_the_admission_budget_while_they_progress() {
+async fn streams_outlast_the_control_timeout_while_they_progress() {
     let chunks = 5;
     let fixture = Fixture::builder()
         .paced(chunks)
@@ -425,7 +510,13 @@ async fn streams_outlast_the_admission_budget_while_they_progress() {
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
-        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { .. }))
+        WorkEvent::Accepted(_)
+    ));
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
     ));
     tokio::time::pause();
     for _ in 0..chunks {
@@ -433,7 +524,9 @@ async fn streams_outlast_the_admission_budget_while_they_progress() {
         pace.release();
         assert!(matches!(
             stream.next().await.unwrap().unwrap(),
-            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { .. }))
+            WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+                HttpResponseEvent::Body { .. }
+            )))
         ));
     }
     tokio::time::resume();
@@ -441,33 +534,144 @@ async fn streams_outlast_the_admission_budget_while_they_progress() {
     fixture.host.backend.finish.release();
     let mut terminal = false;
     while let Some(event) = within(stream.next()).await {
-        terminal |= event.unwrap().terminal().is_some();
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
     }
     assert!(terminal);
     fixture.shutdown().await;
 }
 
 #[tokio::test]
-async fn idle_streams_are_cut_off_after_the_session_timeout() {
+async fn silent_first_result_outlasts_the_control_timeout() {
     let fixture = Fixture::builder()
-        .paced(1)
+        .hold_first()
         .with_max_job_millis(60_000)
-        .hold_completion()
         .build()
         .await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
-    within(stream.next()).await.unwrap().unwrap();
+    within(fixture.host.backend.started.notified()).await;
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
     tokio::time::pause();
-    let started = tokio::time::Instant::now();
-    assert_err!(stream.next().await.unwrap(), WorkGatewayError::Timeout(_));
-    // The idle timer, not the 60 s job limit, ended the stream.
-    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(
+        futures::poll!(stream.next()).is_pending(),
+        "silent accepted work must keep waiting"
+    );
     tokio::time::resume();
-    // Accepted work continues: release its chunk and usage chunk, then finish.
+    fixture.host.backend.first.as_ref().unwrap().release();
+    let mut terminal = false;
+    while let Some(event) = within(stream.next()).await {
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+    }
+    assert!(terminal);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn silent_later_result_outlasts_the_control_timeout() {
+    let fixture = Fixture::builder()
+        .paced(1)
+        .with_max_job_millis(60_000)
+        .build()
+        .await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    // The acceptance, then the response head.
+    for _ in 0..2 {
+        within(stream.next()).await.unwrap().unwrap();
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(
+        futures::poll!(stream.next()).is_pending(),
+        "result gaps are not control RPCs"
+    );
+    tokio::time::resume();
     let pace = fixture.host.backend.pace.as_ref().unwrap();
     pace.release();
     pace.release();
-    fixture.host.backend.finish.release();
+    let mut terminal = false;
+    while let Some(event) = within(stream.next()).await {
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+    }
+    assert!(terminal);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn silent_work_still_ends_at_the_signed_deadline() {
+    let fixture = Fixture::builder()
+        .hold_first()
+        .with_max_job_millis(20_000)
+        .build()
+        .await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    within(fixture.host.backend.started.notified()).await;
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(
+        futures::poll!(stream.next()).is_pending(),
+        "must not expire at the control timeout"
+    );
+    fixture
+        .host
+        .world
+        .clock
+        .set(hellas_auth::authority::UnixMillis(21_001));
+    // Keep execution blocked: only the provider's signed expiry may end delivery.
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    let error = within(stream.next()).await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkGatewayError::Denied(_) | WorkGatewayError::Execution(_)
+        ),
+        "{error:?}"
+    );
+    fixture.host.backend.first.as_ref().unwrap().release();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
+    let fixture = Fixture::builder().build().await;
+    for disconnect in [false, true] {
+        let held = fixture.gateway.source.session.lock().await;
+        let request = fixture
+            .gateway
+            .source
+            .request(WorkRequest::Fetch(fixture.request(None)))
+            .unwrap();
+        let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
+        let run = fixture.gateway.source.clone().run(request, requester);
+        tokio::pin!(run);
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        tokio::time::resume();
+        if disconnect {
+            drop(stream);
+            // Finish while the other request still owns the mutex.
+            assert!(within(run).await.unwrap().is_none());
+            assert_eq!(held.store().next_nonce().unwrap(), 2);
+            drop(held);
+        } else {
+            drop(held);
+            assert!(within(run).await.unwrap().is_some());
+            drop(stream);
+        }
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
 }
 
@@ -481,7 +685,15 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         .build()
         .await;
     fixture.result(None).await.unwrap();
-    let channel = fixture.gateway.session.lock().await.store().channel().id;
+    let channel = fixture
+        .gateway
+        .source
+        .session
+        .lock()
+        .await
+        .store()
+        .channel()
+        .id;
     let state = fixture.host.world.snapshot().await;
     let terminals: Vec<_> = state
         .channel(channel)
@@ -501,5 +713,38 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         span <= carried && span > carried - 1_000,
         "signed {span} ms"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn disconnect_during_control_does_not_propose() {
+    let fixture = Fixture::builder().build().await;
+    let node = fixture.host.world.service.node();
+    let held = hellas_authority::test_support::hold_writer(&node).await;
+    let request = fixture
+        .gateway
+        .source
+        .request(WorkRequest::Fetch(fixture.request(None)))
+        .unwrap();
+    let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
+    let run = fixture.gateway.source.clone().run(request, requester);
+    tokio::pin!(run);
+    assert!(futures::poll!(run.as_mut()).is_pending());
+    drop(stream);
+    assert!(within(run).await.unwrap().is_none());
+    assert_eq!(
+        fixture
+            .gateway
+            .source
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    drop(held);
     fixture.shutdown().await;
 }

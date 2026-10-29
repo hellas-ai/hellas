@@ -19,7 +19,7 @@ use hellas_rpc::protocol::invocation::fetch::{FetchAdmission, FetchLimits, Fetch
 use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
 use hellas_rpc::{Assurance, Retention};
 
-pub(crate) use crate::test_identity::enrollment;
+pub(crate) use crate::test_identity::{address, enrollment};
 
 pub(crate) async fn authority(
     root: &std::path::Path,

@@ -103,7 +103,8 @@ pub fn preflight(
                 .map_err(|e| invalid(0, None, "verified local content", e))?
                 .is_some()
         } else {
-            match content.read(ContentRef::new(id, bytes)) {
+            // A zero-length chunk checks presence without loading held weights.
+            match content.read_chunk(ContentRef::new(id, bytes), 0, 0) {
                 Ok(_) => true,
                 Err(ContentError::Missing) => false,
                 Err(error) => return Err(invalid(0, None, "verified RAM content", error)),

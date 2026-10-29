@@ -3,9 +3,10 @@ use std::io;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 
-pub(super) fn open_nofollow(path: &Path) -> io::Result<File> {
+pub(super) fn open_nofollow(path: &Path, writable: bool) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
+        .write(writable)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }

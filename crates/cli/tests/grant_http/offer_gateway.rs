@@ -8,6 +8,8 @@ struct OfferHost {
     provider: Cli,
     client: Cli,
     node: Process,
+    #[cfg(feature = "otel")]
+    metrics: String,
     socket: PathBuf,
     provider_profile: PathBuf,
     client_profile: PathBuf,
@@ -24,12 +26,22 @@ struct OfferHost {
 }
 impl OfferHost {
     async fn start() -> Self {
+        Self::start_with_metrics(None, None).await
+    }
+    async fn start_with_metrics(
+        metrics_endpoint: Option<String>,
+        metrics_address: Option<String>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let https = Https::start(Some("Bearer fixture-key")).await;
-        let provider = Cli::new(root, "provider", ROOT_PASSKEY);
-        let client = Cli::new(root, "client", FRIEND_PASSKEY);
+        let mut provider = Cli::new(root, "provider", ROOT_PASSKEY);
+        let mut client = Cli::new(root, "client", FRIEND_PASSKEY);
+        provider.metrics_endpoint = metrics_endpoint.clone();
+        client.metrics_endpoint = metrics_endpoint;
+        provider.metrics_address = metrics_address.clone();
+        client.metrics_address = metrics_address;
         assert_eq!(provider.principal(), ROOT.principal());
         assert_eq!(client.principal(), FRIEND.principal());
         for cli in [&provider, &client] {
@@ -125,6 +137,10 @@ impl OfferHost {
         let mut node = provider.spawn(
             &[
                 "serve",
+                #[cfg(feature = "otel")]
+                "--metrics-port",
+                #[cfg(feature = "otel")]
+                "0",
                 "--no-discovery",
                 "--fetch-config",
                 string(&fetch),
@@ -134,6 +150,10 @@ impl OfferHost {
             "provider.log",
         );
         node.wait_for("RPC server running.").await;
+        #[cfg(feature = "otel")]
+        let metrics = node
+            .wait_for("prometheus metrics server listening on ")
+            .await;
         let limits = root.join("machine-limits.json");
         std::fs::write(&limits, b"[]").unwrap();
         provider
@@ -236,6 +256,8 @@ impl OfferHost {
             provider,
             client,
             node,
+            #[cfg(feature = "otel")]
+            metrics,
             socket,
             provider_profile,
             client_profile,
@@ -290,6 +312,10 @@ impl OfferHost {
         let mut process = self.client.spawn(
             &[
                 "gateway",
+                #[cfg(feature = "otel")]
+                "--metrics-port",
+                #[cfg(feature = "otel")]
+                "0",
                 "--offer",
                 "lan",
                 "--trust-store",
@@ -309,8 +335,14 @@ impl OfferHost {
             "gateway.log",
         );
         let address = process.wait_for("gateway listening on ").await;
+        #[cfg(feature = "otel")]
+        let metrics = process
+            .wait_for("prometheus metrics server listening on ")
+            .await;
         Gateway {
             process,
+            #[cfg(feature = "otel")]
+            metrics,
             url: format!("http://{address}/v1/chat/completions"),
             http: gateway_client(&token),
         }
@@ -321,6 +353,8 @@ impl OfferHost {
 }
 struct Gateway {
     process: Process,
+    #[cfg(feature = "otel")]
+    metrics: String,
     url: String,
     http: reqwest::Client,
 }
@@ -484,6 +518,130 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     assert_eq!(host.https.calls.load(Ordering::SeqCst) - before, 1);
     gateway.process.stop().await;
     host.stop().await;
+}
+
+#[cfg(feature = "otel")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_scrape_observes_gateway_and_serve_work() {
+    let (collector, endpoint, mut exports) = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+        let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/v1/metrics",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let send = send.clone();
+                async move {
+                    send.send(body).unwrap();
+                    (
+                        [("content-type", "application/x-protobuf")],
+                        Vec::<u8>::new(),
+                    )
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (task, endpoint, receive)
+    };
+    let host = OfferHost::start_with_metrics(Some(endpoint), Some("0.0.0.0".into())).await;
+    let mut gateway = host.gateway().await;
+    let http = reqwest::Client::new();
+    for url in [&gateway.metrics, &host.metrics] {
+        assert!(
+            url.starts_with("http://0.0.0.0:"),
+            "explicit bind address was ignored: {url}"
+        );
+    }
+    let gateway_metrics = gateway.metrics.replace("0.0.0.0", "127.0.0.1");
+    let serve_metrics = host.metrics.replace("0.0.0.0", "127.0.0.1");
+    for url in [&gateway_metrics, &serve_metrics] {
+        let body = http.get(url).send().await.unwrap().text().await.unwrap();
+        assert!(
+            !body.contains("hellas_gateway_http_requests_total{"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("hellas_execution_executions_completed_total{"),
+            "{body}"
+        );
+    }
+    for count in 1..=2 {
+        host.https.finish.add_permits(1);
+        let response = post(
+            &gateway.http,
+            &gateway.url,
+            json!({"messages":[],"stream":false}),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.bytes().await.unwrap();
+        for (url, names) in [
+            (
+                &gateway_metrics,
+                vec![
+                    "hellas_gateway_http_requests_total",
+                    "hellas_gateway_http_duration_seconds_count",
+                ],
+            ),
+            (
+                &serve_metrics,
+                vec![
+                    "hellas_execution_executions_started_total",
+                    "hellas_execution_executions_completed_total",
+                ],
+            ),
+        ] {
+            let response = http.get(url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            let body = response.text().await.unwrap();
+            for name in names {
+                assert!(
+                    body.lines()
+                        .any(|line| line.starts_with(&format!("{name}{{"))
+                            && line.ends_with(&format!(" {count}"))),
+                    "missing {name}={count}: {body}"
+                );
+            }
+            {
+                assert!(
+                    body.lines()
+                        .any(|line| line.starts_with("endpoint_net_report_reports_total ")),
+                    "{body}"
+                );
+                assert!(
+                    body.contains("# TYPE endpoint_net_report_reports_total counter\n"),
+                    "{body}"
+                );
+            }
+            assert!(
+                !body.contains("# EOF"),
+                "Prometheus text has no OpenMetrics terminator"
+            );
+        }
+    }
+    gateway.process.stop().await;
+    host.stop().await;
+    {
+        // Check the real protobuf push stream, after shutdown has flushed both
+        // providers, as well as the two pulls above.
+        let mut names = vec![
+            b"hellas.gateway.http.requests".as_slice(),
+            b"hellas.execution.executions_completed".as_slice(),
+        ];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !names.is_empty() {
+                let body = exports.recv().await.unwrap();
+                names.retain(|name| !body.windows(name.len()).any(|window| window == *name));
+            }
+        })
+        .await
+        .expect("both instruments must also reach OTLP");
+        collector.abort();
+    }
 }
 
 /// Bootstrap an HTTP authority administered by the client's principal, with

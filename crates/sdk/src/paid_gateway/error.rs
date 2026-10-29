@@ -14,19 +14,21 @@ pub enum PoolError {
     DuplicateProvider(iroh::EndpointId),
     #[error("no provider policy admits this application")]
     NoMatchingPolicy,
+    #[error("paid provider {provider} charges {quoted} per job; the gateway expects {expected}")]
+    Price {
+        provider: hellas_client::ProviderAddress,
+        quoted: u64,
+        expected: u64,
+    },
     #[error("no eligible paid provider could start this request: {0:?}")]
     ProvidersUnavailable(Vec<String>),
     #[error("retained paid work did not recover within its deadline")]
     RecoveryTimeout,
     #[error("paid provider connection exceeded its {0:?} limit")]
     ConnectionTimeout(Duration),
-    #[error("paid output consumer is too slow; accepted work continues settlement")]
-    SlowConsumer,
-    #[error("{0}")]
-    MissingOutput(&'static str),
     #[error("paid provider {provider}: {source}")]
     Provider {
-        provider: iroh::EndpointId,
+        provider: hellas_client::ProviderAddress,
         source: Box<Self>,
     },
     #[error("cannot read {}: {source}", path.display())]
@@ -41,8 +43,6 @@ pub enum PoolError {
     },
     #[error(transparent)]
     Stopped(#[from] super::RequestStopped),
-    #[error(transparent)]
-    Busy(#[from] hellas_gateway::WorkGatewayBusy),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

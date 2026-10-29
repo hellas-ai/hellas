@@ -244,14 +244,20 @@ fn producer_signed_open_happy_path_verifies() {
     assert_eq!(verified, expected);
 }
 
+fn address_of(response: &OpenResponse) -> ProviderAddress {
+    ProviderAddress {
+        enrollment: ContentId::hash(&response.provider_genesis),
+        node: ::iroh::SecretKey::from_bytes(&[3; 32]).public(),
+    }
+}
+
 #[test]
-fn selected_software_provider_requires_a_valid_open_from_the_selected_peer() {
+fn addressed_software_provider_requires_its_enrollment_and_a_valid_open_from_its_peer() {
     let exporter = [5; 32];
     let nonce = [6; 32];
     let (_, response) = signed_open_response(&exporter, &nonce);
-    let bundle =
-        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
-    let trust = selected_provider_trust(&bundle, Assurance::ProducerSigned, None).unwrap();
+    let address = address_of(&response);
+    let trust = address.trust(Assurance::ProducerSigned, None).unwrap();
     verify_open_response(
         &trust,
         &exporter,
@@ -272,18 +278,54 @@ fn selected_software_provider_requires_a_valid_open_from_the_selected_peer() {
         )
         .is_err()
     );
-    assert!(verify_open_response(&trust, &[0; 32], &nonce, ALPN, ENROLLED_PEER, response).is_err());
-    assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
+    assert!(
+        verify_open_response(
+            &trust,
+            &[0; 32],
+            &nonce,
+            ALPN,
+            ENROLLED_PEER,
+            response.clone()
+        )
+        .is_err()
+    );
+    let other = ProviderAddress {
+        enrollment: ContentId::from_bytes([9; 32]),
+        ..address
+    };
+    let error = verify_open_response(
+        &other.trust(Assurance::ProducerSigned, None).unwrap(),
+        &exporter,
+        &nonce,
+        ALPN,
+        ENROLLED_PEER,
+        response,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("genesis pin mismatch"),
+        "{error}"
+    );
+    assert!(address.trust(Assurance::AppleAppAttest, None).is_err());
 }
 
 #[test]
-fn selected_apple_provider_keeps_independent_app_and_cdhash_approval() {
+fn addressed_apple_provider_keeps_independent_app_and_cdhash_approval() {
     let (trust, response, _) =
         apple_open_response(&[5; 32], &[6; 32], 2, Arc::new(TestCounterStore::default()));
-    let bundle =
-        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
-    assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, None).is_err());
-    assert!(selected_provider_trust(&bundle, Assurance::ProducerSigned, None).is_err());
+    let address = address_of(&response);
+    let open = |trust: &ProviderTrustAnchor| {
+        verify_open_response(
+            trust,
+            &[5; 32],
+            &[6; 32],
+            ALPN,
+            ENROLLED_PEER,
+            response.clone(),
+        )
+    };
+    assert!(address.trust(Assurance::AppleAppAttest, None).is_err());
+    assert!(open(&address.trust(Assurance::ProducerSigned, None).unwrap()).is_err());
     for wrong_app in [true, false] {
         let mut bad = trust.clone();
         let apple = bad.apple_app_attest.as_mut().unwrap();
@@ -292,11 +334,24 @@ fn selected_apple_provider_keeps_independent_app_and_cdhash_approval() {
         } else {
             apple.allowed_cd_hashes = vec![[0; 32]];
         }
-        assert!(selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&bad)).is_err());
+        let bad = address
+            .trust(Assurance::AppleAppAttest, Some(&bad))
+            .unwrap();
+        assert!(open(&bad).is_err());
     }
-    let approved =
-        selected_provider_trust(&bundle, Assurance::AppleAppAttest, Some(&trust)).unwrap();
-    verify_open_response(&approved, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).unwrap();
+    let elsewhere = ProviderAddress {
+        enrollment: ContentId::from_bytes([9; 32]),
+        ..address
+    };
+    assert!(
+        elsewhere
+            .trust(Assurance::AppleAppAttest, Some(&trust))
+            .is_err()
+    );
+    let approved = address
+        .trust(Assurance::AppleAppAttest, Some(&trust))
+        .unwrap();
+    open(&approved).unwrap();
 }
 
 #[test]

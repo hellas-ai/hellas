@@ -175,6 +175,10 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         Ok(vec![created, in_progress])
     }
 
+    fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {
+        crate::execution::merge_provenance(&mut state.provenance, provenance);
+    }
+
     fn render_stream_event(
         &self,
         request: &Self::ParsedRequest,
@@ -223,7 +227,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 Ok(Vec::new())
             }
             OutputEvent::Provenance(provenance) => {
-                state.provenance = Some(provenance);
+                self.attest(state, provenance.into());
                 Ok(Vec::new())
             }
             OutputEvent::Error { message, code } => {
@@ -1711,7 +1715,9 @@ mod tests {
                     }),
                     stop_reason: StopReason::EndOfText,
                     provenance: Some(Provenance {
-                        call_commitment: Some("aa".repeat(32)),
+                        commitment: Some("aa".repeat(32)),
+                        provider: Some("secp256k1:02".into()),
+                        transcript: Some("c2lnbmVk".into()),
                     }),
                     error: None,
                 },
@@ -1727,7 +1733,10 @@ mod tests {
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["output"][0]["content"][0]["text"], "hello");
         assert_eq!(body["metadata"]["request_id"], "r1");
-        assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
+        assert_eq!(
+            body["hellas"],
+            json!({"commitment": "aa".repeat(32), "provider": "secp256k1:02", "transcript": "c2lnbmVk"})
+        );
     }
 
     #[test]
@@ -1744,7 +1753,9 @@ mod tests {
                     usage: None,
                     stop_reason: StopReason::Cancelled,
                     provenance: Some(Provenance {
-                        call_commitment: Some("aa".repeat(32)),
+                        commitment: Some("aa".repeat(32)),
+                        provider: Some("secp256k1:02".into()),
+                        transcript: Some("c2lnbmVk".into()),
                     }),
                     error: Some(crate::ExecutionErrorInfo {
                         message: "provider failed".to_string(),
@@ -1765,7 +1776,10 @@ mod tests {
         assert_eq!(body["error"]["message"], "provider failed");
         assert_eq!(body["output"][0]["status"], "incomplete");
         assert_eq!(body["output"][0]["content"][0]["text"], "partial");
-        assert_eq!(body["hellas"]["commitment"], "aa".repeat(32));
+        assert_eq!(
+            body["hellas"],
+            json!({"commitment": "aa".repeat(32), "provider": "secp256k1:02", "transcript": "c2lnbmVk"})
+        );
     }
 
     #[test]

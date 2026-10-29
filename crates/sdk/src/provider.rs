@@ -452,7 +452,7 @@ where
         remote_control.enabled(),
     );
     let work_mount = MountedWork::with_backend(handle.clone());
-    let setup_mount = MountedSetup::with_content_store(content);
+    let setup_mount = MountedSetup::with_content_store(content.clone());
     let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
     let runner = match config.work {
         Some((work, chain)) => Some(
@@ -531,7 +531,8 @@ where
                 .collect(),
         )
         .await?
-        .with_upload_quota(work_mount.upload_quota());
+        .with_upload_quota(work_mount.upload_quota())
+        .with_content_store(content.clone());
         let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.policies,

@@ -40,6 +40,8 @@ pub enum PaidClientError {
     Timeout { stage: &'static str },
     #[error("authenticated provider key differs from the payment channel")]
     ProviderIdentityChanged,
+    #[error("the open channel with {0} was funded for a different provider enrollment")]
+    RetainedEnrollment(hellas_client::ProviderAddress),
     #[error("provider identity lock poisoned")]
     ProviderIdentityPoisoned,
     #[error("paid-work setup ended: {0:?}")]

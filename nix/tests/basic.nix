@@ -20,7 +20,7 @@
         ${package}/bin/hellas --help | grep -F "Hellas node CLI"
         ${package}/bin/hellas gateway --help | grep -F -- "--wrap"
         ${package}/bin/hellas gateway --help | grep -F -- "--text-model <FILE>"
-        ${package}/bin/hellas gateway --help | grep -F -- "--responses-fetch-execution-environment"
+        ${package}/bin/hellas gateway --help | grep -F -- "--responses-overrides"
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-policy"
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-store"
         ${package}/bin/hellas serve --help | grep -F -- "--content <PATH>"

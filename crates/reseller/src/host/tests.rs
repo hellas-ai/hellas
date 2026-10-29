@@ -3,8 +3,7 @@ use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_rpc::{Assurance, RootProof};
 use hellas_sdk::{
-    GrantProviderOptions, grant_client::UnpinnedOffer,
-    grant_gateway::responses::FetchGatewayOptions,
+    GrantProviderOptions, grant_client::UnpinnedOffer, grant_gateway::GrantServeOptions,
 };
 use std::{
     num::NonZeroU64,
@@ -340,20 +339,28 @@ impl ResellerBuilder {
                 .unwrap()
         };
         let gateway = controlled_gateway(
-            FetchGatewayOptions {
-                access,
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                archive: hellas_sdk::gateway::ArchiveOptions {
-                    directory: root.path().join("archive"),
-                    zdr: true,
+            GrantServeOptions {
+                serve: hellas_sdk::GatewayServeOptions {
+                    server: hellas_sdk::gateway::ServerOptions {
+                        access,
+                        host: "127.0.0.1".into(),
+                        port: Some(0),
+                        archive: hellas_sdk::gateway::ArchiveOptions {
+                            directory: root.path().join("archive"),
+                            zdr: true,
+                        },
+                        allow_remote: false,
+                        wrap: None,
+                        wrap_args: Vec::new(),
+                    },
+                    models: Vec::new(),
+                    http: None,
+                    responses_overrides: Default::default(),
+                    responses_models: Vec::new(),
                 },
-                allow_remote: false,
-                wrap: None,
-                wrap_args: Vec::new(),
                 policy: None,
                 session: hellas_sdk::grant_client::GrantSessionOptions {
-                    timeout: std::time::Duration::from_millis(
+                    control_timeout: std::time::Duration::from_millis(
                         pinned.offer().grant.max_job_millis.get(),
                     ),
                     target: pinned,
@@ -362,7 +369,6 @@ impl ResellerBuilder {
                     application: application.clone(),
                     journal_root: root.path().join("client"),
                 },
-                request_overrides: Default::default(),
             },
             client_identity.transport_key(),
             root.path(),
@@ -440,10 +446,8 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // The provider ended the job: a failure upstream of the gateway.
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     fixture.shutdown().await;
 }
 
@@ -658,7 +662,7 @@ struct ControlledGateway {
     access: hellas_rpc::pb::host::GatewayAccess,
 }
 async fn controlled_gateway(
-    gateway: FetchGatewayOptions,
+    gateway: GrantServeOptions,
     key: iroh::SecretKey,
     root: &std::path::Path,
     node: hellas_authority::node::NodeCoordinator,
@@ -669,7 +673,10 @@ async fn controlled_gateway(
         node,
         secret,
         None,
-        Some((gateway.access.clone(), gateway.into_factory(key))),
+        Some((
+            gateway.serve.server.access.clone(),
+            gateway.into_factory(key),
+        )),
     )
     .await;
     let status = control

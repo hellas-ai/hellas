@@ -48,6 +48,16 @@ impl Access {
     ) -> Result<(&'a AuthenticatedCaller, GrantId), NodeStoreError> {
         Ok((self.caller(store, now)?, self.authorization))
     }
+    /// Identify the proposal owner even after its execution rights expire.
+    /// This evidence only permits discarding that actor's signed staged proposal.
+    pub(super) fn proposal_owner(&self) -> Result<ChannelClient, NodeStoreError> {
+        let caller = match self.evidence.as_ref() {
+            Evidence::Native(caller) => caller,
+            Evidence::Session(session, binding) => session.bound_caller(*binding)?,
+        };
+        Ok(ChannelClient::of(caller)?)
+    }
+
     pub(crate) fn caller<'a>(
         &'a self,
         store: &NodeStore,

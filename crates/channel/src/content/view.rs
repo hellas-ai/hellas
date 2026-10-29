@@ -1,10 +1,12 @@
 use super::{ContentError, ContentId, ContentRef, ContentStore};
 use std::{collections::BTreeMap, io::Read as _, sync::Arc};
 
-/// Job-owned bytes with no file paths, durable index or substituters.
+/// Job-owned bytes with no file paths, durable index or substituters. Objects
+/// the provider already holds may be read from `held`; nothing is written there.
 #[derive(Clone, Default)]
 pub struct EphemeralContent {
     objects: BTreeMap<ContentId, Arc<Vec<u8>>>,
+    held: Option<ContentStore>,
 }
 impl std::fmt::Debug for EphemeralContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -15,6 +17,19 @@ impl std::fmt::Debug for EphemeralContent {
     }
 }
 impl EphemeralContent {
+    /// Reads objects this job did not upload from the provider's held content.
+    pub fn with_held(mut self, held: ContentStore) -> Self {
+        self.held = Some(held);
+        self
+    }
+    fn held_file(&self, reference: ContentRef) -> Result<hellas_store::VerifiedFile, ContentError> {
+        self.held
+            .as_ref()
+            .ok_or(ContentError::Missing)?
+            .open_verified(reference.id().digest(), reference.bytes())
+            .map_err(|e| ContentError::Storage(e.to_string()))?
+            .ok_or(ContentError::Missing)
+    }
     pub fn insert(&mut self, bytes: Vec<u8>) -> ContentRef {
         let reference = ContentRef::for_bytes(&bytes);
         self.objects.insert(reference.id(), Arc::new(bytes));
@@ -32,17 +47,25 @@ impl EphemeralContent {
         Ok(())
     }
     pub fn read(&self, reference: ContentRef) -> Result<Arc<Vec<u8>>, ContentError> {
-        let bytes = self
-            .objects
-            .get(&reference.id())
-            .ok_or(ContentError::Missing)?;
+        let Some(bytes) = self.objects.get(&reference.id()) else {
+            return read_file(self.held_file(reference)?);
+        };
         if bytes.len() as u64 != reference.bytes() {
             return Err(ContentError::Hash);
         }
         Ok(bytes.clone())
     }
     pub fn read_bounded(&self, id: ContentId, maximum: u64) -> Result<Arc<Vec<u8>>, ContentError> {
-        let bytes = self.objects.get(&id).ok_or(ContentError::Missing)?;
+        let Some(bytes) = self.objects.get(&id) else {
+            let file = self
+                .held
+                .as_ref()
+                .ok_or(ContentError::Missing)?
+                .open_verified_bounded(id.digest(), maximum)
+                .map_err(|e| ContentError::Storage(e.to_string()))?
+                .ok_or(ContentError::Missing)?;
+            return read_file(file);
+        };
         if bytes.len() as u64 > maximum {
             return Err(ContentError::Invalid);
         }
@@ -117,18 +140,21 @@ impl InvocationContent {
             .ok_or(ContentError::Invalid)?
             .min(maximum as u64) as usize;
         match self {
-            Self::Ephemeral(store) => {
+            Self::Ephemeral(store) if store.objects.contains_key(&reference.id()) => {
                 let bytes = store.read(reference)?;
                 Ok(bytes
                     .get(offset as usize..offset as usize + len)
                     .ok_or(ContentError::Invalid)?
                     .to_vec())
             }
-            Self::Retained(store) => {
-                let file = store
-                    .open_verified(reference.id().digest(), reference.bytes())
-                    .map_err(|e| ContentError::Storage(e.to_string()))?
-                    .ok_or(ContentError::Missing)?;
+            Self::Ephemeral(_) | Self::Retained(_) => {
+                let file = match self {
+                    Self::Ephemeral(store) => store.held_file(reference)?,
+                    Self::Retained(store) => store
+                        .open_verified(reference.id().digest(), reference.bytes())
+                        .map_err(|e| ContentError::Storage(e.to_string()))?
+                        .ok_or(ContentError::Missing)?,
+                };
                 let mut file = file.into_file();
                 file.seek(SeekFrom::Start(offset))?;
                 let mut bytes = vec![0; len];

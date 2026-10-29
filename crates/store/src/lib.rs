@@ -40,7 +40,6 @@
 //! content-addressed store cannot defend a key it did not derive from
 //! the bytes.
 
-pub mod cache;
 pub mod fastresume;
 pub mod hf;
 pub mod hf_cache;

@@ -2,13 +2,18 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{AdaptorError, AdaptorResult};
 
+/// The `hellas` object: `commitment`, `provider` and `transcript`, each
+/// present once known.
 pub(crate) fn provenance_json(provenance: &crate::Provenance) -> Option<JsonValue> {
     let mut object = JsonMap::new();
-    if let Some(commitment) = &provenance.call_commitment {
-        object.insert(
-            "commitment".to_string(),
-            JsonValue::String(commitment.clone()),
-        );
+    for (name, value) in [
+        ("commitment", &provenance.commitment),
+        ("provider", &provenance.provider),
+        ("transcript", &provenance.transcript),
+    ] {
+        if let Some(value) = value {
+            object.insert(name.to_string(), JsonValue::String(value.clone()));
+        }
     }
     (!object.is_empty()).then_some(JsonValue::Object(object))
 }
