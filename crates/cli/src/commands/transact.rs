@@ -321,17 +321,25 @@ async fn execute(
     Ok(result?)
 }
 
+async fn purchase_and_execute(
+    args: &ClientArgs,
+    context: &Context,
+    job: &Job,
+) -> super::CliResult<(Purchase, PaidWorkResult)> {
+    let options = args.options(context, job.price(), job.assurance()).await?;
+    let mut purchase = args.purchase(context, job, &options).await?;
+    let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
+    let result = execute(args, context, job, options, endpoint.clone(), &mut purchase).await;
+    endpoint.close().await;
+    Ok((purchase, result?))
+}
+
 pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     // Load every input before network activity or an owner approval.
     let job = args.job.as_deref().map(Job::load).transpose()?;
     bounded(args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
-        let options = args.client.options(&context, job.price(), job.assurance()).await?;
-        let mut purchase = args.client.purchase(&context, &job, &options).await?;
-        let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-        let result = execute(&args.client, &context, &job, options, endpoint.clone(), &mut purchase).await;
-        endpoint.close().await;
-        let result = result?;
+        let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
         if let Some(directory) = args.output { save_outputs(&directory, &job, &result)?; }
         else if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1) {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
