@@ -310,7 +310,7 @@ unrelated requests combines those requests into one trace and should be avoided.
 
 ### End-to-end check traces
 
-The VM checks under `hydraJobs.x86_64-linux.e2e` use telemetry-enabled test
+The VM checks under `releaseJobs.cli.x86_64-linux.tests` use telemetry-enabled test
 packages and a local collector. Each check publishes
 `traces/<machine>/traces.jsonl` as a Hydra build product, with collector
 diagnostics alongside it. The files contain newline-delimited
