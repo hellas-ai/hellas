@@ -73,7 +73,7 @@ png = { version = "0.18", optional = true }
 rand.workspace = true
 rand_chacha = { version = "0.10", optional = true }
 rand_distr = { version = "0.6", optional = true }
-safetensors = { version = "0.8", optional = true }
+safetensors = { version = "0.7", optional = true }
 serde.workspace = true
 serde_ipld_dagcbor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

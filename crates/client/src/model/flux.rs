@@ -281,7 +281,7 @@ impl Flux {
     }
 }
 
-/// The generator and distribution versions match catena-models' seeded noise.
+/// Seeded noise matches catena-models; the reference digest guards RNG upgrades.
 pub fn noise(seed: u64, width: usize, height: usize) -> Result<Vec<f32>> {
     dimensions(width, height)?;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);

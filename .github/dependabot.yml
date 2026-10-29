@@ -8,6 +8,13 @@ updates:
       interval: "cron"
       cronjob: "0 6 * * *"
       timezone: "Europe/Zurich"
+    ignore:
+      # The executor's compiler protocol uses bincode 1 APIs and encoding.
+      - dependency-name: "bincode"
+        versions: [">=2"]
+      # Catena exposes safetensors 0.7 Dtype values across the crate boundary.
+      - dependency-name: "safetensors"
+        versions: [">=0.8"]
     groups:
       rust-dependencies:
         patterns:
