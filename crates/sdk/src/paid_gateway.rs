@@ -245,6 +245,7 @@ impl PaidPool {
         let recovery = occupied.is_none();
         let streamed = !recovery;
         let progress = requester.progress();
+        let accepted = requester.accepted();
         let mut provider_errors = Vec::new();
         let last = candidates.len() - 1;
         for (index, (provider, route, input)) in candidates.into_iter().enumerate() {
@@ -355,6 +356,7 @@ impl PaidPool {
                 .transpose()?;
             let signer = self.producer_key.clone();
             let on_progress = streamed.then(|| progress.clone());
+            let on_accepted = streamed.then(|| accepted.clone());
             let result = before_proposal(requester, streamed, deadline, |proposed| async move {
                 match job {
                     Some(job) => crate::transact::transact(
@@ -364,6 +366,7 @@ impl PaidPool {
                         crate::transact::TransactionOptions {
                             new_purchase: true,
                             progress: on_progress,
+                            accepted: on_accepted,
                             proposed: Some(&proposed),
                             ..Default::default()
                         },
@@ -461,7 +464,7 @@ impl WorkSource for PaidPool {
             .iter()
             .flat_map(|provider| {
                 crate::gateway_work::fetch_routes(
-                    provider.args.provider,
+                    provider.args.provider.node,
                     [&provider.policy.invocation_policy],
                 )
             })
@@ -477,7 +480,7 @@ impl WorkSource for PaidPool {
         let mut candidates = self
             .providers
             .iter()
-            .filter(|provider| pinned.is_none_or(|pin| pin == provider.args.provider))
+            .filter(|provider| pinned.is_none_or(|pin| pin == provider.args.provider.node))
             .filter_map(|provider| {
                 match request.admitted(
                     &provider.policy.invocation_policy,
@@ -564,6 +567,7 @@ impl WorkSource for PaidPool {
                 Ok(result?.map(|output| Completed {
                     output: output.output,
                     provider: output.provider_key,
+                    transcript: output.transcript,
                 }))
             }
             .instrument(span),
@@ -672,7 +676,9 @@ mod tests {
             providers: vec![PaidWorkOptions {
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),
-                provider: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                provider: crate::test_support::address(
+                    iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                ),
                 provider_addrs: Vec::new(),
                 apple_trust: None,
                 assurance: hellas_rpc::Assurance::ProducerSigned,
@@ -714,7 +720,7 @@ mod tests {
                 args.timeout = Some(hellas_chain::node::RECOVERY_TIMEOUT);
                 let signed = SignedPaidOffer::sign(
                     PaidOffer {
-                        provider: crate::test_support::enrollment(args.provider).0,
+                        provider: crate::test_support::enrollment(args.provider.node).0,
                         proposal: fixture.proposal.clone(),
                         policy: fixture.policy.clone(),
                         omission_bond: 601,
@@ -742,7 +748,7 @@ mod tests {
                 store
                     .commit(
                         SetupRecord::Offer {
-                            peer: *args.provider.as_bytes(),
+                            peer: *args.provider.node.as_bytes(),
                             floor: None,
                             offer: Box::new(signed),
                         },
@@ -813,7 +819,8 @@ mod tests {
         let mut shared = pool_options(&fixture);
         let mut other = shared.providers[0].clone();
         other.journal_root = fixture.root.path().join("other");
-        other.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        other.provider =
+            crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
         shared.providers.push(other);
         assert!(shared.validate().is_ok());
     }
@@ -852,7 +859,7 @@ mod tests {
 
     fn fetch(pool: &PaidPool, method: &str) -> WorkRequest {
         WorkRequest::Fetch(WorkFetchRequest {
-            provider: pool.providers[0].args.provider,
+            provider: pool.providers[0].args.provider.node,
             service: "openai".into(),
             method: method.into(),
             body: crate::test_support::BODY.to_vec(),
@@ -995,7 +1002,8 @@ mod tests {
         let fixture = crate::test_support::PaidFixture::new();
         let mut options = pool_options(&fixture);
         let mut second = options.providers[0].clone();
-        second.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        second.provider =
+            crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
         options.providers.push(second);
         let identity = crate::NodeIdentity::generate();
         let owner = Arc::new(

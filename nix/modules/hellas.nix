@@ -198,6 +198,7 @@ rec {
     "--paid-work-config"
     "--passkey"
     "--metrics-port"
+    "--metrics-addr"
     "--graffiti"
     "--fetch-config"
     "--fetch-max-in-flight"
@@ -205,6 +206,8 @@ rec {
   ];
 
   protectedGatewayExtraArgs = [
+    "--metrics-port"
+    "--metrics-addr"
     "--paid-work-config"
     "--gateway-profile"
     "--identity"
@@ -289,7 +292,7 @@ rec {
         type = types.bool;
         default = cfg.endpoint != null || cfg.collectorEndpoint != null;
         defaultText = lib.literalExpression "otel.endpoint != null || otel.collectorEndpoint != null";
-        description = "Compile in OpenTelemetry and enable the configured exporters. Off when no endpoint is configured. The default package disables Hellas telemetry exporters.";
+        description = "Compile in metrics and OpenTelemetry export. Off when no endpoint is configured; set true explicitly for local metrics without OTLP. Custom packages must be built with the otel feature.";
       };
       collectorEndpoint = mkOption {
         type = types.nullOr types.str;
@@ -473,10 +476,15 @@ rec {
         default = null;
         description = "Maximum number of Fetch executions waiting behind active provider streams.";
       };
+      metricsAddress = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "IP address for unauthenticated metrics. Non-loopback exposes them to the network.";
+      };
       metricsPort = mkOption {
         type = types.nullOr types.port;
         default = null;
-        description = "Optional loopback-only Prometheus metrics port.";
+        description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
       assurance = mkOption {
         type = types.enum [
@@ -538,6 +546,16 @@ rec {
         type = types.nullOr types.port;
         default = 8080;
         description = "HTTP gateway port. Null lets the CLI auto-select.";
+      };
+      metricsAddress = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "IP address for unauthenticated metrics. Non-loopback exposes them to the network.";
+      };
+      metricsPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
       offer = mkOption {
         type = types.nullOr types.str;
@@ -660,6 +678,7 @@ rec {
     {
       lib,
       serve,
+      otel,
     }:
     let
       optArg =
@@ -690,7 +709,12 @@ rec {
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
     ++ optArg "--passkey" serve.passkey
-    ++ optArg "--metrics-port" serve.metricsPort
+    ++ lib.optionals (otel.enable && serve.metricsPort != null) [
+      "--metrics-port"
+      (toString serve.metricsPort)
+      "--metrics-addr"
+      serve.metricsAddress
+    ]
     ++ [
       "--assurance"
       serve.assurance
@@ -705,6 +729,7 @@ rec {
     {
       lib,
       gateway,
+      otel,
     }:
     let
       optArg =
@@ -736,6 +761,12 @@ rec {
       gateway.host
     ]
     ++ optArg "--port" gateway.port
+    ++ lib.optionals (otel.enable && gateway.metricsPort != null) [
+      "--metrics-port"
+      (toString gateway.metricsPort)
+      "--metrics-addr"
+      gateway.metricsAddress
+    ]
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
     ++ lib.optionals (gateway.responsesOverrides != { }) [
       "--responses-overrides"

@@ -40,7 +40,7 @@ use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, SecretKey};
 use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
@@ -50,9 +50,13 @@ use crate::work_config::WorkConfig;
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
     pub journal_root: PathBuf,
-    pub provider: EndpointId,
+    /// Every connection must present exactly this enrollment and node.
+    pub provider: hellas_client::ProviderAddress,
+    /// Direct UDP addresses of `provider.node`.
     pub provider_addrs: Vec<SocketAddr>,
     pub assurance: hellas_rpc::Assurance,
+    /// Independent approval an Apple provider requires; it must name
+    /// `provider.enrollment`.
     pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
     pub expected_price: u64,
     pub acceptance_blocks: u64,
@@ -99,7 +103,15 @@ impl PaidWorkOptions {
         if self.expected_price == 0 {
             return Err(PaidClientError::InvalidOptions("price must be positive"));
         }
+        self.trust()?;
         Ok(())
+    }
+
+    /// The trust every connection to the addressed provider must satisfy.
+    pub fn trust(&self) -> Result<hellas_client::ProviderTrustAnchor> {
+        Ok(self
+            .provider
+            .trust(self.assurance, self.apple_trust.as_ref())?)
     }
 }
 
@@ -402,13 +414,15 @@ impl PaidWorkSession {
         }
         check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
         let bond = signed.offer().proposal.bond_edge();
-        let trust = hellas_client::selected_provider_trust(
-            &signed.offer().provider,
-            args.assurance,
-            args.apple_trust.as_ref(),
-        )?;
-        let dialer =
-            ProviderDialer::new(args.provider, args.provider_addrs.clone(), endpoint, trust);
+        // Fresh and retained offers alike must name the addressed enrollment.
+        let trust = args.trust()?;
+        trust.verify_enrollment(&signed.offer().provider)?;
+        let dialer = ProviderDialer::new(
+            args.provider.node,
+            args.provider_addrs.clone(),
+            endpoint,
+            trust,
+        );
         let mut setup = SetupEndpoint::new(
             store,
             settlement_key.clone(),
@@ -416,11 +430,11 @@ impl PaidWorkSession {
         );
         if setup.state().revision().is_none() {
             setup
-                .import_offer(*args.provider.as_bytes(), signed)
+                .import_offer(*args.provider.node.as_bytes(), signed)
                 .await?;
         }
         owner
-            .claim(config.chain.network, args.provider, &payment_funding)
+            .claim(config.chain.network, args.provider.node, &payment_funding)
             .await?;
         let bundle = setup
             .state()
@@ -577,18 +591,21 @@ impl PaidWorkSession {
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
-        self.run_prepared(prepared, content, recover, progress, None, None)
+        self.run_prepared(prepared, content, recover, progress, None, None, None)
             .await
     }
 
-    /// Like `run`, also marking `proposed` before a proposal can leave the process.
+    /// Like `run`, also marking `proposed` before a proposal can leave the process,
+    /// and reporting the provider's acceptance of `prepared` to `accepted`.
     /// A caller using cancellation must continue payment/recovery once it is set.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_prepared(
         &mut self,
         prepared: Option<PreparedInvocation>,
         content: &InvocationContent,
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
         proposed: Option<&AtomicBool>,
         purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -740,6 +757,7 @@ impl PaidWorkSession {
                     &ready,
                     config.poll,
                     None,
+                    None,
                     JobLookup::Retained(work_id),
                     None,
                     None,
@@ -784,6 +802,7 @@ impl PaidWorkSession {
                     &ready,
                     config.poll,
                     progress.as_ref(),
+                    accepted.as_ref(),
                     if recover {
                         JobLookup::New
                     } else {
@@ -923,6 +942,7 @@ async fn execute_paid_job(
     ready: &hellas_channel::model::setup::ReadyChannel,
     poll: Duration,
     progress: Option<&hellas_channel::work::PaidProgress>,
+    accepted: Option<&crate::transact::Accepted>,
     lookup: JobLookup,
     proposed: Option<&AtomicBool>,
     mut purchase: Option<&mut crate::transact::Purchase>,
@@ -1005,6 +1025,12 @@ async fn execute_paid_job(
     };
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.accepting(work_id)?;
+    }
+    if let Some(accepted) = accepted {
+        accepted(hellas_rpc::provenance::ExecutionProvenance {
+            commitment_id: *work_id.as_bytes(),
+            provider: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+        });
     }
     let transcript = if already_collected {
         client

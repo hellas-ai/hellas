@@ -311,6 +311,24 @@ impl NodeStore {
         .await?;
         Ok(provider_signature)
     }
+    /// Verify ownership without requiring the proposal's terms to remain current.
+    pub(crate) fn authenticate_proposal(
+        &self,
+        a: &GrantJobAuthorizationV1,
+        client: crate::model::grant::ChannelClient,
+        client_signature: &Signature,
+    ) -> Result<Digest, NodeStoreError> {
+        let id = grant_work_id(self.state.network(), a);
+        self.state.check_channel(a, client)?;
+        hellas_auth::signature::verify_digest_signature(
+            &client.node.public_key(),
+            client_signature,
+            id,
+        )
+        .map_err(|_| GrantError::Signature)?;
+        Ok(id)
+    }
+
     /// Probe an uncertain proposal without its body. Authenticate first; known
     /// work returns its original co-signature before current admission checks.
     /// An unknown expired proposal is conclusively refused before input decode.
@@ -322,14 +340,7 @@ impl NodeStore {
         client_signature: &Signature,
         now: UnixMillis,
     ) -> Result<Option<Signature>, NodeStoreError> {
-        let id = grant_work_id(self.state.network(), a);
-        self.state.check_channel(a, client)?;
-        hellas_auth::signature::verify_digest_signature(
-            &client.node.public_key(),
-            client_signature,
-            id,
-        )
-        .map_err(|_| GrantError::Signature)?;
+        let id = self.authenticate_proposal(a, client, client_signature)?;
         if let Some(channel) = self.state.channel(a.channel_id) {
             if let Some(job) = channel.job_book().job_by_id(id) {
                 if job.authorization() == a && job.client_signature() == *client_signature {

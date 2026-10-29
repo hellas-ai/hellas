@@ -1,8 +1,16 @@
 use super::*;
 use clap::Parser as _;
 
+fn node() -> iroh::EndpointId {
+    iroh::SecretKey::from_bytes(&[7; 32]).public()
+}
+
 fn provider() -> String {
-    iroh::SecretKey::from_bytes(&[7; 32]).public().to_string()
+    hellas_sdk::client::ProviderAddress {
+        enrollment: hellas_rpc::ContentId::from_bytes([9; 32]),
+        node: node(),
+    }
+    .to_string()
 }
 
 fn fetch_args(extra: &[&str]) -> FetchArgs {
@@ -19,11 +27,59 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
     if !extra.contains(&"--max-response-bytes") {
         args.extend(["--max-response-bytes", "4096"]);
     }
+    if !extra.contains(&"--contract") {
+        args.extend(["--contract", "http"]);
+    }
     args.extend_from_slice(extra);
     let crate::Commands::Fetch(args) = crate::Cli::try_parse_from(args).unwrap().command else {
         panic!("Fetch");
     };
     args
+}
+
+#[test]
+fn provider_is_named_only_by_its_enrollment_and_node() {
+    let id = provider();
+    let p: Provider = id.parse().unwrap();
+    assert_eq!(p.address.to_string(), id);
+    assert!(p.addresses.is_empty());
+    let node = node().to_string();
+    for invalid in [node.clone(), format!("{node}@127.0.0.1:1234")] {
+        for command in [
+            &["hellas", "transact", "--settle", "--provider", &invalid][..],
+            &["hellas", "transact", "--job", "job", "--provider", &invalid],
+            &[
+                "hellas",
+                "fetch",
+                "https://example.test",
+                "--payment",
+                "1",
+                "--contract",
+                "http",
+                "--provider",
+                &invalid,
+            ],
+            &[
+                "hellas",
+                "run",
+                "--source",
+                "s",
+                "--entry",
+                "e",
+                "--provider",
+                &invalid,
+            ],
+        ] {
+            let error = crate::Cli::try_parse_from(command)
+                .err()
+                .expect("node ID alone");
+            assert!(
+                error.to_string().contains("ENROLLMENT_ID@NODE_ID"),
+                "{command:?}: {error}"
+            );
+        }
+    }
+    assert!(format!("{id}@not-an-address").parse::<Provider>().is_err());
 }
 
 #[test]
@@ -62,11 +118,66 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         );
     }
     let p: Provider = format!("{id}@127.0.0.1:1234").parse().unwrap();
+    assert_eq!(p.address.to_string(), id);
     assert_eq!(
         p.addresses,
         vec!["127.0.0.1:1234".parse::<SocketAddr>().unwrap()]
     );
     assert!(fetch_args(&["--faucet"]).client.timeout.is_none());
+}
+
+#[test]
+fn fetch_runs_only_under_a_contract_the_buyer_names() {
+    let id = provider();
+    let error = crate::Cli::try_parse_from([
+        "hellas",
+        "fetch",
+        "https://example.test/path",
+        "--provider",
+        &id,
+        "--payment",
+        "20",
+    ])
+    .err()
+    .expect("a Fetch without a named contract");
+    assert!(error.to_string().contains("--contract"), "{error}");
+    assert_eq!(
+        fetch_args(&[]).contract().unwrap(),
+        hellas_rpc::FetchContract::http().unwrap()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let http = root.path().join("http.json");
+    std::fs::write(
+        &http,
+        serde_json::to_vec(&hellas_rpc::FetchContract::http().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let http = http.display().to_string();
+    assert_eq!(
+        fetch_args(&["--contract", &http]).contract().unwrap(),
+        hellas_rpc::FetchContract::http().unwrap()
+    );
+    let responses = root.path().join("responses.json");
+    std::fs::write(
+        &responses,
+        serde_json::to_vec(
+            &hellas_rpc::FetchContract::new(
+                "openai-responses-0.0.3",
+                hellas_rpc::FetchSchema::StatelessResponsesV1,
+                "openai-responses-driver-0.0.2",
+                hellas_rpc::protocol::fetch_contract::FetchEgress::FixedHttps(
+                    "https://api.openai.com/v1/responses".into(),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let responses = responses.display().to_string();
+    assert!(fetch_args(&["--contract", &responses]).contract().is_err());
+    let missing = root.path().join("missing.json").display().to_string();
+    assert!(fetch_args(&["--contract", &missing]).contract().is_err());
 }
 
 #[test]

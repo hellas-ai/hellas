@@ -16,7 +16,7 @@ pub enum PoolError {
     NoMatchingPolicy,
     #[error("paid provider {provider} charges {quoted} per job; the gateway expects {expected}")]
     Price {
-        provider: iroh::EndpointId,
+        provider: hellas_client::ProviderAddress,
         quoted: u64,
         expected: u64,
     },
@@ -28,7 +28,7 @@ pub enum PoolError {
     ConnectionTimeout(Duration),
     #[error("paid provider {provider}: {source}")]
     Provider {
-        provider: iroh::EndpointId,
+        provider: hellas_client::ProviderAddress,
         source: Box<Self>,
     },
     #[error("cannot read {}: {source}", path.display())]

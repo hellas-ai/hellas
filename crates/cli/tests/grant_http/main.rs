@@ -142,6 +142,8 @@ struct Cli {
     root: PathBuf,
     identity: PathBuf,
     passkey: PathBuf,
+    metrics_endpoint: Option<String>,
+    metrics_address: Option<String>,
 }
 impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
@@ -151,6 +153,8 @@ impl Cli {
             root: root.into(),
             identity: root.join(name),
             passkey: path,
+            metrics_endpoint: None,
+            metrics_address: None,
         }
     }
     fn principal(&self) -> hellas_auth::authority::PrincipalId {
@@ -192,10 +196,23 @@ impl Cli {
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
-            .env("RUST_LOG", "warn,hellas_gateway=info")
+            .env("RUST_LOG", "warn,hellas_gateway=info,hellas::metrics=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(address) = &self.metrics_address
+            && args.contains(&"--metrics-port")
+        {
+            command.args(["--metrics-addr", address]);
+        }
+        if let Some(endpoint) = &self.metrics_endpoint {
+            command
+                .env("OTEL_SDK_DISABLED", "false")
+                .env("OTEL_TRACES_EXPORTER", "none")
+                .env("OTEL_METRICS_EXPORTER", "otlp")
+                .env("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", endpoint)
+                .env("OTEL_METRIC_EXPORT_INTERVAL", "100");
+        }
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {

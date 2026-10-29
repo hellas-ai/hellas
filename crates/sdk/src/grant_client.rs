@@ -479,6 +479,8 @@ impl Link {
 pub struct GrantWorkResult {
     pub work_id: Digest,
     pub result: PaidJobResultV1,
+    /// The verified signed transcript; `result.transcript_content` names
+    /// its canonical encoding.
     pub events: Vec<OutputEventEnvelope>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub provider_key: PublicKey,
@@ -744,6 +746,7 @@ impl GrantSession {
         input: PreparedInvocation,
         content: &InvocationContent,
         progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<GrantWorkResult> {
         let (policy, id, mut stream, finish_by) =
@@ -753,6 +756,12 @@ impl GrantSession {
             .invocation_policy
             .admit(&input, &self.options.signer.public_key())?;
         let producer = PublicKey::Secp256k1(grant_producer(&self.target.provider)?.to_bytes());
+        if let Some(accepted) = &accepted {
+            accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: *id.as_bytes(),
+                provider: producer,
+            });
+        }
         let mut verifier = StreamVerifier::new(
             input.request.clone(),
             producer,

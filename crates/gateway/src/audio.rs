@@ -1,6 +1,7 @@
 //! Multipart audio is prepared and decoded on the gateway, through one Compute job.
 use super::{
-    AudioOptions, ComputeEvent, GatewayError, GatewayResult, WorkExecutionBackend, json_error,
+    AudioOptions, ComputeEvent, GatewayError, GatewayResult, WorkEvent, WorkExecutionBackend,
+    json_error,
 };
 use axum::{
     Json, Router,
@@ -170,31 +171,132 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
         Ok(stream) => stream,
         Err(error) => return work_error(error),
     };
-    loop {
+    let mut accepted = None;
+    let mut transcript = None;
+    let mut response = loop {
         match crate::before_deadline(deadline, stream.next()).await {
-            Ok(Some(Ok(ComputeEvent::Output(_)))) => {}
-            Ok(Some(Ok(ComputeEvent::Done { output, .. }))) => {
-                return match state.package.decode(&output) {
+            Ok(Some(Ok(WorkEvent::Accepted(provenance)))) => accepted = Some(provenance),
+            Ok(Some(Ok(WorkEvent::Transcript(signed)))) => transcript = Some(signed),
+            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Output(_))))) => {}
+            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Done { output, .. })))) => {
+                break match state.package.decode(&output) {
                     Ok(ModelResponse::Transcription(result)) if format == "text" => {
-                        result.text.into_response()
+                        text_response(result.text, transcript.as_deref())
                     }
-                    Ok(ModelResponse::Transcription(result)) => {
-                        Json(serde_json::json!({"text":result.text})).into_response()
-                    }
-                    Ok(_) => json_error(StatusCode::BAD_GATEWAY, "unexpected model response"),
-                    Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+                    Ok(ModelResponse::Transcription(result)) => audio_json(
+                        StatusCode::OK,
+                        serde_json::json!({"text":result.text}),
+                        accepted.as_ref(),
+                        transcript.as_deref(),
+                    ),
+                    Ok(_) => audio_error(
+                        StatusCode::BAD_GATEWAY,
+                        "unexpected model response",
+                        accepted.as_ref(),
+                        transcript.as_deref(),
+                    ),
+                    Err(error) => audio_error(
+                        StatusCode::BAD_GATEWAY,
+                        error.to_string(),
+                        accepted.as_ref(),
+                        transcript.as_deref(),
+                    ),
                 };
             }
-            Ok(Some(Err(error))) => return work_error(error),
-            Ok(None) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "execution stream ended without terminal outcome",
+            Ok(Some(Err(error))) => {
+                let error: hellas_adaptors::BackendError = error.into();
+                break audio_error(
+                    super::backend_status(&error),
+                    error.to_string(),
+                    accepted.as_ref(),
+                    transcript.as_deref(),
                 );
             }
-            Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "transcription timed out"),
+            Ok(None) => {
+                break audio_error(
+                    StatusCode::BAD_GATEWAY,
+                    "execution stream ended without terminal outcome",
+                    accepted.as_ref(),
+                    transcript.as_deref(),
+                );
+            }
+            Err(_) => {
+                break audio_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "transcription timed out",
+                    accepted.as_ref(),
+                    transcript.as_deref(),
+                );
+            }
         }
+    };
+    if let Some(accepted) = accepted {
+        response.extensions_mut().insert(accepted);
     }
+    response
+}
+
+fn audio_error(
+    status: StatusCode,
+    message: impl Into<String>,
+    accepted: Option<&hellas_rpc::provenance::ExecutionProvenance>,
+    transcript: Option<&[u8]>,
+) -> Response {
+    audio_json(
+        status,
+        serde_json::json!({"error": {"message": message.into()}}),
+        accepted,
+        transcript,
+    )
+}
+
+fn audio_json(
+    status: StatusCode,
+    mut body: serde_json::Value,
+    accepted: Option<&hellas_rpc::provenance::ExecutionProvenance>,
+    transcript: Option<&[u8]>,
+) -> Response {
+    if let Some(transcript) = transcript {
+        body["hellas"] = serde_json::to_value(crate::backend::provenance::completed_provenance(
+            accepted, transcript,
+        ))
+        .expect("provenance serializes");
+    }
+    (status, Json(body)).into_response()
+}
+
+/// Keep the transcription's text bytes intact; trail its signed evidence.
+fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderName, HeaderValue, header},
+    };
+    use base64::Engine as _;
+    use hellas_rpc::provenance::TRANSCRIPT_KEY;
+    use http_body::Frame;
+
+    let Some(transcript) = transcript else {
+        return text.into_response();
+    };
+    let signed =
+        HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(transcript))
+            .expect("base64 is a valid header value");
+    let frames = futures::stream::iter([
+        Ok::<_, std::convert::Infallible>(Frame::data(axum::body::Bytes::from(text))),
+        Ok(Frame::trailers(HeaderMap::from_iter([(
+            HeaderName::from_static(TRANSCRIPT_KEY),
+            signed,
+        )]))),
+    ]);
+    let mut response = Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::TRAILER, HeaderValue::from_static(TRANSCRIPT_KEY));
+    response
 }
 fn work_error(error: super::WorkGatewayError) -> Response {
     let error: hellas_adaptors::BackendError = error.into();

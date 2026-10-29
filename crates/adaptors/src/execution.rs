@@ -1,4 +1,4 @@
-use hellas_rpc::output::{Provenance, StopReason, TextChannel, Usage};
+use hellas_rpc::output::{StopReason, TextChannel, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -175,6 +175,51 @@ pub struct ExecutionResult {
     pub stop_reason: StopReason,
     pub provenance: Option<Provenance>,
     pub error: Option<ExecutionErrorInfo>,
+}
+
+/// Provenance of one job, rendered as the `hellas` object of each response
+/// that carries it. A provider signs none of it: the gateway vouches for the
+/// job it ran, apart from the signed output vocabulary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Lowercase hex commitment: the work id the provider accepted.
+    pub commitment: Option<String>,
+    /// The accepting provider's key, as
+    /// [`hellas_rpc::provenance::encode_public_key`] renders it.
+    pub provider: Option<String>,
+    /// Base64 of the canonical provider-signed transcript, once the job
+    /// has completed.
+    pub transcript: Option<String>,
+}
+
+impl Provenance {
+    /// The fields `next` names replace these.
+    pub fn merge(&mut self, next: Provenance) {
+        if next.commitment.is_some() {
+            self.commitment = next.commitment;
+        }
+        if next.provider.is_some() {
+            self.provider = next.provider;
+        }
+        if next.transcript.is_some() {
+            self.transcript = next.transcript;
+        }
+    }
+}
+
+/// A call commitment a provider signed into its output.
+impl From<hellas_rpc::output::Provenance> for Provenance {
+    fn from(provenance: hellas_rpc::output::Provenance) -> Self {
+        Self {
+            commitment: provenance.call_commitment,
+            ..Self::default()
+        }
+    }
+}
+
+/// Merge `next` into `current`, starting it if there is none yet.
+pub(crate) fn merge_provenance(current: &mut Option<Provenance>, next: Provenance) {
+    current.get_or_insert_default().merge(next);
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

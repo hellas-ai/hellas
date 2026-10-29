@@ -235,7 +235,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             args: PaidWorkOptions {
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),
-                provider: server.id(),
+                provider: crate::test_support::address(server.id()),
                 provider_addrs: server.bound_sockets(),
                 apple_trust: None,
                 assurance: Assurance::ProducerSigned,
@@ -277,7 +277,30 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
         let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
         let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
-        let result = crate::transact::transact(&mut session, &job, &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(), crate::transact::TransactionOptions {new_purchase: true, ..Default::default()}).await.unwrap();
+        // The acceptance is reported once, before any output, and names the
+        // work and the provider whose transcript the result carries.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (on_accept, on_output) = (seen.clone(), seen.clone());
+        let options = crate::transact::TransactionOptions {
+            new_purchase: true,
+            accepted: Some(Arc::new(move |provenance| on_accept.lock().unwrap().push(Some(provenance)))),
+            progress: Some(Arc::new(move |_| {
+                on_output.lock().unwrap().push(None);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let result = crate::transact::transact(&mut session, &job, &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(), options).await.unwrap();
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(seen.len() > 1, "acceptance and output were reported");
+        assert_eq!(
+            seen[0],
+            Some(hellas_rpc::provenance::ExecutionProvenance { commitment_id: *result.work_id.as_bytes(), provider: result.provider_key })
+        );
+        assert!(seen[1..].iter().all(Option::is_none), "one acceptance, before any output");
+        for envelope in hellas_channel::model::work::decode_transcript(&result.transcript, hellas_channel::work_store::journal::MAX_RECORD_BYTES).unwrap() {
+            envelope.verify(&result.provider_key).unwrap();
+        }
         assert_ne!(result.work_id, first);
         assert_eq!(result.credited_cumulative, 2 * crate::test_support::PRICE);
         assert_eq!(session.with_state(|state| state.proposal_nonce_high_water()).await.unwrap(), 2);
@@ -328,6 +351,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 "responses",
                 grant_input,
                 &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                None,
                 None,
                 None,
             )

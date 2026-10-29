@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
-use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
+use hellas_gateway::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
 use hellas_rpc::output::OutputEvent;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
 use std::sync::atomic::Ordering;
@@ -246,11 +246,74 @@ impl Fixture {
         let mut stream = self.gateway.fetch(self.request(cap))?;
         let mut terminal = false;
         while let Some(event) = stream.next().await {
-            terminal |= event?.terminal().is_some();
+            terminal |= matches!(event?, WorkEvent::Output(event) if event.terminal().is_some());
         }
         assert!(terminal);
         Ok(())
     }
+}
+
+/// The gateway names the accepted work and its provider before any output,
+/// and hands over the transcript that provider signed: every envelope
+/// verifies under the announced key, and the bytes are exactly those the
+/// provider's signed result for that work id names.
+#[tokio::test]
+async fn delivered_transcripts_verify_against_the_accepting_provider() {
+    let fixture = Fixture::builder().build().await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = within(stream.next()).await {
+        events.push(event.unwrap());
+    }
+    let WorkEvent::Accepted(accepted) = &events[0] else {
+        panic!("acceptance must precede output")
+    };
+    assert!(matches!(
+        &events[1],
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
+    ));
+    let [
+        ..,
+        WorkEvent::Transcript(transcript),
+        WorkEvent::Output(terminal),
+    ] = events.as_slice()
+    else {
+        panic!("the transcript must precede the terminal")
+    };
+    assert!(terminal.terminal().is_some());
+    let provider = grant_runner(&fixture.gateway.source.offer).unwrap();
+    assert_eq!(accepted.provider, provider);
+
+    let envelopes = hellas_channel::model::work::decode_transcript(
+        transcript,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+    )
+    .unwrap();
+    assert!(!envelopes.is_empty());
+    for envelope in &envelopes {
+        envelope.verify(&provider).unwrap();
+    }
+    let stranger = ProducerSigningKey::from_secret_bytes([9; 32])
+        .unwrap()
+        .public_key();
+    assert!(envelopes[0].verify(&stranger).is_err());
+
+    let session = fixture.gateway.source.session.lock().await;
+    let job = session
+        .store()
+        .book()
+        .job_by_id(hellas_auth::Digest::from_bytes(accepted.commitment_id))
+        .expect("the commitment names the accepted job");
+    let (result, _) = job.result().expect("the provider signed a result");
+    assert_eq!(result.work_id.as_bytes(), &accepted.commitment_id);
+    assert_eq!(
+        hellas_rpc::ContentRef::for_bytes(transcript),
+        result.transcript_content
+    );
+    drop(session);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -271,6 +334,10 @@ async fn resource_repair_precedes_client_signing() {
 async fn disconnected_consumers_do_not_abandon_accepted_work() {
     let fixture = Fixture::builder().hold_completion().build().await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
     // Admission includes durable writes. Wait for the producer's progress before
     // testing its delivery; the finish gate remains closed throughout this check.
     let first = tokio::select! {
@@ -283,7 +350,9 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     .unwrap();
     assert!(matches!(
         first,
-        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { .. }))
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
     ));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     drop(stream);
@@ -441,7 +510,13 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
-        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { .. }))
+        WorkEvent::Accepted(_)
+    ));
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+            HttpResponseEvent::Head { .. }
+        )))
     ));
     tokio::time::pause();
     for _ in 0..chunks {
@@ -449,7 +524,9 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
         pace.release();
         assert!(matches!(
             stream.next().await.unwrap().unwrap(),
-            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { .. }))
+            WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+                HttpResponseEvent::Body { .. }
+            )))
         ));
     }
     tokio::time::resume();
@@ -457,7 +534,8 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
     fixture.host.backend.finish.release();
     let mut terminal = false;
     while let Some(event) = within(stream.next()).await {
-        terminal |= event.unwrap().terminal().is_some();
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
     }
     assert!(terminal);
     fixture.shutdown().await;
@@ -472,6 +550,10 @@ async fn silent_first_result_outlasts_the_control_timeout() {
         .await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
     within(fixture.host.backend.started.notified()).await;
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(
@@ -482,7 +564,8 @@ async fn silent_first_result_outlasts_the_control_timeout() {
     fixture.host.backend.first.as_ref().unwrap().release();
     let mut terminal = false;
     while let Some(event) = within(stream.next()).await {
-        terminal |= event.unwrap().terminal().is_some();
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
     }
     assert!(terminal);
     fixture.shutdown().await;
@@ -496,7 +579,10 @@ async fn silent_later_result_outlasts_the_control_timeout() {
         .build()
         .await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
-    within(stream.next()).await.unwrap().unwrap();
+    // The acceptance, then the response head.
+    for _ in 0..2 {
+        within(stream.next()).await.unwrap().unwrap();
+    }
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(
@@ -509,7 +595,8 @@ async fn silent_later_result_outlasts_the_control_timeout() {
     pace.release();
     let mut terminal = false;
     while let Some(event) = within(stream.next()).await {
-        terminal |= event.unwrap().terminal().is_some();
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
     }
     assert!(terminal);
     fixture.shutdown().await;
@@ -524,6 +611,10 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
         .await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
     within(fixture.host.backend.started.notified()).await;
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        WorkEvent::Accepted(_)
+    ));
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     assert!(

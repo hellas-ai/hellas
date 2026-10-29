@@ -51,7 +51,9 @@ identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
 work is sold only with `--paid-work-config FILE`: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
 The example charges 20 per job, ten jobs per channel, and stops execution after
-90 seconds. `serve` prints A's `Node ID`.
+90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
+content ID of A's enrollment and the node it binds. B learns it from A out of
+band and every paid connection must present exactly that enrollment.
 
 Person B runs no node. With a Catena program `counter.hex`:
 
@@ -65,9 +67,9 @@ one command builds a job, pays A and prints the result; a second closes the
 channel:
 
 ```sh
-hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20
-hellas --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 B's key approves funding once per channel: A's jobs per channel times its
@@ -363,14 +365,31 @@ cargo outdated --workspace --root-deps-only  # outdated deps
 cargo update --workspace   # update Cargo.lock
 ```
 
-### Optional OpenTelemetry
+### Optional metrics and OpenTelemetry
 
-The `otel` Cargo feature is opt-in across the CLI (including Fetch, node,
-gateway, indexer and validator commands). Default Nix packages, including
-public musl builds, disable Hellas telemetry exporters. Request instrumentation
-uses shared enabled/no-op implementations; ordinary operational logs remain.
-Transitive dependencies still include metrics collection and telemetry SDK crates;
-disabling `otel` does not remove those dependencies.
+The default-off `otel` Cargo feature enables metrics and OTLP export across the
+CLI. Default packages, including public musl and Docker builds, omit the metrics
+server, `--metrics-port`/`--metrics-addr`, and gateway/executor instruments.
+Dependencies may still collect their own telemetry independently. Use an `otel`
+build (`cli.override { otel = true; }` or the `docker-otel` image) for metrics.
+
+With that build, `hellas serve --metrics-port 9090` and
+`hellas gateway --metrics-port 9091` serve Prometheus text at
+`http://127.0.0.1:<port>/metrics`. This unauthenticated listener defaults to
+loopback. `--metrics-addr IP` explicitly selects another interface, including
+`0.0.0.0` for container scraping. One-shot commands do not start a metrics server.
+Scrapes collect executor and gateway instruments from the same meter provider
+used for optional OTLP push; both can run together. OTLP environment opt-outs,
+including `OTEL_SDK_DISABLED`, leave the requested local listener active.
+Iroh endpoint metrics share the response for serve and remote-grant gateways;
+paid-pool gateways do not expose their private endpoint.
+
+NixOS exposes `services.hellas.metricsPort` and
+`services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port
+(default `"127.0.0.1"`). Set `services.hellas.otel.enable = true` to select the
+feature-enabled default package, even for local scraping without a collector.
+Metrics ports require this setting; custom packages must also enable `otel`.
+Chain validators retain their separate `--metrics-bind-address` spelling.
 
 The exported NixOS, nix-darwin and Home Manager modules share `otel` options:
 
@@ -387,7 +406,7 @@ programs.hellas.otel.collectorEndpoint = "http://127.0.0.1:4318";
 ```
 
 A configured endpoint enables the feature on the module's default package;
-`otel.enable = false` explicitly selects the build without telemetry. Custom
+`otel.enable = false` selects the build without metrics or OTLP export. Custom
 packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
 HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
 continues to accept an exact trace URL. Home Manager and nix-darwin scope

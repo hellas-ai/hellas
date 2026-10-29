@@ -403,6 +403,7 @@ impl WorkSource for GrantSource {
                 prepared,
                 &content,
                 Some(requester.progress()),
+                Some(requester.accepted()),
                 Some(&proposed),
             );
             tokio::pin!(operation);
@@ -418,6 +419,8 @@ impl WorkSource for GrantSource {
             }
             .map_err(client_error)?;
             Ok(Some(Completed {
+                transcript: hellas_channel::model::work::encode_transcript(&output.events)
+                    .map_err(error)?,
                 output: output.output,
                 provider: output.provider_key,
             }))

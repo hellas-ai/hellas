@@ -204,6 +204,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
                 Ok(())
             })),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -308,6 +309,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                     &InvocationContent::Ephemeral(Default::default()),
                     None,
                     None,
+                    None,
                 )
                 .await,
             Err(GrantClientError::RecoveryRequired)
@@ -393,6 +395,7 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
             &InvocationContent::Ephemeral(Default::default()),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -425,6 +428,7 @@ async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
                     &InvocationContent::Ephemeral(Default::default()),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -451,6 +455,7 @@ async fn recovered_metadata_is_bound_to_the_requested_job_channel_and_provider()
             "responses",
             f.input(),
             &InvocationContent::Ephemeral(Default::default()),
+            None,
             None,
             None,
         )

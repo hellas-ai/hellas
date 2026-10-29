@@ -55,14 +55,14 @@ Opening one as the other fails.
 Use a [job folder](../../docs/jobs.md) to keep the caller input reusable:
 
 ```sh
-hellas --passkey owner.key transact --job ./job --provider NODE_ID -o ./result
-hellas --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
-  --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas --passkey owner.key transact --settle --provider NODE_ID
+hellas --passkey owner.key transact --job ./job --provider ENROLLMENT_ID@NODE_ID -o ./result
+hellas --faucet fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --payment 20 \
+  --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
+hellas --passkey owner.key transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
-The helper selects the Fetch contract from the authenticated provider quote and
-calls the same transaction as a raw folder. The provider's owner-approved
+The helper runs under the Fetch contract its caller names and calls the same
+transaction as a raw folder; a quote that does not admit it is refused. The provider's owner-approved
 `PaidPolicy` fixes its contract, route, price and resource limits. Chain
 configuration holds chain pins and journal locations. See the
 [paid gateway guide](../../docs/paid-gateway.md) for provider and wallet setup.
@@ -96,8 +96,10 @@ connection time. A registered route such as `http/request` must implement the
 HTTP manifest. The paid policy's byte/frame limits must cover the encoded HTTP
 response as well as its envelopes (base64 expands binary bodies).
 
-Use `hellas fetch --contract http-contract.json` to select the quoted canonical
-HTTP descriptor explicitly. Software providers require the selected endpoint identity. Apple-attested
+`hellas fetch --contract http` names the HTTPS descriptor built into the release;
+`--contract FILE` names an exact descriptor. The contract is never taken from the
+provider's quote. Software providers require the provider address
+`ENROLLMENT_ID@NODE_ID`. Apple-attested
 providers also require an independently approved `--trust-store` and `--trust-policy`
 with app IDs and release CDHashes; see the [paid gateway guide](../../docs/paid-gateway.md).
 The signed offer carries the provider enrollment and channel policy. Every paid

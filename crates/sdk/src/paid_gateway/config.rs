@@ -2,7 +2,6 @@ use super::{PaidWorkOptions, PoolError, Result};
 use crate::trust_policy::TrustPolicyStore;
 use crate::work_config::load_work_config;
 use hellas_rpc::Assurance;
-use iroh::EndpointId;
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
@@ -54,8 +53,8 @@ impl PaidGatewayOptions {
                     "paid providers must have distinct journal roots",
                 ));
             }
-            if !endpoints.insert(provider.provider) {
-                return Err(PoolError::DuplicateProvider(provider.provider));
+            if !endpoints.insert(provider.provider.node) {
+                return Err(PoolError::DuplicateProvider(provider.provider.node));
             }
         }
         Ok(())
@@ -163,7 +162,7 @@ const fn max_pending_requests() -> usize {
 struct ProviderFile {
     chain_config: PathBuf,
     journal_root: PathBuf,
-    provider: EndpointId,
+    provider: hellas_client::ProviderAddress,
     #[serde(default)]
     provider_addrs: Vec<SocketAddr>,
     payment: u64,
@@ -174,13 +173,30 @@ struct ProviderFile {
 mod tests {
     use super::*;
     fn provider() -> serde_json::Value {
-        serde_json::json!({"chain_config":"/config/chain.json", "journal_root":"/state/client", "provider":iroh::SecretKey::from_bytes(&[4;32]).public(),
+        serde_json::json!({"chain_config":"/config/chain.json", "journal_root":"/state/client",
+            "provider":crate::test_support::address(iroh::SecretKey::from_bytes(&[4;32]).public()),
             "payment":10})
     }
     #[test]
-    fn software_pool_selects_node_and_price_without_a_policy_or_offer_copy() {
+    fn software_pool_selects_address_and_price_without_a_policy_or_offer_copy() {
         let entry: ProviderFile = serde_json::from_value(provider()).unwrap();
+        assert_eq!(
+            entry.provider,
+            crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public())
+        );
         assert_eq!(entry.payment, 10);
+        let mut node_only = provider();
+        node_only["provider"] = iroh::SecretKey::from_bytes(&[4; 32])
+            .public()
+            .to_string()
+            .into();
+        let error = serde_json::from_value::<ProviderFile>(node_only)
+            .err()
+            .expect("a node ID alone is not a provider address");
+        assert!(
+            error.to_string().contains("ENROLLMENT_ID@NODE_ID"),
+            "{error}"
+        );
         assert!(entry.trust_policy.is_none());
         for field in [
             "offer",

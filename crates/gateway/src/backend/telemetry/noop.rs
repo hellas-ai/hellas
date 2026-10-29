@@ -1,5 +1,5 @@
 use futures::Stream;
-use hellas_adaptors::{BackendError, BackendRequest, OutputEvent};
+use hellas_adaptors::{BackendError, BackendEvent, BackendRequest};
 use tracing::Span;
 
 #[derive(Clone)]
@@ -24,7 +24,7 @@ impl Inference {
     pub(crate) fn response_model(&mut self, _: &str) {}
     pub(crate) fn stream<S>(self, stream: S) -> S
     where
-        S: Stream<Item = Result<OutputEvent, BackendError>> + Send + 'static,
+        S: Stream<Item = Result<BackendEvent, BackendError>> + Send + 'static,
     {
         stream
     }

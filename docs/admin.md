@@ -179,9 +179,11 @@ Its request and authentication clients share the same proxy/CA/redirect policy;
 refresh errors discard upstream descriptions before logging or persistence. These
 path protections do not establish signed-platform privacy or vendor retention policy.
 
-`hellas fetch` selects the HTTPS contract from the provider quote and includes its
-canonical bytes with the signed request. `--contract FILE` selects that exact
-descriptor explicitly; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
+`hellas fetch` runs only under the HTTPS contract its caller names with
+`--contract`: `http`, the contract built into the release, or an exact
+descriptor file. It never takes the contract from the provider's quote; a quote
+that does not admit the named contract is refused before funding. The signed
+request includes the contract's canonical bytes; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
 same descriptor. Ordinary clients select descriptors from resource policy, without
 linking the reseller implementation. Missing descriptors and old bundle shapes deny.
 

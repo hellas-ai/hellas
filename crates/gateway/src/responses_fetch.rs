@@ -1,10 +1,11 @@
 //! Responses presentation over an already funded, authenticated Work backend.
-use super::{WorkExecutionBackend, WorkFetchRequest};
+use super::backend::provenance::{completed_provenance, provenance_from_execution};
+use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
 use axum::{Router, body::Bytes, extract::State, response::Response, routing::post};
 use futures::StreamExt;
 use hellas_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, RenderContext,
-    openai::responses::OpenAiResponsesAdaptor,
+    BackendError, BackendEvent, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
+    RenderContext, openai::responses::OpenAiResponsesAdaptor,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -73,7 +74,7 @@ impl ExecutionBackend for FetchBackend {
             body.extend(self.options.overrides.clone());
             body.insert("stream".into(), Value::Bool(true));
             body.insert("store".into(), Value::Bool(false));
-            let events = self
+            let mut events = self
                 .work
                 .fetch(WorkFetchRequest {
                     provider: self.options.provider,
@@ -83,9 +84,23 @@ impl ExecutionBackend for FetchBackend {
                         .map_err(|e| BackendError::rejected(e.to_string()))?,
                 })
                 .map_err(BackendError::from)?;
+            let accepted = crate::accepted(&mut events).await;
+            let initial = accepted.as_ref().map(provenance_from_execution);
             Ok(BackendStream::new(
-                events.map(|event| event.map_err(BackendError::from)),
-                None,
+                events.filter_map(move |event| {
+                    std::future::ready(match event {
+                        Ok(WorkEvent::Output(event)) => Some(Ok(event.into())),
+                        Ok(WorkEvent::Transcript(transcript)) => {
+                            Some(Ok(BackendEvent::Provenance(completed_provenance(
+                                accepted.as_ref(),
+                                &transcript,
+                            ))))
+                        }
+                        Ok(WorkEvent::Accepted(_)) => None,
+                        Err(error) => Some(Err(BackendError::from(error))),
+                    })
+                }),
+                initial,
             ))
         })
     }

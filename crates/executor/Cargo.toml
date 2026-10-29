@@ -29,7 +29,6 @@ hellas-wire = { workspace = true }
 libloading = "0.9"
 metacat = "0.3"
 opentelemetry = { workspace = true, optional = true }
-prometheus-client = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_ipld_dagcbor.workspace = true

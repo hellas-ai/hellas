@@ -27,20 +27,29 @@ pub use transcribe::{TranscribeArgs, transcribe};
 #[cfg(test)]
 mod tests;
 
+/// `ENROLLMENT_ID@NODE_ID`, optionally followed by `@IP:PORT`.
 #[derive(Clone, Debug)]
 pub struct Provider {
-    pub id: iroh::EndpointId,
+    pub address: hellas_sdk::client::ProviderAddress,
     pub addresses: Vec<SocketAddr>,
 }
 impl std::str::FromStr for Provider {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (id, address) = value
-            .split_once('@')
-            .map_or((value, None), |(id, a)| (id, Some(a)));
+        let (address, direct) = value
+            .match_indices('@')
+            .nth(1)
+            .map_or((value, None), |(at, _)| {
+                (&value[..at], Some(&value[at + 1..]))
+            });
         Ok(Self {
-            id: id.parse().context("invalid provider node ID")?,
-            addresses: address.map(str::parse).transpose()?.into_iter().collect(),
+            address: address.parse()?,
+            addresses: direct
+                .map(str::parse)
+                .transpose()
+                .context("invalid provider @IP:PORT")?
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -66,7 +75,8 @@ fn duration(value: &str) -> Result<Duration, String> {
 
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
-    /// Provider node ID, optionally followed by @IP:PORT.
+    /// Provider address ENROLLMENT_ID@NODE_ID, as `hellas serve` prints it,
+    /// optionally followed by @IP:PORT.
     #[arg(long)]
     provider: Provider,
     /// Additional direct UDP addresses for the provider.
@@ -131,9 +141,11 @@ pub struct FetchArgs {
     data: Option<String>,
     #[arg(long)]
     max_response_bytes: Option<u32>,
-    /// Explicit selection of the provider's admitted Fetch contract.
-    #[arg(long, value_name = "FILE")]
-    contract: Option<PathBuf>,
+    /// The Fetch contract this request must run under: `http`, the HTTPS
+    /// contract built into this release, or an exact contract JSON file. It is
+    /// never taken from the provider's quote.
+    #[arg(long, value_name = "http|FILE")]
+    contract: String,
     /// DER trust anchor; repeat for private HTTPS roots.
     #[arg(long = "tls-root", value_name = "FILE")]
     tls_roots: Vec<PathBuf>,
@@ -208,12 +220,18 @@ impl ClientArgs {
                 )
                 .to_string(),
             )
-            .join(self.provider.id.to_string())
+            .join(self.provider.address.to_string())
             .join(hex::encode(owner.principal().as_bytes()))
             .join(format!("{}.json", job.digest()));
         let mut purchase = Purchase::open(&path, job, self.buy_again)?;
         purchase.reconcile(options).await?;
         Ok(purchase)
+    }
+
+    /// One directory of channel journals per provider address.
+    fn journals(&self, root: &Path) -> PathBuf {
+        root.join("channels")
+            .join(self.provider.address.to_string())
     }
 
     async fn options(
@@ -236,9 +254,9 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: root.join("channels").join(self.provider.id.to_string()),
+            journal_root: self.journals(&root),
             config,
-            provider: self.provider.id,
+            provider: self.provider.address,
             provider_addrs: self
                 .provider
                 .addresses
@@ -328,6 +346,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
+    let contract = args.contract()?;
     ensure!(args.payment > 0, "--payment must be positive");
     bounded(
         args.client.timeout,
@@ -345,20 +364,6 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     args.client.owner(&context)?.principal(),
                 )
                 .await?;
-                let selected = args
-                    .contract
-                    .as_ref()
-                    .map(|path| -> super::CliResult<hellas_rpc::FetchContract> {
-                        serde_json::from_slice::<hellas_rpc::FetchContract>(
-                            &super::read_bounded_regular_file(
-                                path,
-                                "contract",
-                                hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
-                            )?,
-                        )
-                        .map_err(Into::into)
-                    })
-                    .transpose()?;
                 let admission = quote
                     .policy
                     .invocation_policy
@@ -366,21 +371,13 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     .iter()
                     .find_map(|a| match a {
                         hellas_rpc::protocol::invocation::Admission::Fetch { admission }
-                            if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1
-                                && selected
-                                    .as_ref()
-                                    .is_none_or(|contract| contract == &admission.contract) =>
+                            if admission.contract == contract =>
                         {
                             Some(admission)
                         }
                         _ => None,
                     })
-                    .context(if selected.is_some() {
-                        "selected contract is not admitted. Nothing was paid."
-                    } else {
-                        "provider does not admit HTTPS Fetch. Nothing was paid."
-                    })?;
-                let contract = &admission.contract;
+                    .context("provider does not admit the named contract. Nothing was paid.")?;
                 let route = &admission.route;
                 let (service, method) = match route {
                     hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch {
@@ -447,6 +444,23 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
 }
 
 impl FetchArgs {
+    /// The named HTTPS contract; checked before any provider is contacted.
+    fn contract(&self) -> super::CliResult<hellas_rpc::FetchContract> {
+        let contract = match self.contract.as_str() {
+            "http" => hellas_rpc::FetchContract::http()?,
+            path => serde_json::from_slice(&super::read_bounded_regular_file(
+                Path::new(path),
+                "contract",
+                hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+            )?)?,
+        };
+        ensure!(
+            contract.schema() == hellas_rpc::FetchSchema::HttpV1,
+            "hellas fetch requires an http_v1 contract"
+        );
+        Ok(contract)
+    }
+
     fn assurance(&self) -> Assurance {
         if self.assurance == "apple-app-attest" {
             Assurance::AppleAppAttest
@@ -565,7 +579,7 @@ fn write(path: &Path, bytes: &[u8]) -> super::CliResult<()> {
 fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
     format!(
         "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} ({})",
-        provider.id,
+        provider.address,
         job.digest(),
         job.manifest().application().evaluator(),
         job.manifest().application().adaptor(),
@@ -577,7 +591,7 @@ fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
         } else {
             format!(
                 "open; `hellas transact --settle --provider {}` closes it",
-                provider.id
+                provider.address
             )
         }
     )

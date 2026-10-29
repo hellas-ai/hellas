@@ -1,6 +1,7 @@
 use super::config::{HttpRoute, public_tls};
 use super::routing::retry_delay;
 use super::*;
+use hellas_rpc::provenance::ExecutionProvenance;
 use std::{
     collections::BTreeMap,
     time::{Duration, SystemTime},
@@ -46,12 +47,12 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             }
             let ack = self.ack.clone();
             Ok(Box::pin(async_stream::try_stream! {
-                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
                     status: 200, headers: vec![("content-type".into(), "application/octet-stream".into())],
-                }));
-                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64: "AP8K".into() }));
+                })));
+                yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64: "AP8K".into() })));
                 ack.notified().await;
-                yield OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None };
+                yield WorkEvent::Output(OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None });
             }))
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
@@ -325,4 +326,167 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
             crate::GatewayConfigError::FetchRouteMismatch(_)
         ))
     ));
+}
+
+/// A provider that accepts the request, answers with `status` and the given
+/// body, and signs `transcript`.
+struct Proxied {
+    provider: iroh::EndpointId,
+    status: u16,
+    body: Option<&'static str>,
+    transcript: Vec<u8>,
+}
+
+impl WorkExecutionBackend for Proxied {
+    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+        vec![crate::FetchRoute {
+            provider: self.provider,
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("http".into(), "request".into())),
+        }]
+    }
+    fn fetch(
+        &self,
+        _: WorkFetchRequest,
+    ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
+        let mut events = vec![
+            WorkEvent::Accepted(ExecutionProvenance {
+                commitment_id: [0x7c; 32],
+                provider: hellas_auth::PublicKey::Secp256k1([0x02; 33]),
+            }),
+            WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+                HttpResponseEvent::Head {
+                    status: self.status,
+                    // A provider cannot speak for the gateway.
+                    headers: vec![("x-hellas-provider".into(), "forged".into())],
+                },
+            ))),
+        ];
+        if let Some(body) = self.body {
+            events.push(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
+                HttpResponseEvent::Body {
+                    base64: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        body,
+                    ),
+                },
+            ))));
+        }
+        events.push(WorkEvent::Transcript(self.transcript.clone()));
+        events.push(WorkEvent::Output(OutputEvent::Finished {
+            stop_reason: StopReason::EndOfText,
+            usage: None,
+        }));
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The raw HTTP/1.1 exchange, so the wire shows where each value travels.
+async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = "opaque request";
+    socket
+        .write_all(
+            format!(
+                "POST /v1/responses HTTP/1.1\r\nhost: gateway\r\nauthorization: Bearer {bearer}\r\n\
+                 te: trailers\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    socket.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+/// Proxied HTTPS responses name the accepted job and its provider in their
+/// head, and trail the body with the transcript that provider signed. A
+/// bodyless response, whose head waits for completion, carries it as a header.
+#[tokio::test]
+async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trailers() {
+    use base64::Engine as _;
+    let transcript = b"provider-signed transcript".to_vec();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&transcript);
+    let provider = format!("secp256k1:{}", "02".repeat(33));
+    for (status, body) in [(200, Some("streamed body")), (204, None)] {
+        let paid = Arc::new(Proxied {
+            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
+            status,
+            body,
+            transcript: transcript.clone(),
+        });
+        let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+            "service": "http", "method": "request", "routes": [{
+                "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
+            }]
+        }))
+        .unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let fixture = crate::access::tests::Fixture::new().await;
+        let handle = crate::start(crate::GatewayOptions {
+            server: crate::ServerOptions {
+                // Archive the exchange, so trailers must pass the archive too.
+                archive: crate::ArchiveOptions {
+                    directory: archive.path().into(),
+                    zdr: false,
+                },
+                host: "127.0.0.1".into(),
+                port: Some(0),
+                access: fixture.access,
+                allow_remote: false,
+                wrap: None,
+                wrap_args: Vec::new(),
+            },
+            work: paid,
+            presentations: crate::Presentations {
+                http: Some(config),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        let wire = exchange(handle.address(), handle.bearer()).await;
+        let (head, rest) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{head}");
+        assert!(
+            head.contains(&format!(
+                "\r\nx-hellas-commitment-bin: {}\r\n",
+                "7c".repeat(32)
+            )),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("\r\nx-hellas-provider: {provider}\r\n")),
+            "{head}"
+        );
+        assert!(!head.contains("forged"), "{head}");
+        match body {
+            Some(body) => {
+                assert!(
+                    head.contains("\r\ntrailer: x-hellas-transcript\r\n"),
+                    "{head}"
+                );
+                assert!(!head.contains("x-hellas-transcript:"), "{head}");
+                assert!(rest.contains(body), "{rest}");
+                assert!(
+                    rest.ends_with(&format!("\r\n0\r\nx-hellas-transcript: {encoded}\r\n\r\n")),
+                    "{rest:?}"
+                );
+            }
+            None => {
+                assert!(
+                    head.contains(&format!("\r\nx-hellas-transcript: {encoded}\r\n")),
+                    "{head}"
+                );
+                assert!(rest.is_empty(), "{rest:?}");
+            }
+        }
+        handle.shutdown().await.unwrap();
+    }
 }

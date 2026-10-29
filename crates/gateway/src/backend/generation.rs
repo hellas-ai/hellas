@@ -61,19 +61,22 @@ mod tests {
         }));
         let stream = generation_stream(PreparedGeneration {
             chat: None,
-            prepared: Box::pin(futures::stream::iter(events)),
+            prepared: Box::pin(
+                futures::stream::iter(events).map(|event| event.map(crate::WorkEvent::Output)),
+            ),
             provenance: None,
             prompt_tokens: 1,
             presentation: Arc::new(
                 hellas_presentation::TextPresentation::from_gguf(&path).unwrap(),
             ),
-            inference_timeout: Some(std::time::Duration::from_secs(5)),
+            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
         });
         tokio::pin!(stream);
         let mut text = String::new();
         let mut completed = false;
         while let Some(event) = stream.next().await {
             match event.unwrap() {
+                GenerationEvent::Transcript(_) => panic!("fixture has no transcript"),
                 GenerationEvent::Delta(delta) => text.push_str(&delta),
                 GenerationEvent::Done(done) => {
                     assert_eq!(done.output_tokens, 2);
@@ -94,6 +97,8 @@ use super::super::state::PreparedGeneration;
 #[derive(Debug, Clone)]
 pub(super) enum GenerationEvent {
     Delta(String),
+    /// Canonical bytes of the provider-signed transcript.
+    Transcript(Vec<u8>),
     Done(TextCompletion),
 }
 
@@ -131,7 +136,16 @@ pub(super) fn generation_stream(
         let mut received = 0u64;
         tokio::pin!(prepared);
         while let Some(event) = prepared.next().await {
-            match event? {
+            let event = match event? {
+                crate::WorkEvent::Output(event) => event,
+                crate::WorkEvent::Transcript(transcript) => {
+                    yield GenerationEvent::Transcript(transcript);
+                    continue;
+                }
+                // PreparedGeneration::accept consumed the acceptance.
+                crate::WorkEvent::Accepted(_) => continue,
+            };
+            match event {
                 ComputeEvent::Output(chunk) => {
                     if chunk.name != "emitted" || chunk.format != "catena.u64le.v1" {
                         Err(invalid("text job returned an unexpected output"))?;

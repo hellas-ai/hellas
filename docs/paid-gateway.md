@@ -38,11 +38,15 @@ audio to 16 kHz on the client, and returns `{"text":"..."}` or plain text with
 The audio route has its own body limit, including archival and multipart model
 splitting. Ordinary JSON routes retain their existing limit. HTTP format options
 and multipart fields are validated before submitting work.
+Responses identify the accepted job and provider in `x-hellas-commitment-bin` and
+`x-hellas-provider`. JSON includes the signed transcript in its `hellas` object;
+plain text carries it in the `x-hellas-transcript` trailer (HTTP/1.1 clients must
+send `TE: trailers` to receive trailers).
 
 For a single paid job without an HTTP server:
 
 ```sh
-hellas --passkey owner.key transcribe --provider NODE_ID \
+hellas --passkey owner.key transcribe --provider ENROLLMENT_ID@NODE_ID \
   --model /models/whisper-tiny --audio speech.wav --language en --payment 20
 ```
 
@@ -100,7 +104,7 @@ The pool selects providers and expected prices. It obtains each policy with
     {
       "chain_config": "/srv/hellas/chain.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
-      "provider": "PROVIDER_ENDPOINT_ID",
+      "provider": "ENROLLMENT_ID@NODE_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "payment": 20
     }
@@ -127,7 +131,7 @@ provider's jobs per channel times its price, plus omission reserve and fees.
 At most four eligible owner coins fund one delegated output; change returns
 undelegated to the same owner. The wallet records the signed reshape before
 submission and shares reservations across gateway providers. Later jobs reuse
-the open channel. `transact --settle --provider NODE_ID` closes it and returns unspent funding.
+the open channel. `transact --settle --provider ENROLLMENT_ID@NODE_ID` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -139,9 +143,12 @@ The original signed offer, policy and authenticated peer are durable together;
 retries return the same offer and restart requires no route configuration.
 Unanswered offers expire at their bond timeout.
 
-ProducerSigned providers need only the selected endpoint ID. Each live Open
-checks that the enrollment names that transport and verifies the producer proof.
-Apple-attested providers additionally require the existing independent trust store.
+`provider` is the address `hellas serve` prints: the content ID of the
+provider's enrollment bundle and the node ID it binds. Each live Open checks
+that the provider presents exactly that enrollment, that it names the live
+transport, and verifies the producer proof; a retained channel whose offer names
+another enrollment is refused on restart. Apple-attested providers additionally
+require the existing independent trust store.
 For those entries, add a top-level `trust_store` directory and a per-provider
 `trust_policy` ID. Approve app IDs and release CDHashes independently:
 
@@ -152,7 +159,8 @@ hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
 ```
 
 The existing trust JSON contains `provider_genesis`, `assurance`, and `apple`
-with `app_id` and `cd_hashes`. Missing or mismatched
+with `app_id` and `cd_hashes`; `provider_genesis` must equal the address's
+enrollment ID. Missing or mismatched
 Apple approval fails before funding or disclosure. Approval replacement retains
 its revision checks and persistent assertion counters. `transact` accepts
 `--trust-store` and `--trust-policy` for Apple providers; software providers do not
@@ -271,8 +279,10 @@ accept complete URLs instead. Give these services distinct `OTEL_SERVICE_NAME`
 values. Validators require both `validator` and `otel`. Sampling honors the
 upstream sampled flag; `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
 `OTEL_TRACES_SAMPLER_ARG` controls new root traces. Default packages omit the
-Hellas telemetry exporters; transitive dependencies still include metrics and SDK
-crates. Nix module `otel` options select enabled builds.
+metrics server, gateway/executor instruments and OTLP exporters. The `otel`
+build also enables `serve` and `gateway --metrics-port` scraping, with an optional
+`--metrics-addr IP` (default loopback, unauthenticated). Transitive dependencies
+still include metrics and SDK crates. Nix module `otel` options select enabled builds.
 
 The gateway accepts W3C `traceparent`/`tracestate` headers and returns
 `traceparent` plus `x-hellas-trace-id` for trace lookup. Without an incoming
@@ -313,7 +323,7 @@ Hydra retains these outputs on test failure using its `nix-support/failed`
 convention, so a failing check still has downloadable traces. Local
 `nix build .#nixosTests.x86_64-linux.<name>` keeps the usual failing exit status;
 use the Hydra attribute when retaining failure outputs is needed. Public
-packages still build without telemetry by default.
+packages still build without metrics or OTLP export by default.
 
 ## Embedding
 

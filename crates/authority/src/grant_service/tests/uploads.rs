@@ -322,8 +322,7 @@ async fn malformed_first_grant_chunks_release_quota_and_cannot_retain_the_writer
             .unwrap()
             .uploads
             .get(&a.channel_id.0)
-            .unwrap()
-            .is_staged()
+            .is_some_and(|uploads| uploads.is_staged())
     );
     let malformed = b"not a prepared input";
     let mut bad = request.clone();
@@ -353,8 +352,7 @@ async fn malformed_first_grant_chunks_release_quota_and_cannot_retain_the_writer
             .unwrap()
             .uploads
             .get(&a.channel_id.0)
-            .unwrap()
-            .is_staged()
+            .is_some_and(|uploads| uploads.is_staged())
     );
     assert_no_payload_files(root.path(), &bytes);
     // Leave a valid unfinished upload with a deadline in the future. Its

@@ -80,6 +80,11 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway.extraArgs may not override" assertion.message
     ) (throw "missing gateway extraArgs assertion") evaluation.config.assertions;
+  metricsFeatureAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "metrics ports require otel.enable" assertion.message
+    ) (throw "missing metrics feature assertion") evaluation.config.assertions;
   trustPairAssertion =
     evaluation:
     lib.findFirst (
@@ -565,6 +570,9 @@ let
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.toml";
           passkey = "/run/hellas/owner.passkey";
+          otel.enable = true;
+          metricsPort = 9400;
+          metricsAddress = "0.0.0.0";
           queueSize = 0;
           fetchConfigFile = "/run/hellas/fetch.json";
           environmentFile = "/run/hellas/provider.env";
@@ -575,6 +583,8 @@ let
             offer = "provider";
             passkey = "/run/hellas/principal.passkey";
             workProfile = "/run/hellas/work-profile.json";
+            metricsPort = 9401;
+            metricsAddress = "::1";
             defaultMaxTokens = 4294967295;
             assurance = "apple-app-attest";
             trustPolicy = "provider";
@@ -664,6 +674,63 @@ in
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+    assert
+      !(metricsFeatureAssertion (evalProvider {
+        metricsPort = 9400;
+      })).assertion;
+    assert
+      !(metricsFeatureAssertion (evalGateway {
+        metricsPort = 9401;
+      })).assertion;
+    assert
+      !(lib.hasInfix "--metrics-"
+        (evalProvider { metricsPort = 9400; }).config.systemd.services.hellas.serviceConfig.ExecStart
+      );
+    assert
+      !(lib.hasInfix "--metrics-"
+        (evalGateway { metricsPort = 9401; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
+      );
+    assert lib.hasInfix "--metrics-port 9400" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-addr 0.0.0.0" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--metrics-addr ::1" gatewayService.serviceConfig.ExecStart;
+    assert (evalGateway { }).config.services.hellas.gateway.metricsAddress == "127.0.0.1";
+    assert (evalProvider { }).config.services.hellas.metricsAddress == "127.0.0.1";
+    assert lib.all
+      (
+        args:
+        !(serveExtraArgsAssertion (evalProvider {
+          extraArgs = args;
+        })).assertion
+        && !(gatewayExtraArgsAssertion (evalGateway {
+          extraArgs = args;
+        })).assertion
+      )
+      [
+        [
+          "--metrics-addr"
+          "0.0.0.0"
+        ]
+        [ "--metrics-addr=0.0.0.0" ]
+      ];
+    assert lib.hasInfix "--metrics-port 9401" gatewayService.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--metrics-port"
+        (evalGateway { }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
+      );
+    assert lib.all
+      (
+        args:
+        !(gatewayExtraArgsAssertion (evalGateway {
+          extraArgs = args;
+        })).assertion
+      )
+      [
+        [
+          "--metrics-port"
+          "9402"
+        ]
+        [ "--metrics-port=9402" ]
+      ];
     assert lib.hasInfix "--responses-model gpt-x,gpt-y" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--responses-overrides" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"

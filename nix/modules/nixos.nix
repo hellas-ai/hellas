@@ -200,6 +200,10 @@ in
   config = mkIf (cfg.enable || gateway.enable) {
     assertions = [
       {
+        assertion = cfg.otel.enable || (cfg.metricsPort == null && gateway.metricsPort == null);
+        message = "services.hellas metrics ports require otel.enable and packages built with the otel feature.";
+      }
+      {
         assertion = !gateway.enable || gateway.gatewayProfile != null;
         message = "services.hellas.gateway requires gatewayProfile for its provisioned HTTP authority.";
       }
@@ -314,6 +318,7 @@ in
           ++ hellas.mkServeArgs {
             inherit lib;
             serve = cfg;
+            inherit (cfg) otel;
           }
         );
         Restart = "on-failure";
@@ -389,6 +394,7 @@ in
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
             inherit lib gateway;
+            inherit (cfg) otel;
           }
         );
         Restart = "on-failure";

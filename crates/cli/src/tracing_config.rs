@@ -14,7 +14,66 @@ use tracing_subscriber::reload;
 #[cfg_attr(not(feature = "otel"), path = "tracing_config/noop.rs")]
 mod telemetry;
 
-pub use telemetry::TracerGuard;
+pub struct TracerGuard {
+    traces: telemetry::TracerGuard,
+    #[cfg(feature = "otel")]
+    metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
+}
+
+impl TracerGuard {
+    pub fn shutdown(self) {
+        self.traces.shutdown();
+        #[cfg(feature = "otel")]
+        if let Err(error) = self.metrics.shutdown() {
+            eprintln!("warning: failed to flush metrics: {error}");
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+fn build_meter_provider(
+    registry: Option<&prometheus::Registry>,
+) -> opentelemetry_sdk::metrics::SdkMeterProvider {
+    let mut builder =
+        opentelemetry_sdk::metrics::SdkMeterProvider::builder().with_resource(otlp_resource());
+    if let Some(registry) = registry {
+        let reader = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .build()
+            .expect("register the sole OpenTelemetry collector");
+        builder = builder.with_reader(reader);
+    }
+    #[cfg(feature = "otel")]
+    if telemetry::otlp_signal_enabled("METRICS") {
+        match opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .build()
+        {
+            Ok(exporter) => builder = builder.with_periodic_exporter(exporter),
+            Err(_) => {
+                eprintln!("warning: failed to build OTLP metric exporter; check OTEL configuration")
+            }
+        }
+    }
+    builder.build()
+}
+
+#[cfg(feature = "otel")]
+fn otlp_resource() -> opentelemetry_sdk::Resource {
+    let resource = opentelemetry_sdk::Resource::builder().build();
+    // Keep the CLI's fallback name without overriding the standard resource
+    // detectors' OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES precedence.
+    if resource.get(&opentelemetry::Key::new("service.name"))
+        == Some(opentelemetry::Value::from("unknown_service"))
+    {
+        opentelemetry_sdk::Resource::builder()
+            .with_service_name("hellas-node")
+            .build()
+    } else {
+        resource
+    }
+}
+
 use telemetry::install_with_otel;
 
 type FilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
@@ -68,14 +127,24 @@ where
 /// enables only that signal and overrides the base URL. The SDK appends `/v1/traces`
 /// or `/v1/metrics` to the base URL and uses signal-specific URLs verbatim.
 /// `OTEL_{TRACES,METRICS}_EXPORTER=otlp` also enables that signal with the SDK's
-/// default endpoint, while `none` disables it. `OTEL_SDK_DISABLED=true` disables both.
+/// default endpoint, while `none` disables it. `OTEL_SDK_DISABLED=true` disables
+/// both OTLP signals.
 /// No endpoint or explicit exporter means no network telemetry by default.
+/// Local scraping, when requested with `--metrics-port`, uses the same meter
+/// provider independently of these OTLP switches. Both require the `otel` build.
 ///
 /// The SDK handles common and signal-specific OTLP headers/timeouts,
 /// `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER` and
 /// `OTEL_TRACES_SAMPLER_ARG`, and `OTEL_METRIC_EXPORT_INTERVAL`. Log events stay
 /// in the local fmt/file sinks; only span metadata is exported as traces.
-pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
+pub fn init_tracing(
+    log_file: Option<&Path>,
+    #[cfg(feature = "otel")] metrics: Option<&prometheus::Registry>,
+) -> TracerGuard {
+    #[cfg(feature = "otel")]
+    let meter_provider = build_meter_provider(metrics);
+    #[cfg(feature = "otel")]
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
     let (filter_layer, filter_handle) = reload::Layer::new(base_env_filter());
     let _ = LOG_FILTER.set(filter_handle);
 
@@ -113,7 +182,11 @@ pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
         .with(fmt_layer)
         .with(file_layer);
 
-    install_with_otel(registry)
+    TracerGuard {
+        traces: install_with_otel(registry),
+        #[cfg(feature = "otel")]
+        metrics: meter_provider,
+    }
 }
 
 #[cfg(test)]

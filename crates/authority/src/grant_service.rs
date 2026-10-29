@@ -1,10 +1,11 @@
 //! Grant funding on Work. One provider writer owns authority and accounting;
 //! bounded RAM owns bodies. Executor admission is reserved before co-signing.
+#[cfg(test)]
+use crate::model::grant::grant_work_id;
 use crate::model::grant::records::grant_producer;
 use crate::model::grant::{
     ChannelClient, ChannelId, GrantJobAuthorizationV1,
     budget::Usage,
-    grant_work_id,
     records::{GrantError, GrantPolicy},
     standing::StandingLocator,
 };
@@ -20,8 +21,9 @@ use hellas_rpc::pb::work::Refusable;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     GetStandingRequest, GetStandingResponse, GrantRefusal, GrantRefusalCode, GrantTerminalMetadata,
-    GrantTerminalState, StreamResultRequest, WorkAccepted, WorkRefused, WorkRoute, WorkStreamEvent,
-    WorkStreamTerminal, accept_work_response, get_standing_response, work_stream_event,
+    GrantTerminalState, StreamResultRequest, WorkAccepted, WorkRefusalCode, WorkRefused, WorkRoute,
+    WorkStreamEvent, WorkStreamTerminal, accept_work_response, get_standing_response,
+    work_stream_event,
 };
 use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_wire::{TransportContext, WireStatus};
@@ -407,233 +409,267 @@ impl GrantService {
             let client_signature = signature(&request.client_signature)?;
             let mut store = self.node.writer().await?;
             access.observe(&mut decision, &store, self.node.observed_time(&store));
-            access.authorize(&store, a.grant_id, self.node.observed_time(&store))?;
-            authorize_route(a.channel_id, request.route.as_ref())?;
-            self.inner
-                .lock()
-                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
-                .reap();
-            let now = self.node.observed_time(&store);
-            let id = grant_work_id(store.state().network(), &a);
-            let caller = access.caller(&store, now)?;
-            let client = ChannelClient::of(caller).map_err(NodeStoreError::from)?;
-            if let Some(signature) = store
-                .precheck_acceptance(&a, client, &client_signature, now)
-                .await?
-            {
+            let id =
+                store.authenticate_proposal(&a, access.proposal_owner()?, &client_signature)?;
+            let result = async {
                 access.authorize(&store, a.grant_id, self.node.observed_time(&store))?;
-                return Ok(accepted(id, signature));
-            }
-            // Refresh after the durable probe; its wait must not extend the job deadline.
-            let observed_at = Instant::now();
-            let now = self.node.observed_time(&store);
-            access.authorize(&store, a.grant_id, now)?;
-            let reference =
-                hellas_rpc::protocol::content_upload::decode_reference(&request.prepared_input)
-                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
-            let prepared_input = self
-                .inner
-                .lock()
-                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
-                .uploads
-                .get(&a.channel_id.0)
-                .ok_or_else(|| refused(GrantRefusalCode::Malformed))?
-                .read(id, reference, hellas_rpc::Retention::Ephemeral)
-                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-            let policy = store.state().policy_for(&a)?.clone();
-            let input = PreparedInvocation::from_canonical_bytes(
-                &prepared_input,
-                hellas_channel::content::MAX_CONTENT_BYTES,
-            )
-            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-            let context = WorkContext {
-                network: store.state().network(),
-                channel: a.channel_id.0,
-                client: client.signer(),
-                provider: grant_producer(store.state().provider()?)
-                    .map_err(NodeStoreError::from)?,
-            };
-            let facts = hellas_channel::job::check_input(
-                &context,
-                &(&a).into(),
-                &policy.invocation_policy,
-                &input,
-            )
-            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-            let manifest = input
-                .manifest()
-                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-            let content = {
-                let held = self
+                authorize_route(a.channel_id, request.route.as_ref())?;
+                self.inner
+                    .lock()
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
+                    .reap();
+                let now = self.node.observed_time(&store);
+                let caller = access.caller(&store, now)?;
+                let client = ChannelClient::of(caller).map_err(NodeStoreError::from)?;
+                if let Some(signature) = store
+                    .precheck_acceptance(&a, client, &client_signature, now)
+                    .await?
+                {
+                    access.authorize(&store, a.grant_id, self.node.observed_time(&store))?;
+                    return Ok(accepted(id, signature));
+                }
+                // Refresh after the durable probe; its wait must not extend the job deadline.
+                let observed_at = Instant::now();
+                let now = self.node.observed_time(&store);
+                access.authorize(&store, a.grant_id, now)?;
+                let reference =
+                    hellas_rpc::protocol::content_upload::decode_reference(&request.prepared_input)
+                        .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+                let prepared_input = self
                     .inner
                     .lock()
-                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-                let uploads = held
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
                     .uploads
                     .get(&a.channel_id.0)
-                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
-                let root = uploads
-                    .root(id, manifest.root(), hellas_rpc::Retention::Ephemeral)
+                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?
+                    .read(id, reference, hellas_rpc::Retention::Ephemeral)
                     .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let objects = hellas_channel::job::content_closure(
-                    &policy.invocation_policy,
-                    &manifest,
-                    &root,
-                    a.input_content,
+                let policy = store.state().policy_for(&a)?.clone();
+                let input = PreparedInvocation::from_canonical_bytes(
+                    &prepared_input,
+                    hellas_channel::content::MAX_CONTENT_BYTES,
                 )
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                uploads
-                    .invocation_content(id, &objects, hellas_rpc::Retention::Ephemeral)
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?
-            };
-            let reserve = input
-                .retained_heap_bytes()
-                .unwrap_or(usize::MAX)
-                .saturating_add(content.ephemeral_bytes().try_into().unwrap_or(usize::MAX))
-                .saturating_add(facts.max_spool_bytes.try_into().unwrap_or(usize::MAX));
-            {
+                let context = WorkContext {
+                    network: store.state().network(),
+                    channel: a.channel_id.0,
+                    client: client.signer(),
+                    provider: grant_producer(store.state().provider()?)
+                        .map_err(NodeStoreError::from)?,
+                };
+                let facts = hellas_channel::job::check_input(
+                    &context,
+                    &(&a).into(),
+                    &policy.invocation_policy,
+                    &input,
+                )
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                let manifest = input
+                    .manifest()
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                let content = {
+                    let held = self
+                        .inner
+                        .lock()
+                        .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+                    let uploads = held
+                        .uploads
+                        .get(&a.channel_id.0)
+                        .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+                    let root = uploads
+                        .root(id, manifest.root(), hellas_rpc::Retention::Ephemeral)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                    let objects = hellas_channel::job::content_closure(
+                        &policy.invocation_policy,
+                        &manifest,
+                        &root,
+                        a.input_content,
+                    )
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                    uploads
+                        .invocation_content(id, &objects, hellas_rpc::Retention::Ephemeral)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?
+                };
+                let reserve = input
+                    .retained_heap_bytes()
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(content.ephemeral_bytes().try_into().unwrap_or(usize::MAX))
+                    .saturating_add(facts.max_spool_bytes.try_into().unwrap_or(usize::MAX));
+                {
+                    let mut held = self
+                        .inner
+                        .lock()
+                        .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+                    held.status.check()?;
+                    if !matches!(held.status, ServiceStatus::Serving) {
+                        return Err(refused(GrantRefusalCode::QueueCapacity));
+                    }
+                    held.live.retain(|_, l| {
+                        l.phase.active()
+                            || (l.authorization.delivery_deadline_ms >= now && l.cache.retained())
+                    });
+                    if held.live.len() >= 256
+                        || held
+                            .live
+                            .values()
+                            .fold(reserve, |n, l| n.saturating_add(l.ram()))
+                            > MAX_RAM
+                    {
+                        return Err(refused(GrantRefusalCode::StateCapacity));
+                    }
+                }
+                let domain = facts.capacity_domain;
+                let permit =
+                    (self.admit)(domain).map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
+                if permit.domain() != domain {
+                    return Err(refused(GrantRefusalCode::QueueCapacity));
+                }
+                let deadline = observed_at
+                    .checked_add(Duration::from_millis(
+                        a.terminal_deadline_ms.0.saturating_sub(now.0),
+                    ))
+                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+                let application = access.application(&store, now)?;
+                let signature = store
+                    .accept(application, a, client_signature, &input, &self.signer, now)
+                    .await?;
+                self.inner
+                    .lock()
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
+                    .uploads
+                    .remove(&a.channel_id.0);
+                let cache = ResultCache::new(a.terminal_deadline_ms, self.node.changed.clone());
+                let registered_at = self.node.observed_time(&store);
+                let cancellation =
+                    store.register_execution(id, a, access.clone(), &cache, registered_at);
+                cache.monitor(self.node.clock.clone());
                 let mut held = self
                     .inner
                     .lock()
                     .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-                held.status.check()?;
-                if !matches!(held.status, ServiceStatus::Serving) {
-                    return Err(refused(GrantRefusalCode::QueueCapacity));
-                }
-                held.live.retain(|_, l| {
-                    l.phase.active()
-                        || (l.authorization.delivery_deadline_ms >= now && l.cache.retained())
-                });
-                if held.live.len() >= 256
-                    || held
-                        .live
-                        .values()
-                        .fold(reserve, |n, l| n.saturating_add(l.ram()))
-                        > MAX_RAM
-                {
-                    return Err(refused(GrantRefusalCode::StateCapacity));
-                }
-            }
-            let domain = facts.capacity_domain;
-            let permit =
-                (self.admit)(domain).map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
-            if permit.domain() != domain {
-                return Err(refused(GrantRefusalCode::QueueCapacity));
-            }
-            let deadline = observed_at
-                .checked_add(Duration::from_millis(
-                    a.terminal_deadline_ms.0.saturating_sub(now.0),
-                ))
-                .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
-            let application = access.application(&store, now)?;
-            let signature = store
-                .accept(application, a, client_signature, &input, &self.signer, now)
-                .await?;
-            self.inner
-                .lock()
-                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
-                .uploads
-                .remove(&a.channel_id.0);
-            let cache = ResultCache::new(a.terminal_deadline_ms, self.node.changed.clone());
-            let registered_at = self.node.observed_time(&store);
-            let cancellation =
-                store.register_execution(id, a, access.clone(), &cache, registered_at);
-            cache.monitor(self.node.clock.clone());
-            let mut held = self
-                .inner
-                .lock()
-                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-            held.live.insert(
-                id,
-                Live {
-                    authorization: a,
-                    policy: policy.clone(),
-                    facts,
-                    cache,
-                    prefix: Default::default(),
-                    reserved_ram: reserve,
-                    phase: LivePhase::Queued,
-                },
-            );
-            let service = self.clone();
-            let execution_access = access.clone();
-            let admission =
-                WorkAdmission::grant(permit, deadline, cancellation.clone(), async move {
-                    let mut store = service
-                        .node
-                        .store
-                        .lock()
-                        .await
-                        .map_err(|_| BackendFault::caused_by(NodeStoreError::WriterPoisoned))?;
-                    service
-                        .inner
-                        .lock()
-                        .map_err(|_| BackendFault::caused_by(NodeStoreError::WriterPoisoned))?
-                        .status
-                        .check()
-                        .map_err(BackendFault::caused_by)?;
-                    execution_access
-                        .authorize(&store, a.grant_id, service.node.observed_time(&store))
-                        .map_err(BackendFault::caused_by)?;
-                    // Unlike idempotent journal replay, an invocation must consume the
-                    // Accepted phase exactly once before any backend preparation.
-                    let job = store
-                        .state()
-                        .channel(a.channel_id)
-                        .and_then(|c| c.job_book().job_by_id(id));
-                    if job.is_none_or(|j| j.phase() != JobPhase::Accepted) {
-                        return Err(BackendFault::caused_by(ExecutionError::NotDispatchable));
+                held.live.insert(
+                    id,
+                    Live {
+                        authorization: a,
+                        policy: policy.clone(),
+                        facts,
+                        cache,
+                        prefix: Default::default(),
+                        reserved_ram: reserve,
+                        phase: LivePhase::Queued,
+                    },
+                );
+                let service = self.clone();
+                let execution_access = access.clone();
+                let admission =
+                    WorkAdmission::grant(permit, deadline, cancellation.clone(), async move {
+                        let mut store =
+                            service.node.store.lock().await.map_err(|_| {
+                                BackendFault::caused_by(NodeStoreError::WriterPoisoned)
+                            })?;
+                        service
+                            .inner
+                            .lock()
+                            .map_err(|_| BackendFault::caused_by(NodeStoreError::WriterPoisoned))?
+                            .status
+                            .check()
+                            .map_err(BackendFault::caused_by)?;
+                        execution_access
+                            .authorize(&store, a.grant_id, service.node.observed_time(&store))
+                            .map_err(BackendFault::caused_by)?;
+                        // Unlike idempotent journal replay, an invocation must consume the
+                        // Accepted phase exactly once before any backend preparation.
+                        let job = store
+                            .state()
+                            .channel(a.channel_id)
+                            .and_then(|c| c.job_book().job_by_id(id));
+                        if job.is_none_or(|j| j.phase() != JobPhase::Accepted) {
+                            return Err(BackendFault::caused_by(ExecutionError::NotDispatchable));
+                        }
+                        let now = service.node.observed_time(&store);
+                        let application = execution_access
+                            .application(&store, now)
+                            .map_err(BackendFault::caused_by)?;
+                        store
+                            .dispatch(application, a.channel_id, id, now)
+                            .await
+                            .map_err(BackendFault::caused_by)?;
+                        service
+                            .inner
+                            .lock()
+                            .map_err(|_| BackendFault::caused_by(NodeStoreError::WriterPoisoned))?
+                            .live
+                            .get_mut(&id)
+                            .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?
+                            .phase = LivePhase::Running;
+                        Ok(())
+                    });
+                let service = self.clone();
+                let progress_service = self.clone();
+                let progress = Arc::new(move |event| progress_service.progress(id, event));
+                let task = tokio::spawn(async move {
+                    let execution = async {
+                        (service.run)(input.clone(), policy, content, admission, progress).await
+                    };
+                    let execution = std::panic::AssertUnwindSafe(execution).catch_unwind();
+                    tokio::pin!(execution);
+                    let output = tokio::select! {
+                        result = &mut execution => result,
+                        () = service.monitor_execution(id, cancellation) => execution.await,
                     }
-                    let now = service.node.observed_time(&store);
-                    let application = execution_access
-                        .application(&store, now)
-                        .map_err(BackendFault::caused_by)?;
-                    store
-                        .dispatch(application, a.channel_id, id, now)
-                        .await
-                        .map_err(BackendFault::caused_by)?;
-                    service
-                        .inner
-                        .lock()
-                        .map_err(|_| BackendFault::caused_by(NodeStoreError::WriterPoisoned))?
-                        .live
-                        .get_mut(&id)
-                        .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?
-                        .phase = LivePhase::Running;
-                    Ok(())
-                });
-            let service = self.clone();
-            let progress_service = self.clone();
-            let progress = Arc::new(move |event| progress_service.progress(id, event));
-            let task = tokio::spawn(async move {
-                let execution = async {
-                    (service.run)(input.clone(), policy, content, admission, progress).await
-                };
-                let execution = std::panic::AssertUnwindSafe(execution).catch_unwind();
-                tokio::pin!(execution);
-                let output = tokio::select! {
-                    result = &mut execution => result,
-                    () = service.monitor_execution(id, cancellation) => execution.await,
-                }
-                .unwrap_or_else(|_| Err(BackendFault::caused_by(ExecutionError::Panicked)));
-                if let Err(error) = service.finish(id, &input, output).await {
-                    tracing::error!(?id, %error, "grant completion could not be made durable");
-                    if let Ok(mut held) = service.inner.lock() {
-                        held.fail(error);
-                        if let Some(live) = held.live.get_mut(&id) {
-                            live.phase = LivePhase::Refused(GrantRefusalCode::StorageUnavailable);
+                    .unwrap_or_else(|_| Err(BackendFault::caused_by(ExecutionError::Panicked)));
+                    if let Err(error) = service.finish(id, &input, output).await {
+                        tracing::error!(?id, %error, "grant completion could not be made durable");
+                        if let Ok(mut held) = service.inner.lock() {
+                            held.fail(error);
+                            if let Some(live) = held.live.get_mut(&id) {
+                                live.phase =
+                                    LivePhase::Refused(GrantRefusalCode::StorageUnavailable);
+                            }
                         }
                     }
-                }
-                service.node.changed.notify_waiters();
-            });
-            held.tasks.insert(id, task);
-            drop(held);
-            Ok(accepted(id, signature))
+                    service.node.changed.notify_waiters();
+                });
+                held.tasks.insert(id, task);
+                drop(held);
+                Ok(accepted(id, signature))
+            }
+            .await;
+            self.finish_proposal(a.channel_id, id, result)
         }
         .await;
         decision.finish_work(result)
     }
+    /// Conclusive refusal ends the client's proposal, including its staged body.
+    /// Call only after verifying its original actor, channel and signature.
+    fn finish_proposal<T>(
+        &self,
+        channel: ChannelId,
+        id: Digest,
+        result: Result<T, WorkRefused>,
+    ) -> Result<T, WorkRefused> {
+        if let Err(refusal) = &result
+            && matches!(
+                WorkRefusalCode::try_from(refusal.code),
+                Ok(WorkRefusalCode::Invalid | WorkRefusalCode::Expired | WorkRefusalCode::Declined)
+            )
+        {
+            let mut held = self
+                .inner
+                .lock()
+                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+            if let Some(uploads) = held.uploads.get_mut(&channel.0) {
+                uploads
+                    .discard(id)
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+                if !uploads.is_staged() {
+                    held.uploads.remove(&channel.0);
+                }
+            }
+        }
+        result
+    }
+
     async fn monitor_execution(
         &self,
         id: Digest,

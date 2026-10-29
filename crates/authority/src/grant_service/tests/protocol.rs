@@ -7,6 +7,7 @@ mod delivery;
 mod expiry;
 mod recovery;
 mod refusals;
+mod refused_uploads;
 mod revocation;
 mod rpc_stream;
 mod sponsorship;

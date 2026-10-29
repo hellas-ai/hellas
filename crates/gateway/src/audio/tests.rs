@@ -18,6 +18,8 @@ struct Fake {
     timeout: Option<std::time::Duration>,
     delay: Option<std::time::Duration>,
     started: tokio::sync::Notify,
+    provenance: Option<(hellas_rpc::provenance::ExecutionProvenance, Vec<u8>)>,
+    invalid_output: Option<Outcome>,
 }
 impl WorkExecutionBackend for Fake {
     fn timeout(&self) -> Option<std::time::Duration> {
@@ -58,7 +60,7 @@ impl WorkExecutionBackend for Fake {
             offset: 0,
             bytes: artifact.bytes.clone(),
         };
-        let output = InvocationOutput {
+        let mut output = InvocationOutput {
             outcome: Outcome::Succeeded,
             artifacts: vec![artifact],
             metadata: JsonBytes(
@@ -69,21 +71,34 @@ impl WorkExecutionBackend for Fake {
                 .unwrap(),
             ),
         };
+        if let Some(outcome) = self.invalid_output {
+            output.outcome = outcome;
+            output.artifacts.clear();
+        }
         let events = [
-            Ok(ComputeEvent::Output(chunk)),
-            Ok(ComputeEvent::Done {
+            ComputeEvent::Output(chunk),
+            ComputeEvent::Done {
                 output,
                 provider: hellas_auth::ProducerSigningKey::from_secret_bytes([9; 32])
                     .unwrap()
                     .public_key(),
-            }),
+            },
         ];
         let delay = self.delay;
+        let provenance = self.provenance.clone();
         Ok(Box::pin(async_stream::stream! {
+            if let Some((accepted, _)) = &provenance {
+                yield Ok(WorkEvent::Accepted(accepted.clone()));
+            }
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            for event in events { yield event; }
+            for event in events {
+                if matches!(event, ComputeEvent::Done { .. }) && let Some((_, transcript)) = &provenance {
+                    yield Ok(WorkEvent::Transcript(transcript.clone()));
+                }
+                yield Ok(WorkEvent::Output(event));
+            }
         }))
     }
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
@@ -109,6 +124,7 @@ async fn app(names: &[&str], work: Arc<Fake>) -> Router {
     )
     .await
     .unwrap()
+    .layer(crate::provenance_layer::ProvenanceLayer)
 }
 fn wav(rate: u32, frames: usize) -> Vec<u8> {
     let bytes = frames as u32 * 2;
@@ -179,6 +195,122 @@ async fn multipart_wav_returns_json_or_text_through_compute() {
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
+async fn transcriptions_carry_provenance_through_archive_in_both_formats() {
+    use base64::Engine as _;
+    use hellas_rpc::provenance::{
+        COMMITMENT_KEY, ExecutionProvenance, PROVIDER_KEY, TRANSCRIPT_KEY, encode_public_key,
+    };
+    use http_body_util::BodyExt as _;
+    let accepted = ExecutionProvenance {
+        commitment_id: [0xab; 32],
+        provider: hellas_auth::ProducerSigningKey::from_secret_bytes([9; 32])
+            .unwrap()
+            .public_key(),
+    };
+    let transcript = b"exact canonical signed bytes".to_vec();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&transcript);
+    let fake = Arc::new(Fake {
+        provenance: Some((accepted.clone(), transcript)),
+        ..Default::default()
+    });
+    let base = app(&["tiny"], fake.clone()).await;
+    let root = tempfile::tempdir().unwrap();
+    for zdr in [false, true] {
+        let policy = crate::archive::Policy::new(crate::ArchiveOptions {
+            directory: root.path().join(if zdr { "zdr" } else { "retaining" }),
+            zdr,
+        });
+        policy.prepare();
+        let app = base.clone().layer(axum::middleware::from_fn_with_state(
+            policy,
+            crate::archive::record,
+        ));
+        for format in ["json", "text"] {
+            let response = app
+                .clone()
+                .oneshot(request(&[
+                    ("model", b"tiny"),
+                    ("file", &wav(16000, 160)),
+                    ("response_format", format.as_bytes()),
+                ]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[COMMITMENT_KEY], "ab".repeat(32));
+            assert_eq!(
+                response.headers()[PROVIDER_KEY],
+                encode_public_key(&accepted.provider)
+            );
+            if format == "text" {
+                assert_eq!(response.headers()["trailer"], TRANSCRIPT_KEY);
+            }
+            let collected = response.into_body().collect().await.unwrap();
+            if format == "text" {
+                assert_eq!(collected.trailers().unwrap()[TRANSCRIPT_KEY], encoded);
+                assert_eq!(&collected.to_bytes()[..], b"hi there");
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&collected.to_bytes()).unwrap();
+                assert_eq!(
+                    value,
+                    serde_json::json!({"text": "hi there", "hellas": {
+                        "commitment": "ab".repeat(32), "provider": encode_public_key(&accepted.provider), "transcript": encoded,
+                    }})
+                );
+            }
+        }
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn completed_transcription_errors_preserve_the_verified_transcript() {
+    use base64::Engine as _;
+    use hellas_rpc::provenance::{COMMITMENT_KEY, ExecutionProvenance};
+    for outcome in [
+        Outcome::Succeeded,
+        Outcome::Failed(hellas_rpc::protocol::invocation::output::FailureReason::Execution),
+    ] {
+        let fake = Arc::new(Fake {
+            invalid_output: Some(outcome),
+            provenance: Some((
+                ExecutionProvenance {
+                    commitment_id: [0xab; 32],
+                    provider: hellas_auth::ProducerSigningKey::from_secret_bytes([9; 32])
+                        .unwrap()
+                        .public_key(),
+                },
+                b"verified transcript".to_vec(),
+            )),
+            ..Default::default()
+        });
+        let app = app(&["tiny"], fake).await;
+        for format in ["json", "text"] {
+            let response = app
+                .clone()
+                .oneshot(request(&[
+                    ("model", b"tiny"),
+                    ("file", &wav(16000, 160)),
+                    ("response_format", format.as_bytes()),
+                ]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response.headers()[COMMITMENT_KEY], "ab".repeat(32));
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value["error"]["message"].is_string());
+            assert_eq!(
+                value["hellas"]["transcript"],
+                base64::engine::general_purpose::STANDARD.encode(b"verified transcript")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn shared_audio_path_uses_multipart_model_and_its_own_body_limit() {
     let fake = Arc::new(Fake::default());
     let base = app(&["tiny", "second"], fake.clone()).await;
@@ -213,6 +345,16 @@ async fn shared_audio_path_uses_multipart_model_and_its_own_body_limit() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !response
+                .headers()
+                .contains_key(hellas_rpc::provenance::COMMITMENT_KEY)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key(hellas_rpc::provenance::PROVIDER_KEY)
+        );
         let ordinary = Request::post("/v1/completions")
             .body(Body::from(vec![0; 3 << 20]))
             .unwrap();

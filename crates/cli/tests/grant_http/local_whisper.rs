@@ -173,11 +173,33 @@ async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response.text().await.unwrap();
     println!("status={status} body={body}");
     println!("{}", std::fs::read_to_string(&gateway.log).unwrap());
     gateway.stop().await;
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    use base64::Engine as _;
+    use hellas_rpc::provenance::{COMMITMENT_KEY, PROVIDER_KEY, encode_public_key};
+    let provider =
+        hellas_auth::PublicKey::Secp256k1(grant_producer(&enrollment).unwrap().to_bytes());
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(headers[PROVIDER_KEY], encode_public_key(&provider));
+    assert_eq!(value["hellas"]["provider"], encode_public_key(&provider));
+    let commitment = value["hellas"]["commitment"].as_str().unwrap();
+    assert_eq!(headers[COMMITMENT_KEY], commitment);
+    let transcript = base64::engine::general_purpose::STANDARD
+        .decode(value["hellas"]["transcript"].as_str().unwrap())
+        .unwrap();
+    let envelopes = hellas_channel::model::work::decode_transcript(
+        &transcript,
+        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+    )
+    .unwrap();
+    assert!(!envelopes.is_empty());
+    for envelope in &envelopes {
+        envelope.verify(&provider).unwrap();
+    }
 
     let config: Value =
         serde_json::from_slice(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
@@ -212,10 +234,7 @@ async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
     else {
         panic!()
     };
-    assert_eq!(
-        serde_json::from_str::<Value>(&body).unwrap()["text"],
-        expected_text.text
-    );
+    assert_eq!(value["text"], expected_text.text);
     // The provider's durable signed result commits the exact padded output,
     // including every token ID. Compare that binding with the upstream tokens;
     // the HTTP presentation need not expose token IDs or internal buffers.
@@ -237,25 +256,29 @@ async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
     let book = store.state().channel(channel_id).unwrap().job_book();
     let actual: Vec<_> = book
         .jobs()
-        .filter_map(|job| {
-            job.result()
-                .map(|(result, _)| result.canonical_output_digest)
-        })
+        .filter_map(|job| job.result().map(|(result, _)| result))
         .chain(book.terminals().filter_map(|terminal| {
             terminal
                 .outcome
                 .result
                 .as_ref()
-                .map(|signed| signed.result.canonical_output_digest)
+                .map(|signed| &signed.result)
         }))
         .collect();
+    assert_eq!(actual.len(), 1, "one signed transcription result");
+    let actual = &actual[0];
+    assert_eq!(hex::encode(actual.work_id.as_bytes()), commitment);
     assert_eq!(
-        actual,
-        [expected.content_id().unwrap().digest()],
+        actual.transcript_content,
+        hellas_rpc::ContentRef::for_bytes(&transcript)
+    );
+    assert_eq!(
+        actual.canonical_output_digest,
+        expected.content_id().unwrap().digest(),
         "signed output must contain exactly the upstream token IDs"
     );
     println!(
-        "verified {} reference token IDs via signed output digest",
+        "verified {} reference token IDs via signed output digest and delivered provenance",
         tokens.len()
     );
 }

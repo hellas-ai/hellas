@@ -1,28 +1,30 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use hellas_adaptors::{BackendError, OutputEvent};
+use hellas_adaptors::{BackendError, BackendEvent, OutputEvent};
 
 use super::generation::TextCompletion;
 
 use super::super::state::PreparedGeneration;
 use super::generation::{GenerationEvent, generation_stream};
-use super::provenance::{provenance_from_execution, stop_reason_from_runtime, usage};
+use super::provenance::{completed_provenance, stop_reason_from_runtime, usage};
 
 pub(super) fn text_events(
     mut prepared: PreparedGeneration,
-) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send {
+) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> + Send {
     try_stream! {
         let prompt_tokens = prepared.prompt_tokens;
         let mut tools = prepared.chat.take().unwrap_or_else(hellas_presentation::chat::ChatTurn::plain);
         let stream_provenance = prepared.provenance.clone();
+        let mut transcript = None;
         let deadline = prepared.deadline();
         let inner = generation_stream(prepared);
         tokio::pin!(inner);
 
         loop {
             match crate::before_deadline(deadline, inner.next()).await {
+                Ok(Some(Ok(GenerationEvent::Transcript(signed)))) => transcript = Some(signed),
                 Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
-                    for event in tools.feed(&delta).map_err(|error| BackendError::failed(error.to_string()))? { yield event; }
+                    for event in tools.feed(&delta).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
                 }
                 Ok(Some(Ok(GenerationEvent::Done(TextCompletion {
                     output_tokens,
@@ -37,14 +39,14 @@ pub(super) fn text_events(
                         ?stop_reason,
                         "gateway stream ready"
                     );
-                    if let Some(provenance) = stream_provenance.as_ref().map(provenance_from_execution) {
-                        yield OutputEvent::Provenance(provenance);
+                    if let Some(transcript) = &transcript {
+                        yield BackendEvent::Provenance(completed_provenance(stream_provenance.as_ref(), transcript));
                     }
-                    for event in tools.finish(stop_reason_from_runtime(stop_reason.clone())).map_err(|error| BackendError::failed(error.to_string()))? { yield event; }
+                    for event in tools.finish(stop_reason_from_runtime(stop_reason.clone())).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
                     yield OutputEvent::Finished {
                         stop_reason: if tools.called() { hellas_adaptors::StopReason::ToolCall } else { stop_reason_from_runtime(stop_reason) },
                         usage: Some(usage(prompt_tokens, output_tokens)),
-                    };
+                    }.into();
                     return;
                 }
                 Ok(Some(Err(err))) => Err(err)?,
@@ -64,6 +66,45 @@ mod tests {
         compute::{RunMetadata, StopReason},
         output::{InvocationOutput, Outcome},
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_acceptance_and_output_share_one_absolute_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut prepared = PreparedGeneration {
+            chat: None,
+            prepared: Box::pin(async_stream::stream! {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                yield Ok(crate::WorkEvent::Accepted(hellas_rpc::provenance::ExecutionProvenance {
+                    commitment_id: [1; 32], provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7;32]).unwrap().public_key(),
+                }));
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                yield Err(crate::WorkGatewayError::Unsupported);
+            }),
+            provenance: None,
+            prompt_tokens: 1,
+            presentation: std::sync::Arc::new(
+                hellas_presentation::TextPresentation::from_gguf(
+                    &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../client/src/model/package/mini-qwen3.gguf"),
+                )
+                .unwrap(),
+            ),
+            deadline: Some(start + std::time::Duration::from_secs(5)),
+        };
+        prepared.accept().await.unwrap();
+        assert!(prepared.provenance.is_some());
+        let events = text_events(prepared).collect::<Vec<_>>().await;
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("inference timed out")
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn text_waits_without_a_client_deadline_but_keeps_explicit_budgets() {
@@ -86,7 +127,7 @@ mod tests {
                         },
                         provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7;32]).unwrap().public_key(),
                     };
-                }),
+                }.map(|event: Result<_, crate::WorkGatewayError>| event.map(crate::WorkEvent::Output))),
                 provenance: None,
                 prompt_tokens: 1,
                 presentation: std::sync::Arc::new(
@@ -96,7 +137,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                inference_timeout: timeout,
+                deadline: timeout.map(|timeout| tokio::time::Instant::now() + timeout),
             };
             let events = text_events(prepared).collect::<Vec<_>>().await;
             if timeout.is_some() {
@@ -112,7 +153,7 @@ mod tests {
             } else {
                 assert!(matches!(
                     events.last(),
-                    Some(Ok(OutputEvent::Finished { .. }))
+                    Some(Ok(BackendEvent::Output(OutputEvent::Finished { .. })))
                 ));
             }
         }

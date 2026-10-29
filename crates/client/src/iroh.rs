@@ -16,6 +16,10 @@ use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, Ser
 use hellas_wire::{Metadata, MethodMarker, PeerIdentity, ServiceMarker, StreamTransport};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::sync::{Arc, Mutex};
+
+mod address;
+pub use address::{ProviderAddress, ProviderAddressError};
+
 #[derive(Clone)]
 pub struct AppleAppAttestTrust {
     pub app_id: String,
@@ -302,65 +306,6 @@ where
         peer,
         response,
     )
-}
-
-/// A paid caller selects the transport identity. Apple software approval remains
-/// independently pinned; software providers need no separate enrollment pin.
-pub async fn confidential_open_selected<M>(
-    transport: &IrohTransport,
-    assurance: Assurance,
-    apple: Option<&ProviderTrustAnchor>,
-) -> ClientResult<(ProviderEnrollmentBundle, ProviderTrustAnchor)>
-where
-    M: MethodMarker<Request = OpenRequest, Response = OpenResponse>,
-{
-    let (exporter, nonce, peer, response) = request_open::<M>(transport).await?;
-    let bundle = ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis)
-        .map_err(|e| ClientError::source("invalid selected provider enrollment", e))?;
-    let trust = selected_provider_trust(&bundle, assurance, apple)?;
-    verify_open_response(
-        &trust,
-        &exporter,
-        &nonce,
-        <M::Service as ServiceMarker>::ALPN.as_bytes(),
-        peer,
-        response,
-    )?;
-    Ok((bundle, trust))
-}
-
-pub fn selected_provider_trust(
-    bundle: &ProviderEnrollmentBundle,
-    assurance: Assurance,
-    apple: Option<&ProviderTrustAnchor>,
-) -> ClientResult<ProviderTrustAnchor> {
-    let trust = match bundle.genesis.statement.root_kind {
-        RootKind::Software if assurance == Assurance::ProducerSigned => ProviderTrustAnchor {
-            expected_genesis: bundle.content_id(),
-            required_assurance: assurance,
-            apple_app_attest: None,
-        },
-        RootKind::Software => {
-            return Err(ClientError::protocol(
-                "Apple assurance requires an attested provider",
-            ));
-        }
-        RootKind::SecureEnclave => {
-            let trust = apple
-                .filter(|trust| trust.apple_app_attest.is_some())
-                .ok_or_else(|| {
-                    ClientError::protocol("Apple provider requires independent software approval")
-                })?;
-            if trust.required_assurance != assurance {
-                return Err(ClientError::protocol(
-                    "Apple approval assurance differs from request",
-                ));
-            }
-            trust.clone()
-        }
-    };
-    trust.verify_enrollment(bundle)?;
-    Ok(trust)
 }
 
 async fn request_open<M>(
