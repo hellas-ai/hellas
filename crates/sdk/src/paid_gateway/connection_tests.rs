@@ -145,6 +145,26 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 poll: Duration::from_millis(20),
                 max_observation_age: Duration::from_secs(30),
             };
+            // A peer that accepts TCP but never completes WebSocket setup must
+            // not hold up another peer's already verified snapshot.
+            let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut with_stalled = config.clone();
+            with_stalled.validators[0] = format!("ws://{}", stalled.local_addr().unwrap());
+            let remote = tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::client_chain::connect(&with_stalled, Duration::from_secs(30)),
+            )
+            .await
+            .expect("verified peers must not wait for the stalled peer's 5s timeout")
+            .unwrap();
+            assert!(
+                hellas_chain::LightClient::get_latest_block(&remote)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            drop(remote);
+            drop(stalled);
             let original = pool.providers.remove(0);
             for (index, endpoint) in [&first.endpoint, &second.endpoint].into_iter().enumerate() {
                 let mut args = original.args.clone();
