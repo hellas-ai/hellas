@@ -1,5 +1,6 @@
 #![cfg(unix)]
 mod contact;
+mod local_flux;
 mod local_text;
 mod local_whisper;
 mod managed;

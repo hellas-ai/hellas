@@ -131,6 +131,50 @@ kind = { kind = "scalar", value = "u64" }
 
 The result then also carries an `emitted` output with every emitted value.
 
+## Image jobs
+
+Convert a local distilled Flux2 Klein 4B snapshot once:
+
+```sh
+hellas convert-flux --checkpoint ./FLUX.2-klein-4B --output ./klein
+```
+
+The converter validates the checkpoint and creates three ordinary provider
+assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
+tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
+catena-models. Index the assets on the provider with `--content-root ./klein`.
+The client needs the package's JSON files; it does not upload the weights.
+For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
+uploads for the program, token IDs and noise. Set its execution budget for
+the selected hardware and step count.
+
+```sh
+hellas --faucet image --provider ENROLLMENT_ID@NODE_ID --model ./klein \
+  --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
+  --payment 20 -o fox.png
+```
+
+`image` saves the job before purchase, writes the PNG to `-o` (default
+`image.png`), and saves its signed result under the job folder's `result/`.
+One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
+conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
+client inputs; PNG encoding is client presentation of the signed RGB buffer.
+
+The gateway exposes the same package with `gateway --image-model ./klein`
+and a paid pool, `--offer`, or `--local-grant` as usual:
+
+```sh
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"klein","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
+```
+
+The response contains `data[0].b64_json` and signed evidence in `hellas`.
+The model name is the package directory name. Width and height must each be
+multiples of 16 from 16 through 512; steps must be 1–50. Defaults are 512×512,
+four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
+format; unsupported fields are rejected before work starts.
+
 ## Fetch jobs
 
 ```toml

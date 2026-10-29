@@ -1,4 +1,6 @@
 //! Client-side model assets.
+#[cfg(feature = "models")]
+pub mod flux;
 pub mod gguf;
 #[cfg(feature = "models")]
 mod package;

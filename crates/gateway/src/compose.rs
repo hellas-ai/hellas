@@ -48,6 +48,13 @@ pub(crate) async fn router(
                     router: super::audio::router(audio, work.clone()).await?,
                 });
             }
+            super::ModelOptions::Flux(image) => {
+                claims.push(Claim {
+                    path: super::image::PATH.into(),
+                    models: vec![image.model_name.clone()],
+                    router: super::image::router(image, work.clone()).await?,
+                });
+            }
         }
     }
     if let Some(responses) = &presentations.responses {
@@ -159,6 +166,8 @@ mod tests;
 pub(super) fn request_limit(path: &str) -> usize {
     if path == super::audio::PATH {
         super::audio::MAX_REQUEST_BYTES
+    } else if path == super::image::PATH {
+        super::image::MAX_REQUEST_BYTES
     } else {
         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES
     }

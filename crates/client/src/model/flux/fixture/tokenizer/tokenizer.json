@@ -1,0 +1,1 @@
+{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0,"there":1,"[UNK]":2,"eos":3,"sot":4,"en":5,"task":6,"no":7},"unk_token":"[UNK]"}}

@@ -37,7 +37,7 @@ fn canonical_qwen3_job_bytes_are_stable() {
 fn shipped_qwen3_program_matches_catena_models() {
     let package = ModelPackage::open(&fixture()).unwrap();
     let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
-    let config = catena_models::checkpoint::read_gguf_model_config(&fixture()).unwrap();
+    let config = catena_models::checkpoint::read_gguf_model_config(fixture()).unwrap();
     let model = catena_models::catena::generated_model_source_for(&config).unwrap();
     crate::model::program::assert_shipped_module(&job, &model);
 }

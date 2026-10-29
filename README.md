@@ -149,7 +149,15 @@ POST /v1/completions
 POST /v1/responses
 POST /v1/chat/completions
 POST /v1/messages
+POST /v1/audio/transcriptions    (--audio-model)
+POST /v1/images/generations     (--image-model)
 ```
+
+`--image-model DIR` serves a converted Flux2 Klein 4B package. Each image is
+one Compute job containing text encoding, denoising and image decoding; the
+gateway returns a base64 PNG and the provider's signed evidence. Images are
+limited to 512×512. The same package works with `hellas image`; see
+[image jobs](docs/jobs.md#image-jobs) for conversion and requests.
 
 Monitor discovery and peer health with `hellas monitor --timeout-secs 30`.
 

@@ -20,11 +20,11 @@ pub(super) fn render(model: &str) -> Result<String> {
     let mut pending: Vec<_> = program
         .arrows
         .iter()
-        .filter_map(|(name, arrow)| {
-            (!name.as_str().starts_with("meta.")
-                && (arrow.definition.is_none() || !name.as_str().starts_with("stdlib.")))
-            .then(|| name.as_str().to_owned())
+        .filter(|(name, arrow)| {
+            !name.as_str().starts_with("meta.")
+                && (arrow.definition.is_none() || !name.as_str().starts_with("stdlib."))
         })
+        .map(|(name, _)| name.as_str().to_owned())
         .collect();
     let mut used = BTreeSet::new();
     while let Some(name) = pending.pop() {
