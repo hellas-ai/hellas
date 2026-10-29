@@ -180,11 +180,7 @@ async fn local_grant_flux_matches_reference_image_without_a_chain() {
     let transcript = base64::engine::general_purpose::STANDARD
         .decode(value["hellas"]["transcript"].as_str().unwrap())
         .unwrap();
-    let envelopes = hellas_channel::model::work::decode_transcript(
-        &transcript,
-        hellas_channel::work_store::journal::MAX_RECORD_BYTES,
-    )
-    .unwrap();
+    let envelopes = hellas_channel::model::work::decode_transcript(&transcript, 8 << 20).unwrap();
     assert!(!envelopes.is_empty());
     use hellas_rpc::protocol::invocation::output::{
         ARTIFACT_CHUNK, ArtifactPrefix, InvocationOutput, Outcome,
