@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
-pub const OUTPUT_BUFFER_BYTES: usize = 2 * hellas_channel::work_store::journal::MAX_RECORD_BYTES;
+// A complete image burst can retain prefixes, an integer-array CBOR
+// transcript and decoded pixels together before the consumer polls.
+pub const OUTPUT_BUFFER_BYTES: usize = 4 * hellas_channel::work_store::journal::MAX_RECORD_BYTES;
 pub const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 pub const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
 pub type BufferedEvent<E, X> = (Result<E, X>, OwnedSemaphorePermit);
@@ -776,29 +778,16 @@ mod output_tests {
     }
 
     #[test]
-    fn the_largest_possible_completion_fits_the_output_budget() {
-        // The signed transcript is one channel message, capped at
-        // `MAX_RECORD_BYTES`. `emit` must therefore charge it at most that,
-        // plus the single per-message `OUTPUT_EVENT_OVERHEAD`, or a
-        // completion the protocol permits cannot be delivered at all:
-        // `try_acquire_many_owned` fails, `overflow` latches, and the caller
-        // is told its reader is too slow for work it has already paid for.
-        //
-        // This is the invariant that a per-contained-event overhead broke.
-        // Multiplying the overhead by event count makes the charge unbounded
-        // with respect to `MAX_RECORD_BYTES` -- ~8000 small events exceeded
-        // the budget on their own -- so no value of `OUTPUT_BUFFER_BYTES`
-        // could satisfy this assertion.
+    fn a_channel_record_sized_transcript_fits_the_output_budget() {
+        // One transcript event pays one overhead charge, regardless of the
+        // envelope count. Full grant transcripts can span multiple records.
         let transcript = WorkEvent::<OutputEvent>::Transcript(vec![0; MAX_RECORD_BYTES]);
-        let worst_case = event_bytes(&transcript).saturating_add(OUTPUT_EVENT_OVERHEAD);
-        assert!(
-            worst_case <= OUTPUT_BUFFER_BYTES,
-            "a maximal completion charges {worst_case} against a {OUTPUT_BUFFER_BYTES} budget",
-        );
+        let bytes = event_bytes(&transcript).saturating_add(OUTPUT_EVENT_OVERHEAD);
+        assert!(bytes <= OUTPUT_BUFFER_BYTES);
     }
 
     #[tokio::test]
-    async fn signed_compute_transcript_and_full_output_fit_together() {
+    async fn signed_image_burst_fits_the_output_budget() {
         use hellas_rpc::protocol::invocation::{
             Artifact, InvocationRequest,
             compute::RunMetadata,
@@ -813,13 +802,14 @@ mod output_tests {
             assurance: hellas_rpc::Assurance::ProducerSigned,
             retain: false,
         };
-        // A no-step buffer may be called emitted and need not contain u32 IDs.
+        // A 512x512 RGB F32 image; 255 maximizes the envelope's CBOR
+        // integer-array expansion, independently of the queue budget.
         let output = InvocationOutput {
             outcome: Outcome::Succeeded,
             artifacts: vec![Artifact::new(
-                "emitted",
+                "image",
                 "catena.bytes.v1",
-                vec![255; 1_700_000],
+                vec![255; 512 * 512 * 3 * 4],
             )],
             metadata: hellas_rpc::JsonBytes(
                 hellas_rpc::canonical_dag_cbor(&RunMetadata {
@@ -833,9 +823,10 @@ mod output_tests {
             .sign(&request, &key, output::MAX_CHUNK_BYTES)
             .unwrap();
         let transcript = hellas_channel::model::work::encode_transcript(&envelopes).unwrap();
-        assert!(transcript.len() <= MAX_RECORD_BYTES);
+        assert!(transcript.len() > MAX_RECORD_BYTES);
+        let decoded = hellas_channel::model::work::decode_transcript(&transcript, 8 << 20).unwrap();
         assert_eq!(
-            output::verify(&request, &key.public_key(), &envelopes, MAX_RECORD_BYTES).unwrap(),
+            output::verify(&request, &key.public_key(), &decoded, 8 << 20).unwrap(),
             output
         );
         let accepted = hellas_rpc::provenance::ExecutionProvenance {
@@ -843,18 +834,13 @@ mod output_tests {
             provider: key.public_key(),
         };
         let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
+        let budget = requester.budget.clone();
+        // A retained result can arrive in one burst before the consumer polls.
         requester.accepted()(accepted.clone());
-        assert!(
-            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Accepted(actual) if actual == accepted)
-        );
         let progress = requester.progress();
         for envelope in &envelopes[..envelopes.len() - 1] {
             progress(envelope.clone()).unwrap();
-            assert!(
-                matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Output(chunk)) if chunk.name == "emitted" && chunk.bytes.as_bytes().iter().all(|b| *b == 255))
-            );
         }
-        // submit queues both synchronously; the consumer cannot poll between them.
         requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
         requester.emit(Ok(WorkEvent::Output(
             ComputeEvent::completed(&output, &key.public_key()).unwrap(),
@@ -862,12 +848,29 @@ mod output_tests {
         drop(progress);
         drop(requester);
         assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Accepted(actual) if actual == accepted)
+        );
+        let mut pixels = Vec::new();
+        for _ in &envelopes[..envelopes.len() - 1] {
+            let WorkEvent::Output(ComputeEvent::Output(chunk)) =
+                response.next().await.unwrap().unwrap()
+            else {
+                panic!("expected image prefix");
+            };
+            assert_eq!(chunk.name, "image");
+            assert_eq!(chunk.format, "catena.bytes.v1");
+            assert_eq!(chunk.offset, pixels.len() as u64);
+            pixels.extend_from_slice(chunk.bytes.as_bytes());
+        }
+        assert_eq!(pixels, output.artifacts[0].bytes.as_bytes());
+        assert!(
             matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript)
         );
         assert!(
             matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Done { output: actual, provider }) if actual == output && provider == key.public_key())
         );
         assert!(response.next().await.is_none());
+        assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
     }
 
     fn text(delta: &str) -> OutputEvent {

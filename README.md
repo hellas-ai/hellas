@@ -18,7 +18,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-9ec3f625170e`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-d116170a7e66`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
@@ -55,16 +55,11 @@ The example charges 20 per job, ten jobs per channel, and stops execution after
 content ID of A's enrollment and the node it binds. B learns it from A out of
 band and every paid connection must present exactly that enrollment.
 
-Person B runs no node. With a Catena program `counter.hex`:
-
-```text
-(def program initialize : [] -> (u64 val) = const.u64.0x0000000000000000)
-(def program advance : {(u64 val) (u64 val)} -> (u64 val)
-= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
-```
-
-one command builds a job, pays A and prints the result; a second closes the
-channel:
+Person B runs no node. Given a self-contained Catena program `counter.hex`
+whose `advance` entry adds two `u64` values, one command builds a job, pays A
+and prints the result; a second closes the channel. The source must include
+any stdlib definitions it uses; the provider compiles exactly the supplied
+sources.
 
 ```sh
 hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
@@ -126,7 +121,8 @@ memory-only jobs read weights the provider already holds; they never write them.
 
 `--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
 gateway renders each request as a Compute job from the GGUF's configuration
-and tokenizer and sends it to its paid pool or grant; the weights are not
+and tokenizer. It bundles its own reachable Catena stdlib into one Hex source
+and sends the job to its paid pool or grant; the weights are not
 uploaded, so providers must already hold that GGUF (see the quickstart). The
 API model label is the file name without its extension.
 
@@ -153,7 +149,15 @@ POST /v1/completions
 POST /v1/responses
 POST /v1/chat/completions
 POST /v1/messages
+POST /v1/audio/transcriptions    (--audio-model)
+POST /v1/images/generations     (--image-model)
 ```
+
+`--image-model DIR` serves a converted Flux2 Klein 4B package. Each image is
+one Compute job containing text encoding, denoising and image decoding; the
+gateway returns a base64 PNG and the provider's signed evidence. Images are
+limited to 512×512. The same package works with `hellas image`; see
+[image jobs](docs/jobs.md#image-jobs) for conversion and requests.
 
 Monitor discovery and peer health with `hellas monitor --timeout-secs 30`.
 

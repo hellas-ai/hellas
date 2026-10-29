@@ -1,5 +1,50 @@
 use super::*;
 
+#[test]
+fn image_cli_and_gateway_surfaces_are_available() {
+    let convert = Cli::try_parse_from([
+        "hellas",
+        "convert-flux",
+        "--checkpoint",
+        "snapshot",
+        "--output",
+        "klein",
+    ])
+    .unwrap();
+    assert!(matches!(convert.command, Commands::ConvertFlux { .. }));
+    let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
+    let image = Cli::try_parse_from([
+        "hellas",
+        "image",
+        "--provider",
+        &provider,
+        "--model",
+        "klein",
+        "--prompt",
+        "fox",
+        "--payment",
+        "20",
+        "--seed",
+        "42",
+        "--steps",
+        "4",
+        "--width",
+        "512",
+        "--height",
+        "512",
+    ])
+    .unwrap();
+    assert!(matches!(image.command, Commands::Image(_)));
+    let gateway = parse_gateway(&["--image-model", "klein"]).unwrap();
+    assert!(matches!(
+        gateway.command,
+        Commands::Gateway {
+            image_model: Some(_),
+            ..
+        }
+    ));
+}
+
 #[cfg(unix)]
 mod machines;
 

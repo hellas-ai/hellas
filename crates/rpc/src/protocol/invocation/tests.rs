@@ -165,7 +165,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "b0f2f6a287b0ed4435bdfdd2888d82af166b4ff3f74ad3f6a169ad476efabf56"
+        "7290cb2b26f9a81b4a0f64098b701603fc631c8969a632ba221c9b4ac41fa8c3"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
@@ -1301,5 +1301,31 @@ fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matchin
         policy()
             .content_closure(&closure_manifest(&reordered), &reordered)
             .is_err()
+    );
+}
+
+#[test]
+fn compute_evaluator_matches_locked_catena_revision() {
+    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+    let mut packages = lock
+        .split("\n[[package]]\n")
+        .filter(|package| package.lines().any(|line| line == "name = \"catena-lang\""));
+    let package = packages.next().expect("catena-lang is locked");
+    assert!(packages.next().is_none(), "multiple catena-lang revisions");
+    let revision = package
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "source = \"git+https://github.com/hellas-ai/catena-lang.git?branch=master#",
+            )
+            .and_then(|source| source.strip_suffix('"'))
+        })
+        .expect("catena-lang is pinned to upstream master");
+    assert_eq!(revision.len(), 40);
+    assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        compute::EVALUATOR,
+        format!("hellas/catena-{}", &revision[..12]),
+        "compute evaluator must identify the locked Catena compiler"
     );
 }

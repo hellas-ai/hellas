@@ -1,16 +1,13 @@
 //! Multipart audio is prepared and decoded on the gateway, through one Compute job.
-use super::{
-    AudioOptions, ComputeEvent, GatewayError, GatewayResult, WorkEvent, WorkExecutionBackend,
-    json_error,
-};
+use super::backend::provenance::json_response;
+use super::{AudioOptions, GatewayError, GatewayResult, WorkExecutionBackend, json_error};
 use axum::{
-    Json, Router,
+    Router,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
 };
-use futures::StreamExt;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
@@ -167,67 +164,43 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
             "transcription preparation timed out",
         );
     }
-    let mut stream = match state.work.run(job) {
-        Ok(stream) => stream,
-        Err(error) => return work_error(error),
-    };
-    let mut accepted = None;
-    let mut transcript = None;
-    let mut response = loop {
-        match crate::before_deadline(deadline, stream.next()).await {
-            Ok(Some(Ok(WorkEvent::Accepted(provenance)))) => accepted = Some(provenance),
-            Ok(Some(Ok(WorkEvent::Transcript(signed)))) => transcript = Some(signed),
-            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Output(_))))) => {}
-            Ok(Some(Ok(WorkEvent::Output(ComputeEvent::Done { output, .. })))) => {
-                break match state.package.decode(&output) {
-                    Ok(ModelResponse::Transcription(result)) if format == "text" => {
-                        text_response(result.text, transcript.as_deref())
-                    }
-                    Ok(ModelResponse::Transcription(result)) => audio_json(
-                        StatusCode::OK,
-                        serde_json::json!({"text":result.text}),
-                        accepted.as_ref(),
-                        transcript.as_deref(),
-                    ),
-                    Ok(_) => audio_error(
-                        StatusCode::BAD_GATEWAY,
-                        "unexpected model response",
-                        accepted.as_ref(),
-                        transcript.as_deref(),
-                    ),
-                    Err(error) => audio_error(
-                        StatusCode::BAD_GATEWAY,
-                        error.to_string(),
-                        accepted.as_ref(),
-                        transcript.as_deref(),
-                    ),
-                };
+    let crate::compute::Completion {
+        output,
+        accepted,
+        transcript,
+    } = crate::compute::collect(
+        state.work.as_ref(),
+        job,
+        deadline,
+        "transcription timed out",
+    )
+    .await;
+    let mut response = match output {
+        Ok(output) => match state.package.decode(&output) {
+            Ok(ModelResponse::Transcription(result)) if format == "text" => {
+                text_response(result.text, transcript.as_deref())
             }
-            Ok(Some(Err(error))) => {
-                let error: hellas_adaptors::BackendError = error.into();
-                break audio_error(
-                    super::backend_status(&error),
-                    error.to_string(),
-                    accepted.as_ref(),
-                    transcript.as_deref(),
-                );
-            }
-            Ok(None) => {
-                break audio_error(
-                    StatusCode::BAD_GATEWAY,
-                    "execution stream ended without terminal outcome",
-                    accepted.as_ref(),
-                    transcript.as_deref(),
-                );
-            }
-            Err(_) => {
-                break audio_error(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "transcription timed out",
-                    accepted.as_ref(),
-                    transcript.as_deref(),
-                );
-            }
+            Ok(ModelResponse::Transcription(result)) => json_response(
+                StatusCode::OK,
+                serde_json::json!({"text":result.text}),
+                accepted.as_ref(),
+                transcript.as_deref(),
+            ),
+            Ok(_) => audio_error(
+                StatusCode::BAD_GATEWAY,
+                "unexpected model response",
+                accepted.as_ref(),
+                transcript.as_deref(),
+            ),
+            Err(error) => audio_error(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                accepted.as_ref(),
+                transcript.as_deref(),
+            ),
+        },
+        Err((status, message)) => {
+            audio_error(status, message, accepted.as_ref(), transcript.as_deref())
         }
     };
     if let Some(accepted) = accepted {
@@ -242,27 +215,12 @@ fn audio_error(
     accepted: Option<&hellas_rpc::provenance::ExecutionProvenance>,
     transcript: Option<&[u8]>,
 ) -> Response {
-    audio_json(
+    json_response(
         status,
         serde_json::json!({"error": {"message": message.into()}}),
         accepted,
         transcript,
     )
-}
-
-fn audio_json(
-    status: StatusCode,
-    mut body: serde_json::Value,
-    accepted: Option<&hellas_rpc::provenance::ExecutionProvenance>,
-    transcript: Option<&[u8]>,
-) -> Response {
-    if let Some(transcript) = transcript {
-        body["hellas"] = serde_json::to_value(crate::backend::provenance::completed_provenance(
-            accepted, transcript,
-        ))
-        .expect("provenance serializes");
-    }
-    (status, Json(body)).into_response()
 }
 
 /// Keep the transcription's text bytes intact; trail its signed evidence.
@@ -298,10 +256,5 @@ fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
         .insert(header::TRAILER, HeaderValue::from_static(TRANSCRIPT_KEY));
     response
 }
-fn work_error(error: super::WorkGatewayError) -> Response {
-    let error: hellas_adaptors::BackendError = error.into();
-    json_error(super::backend_status(&error), error.to_string())
-}
-
 #[cfg(test)]
 mod tests;

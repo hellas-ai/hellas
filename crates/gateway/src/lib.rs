@@ -8,10 +8,12 @@ mod archive;
 mod audio;
 mod backend;
 mod compose;
+mod compute;
 mod dispatch;
 mod error;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
+mod image;
 mod openai;
 mod plain;
 mod provenance_layer;
@@ -253,6 +255,14 @@ pub struct Presentations {
 pub enum ModelOptions {
     Text(TextOptions),
     Whisper(AudioOptions),
+    Flux(ImageOptions),
+}
+
+#[derive(Clone)]
+pub struct ImageOptions {
+    /// Converted Flux2 Klein package metadata and tokenizer.
+    pub model: PathBuf,
+    pub model_name: String,
 }
 
 #[derive(Clone)]

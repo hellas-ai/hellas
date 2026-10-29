@@ -100,8 +100,16 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         assert_eq!(job.environment.assets[0].object, object);
         assert!(job.content.read(object).is_err());
         assert_eq!(job.environment.sources.len(), 1);
-        let source = job.content.read(job.environment.sources[0]).unwrap();
-        assert_eq!(&*source, graph::bundle(&cfg, false).unwrap().as_bytes());
+        assert_eq!(
+            job.environment.sources[0],
+            ContentRef::new(
+                "a48635a262943cd85bb0896314b92281ef21581b05e710bf3ecaba29812f3861"
+                    .parse()
+                    .unwrap(),
+                347973,
+            ),
+        );
+        assert!(job.content.read(job.environment.sources[0]).is_ok());
         assert!(job.plan.step.is_none());
         assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
         assert_eq!(job.plan.calls[0].args.len(), 10 + tensors(&cfg).len());
@@ -125,6 +133,24 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
             floats("features", &audio::log_mel(&[0.; 400]).unwrap())
         );
     }
+}
+
+#[test]
+fn shipped_whisper_program_matches_catena_models() {
+    let model =
+        ModelPackage::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
+            .unwrap();
+    let job = model
+        .render_job(&ModelRequest::Transcription {
+            samples: &[0.; 400],
+            language: Some("en"),
+            max_new_tokens: 4,
+        })
+        .unwrap();
+    let config =
+        Config::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
+            .unwrap();
+    crate::model::program::assert_shipped_module(&job, &graph::bundle(&config, false).unwrap());
 }
 
 #[test]
