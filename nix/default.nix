@@ -408,7 +408,7 @@ let
         pkgs.actionlint
         pkgs.shellcheck
       ];
-      command = "actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml";
+      command = "actionlint .github/workflows/*.yml";
     };
     "no-catgrad-lock" = noCatgradLock;
 
@@ -493,10 +493,6 @@ let
     '';
   };
 
-  hydraRequired = pkgs.releaseTools.aggregate {
-    name = "hellas-required";
-    constituents = [ hydraUnit ] ++ lib.attrValues hydraLints;
-  };
 in
 {
   packages =
@@ -563,9 +559,7 @@ in
   };
   nixosTests = linuxOutputs.nixosTests or { };
 
-  # Evaluated by a separate, non-reporting Hydra jobset (infra
-  # services/ci/hydra.nix). Deliberately not under hydraJobs: nothing here may
-  # join `required` or report a GitHub status.
+  # Evaluated by the explicit Windows jobset in infra services/ci/hydra.nix.
   windowsJobs = lib.optionalAttrs isX86_64Linux {
     inherit (windowsPackages) cli;
     # Runs on the `wsl` builder (NixOS-WSL inside a Windows VM), whose sandbox
@@ -588,12 +582,6 @@ in
           grep -q . "$TMPDIR/version"
           cp "$TMPDIR/version" "$out"
         '';
-  };
-
-  hydraJobs = {
-    lints = hydraLints;
-    unit = hydraUnit;
-    required = hydraRequired;
   };
 
   releaseJobs = import ./releases.nix {

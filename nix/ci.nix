@@ -73,12 +73,10 @@ let
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
-    actions =
-      mk "check-actions" "actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml"
-        [
-          pkgs.actionlint
-          pkgs.shellcheck
-        ];
+    actions = mk "check-actions" "actionlint .github/workflows/*.yml" [
+      pkgs.actionlint
+      pkgs.shellcheck
+    ];
     unit = mkCargo "check-unit" unitTestCommand (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.

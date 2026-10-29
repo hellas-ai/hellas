@@ -1,10 +1,10 @@
 # Checks and releases
 
-Pull requests into `master` or `devnet` run lints and unit tests. The same
-checks run after a merge to `master`. Hydra's default `hydraJobs` output
-contains only lints, unit tests and their `required` aggregate on each Linux
-architecture. Ordinary PR evaluations do not build release packages, images
-or VMs.
+Pull requests into `master` or `devnet` run lints and unit tests on GitHub-hosted
+Ubuntu runners. The same checks run after a merge to `master`. Rust outputs
+are cached separately per job and dependency lock. Nix dependencies use the
+public binary caches. Hydra handles component releases and the explicit
+Windows jobset; it does not evaluate pull requests.
 
 ```sh
 nix run .#check          # PR checks
@@ -98,9 +98,9 @@ where state compatibility permits it.
 
 ## Required checks
 
-When adopting this split, change the default-branch ruleset to require `Lints`,
-`Unit tests` and `ci/aarch64/required`. Remove the old `Build smoke passed` and
-`E2E passed` requirements. Keep the pull-request, review-resolution and
+When adopting this split, change the default-branch ruleset to require `Lints`
+and `Unit tests`. Remove the old `Build smoke passed`, `E2E passed` and
+`ci/aarch64/required` requirements. Keep the pull-request, review-resolution and
 branch-integrity rules. Apply the status-check transition when landing the CI
 change, then update other open branches so they report the new unit-test check.
 A workflow edit alone does not change GitHub's repository rules.

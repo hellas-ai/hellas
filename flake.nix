@@ -30,12 +30,12 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      hydraSystems = [
+      releaseSystems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      forHydraSystems = nixpkgs.lib.genAttrs hydraSystems;
+      forReleaseSystems = nixpkgs.lib.genAttrs releaseSystems;
       perSystem = forAllSystems (
         system:
         import ./nix {
@@ -55,7 +55,6 @@
       checks = forAllSystems (system: perSystem.${system}.checks);
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
-      hydraJobs = forHydraSystems (system: perSystem.${system}.hydraJobs);
       # Selected explicitly by the component's Hydra jobset, never by PR CI.
       releaseJobs =
         builtins.mapAttrs
@@ -70,7 +69,7 @@
             }
           )
           {
-            cli = forHydraSystems (system: perSystem.${system}.releaseJobs.cli);
+            cli = forReleaseSystems (system: perSystem.${system}.releaseJobs.cli);
             gpu.x86_64-linux = perSystem.x86_64-linux.releaseJobs.gpu;
             consensus.x86_64-linux = perSystem.x86_64-linux.releaseJobs.consensus;
           };
