@@ -313,10 +313,11 @@ nix run .#check-kernel-models
 nix run .#check-kernel-model-verify
 ```
 
-`nix run .#check` runs the PR lints and unit tests. Full chain tests, VM tests,
-portable binaries and container builds belong to chain releases. See
-[checks and chain releases](docs/releases.md) for promotion from `master` to
-`devnet` and deployment through infra.
+`nix run .#check` runs the PR lints and unit tests. CLI, GPU execution and
+consensus have independent Hydra release jobsets for their heavier tests and
+artifacts. See [checks and releases](docs/releases.md) for promotion and
+deployment through infra. `devnet` tracks chain rollout; it does not trigger
+CLI or GPU releases.
 
 ## Docker
 

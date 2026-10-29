@@ -595,4 +595,21 @@ in
     unit = hydraUnit;
     required = hydraRequired;
   };
+
+  releaseJobs = import ./releases.nix {
+    inherit
+      self
+      pkgs
+      lib
+      system
+      nativePkg
+      nativePackages
+      crossPackages
+      linuxOutputs
+      hydraLints
+      hydraUnit
+      hellasRpcWasm
+      ci
+      ;
+  };
 }
