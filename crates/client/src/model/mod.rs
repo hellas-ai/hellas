@@ -3,6 +3,8 @@ pub mod gguf;
 #[cfg(feature = "models")]
 mod package;
 #[cfg(feature = "models")]
+mod program;
+#[cfg(feature = "models")]
 pub use package::{ComputeJob, ModelPackage, ModelRequest, ModelResponse};
 #[cfg(feature = "models")]
 mod qwen3;

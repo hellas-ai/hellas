@@ -202,7 +202,8 @@ impl Whisper {
             "derived weight file has wrong length"
         );
         let mut content = EphemeralContent::default();
-        let source = content.insert(graph::bundle(&config, false)?.into_bytes());
+        let source =
+            content.insert(super::program::render(&graph::bundle(&config, false)?)?.into_bytes());
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {

@@ -55,11 +55,7 @@ pub fn child_main() -> Result<bool> {
 }
 
 pub fn compile_sources(sources: &[String], dialect: GpuDialect) -> Result<RuntimeModule> {
-    let texts: Vec<_> = catena_lang::stdlib::core_sources()
-        .map(|s| -> &str { s })
-        .chain(sources.iter().map(String::as_str))
-        .collect();
-    let raw = metacat::theory::RawTheorySet::from_texts(texts)?;
+    let raw = metacat::theory::RawTheorySet::from_texts(sources.iter().map(String::as_str))?;
     Ok(catena_lang::compile::compile(
         &mut CompileReport::new(raw),
         CodegenKind::Default,
@@ -112,12 +108,9 @@ pub fn compile_cancellable(
     {
         return Err("sources exceed compile limit".into());
     }
-    let all: Vec<_> = catena_lang::stdlib::core_sources()
-        .map(|s| -> &str { s })
-        .chain(sources.iter().map(String::as_str))
-        .collect();
+    let texts: Vec<_> = sources.iter().map(String::as_str).collect();
     let cache = if retention == Retention::Retain {
-        ModuleCache::from_sources(&all, CodegenKind::Default, dialect)
+        ModuleCache::from_sources(&texts, CodegenKind::Default, dialect)
     } else {
         None
     };

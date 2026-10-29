@@ -61,6 +61,13 @@ buffer) or `input:NAME`, where `--input FILE` supplies the bytes of input
 flat price A charges per job. The provider checks the arguments against the
 program signature before calling it.
 
+Sources must be self-contained: include every stdlib definition the program
+uses. The provider compiles exactly the shipped sources with the named
+evaluator, including on a cache miss or preflight; it supplies no implicit
+stdlib. Model packages bundle the client's stdlib and model into one Hex
+source, pruned using catena-models' reachability policy. The resulting bytes
+are part of the job's content identity.
+
 `run` saves the folder under the requester state, or at `--save-job DIR`:
 
 ```toml

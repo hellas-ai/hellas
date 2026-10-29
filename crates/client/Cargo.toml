@@ -40,6 +40,7 @@ models = [
     "dep:tokenizers",
     "dep:tempfile",
     "dep:hound",
+    "dep:metacat",
 ]
 
 [dependencies]
@@ -64,6 +65,7 @@ hellas-wire.workspace = true
 hound = { version = "3.5", optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
+metacat = { version = "0.3", optional = true }
 rand.workspace = true
 safetensors = { version = "0.7", optional = true }
 serde.workspace = true
@@ -80,6 +82,7 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 base64.workspace = true
 bytes.workspace = true
+catena-lang.workspace = true
 ciborium.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }

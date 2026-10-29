@@ -963,9 +963,13 @@ fn counter_plan() -> Plan {
 }
 fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_rpc::ContentRef) {
     let mut content = hellas_channel::content::EphemeralContent::default();
+    let mut sources: Vec<_> = catena_lang::stdlib::core_sources()
+        .map(|text| content.insert(text.as_bytes().to_vec()))
+        .collect();
     let source = content.insert(source.as_bytes().to_vec());
+    sources.push(source);
     let environment = invocation::compute::Environment {
-        sources: vec![source],
+        sources,
         assets: vec![],
     };
     content.insert(environment.canonical_bytes().unwrap());

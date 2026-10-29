@@ -55,16 +55,11 @@ The example charges 20 per job, ten jobs per channel, and stops execution after
 content ID of A's enrollment and the node it binds. B learns it from A out of
 band and every paid connection must present exactly that enrollment.
 
-Person B runs no node. With a Catena program `counter.hex`:
-
-```text
-(def program initialize : [] -> (u64 val) = const.u64.0x0000000000000000)
-(def program advance : {(u64 val) (u64 val)} -> (u64 val)
-= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
-```
-
-one command builds a job, pays A and prints the result; a second closes the
-channel:
+Person B runs no node. Given a self-contained Catena program `counter.hex`
+whose `advance` entry adds two `u64` values, one command builds a job, pays A
+and prints the result; a second closes the channel. The source must include
+any stdlib definitions it uses; the provider compiles exactly the supplied
+sources.
 
 ```sh
 hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
@@ -126,7 +121,8 @@ memory-only jobs read weights the provider already holds; they never write them.
 
 `--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
 gateway renders each request as a Compute job from the GGUF's configuration
-and tokenizer and sends it to its paid pool or grant; the weights are not
+and tokenizer. It bundles its own reachable Catena stdlib into one Hex source
+and sends the job to its paid pool or grant; the weights are not
 uploaded, so providers must already hold that GGUF (see the quickstart). The
 API model label is the file name without its extension.
 
