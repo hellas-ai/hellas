@@ -15,11 +15,15 @@ impl WorkExecutionBackend for Recorder {
     fn fetch_routes(&self) -> Vec<FetchRoute> {
         vec![
             FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::HttpV1,
                 sealed: Some(("http".into(), "request".into())),
             },
             FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::StatelessResponsesV1,
                 sealed: Some(("openai".into(), "responses".into())),

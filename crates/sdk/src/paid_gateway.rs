@@ -471,6 +471,13 @@ impl WorkSource for PaidPool {
     /// A pinned request has at most its own provider: account and session
     /// selection is final, so it never fails over.
     fn request(&self, request: WorkRequest) -> Result<PaidRequest> {
+        if matches!(&request, WorkRequest::Fetch(fetch) if fetch.resource.is_some() || fetch.channel.is_some())
+        {
+            return Err(WorkGatewayError::Rejected(Box::new(std::io::Error::other(
+                "paid work has no grant resource selector",
+            )))
+            .into());
+        }
         let pinned = request.pinned();
         let mut refusal = None;
         let mut candidates = self
@@ -837,6 +844,8 @@ mod tests {
 
     fn fetch(pool: &PaidPool, method: &str) -> WorkRequest {
         WorkRequest::Fetch(WorkFetchRequest {
+            resource: None,
+            channel: None,
             provider: pool.providers[0].args.provider.node,
             service: "openai".into(),
             method: method.into(),

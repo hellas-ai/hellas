@@ -19,10 +19,10 @@ fn catena_child() {
 mod automatic;
 #[path = "paid_e2e/gateway.rs"]
 mod gateway;
-#[path = "paid_e2e/remote.rs"]
-mod remote;
 #[path = "native_execution/grant.rs"]
 mod grant;
+#[path = "paid_e2e/remote.rs"]
+mod remote;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -634,6 +634,8 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
+                resource: None,
+                channel: None,
                 provider: options.provider.node,
                 service: "openai".into(),
                 method: "wrong-route".into(),
@@ -649,6 +651,8 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
+                resource: None,
+                channel: None,
                 provider: options.provider.node,
                 service: "openai".into(),
                 method: "responses".into(),

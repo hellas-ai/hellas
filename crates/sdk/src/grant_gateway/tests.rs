@@ -236,6 +236,8 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
+            resource: None,
+            channel: None,
             provider: self.gateway.source.provider,
             service: "openai".into(),
             method: "responses".into(),
@@ -400,6 +402,287 @@ async fn paused_terms_are_denied_at_the_gateway() {
     assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn refreshed_https_bounds_are_checked_before_proposal() {
+    for change in 0..5 {
+        let fixture = Fixture::builder().build().await;
+        let mut policy = fixture.host.allowance.policies[0].clone();
+        policy.revision.0 += 1;
+        let https = policy.https.as_mut().unwrap();
+        match change {
+            0 => https.origin = "https://changed.fixture".into(),
+            1 => https.credential = Some("changed".into()),
+            2 => https.max_output_tokens = 3,
+            3 => https.paths = vec!["/changed".into()],
+            _ => https.max_response_bytes = 128,
+        }
+        let guard = fixture.gateway.source.session.lock().await;
+        let mut stream = fixture.gateway.fetch(fixture.request(Some(6))).unwrap();
+        let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+            fixture.host.world.service.clone(),
+            fixture.host.world.secret(ROOT),
+            vec![policy.clone()],
+        )
+        .await;
+        admin
+            .command(WorkControlCommand::ConfigureResource {
+                policy: policy.name,
+            })
+            .await
+            .unwrap();
+        let grant = &fixture.host.allowance;
+        admin
+            .command(WorkControlCommand::Revise {
+                id: ids::ALLOWANCE,
+                expected_revision: grant.revision,
+                terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                    policies: grant.policies.iter().map(|p| p.name.clone()).collect(),
+                    budget: grant.budget,
+                    max_job_millis: grant.max_job_millis,
+                    enabled: true,
+                    allow_account_backed: grant.allow_account_backed,
+                },
+            })
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(within(stream.next()).await.unwrap().is_err());
+        assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .gateway
+                .source
+                .session
+                .lock()
+                .await
+                .store()
+                .next_nonce()
+                .unwrap(),
+            1
+        );
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn renamed_policy_keeps_the_selected_resource() {
+    let fixture = Fixture::builder().build().await;
+    let journal = tempfile::tempdir().unwrap();
+    let mut options = fixture.host.options(vec![]);
+    options.journal_root = journal.path().to_owned();
+    let source = GrantSource::open(
+        options,
+        GrantTransport::Local(fixture.host.world.service.clone()),
+        Some("chat".into()),
+    )
+    .await
+    .unwrap();
+    let gateway = Arc::new(WorkGateway::new(source, 32));
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    policy.revision.0 += 1;
+    policy.name = "renamed".into();
+    let guard = gateway.source.session.lock().await;
+    let mut stream = gateway.fetch(fixture.request(None)).unwrap();
+    let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+        fixture.host.world.service.clone(),
+        fixture.host.world.secret(ROOT),
+        vec![policy.clone()],
+    )
+    .await;
+    admin
+        .command(WorkControlCommand::ConfigureResource {
+            policy: policy.name.clone(),
+        })
+        .await
+        .unwrap();
+    let grant = &fixture.host.allowance;
+    admin
+        .command(WorkControlCommand::Revise {
+            id: ids::ALLOWANCE,
+            expected_revision: grant.revision,
+            terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                policies: vec![policy.name],
+                budget: grant.budget,
+                max_job_millis: grant.max_job_millis,
+                enabled: true,
+                allow_account_backed: grant.allow_account_backed,
+            },
+        })
+        .await
+        .unwrap();
+    drop(guard);
+    while let Some(event) = within(stream.next()).await {
+        event.unwrap();
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    gateway.drain().await.unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_resource_or_channel_never_reaches_a_proposal() {
+    let fixture = Fixture::builder().build().await;
+    let resource = fixture.host.allowance.policies[0].resource;
+    let channel = fixture.gateway.source.channel;
+    for (selected_resource, selected_channel) in [
+        (
+            Some(hellas_auth::authority::ResourceId(
+                hellas_auth::Digest::hash(b"other"),
+            )),
+            Some(channel),
+        ),
+        (
+            Some(resource),
+            Some(hellas_channel::model::grant::ChannelId(
+                hellas_auth::Digest::hash(b"other"),
+            )),
+        ),
+        (Some(resource), None),
+    ] {
+        let mut request = fixture.request(None);
+        request.resource = selected_resource;
+        request.channel = selected_channel;
+        assert!(fixture.gateway.fetch(request).is_err());
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .gateway
+            .source
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        1
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn https_policy_conversion_rejects_a_non_http_schema() {
+    let fixture = Fixture::builder().build().await;
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    for admission in &mut policy.invocation_policy.admissions {
+        if let Admission::Fetch { admission } = admission {
+            admission.contract = hellas_channel::test_support::test_responses_contract();
+        }
+    }
+    assert!(policy_http_routes(&policy).is_err());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
+    let fixture = Fixture::builder().build().await;
+    let old = fixture.host.allowance.policies[0].clone();
+    let mut renamed = old.clone();
+    renamed.revision.0 += 1;
+    renamed.name = "old-resource".into();
+    let mut replacement = old.clone();
+    replacement.resource =
+        hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
+    let guard = fixture.gateway.source.session.lock().await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+        fixture.host.world.service.clone(),
+        fixture.host.world.secret(ROOT),
+        vec![renamed.clone(), replacement.clone()],
+    )
+    .await;
+    for policy in [renamed.name, replacement.name.clone()] {
+        admin
+            .command(WorkControlCommand::ConfigureResource { policy })
+            .await
+            .unwrap();
+    }
+    let grant = &fixture.host.allowance;
+    admin
+        .command(WorkControlCommand::Revise {
+            id: ids::ALLOWANCE,
+            expected_revision: grant.revision,
+            terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                policies: vec![replacement.name],
+                budget: grant.budget,
+                max_job_millis: grant.max_job_millis,
+                enabled: true,
+                allow_account_backed: grant.allow_account_backed,
+            },
+        })
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(within(stream.next()).await.unwrap().is_err());
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .gateway
+            .source
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        1
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_start_failure_does_not_close_shared_endpoint() {
+    let fixture = Fixture::builder().remote().build().await;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let mut options = fixture
+        .host
+        .options(fixture.remote.as_ref().unwrap().addresses());
+    let journal = tempfile::tempdir().unwrap();
+    options.journal_root = journal.path().to_owned();
+    assert!(
+        GrantSource::open(
+            options.clone(),
+            GrantTransport::Remote(endpoint.clone()),
+            Some("missing".into())
+        )
+        .await
+        .is_err()
+    );
+    assert!(!endpoint.is_closed());
+    let source = GrantSource::open(options, GrantTransport::Remote(endpoint.clone()), None)
+        .await
+        .unwrap();
+    source.session.lock().await.shutdown().await.unwrap();
+    assert!(!endpoint.is_closed());
+    endpoint.close().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_closes_remote_endpoint_after_drain() {
+    let fixture = Fixture::builder().remote().build().await;
+    let endpoint = fixture
+        .gateway
+        .endpoint
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(!endpoint.is_closed());
+    fixture.gateway.drain().await.unwrap();
+    assert!(endpoint.is_closed());
+    assert!(fixture.gateway.endpoint.lock().await.is_none());
+    if let Some(remote) = fixture.remote {
+        remote.shutdown().await;
+    }
 }
 
 struct Http {

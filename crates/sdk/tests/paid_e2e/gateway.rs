@@ -24,6 +24,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             let started = tokio::time::Instant::now();
             let request = gateway
                 .fetch(hellas_gateway::WorkFetchRequest {
+                    resource: None,
+                    channel: None,
                     provider: case.options.provider.node,
                     service: "openai".into(),
                     method: "responses".into(),

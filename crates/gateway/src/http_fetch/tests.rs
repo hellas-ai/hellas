@@ -20,6 +20,8 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
     impl WorkExecutionBackend for Paid {
         fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
             vec![crate::FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::HttpV1,
                 sealed: Some(("http".into(), "request".into())),
@@ -283,6 +285,8 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
             ["a", "b"]
                 .into_iter()
                 .map(|method| crate::FetchRoute {
+                    resource: None,
+                    channel: None,
                     provider: self.0,
                     schema: hellas_rpc::FetchSchema::HttpV1,
                     sealed: Some(("http".into(), method.into())),
@@ -328,6 +332,63 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
     ));
 }
 
+#[test]
+fn resource_selection_resolves_same_provider_routes_independently() {
+    let provider = iroh::SecretKey::from_bytes(&[13; 32]).public();
+    let first = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"first"));
+    let second = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
+    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
+    let routes = vec![
+        crate::FetchRoute {
+            provider,
+            resource: Some(first),
+            channel: Some(channel),
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("http".into(), "first".into())),
+        },
+        crate::FetchRoute {
+            provider,
+            resource: Some(second),
+            channel: Some(channel),
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("other".into(), "second".into())),
+        },
+    ];
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({"routes": [{
+        "path": "/v1/test", "method": "POST", "url": "https://example.test/v1/test"
+    }]}))
+    .unwrap();
+    let mut routing = routing::Routing::new(&config, &[provider]).unwrap();
+    let backend = &mut routing.backends[0];
+    assert!(matches!(
+        fetch_route(&routes, backend, None),
+        Err(crate::GatewayConfigError::AmbiguousFetchRoute(_))
+    ));
+    backend.resource = Some(first);
+    backend.channel = Some(channel);
+    assert_eq!(
+        fetch_route(&routes, backend, None).unwrap(),
+        ("http".into(), "first".into())
+    );
+    backend.resource = Some(second);
+    assert_eq!(
+        fetch_route(&routes, backend, None).unwrap(),
+        ("other".into(), "second".into())
+    );
+    assert!(fetch_route(&routes, backend, Some(&("http".into(), "first".into()))).is_err());
+    let mut wrong_schema = routes.clone();
+    wrong_schema[0].schema = hellas_rpc::FetchSchema::StatelessResponsesV1;
+    let http_routes: Vec<_> = wrong_schema
+        .into_iter()
+        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
+        .collect();
+    backend.resource = Some(first);
+    assert!(matches!(
+        fetch_route(&http_routes, backend, None),
+        Err(crate::GatewayConfigError::MissingFetchRoute(_))
+    ));
+}
+
 /// A provider that accepts the request, answers with `status` and the given
 /// body, and signs `transcript`.
 struct Proxied {
@@ -340,6 +401,8 @@ struct Proxied {
 impl WorkExecutionBackend for Proxied {
     fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
         vec![crate::FetchRoute {
+            resource: None,
+            channel: None,
             provider: self.provider,
             schema: hellas_rpc::FetchSchema::HttpV1,
             sealed: Some(("http".into(), "request".into())),

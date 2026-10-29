@@ -5,9 +5,8 @@ use crate::gateway_work::{
     Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
 };
 use crate::grant_client::{GrantClientError, GrantSession, GrantSessionOptions, GrantTransport};
-use crate::job::JobInput;
 use futures::future::BoxFuture;
-use hellas_auth::{ProducerSigningKey, PublicKey};
+use hellas_auth::{ProducerSigningKey, PublicKey, authority::ResourceId};
 use hellas_authority::model::grant::records::{
     GrantPolicy, SignedOffer, grant_producer, grant_transport,
 };
@@ -103,11 +102,11 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
 pub struct GrantSource {
     session: AsyncMutex<GrantSession>,
     offer: SignedOffer,
-    policy: Option<String>,
+    policy: Option<ResourceId>,
     provider: iroh::EndpointId,
+    channel: hellas_channel::model::grant::ChannelId,
     signer: Arc<ProducerSigningKey>,
     assurance: hellas_rpc::Assurance,
-    endpoint: Option<iroh::Endpoint>,
 }
 /// A grant channel behind the shared gateway.
 pub type GrantGateway = WorkGateway<GrantSource>;
@@ -119,65 +118,22 @@ impl GrantGateway {
         transport: GrantTransport,
         policy: Option<String>,
     ) -> Result<Arc<Self>, WorkGatewayError> {
-        let assurance = options.target.trust().required_assurance;
-        let signer = options.signer.clone();
-        let provider = iroh::EndpointId::from_bytes(
-            &grant_transport(&options.target.offer().provider).map_err(error)?,
-        )
-        .map_err(|_| error(GrantGatewayError::Transport))?;
         let endpoint = match &transport {
             GrantTransport::Remote(endpoint) => Some(endpoint.clone()),
             GrantTransport::Local(_) => None,
         };
-        let mut session = match GrantSession::open(options, transport).await {
-            Ok(session) => session,
+        let source = match GrantSource::open(options, transport, policy).await {
+            Ok(source) => source,
             Err(error) => {
                 if let Some(endpoint) = endpoint {
                     endpoint.close().await;
                 }
-                return Err(client_error(error));
+                return Err(error);
             }
         };
-        // Recover the single unresolved acceptance before admitting fresh work.
-        // Lost bodies can only be resolved after their signed acceptance window.
-        loop {
-            match session.recover().await {
-                Ok(_) => break,
-                Err(GrantClientError::RecoveryTooEarly) => {
-                    tokio::time::sleep(Duration::from_millis(250)).await
-                }
-                Err(e) => {
-                    let _ = session.shutdown().await;
-                    if let Some(endpoint) = endpoint {
-                        endpoint.close().await;
-                    }
-                    return Err(client_error(e));
-                }
-            }
-        }
-        let offer = session.offer().clone();
-        if policy
-            .as_ref()
-            .is_some_and(|name| !offer.offer().grant.policies.iter().any(|p| &p.name == name))
-        {
-            let _ = session.shutdown().await;
-            if let Some(endpoint) = endpoint {
-                endpoint.close().await;
-            }
-            return Err(rejected(GrantGatewayError::NoMatchingPolicy));
-        }
-        Ok(Arc::new(WorkGateway::new(
-            GrantSource {
-                session: AsyncMutex::new(session),
-                offer,
-                policy,
-                provider,
-                signer,
-                assurance,
-                endpoint,
-            },
-            32,
-        )))
+        Ok(Arc::new(
+            WorkGateway::new(source, 32).with_endpoint(endpoint),
+        ))
     }
 
     /// Exact private HTTP routes derived from current standing, if the grant
@@ -192,7 +148,7 @@ impl GrantGateway {
                     .source
                     .policy
                     .as_ref()
-                    .is_none_or(|name| name == &p.name)
+                    .is_none_or(|resource| *resource == p.resource)
         });
         let Some(policy) = policies.next() else {
             return Ok(None);
@@ -200,47 +156,65 @@ impl GrantGateway {
         if policies.next().is_some() {
             return Err(rejected(GrantGatewayError::AmbiguousPolicy));
         }
-        let (service, method) = policy
-            .invocation_policy
-            .admissions
-            .iter()
-            .find_map(|a| match a {
-                Admission::Fetch { admission } => match &admission.route {
-                    FetchRoutePolicy::SealedRoute { service, method } => Some((service, method)),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-        let template = policy
-            .https
-            .as_ref()
-            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+        let (service, method, routes) = policy_http_routes(policy)?;
         Ok(Some(hellas_gateway::HttpGatewayConfig {
-            service: Some(service.clone()),
-            method: Some(method.clone()),
+            service: Some(service),
+            method: Some(method),
             backends: Default::default(),
             max_in_flight: 32,
-            routes: template
-                .paths
-                .iter()
-                .flat_map(|path| {
-                    template
-                        .methods
-                        .iter()
-                        .map(move |verb| hellas_gateway::HttpRoute {
-                            path: path.clone(),
-                            method: verb.clone(),
-                            url: format!("{}{}", template.origin, path),
-                            credential: template.credential.clone(),
-                            tls: template.tls.clone(),
-                            headers: vec![],
-                            max_response_bytes: template.max_response_bytes,
-                        })
-                })
-                .collect(),
+            routes,
         }))
     }
+}
+
+/// Project the signed resource into HTTP presentation routes.
+fn policy_http_routes(
+    policy: &GrantPolicy,
+) -> Result<(String, String, Vec<hellas_gateway::HttpRoute>), WorkGatewayError> {
+    let mut admitted_routes = policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .filter_map(|a| match a {
+            Admission::Fetch { admission }
+                if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1 =>
+            {
+                match &admission.route {
+                    FetchRoutePolicy::SealedRoute { service, method } => Some((service, method)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+    let (service, method) = admitted_routes
+        .next()
+        .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+    if admitted_routes.any(|route| route != (service, method)) {
+        return Err(rejected(GrantGatewayError::AmbiguousPolicy));
+    }
+    let template = policy
+        .https
+        .as_ref()
+        .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+    let routes = template
+        .paths
+        .iter()
+        .flat_map(|path| {
+            template
+                .methods
+                .iter()
+                .map(move |verb| hellas_gateway::HttpRoute {
+                    path: path.clone(),
+                    method: verb.clone(),
+                    url: format!("{}{}", template.origin, path),
+                    credential: template.credential.clone(),
+                    tls: template.tls.clone(),
+                    headers: vec![],
+                    max_response_bytes: template.max_response_bytes,
+                })
+        })
+        .collect();
+    Ok((service.clone(), method.clone(), routes))
 }
 
 /// A gateway over one grant channel.
@@ -303,35 +277,103 @@ fn grant_runner(offer: &SignedOffer) -> Result<PublicKey, WorkGatewayError> {
 }
 
 impl GrantSource {
+    /// Open one source without taking ownership of its transport endpoint.
+    async fn open(
+        options: GrantSessionOptions,
+        transport: GrantTransport,
+        policy: Option<String>,
+    ) -> Result<Self, WorkGatewayError> {
+        let assurance = options.target.trust().required_assurance;
+        let signer = options.signer.clone();
+        let provider = iroh::EndpointId::from_bytes(
+            &grant_transport(&options.target.offer().provider).map_err(error)?,
+        )
+        .map_err(|_| error(GrantGatewayError::Transport))?;
+        let mut session = GrantSession::open(options, transport)
+            .await
+            .map_err(client_error)?;
+        loop {
+            match session.recover().await {
+                Ok(_) => break,
+                Err(GrantClientError::RecoveryTooEarly) => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => {
+                    let _ = session.shutdown().await;
+                    return Err(client_error(e));
+                }
+            }
+        }
+        let offer = session.offer().clone();
+        let policy = match policy {
+            Some(name) => match offer.offer().grant.policies.iter().find(|p| p.name == name) {
+                Some(policy) => Some(policy.resource),
+                None => {
+                    let _ = session.shutdown().await;
+                    return Err(rejected(GrantGatewayError::NoMatchingPolicy));
+                }
+            },
+            None => None,
+        };
+        let channel = session.store().channel().id;
+        Ok(Self {
+            session: AsyncMutex::new(session),
+            offer,
+            policy,
+            provider,
+            channel,
+            signer,
+            assurance,
+        })
+    }
+
     fn policies(&self) -> impl Iterator<Item = &GrantPolicy> {
         self.offer
             .offer()
             .grant
             .policies
             .iter()
-            .filter(|p| self.policy.as_ref().is_none_or(|name| name == &p.name))
+            .filter(|p| self.policy.is_none_or(|resource| resource == p.resource))
     }
 }
 
 impl WorkSource for GrantSource {
     type Error = WorkGatewayError;
-    type Request = (String, JobInput);
+    type Request = (ResourceId, WorkRequest);
 
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
-        crate::gateway_work::fetch_routes(
-            self.provider,
-            self.policies().map(|policy| &policy.invocation_policy),
-        )
+        self.policies()
+            .flat_map(|policy| {
+                crate::gateway_work::fetch_routes(
+                    self.provider,
+                    std::iter::once(&policy.invocation_policy),
+                )
+                .into_iter()
+                .map(move |mut route| {
+                    route.resource = Some(policy.resource);
+                    route.channel = Some(self.channel);
+                    route
+                })
+            })
+            .collect()
     }
 
     /// Grant work is memory-only. Exactly one granted policy must admit it.
-    fn request(&self, request: WorkRequest) -> Result<(String, JobInput), WorkGatewayError> {
+    fn request(&self, request: WorkRequest) -> Result<Self::Request, WorkGatewayError> {
         if let Some(provider) = request.pinned().filter(|p| *p != self.provider) {
             return Err(WorkGatewayError::Provider(provider));
+        }
+        if matches!(&request, WorkRequest::Fetch(fetch) if fetch.channel.is_some() != fetch.resource.is_some() || fetch.channel.is_some_and(|channel| channel != self.channel))
+        {
+            return Err(rejected(GrantGatewayError::NoMatchingPolicy));
         }
         let mut admitted = None;
         let mut refusal = None;
         for policy in self.policies() {
+            if matches!(&request, WorkRequest::Fetch(fetch) if fetch.resource.is_some_and(|resource| resource != policy.resource))
+            {
+                continue;
+            }
             match request.admitted(
                 &policy.invocation_policy,
                 policy.https.as_ref(),
@@ -341,19 +383,21 @@ impl WorkSource for GrantSource {
                 Ok(_) if admitted.is_some() => {
                     return Err(rejected(GrantGatewayError::AmbiguousPolicy));
                 }
-                Ok(input) => admitted = Some((policy.name.clone(), input)),
+                Ok(_) => admitted = Some(policy.resource),
                 Err(error) => refusal = Some(error),
             }
         }
-        admitted.ok_or_else(|| match refusal {
-            Some(error) => rejected(error),
-            None => rejected(GrantGatewayError::NoMatchingPolicy),
-        })
+        admitted
+            .map(|resource| (resource, request))
+            .ok_or_else(|| match refusal {
+                Some(error) => rejected(error),
+                None => rejected(GrantGatewayError::NoMatchingPolicy),
+            })
     }
 
     fn run<E: GatewayEvent>(
         self: Arc<Self>,
-        (name, input): (String, JobInput),
+        (resource, request): Self::Request,
         requester: Requester<E, WorkGatewayError>,
     ) -> BoxFuture<'static, Result<Option<Completed>, WorkGatewayError>> {
         Box::pin(async move {
@@ -373,16 +417,23 @@ impl WorkSource for GrantSource {
                     session.refresh().await
                 } => { recovered.map_err(client_error)?; }
             }
-            // Scope changes may refresh the named policy; they never move the
-            // request to another one.
+            // Re-admit the original request against the selected resource after refresh.
             let offer = session.offer();
             let policy = offer
                 .offer()
                 .grant
                 .policies
                 .iter()
-                .find(|policy| policy.name == name)
+                .find(|policy| policy.resource == resource)
                 .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+            let input = request
+                .admitted(
+                    &policy.invocation_policy,
+                    policy.https.as_ref(),
+                    self.assurance,
+                    false,
+                )
+                .map_err(rejected)?;
             let prepared = input
                 .prepare(
                     &input.manifest().map_err(rejected)?,
@@ -398,8 +449,8 @@ impl WorkSource for GrantSource {
             }
             let proposed = std::sync::atomic::AtomicBool::new(false);
             let content = input.content();
-            let operation = session.run(
-                &name,
+            let operation = session.run_current(
+                resource,
                 prepared,
                 &content,
                 Some(requester.progress()),
@@ -437,17 +488,12 @@ impl WorkSource for GrantSource {
 
     fn shutdown(&self) -> BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {
         Box::pin(async move {
-            let session = self
-                .session
+            self.session
                 .lock()
                 .await
                 .shutdown()
                 .await
-                .map_err(|error| hellas_gateway::WorkShutdownError::Recovery(Arc::new(error)));
-            if let Some(endpoint) = &self.endpoint {
-                endpoint.close().await;
-            }
-            session
+                .map_err(|error| hellas_gateway::WorkShutdownError::Recovery(Arc::new(error)))
         })
     }
 }

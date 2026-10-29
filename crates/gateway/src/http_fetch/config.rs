@@ -31,6 +31,11 @@ pub struct HttpBackend {
     pub max_in_flight: Option<usize>,
     /// Endpoint in the paid pool. May be omitted when there is exactly one.
     pub provider: Option<iroh::EndpointId>,
+    /// Canonical resource selected within the provider's grant channel.
+    #[serde(default)]
+    pub resource: Option<hellas_auth::authority::ResourceId>,
+    #[serde(default)]
+    pub channel: Option<hellas_channel::model::grant::ChannelId>,
 }
 
 fn default_concurrency() -> usize {

@@ -492,6 +492,12 @@ pub enum Recovery {
     Refused(Digest),
 }
 
+#[derive(Clone, Copy)]
+enum GrantSelection<'a> {
+    Name(&'a str),
+    Resource(hellas_auth::authority::ResourceId),
+}
+
 pub struct GrantSession {
     options: GrantSessionOptions,
     transport: SessionTransport,
@@ -499,6 +505,7 @@ pub struct GrantSession {
     offer: SignedOffer,
     store: GrantClientStore,
     observed: UnixMillis,
+    standing_now: UnixMillis,
     observed_at: Instant,
     pending_body: Option<(Digest, PreparedInvocation, InvocationContent)>,
 }
@@ -547,6 +554,7 @@ impl GrantSession {
             offer,
             store,
             observed: standing.now,
+            standing_now: standing.now,
             observed_at: Instant::now(),
             pending_body: None,
         })
@@ -629,6 +637,7 @@ impl GrantSession {
             return Err(GrantError::Revision(self.offer.offer().grant.revision).into());
         }
         self.observed = standing.now.max(self.store.now());
+        self.standing_now = standing.now;
         self.observed_at = Instant::now();
         self.offer = standing.offer.clone();
         self.store.tick(self.now()).await?;
@@ -749,8 +758,49 @@ impl GrantSession {
         accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<GrantWorkResult> {
+        self.run_selected(
+            GrantSelection::Name(policy_name),
+            input,
+            content,
+            progress,
+            accepted,
+            proposed,
+        )
+        .await
+    }
+
+    /// The gateway has just refreshed standing and prepared this exact resource.
+    pub(crate) async fn run_current(
+        &mut self,
+        resource: hellas_auth::authority::ResourceId,
+        input: PreparedInvocation,
+        content: &InvocationContent,
+        progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<GrantWorkResult> {
+        self.run_selected(
+            GrantSelection::Resource(resource),
+            input,
+            content,
+            progress,
+            accepted,
+            proposed,
+        )
+        .await
+    }
+
+    async fn run_selected(
+        &mut self,
+        selection: GrantSelection<'_>,
+        input: PreparedInvocation,
+        content: &InvocationContent,
+        progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<GrantWorkResult> {
         let (policy, id, mut stream, finish_by) =
-            self.admit(policy_name, &input, content, proposed).await?;
+            self.admit(selection, &input, content, proposed).await?;
         let channel = self.store.channel().id;
         let facts = policy
             .invocation_policy
@@ -892,7 +942,7 @@ impl GrantSession {
     /// the provider to report the terminal state.
     async fn admit(
         &mut self,
-        policy_name: &str,
+        selection: GrantSelection<'_>,
         input: &PreparedInvocation,
         content: &InvocationContent,
         proposed: Option<&std::sync::atomic::AtomicBool>,
@@ -908,14 +958,19 @@ impl GrantSession {
         if input.request.assurance != self.options.target.trust().required_assurance {
             return Err(GrantProtocolError::Assurance.into());
         }
-        let standing = self.refresh().await?;
+        if matches!(selection, GrantSelection::Name(_)) {
+            self.refresh().await?;
+        }
         let policy = self
             .offer
             .offer()
             .grant
             .policies
             .iter()
-            .find(|p| p.name == policy_name)
+            .find(|p| match selection {
+                GrantSelection::Name(name) => p.name == name,
+                GrantSelection::Resource(resource) => p.resource == resource,
+            })
             .ok_or(GrantError::OutOfScope)?
             .clone();
         policy
@@ -924,8 +979,8 @@ impl GrantSession {
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so
         // measuring the signed limit from it never exceeds the allowance.
-        let terminal = standing
-            .now
+        let terminal = self
+            .standing_now
             .0
             .checked_add(self.offer.offer().grant.max_job_millis.get())
             .ok_or(GrantError::Malformed)?;

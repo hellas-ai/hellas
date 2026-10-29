@@ -87,6 +87,8 @@ pub(super) struct Backend {
     pub models: Vec<String>,
     pub routes: Vec<HttpRoute>,
     pub provider: iroh::EndpointId,
+    pub resource: Option<hellas_auth::authority::ResourceId>,
+    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     account: Arc<Account>,
 }
 
@@ -239,6 +241,8 @@ impl Routing {
                     routes: vec![route.clone()],
                     max_in_flight: None,
                     provider: None,
+                    resource: None,
+                    channel: None,
                 },
             )
         });
@@ -275,6 +279,8 @@ impl Routing {
                 models: backend.models,
                 routes: backend.routes,
                 provider,
+                resource: backend.resource,
+                channel: backend.channel,
                 account: account.clone(),
             });
         }

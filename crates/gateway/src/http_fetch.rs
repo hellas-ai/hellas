@@ -117,12 +117,24 @@ fn fetch_route(
     backend: &routing::Backend,
     named: Option<&(String, String)>,
 ) -> Result<(String, String), crate::GatewayConfigError> {
+    if backend.resource.is_some() != backend.channel.is_some()
+        || (backend.resource.is_some() && named.is_some())
+    {
+        return Err(crate::GatewayConfigError::FetchRouteMismatch(
+            backend.name.clone(),
+        ));
+    }
     let mut sealed = Vec::new();
     let mut open = false;
-    for route in routes
-        .iter()
-        .filter(|route| route.provider == backend.provider)
-    {
+    for route in routes.iter().filter(|route| {
+        route.provider == backend.provider
+            && backend
+                .resource
+                .is_none_or(|resource| route.resource == Some(resource))
+            && backend
+                .channel
+                .is_none_or(|channel| route.channel == Some(channel))
+    }) {
         match &route.sealed {
             Some(route) => sealed.push(route),
             None => open = true,
@@ -398,6 +410,8 @@ async fn open(
     let (service, method) = &state.fetch_routes[backend];
     let mut stream = state.paid.fetch(WorkFetchRequest {
         provider,
+        resource: state.routing.backends[backend].resource,
+        channel: state.routing.backends[backend].channel,
         service: service.clone(),
         method: method.clone(),
         body: payload,
