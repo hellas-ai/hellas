@@ -21,7 +21,9 @@ use std::{
 
 mod client;
 mod run;
+mod transcribe;
 pub use run::{RunArgs, run as run_program};
+pub use transcribe::{TranscribeArgs, transcribe};
 #[cfg(test)]
 mod tests;
 

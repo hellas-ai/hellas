@@ -109,7 +109,11 @@ impl TextState {
         let prompt = input_ids.into_iter().map(u64::from).collect::<Vec<_>>();
         let job = self
             .text
-            .render_job(&prompt, u64::from(max_tokens), &[])
+            .render_job(&hellas_client::model::ModelRequest::Text {
+                prompt_ids: &prompt,
+                max_new: u64::from(max_tokens),
+                stops: &[],
+            })
             .map_err(|error| {
                 BackendError::rejected(format!("Failed to prepare model input: {error:#}"))
             })?;

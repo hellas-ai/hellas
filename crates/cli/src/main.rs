@@ -348,6 +348,15 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
+    /// Convert a local published Whisper checkpoint into a client model package.
+    ConvertWhisper {
+        #[arg(long, value_name = "DIR")]
+        checkpoint: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+    },
+    /// Transcribe one WAV with a client-rendered Whisper job on a paid provider.
+    Transcribe(commands::transact::TranscribeArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -536,6 +545,7 @@ async fn async_main() {
             | Commands::Transact(_)
             | Commands::Fetch(_)
             | Commands::Run(_)
+            | Commands::Transcribe(_)
             | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
@@ -628,6 +638,25 @@ async fn async_main() {
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
                 std::process::exit(1);
+            }
+            return;
+        }
+        Commands::ConvertWhisper { checkpoint, output } => {
+            let result = hellas_client::model::whisper::convert_whisper(&checkpoint, &output);
+            tracer_provider.shutdown();
+            match result {
+                Ok(object) => println!(
+                    "weights: {} ({} bytes), {}",
+                    object.id(),
+                    object.bytes(),
+                    output
+                        .join(hellas_client::model::whisper::WEIGHTS_FILE)
+                        .display()
+                ),
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    std::process::exit(1);
+                }
             }
             return;
         }
@@ -998,6 +1027,21 @@ async fn async_main() {
             }
             .await
         }
+        Commands::Transcribe(args) => {
+            async {
+                commands::transact::transcribe(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::ConvertWhisper { .. } => unreachable!("conversion handled before identity load"),
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),

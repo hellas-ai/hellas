@@ -1,4 +1,19 @@
+trait TextJobTest {
+    fn text_job(&self, prompt_ids: &[u64], max_new: u64, stops: &[u64]) -> Result<ComputeJob>;
+}
+impl TextJobTest for ModelPackage {
+    fn text_job(&self, prompt_ids: &[u64], max_new: u64, stops: &[u64]) -> Result<ComputeJob> {
+        self.render_job(&ModelRequest::Text {
+            prompt_ids,
+            max_new,
+            stops,
+        })
+    }
+}
 use super::*;
+use crate::model::gguf;
+use hellas_rpc::{ContentRef, protocol::invocation::compute::*};
+use std::fs::File;
 
 fn fixture() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/package/mini-qwen3.gguf")
@@ -7,7 +22,7 @@ fn fixture() -> std::path::PathBuf {
 #[test]
 fn canonical_qwen3_job_bytes_are_stable() {
     let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.render_job(&[2, 1], 2, &[0, 0]).unwrap();
+    let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
     assert_eq!(
         job.environment.canonical_bytes().unwrap(),
         include_bytes!("qwen3-environment.cbor")
@@ -21,7 +36,7 @@ fn canonical_qwen3_job_bytes_are_stable() {
 #[test]
 fn tiny_gguf_renders_the_complete_qwen3_step_job() {
     let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.render_job(&[2, 1], 2, &[0, 0]).unwrap();
+    let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
 
     let [source] = job.environment.sources[..] else {
         panic!("one rendered source")
@@ -127,11 +142,11 @@ fn tiny_gguf_renders_the_complete_qwen3_step_job() {
 #[test]
 fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
     let package = ModelPackage::open(&fixture()).unwrap();
-    assert!(package.render_job(&[], 1, &[]).is_err());
-    assert!(package.render_job(&[2], 0, &[]).is_err());
-    assert!(package.render_job(&[2], 128, &[]).is_err());
-    assert!(package.render_job(&[2], u64::MAX, &[]).is_err());
-    assert!(package.render_job(&[4], 1, &[]).is_err());
-    assert!(package.render_job(&[2], 1, &[4]).is_err());
-    assert!(package.render_job(&[2], 127, &[3]).is_ok());
+    assert!(package.text_job(&[], 1, &[]).is_err());
+    assert!(package.text_job(&[2], 0, &[]).is_err());
+    assert!(package.text_job(&[2], 128, &[]).is_err());
+    assert!(package.text_job(&[2], u64::MAX, &[]).is_err());
+    assert!(package.text_job(&[4], 1, &[]).is_err());
+    assert!(package.text_job(&[2], 1, &[4]).is_err());
+    assert!(package.text_job(&[2], 127, &[3]).is_ok());
 }
