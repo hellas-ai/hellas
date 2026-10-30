@@ -42,6 +42,9 @@ type Result<T> = std::result::Result<T, PurchaseError>;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum Phase {
+    InputBound,
+    TargetBound,
+    ChannelBound,
     Running,
     Paying,
     Paid,
@@ -58,6 +61,15 @@ struct Record {
     nonce: u64,
     work: Option<[u8; 32]>,
     phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<PurchaseTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PurchaseTarget {
+    pub network: String,
+    pub provider: hellas_client::ProviderAddress,
 }
 
 struct PurchaseLock(File);
@@ -103,7 +115,32 @@ impl Purchase {
 
     /// Open a caller-owned attempt without clearing a terminal record.
     pub fn open_tracked(path: &Path, job: &Job) -> Result<Self> {
-        Self::open_identity(path, job.digest(), job.price(), true)
+        Self::open_tracked_inner(path, job, true)
+    }
+
+    pub(crate) fn open_existing_tracked(path: &Path, job: &Job) -> Result<Self> {
+        Self::open_tracked_inner(path, job, false)
+    }
+
+    fn open_tracked_inner(path: &Path, job: &Job, create: bool) -> Result<Self> {
+        let mut purchase = Self::open_identity(path, job.digest(), job.price(), true)?;
+        if purchase.record.is_none() {
+            if !create {
+                return Err(PurchaseError::Identity);
+            }
+            purchase.record = Some(Record {
+                job: purchase.job,
+                price: purchase.price,
+                channel: [0; 32],
+                bond: [0; 32],
+                nonce: 0,
+                work: None,
+                phase: Phase::InputBound,
+                target: None,
+            });
+            purchase.persist()?;
+        }
+        Ok(purchase)
     }
 
     fn open_identity(path: &Path, job: Digest, price: u64, tracked: bool) -> Result<Self> {
@@ -120,7 +157,11 @@ impl Purchase {
         if let Some(record) = &record
             && (record.job != *job.as_bytes()
                 || record.price != price
-                || record.nonce == 0
+                || (record.nonce == 0
+                    && !matches!(
+                        record.phase,
+                        Phase::InputBound | Phase::TargetBound | Phase::ChannelBound
+                    ))
                 || (matches!(
                     record.phase,
                     Phase::Paying | Phase::Paid | Phase::Reported | Phase::Rejected
@@ -151,6 +192,79 @@ impl Purchase {
         }
     }
 
+    /// Bind a target before funding. Returns true only when this handle wrote
+    /// a new binding; an existing binding never authorizes fresh funding.
+    pub(crate) fn bind_target(&mut self, target: PurchaseTarget) -> Result<bool> {
+        if !self.tracked {
+            return Err(PurchaseError::Identity);
+        }
+        if let Some(record) = &self.record {
+            if record.phase == Phase::InputBound && record.target.is_none() {
+                let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
+                record.target = Some(target);
+                record.phase = Phase::TargetBound;
+                self.persist()?;
+                return Ok(true);
+            }
+            return if record.target.as_ref() == Some(&target) {
+                Ok(false)
+            } else {
+                Err(PurchaseError::Identity)
+            };
+        }
+        self.record = Some(Record {
+            job: self.job,
+            price: self.price,
+            channel: [0; 32],
+            bond: [0; 32],
+            nonce: 0,
+            work: None,
+            phase: Phase::TargetBound,
+            target: Some(target),
+        });
+        self.persist()?;
+        Ok(true)
+    }
+
+    pub(crate) fn has_target(&self) -> bool {
+        self.record
+            .as_ref()
+            .is_some_and(|record| record.target.is_some())
+    }
+    pub(crate) fn matches_target(&self, target: &PurchaseTarget) -> bool {
+        self.record
+            .as_ref()
+            .and_then(|record| record.target.as_ref())
+            == Some(target)
+    }
+    pub(crate) fn work_id(&self) -> Option<Digest> {
+        self.record
+            .as_ref()
+            .and_then(|record| record.work)
+            .map(Digest::from_bytes)
+    }
+
+    /// A recorded nonce is an irrevocable proposal intent for tracked attempts.
+    pub(crate) fn has_proposal_intent(&self) -> bool {
+        self.record.as_ref().is_some_and(|record| record.nonce != 0)
+    }
+
+    pub(crate) fn bind_channel(&mut self, channel: Digest, bond: EdgeId) -> Result<()> {
+        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
+        if record.target.is_none() {
+            return Err(PurchaseError::Identity);
+        }
+        if record.phase == Phase::TargetBound {
+            record.channel = *channel.as_bytes();
+            record.bond = bond.to_bytes();
+            record.phase = Phase::ChannelBound;
+            self.persist()?;
+        } else if record.channel != *channel.as_bytes() || record.bond != bond.to_bytes() {
+            return Err(PurchaseError::Identity);
+        }
+        Ok(())
+    }
+
     pub fn is_pending(&self) -> bool {
         self.record.is_some()
     }
@@ -175,6 +289,12 @@ impl Purchase {
         let Some(record) = self.record.clone() else {
             return Ok(());
         };
+        if matches!(
+            record.phase,
+            Phase::InputBound | Phase::TargetBound | Phase::ChannelBound
+        ) {
+            return Err(self.unfinished("target or channel binding is incomplete"));
+        }
         if self.tracked
             && matches!(
                 record.phase,
@@ -306,14 +426,26 @@ impl Purchase {
 
     pub(super) fn nonce(&self, channel: Digest) -> Result<Option<u64>> {
         match &self.record {
+            Some(record)
+                if record.channel == *channel.as_bytes() && record.phase == Phase::ChannelBound =>
+            {
+                Ok(None)
+            }
             Some(record) if record.channel == *channel.as_bytes() => Ok(Some(record.nonce)),
             Some(_) => Err(self.unfinished("the original channel is unavailable")),
             None => Ok(None),
         }
     }
     pub(super) fn begin(&mut self, channel: Digest, bond: EdgeId, nonce: u64) -> Result<()> {
-        if let Some(record) = &self.record {
-            if record.channel != *channel.as_bytes() || record.nonce != nonce {
+        if let Some(record) = &mut self.record {
+            if record.phase == Phase::ChannelBound
+                && record.channel == *channel.as_bytes()
+                && record.bond == bond.to_bytes()
+            {
+                record.nonce = nonce;
+                record.phase = Phase::Running;
+                self.persist()?;
+            } else if record.channel != *channel.as_bytes() || record.nonce != nonce {
                 return Err(PurchaseError::Identity);
             }
         } else {
@@ -325,6 +457,7 @@ impl Purchase {
                 nonce,
                 work: None,
                 phase: Phase::Running,
+                target: None,
             });
             self.persist()?;
         }
@@ -381,6 +514,29 @@ impl Purchase {
         record.phase = phase;
         self.persist()
     }
+    pub(crate) fn status(&self) -> Result<PurchaseStatus> {
+        let Some(record) = &self.record else {
+            return Ok(PurchaseStatus::Absent);
+        };
+        let work = record.work.map(Digest::from_bytes);
+        Ok(match record.phase {
+            Phase::InputBound => PurchaseStatus::InputBound,
+            Phase::TargetBound => PurchaseStatus::TargetBound,
+            Phase::ChannelBound => PurchaseStatus::ChannelBound,
+            Phase::Running => PurchaseStatus::Running { work },
+            Phase::Paying => PurchaseStatus::Paying {
+                work: work.ok_or(PurchaseError::Identity)?,
+            },
+            Phase::Paid | Phase::Reported => PurchaseStatus::Paid {
+                work: work.ok_or(PurchaseError::Identity)?,
+                reported: record.phase == Phase::Reported,
+            },
+            Phase::Rejected => PurchaseStatus::Rejected {
+                work: work.ok_or(PurchaseError::Identity)?,
+            },
+        })
+    }
+
     fn persist(&self) -> Result<()> {
         hellas_private::write_atomically(
             &self.path,
@@ -400,6 +556,9 @@ pub struct PurchaseRecovery(Purchase);
 #[derive(Debug, PartialEq, Eq)]
 pub enum PurchaseStatus {
     Absent,
+    InputBound,
+    TargetBound,
+    ChannelBound,
     Running { work: Option<Digest> },
     Paying { work: Digest },
     Paid { work: Digest, reported: bool },
@@ -415,27 +574,12 @@ impl PurchaseRecovery {
         self.0
             .record
             .as_ref()
+            .filter(|record| !matches!(record.phase, Phase::InputBound | Phase::TargetBound))
             .map(|record| Digest::from_bytes(record.channel))
     }
 
     pub fn inspect(&self) -> Result<PurchaseStatus> {
-        let Some(record) = &self.0.record else {
-            return Ok(PurchaseStatus::Absent);
-        };
-        let work = record.work.map(Digest::from_bytes);
-        Ok(match record.phase {
-            Phase::Running => PurchaseStatus::Running { work },
-            Phase::Paying => PurchaseStatus::Paying {
-                work: work.ok_or(PurchaseError::Identity)?,
-            },
-            Phase::Paid | Phase::Reported => PurchaseStatus::Paid {
-                work: work.ok_or(PurchaseError::Identity)?,
-                reported: record.phase == Phase::Reported,
-            },
-            Phase::Rejected => PurchaseStatus::Rejected {
-                work: work.ok_or(PurchaseError::Identity)?,
-            },
-        })
+        self.0.status()
     }
 
     pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<PurchaseStatus> {
@@ -493,6 +637,18 @@ mod tests {
             {
                 let mut purchase = Purchase::open_tracked(&path, &job).unwrap();
                 purchase
+                    .bind_target(PurchaseTarget {
+                        network: "fixture".into(),
+                        provider: hellas_client::ProviderAddress {
+                            enrollment: hellas_rpc::ContentId::hash(b"provider"),
+                            node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+                        },
+                    })
+                    .unwrap();
+                purchase
+                    .bind_channel(channel, EdgeId::from_bytes([2; 32]))
+                    .unwrap();
+                purchase
                     .begin(channel, EdgeId::from_bytes([2; 32]), 3)
                     .unwrap();
                 purchase.accepting(work).unwrap();
@@ -524,6 +680,49 @@ mod tests {
                 Err(PurchaseError::AlreadyReported | PurchaseError::Rejected)
             ));
         }
+    }
+
+    #[test]
+    fn tracked_target_and_channel_bindings_cannot_change() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("purchase");
+        let job = job();
+        let target = PurchaseTarget {
+            network: "fixture".into(),
+            provider: hellas_client::ProviderAddress {
+                enrollment: hellas_rpc::ContentId::hash(b"provider"),
+                node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            },
+        };
+        let channel = Digest::from_bytes([1; 32]);
+        let bond = EdgeId::from_bytes([2; 32]);
+        {
+            let mut attempt = Purchase::open_tracked(&path, &job).unwrap();
+            assert!(attempt.bind_target(target.clone()).unwrap());
+            assert!(!attempt.bind_target(target.clone()).unwrap());
+            let mut other = target.clone();
+            other.network = "other".into();
+            assert!(attempt.bind_target(other).is_err());
+            attempt.bind_channel(channel, bond).unwrap();
+            attempt.bind_channel(channel, bond).unwrap();
+            assert!(
+                attempt
+                    .bind_channel(Digest::from_bytes([8; 32]), bond)
+                    .is_err()
+            );
+        }
+        let mut attempt = Purchase::open_tracked(&path, &job).unwrap();
+        assert!(!attempt.bind_target(target).unwrap());
+        assert_eq!(attempt.nonce(channel).unwrap(), None);
+        attempt.begin(channel, bond, 3).unwrap();
+        assert_eq!(attempt.nonce(channel).unwrap(), Some(3));
+        assert!(attempt.has_proposal_intent());
+        drop(attempt);
+        assert!(
+            Purchase::open_tracked(&path, &job)
+                .unwrap()
+                .has_proposal_intent()
+        );
     }
 
     #[test]

@@ -5,11 +5,10 @@ use hellas_auth::ProducerSigningKey;
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
 use hellas_sdk::{
+    execution::{ExecutionAttempt, ExecutionResult, ExecutionSession, ExecutionTerms},
     job::{Job, JobInput},
-    paid_client::{
-        PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint, request_paid_quote,
-    },
-    transact::{Purchase, TransactionOptions, transact},
+    paid_client::{PaidWorkOptions, PaidWorkResult, bind_paid_endpoint, request_paid_quote},
+    transact::PurchaseRecovery,
 };
 use std::{
     io::Write as _,
@@ -207,7 +206,7 @@ impl ClientArgs {
         context: &Context,
         job: &Job,
         options: &PaidWorkOptions,
-    ) -> super::CliResult<Purchase> {
+    ) -> super::CliResult<ExecutionAttempt> {
         let owner = self.owner(context)?;
         let path = self
             .root(context)
@@ -225,9 +224,12 @@ impl ClientArgs {
             .join(self.provider.address.to_string())
             .join(hex::encode(owner.principal().as_bytes()))
             .join(format!("{}.json", job.digest()));
-        let mut purchase = Purchase::open(&path, job, self.buy_again)?;
-        purchase.reconcile(options).await?;
-        Ok(purchase)
+        if let Some(attempt) = select_attempt(&path, job, self.buy_again)? {
+            return Ok(attempt);
+        }
+        let mut legacy = PurchaseRecovery::open(&path, job.digest(), job.price())?;
+        let status = legacy.reconcile(options).await?;
+        bail!("existing purchase is {status:?}; use --buy-again to create a new attempt");
     }
 
     /// One directory of channel journals per provider address.
@@ -277,6 +279,70 @@ impl ClientArgs {
     }
 }
 
+fn select_attempt(
+    path: &Path,
+    job: &Job,
+    buy_again: bool,
+) -> super::CliResult<Option<ExecutionAttempt>> {
+    let parent = path.parent().context("purchase directory is missing")?;
+    hellas_private::create_dir_all_durable(parent)?;
+    let pointer = path.with_extension("latest");
+    let lock = hellas_private::open_lock_beside(&pointer)?;
+    lock.try_lock()
+        .map_err(|_| anyhow::anyhow!("another command is selecting this job's attempt"))?;
+    let existing = match hellas_private::read_bounded_regular_file(&pointer, 32) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let terms = ExecutionTerms::Paid { price: job.price() };
+    if !buy_again && let Some(id) = existing {
+        let id = std::str::from_utf8(&id)?;
+        ensure!(
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid purchase attempt pointer"
+        );
+        let attempt_path = parent.join(format!("{}.{}.json", job.digest(), id));
+        return Ok(Some(ExecutionAttempt::open_existing(
+            &attempt_path,
+            job.input(),
+            terms,
+        )?));
+    }
+    if !buy_again && path.try_exists()? {
+        return Ok(None);
+    }
+    if !buy_again {
+        let prefix = format!("{}.", job.digest());
+        for entry in std::fs::read_dir(parent)? {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".json"))
+                && id.len() == 32
+                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!(
+                    "purchase attempt pointer is missing; recover the existing attempt before starting another"
+                );
+            }
+        }
+    }
+    let id = hex::encode(rand::random::<[u8; 16]>());
+    let attempt_path = parent.join(format!("{}.{}.json", job.digest(), id));
+    ensure!(
+        !attempt_path.try_exists()?,
+        "purchase attempt identity already exists"
+    );
+    let attempt = ExecutionAttempt::open(&attempt_path, job.input(), terms)?;
+    hellas_private::write_atomically(&pointer, ".writing", id.as_bytes())?;
+    Ok(Some(attempt))
+}
+
 /// Bound `work` by `--timeout`; without one, wait until it is done.
 async fn bounded<T>(
     timeout: Option<Duration>,
@@ -297,35 +363,64 @@ async fn execute(
     job: &Job,
     options: PaidWorkOptions,
     endpoint: iroh::Endpoint,
-    purchase: &mut Purchase,
+    purchase: &mut ExecutionAttempt,
 ) -> super::CliResult<PaidWorkResult> {
+    let facts = purchase.inspect()?;
+    if facts.reported || matches!(facts.terminal, hellas_sdk::execution::Terminal::Rejected) {
+        bail!("this attempt is already terminal; use --buy-again for a new attempt");
+    }
+    if matches!(facts.payment, hellas_sdk::execution::Payment::Paid) {
+        bail!(
+            "the original attempt was paid but its output is unavailable; use --buy-again for a new attempt"
+        );
+    }
     let owner = args.owner(context)?;
-    let mut session = if purchase.is_pending() {
-        PaidWorkSession::open_retained(options, endpoint, context.settlement.clone(), owner).await?
-    } else {
-        PaidWorkSession::open_for_job(options, endpoint, context.settlement.clone(), owner, job)
-            .await?
-    };
-    let result = transact(
-        &mut session,
-        job,
-        &context.producer,
-        TransactionOptions {
-            settle: args.settle,
-            purchase: Some(purchase),
-            ..Default::default()
-        },
-    )
+    let mut session = purchase
+        .open_paid_session(
+            job.input(),
+            options,
+            endpoint,
+            context.settlement.clone(),
+            owner,
+            Default::default(),
+        )
+        .await?;
+    let terms = ExecutionTerms::Paid { price: job.price() };
+    let result = ExecutionSession::Paid(&mut session)
+        .execute(
+            job.input().clone(),
+            terms,
+            &context.producer,
+            Default::default(),
+            Some(purchase),
+        )
+        .await;
+    let result: super::CliResult<PaidWorkResult> = async {
+        match result {
+            Ok(ExecutionResult::Paid(mut result)) => {
+                if args.settle {
+                    result.settled_provider_payout = Some(session.settle().await?);
+                }
+                Ok(result)
+            }
+            Ok(ExecutionResult::Grant(_)) => unreachable!("paid session returned grant result"),
+            Err(hellas_sdk::execution::ExecutionError::RecoveryRequired) => {
+                let facts = ExecutionSession::Paid(&mut session).recover(purchase).await?;
+                bail!("the existing purchase requires recovery (work {:?}, payment {:?}, result available: {}); use --buy-again for a new attempt", facts.work, facts.payment, facts.result_available)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
     .await;
     session.shutdown().await;
-    Ok(result?)
+    result
 }
 
 async fn purchase_and_execute(
     args: &ClientArgs,
     context: &Context,
     job: &Job,
-) -> super::CliResult<(Purchase, PaidWorkResult)> {
+) -> super::CliResult<(ExecutionAttempt, PaidWorkResult)> {
     let options = args.options(context, job.price(), job.assurance()).await?;
     let mut purchase = args.purchase(context, job, &options).await?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
@@ -351,7 +446,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         std::io::stdout().lock().flush()?;
         purchase.reported()?;
         Ok(())
-    }, |timeout| format!("transaction exceeded {timeout:?}; retry the same folder to resume its unpaid work")).await
+    }, |timeout| format!("transaction exceeded {timeout:?}; use the same folder to recover its existing attempt")).await
 }
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
@@ -447,7 +542,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             result
         },
         |timeout| {
-            format!("Fetch exceeded {timeout:?}; resume with transact --job and the saved folder")
+            format!("Fetch exceeded {timeout:?}; recover the existing attempt with transact --job and the saved folder")
         },
     )
     .await

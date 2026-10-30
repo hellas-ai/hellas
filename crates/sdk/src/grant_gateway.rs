@@ -6,10 +6,8 @@ use crate::gateway_work::{
 };
 use crate::grant_client::{GrantClientError, GrantSession, GrantSessionOptions, GrantTransport};
 use futures::future::BoxFuture;
-use hellas_auth::{ProducerSigningKey, PublicKey, authority::ResourceId};
-use hellas_authority::model::grant::records::{
-    GrantPolicy, SignedOffer, grant_producer, grant_transport,
-};
+use hellas_auth::authority::ResourceId;
+use hellas_authority::model::grant::records::{GrantPolicy, SignedOffer, grant_transport};
 use hellas_gateway::{WorkGatewayBusy, WorkGatewayError};
 use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
 use std::{sync::Arc, time::Duration};
@@ -105,7 +103,6 @@ pub struct GrantSource {
     policy: Option<ResourceId>,
     provider: iroh::EndpointId,
     channel: hellas_channel::model::grant::ChannelId,
-    signer: Arc<ProducerSigningKey>,
     assurance: hellas_rpc::Assurance,
 }
 /// A grant channel behind the shared gateway.
@@ -268,14 +265,6 @@ impl GrantServeOptions {
     }
 }
 
-fn grant_runner(offer: &SignedOffer) -> Result<PublicKey, WorkGatewayError> {
-    Ok(PublicKey::Secp256k1(
-        grant_producer(&offer.offer().provider)
-            .map_err(error)?
-            .to_bytes(),
-    ))
-}
-
 impl GrantSource {
     /// Open one source without taking ownership of its transport endpoint.
     async fn open(
@@ -284,7 +273,6 @@ impl GrantSource {
         policy: Option<String>,
     ) -> Result<Self, WorkGatewayError> {
         let assurance = options.target.trust().required_assurance;
-        let signer = options.signer.clone();
         let provider = iroh::EndpointId::from_bytes(
             &grant_transport(&options.target.offer().provider).map_err(error)?,
         )
@@ -322,7 +310,6 @@ impl GrantSource {
             policy,
             provider,
             channel,
-            signer,
             assurance,
         })
     }
@@ -434,16 +421,13 @@ impl WorkSource for GrantSource {
                     false,
                 )
                 .map_err(rejected)?;
-            let prepared = input
-                .prepare(
-                    &input.manifest().map_err(rejected)?,
-                    &self.signer,
-                    rand::random(),
-                    grant_runner(offer)?,
-                    &policy.invocation_policy,
-                    false,
-                )
-                .map_err(rejected)?;
+            let prepared = crate::execution::prepare_grant_input(
+                &input,
+                policy,
+                offer,
+                session.execution_signer(),
+            )
+            .map_err(rejected)?;
             if requester.is_closed() {
                 return Err(WorkGatewayBusy.into());
             }

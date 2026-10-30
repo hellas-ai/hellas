@@ -268,12 +268,43 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             terminal_deadline_ms: UnixMillis(4000),
             delivery_deadline_ms: UnixMillis(5000),
         };
+        let tracking_input = crate::job::JobInput::Fetch {
+            contract: test_responses_contract(),
+            service: "openai".into(),
+            method: "responses".into(),
+            request: br#"{"model":"fixture","input":"sdk-private-input","max_output_tokens":8}"#
+                .to_vec(),
+            assurance: Assurance::ProducerSigned,
+        };
+        let terms = crate::execution::ExecutionTerms::Grant {
+            resource: a.resource_id,
+        };
+        let path = f.root.path().join("tracked-attempt");
+        let mut attempt =
+            crate::execution::ExecutionAttempt::open(&path, &tracking_input, terms).unwrap();
+        attempt
+            .bind_target(crate::execution::ExecutionTarget {
+                network: network(),
+                provider: hellas_client::ProviderAddress::of(&offer.offer().provider).unwrap(),
+            })
+            .unwrap();
+        drop(attempt);
+        let id = grant_work_id(network(), &a);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        marker["channel"] = serde_json::to_value(channel).unwrap();
+        marker["authorization"] = serde_json::json!(a.encode());
+        marker["work"] = serde_json::json!(id.as_bytes());
+        hellas_private::write_atomically(&path, ".writing", &serde_json::to_vec(&marker).unwrap())
+            .unwrap();
+        let mut attempt =
+            crate::execution::ExecutionAttempt::open_existing(&path, &tracking_input, terms)
+                .unwrap();
         let signature = session
             .store
             .propose(&offer, a, &input, &principal(1).1, UnixMillis(1000))
             .await
             .unwrap();
-        let id = grant_work_id(network(), &a);
         if accepted {
             let caller = f
                 .service
@@ -315,18 +346,45 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             Err(GrantClientError::RecoveryRequired)
         ));
         assert!(matches!(
-            resumed.recover().await,
-            Err(GrantClientError::RecoveryTooEarly)
+            crate::execution::ExecutionSession::Grant(&mut resumed)
+                .recover(&mut attempt)
+                .await,
+            Err(crate::execution::ExecutionError::Grant(
+                GrantClientError::RecoveryTooEarly
+            ))
         ));
         f.clock.set(UnixMillis(2500));
+        let facts = crate::execution::ExecutionSession::Grant(&mut resumed)
+            .recover(&mut attempt)
+            .await
+            .unwrap();
         assert_eq!(
-            resumed.recover().await.unwrap(),
+            facts.acceptance,
             if accepted {
-                Recovery::Accepted(id)
+                crate::execution::Acceptance::Accepted
             } else {
-                Recovery::Refused(id)
+                crate::execution::Acceptance::Rejected
             }
         );
+        if !accepted {
+            // Recreate the crash window between the tombstone and clearing
+            // the pending exchange. Recovery must not resend the proposal.
+            resumed.store.resume(id, UnixMillis(2500)).await.unwrap();
+            let facts = crate::execution::ExecutionSession::Grant(&mut resumed)
+                .recover(&mut attempt)
+                .await
+                .unwrap();
+            assert_eq!(facts.acceptance, crate::execution::Acceptance::Rejected);
+            assert!(resumed.store.book().pending_proposal().is_none());
+            drop(attempt);
+            let reopened =
+                crate::execution::ExecutionAttempt::open_existing(&path, &tracking_input, terms)
+                    .unwrap();
+            assert_eq!(
+                reopened.inspect().unwrap().terminal,
+                crate::execution::Terminal::Rejected
+            );
+        }
         assert_eq!(resumed.store().next_nonce().unwrap(), 2);
         assert!(resumed.store().book().pending_proposal().is_none());
         resumed.shutdown().await.unwrap();

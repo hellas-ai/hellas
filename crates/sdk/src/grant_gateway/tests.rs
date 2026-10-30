@@ -1,6 +1,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
 use hellas_gateway::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
@@ -285,7 +286,13 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
         panic!("the transcript must precede the terminal")
     };
     assert!(terminal.terminal().is_some());
-    let provider = grant_runner(&fixture.gateway.source.offer).unwrap();
+    let provider = PublicKey::Secp256k1(
+        hellas_authority::model::grant::records::grant_producer(
+            &fixture.gateway.source.offer.offer().provider,
+        )
+        .unwrap()
+        .to_bytes(),
+    );
     assert_eq!(accepted.provider, provider);
 
     let envelopes = hellas_channel::model::work::decode_transcript(

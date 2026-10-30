@@ -763,9 +763,124 @@ async fn compute_and_settle(
     let client_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     let (k, nonce) = (u64::from(rand::random::<u32>()), rand::random::<u32>());
     let (job, source) = compute_job(&increment(k), increment_plan(Arg::U64(41)));
-    let result = transact(&mut session, &job, &client_key, None)
+    let first_job = job.clone();
+    let terms = hellas_sdk::execution::ExecutionTerms::Paid { price: job.price() };
+    let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(
+        &root.join("tracked-attempt"),
+        job.input(),
+        terms,
+    )
+    .unwrap();
+    attempt
+        .bind_target(hellas_sdk::execution::ExecutionTarget {
+            network: options.config.chain.network,
+            provider: options.provider,
+        })
+        .unwrap();
+    attempt.retain_results(true);
+    let result = hellas_sdk::execution::ExecutionSession::Paid(&mut session)
+        .execute(
+            job.input().clone(),
+            terms,
+            &client_key,
+            Default::default(),
+            Some(&mut attempt),
+        )
         .await
         .unwrap();
+    let hellas_sdk::execution::ExecutionResult::Paid(result) = result else {
+        panic!("paid result")
+    };
+    let first_work = result.work_id;
+    assert!(hellas_kernel::SigVerifier::verify_sig(
+        &hellas_kernel::Secp256k1Verifier::new(),
+        result.acceptance_signature,
+        session.descriptor().channel().provider_key(),
+        hellas_channel::model::work::signing_hash(result.work_id),
+    ));
+    assert!(attempt.inspect().unwrap().result_available);
+    attempt.reported().unwrap();
+    assert!(attempt.inspect().unwrap().reported);
+    assert!(
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
+            .execute(
+                job.input().clone(),
+                terms,
+                &client_key,
+                Default::default(),
+                Some(&mut attempt)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(compute.calls(), 1);
+    // A paid marker whose receipt was never written remains paid, with no
+    // locally deliverable output, and cannot authorize another execution.
+    let mut paid_without_receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("tracked-attempt")).unwrap()).unwrap();
+    paid_without_receipt["phase"] = serde_json::json!("Paid");
+    let paid_without_receipt_path = root.join("paid-without-receipt");
+    hellas_private::write_atomically(
+        &paid_without_receipt_path,
+        ".writing",
+        &serde_json::to_vec(&paid_without_receipt).unwrap(),
+    )
+    .unwrap();
+    let mut paid_without_receipt = hellas_sdk::execution::ExecutionAttempt::open_existing(
+        &paid_without_receipt_path,
+        job.input(),
+        terms,
+    )
+    .unwrap();
+    let facts = paid_without_receipt.inspect().unwrap();
+    assert_eq!(facts.payment, hellas_sdk::execution::Payment::Paid);
+    assert!(!facts.result_available);
+    assert!(!facts.reported);
+    assert!(matches!(
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
+            .execute(
+                job.input().clone(),
+                terms,
+                &client_key,
+                Default::default(),
+                Some(&mut paid_without_receipt)
+            )
+            .await,
+        Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
+    ));
+    assert_eq!(compute.calls(), 1);
+    // A persisted proposal nonce survives an interrupted caller. Even if the
+    // attempt has no recorded acceptance, it may only be recovered.
+    let mut interrupted_record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("tracked-attempt")).unwrap()).unwrap();
+    interrupted_record["phase"] = serde_json::json!("Running");
+    interrupted_record["work"] = serde_json::Value::Null;
+    let interrupted_path = root.join("interrupted-attempt");
+    hellas_private::write_atomically(
+        &interrupted_path,
+        ".writing",
+        &serde_json::to_vec(&interrupted_record).unwrap(),
+    )
+    .unwrap();
+    let mut interrupted_attempt = hellas_sdk::execution::ExecutionAttempt::open_existing(
+        &interrupted_path,
+        job.input(),
+        terms,
+    )
+    .unwrap();
+    assert!(matches!(
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
+            .execute(
+                job.input().clone(),
+                terms,
+                &client_key,
+                Default::default(),
+                Some(&mut interrupted_attempt)
+            )
+            .await,
+        Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
+    ));
+    assert_eq!(compute.calls(), 1);
     assert_eq!(
         (result.job_price, result.credited_cumulative),
         (JOB_PRICE, JOB_PRICE)
@@ -900,7 +1015,39 @@ async fn compute_and_settle(
         .unwrap();
     assert_eq!(result.work_id, interrupted);
     assert_eq!(compute.calls(), calls + 1);
-    assert_eq!(result.credited_cumulative, CREDITED);
+    assert_eq!(result.credited_cumulative, CREDITED - JOB_PRICE);
+
+    // A different explicit attempt is a new purchase, even for identical input.
+    let mut second = hellas_sdk::execution::ExecutionAttempt::open(
+        &root.join("tracked-attempt-second"),
+        first_job.input(),
+        terms,
+    )
+    .unwrap();
+    second
+        .bind_target(hellas_sdk::execution::ExecutionTarget {
+            network: options.config.chain.network,
+            provider: options.provider,
+        })
+        .unwrap();
+    let calls = compute.calls();
+    let hellas_sdk::execution::ExecutionResult::Paid(second_result) =
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
+            .execute(
+                first_job.input().clone(),
+                terms,
+                &client_key,
+                Default::default(),
+                Some(&mut second),
+            )
+            .await
+            .unwrap()
+    else {
+        panic!("paid result")
+    };
+    assert_ne!(second_result.work_id, first_work);
+    assert_eq!(compute.calls(), calls + 1);
+    assert_eq!(second_result.credited_cumulative, CREDITED);
 
     // 10: the settled close pays A exactly the credited total.
     assert_eq!(
@@ -927,7 +1074,7 @@ async fn compute_and_settle(
     );
 }
 
-const CREDITED: u64 = 3 * JOB_PRICE;
+const CREDITED: u64 = 4 * JOB_PRICE;
 const COUNTER: &str = r#"(def program initialize : [] -> (u64 val) = const.u64.0x0000000000000000)
 (def program advance : {(u64 val) (u64 val)} -> (u64 val)
 = ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
@@ -1878,7 +2025,7 @@ async fn finish(case: Box<Case>) {
         &first,
     ))
     .await;
-    assert_eq!(compute.calls(), 4);
+    assert_eq!(compute.calls(), 5);
     assert_eq!(
         holdings(&devnet, owners[1].key())
             .await

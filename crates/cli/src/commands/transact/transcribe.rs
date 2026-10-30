@@ -64,7 +64,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
             Ok(())
         },
         |timeout| {
-            format!("transcription exceeded {timeout:?}; retry the saved job folder to resume")
+            format!("transcription exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
         },
     )
     .await

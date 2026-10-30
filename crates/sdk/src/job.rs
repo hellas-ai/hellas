@@ -114,6 +114,34 @@ struct ContentFile {
 }
 
 impl JobInput {
+    /// Stable semantic identity for caller-owned attempt tracking. Paths and
+    /// invocation randomness are deliberately excluded.
+    pub fn tracking_digest(&self) -> Digest {
+        let bytes = match self {
+            Self::Fetch {
+                contract,
+                service,
+                method,
+                request,
+                assurance,
+            } => hellas_rpc::canonical_dag_cbor(&(
+                "fetch",
+                serde_bytes::Bytes::new(&contract.canonical_bytes()),
+                service,
+                method,
+                assurance.to_byte(),
+                serde_bytes::Bytes::new(request),
+            )),
+            Self::Compute {
+                environment,
+                plan,
+                inputs,
+                ..
+            } => hellas_rpc::canonical_dag_cbor(&("compute", environment, plan, inputs)),
+        }
+        .expect("job input contains only canonical strings, integers and bytes");
+        hash_tuple("hellas.work.attempt.input.v1", &[&bytes])
+    }
     /// Checks the input's own bounds and returns its program manifest.
     pub fn manifest(&self) -> Result<ProgramManifest> {
         Ok(match self {

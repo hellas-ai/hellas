@@ -107,6 +107,39 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             ));
             assert_eq!(*gate.amounts.lock().unwrap(), vec![CLIENT_FUNDING]);
             assert!(case.approvals.0.lock().unwrap().is_empty());
+            // A crash after target binding cannot authorize fresh funding on reopen.
+            let path = case.root.path().join("bound-attempt.json");
+            let terms = hellas_sdk::execution::ExecutionTerms::Paid { price: PRICE };
+            let mut attempt =
+                hellas_sdk::execution::ExecutionAttempt::open(&path, job.input(), terms).unwrap();
+            attempt
+                .bind_target(hellas_sdk::execution::ExecutionTarget {
+                    network: case.options.config.chain.network,
+                    provider: case.options.provider,
+                })
+                .unwrap();
+            drop(attempt);
+            let mut attempt =
+                hellas_sdk::execution::ExecutionAttempt::open_existing(&path, job.input(), terms)
+                    .unwrap();
+            assert!(
+                attempt
+                    .open_paid_session(
+                        job.input(),
+                        case.options.clone(),
+                        case.endpoint.clone(),
+                        client_settlement(),
+                        case.owner.clone(),
+                        hellas_sdk::paid_client::SessionFundingOptions {
+                            max_funding: Some(CLIENT_FUNDING),
+                            approval: Some(gate.clone()),
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(*gate.amounts.lock().unwrap(), vec![CLIENT_FUNDING]);
+            assert!(case.approvals.0.lock().unwrap().is_empty());
             gate.allow.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut session = sealing_while(
                 &mut case.devnet,

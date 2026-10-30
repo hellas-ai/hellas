@@ -39,6 +39,12 @@ struct ClientState {
     book: JobBook<GrantFunding>,
     now: UnixMillis,
 }
+/// Verified local facts for one grant work ID, read without opening a writer.
+pub struct GrantWorkInspection {
+    pub phase: JobPhase,
+    pub result: Option<SignedResult>,
+    pub pending: bool,
+}
 #[derive(Serialize, Deserialize)]
 struct Frame {
     namespace: String,
@@ -83,6 +89,54 @@ struct StoredJob {
     result: Option<SignedResult>,
 }
 impl GrantClientStore {
+    fn replayer(&self) -> GrantReplayer {
+        GrantReplayer {
+            context: self.context,
+            channel: self.channel.clone(),
+        }
+    }
+
+    /// Replay a grant journal read-only with its expected identities. This
+    /// does not tick its clock or create a journal.
+    pub async fn inspect_work(
+        directory: &Path,
+        network: NetworkId,
+        provider: ProviderEnrollmentBundle,
+        channel: GrantChannelState,
+        work: Digest,
+    ) -> Result<Option<GrantWorkInspection>, NodeStoreError> {
+        check_grant_provider(&provider)?;
+        if channel.id
+            != grant_channel_id(
+                network,
+                provider.content_id(),
+                channel.grant,
+                channel.client,
+                channel.generation,
+            )
+        {
+            return Err(GrantError::Generation.into());
+        }
+        let context = WorkContext {
+            network,
+            channel: channel.id.0,
+            client: channel.client.signer(),
+            provider: grant_producer(&provider)?,
+        };
+        let (id, replay) = Journal::inspect(directory, JOURNAL_STEM).await?;
+        if id != journal_id(&channel) {
+            return Err(GrantError::Audience.into());
+        }
+        let state = GrantReplayer { context, channel }.replay(replay)?;
+        Ok(state.book.job_by_id(work).map(|job| GrantWorkInspection {
+            phase: job.phase(),
+            result: job.result().map(|(result, signature)| SignedResult {
+                result: *result,
+                signature: *signature,
+            }),
+            pending: state.book.pending_proposal() == Some(work),
+        }))
+    }
     /// The channel's node key, which this client's credential is bound to,
     /// signs every proposal on behalf of the channel's principal.
     pub async fn open(
@@ -120,23 +174,11 @@ impl GrantClientStore {
             provider,
             state: ClientState::default(),
         };
-        store.state = store.replay(replay)?;
+        store.state = store.replayer().replay(replay)?;
         store.tick(now).await?;
         Ok(store)
     }
-    fn replay(&self, replay: Replay) -> Result<ClientState, NodeStoreError> {
-        let mut state = match replay.checkpoint {
-            Some(bytes) => self.restore(decode(&bytes)?)?,
-            None => ClientState::default(),
-        };
-        for bytes in replay.records {
-            let frame: Frame = decode(&bytes)?;
-            let mut candidate = state.clone();
-            self.apply(&mut candidate, &frame)?;
-            state = candidate;
-        }
-        Ok(state)
-    }
+
     /// A failed or cancelled append leaves its outcome unknown. Replay what
     /// committed instead of refusing every later transition until restart.
     async fn reopen_if_poisoned(&mut self) -> Result<(), NodeStoreError> {
@@ -146,7 +188,7 @@ impl GrantClientStore {
         self.journal.close().await;
         let (journal, replay) =
             Journal::open_latest(&self.directory, JOURNAL_STEM, journal_id(&self.channel)).await?;
-        self.state = self.replay(replay)?;
+        self.state = self.replayer().replay(replay)?;
         self.journal = journal;
         Ok(())
     }
@@ -326,6 +368,81 @@ impl GrantClientStore {
             .await?;
         Ok(())
     }
+
+    async fn commit(
+        &mut self,
+        now: UnixMillis,
+        change: Change,
+        new: bool,
+    ) -> Result<(), NodeStoreError> {
+        self.reopen_if_poisoned().await?;
+        let frame = Frame {
+            namespace: NAMESPACE.into(),
+            now: now.max(self.now()),
+            change,
+        };
+        let mut candidate = self.state.clone();
+        self.replayer().apply(&mut candidate, &frame)?;
+        // Reserve enough space for a provider signature and result for each
+        // exported proposal before admitting it, including unanswered ones.
+        if candidate.book.jobs().len() > MAX_JOBS
+            || encode(&self.snapshot(&candidate))?
+                .len()
+                .saturating_add(candidate.book.jobs().len() * 512)
+                > MAX_CHECKPOINT_BYTES
+        {
+            return Err(GrantError::StateCapacity.into());
+        }
+        if self.journal.at_soft_limit() {
+            let rotated = self.rotate().await;
+            if new {
+                rotated?;
+            }
+        }
+        self.journal.append(&encode(&frame)?).await?;
+        self.state = candidate;
+        Ok(())
+    }
+    fn snapshot(&self, state: &ClientState) -> Snapshot {
+        Snapshot {
+            namespace: NAMESPACE.into(),
+            now: state.now,
+            nonce: state.book.proposal_nonce_high_water(),
+            pending: state.book.pending_proposal(),
+            jobs: state
+                .book
+                .jobs()
+                .map(|j| StoredJob {
+                    authorization: *j.authorization(),
+                    client_signature: j.client_signature(),
+                    provider_signature: j.provider_signature(),
+                    result: j.result().map(|(result, signature)| SignedResult {
+                        result: *result,
+                        signature: *signature,
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+struct GrantReplayer {
+    context: WorkContext,
+    channel: GrantChannelState,
+}
+impl GrantReplayer {
+    fn replay(&self, replay: Replay) -> Result<ClientState, NodeStoreError> {
+        let mut state = match replay.checkpoint {
+            Some(bytes) => self.restore(decode(&bytes)?)?,
+            None => ClientState::default(),
+        };
+        for bytes in replay.records {
+            let frame: Frame = decode(&bytes)?;
+            let mut candidate = state.clone();
+            self.apply(&mut candidate, &frame)?;
+            state = candidate;
+        }
+        Ok(state)
+    }
     fn check_job(
         &self,
         a: &GrantJobAuthorizationV1,
@@ -411,61 +528,6 @@ impl GrantClientStore {
         });
         Ok(changed)
     }
-    async fn commit(
-        &mut self,
-        now: UnixMillis,
-        change: Change,
-        new: bool,
-    ) -> Result<(), NodeStoreError> {
-        self.reopen_if_poisoned().await?;
-        let frame = Frame {
-            namespace: NAMESPACE.into(),
-            now: now.max(self.now()),
-            change,
-        };
-        let mut candidate = self.state.clone();
-        self.apply(&mut candidate, &frame)?;
-        // Reserve enough space for a provider signature and result for each
-        // exported proposal before admitting it, including unanswered ones.
-        if candidate.book.jobs().len() > MAX_JOBS
-            || encode(&self.snapshot(&candidate))?
-                .len()
-                .saturating_add(candidate.book.jobs().len() * 512)
-                > MAX_CHECKPOINT_BYTES
-        {
-            return Err(GrantError::StateCapacity.into());
-        }
-        if self.journal.at_soft_limit() {
-            let rotated = self.rotate().await;
-            if new {
-                rotated?;
-            }
-        }
-        self.journal.append(&encode(&frame)?).await?;
-        self.state = candidate;
-        Ok(())
-    }
-    fn snapshot(&self, state: &ClientState) -> Snapshot {
-        Snapshot {
-            namespace: NAMESPACE.into(),
-            now: state.now,
-            nonce: state.book.proposal_nonce_high_water(),
-            pending: state.book.pending_proposal(),
-            jobs: state
-                .book
-                .jobs()
-                .map(|j| StoredJob {
-                    authorization: *j.authorization(),
-                    client_signature: j.client_signature(),
-                    provider_signature: j.provider_signature(),
-                    result: j.result().map(|(result, signature)| SignedResult {
-                        result: *result,
-                        signature: *signature,
-                    }),
-                })
-                .collect(),
-        }
-    }
     fn restore(&self, snapshot: Snapshot) -> Result<ClientState, NodeStoreError> {
         if snapshot.namespace != NAMESPACE || snapshot.jobs.len() > MAX_JOBS {
             return Err(NodeStoreError::Malformed);
@@ -523,6 +585,7 @@ impl GrantClientStore {
         Ok(state)
     }
 }
+
 fn journal_id(channel: &GrantChannelState) -> JournalId {
     JournalId {
         kind: JournalKind::Grant,

@@ -1,6 +1,44 @@
 use super::*;
 use clap::Parser as _;
 
+#[test]
+fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
+    let request = fetch_args(&[]).request().unwrap();
+    let job = Job::fetch(
+        20,
+        hellas_rpc::FetchContract::http().unwrap(),
+        "http".into(),
+        "request".into(),
+        serde_json::to_vec(&request).unwrap(),
+        Assurance::ProducerSigned,
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join(format!("{}.json", job.digest()));
+    let pointer = legacy.with_extension("latest");
+    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    let first = std::fs::read_to_string(&pointer).unwrap();
+    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    assert_eq!(std::fs::read_to_string(&pointer).unwrap(), first);
+    std::fs::remove_file(&pointer).unwrap();
+    assert!(select_attempt(&legacy, &job, false).is_err());
+    std::fs::write(&pointer, &first).unwrap();
+    drop(select_attempt(&legacy, &job, true).unwrap().unwrap());
+    let second = std::fs::read_to_string(&pointer).unwrap();
+    assert_ne!(first, second);
+    assert!(
+        root.path()
+            .join(format!("{}.{}.json", job.digest(), first))
+            .exists()
+    );
+    let second_path = root
+        .path()
+        .join(format!("{}.{}.json", job.digest(), second));
+    std::fs::remove_file(second_path).unwrap();
+    assert!(select_attempt(&legacy, &job, false).is_err());
+    assert_eq!(std::fs::read_to_string(&pointer).unwrap(), second);
+}
+
 fn node() -> iroh::EndpointId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
@@ -317,6 +355,7 @@ fn output_claims_only_provider_signature_and_job_binding() {
             metadata: hellas_rpc::JsonBytes(vec![]),
         },
         work_id: hellas_auth::Digest::from_bytes([4; 32]),
+        acceptance_signature: hellas_kernel::Sig::from_bytes([0; hellas_kernel::Sig::LENGTH]),
         credited_cumulative: 20,
         job_price: 20,
         provider_key: ProducerSigningKey::from_secret_bytes([8; 32])

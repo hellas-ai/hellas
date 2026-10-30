@@ -13,7 +13,7 @@ pub use administration::{
     WORK_ALLOWANCE_CONFIGURE, WORK_ALLOWANCE_READ, WORK_BUDGET_CONFIGURE, WORK_GENERATION_RESET,
     WORK_OFFER_EXPORT, WORK_PAID_POLICY_CONFIGURE, WORK_RESOURCE_CONFIGURE, WORK_RESOURCE_REPAIR,
 };
-pub use client::GrantClientStore;
+pub use client::{GrantClientStore, GrantWorkInspection};
 pub mod ledger;
 use crate::model::grant::{ChannelId, GrantJobAuthorizationV1};
 use hellas_auth::Signature;

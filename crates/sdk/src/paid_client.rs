@@ -106,7 +106,7 @@ pub struct SessionFundingOptions {
 }
 
 impl SessionFundingOptions {
-    fn check_quote(&self, funding_value: u64) -> Result<()> {
+    pub(crate) fn check_quote(&self, funding_value: u64) -> Result<()> {
         if self.max_funding.is_some_and(|limit| funding_value > limit) {
             return Err(PaidClientError::InvalidOptions(
                 "quote exceeds caller funding cap",
@@ -206,6 +206,8 @@ pub struct PaidWorkResult {
     pub transcript: Vec<u8>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub work_id: hellas_auth::Digest,
+    /// Provider co-signature over the accepted work identity.
+    pub acceptance_signature: hellas_kernel::Sig,
     pub credited_cumulative: u64,
     pub job_price: u64,
     pub provider_key: hellas_auth::PublicKey,
@@ -353,6 +355,12 @@ impl OpenIntent {
 }
 
 impl PaidWorkSession {
+    pub(crate) fn execution_target(&self) -> crate::execution::ExecutionTarget {
+        crate::execution::ExecutionTarget {
+            network: self.args.config.chain.network,
+            provider: self.args.provider,
+        }
+    }
     pub fn open(
         args: PaidWorkOptions,
         endpoint: Endpoint,
@@ -678,6 +686,54 @@ impl PaidWorkSession {
     /// Identifies the funded channel and its admitted execution policy.
     pub fn descriptor(&self) -> &WorkChannelDescriptor {
         &self.descriptor
+    }
+
+    /// Finish an existing verified payment obligation only. This path never
+    /// proposes work, uploads input, or invokes the provider's backend.
+    pub(crate) async fn recover_verified_payment(
+        &mut self,
+        work: hellas_auth::Digest,
+    ) -> Result<bool> {
+        let payable = self
+            .client
+            .with_state(|state| {
+                state.job_by_id(work).is_some_and(|job| {
+                    job.phase() == hellas_channel::work_store::JobPhase::Verified
+                        && job.result().is_some_and(|(result, _)| {
+                            result.outcome == hellas_channel::model::work::ResultOutcome::Finished
+                        })
+                })
+            })
+            .await?;
+        if !payable {
+            return Ok(false);
+        }
+        pay_when_ready(
+            &self.dialer,
+            &mut self.client,
+            work,
+            self.args.config.poll,
+            self.args.timeout,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn recorded_terminal(
+        &self,
+        work: hellas_auth::Digest,
+    ) -> Result<Option<bool>> {
+        self.client
+            .with_state(|state| {
+                state.terminal_by_id(work).map(|terminal| {
+                    matches!(
+                        terminal.outcome,
+                        hellas_channel::work_store::TerminalOutcome::Certified { .. }
+                    )
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Reads local journal state under a short lock.
@@ -1156,6 +1212,14 @@ async fn execute_paid_job(
             false,
         ),
     };
+    let acceptance_signature = client
+        .with_state(|state| {
+            state
+                .job_by_id(work_id)
+                .and_then(|job| job.provider_signature())
+        })
+        .await?
+        .ok_or(PaidClientError::MissingState("accepted work signature"))?;
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.accepting(work_id)?;
     }
@@ -1256,6 +1320,7 @@ async fn execute_paid_job(
         payment_edge: ready.channel().payment_edge(),
         channel_id: ready.channel().id(),
         work_id,
+        acceptance_signature,
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
         transcript,

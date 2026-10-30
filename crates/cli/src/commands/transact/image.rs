@@ -56,7 +56,7 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
             Ok(())
         },
         |timeout| {
-            format!("image generation exceeded {timeout:?}; retry the saved job folder to resume")
+            format!("image generation exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
         },
     )
     .await

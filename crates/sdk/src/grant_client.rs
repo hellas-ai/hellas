@@ -67,6 +67,8 @@ pub enum GrantClientError {
     Store(#[from] NodeStoreError),
     #[error("grant session is closed")]
     Closed,
+    #[error("grant attempt binding failed: {0}")]
+    Attempt(String),
     #[error(transparent)]
     Protocol(#[from] GrantProtocolError),
     #[error(transparent)]
@@ -478,12 +480,16 @@ impl Link {
 }
 pub struct GrantWorkResult {
     pub work_id: Digest,
+    /// Provider co-signature over the accepted work identity.
+    pub acceptance_signature: Signature,
     pub result: PaidJobResultV1,
     /// The verified signed transcript; `result.transcript_content` names
     /// its canonical encoding.
     pub events: Vec<OutputEventEnvelope>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub provider_key: PublicKey,
+    /// Provider signature over the channel-bound result.
+    pub result_signature: Signature,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
@@ -510,6 +516,12 @@ pub struct GrantSession {
     pending_body: Option<(Digest, PreparedInvocation, InvocationContent)>,
 }
 impl GrantSession {
+    pub(crate) fn execution_target(&self) -> Result<crate::execution::ExecutionTarget> {
+        Ok(crate::execution::ExecutionTarget {
+            network: self.target.network,
+            provider: hellas_client::ProviderAddress::of(&self.target.provider)?,
+        })
+    }
     pub async fn open(options: GrantSessionOptions, transport: GrantTransport) -> Result<Self> {
         if options.control_timeout.is_zero() {
             return Err(GrantError::Signature.into());
@@ -646,6 +658,12 @@ impl GrantSession {
     /// Resolve only the existing proposal, without executing a replacement.
     /// When the body was lost, an accepted proof reports Accepted with no output.
     pub async fn recover(&mut self) -> Result<Recovery> {
+        self.recover_tracked(None).await
+    }
+    pub(crate) async fn recover_tracked(
+        &mut self,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
+    ) -> Result<Recovery> {
         let Some(id) = self.store.book().pending_proposal() else {
             return Ok(Recovery::None);
         };
@@ -689,7 +707,7 @@ impl GrantSession {
         )
         .await
         .map_err(|_| GrantClientError::Timeout)??;
-        match self.apply_acceptance(id, response, probe).await {
+        match self.apply_acceptance(id, response, probe, tracker).await {
             Ok(()) => Ok(Recovery::Accepted(id)),
             Err(error @ GrantClientError::Refused { .. }) => {
                 if self.store.book().pending_proposal().is_none() {
@@ -706,6 +724,7 @@ impl GrantSession {
         id: Digest,
         response: AcceptWorkResponse,
         probe: bool,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<()> {
         match response.outcome {
             Some(accept_work_response::Outcome::Accepted(accepted)) => {
@@ -740,13 +759,37 @@ impl GrantSession {
                         }
                     );
                 if conclusive && !malformed_probe {
-                    self.store.refused(id, self.now()).await?;
                     self.pending_body = None;
+                    if let Some(tracker) = tracker {
+                        tracker
+                            .mark_rejected(id)
+                            .map_err(|error| GrantClientError::Attempt(error.to_string()))?;
+                    }
+                    self.store.refused(id, self.now()).await?;
                 }
                 Err(error)
             }
             None => Err(GrantProtocolError::AcceptanceOutcome.into()),
         }
+    }
+    /// Finish a journal transition for a refusal already durably recorded by
+    /// the caller's attempt, without contacting the provider again.
+    pub(crate) async fn resolve_recorded_refusal(&mut self, work: Digest) -> Result<()> {
+        let pending = self.store.book().pending_proposal();
+        if pending.is_some_and(|id| id != work)
+            || self
+                .store
+                .book()
+                .job_by_id(work)
+                .is_some_and(|job| job.phase() != hellas_channel::work_store::JobPhase::HalfSigned)
+        {
+            return Err(GrantProtocolError::AcceptanceIdentity.into());
+        }
+        if pending == Some(work) {
+            self.pending_body = None;
+            self.store.refused(work, self.now()).await?;
+        }
+        Ok(())
     }
     /// Mark proposal persistence before cancellation could abandon its recovery.
     pub async fn run(
@@ -765,6 +808,7 @@ impl GrantSession {
             progress,
             accepted,
             proposed,
+            None,
         )
         .await
     }
@@ -786,10 +830,36 @@ impl GrantSession {
             progress,
             accepted,
             proposed,
+            None,
         )
         .await
     }
 
+    pub(crate) async fn run_tracked_current(
+        &mut self,
+        resource: hellas_auth::authority::ResourceId,
+        input: PreparedInvocation,
+        content: &InvocationContent,
+        observers: crate::execution::ExecutionObservers,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
+    ) -> Result<GrantWorkResult> {
+        self.run_selected(
+            GrantSelection::Resource(resource),
+            input,
+            content,
+            observers.progress,
+            observers.accepted,
+            None,
+            tracker,
+        )
+        .await
+    }
+
+    pub(crate) fn execution_signer(&self) -> &ProducerSigningKey {
+        &self.options.signer
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_selected(
         &mut self,
         selection: GrantSelection<'_>,
@@ -798,9 +868,17 @@ impl GrantSession {
         progress: Option<PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantWorkResult> {
-        let (policy, id, mut stream, finish_by) =
-            self.admit(selection, &input, content, proposed).await?;
+        let (policy, id, mut stream, finish_by) = self
+            .admit(selection, &input, content, proposed, tracker)
+            .await?;
+        let acceptance_signature = self
+            .store
+            .book()
+            .job_by_id(id)
+            .and_then(|job| job.provider_signature())
+            .ok_or(GrantProtocolError::AcceptanceIdentity)?;
         let channel = self.store.channel().id;
         let facts = policy
             .invocation_policy
@@ -930,10 +1008,12 @@ impl GrantSession {
             .await?;
         Ok(GrantWorkResult {
             work_id: id,
+            acceptance_signature,
             result: signed.result,
             events,
             output,
             provider_key: producer,
+            result_signature: signed.signature,
         })
     }
 
@@ -946,6 +1026,7 @@ impl GrantSession {
         input: &PreparedInvocation,
         content: &InvocationContent,
         proposed: Option<&std::sync::atomic::AtomicBool>,
+        mut tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<(
         GrantPolicy,
         Digest,
@@ -1039,6 +1120,12 @@ impl GrantSession {
                 terminal.checked_add(300_000).ok_or(GrantError::Malformed)?,
             ),
         };
+        let id = grant_work_id(self.target.network, &a);
+        if let Some(tracker) = tracker.as_deref_mut() {
+            tracker
+                .bind_proposal(&a, id)
+                .map_err(|error| GrantClientError::Attempt(error.to_string()))?;
+        }
         // Cancellation after this point must retain or recover the proposal.
         if let Some(proposed) = proposed {
             proposed.store(true, std::sync::atomic::Ordering::Release);
@@ -1047,7 +1134,6 @@ impl GrantSession {
             .store
             .propose(&self.offer, a, input, &self.options.signer, now)
             .await?;
-        let id = grant_work_id(self.target.network, &a);
         self.pending_body = Some((id, input.clone(), content.clone()));
 
         let request = AcceptWorkRequest {
@@ -1065,7 +1151,7 @@ impl GrantSession {
         )
         .await
         .map_err(|_| GrantClientError::Timeout)??;
-        self.apply_acceptance(id, response, false).await?;
+        self.apply_acceptance(id, response, false, tracker).await?;
         let delivery = StreamResultRequest {
             route: Some(WorkRoute::grant(channel.0)),
             work_id: id.as_bytes().to_vec(),
