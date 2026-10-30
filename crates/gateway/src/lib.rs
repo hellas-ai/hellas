@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
 pub use hellas_rpc::compute_event::ComputeEvent;
-pub use http_fetch::{HttpGatewayConfig, HttpRoute, RoutingError};
+pub use http_fetch::{HttpBackend, HttpGatewayConfig, HttpRoute, RoutingError};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 

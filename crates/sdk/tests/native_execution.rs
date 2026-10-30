@@ -21,6 +21,8 @@ mod automatic;
 mod gateway;
 #[path = "native_execution/grant.rs"]
 mod grant;
+#[path = "native_execution/pool.rs"]
+mod pool;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
 #[path = "paid_e2e/settlement.rs"]

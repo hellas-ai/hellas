@@ -65,6 +65,7 @@ pub mod node_control;
 mod gateway_work;
 pub use gateway_work::{GatewayServeOptions, WorkGateway, serve_gateway};
 pub mod grant_gateway;
+pub mod grant_store;
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

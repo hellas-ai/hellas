@@ -540,7 +540,7 @@ pub struct WorkGateway<S> {
     pub(crate) source: Arc<S>,
     pub(crate) admission: Arc<Semaphore>,
     tasks: WorkTasks,
-    pub(crate) endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
+    pub(crate) endpoints: tokio::sync::Mutex<Vec<iroh::Endpoint>>,
 }
 impl<S: WorkSource> WorkGateway<S> {
     pub(crate) fn new(source: S, max_pending: usize) -> Self {
@@ -548,11 +548,15 @@ impl<S: WorkSource> WorkGateway<S> {
             source: Arc::new(source),
             admission: Arc::new(Semaphore::new(max_pending)),
             tasks: WorkTasks::default(),
-            endpoint: tokio::sync::Mutex::new(None),
+            endpoints: tokio::sync::Mutex::new(Vec::new()),
         }
     }
     pub(crate) fn with_endpoint(mut self, endpoint: Option<iroh::Endpoint>) -> Self {
-        self.endpoint = tokio::sync::Mutex::new(endpoint);
+        self.endpoints = tokio::sync::Mutex::new(endpoint.into_iter().collect());
+        self
+    }
+    pub(crate) fn with_endpoints(mut self, endpoints: Vec<iroh::Endpoint>) -> Self {
+        self.endpoints = tokio::sync::Mutex::new(endpoints);
         self
     }
     pub(crate) fn submit<E: GatewayEvent>(
@@ -633,8 +637,8 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
         Box::pin(async move {
             let tasks = self.tasks.drain().await;
             let source = self.source.shutdown().await;
-            let endpoint = self.endpoint.lock().await.take();
-            if let Some(endpoint) = endpoint {
+            let endpoints = std::mem::take(&mut *self.endpoints.lock().await);
+            for endpoint in endpoints {
                 endpoint.close().await;
             }
             tasks.and(source)

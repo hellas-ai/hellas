@@ -9,7 +9,7 @@ mod observation;
 mod routing;
 pub use routing::RoutingError;
 
-pub use config::{HttpGatewayConfig, HttpRoute};
+pub use config::{HttpBackend, HttpGatewayConfig, HttpRoute};
 #[cfg(test)]
 mod tests;
 

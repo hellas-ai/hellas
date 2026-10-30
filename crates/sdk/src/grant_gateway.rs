@@ -10,7 +10,13 @@ use hellas_auth::authority::ResourceId;
 use hellas_authority::model::grant::records::{GrantPolicy, SignedOffer, grant_transport};
 use hellas_gateway::{WorkGatewayBusy, WorkGatewayError};
 use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +29,8 @@ pub enum GrantGatewayError {
     AmbiguousPolicy,
     #[error("grant provider transport is invalid")]
     Transport,
+    #[error("grant pool has duplicate or invalid channel/resource selections")]
+    PoolSelection,
 }
 fn error(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Execution(Box::new(e))
@@ -97,7 +105,7 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
     }
 }
 /// One private grant channel as a gateway work source.
-pub struct GrantSource {
+struct GrantSource {
     session: AsyncMutex<GrantSession>,
     offer: SignedOffer,
     policy: Option<ResourceId>,
@@ -105,8 +113,146 @@ pub struct GrantSource {
     channel: hellas_channel::model::grant::ChannelId,
     assurance: hellas_rpc::Assurance,
 }
-/// A grant channel behind the shared gateway.
-pub type GrantGateway = WorkGateway<GrantSource>;
+/// One channel and its explicitly selected resources.
+#[derive(Clone)]
+pub struct GrantPoolChannel {
+    pub session: GrantSessionOptions,
+    pub resources: Vec<ResourceId>,
+}
+
+/// Static pool configuration; changes take effect on restart.
+#[derive(Clone)]
+pub struct GrantPoolOptions {
+    pub channels: Vec<GrantPoolChannel>,
+}
+
+impl GrantPoolOptions {
+    /// Check saved channel and resource identities without opening a session.
+    pub fn validate(&self) -> Result<(), GrantGatewayError> {
+        if self.channels.is_empty() || self.channels.len() > 256 {
+            return Err(GrantGatewayError::PoolSelection);
+        }
+        let mut identities = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for channel in &self.channels {
+            if channel.resources.is_empty() {
+                return Err(GrantGatewayError::PoolSelection);
+            }
+            let offer = channel.session.target.offer();
+            if !identities.insert(*channel_id(&channel.session)?.0.as_bytes()) {
+                return Err(GrantGatewayError::PoolSelection);
+            }
+            let mut resources = std::collections::HashSet::new();
+            for resource in &channel.resources {
+                if !resources.insert(*resource)
+                    || !offer
+                        .grant
+                        .policies
+                        .iter()
+                        .any(|policy| policy.resource == *resource)
+                {
+                    return Err(GrantGatewayError::PoolSelection);
+                }
+                count += 1;
+            }
+        }
+        if count > 256 {
+            return Err(GrantGatewayError::PoolSelection);
+        }
+        Ok(())
+    }
+
+    /// Project the saved Fetch routes for offline presentation validation.
+    pub fn fetch_routes(&self) -> Result<Vec<hellas_gateway::FetchRoute>, WorkGatewayError> {
+        self.validate().map_err(rejected)?;
+        let mut routes = Vec::new();
+        for channel in &self.channels {
+            let offer = channel.session.target.offer();
+            let provider =
+                iroh::EndpointId::from_bytes(&grant_transport(&offer.provider).map_err(error)?)
+                    .map_err(|_| error(GrantGatewayError::Transport))?;
+            let id = channel_id(&channel.session).map_err(rejected)?;
+            for resource in &channel.resources {
+                let policy = offer
+                    .grant
+                    .policies
+                    .iter()
+                    .find(|p| p.resource == *resource)
+                    .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+                routes.extend(
+                    crate::gateway_work::fetch_routes(
+                        provider,
+                        std::iter::once(&policy.invocation_policy),
+                    )
+                    .into_iter()
+                    .map(|mut route| {
+                        route.resource = Some(*resource);
+                        route.channel = Some(id);
+                        route
+                    }),
+                );
+            }
+        }
+        Ok(routes)
+    }
+
+    /// Project saved signed terms without contacting providers; runtime opens
+    /// refresh standing and performs the same projection again.
+    pub fn http_config(
+        &self,
+    ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
+        self.validate().map_err(rejected)?;
+        let mut rows = Vec::new();
+        for channel in &self.channels {
+            let offer = channel.session.target.offer();
+            let provider =
+                iroh::EndpointId::from_bytes(&grant_transport(&offer.provider).map_err(error)?)
+                    .map_err(|_| error(GrantGatewayError::Transport))?;
+            let id = channel_id(&channel.session).map_err(rejected)?;
+            for resource in &channel.resources {
+                let policy = offer
+                    .grant
+                    .policies
+                    .iter()
+                    .find(|policy| policy.resource == *resource)
+                    .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+                rows.push((provider, id, policy));
+            }
+        }
+        pool_http_config(rows)
+    }
+}
+
+fn channel_id(
+    session: &GrantSessionOptions,
+) -> Result<hellas_channel::model::grant::ChannelId, GrantGatewayError> {
+    let node = hellas_auth::authority::NodeKey::from_public_key(session.signer.public_key())
+        .map_err(|_| GrantGatewayError::PoolSelection)?;
+    let client = hellas_channel::model::grant::ChannelClient {
+        principal: session.principal,
+        node,
+    };
+    Ok(session.target.offer().channel(client))
+}
+
+struct GrantSelection {
+    channel: usize,
+    resource: ResourceId,
+    pending: Arc<AtomicUsize>,
+}
+
+/// Dispatches exact grant selections through one shared gateway.
+pub struct GrantPoolSource {
+    channels: Vec<Arc<GrantSource>>,
+    selections: Vec<GrantSelection>,
+    explicit: bool,
+    choose: std::sync::Mutex<()>,
+}
+
+/// A shared gateway backed by one or more grant channels.
+pub type GrantPool = WorkGateway<GrantPoolSource>;
+/// The single-channel interface delegates to the same pool implementation.
+pub type GrantGateway = GrantPool;
 
 impl GrantGateway {
     /// The gateway owns the endpoint lifecycle when given a remote transport.
@@ -129,8 +275,34 @@ impl GrantGateway {
             }
         };
         Ok(Arc::new(
-            WorkGateway::new(source, 32).with_endpoint(endpoint),
+            WorkGateway::new(GrantPoolSource::single(source), 32).with_endpoint(endpoint),
         ))
+    }
+
+    /// Open one session per channel and explicitly select its resources.
+    pub async fn open_pool(
+        options: GrantPoolOptions,
+        transports: Vec<GrantTransport>,
+    ) -> Result<Arc<Self>, WorkGatewayError> {
+        let endpoints: Vec<_> = transports
+            .iter()
+            .filter_map(|transport| match transport {
+                GrantTransport::Remote(endpoint) => Some(endpoint.clone()),
+                GrantTransport::Local(_) => None,
+            })
+            .collect();
+        let result = GrantPoolSource::open(options, transports).await;
+        match result {
+            Ok(source) => Ok(Arc::new(
+                WorkGateway::new(source, 32).with_endpoints(endpoints),
+            )),
+            Err(error) => {
+                for endpoint in endpoints {
+                    endpoint.close().await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Exact private HTTP routes derived from current standing, if the grant
@@ -139,10 +311,13 @@ impl GrantGateway {
     pub fn http_config(
         &self,
     ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
-        let mut policies = self.source.offer.offer().grant.policies.iter().filter(|p| {
+        if self.source.explicit {
+            return self.source.pool_http_config();
+        }
+        let source = &self.source.channels[0];
+        let mut policies = source.offer.offer().grant.policies.iter().filter(|p| {
             p.https.is_some()
-                && self
-                    .source
+                && self.source.channels[0]
                     .policy
                     .as_ref()
                     .is_none_or(|resource| *resource == p.resource)
@@ -161,6 +336,270 @@ impl GrantGateway {
             max_in_flight: 32,
             routes,
         }))
+    }
+}
+
+impl GrantPoolSource {
+    fn single(source: GrantSource) -> Self {
+        let selections = source
+            .policies()
+            .map(|policy| GrantSelection {
+                channel: 0,
+                resource: policy.resource,
+                pending: Arc::new(AtomicUsize::new(0)),
+            })
+            .collect();
+        Self {
+            channels: vec![Arc::new(source)],
+            selections,
+            explicit: false,
+            choose: std::sync::Mutex::new(()),
+        }
+    }
+
+    async fn open(
+        options: GrantPoolOptions,
+        transports: Vec<GrantTransport>,
+    ) -> Result<Self, WorkGatewayError> {
+        if options.channels.len() != transports.len() {
+            return Err(rejected(GrantGatewayError::PoolSelection));
+        }
+        options.validate().map_err(rejected)?;
+        let mut channels: Vec<Arc<GrantSource>> = Vec::new();
+        let mut selections = Vec::new();
+        for (entry, transport) in options.channels.into_iter().zip(transports) {
+            let source = match GrantSource::open(entry.session, transport, None).await {
+                Ok(source) => source,
+                Err(error) => {
+                    for source in &channels {
+                        let _ = source.shutdown().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if entry.resources.iter().any(|resource| {
+                !source
+                    .offer
+                    .offer()
+                    .grant
+                    .policies
+                    .iter()
+                    .any(|policy| policy.resource == *resource)
+            }) {
+                let _ = source.shutdown().await;
+                for source in &channels {
+                    let _ = source.shutdown().await;
+                }
+                return Err(rejected(GrantGatewayError::NoMatchingPolicy));
+            }
+            let index = channels.len();
+            selections.extend(entry.resources.into_iter().map(|resource| GrantSelection {
+                channel: index,
+                resource,
+                pending: Arc::new(AtomicUsize::new(0)),
+            }));
+            channels.push(Arc::new(source));
+        }
+        Ok(Self {
+            channels,
+            selections,
+            explicit: true,
+            choose: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn pool_http_config(
+        &self,
+    ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
+        let mut rows = Vec::new();
+        for selection in &self.selections {
+            let source = &self.channels[selection.channel];
+            let policy = source
+                .policies()
+                .find(|policy| policy.resource == selection.resource)
+                .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+            rows.push((source.provider, source.channel, policy));
+        }
+        pool_http_config(rows)
+    }
+}
+
+fn pool_http_config<'a>(
+    rows: impl IntoIterator<
+        Item = (
+            iroh::EndpointId,
+            hellas_channel::model::grant::ChannelId,
+            &'a GrantPolicy,
+        ),
+    >,
+) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
+    let mut backends = std::collections::BTreeMap::new();
+    for (index, (provider, channel, policy)) in rows.into_iter().enumerate() {
+        let Some(template) = &policy.https else {
+            continue;
+        };
+        let (_, _, mut routes) = policy_http_routes(policy)?;
+        for route in &mut routes {
+            route.credential = None;
+        }
+        backends.insert(
+            format!("resource-{index:04}"),
+            hellas_gateway::HttpBackend {
+                models: vec![],
+                credential: template.credential.clone(),
+                routes,
+                max_in_flight: None,
+                provider: Some(provider),
+                resource: Some(policy.resource),
+                channel: Some(channel),
+            },
+        );
+    }
+    if backends.is_empty() {
+        return Ok(None);
+    }
+    let config = hellas_gateway::HttpGatewayConfig {
+        service: None,
+        method: None,
+        routes: vec![],
+        backends,
+        max_in_flight: 32,
+    };
+    config.validate().map_err(error)?;
+    Ok(Some(config))
+}
+
+struct PendingSelection(Arc<AtomicUsize>);
+impl Drop for PendingSelection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An exact resource selected for one request.
+pub struct SelectedGrant {
+    channel: usize,
+    resource: ResourceId,
+    request: WorkRequest,
+    _pending: PendingSelection,
+}
+
+impl WorkSource for GrantPoolSource {
+    type Error = WorkGatewayError;
+    type Request = SelectedGrant;
+
+    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
+        self.selections
+            .iter()
+            .flat_map(|selection| {
+                self.channels[selection.channel]
+                    .fetch_routes()
+                    .into_iter()
+                    .filter(move |route| route.resource == Some(selection.resource))
+            })
+            .collect()
+    }
+
+    fn request(&self, request: WorkRequest) -> Result<Self::Request, Self::Error> {
+        if let Some(provider) = request.pinned()
+            && !self
+                .channels
+                .iter()
+                .any(|channel| channel.provider == provider)
+        {
+            return Err(WorkGatewayError::Provider(provider));
+        }
+        if matches!(&request, WorkRequest::Fetch(fetch) if fetch.channel.is_some() != fetch.resource.is_some())
+        {
+            return Err(rejected(GrantGatewayError::NoMatchingPolicy));
+        }
+        let _choose = self.choose.lock().map_err(|_| WorkGatewayBusy)?;
+        let mut candidates = Vec::new();
+        let mut refusal = None;
+        for selection in &self.selections {
+            let source = &self.channels[selection.channel];
+            if request
+                .pinned()
+                .is_some_and(|provider| provider != source.provider)
+                || matches!(&request, WorkRequest::Fetch(fetch) if fetch.channel.is_some_and(|id| id != source.channel) || fetch.resource.is_some_and(|id| id != selection.resource))
+            {
+                continue;
+            }
+            let Some(policy) = source
+                .policies()
+                .find(|policy| policy.resource == selection.resource)
+            else {
+                continue;
+            };
+            match request.admitted(
+                &policy.invocation_policy,
+                policy.https.as_ref(),
+                source.assurance,
+                false,
+            ) {
+                Ok(_) => candidates.push(selection),
+                Err(error) => refusal = Some(error),
+            }
+        }
+        if candidates.is_empty() {
+            return Err(match refusal {
+                Some(error) => rejected(error),
+                None => rejected(GrantGatewayError::NoMatchingPolicy),
+            });
+        }
+        if !self.explicit && candidates.len() > 1 {
+            return Err(rejected(GrantGatewayError::AmbiguousPolicy));
+        }
+        let selected = candidates
+            .into_iter()
+            .min_by_key(|selection| selection.pending.load(Ordering::Acquire))
+            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+        selected.pending.fetch_add(1, Ordering::AcqRel);
+        Ok(SelectedGrant {
+            channel: selected.channel,
+            resource: selected.resource,
+            request,
+            _pending: PendingSelection(selected.pending.clone()),
+        })
+    }
+
+    fn run<E: GatewayEvent>(
+        self: Arc<Self>,
+        selected: Self::Request,
+        requester: Requester<E, Self::Error>,
+    ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>> {
+        Box::pin(async move {
+            let SelectedGrant {
+                channel,
+                resource,
+                request,
+                _pending,
+            } = selected;
+            self.channels[channel]
+                .clone()
+                .run((resource, request), requester)
+                .await
+        })
+    }
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
+    fn gateway_error(error: WorkGatewayError) -> WorkGatewayError {
+        error
+    }
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {
+        Box::pin(async move {
+            let mut failure = None;
+            for source in &self.channels {
+                if let Err(error) = source.shutdown().await {
+                    failure.get_or_insert(error);
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
     }
 }
 
@@ -236,25 +675,7 @@ impl GrantServeOptions {
         transport: GrantTransport,
     ) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
         let gateway = GrantGateway::open(self.session, transport, self.policy).await?;
-        let mut serve = self.serve;
-        if serve.http.is_none() {
-            serve.http = match gateway.http_config() {
-                Ok(http) => http,
-                Err(error) => {
-                    let error = hellas_gateway::GatewayError::from(error);
-                    return Err(
-                        match hellas_gateway::WorkExecutionBackend::drain(&*gateway).await {
-                            Ok(()) => error,
-                            Err(cleanup) => hellas_gateway::GatewayError::Cleanup {
-                                primary: Box::new(error),
-                                cleanup,
-                            },
-                        },
-                    );
-                }
-            };
-        }
-        crate::serve_gateway(gateway, serve).await
+        serve_grant_gateway(gateway, self.serve).await
     }
 
     /// The host supplies the access it validated; the configured access is replaced.
@@ -268,6 +689,47 @@ impl GrantServeOptions {
             })
         })
     }
+}
+
+/// A gateway over an explicit static set of grant channels/resources.
+#[derive(Clone)]
+pub struct GrantPoolServeOptions {
+    pub serve: crate::GatewayServeOptions,
+    pub pool: GrantPoolOptions,
+}
+
+impl GrantPoolServeOptions {
+    pub async fn start(
+        self,
+        transports: Vec<GrantTransport>,
+    ) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
+        let gateway = GrantPool::open_pool(self.pool, transports).await?;
+        serve_grant_gateway(gateway, self.serve).await
+    }
+}
+
+async fn serve_grant_gateway(
+    gateway: Arc<GrantGateway>,
+    mut serve: crate::GatewayServeOptions,
+) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
+    if serve.http.is_none() {
+        serve.http = match gateway.http_config() {
+            Ok(http) => http,
+            Err(error) => {
+                let error = hellas_gateway::GatewayError::from(error);
+                return Err(
+                    match hellas_gateway::WorkExecutionBackend::drain(&*gateway).await {
+                        Ok(()) => error,
+                        Err(cleanup) => hellas_gateway::GatewayError::Cleanup {
+                            primary: Box::new(error),
+                            cleanup,
+                        },
+                    },
+                );
+            }
+        };
+    }
+    crate::serve_gateway(gateway, serve).await
 }
 
 impl GrantSource {
@@ -329,10 +791,7 @@ impl GrantSource {
     }
 }
 
-impl WorkSource for GrantSource {
-    type Error = WorkGatewayError;
-    type Request = (ResourceId, WorkRequest);
-
+impl GrantSource {
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.policies()
             .flat_map(|policy| {
@@ -350,46 +809,9 @@ impl WorkSource for GrantSource {
             .collect()
     }
 
-    /// Grant work is memory-only. Exactly one granted policy must admit it.
-    fn request(&self, request: WorkRequest) -> Result<Self::Request, WorkGatewayError> {
-        if let Some(provider) = request.pinned().filter(|p| *p != self.provider) {
-            return Err(WorkGatewayError::Provider(provider));
-        }
-        if matches!(&request, WorkRequest::Fetch(fetch) if fetch.channel.is_some() != fetch.resource.is_some() || fetch.channel.is_some_and(|channel| channel != self.channel))
-        {
-            return Err(rejected(GrantGatewayError::NoMatchingPolicy));
-        }
-        let mut admitted = None;
-        let mut refusal = None;
-        for policy in self.policies() {
-            if matches!(&request, WorkRequest::Fetch(fetch) if fetch.resource.is_some_and(|resource| resource != policy.resource))
-            {
-                continue;
-            }
-            match request.admitted(
-                &policy.invocation_policy,
-                policy.https.as_ref(),
-                self.assurance,
-                false,
-            ) {
-                Ok(_) if admitted.is_some() => {
-                    return Err(rejected(GrantGatewayError::AmbiguousPolicy));
-                }
-                Ok(_) => admitted = Some(policy.resource),
-                Err(error) => refusal = Some(error),
-            }
-        }
-        admitted
-            .map(|resource| (resource, request))
-            .ok_or_else(|| match refusal {
-                Some(error) => rejected(error),
-                None => rejected(GrantGatewayError::NoMatchingPolicy),
-            })
-    }
-
     fn run<E: GatewayEvent>(
         self: Arc<Self>,
-        (resource, request): Self::Request,
+        (resource, request): (ResourceId, WorkRequest),
         requester: Requester<E, WorkGatewayError>,
     ) -> BoxFuture<'static, Result<Option<Completed>, WorkGatewayError>> {
         Box::pin(async move {
@@ -465,14 +887,6 @@ impl WorkSource for GrantSource {
                 provider: output.provider_key,
             }))
         })
-    }
-
-    fn timeout(&self) -> Option<Duration> {
-        None
-    }
-
-    fn gateway_error(error: WorkGatewayError) -> WorkGatewayError {
-        error
     }
 
     fn shutdown(&self) -> BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {

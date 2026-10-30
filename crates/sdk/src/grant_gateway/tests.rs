@@ -24,6 +24,150 @@ fn inspect_chat(request: &hellas_rpc::fetch::FetchInput) {
     assert_eq!(body["max_tokens"], 6);
     assert_eq!(body["stream_options"]["include_usage"], true);
 }
+
+#[tokio::test]
+async fn explicit_pool_shares_one_channel_and_selects_least_pending_resource() {
+    let template = chat_resource("https://private.fixture", 6);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit {
+        meter: Meter::OutputTokens,
+        window: Window::Total,
+        amount: 20,
+    }]);
+    use_https(&mut allowance.definition.policies[0], template.clone());
+    let first = allowance.definition.policies[0].resource;
+    let mut second_policy = allowance.definition.policies[0].clone();
+    second_policy.resource =
+        hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second resource"));
+    second_policy.name = "second".into();
+    let second = second_policy.resource;
+    allowance.definition.policies.push(second_policy);
+    let backend = Backend {
+        finish: Completion::Immediate,
+        reply: Reply::events(Reply::http(
+            200,
+            "application/json",
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )),
+        ..Backend::default()
+    };
+    let host = crate::test_support::Host::builder()
+        .with_allowance(allowance)
+        .with_backend(backend)
+        .build()
+        .await;
+    let options = host.options(vec![]);
+    let duplicate = GrantPoolOptions {
+        channels: vec![GrantPoolChannel {
+            session: options.clone(),
+            resources: vec![first, first],
+        }],
+    };
+    assert!(
+        GrantPool::open_pool(
+            duplicate,
+            vec![GrantTransport::Local(host.world.service.clone())]
+        )
+        .await
+        .is_err()
+    );
+    let duplicate_channel = GrantPoolOptions {
+        channels: vec![
+            GrantPoolChannel {
+                session: options.clone(),
+                resources: vec![first],
+            },
+            GrantPoolChannel {
+                session: options.clone(),
+                resources: vec![second],
+            },
+        ],
+    };
+    assert!(
+        GrantPool::open_pool(
+            duplicate_channel,
+            vec![
+                GrantTransport::Local(host.world.service.clone()),
+                GrantTransport::Local(host.world.service.clone())
+            ]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 0);
+    let pool = GrantPool::open_pool(
+        GrantPoolOptions {
+            channels: vec![GrantPoolChannel {
+                session: options,
+                resources: vec![first, second],
+            }],
+        },
+        vec![GrantTransport::Local(host.world.service.clone())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(pool.source.channels.len(), 1);
+    assert_eq!(pool.fetch_routes().len(), 2);
+    let http = hellas_rpc::http_fetch::HttpFetchRequest {
+        url: format!("{}{}", template.origin, template.paths[0]),
+        method: "POST".into(),
+        headers: vec![],
+        body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":6}"#),
+        tls: template.tls,
+        credential: None,
+        max_response_bytes: template.max_response_bytes,
+    };
+    let make_request = || WorkFetchRequest {
+        provider: pool.source.channels[0].provider,
+        resource: None,
+        channel: None,
+        service: "openai".into(),
+        method: "responses".into(),
+        body: serde_json::to_vec(&http).unwrap(),
+    };
+    let legacy = GrantPoolSource {
+        channels: pool.source.channels.clone(),
+        selections: pool
+            .source
+            .selections
+            .iter()
+            .map(|selection| GrantSelection {
+                channel: selection.channel,
+                resource: selection.resource,
+                pending: Arc::new(AtomicUsize::new(0)),
+            })
+            .collect(),
+        explicit: false,
+        choose: std::sync::Mutex::new(()),
+    };
+    assert!(matches!(
+        legacy.request(WorkRequest::Fetch(make_request())),
+        Err(WorkGatewayError::Rejected(_))
+    ));
+    let first_pending = pool
+        .source
+        .request(WorkRequest::Fetch(make_request()))
+        .unwrap();
+    let second_pending = pool
+        .source
+        .request(WorkRequest::Fetch(make_request()))
+        .unwrap();
+    assert_eq!(first_pending.resource, first);
+    assert_eq!(second_pending.resource, second);
+    drop((first_pending, second_pending));
+    let config = pool.http_config().unwrap().unwrap();
+    assert_eq!(config.backends.len(), 2);
+    for resource in [first, second] {
+        let mut request = make_request();
+        request.resource = Some(resource);
+        request.channel = Some(pool.source.channels[0].channel);
+        let mut stream = pool.fetch(request).unwrap();
+        while let Some(event) = within(stream.next()).await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 2);
+    pool.drain().await.unwrap();
+}
 struct Fixture {
     host: crate::test_support::Host,
     gateway: Arc<GrantGateway>,
@@ -239,7 +383,7 @@ impl Fixture {
         WorkFetchRequest {
             resource: None,
             channel: None,
-            provider: self.gateway.source.provider,
+            provider: self.gateway.source.channels[0].provider,
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
@@ -288,7 +432,7 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
     assert!(terminal.terminal().is_some());
     let provider = PublicKey::Secp256k1(
         hellas_authority::model::grant::records::grant_producer(
-            &fixture.gateway.source.offer.offer().provider,
+            &fixture.gateway.source.channels[0].offer.offer().provider,
         )
         .unwrap()
         .to_bytes(),
@@ -309,7 +453,7 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
         .public_key();
     assert!(envelopes[0].verify(&stranger).is_err());
 
-    let session = fixture.gateway.source.session.lock().await;
+    let session = fixture.gateway.source.channels[0].session.lock().await;
     let job = session
         .store()
         .book()
@@ -425,7 +569,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.gateway.source.session.lock().await;
+        let guard = fixture.gateway.source.channels[0].session.lock().await;
         let mut stream = fixture.gateway.fetch(fixture.request(Some(6))).unwrap();
         let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
             fixture.host.world.service.clone(),
@@ -458,9 +602,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
         assert!(within(stream.next()).await.unwrap().is_err());
         assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            fixture
-                .gateway
-                .source
+            fixture.gateway.source.channels[0]
                 .session
                 .lock()
                 .await
@@ -486,11 +628,11 @@ async fn renamed_policy_keeps_the_selected_resource() {
     )
     .await
     .unwrap();
-    let gateway = Arc::new(WorkGateway::new(source, 32));
+    let gateway = Arc::new(WorkGateway::new(GrantPoolSource::single(source), 32));
     let mut policy = fixture.host.allowance.policies[0].clone();
     policy.revision.0 += 1;
     policy.name = "renamed".into();
-    let guard = gateway.source.session.lock().await;
+    let guard = gateway.source.channels[0].session.lock().await;
     let mut stream = gateway.fetch(fixture.request(None)).unwrap();
     let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
         fixture.host.world.service.clone(),
@@ -532,7 +674,7 @@ async fn renamed_policy_keeps_the_selected_resource() {
 async fn wrong_resource_or_channel_never_reaches_a_proposal() {
     let fixture = Fixture::builder().build().await;
     let resource = fixture.host.allowance.policies[0].resource;
-    let channel = fixture.gateway.source.channel;
+    let channel = fixture.gateway.source.channels[0].channel;
     for (selected_resource, selected_channel) in [
         (
             Some(hellas_auth::authority::ResourceId(
@@ -555,9 +697,7 @@ async fn wrong_resource_or_channel_never_reaches_a_proposal() {
     }
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        fixture
-            .gateway
-            .source
+        fixture.gateway.source.channels[0]
             .session
             .lock()
             .await
@@ -624,7 +764,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.gateway.source.session.lock().await;
+    let guard = fixture.gateway.source.channels[0].session.lock().await;
     let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
     let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
         fixture.host.world.service.clone(),
@@ -657,9 +797,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     assert!(within(stream.next()).await.unwrap().is_err());
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        fixture
-            .gateway
-            .source
+        fixture.gateway.source.channels[0]
             .session
             .lock()
             .await
@@ -709,16 +847,16 @@ async fn gateway_closes_remote_endpoint_after_drain() {
     let fixture = Fixture::builder().remote().build().await;
     let endpoint = fixture
         .gateway
-        .endpoint
+        .endpoints
         .lock()
         .await
-        .as_ref()
+        .first()
         .unwrap()
         .clone();
     assert!(!endpoint.is_closed());
     fixture.gateway.drain().await.unwrap();
     assert!(endpoint.is_closed());
-    assert!(fixture.gateway.endpoint.lock().await.is_none());
+    assert!(fixture.gateway.endpoints.lock().await.is_empty());
     if let Some(remote) = fixture.remote {
         remote.shutdown().await;
     }
@@ -967,7 +1105,7 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.source.session.lock().await;
+        let held = fixture.gateway.source.channels[0].session.lock().await;
         let request = fixture
             .gateway
             .source
@@ -1007,9 +1145,7 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         .build()
         .await;
     fixture.result(None).await.unwrap();
-    let channel = fixture
-        .gateway
-        .source
+    let channel = fixture.gateway.source.channels[0]
         .session
         .lock()
         .await
@@ -1055,9 +1191,7 @@ async fn disconnect_during_control_does_not_propose() {
     drop(stream);
     assert!(within(run).await.unwrap().is_none());
     assert_eq!(
-        fixture
-            .gateway
-            .source
+        fixture.gateway.source.channels[0]
             .session
             .lock()
             .await

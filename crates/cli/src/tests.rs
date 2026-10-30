@@ -626,3 +626,38 @@ fn metrics_flags_require_the_otel_build() {
         }
     }
 }
+
+#[test]
+fn grant_pool_gateway_flags_enforce_source_exclusivity() {
+    let cli = parse_gateway(&[
+        "--grant-pool-config",
+        "pool.json",
+        "--trust-store",
+        "trust",
+        "--check-config",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Gateway {
+            grant_pool_config: Some(_),
+            check_config: true,
+            ..
+        }
+    ));
+    for selector in [
+        "--offer",
+        "--local-grant",
+        "--paid-work-config",
+        "--work-profile",
+        "--grant-policy",
+        "--http-fetch-config",
+        "--trust-policy",
+    ] {
+        assert!(
+            parse_gateway(&["--grant-pool-config", "pool.json", selector, "other"]).is_err(),
+            "{selector}"
+        );
+    }
+    assert!(parse_gateway(&["--check-config"]).is_err());
+}
