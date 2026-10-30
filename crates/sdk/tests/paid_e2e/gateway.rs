@@ -45,7 +45,10 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             let stayed_pending = held.is_err();
             assert_eq!(case.devnet.height(), height);
             let result = if stayed_pending {
-                sealing_while(&mut case.devnet, Duration::from_millis(100), &mut request).await
+                // Keep simulated block time realistic: sealing ten blocks per second
+                // can expire the 16-block acceptance window before the provider
+                // processes an otherwise timely request.
+                sealing_while(&mut case.devnet, Duration::from_secs(1), &mut request).await
             } else {
                 held.unwrap()
             };
