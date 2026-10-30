@@ -7,9 +7,13 @@ use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
 mod error;
+mod funding;
 pub(crate) mod offer;
+mod settlement;
 pub use error::PaidClientError;
+pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
 pub use offer::{PaidQuote, request_paid_quote, retained_paid_policy};
+pub use settlement::{FinalizedChannelSettlement, finalized_channel_settlement};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;
@@ -65,6 +69,51 @@ pub struct PaidWorkOptions {
     /// Bounds retries while a provider is not ready; `None` waits until done.
     /// A session's overall lifetime is controlled by its caller.
     pub timeout: Option<Duration>,
+}
+
+/// Application approval of the actual channel funding. Implementations must
+/// reserve idempotently for a stable reservation ID, including after a crash
+/// between approval and persistence of the signed funding intent.
+/// A caller must use a distinct reservation for each deliberate funding
+/// attempt and keep the same ID when recovering that attempt.
+pub trait FundingApproval: Send + Sync {
+    fn reservation(
+        &self,
+        network: hellas_kernel::NetworkId,
+        provider: iroh::EndpointId,
+    ) -> [u8; 16];
+    fn reserve(
+        &self,
+        reservation: [u8; 16],
+        amount: u64,
+    ) -> futures::future::BoxFuture<'_, std::result::Result<(), PaidClientError>>;
+    fn recover(
+        &self,
+        reservation: [u8; 16],
+        amount: u64,
+    ) -> futures::future::BoxFuture<'_, std::result::Result<(), PaidClientError>>;
+}
+
+/// Funding constraints shared by native and gateway session opening.
+#[derive(Clone, Default)]
+pub struct SessionFundingOptions {
+    /// Maximum actual funding for a newly quoted channel. Reopening a retained
+    /// channel does not reserve or fund again and does not apply this cap.
+    pub max_funding: Option<u64>,
+    /// Durable application reservation for fresh funding; omitted for callers
+    /// that do not need an application-level reservation.
+    pub approval: Option<Arc<dyn FundingApproval>>,
+}
+
+impl SessionFundingOptions {
+    fn check_quote(&self, funding_value: u64) -> Result<()> {
+        if self.max_funding.is_some_and(|limit| funding_value > limit) {
+            return Err(PaidClientError::InvalidOptions(
+                "quote exceeds caller funding cap",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Chain reads keep their recovery bound even when the caller sets none.
@@ -286,6 +335,13 @@ enum OpenIntent {
     Job(Box<crate::job::Job>),
     Retained,
 }
+
+/// Admission mode for session opening. Retained opening cannot fund a channel.
+pub enum SessionOpenMode<'a> {
+    Any,
+    Job(&'a crate::job::Job),
+    Retained,
+}
 impl OpenIntent {
     fn job(&self) -> Option<&crate::job::Job> {
         if let Self::Job(job) = self {
@@ -303,13 +359,13 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
+        Box::pin(Self::open_with_options(
             args,
             endpoint,
             settlement_key,
             owner,
-            OpenIntent::Any,
-            None,
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
         ))
     }
 
@@ -320,13 +376,13 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
+        Box::pin(Self::open_with_options(
             args,
             endpoint,
             settlement_key,
             owner,
-            OpenIntent::Retained,
-            None,
+            SessionOpenMode::Retained,
+            SessionFundingOptions::default(),
         ))
     }
 
@@ -338,13 +394,39 @@ impl PaidWorkSession {
         owner: Arc<ClientOwner>,
         job: &crate::job::Job,
     ) -> impl std::future::Future<Output = Result<Self>> {
+        Box::pin(Self::open_with_options(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            SessionOpenMode::Job(job),
+            SessionFundingOptions::default(),
+        ))
+    }
+
+    /// Open with one set of funding constraints, admitting a supplied job
+    /// against the actual quote before any fresh owner funding.
+    pub fn open_with_options(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        owner: Arc<ClientOwner>,
+        mode: SessionOpenMode<'_>,
+        funding: SessionFundingOptions,
+    ) -> impl std::future::Future<Output = Result<Self>> {
+        let intent = match mode {
+            SessionOpenMode::Any => OpenIntent::Any,
+            SessionOpenMode::Job(job) => OpenIntent::Job(Box::new(job.clone())),
+            SessionOpenMode::Retained => OpenIntent::Retained,
+        };
         Box::pin(Self::open_inner(
             args,
             endpoint,
             settlement_key,
             owner,
-            OpenIntent::Job(Box::new(job.clone())),
+            intent,
             None,
+            funding,
         ))
     }
 
@@ -356,14 +438,19 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
         connection_timeout: Duration,
+        funding: SessionFundingOptions,
+        job: Option<&crate::job::Job>,
     ) -> Result<Self> {
         Self::open_inner(
             args,
             endpoint,
             settlement_key,
             owner,
-            OpenIntent::Any,
+            job.map_or(OpenIntent::Retained, |job| {
+                OpenIntent::Job(Box::new(job.clone()))
+            }),
             Some(connection_timeout),
+            funding,
         )
         .await
     }
@@ -375,6 +462,7 @@ impl PaidWorkSession {
         owner: Arc<ClientOwner>,
         intent: OpenIntent,
         connection_timeout: Option<Duration>,
+        funding: SessionFundingOptions,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
@@ -414,12 +502,20 @@ impl PaidWorkSession {
                     request_paid_quote(&args, &endpoint, &settlement_key, owner.principal()),
                 )
                 .await?;
+                funding.check_quote(quote.funding_value)?;
                 if let Some(job) = intent.job() {
                     job.check_policy(&quote.policy)?;
                 }
-                let signed =
-                    offer::fund_offer(&args, &endpoint, &settlement_key, &owner, &remote, quote)
-                        .await?;
+                let signed = offer::fund_offer(
+                    &args,
+                    &endpoint,
+                    &settlement_key,
+                    &owner,
+                    &remote,
+                    quote,
+                    funding.approval.as_deref(),
+                )
+                .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,

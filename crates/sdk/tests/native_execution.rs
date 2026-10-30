@@ -23,6 +23,8 @@ mod gateway;
 mod grant;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
+#[path = "paid_e2e/settlement.rs"]
+mod settlement_recovery;
 
 use std::sync::Arc;
 use std::time::Duration;

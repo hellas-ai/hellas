@@ -15,6 +15,12 @@ pub enum PurchaseError {
         "already paid (work {work}, price {price}), result lost. No new charge. Use --buy-again to deliberately purchase again, or transact --settle to close the channel."
     )]
     ResultLost { work: Digest, price: u64 },
+    #[error("this tracked purchase was already reported; create a new attempt to buy again")]
+    AlreadyReported,
+    #[error(
+        "this tracked purchase was rejected without payment; create a new attempt to try again"
+    )]
+    Rejected,
     #[error(
         "unfinished purchase {work} cannot resume: {reason}. No new charge. Resume or settle the original channel."
     )]
@@ -40,6 +46,7 @@ enum Phase {
     Paying,
     Paid,
     Reported,
+    Rejected,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,9 +79,34 @@ pub struct Purchase {
     price: u64,
     record: Option<Record>,
     buy_again: bool,
+    tracked: bool,
 }
 impl Purchase {
     pub fn open(path: &Path, job: &Job, buy_again: bool) -> Result<Self> {
+        let mut purchase = Self::open_identity(path, job.digest(), job.price(), false)?;
+        purchase.buy_again = buy_again;
+        if let Some(record) = &purchase.record
+            && !buy_again
+            && record.phase == Phase::Paid
+        {
+            return Err(PurchaseError::ResultLost {
+                work: Digest::from_bytes(record.work.ok_or(PurchaseError::Identity)?),
+                price: record.price,
+            });
+        }
+        purchase.record = purchase.record.filter(|record| {
+            !matches!(record.phase, Phase::Reported | Phase::Rejected)
+                && !(buy_again && record.phase == Phase::Paid)
+        });
+        Ok(purchase)
+    }
+
+    /// Open a caller-owned attempt without clearing a terminal record.
+    pub fn open_tracked(path: &Path, job: &Job) -> Result<Self> {
+        Self::open_identity(path, job.digest(), job.price(), true)
+    }
+
+    fn open_identity(path: &Path, job: Digest, price: u64, tracked: bool) -> Result<Self> {
         let parent = path.parent().ok_or(PurchaseError::Identity)?;
         hellas_private::create_dir_all_durable(parent)?;
         let lock = hellas_private::open_lock_beside(path)?;
@@ -85,33 +117,38 @@ impl Purchase {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        if let Some(record) = &record {
-            if record.job != *job.digest().as_bytes()
-                || record.price != job.price()
+        if let Some(record) = &record
+            && (record.job != *job.as_bytes()
+                || record.price != price
                 || record.nonce == 0
-                || (matches!(record.phase, Phase::Paying | Phase::Paid | Phase::Reported)
-                    && record.work.is_none())
-            {
-                return Err(PurchaseError::Identity);
-            }
-            if !buy_again && record.phase == Phase::Paid {
-                return Err(PurchaseError::ResultLost {
-                    work: Digest::from_bytes(record.work.ok_or(PurchaseError::Identity)?),
-                    price: record.price,
-                });
-            }
+                || (matches!(
+                    record.phase,
+                    Phase::Paying | Phase::Paid | Phase::Reported | Phase::Rejected
+                ) && record.work.is_none()))
+        {
+            return Err(PurchaseError::Identity);
         }
-        let record = record.filter(|record| {
-            record.phase != Phase::Reported && !(buy_again && record.phase == Phase::Paid)
-        });
         Ok(Self {
             path: path.to_owned(),
             _lock: lock,
-            job: *job.digest().as_bytes(),
-            price: job.price(),
+            job: *job.as_bytes(),
+            price,
             record,
-            buy_again,
+            buy_again: false,
+            tracked,
         })
+    }
+
+    pub(super) fn ensure_executable(&self) -> Result<()> {
+        match self.record.as_ref() {
+            Some(record) if record.phase == Phase::Reported => Err(PurchaseError::AlreadyReported),
+            Some(record) if record.phase == Phase::Rejected => Err(PurchaseError::Rejected),
+            Some(record) if record.phase == Phase::Paid => Err(PurchaseError::ResultLost {
+                work: Digest::from_bytes(record.work.ok_or(PurchaseError::Identity)?),
+                price: record.price,
+            }),
+            _ => Ok(()),
+        }
     }
 
     pub fn is_pending(&self) -> bool {
@@ -138,6 +175,14 @@ impl Purchase {
         let Some(record) = self.record.clone() else {
             return Ok(());
         };
+        if self.tracked
+            && matches!(
+                record.phase,
+                Phase::Paid | Phase::Reported | Phase::Rejected
+            )
+        {
+            return Ok(());
+        }
         if !options.journal_root.exists() {
             return Err(self.unfinished("channel journal is missing"));
         }
@@ -207,7 +252,10 @@ impl Purchase {
         }
         if let Some(work) = record.work.map(Digest::from_bytes)
             && store.state().terminal_by_id(work).is_some_and(|terminal| {
-                matches!(terminal.outcome, TerminalOutcome::Rejected { .. })
+                matches!(
+                    terminal.outcome,
+                    TerminalOutcome::Rejected { .. } | TerminalOutcome::Expired { .. }
+                )
             })
         {
             return self.unpaid(work);
@@ -299,6 +347,10 @@ impl Purchase {
         {
             return Err(PurchaseError::Identity);
         }
+        if self.tracked {
+            self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Rejected;
+            return self.persist();
+        }
         match std::fs::remove_file(&self.path) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -311,6 +363,9 @@ impl Purchase {
     /// Call only after all selected output writes and the result report succeed.
     pub fn reported(&mut self) -> Result<()> {
         let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
+        if record.phase == Phase::Reported {
+            return Ok(());
+        }
         if record.phase != Phase::Paid {
             return Err(PurchaseError::Identity);
         }
@@ -333,6 +388,62 @@ impl Purchase {
             &serde_json::to_vec(self.record.as_ref().ok_or(PurchaseError::Identity)?)?,
         )?;
         Ok(())
+    }
+}
+
+/// An exclusively locked, recovery-only view of a purchase marker. It never
+/// opens a channel, allocates a proposal, or needs the original payload.
+pub struct PurchaseRecovery(Purchase);
+
+/// Local purchase facts. An absent marker cannot establish whether an older
+/// application attempt existed before its metadata was retained.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PurchaseStatus {
+    Absent,
+    Running { work: Option<Digest> },
+    Paying { work: Digest },
+    Paid { work: Digest, reported: bool },
+    Rejected { work: Digest },
+}
+
+impl PurchaseRecovery {
+    pub fn open(path: &Path, job: Digest, price: u64) -> Result<Self> {
+        Purchase::open_identity(path, job, price, true).map(Self)
+    }
+
+    pub fn channel(&self) -> Option<Digest> {
+        self.0
+            .record
+            .as_ref()
+            .map(|record| Digest::from_bytes(record.channel))
+    }
+
+    pub fn inspect(&self) -> Result<PurchaseStatus> {
+        let Some(record) = &self.0.record else {
+            return Ok(PurchaseStatus::Absent);
+        };
+        let work = record.work.map(Digest::from_bytes);
+        Ok(match record.phase {
+            Phase::Running => PurchaseStatus::Running { work },
+            Phase::Paying => PurchaseStatus::Paying {
+                work: work.ok_or(PurchaseError::Identity)?,
+            },
+            Phase::Paid | Phase::Reported => PurchaseStatus::Paid {
+                work: work.ok_or(PurchaseError::Identity)?,
+                reported: record.phase == Phase::Reported,
+            },
+            Phase::Rejected => PurchaseStatus::Rejected {
+                work: work.ok_or(PurchaseError::Identity)?,
+            },
+        })
+    }
+
+    pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<PurchaseStatus> {
+        match self.0.reconcile(options).await {
+            Ok(()) | Err(PurchaseError::ResultLost { .. }) => (),
+            Err(error) => return Err(error),
+        }
+        self.inspect()
     }
 }
 
@@ -367,6 +478,93 @@ mod tests {
             assert_eq!(record.work, (phase != Phase::Running).then_some([7; 32]));
             assert_eq!(serde_json::to_vec(&record).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn tracked_terminal_records_survive_reopen_and_cannot_execute_again() {
+        let root = tempfile::tempdir().unwrap();
+        let job = job();
+        let channel = Digest::from_bytes([1; 32]);
+        let work = Digest::from_bytes([7; 32]);
+        for reported in [false, true] {
+            let path = root
+                .path()
+                .join(if reported { "reported" } else { "rejected" });
+            {
+                let mut purchase = Purchase::open_tracked(&path, &job).unwrap();
+                purchase
+                    .begin(channel, EdgeId::from_bytes([2; 32]), 3)
+                    .unwrap();
+                purchase.accepting(work).unwrap();
+                if reported {
+                    purchase.paid(work).unwrap();
+                    purchase.reported().unwrap();
+                    purchase.reported().unwrap();
+                } else {
+                    purchase.unpaid(work).unwrap();
+                }
+            }
+            let recovered = PurchaseRecovery::open(&path, job.digest(), job.price()).unwrap();
+            assert_eq!(recovered.channel(), Some(channel));
+            assert_eq!(
+                recovered.inspect().unwrap(),
+                if reported {
+                    PurchaseStatus::Paid {
+                        work,
+                        reported: true,
+                    }
+                } else {
+                    PurchaseStatus::Rejected { work }
+                }
+            );
+            drop(recovered);
+            let purchase = Purchase::open_tracked(&path, &job).unwrap();
+            assert!(matches!(
+                purchase.ensure_executable(),
+                Err(PurchaseError::AlreadyReported | PurchaseError::Rejected)
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_reads_legacy_phases_without_the_original_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let job = job();
+        for (bytes, expected) in [
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/running.json").as_slice(),
+                PurchaseStatus::Running { work: None },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/paying.json").as_slice(),
+                PurchaseStatus::Paying {
+                    work: Digest::from_bytes([7; 32]),
+                },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/paid.json").as_slice(),
+                PurchaseStatus::Paid {
+                    work: Digest::from_bytes([7; 32]),
+                    reported: false,
+                },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/legacy-purchase/reported.json").as_slice(),
+                PurchaseStatus::Paid {
+                    work: Digest::from_bytes([7; 32]),
+                    reported: true,
+                },
+            ),
+        ] {
+            let path = root.path().join("purchase");
+            hellas_private::write_atomically(&path, ".writing", bytes).unwrap();
+            let recovery = PurchaseRecovery::open(&path, job.digest(), job.price()).unwrap();
+            assert_eq!(recovery.inspect().unwrap(), expected);
+        }
+        let absent =
+            PurchaseRecovery::open(&root.path().join("missing"), job.digest(), job.price())
+                .unwrap();
+        assert_eq!(absent.inspect().unwrap(), PurchaseStatus::Absent);
     }
 
     fn job() -> Job {

@@ -882,9 +882,14 @@ async fn compute_and_settle(
         .unwrap();
     session.shutdown().await;
     drop(session);
-    let mut session = PaidWorkSession::open(options, endpoint.clone(), key.clone(), owner)
-        .await
-        .unwrap();
+    let mut session = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        key.clone(),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
     compute
         .0
         .pause
@@ -906,6 +911,20 @@ async fn compute_and_settle(
     );
     session.shutdown().await;
     drop(session);
+    let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
+        &options,
+        original.offer().proposal.bond_edge(),
+        owner.principal(),
+        owner.delegate(),
+    )
+    .await
+    .unwrap()
+    .expect("settled channel has finalized evidence");
+    assert_eq!(receipt.provider_payout, CREDITED);
+    assert_eq!(
+        receipt.client_returned + receipt.provider_payout,
+        receipt.funding_value
+    );
 }
 
 const CREDITED: u64 = 3 * JOB_PRICE;

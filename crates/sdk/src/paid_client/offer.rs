@@ -188,16 +188,20 @@ pub(super) async fn fund_offer(
     owner: &crate::client_owner::ClientOwner,
     chain: &RemoteLightClient,
     quote: PaidQuote,
+    approval: Option<&dyn super::FundingApproval>,
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
     let funding = owner
-        .fund(
+        .fund_with_approval(
             chain,
             args.config.chain.network,
             args.provider.node,
             quote.funding_value,
-            args.config.poll,
-            super::read_timeout(args.timeout),
+            crate::client_owner::FundingControls {
+                poll: args.config.poll,
+                timeout: super::read_timeout(args.timeout),
+                approval,
+            },
         )
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;

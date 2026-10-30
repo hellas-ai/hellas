@@ -8,7 +8,7 @@ use hellas_auth::ProducerSigningKey;
 use hellas_channel::work::PaidProgress;
 use hellas_rpc::ContentRef;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
-pub use purchase::{Purchase, PurchaseError};
+pub use purchase::{Purchase, PurchaseError, PurchaseRecovery, PurchaseStatus};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +132,9 @@ pub async fn transact(
     key: &ProducerSigningKey,
     mut options: TransactionOptions<'_>,
 ) -> Result<PaidWorkResult> {
+    if let Some(purchase) = options.purchase.as_deref() {
+        purchase.ensure_executable()?;
+    }
     let quoted = session.descriptor().payment_policy().fixed_price;
     if quoted != job.price() {
         return Err(TransactError::Price {
