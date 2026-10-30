@@ -298,9 +298,16 @@ fn select_attempt(
     let parent = path.parent().context("purchase directory is missing")?;
     hellas_private::create_dir_all_durable(parent)?;
     let pointer = path.with_extension("latest");
+    struct AttemptPointerLock(std::fs::File);
+    impl Drop for AttemptPointerLock {
+        fn drop(&mut self) {
+            let _ = self.0.unlock();
+        }
+    }
     let lock = hellas_private::open_lock_beside(&pointer)?;
     lock.try_lock()
         .map_err(|_| anyhow::anyhow!("another command is selecting this job's attempt"))?;
+    let _lock = AttemptPointerLock(lock);
     let existing = match hellas_private::read_bounded_regular_file(&pointer, 32) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
