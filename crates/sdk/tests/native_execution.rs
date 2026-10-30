@@ -17,6 +17,8 @@ fn catena_child() {
 
 #[path = "paid_e2e/automatic.rs"]
 mod automatic;
+#[path = "paid_e2e/budget.rs"]
+mod budget;
 #[path = "paid_e2e/gateway.rs"]
 mod gateway;
 #[path = "native_execution/grant.rs"]
