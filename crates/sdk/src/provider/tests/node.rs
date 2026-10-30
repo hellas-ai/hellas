@@ -989,6 +989,11 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
         runner.tick(&source).await,
         "the one source answers both clocks"
     );
+    source.set_snapshot(second.channel_snapshot(second.bond_terms().timeout.get(), None, None));
+    assert!(
+        runner.tick(&source).await,
+        "the next tick advances A through its finalized response to adjudication"
+    );
     let submitted = source.submitted();
     let adjudications = submitted
         .iter()
@@ -1101,9 +1106,13 @@ const PAYMENT_RESERVE: u64 = 200;
 /// The finalized block this channel's payment Open landed in, and so
 /// the cursor every mount of it starts at.
 const ORIGIN: u64 = 44;
+/// The finalized block that opened the fixture contest.
+const CONTEST_HEIGHT: u64 = ORIGIN + 1;
 /// Height at which the fixture contest's response window shuts. Above
 /// the origin, which is what makes the answer below a timely one.
-const RESPONSE_DEADLINE: u64 = 60;
+const RESPONSE_DEADLINE: u64 = CONTEST_HEIGHT + MIN_OMIT_RESPONSE_BLOCKS;
+/// The finalized block that accepted the fixture contest response.
+const RESPONSE_HEIGHT: u64 = CONTEST_HEIGHT + 1;
 /// The immutable history floor both journals are armed at.
 const FLOOR: u64 = 7;
 
@@ -1648,7 +1657,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
         },
     )
     .await;
-    let start_id = StartId::from_bytes([0x7c; 32]);
+    let start_id = contest_start_id();
     commit(
         &mut store,
         ChannelRecord::CloseOpened {
@@ -1659,7 +1668,58 @@ async fn write_contested_channel(root: &Path) -> StartId {
         },
     )
     .await;
+    commit(
+        &mut store,
+        ChannelRecord::CursorAdvanced {
+            height: CONTEST_HEIGHT,
+            parent: payload_at(ORIGIN),
+            payload: payload_at(CONTEST_HEIGHT),
+        },
+    )
+    .await;
     start_id
+}
+
+fn contest_start() -> hellas_kernel::PaymentCloseStart {
+    hellas_channel::work_close::close_start(
+        descriptor().channel(),
+        Party::Maker,
+        ORIGIN,
+        None,
+        &client(),
+    )
+    .expect("the fixture close start builds")
+}
+
+fn contest_start_id() -> StartId {
+    let start = contest_start();
+    hellas_kernel::start_id(
+        hellas_channel::work_close::start_body_digest(descriptor().channel(), &start),
+        CONTEST_HEIGHT,
+    )
+}
+
+fn contest_response() -> hellas_kernel::PaymentCloseResponse {
+    let channel = descriptor().channel().clone();
+    let job = authorization();
+    let result = hellas_channel::job::paid_terminal_result(
+        &channel,
+        &job,
+        &work_policy(),
+        &bundle(),
+        &answer_transcript(),
+    )
+    .expect("the fixture result derives");
+    let (certificate, _) =
+        next_payment(&channel, &job, &result, 0, settlement()).expect("the fixture payment builds");
+    let sig = client().sign(certificate.digest(network()));
+    hellas_channel::work_close::close_response(
+        &channel,
+        contest_start_id(),
+        (certificate, sig),
+        &provider(),
+    )
+    .expect("the fixture close response builds")
 }
 
 /// The coherent finalized view the clock asks this fixture chain for.
@@ -1698,7 +1758,7 @@ fn pending_contest(responded: bool) -> RegistryChunk {
     value.extend_from_slice(&[1, 23, 4]); // envelope and pending-close version
     value.extend_from_slice(payment_edge().as_bytes());
     value.push(Party::Maker.tag());
-    value.extend_from_slice(&[0x7c; StartId::LENGTH]);
+    value.extend_from_slice(&contest_start_id().to_bytes());
     value.extend_from_slice(&RESPONSE_DEADLINE.to_be_bytes());
     value.extend_from_slice(&0_u64.to_be_bytes());
     let final_cumulative = if responded {
@@ -1710,7 +1770,7 @@ fn pending_contest(responded: bool) -> RegistryChunk {
     value.push(u8::from(responded));
     value.push(u8::from(responded));
     value.extend_from_slice(&OMISSION_BOND.to_be_bytes());
-    value.extend_from_slice(&[0, 0]); // maker/taker owner_signed
+    value.extend_from_slice(&[1, u8::from(responded)]); // maker/taker owner_signed
     assert_eq!(value.len(), PendingPaymentClose::ENCODED_SIZE);
     let record = match PendingPaymentClose::decode_exact(&value) {
         Ok(record) => record,
@@ -1940,15 +2000,27 @@ impl FinalizedBlocks for TestChain {
                 Err(error) => panic!("the fixture chain is open: {error}"),
             }
         }
-        Ok(Some(ORIGIN))
+        let responded = matches!(
+            self.0.snapshot.lock().unwrap().observed_channel().pending,
+            hellas_kernel::PendingSlot::Present(pending) if pending.responded()
+        );
+        Ok(Some(if responded { RESPONSE_HEIGHT } else { ORIGIN }))
     }
 
     async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        Ok((height == ORIGIN).then(|| FinalizedWork {
+        let txs = match height {
+            ORIGIN => vec![completed(countersigned(proposed())).payment_open().unwrap()],
+            CONTEST_HEIGHT => vec![Tx::move_action(Move::StartPaymentClose(contest_start()))],
+            RESPONSE_HEIGHT => vec![Tx::move_action(Move::RespondPaymentClose(
+                contest_response(),
+            ))],
+            _ => return Ok(None),
+        };
+        Ok(Some(FinalizedWork {
             height,
             parent: payload_at(height - 1),
             payload: payload_at(height),
-            txs: vec![completed(countersigned(proposed())).payment_open().unwrap()],
+            txs,
         }))
     }
 }
@@ -2096,28 +2168,41 @@ impl FinalizedWorkView for RoutedChain {
 
 impl FinalizedBlocks for RoutedChain {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        Ok(Some(ORIGIN))
+        let responded = self.0.lock().unwrap().snapshots.iter().any(|snapshot| {
+            matches!(
+                snapshot.observed_channel().pending,
+                hellas_kernel::PendingSlot::Present(pending) if pending.responded()
+            )
+        });
+        Ok(Some(if responded { RESPONSE_HEIGHT } else { ORIGIN }))
     }
 
     async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        Ok((height == ORIGIN).then(|| {
-            let completed = &self.0.lock().unwrap().completed_setups;
-            let txs = [OfferFixture::first(), OfferFixture::second()]
-                .into_iter()
-                .filter(|route| completed.contains(&route.bond_edge()))
-                .map(|route| {
-                    route
-                        .completed(route.countersigned(route.proposed()))
-                        .payment_open()
-                        .unwrap()
-                })
-                .collect();
-            FinalizedWork {
-                height,
-                parent: payload_at(height - 1),
-                payload: payload_at(height),
-                txs,
+        let txs = match height {
+            ORIGIN => {
+                let completed = &self.0.lock().unwrap().completed_setups;
+                [OfferFixture::first(), OfferFixture::second()]
+                    .into_iter()
+                    .filter(|route| completed.contains(&route.bond_edge()))
+                    .map(|route| {
+                        route
+                            .completed(route.countersigned(route.proposed()))
+                            .payment_open()
+                            .unwrap()
+                    })
+                    .collect()
             }
+            CONTEST_HEIGHT => vec![Tx::move_action(Move::StartPaymentClose(contest_start()))],
+            RESPONSE_HEIGHT => vec![Tx::move_action(Move::RespondPaymentClose(
+                contest_response(),
+            ))],
+            _ => return Ok(None),
+        };
+        Ok(Some(FinalizedWork {
+            height,
+            parent: payload_at(height - 1),
+            payload: payload_at(height),
+            txs,
         }))
     }
 }
