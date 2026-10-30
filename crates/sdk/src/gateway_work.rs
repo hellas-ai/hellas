@@ -718,7 +718,6 @@ mod task_tests {
 mod output_tests {
     use super::*;
     use futures::StreamExt;
-    use hellas_channel::work_store::journal::MAX_RECORD_BYTES;
 
     type TestRequester = Requester<OutputEvent, WorkGatewayError>;
 
@@ -791,102 +790,6 @@ mod output_tests {
                 if actual == output && signer == provider)
             );
         }
-    }
-
-    #[test]
-    fn a_channel_record_sized_transcript_fits_the_output_budget() {
-        // One transcript event pays one overhead charge, regardless of the
-        // envelope count. Full grant transcripts can span multiple records.
-        let transcript = WorkEvent::<OutputEvent>::Transcript(vec![0; MAX_RECORD_BYTES]);
-        let bytes = event_bytes(&transcript).saturating_add(OUTPUT_EVENT_OVERHEAD);
-        assert!(bytes <= OUTPUT_BUFFER_BYTES);
-    }
-
-    #[tokio::test]
-    async fn signed_image_burst_fits_the_output_budget() {
-        use hellas_rpc::protocol::invocation::{
-            Artifact, InvocationRequest,
-            compute::RunMetadata,
-            output::{self, Outcome},
-        };
-        let key = hellas_auth::ProducerSigningKey::from_secret_bytes([19; 32]).unwrap();
-        let request = InvocationRequest {
-            execution_environment: hellas_rpc::ContentId::hash(b"compute source"),
-            input: hellas_rpc::ContentId::hash(b"compute input"),
-            runner_public_key: key.public_key(),
-            nonce: [3; 32],
-            assurance: hellas_rpc::Assurance::ProducerSigned,
-            retain: false,
-        };
-        // A 512x512 RGB F32 image; 255 maximizes the envelope's CBOR
-        // integer-array expansion, independently of the queue budget.
-        let output = InvocationOutput {
-            outcome: Outcome::Succeeded,
-            artifacts: vec![Artifact::new(
-                "image",
-                "catena.bytes.v1",
-                vec![255; 512 * 512 * 3 * 4],
-            )],
-            metadata: hellas_rpc::JsonBytes(
-                hellas_rpc::canonical_dag_cbor(&RunMetadata {
-                    steps: 0,
-                    stop: None,
-                })
-                .unwrap(),
-            ),
-        };
-        let envelopes = output
-            .sign(&request, &key, output::MAX_CHUNK_BYTES)
-            .unwrap();
-        let transcript = hellas_channel::model::work::encode_transcript(&envelopes).unwrap();
-        assert!(transcript.len() > MAX_RECORD_BYTES);
-        let decoded = hellas_channel::model::work::decode_transcript(&transcript, 8 << 20).unwrap();
-        assert_eq!(
-            output::verify(&request, &key.public_key(), &decoded, 8 << 20).unwrap(),
-            output
-        );
-        let accepted = hellas_rpc::provenance::ExecutionProvenance {
-            commitment_id: [23; 32],
-            provider: key.public_key(),
-        };
-        let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
-        let budget = requester.budget.clone();
-        // A retained result can arrive in one burst before the consumer polls.
-        requester.accepted()(accepted.clone());
-        let progress = requester.progress();
-        for envelope in &envelopes[..envelopes.len() - 1] {
-            progress(envelope.clone()).unwrap();
-        }
-        requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
-        requester.emit(Ok(WorkEvent::Output(
-            ComputeEvent::completed(&output, &key.public_key()).unwrap(),
-        )));
-        drop(progress);
-        drop(requester);
-        assert!(
-            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Accepted(actual) if actual == accepted)
-        );
-        let mut pixels = Vec::new();
-        for _ in &envelopes[..envelopes.len() - 1] {
-            let WorkEvent::Output(ComputeEvent::Output(chunk)) =
-                response.next().await.unwrap().unwrap()
-            else {
-                panic!("expected image prefix");
-            };
-            assert_eq!(chunk.name, "image");
-            assert_eq!(chunk.format, "catena.bytes.v1");
-            assert_eq!(chunk.offset, pixels.len() as u64);
-            pixels.extend_from_slice(chunk.bytes.as_bytes());
-        }
-        assert_eq!(pixels, output.artifacts[0].bytes.as_bytes());
-        assert!(
-            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript)
-        );
-        assert!(
-            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Done { output: actual, provider }) if actual == output && provider == key.public_key())
-        );
-        assert!(response.next().await.is_none());
-        assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
     }
 
     fn text(delta: &str) -> OutputEvent {

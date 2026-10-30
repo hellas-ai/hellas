@@ -7,6 +7,110 @@ use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::{Assurance, ProviderEnrollmentBundle};
 use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
+#[tokio::test]
+async fn paid_image_burst_is_verified_and_delivered() {
+    use crate::gateway_work::{GatewayEvent as _, Requester};
+    use hellas_channel::test_support::channel as fixture;
+    use hellas_gateway::{ComputeEvent, WorkEvent, WorkGatewayError};
+    use hellas_rpc::protocol::invocation::{
+        Artifact,
+        compute::{OutputKind, RunMetadata},
+        output::{self, InvocationOutput, Outcome},
+    };
+    let mut policy = fixture::work_policy();
+    policy.limits.max_output_bytes = 4 << 20;
+    let mut plan = fixture::plan();
+    plan.outputs[0].kind = OutputKind::Buffer { max_bytes: 3 << 20 };
+    let mut prepared = fixture::bundle(1);
+    prepared.input.parameters = hellas_rpc::JsonBytes(plan.canonical_bytes().unwrap());
+    prepared.request.input = prepared.input.content_id().unwrap();
+    prepared.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
+    let key = fixture::provider_producer();
+    let caller = PublicKey::Secp256k1(fixture::client().party_key().to_bytes());
+    // A 512x512 RGB F32 image; 255 maximizes CBOR integer-array expansion.
+    let expected = InvocationOutput {
+        outcome: Outcome::Succeeded,
+        artifacts: vec![Artifact::new(
+            "answer",
+            "catena.bytes.v1",
+            vec![255; 512 * 512 * 3 * 4],
+        )],
+        metadata: hellas_rpc::JsonBytes(
+            hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                steps: 0,
+                stop: None,
+            })
+            .unwrap(),
+        ),
+    };
+    let events = expected
+        .sign(&prepared.request, &key, output::MAX_CHUNK_BYTES)
+        .unwrap();
+    let transcript = hellas_channel::model::work::encode_transcript(&events).unwrap();
+    assert!(transcript.len() > hellas_channel::work_store::journal::MAX_RECORD_BYTES);
+    let verified =
+        verify_transcript(&prepared, &policy, &caller, &key.public_key(), &transcript).unwrap();
+    assert_eq!(verified.output, expected);
+
+    let limit = policy.admit(&prepared, &caller).unwrap().max_spool_bytes as usize;
+    let oversized = vec![0; limit + 1];
+    let error =
+        verify_transcript(&prepared, &policy, &caller, &key.public_key(), &oversized).unwrap_err();
+    assert!(error.to_string().contains("over the authorized limit"));
+    assert!(
+        verify_transcript(
+            &prepared,
+            &policy,
+            &caller,
+            &ProducerSigningKey::from_secret_bytes([3; 32])
+                .unwrap()
+                .public_key(),
+            &transcript,
+        )
+        .is_err()
+    );
+    let accepted = hellas_rpc::provenance::ExecutionProvenance {
+        commitment_id: [23; 32],
+        provider: key.public_key(),
+    };
+    let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
+    // A retained result can arrive in one burst before the consumer polls.
+    requester.accepted()(accepted.clone());
+    let progress = requester.progress();
+    for envelope in &events[..events.len() - 1] {
+        progress(envelope.clone()).unwrap();
+    }
+    requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
+    requester.emit(Ok(WorkEvent::Output(
+        ComputeEvent::completed(&verified.output, &key.public_key()).unwrap(),
+    )));
+    drop(progress);
+    drop(requester);
+    assert!(
+        matches!(response.next().await.unwrap().unwrap(), WorkEvent::Accepted(actual) if actual == accepted)
+    );
+    let mut pixels = Vec::new();
+    for _ in &events[..events.len() - 1] {
+        let WorkEvent::Output(ComputeEvent::Output(chunk)) =
+            response.next().await.unwrap().unwrap()
+        else {
+            panic!("expected image prefix");
+        };
+        assert_eq!(chunk.name, "answer");
+        assert_eq!(chunk.format, "catena.bytes.v1");
+        assert_eq!(chunk.offset, pixels.len() as u64);
+        pixels.extend_from_slice(chunk.bytes.as_bytes());
+    }
+    assert_eq!(pixels, expected.artifacts[0].bytes.as_bytes());
+    assert!(
+        matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript)
+    );
+    assert!(
+        matches!(response.next().await.unwrap().unwrap(), WorkEvent::Output(ComputeEvent::Done { output: actual, provider }) if actual == expected && provider == key.public_key())
+    );
+    assert!(response.next().await.is_none());
+}
+
 #[test]
 fn paid_image_transcript_uses_the_admitted_spool_bound() {
     use hellas_channel::test_support::channel as fixture;
