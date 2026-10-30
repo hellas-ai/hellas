@@ -361,3 +361,35 @@ a retained channel can be reused without allocating that amount again. A
 funding approval reserves the quoted channel amount; each successful job pays
 the fixed per-job price. Tracking and recovery behavior is described in
 [Tracked native execution](jobs.md#tracked-native-execution).
+
+## Retained settlement and journal upgrades
+
+`hellas transact --settle` and the SDK's `settle_channel` close an existing
+funded channel after the entire provider has stopped, including its background
+clock. The shared channel driver submits the close start and final adjudicated
+transaction, using authenticated finalized blocks from the pinned consensus
+chain. It recovers accepted responses, omission penalties, and owner-authority
+flags through the same pending-close transitions and payout builder used by the
+kernel. This factors existing consensus behavior; it changes no transaction
+encoding, consensus rule, or response deadline. Live object-proof RPCs are not
+required. Funding is returned to application accounting only after verification
+of the finalized close receipt.
+
+For older journals, contest reconstruction covers the accepted start through
+the response deadline, or stops sooner after an accepted response. Each verified
+block advances durable `CloseHistoryAdvanced` journal progress. Cancellation,
+restart, and checkpoint rotation preserve that progress, so repeated bounded
+attempts resume at the next unread block even with the maximum legal response
+window. Missing or inconsistent evidence remains an error. A source used as
+`FinalizedBlocks` must independently authenticate every historical block on the
+same pinned consensus chain; an unverified remote RPC connection does not meet
+that contract.
+
+The channel journal adds record tag **14** and an optional checkpoint tail for
+verified contest history. Existing checkpoints remain readable and require no
+separate migration. Once a new binary writes these records or checkpoints,
+binaries predating this extension cannot read that journal and fail closed.
+A software rollback must therefore retain support for this journal extension;
+replacing the binary with an older release is not a compatible rollback. Merely
+building or integrating this change does not upgrade running deployments or
+rewrite their journals.

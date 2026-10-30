@@ -57,6 +57,11 @@ use crate::light_client::{FinalizedBlockQuery, LightClient, QueryError};
 use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 
 /// One light client, as a paid endpoint's block source.
+///
+/// The client must authenticate each finalized historical block on the same
+/// pinned consensus chain. Use a local validating node or a remote client with
+/// an independently authenticated consensus verifier; this adapter does not
+/// turn an unverified remote connection into trusted finality evidence.
 #[derive(Clone, Debug)]
 pub struct WorkBlocks<C> {
     client: C,
@@ -69,7 +74,7 @@ pub struct WorkBlocks<C> {
 pub struct PaidWorkClockAdvance {
     /// The verified snapshot already read for settlement, reusable by admission.
     pub snapshot: Option<WorkChannelSnapshot>,
-    /// The journaled start-or-response drive that ran first.
+    /// The shared start, response, and final adjudication drive that ran first.
     pub close: CloseProgress,
     /// Submission outcome for a due adjudicated payment close.
     pub adjudication: Option<SubmitTxOutcome>,
@@ -183,14 +188,10 @@ impl From<QueryError> for BlockSourceError {
 ///
 /// The journaled close drive runs first. The endpoint is then borrowed
 /// synchronously only long enough to copy the two edge ids and embedded
-/// bond terms. One coherent finalized snapshot from `source` decides both
-/// permissionless submissions: the payment close through
-/// [`WorkService::adjudicated_close`], and the bond timeout when that same
-/// read still contains the bond after finalized payment closure or at its horizon.
-///
-/// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
-/// not failures. They leave adjudication absent from the returned advance
-/// and are reconsidered from a fresh snapshot on the next tick.
+/// bond terms. Payment adjudication belongs to the shared close driver and
+/// requires only finalized history, just as it does for an offline client's
+/// recovery. A coherent finalized object snapshot is still needed for the
+/// separate bond timeout after payment closure or at the bond horizon.
 ///
 /// # Errors
 ///
@@ -207,6 +208,11 @@ where
         .advance_close(source, source)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
+    let adjudication = match close {
+        CloseProgress::AdjudicationSubmitted { outcome, .. } => Some(outcome),
+        _ => None,
+    };
+
     let (query, bond_terms, settled_height) = service
         .with_state(|state| {
             let channel = state.channel();
@@ -232,27 +238,9 @@ where
         return Ok(PaidWorkClockAdvance {
             snapshot: None,
             close,
-            adjudication: None,
+            adjudication,
             bond_timeout: None,
         });
-    };
-
-    let adjudication = match service
-        .adjudicated_close(&snapshot.observed_channel())
-        .await
-    {
-        Ok(tx) => Some(
-            source
-                .submit(tx)
-                .await
-                .map_err(PaidWorkClockError::Submission)?,
-        ),
-        Err(
-            CloseError::NoContest
-            | CloseError::OtherContest
-            | CloseError::ResponseWindowOpen { .. },
-        ) => None,
-        Err(error) => return Err(PaidWorkClockError::Decision(error)),
     };
 
     // The journal's finalized close and a snapshot at least that new jointly

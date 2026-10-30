@@ -83,6 +83,7 @@ impl Channel<PaymentFunding> {
                 origin_observed: false,
                 close_prepared: None,
                 close_opened: None,
+                close_history: None,
                 close_responded: None,
                 close_settled: None,
             },
@@ -138,6 +139,9 @@ impl Channel<PaymentFunding> {
         metadata_only: bool,
     ) -> Result<(), ChannelStateError> {
         self.book.revalidate_exchange(self.role)?;
+        if let Some(history) = self.funding.close_history {
+            self.check_close_history(history)?;
+        }
         // The one number consensus sees, against the one terminal that
         // could have moved it. A ledger the terminal does not produce is
         // a channel that would credit a second payment.
@@ -485,6 +489,17 @@ impl Channel<PaymentFunding> {
         }
     }
 
+    /// Finalized start metadata used to recover its full contest from history.
+    pub(crate) const fn open_contest(&self) -> Option<OpenContest> {
+        self.funding.close_opened
+    }
+
+    /// Verified historical replay progress, including accepted responses.
+    #[must_use]
+    pub const fn close_history(&self) -> Option<CloseHistory> {
+        self.funding.close_history
+    }
+
     /// Returns the answer this endpoint has already fixed for the
     /// contest on this edge, if it has fixed one.
     ///
@@ -523,7 +538,13 @@ impl Channel<PaymentFunding> {
     /// answer derives the same one.
     #[must_use]
     pub fn answerable_contest(&self) -> Option<(OpenContest, (EarnedCertificate, Sig))> {
-        if self.role != Role::Provider || self.funding.close_settled.is_some() {
+        if self.role != Role::Provider
+            || self.funding.close_settled.is_some()
+            || self
+                .funding
+                .close_history
+                .is_some_and(|history| history.pending.responded())
+        {
             return None;
         }
         let contest = self.funding.close_opened?;
@@ -698,6 +719,9 @@ impl Channel<PaymentFunding> {
             ChannelRecord::JobTerminated { work_id, outcome } => {
                 self.apply_terminated(*work_id, outcome, verifier)
             }
+            ChannelRecord::CloseHistoryAdvanced { parent, history } => {
+                self.apply_close_history(*parent, *history)
+            }
             ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
             ChannelRecord::CloseOpened {
                 start_id,
@@ -727,6 +751,83 @@ impl Channel<PaymentFunding> {
                 provider_payout: *provider_payout,
             }),
         }
+    }
+
+    fn check_close_history(&self, history: CloseHistory) -> Result<(), ChannelStateError> {
+        let contest = self
+            .funding
+            .close_opened
+            .ok_or(ChannelStateError::Malformed)?;
+        let pending = history.pending;
+        let inclusion = contest
+            .response_deadline
+            .checked_sub(self.channel().payment_terms().omit_response_blocks)
+            .ok_or(ChannelStateError::Malformed)?;
+        if history.height < inclusion
+            || history.height > contest.response_deadline
+            || history.height > self.cursor().0.saturating_add(1)
+            || pending.payment_edge() != self.channel().payment_edge()
+            || pending.start_id() != contest.start_id
+            || pending.opener_role() != contest.opener
+            || pending.response_deadline() != contest.response_deadline
+            || pending.start_cumulative() != contest.claimed
+            || pending.final_cumulative() < contest.claimed
+            || pending.final_cumulative() > self.settlement().capacity()
+            || pending.penalty_amount() != self.channel().payment_terms().omission_bond
+            || (!pending.responded()
+                && (pending.final_cumulative() != contest.claimed || pending.penalty_due()))
+            || (pending.responded()
+                && (pending.final_cumulative() <= contest.claimed
+                    || pending.penalty_due() != (contest.opener == Party::Maker)))
+        {
+            return Err(ChannelStateError::Malformed);
+        }
+        Ok(())
+    }
+
+    fn apply_close_history(
+        &mut self,
+        parent: [u8; 32],
+        history: CloseHistory,
+    ) -> Result<Applied, ChannelStateError> {
+        self.check_close_history(history)?;
+        if self.funding.close_history == Some(history) {
+            return Ok(Applied::Redundant);
+        }
+        if let Some(previous) = self.funding.close_history {
+            if history.height
+                != previous
+                    .height
+                    .checked_add(1)
+                    .ok_or(ChannelStateError::Malformed)?
+                || parent != previous.payload
+                || (history.pending.responded()
+                    && !previous.pending.responded()
+                    && history.height >= history.pending.response_deadline())
+                || history.pending.owner_signed()[0] != previous.pending.owner_signed()[0]
+                || ((previous.pending.responded() || !history.pending.responded())
+                    && history.pending != previous.pending)
+                || history.pending.final_cumulative() < previous.pending.final_cumulative()
+                || previous
+                    .pending
+                    .owner_signed()
+                    .iter()
+                    .zip(history.pending.owner_signed())
+                    .any(|(before, after)| *before && !after)
+            {
+                return Err(ChannelStateError::Malformed);
+            }
+        } else if history.height
+            != history
+                .pending
+                .response_deadline()
+                .checked_sub(self.channel().payment_terms().omit_response_blocks)
+                .ok_or(ChannelStateError::Malformed)?
+        {
+            return Err(ChannelStateError::Malformed);
+        }
+        self.funding.close_history = Some(history);
+        Ok(Applied::Changed)
     }
 
     /// Moves the cursor on by exactly one contiguous block.

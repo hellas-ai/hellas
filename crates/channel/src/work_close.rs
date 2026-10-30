@@ -74,7 +74,7 @@
 use hellas_kernel::{
     EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PayloadHash, PaymentCloseResponse,
     PaymentCloseStart, Payout, PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier,
-    StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
+    StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts,
 };
 use hex::encode as hex;
 
@@ -154,6 +154,11 @@ pub trait TxSink {
 /// mempool, a coin query, or an activity stream to get it. It is also
 /// what lets the loop below be tested against a history a test writes
 /// down rather than a validator it runs.
+///
+/// This is a trusted evidence boundary: every returned block must be
+/// authenticated as finalized on the same pinned consensus chain. An
+/// unauthenticated RPC response is not an implementation of this contract.
+/// Historical queries retain this guarantee independently of query order.
 pub trait FinalizedBlocks {
     /// Returns the highest finalized height, or `None` before anything
     /// is finalized.
@@ -255,6 +260,13 @@ pub enum CloseProgress {
         /// The contest a response or a close must name.
         start_id: StartId,
     },
+    /// The final adjudicated transaction was offered, but is not yet finalized.
+    AdjudicationSubmitted {
+        /// Contest whose verified state determined this close.
+        start_id: StartId,
+        /// What the node did with the final transaction.
+        outcome: hellas_rpc::SubmitTxOutcome,
+    },
     /// A retained start was handed to consensus at this height. It is
     /// not included until a block says so.
     Submitted {
@@ -303,6 +315,9 @@ pub enum CatchUpError {
     /// A block was refused by the journal.
     #[error(transparent)]
     Store(#[from] WorkStoreError),
+    /// The finalized contest cannot be distributed by the funded edge.
+    #[error(transparent)]
+    Close(#[from] CloseError),
 }
 
 /// Returns the digest a close opener signs for `start`.
@@ -314,18 +329,7 @@ pub enum CatchUpError {
 /// one on this channel's payment edge.
 #[must_use]
 pub fn start_body_digest(channel: &PaidChannel, start: &PaymentCloseStart) -> PayloadHash {
-    let earned = match start.certificate() {
-        None => no_earned_digest(channel.payment_edge(), channel.payment_terms_hash()),
-        Some((certificate, _)) => certificate.digest(channel.network()),
-    };
-    hellas_kernel::start_digest(
-        channel.network(),
-        channel.payment_edge(),
-        channel.payment_terms_hash(),
-        start.opener_role(),
-        (start.valid_from_height(), start.valid_through_height()),
-        earned,
-    )
+    start.digest(channel.network())
 }
 
 /// Builds and signs one close start at finalized height `height`.
@@ -540,6 +544,150 @@ pub fn adjudicated_close(
     ))
 }
 
+/// Applies accepted contest moves through the kernel's canonical transitions.
+/// The caller supplies an authenticated finalized block; journaled summaries
+/// cannot manufacture a response or replace an already accepted one.
+fn contest_after_block(
+    channel: &PaidChannel,
+    previous: Option<PendingPaymentClose>,
+    block: &FinalizedWork,
+    contest: crate::work_store::OpenContest,
+) -> Result<PendingPaymentClose, crate::work_store::ChannelStateError> {
+    use crate::work_store::ChannelStateError::Malformed;
+    let mut pending = previous;
+    for tx in &block.txs {
+        match tx {
+            Tx::Move {
+                action: hellas_kernel::Move::StartPaymentClose(start),
+            } if start.payment_edge() == channel.payment_edge() => {
+                if pending.is_some() || start.terms().hash() != channel.payment_terms_hash() {
+                    return Err(Malformed);
+                }
+                let opened = PendingPaymentClose::from_accepted_start(
+                    channel.network(),
+                    block.height,
+                    start,
+                )
+                .ok_or(Malformed)?;
+                if opened.start_id() != contest.start_id
+                    || opened.opener_role() != contest.opener
+                    || opened.response_deadline() != contest.response_deadline
+                    || opened.start_cumulative() != contest.claimed
+                {
+                    return Err(Malformed);
+                }
+                pending = Some(opened);
+            }
+            Tx::Move {
+                action: hellas_kernel::Move::RespondPaymentClose(response),
+            } if response.payment_edge() == channel.payment_edge() => {
+                let opened = pending.ok_or(Malformed)?;
+                if opened.start_id() != response.start_id()
+                    || opened.responded()
+                    || block.height >= opened.response_deadline()
+                {
+                    return Err(Malformed);
+                }
+                pending = Some(opened.with_accepted_response(response));
+            }
+            Tx::Close { input, .. } if *input == channel.payment_edge() => return Err(Malformed),
+            _ => {}
+        }
+    }
+    pending.ok_or(Malformed)
+}
+
+/// Resume legacy contest reconstruction from its canonical journal checkpoint.
+/// Every verified block is committed before the next result is consumed, so a
+/// bounded caller can cancel repeatedly without discarding completed progress.
+async fn finalized_contest<C, S, V>(
+    source: &S,
+    channel: &mut C,
+    verifier: &V,
+) -> Result<PendingPaymentClose, CatchUpError>
+where
+    C: CloseChannel,
+    S: FinalizedBlocks + ?Sized,
+    V: SigVerifier,
+{
+    let (descriptor, cursor, contest, mut history) = {
+        let store = channel.store().await?;
+        let state = store.state();
+        (
+            state.channel().clone(),
+            state.cursor(),
+            state.open_contest().ok_or(CloseError::NoContest)?,
+            state.close_history(),
+        )
+    };
+    let invalid =
+        || BlockSourceError::new("finalized contest history disagrees with the retained cursor");
+    let inclusion = contest
+        .response_deadline
+        .checked_sub(descriptor.payment_terms().omit_response_blocks)
+        .ok_or_else(invalid)?;
+    // No accepted response can change the contest after this deadline. Every
+    // historical block is independently authenticated on the same pinned chain;
+    // the ordinary cursor has already verified the irrelevant later tail.
+    let end = cursor.0.min(contest.response_deadline);
+    if let Some(held) = history
+        && (held.height >= end || held.pending.responded())
+    {
+        return Ok(held.pending);
+    }
+    let next = history.map_or(inclusion, |held| held.height.saturating_add(1));
+    use futures::{StreamExt as _, stream};
+    let blocks = stream::iter(next..=end)
+        .map(|height| async move {
+            let block = source
+                .block_at(height)
+                .await?
+                .ok_or(CatchUpError::Missing { height })?;
+            Ok::<_, CatchUpError>((height, block))
+        })
+        .buffered(16);
+    futures::pin_mut!(blocks);
+    while let Some(block) = blocks.next().await {
+        let (height, block) = block?;
+        if block.height != height
+            || history.is_some_and(|held| block.parent != held.payload)
+            || (height == cursor.0 && block.payload != cursor.1)
+        {
+            return Err(invalid().into());
+        }
+        let pending = contest_after_block(
+            &descriptor,
+            history.map(|held| held.pending),
+            &block,
+            contest,
+        )
+        .map_err(WorkStoreError::from)?;
+        let verified = crate::work_store::CloseHistory {
+            height,
+            payload: block.payload,
+            pending,
+        };
+        channel
+            .store()
+            .await?
+            .commit(
+                ChannelRecord::CloseHistoryAdvanced {
+                    parent: block.parent,
+                    history: verified,
+                },
+                verifier,
+            )
+            .await?;
+        history = Some(verified);
+        if pending.responded() {
+            break;
+        }
+    }
+    history
+        .map(|held| held.pending)
+        .ok_or_else(|| invalid().into())
+}
+
 /// Reads the finalized tip, and samples what asking for it cost.
 ///
 /// `fresh_tip_ms`, as §4's `Wstart` names it: the read a close start is
@@ -643,7 +791,7 @@ pub async fn observe<V: SigVerifier>(
             .await?;
     }
 
-    apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier).await?;
+    apply_finalized_txs(store, block, verifier).await?;
 
     store
         .commit(
@@ -671,11 +819,16 @@ pub async fn observe<V: SigVerifier>(
 /// later-block one is. The Open itself matches neither arm and is ignored.
 pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
     store: &mut ChannelStore,
-    height: u64,
-    payload: [u8; 32],
-    txs: &[Tx],
+    block: &FinalizedWork,
     verifier: &V,
 ) -> Result<(), WorkStoreError> {
+    let FinalizedWork {
+        height,
+        payload,
+        txs,
+        ..
+    } = block;
+    let (height, payload) = (*height, *payload);
     let channel = store.state().channel().clone();
     let edge = channel.payment_edge();
     for tx in txs {
@@ -779,6 +932,40 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
             _ => {}
         }
     }
+    // New journals retain the canonical state as ordinary observation proceeds.
+    // Old journals with a gap are repaired incrementally by finalized_contest.
+    if store.state().close_settled().is_none()
+        && let Some(contest) = store.state().open_contest()
+        && height <= contest.response_deadline
+    {
+        let previous = store.state().close_history();
+        let next = previous.map_or_else(
+            || {
+                contest
+                    .response_deadline
+                    .checked_sub(channel.payment_terms().omit_response_blocks)
+            },
+            |history| history.height.checked_add(1),
+        );
+        if next == Some(height) {
+            let pending =
+                contest_after_block(&channel, previous.map(|held| held.pending), block, contest)?;
+            store
+                .commit(
+                    ChannelRecord::CloseHistoryAdvanced {
+                        parent: block.parent,
+                        history: crate::work_store::CloseHistory {
+                            height,
+                            payload,
+                            pending,
+                        },
+                    },
+                    verifier,
+                )
+                .await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -872,11 +1059,12 @@ fn expiry_at(
 /// Nothing about a *start* is journaled here. A submission is not a
 /// decision — the signature was journaled before it left
 /// [`crate::work::ProviderEndpoint::prepare_close`], and these are those
-/// same bytes. The one record this writes is the contest's answer,
-/// through [`CloseChannel::fix_answer`], and it is written before the
-/// answer is offered rather than after one was taken: it fixes which
-/// answer this contest is answered by, and says nothing about consensus
-/// having received it.
+/// same bytes. The contest answer is fixed through
+/// [`CloseChannel::fix_answer`] before it is offered. Verified historical
+/// reconstruction is also journaled incrementally; its accepted response state
+/// is distinct from that local answer intent. The final adjudicated transaction
+/// uses only this verified state and remains pending until a finalized close
+/// is observed.
 ///
 /// # Errors
 ///
@@ -926,6 +1114,39 @@ where
             if let Some(response) = channel.fix_answer(start_id).await? {
                 let outcome = sink.submit(response).await?;
                 channel.record_handoff(start_id, outcome).await?;
+                // A still-owed answer takes priority over historical recovery,
+                // including when admission rejected the last attempt.
+                return Ok(CloseProgress::Opened { start_id });
+            }
+            {
+                let (descriptor, settlement, cursor, contest) = {
+                    let store = channel.store().await?;
+                    let state = store.state();
+                    (
+                        state.channel().clone(),
+                        state.settlement(),
+                        state.cursor(),
+                        state.open_contest(),
+                    )
+                };
+                let contest = contest.ok_or(CloseError::NoContest)?;
+                if contest
+                    .response_deadline
+                    .checked_sub(descriptor.payment_terms().omit_response_blocks)
+                    .is_some_and(|inclusion| Some(inclusion) == cursor.0.checked_add(1))
+                {
+                    // CloseOpened is durable before CursorAdvanced. A provider
+                    // may have serviced that duty first after a crash; the next
+                    // catch-up rereads the opening block before adjudication.
+                    return Ok(CloseProgress::Opened { start_id });
+                }
+                let pending = finalized_contest(source, channel, verifier).await?;
+                if pending.responded() || cursor.0 >= pending.response_deadline() {
+                    let outcome = sink
+                        .submit(adjudicated_close(&descriptor, settlement, &pending)?)
+                        .await?;
+                    return Ok(CloseProgress::AdjudicationSubmitted { start_id, outcome });
+                }
             }
             Ok(CloseProgress::Opened { start_id })
         }

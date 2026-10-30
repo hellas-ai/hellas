@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hellas_kernel::{
-    Decode, EarnedCertificate, Key, NetworkId, Party, PayloadHash, PaymentCloseStart, Sig,
-    SigVerifier, StartId, WorkPaymentSettlement,
+    Decode, EarnedCertificate, Key, NetworkId, Party, PayloadHash, PaymentCloseStart,
+    PendingPaymentClose, Sig, SigVerifier, StartId, WorkPaymentSettlement,
 };
 use hellas_xet::XetFileHasher;
 
@@ -548,9 +548,21 @@ pub enum ChannelRecord {
         /// What the close paid the provider.
         provider_payout: u64,
     },
+    /// Durable progress through authenticated contest history. Historical replay
+    /// is independent of the ordinary cursor and survives cancellation. Like
+    /// CursorAdvanced and CloseOpened, this is a trusted journal observation,
+    /// emitted only after authenticated finalized-block validation; an RPC's
+    /// claimed pending state is never sufficient to create this record.
+    CloseHistoryAdvanced {
+        /// Parent of this verified historical block.
+        parent: [u8; 32],
+        /// Verified state after this block.
+        history: CloseHistory,
+    },
 }
 
 mod tag {
+    pub(super) const CLOSE_HISTORY: u8 = 14;
     pub(super) const ORIGIN_OBSERVED: u8 = 13;
     pub(super) const PROPOSAL_EXCHANGE: u8 = 12;
     pub(super) const CURSOR: u8 = 0;
@@ -704,6 +716,7 @@ pub struct PaymentState {
     // Retain the large no-alloc kernel witness behind the journal state's heap boundary.
     close_prepared: Option<Box<PaymentCloseStart>>,
     close_opened: Option<OpenContest>,
+    close_history: Option<CloseHistory>,
     close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,
 }
@@ -728,6 +741,17 @@ pub struct OpenContest {
     pub response_deadline: u64,
     /// Cumulative amount the opener's own start claimed.
     pub claimed: u64,
+}
+
+/// Verified contest state and its own contiguous historical replay cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloseHistory {
+    /// Last historical block applied.
+    pub height: u64,
+    /// That block's authenticated payload.
+    pub payload: [u8; 32],
+    /// Canonical kernel state after its accepted start and responses.
+    pub pending: PendingPaymentClose,
 }
 
 /// The one answer this endpoint has chosen for the contest on its

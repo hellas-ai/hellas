@@ -627,6 +627,24 @@ impl PaymentCloseStart {
         &self.action
     }
 
+    /// Returns the digest authorized by the opener.
+    #[must_use]
+    pub fn digest(&self, network: NetworkId) -> PayloadHash {
+        let terms = self.terms.hash();
+        let earned = self.certificate.as_ref().map_or_else(
+            || no_earned_digest(self.payment_edge, terms),
+            |(certificate, _)| certificate.digest(network),
+        );
+        start_digest(
+            network,
+            self.payment_edge,
+            terms,
+            self.opener_role,
+            (self.valid_from_height, self.valid_through_height),
+            earned,
+        )
+    }
+
     /// Returns the deterministic cost of applying this start.
     ///
     /// Two slots — the payment edge and the pending slot it creates — and
@@ -1012,6 +1030,48 @@ const FLAG_CLEAR: u8 = 0;
 const FLAG_SET: u8 = 1;
 
 impl PendingPaymentClose {
+    /// Reconstructs the state written by an accepted start.
+    ///
+    /// This is the shared state transition used after kernel validation and
+    /// when replaying authenticated finalized transactions. It does not
+    /// validate signatures, funding, or inclusion; callers must establish
+    /// acceptance first. Returns `None` for non-payment terms or overflow.
+    #[must_use]
+    pub fn from_accepted_start(
+        network: NetworkId,
+        height: u64,
+        start: &PaymentCloseStart,
+    ) -> Option<Self> {
+        let crate::TermsProfile::WorkPayment(payment) = start.terms().profile() else {
+            return None;
+        };
+        Some(Self::opened(
+            start.payment_edge(),
+            start.opener_role(),
+            start_id(start.digest(network), height),
+            height.checked_add(payment.omit_response_blocks)?,
+            (
+                start
+                    .certificate()
+                    .map_or(0, |(certificate, _)| certificate.earned_cumulative()),
+                payment.omission_bond,
+            ),
+            start.action().is_owner(),
+        ))
+    }
+
+    /// Applies an accepted response using the kernel's state transition.
+    ///
+    /// Call only after kernel validation or with an authenticated finalized
+    /// response to this contest. This does not establish acceptance itself.
+    #[must_use]
+    pub const fn with_accepted_response(self, response: &PaymentCloseResponse) -> Self {
+        self.responded_at(
+            response.certificate().earned_cumulative(),
+            response.action().is_owner(),
+        )
+    }
+
     /// Canonical encoded length, envelope included.
     pub const ENCODED_SIZE: usize = ENVELOPE_SIZE
         + u8::MAX_ENCODED_SIZE
