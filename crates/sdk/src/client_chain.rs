@@ -110,17 +110,16 @@ pub async fn connect(
                             ));
                         }
                         let client = client.with_consensus_verifier(verifier);
-                        let latest = client.get_latest_block().await?.ok_or_else(|| {
+                        client.get_latest_block().await?.ok_or_else(|| {
                             QueryError::StateUnavailable("chain is catching up".into())
                         })?;
-                        Ok((latest.height, client))
+                        Ok(client)
                     })
                     .await
                 }
             })
             .buffer_unordered(6);
         futures::pin_mut!(attempts);
-        let mut best = None;
         let mut transient = false;
         let mut invalid_source = None;
         loop {
@@ -133,11 +132,10 @@ pub async fn connect(
                 }
             };
             match attempt {
-                Ok(Ok((height, client))) => {
-                    if best.as_ref().is_none_or(|(old, _)| height > *old) {
-                        best = Some((height, client));
-                    }
-                }
+                // A later reply can report a higher tip simply because it took
+                // longer. Use the first authenticated source; channel reads
+                // enforce their own advancing-height and freshness bounds.
+                Ok(Ok(client)) => return Ok(client),
                 Ok(Err(QueryError::Remote(error))) => {
                     reason = error.clone();
                     invalid_source = Some(error);
@@ -151,9 +149,6 @@ pub async fn connect(
                     transient = true;
                 }
             }
-        }
-        if let Some((_, client)) = best {
-            return Ok(client);
         }
         if !transient && let Some(error) = invalid_source {
             return Err(invalid(error));

@@ -5,6 +5,10 @@ application. `hellas run` (one call of a Catena program) and `hellas fetch`
 (one HTTPS request) build such a folder and go through the same SDK
 transaction. Requesters run no node: they keep local signing keys and
 wallet/channel metadata, and chain reads use authenticated validator RPCs.
+Within a connection, requester clones share a verified object view in memory.
+The first read downloads a certified state snapshot; later reads verify only
+new operation ranges, rebuilding the view if pruning overtakes its cursor.
+Signing keys and funding/channel recovery journals remain durable.
 
 ```sh
 hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \

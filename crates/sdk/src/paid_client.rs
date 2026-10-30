@@ -1128,14 +1128,12 @@ async fn execute_paid_job(
         check_payment_window(client, work_id).await?;
         delivery.transcript
     };
-    let verified = proposal.prepared_input.verify_output(
+    let verified = verify_transcript(
+        &proposal.prepared_input,
         ready.invocation_policy(),
         &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
         &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-        &hellas_channel::model::work::decode_transcript(
-            &transcript,
-            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
-        )?,
+        &transcript,
     )?;
     let output = verified.output;
     if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) = output.outcome {
@@ -1170,6 +1168,19 @@ async fn execute_paid_job(
         input: proposal.prepared_input.request.input_commitment()?,
         settled_provider_payout: None,
     })
+}
+
+fn verify_transcript(
+    prepared: &PreparedInvocation,
+    policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
+    caller: &hellas_auth::PublicKey,
+    provider: &hellas_auth::PublicKey,
+    transcript: &[u8],
+) -> Result<hellas_rpc::protocol::invocation::VerifiedOutput> {
+    let facts = policy.admit(prepared, caller)?;
+    let events =
+        hellas_channel::model::work::decode_transcript(transcript, facts.max_spool_bytes as usize)?;
+    Ok(prepared.verify_output(policy, caller, provider, &events)?)
 }
 
 pub(crate) fn check_request(

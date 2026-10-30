@@ -23,6 +23,7 @@ pub struct RemoteLightClient {
     verifier: Option<ConsensusVerifier>,
     finalized_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
     applied_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    objects: std::sync::Arc<commonware_utils::sync::AsyncMutex<Option<objects::View>>>,
 }
 
 impl RemoteLightClient {
@@ -49,6 +50,7 @@ impl RemoteLightClient {
             verifier: None,
             finalized_height: Default::default(),
             applied_height: Default::default(),
+            objects: Default::default(),
         }
     }
 
@@ -64,6 +66,7 @@ impl RemoteLightClient {
         self.verifier = Some(verifier);
         self.finalized_height = Default::default();
         self.applied_height = Default::default();
+        self.objects = Default::default();
         self
     }
 

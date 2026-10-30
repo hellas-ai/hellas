@@ -8,8 +8,67 @@ use commonware_consensus::{
 };
 use commonware_storage::mmr::Location;
 use commonware_utils::non_empty_range;
+use hellas_rpc::pb::chain::{GetOperationsRequest, GetOperationsResponse};
+use std::sync::{Arc, Mutex};
 
 type Pending = crate::execution::finalized::Executed<commonware_runtime::tokio::Context>;
+
+#[derive(Default)]
+struct Operations {
+    requests: Vec<GetOperationsRequest>,
+    corrupt: bool,
+}
+
+#[derive(Clone)]
+struct ObservedClient {
+    local: LocalLightClient,
+    operations: Arc<Mutex<Operations>>,
+}
+
+// Forward the real fixture, intercepting only operation proofs for assertions
+// and fault injection at the wire boundary.
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {$ (
+        async fn $name(&self, $($arg: $ty),*) -> Result<$out, QueryError> {
+            self.local.$name($($arg),*).await
+        }
+    )*};
+}
+
+impl LightClient for ObservedClient {
+    async fn get_operations(
+        &self,
+        request: GetOperationsRequest,
+    ) -> Result<GetOperationsResponse, QueryError> {
+        let corrupt = {
+            let mut operations = self.operations.lock().unwrap();
+            operations.requests.push(request);
+            operations.corrupt
+        };
+        let mut response = self.local.get_operations(request).await?;
+        if corrupt {
+            response.operations[0][1] ^= 1;
+        }
+        Ok(response)
+    }
+
+    forward! {
+        get_state_root() -> Option<Digest>;
+        get_proof(object_id: ObjectId) -> Option<Vec<u8>>;
+        get_coin(payload: Digest, object_id: ObjectId) -> Option<crate::domain::Coin>;
+        get_edge(payload: Digest, object_id: ObjectId) -> Option<crate::EdgeLookup>;
+        get_finalization(payload: Digest) -> Option<Vec<u8>>;
+        get_latest_block() -> Option<LatestBlock>;
+        get_finalized_block(query: FinalizedBlockQuery) -> Option<FinalizedBlock>;
+        get_applied_finalized_block(query: FinalizedBlockQuery) -> Option<FinalizedBlock>;
+        submit_tx(tx: Transaction) -> hellas_rpc::SubmitTxOutcome;
+        get_validators() -> Vec<String>;
+        get_consensus_info() -> ConsensusInfo;
+        get_coins_by_owner(owner: SettlementKey) -> Option<crate::CoinListing>;
+        get_coins_by_delegate(delegate: SettlementKey) -> Option<crate::CoinListing>;
+        get_edges_by_owner(owner: SettlementKey) -> Option<crate::OwnerEdges>;
+    }
+}
 
 struct Fixture {
     database: UtxoDatabase<commonware_runtime::tokio::Context>,
@@ -22,6 +81,8 @@ struct Fixture {
     new_coin: ObjectId,
     server: tokio::task::JoinHandle<()>,
     archive: Handle<()>,
+    chain_indexer: ChainIndexer,
+    operations: Arc<Mutex<Operations>>,
 }
 
 async fn prepare(
@@ -115,7 +176,7 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
         database.clone(),
         owners.clone(),
         Mempool::default(),
-        archive,
+        archive.clone(),
         ConsensusInfo {
             validators: vec![],
             threshold_identity: committee.assembler.identity().encode().to_vec(),
@@ -126,9 +187,13 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let (activity, _) = tokio::sync::broadcast::channel(8);
+    let operations = Arc::new(Mutex::new(Operations::default()));
     let server = crate::server::spawn_light_client_server(
         address,
-        local,
+        ObservedClient {
+            local,
+            operations: operations.clone(),
+        },
         activity,
         crate::server::LightClientRpcState::default(),
     )
@@ -149,6 +214,26 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
         new_coin: ids[0],
         server,
         archive: archive_task,
+        chain_indexer: archive,
+        operations,
+    }
+}
+
+impl Fixture {
+    fn assert_reads(&self, range: std::ops::Range<u64>) {
+        let mut requests = std::mem::take(&mut self.operations.lock().unwrap().requests);
+        requests.sort_by_key(|request| request.start);
+        for request in &requests {
+            assert_eq!(request.op_count, range.end);
+        }
+        assert_eq!(
+            requests
+                .into_iter()
+                .flat_map(|r| r.start..r.start + r.max_ops)
+                .collect::<Vec<_>>(),
+            range.collect::<Vec<_>>(),
+            "verified reads must cover only the missing operation range",
+        );
     }
 }
 
@@ -156,18 +241,12 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
 fn object_witness_uses_a_certified_applied_checkpoint() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;
-        let count = fixture.database.read().await.bounds().end;
-        assert_eq!(count, fixture.applied.sync_target().range.end());
-        assert!(fixture.archived.sync_target().range.end() > count);
-        eprintln!(
-            "archive height={} root={} count={}; committed height={} root={} count={}",
-            fixture.archived.height(),
-            fixture.archived.state_root(),
-            fixture.archived.sync_target().range.end(),
-            fixture.applied.height(),
-            fixture.applied.state_root(),
-            count,
+        let applied = fixture.applied.sync_target();
+        assert_eq!(
+            fixture.database.read().await.bounds().end,
+            applied.range.end()
         );
+        assert!(fixture.archived.sync_target().range.end() > applied.range.end());
         // Observing archive progress must not reject the older applied checkpoint.
         let latest = fixture
             .remote
@@ -176,13 +255,12 @@ fn object_witness_uses_a_certified_applied_checkpoint() {
             .unwrap()
             .unwrap();
         assert_eq!(latest.snapshot.payload, fixture.archived.digest());
+        // Bootstrap without the coin, then request it through a clone of the client.
+        fixture.remote.get_objects(vec![]).await.unwrap().unwrap();
+        fixture.assert_reads(*applied.range.start()..*applied.range.end());
+        let remote = fixture.remote.clone();
         let keys = vec![fixture.old_coin, fixture.new_coin];
-        let snapshot = fixture
-            .remote
-            .get_objects(keys.clone())
-            .await
-            .unwrap()
-            .unwrap();
+        let snapshot = remote.get_objects(keys.clone()).await.unwrap().unwrap();
         assert_eq!(snapshot.block.height, fixture.applied.height().get());
         assert_eq!(snapshot.block.payload, fixture.applied.digest());
         assert_eq!(snapshot.block.state_root, fixture.applied.state_root());
@@ -190,19 +268,23 @@ fn object_witness_uses_a_certified_applied_checkpoint() {
             matches!(snapshot.objects.get(&fixture.old_coin), Some(Object::Coin(coin)) if coin.value == 100)
         );
         assert!(!snapshot.objects.contains_key(&fixture.new_coin));
+        fixture.assert_reads(*applied.range.end()..*applied.range.end());
 
         fixture
             .database
             .finalize(fixture.pending.take().unwrap())
             .await;
         assert_eq!(fixture.owners.cursor().payload, fixture.applied.digest());
+        // A corrupt suffix must not advance the shared cache or publish partial changes.
+        fixture.operations.lock().unwrap().corrupt = true;
+        assert!(fixture.remote.get_objects(keys.clone()).await.is_err());
+        fixture.operations.lock().unwrap().corrupt = false;
+        fixture.operations.lock().unwrap().requests.clear();
         // Also cover the commit-before-owner-publication window without any sleeps.
-        let snapshot = fixture
-            .remote
-            .get_objects(keys.clone())
-            .await
-            .unwrap()
-            .unwrap();
+        let snapshot = remote.get_objects(keys.clone()).await.unwrap().unwrap();
+        let target = fixture.archived.sync_target();
+        fixture
+            .assert_reads((*applied.range.end()).max(*target.range.start())..*target.range.end());
         assert_eq!(snapshot.block.payload, fixture.archived.digest());
         assert_eq!(snapshot.block.state_root, fixture.archived.state_root());
         assert!(!snapshot.objects.contains_key(&fixture.old_coin));
@@ -210,9 +292,65 @@ fn object_witness_uses_a_certified_applied_checkpoint() {
             matches!(snapshot.objects.get(&fixture.new_coin), Some(Object::Coin(coin)) if coin.value == 100)
         );
         fixture.owners.apply_finalized(&fixture.archived).unwrap();
-        let published = fixture.remote.get_objects(keys).await.unwrap().unwrap();
+        let published = remote.get_objects(keys.clone()).await.unwrap().unwrap();
         assert_eq!(published.block.payload, snapshot.block.payload);
         assert_eq!(published.block.state_root, snapshot.block.state_root);
+        fixture.assert_reads(*target.range.end()..*target.range.end());
+
+        let committee = consensus_fixture(91);
+        let mut parent = fixture.archived.clone();
+        let mut cursor = *target.range.end();
+        for step in 0..8 {
+            // Spend the cached coin so pruning can retire its original operation.
+            let txs = if step == 1 {
+                let (tx, ids) = crate::execution::test_support::reshape(
+                    41,
+                    &[fixture.new_coin],
+                    &[(owner_key(41), Some(owner_key(42)), 100)],
+                );
+                fixture.new_coin = ids[0];
+                vec![tx]
+            } else {
+                vec![]
+            };
+            let (block, batch) = prepare(
+                &fixture.database,
+                &[(owner_key(41), 100)],
+                &parent,
+                &committee,
+                txs,
+            )
+            .await;
+            fixture.database.finalize(batch).await;
+            fixture
+                .chain_indexer
+                .ingest_finalized(block.clone(), finalization(&committee, &block))
+                .await
+                .unwrap();
+            fixture.owners.apply_finalized(&block).unwrap();
+            parent = block;
+            if step == 0 {
+                assert!(*parent.sync_target().range.start() < cursor);
+                let snapshot = remote.get_objects(keys.clone()).await.unwrap().unwrap();
+                assert_eq!(snapshot.block.payload, parent.digest());
+                assert!(snapshot.objects.contains_key(&fixture.new_coin));
+                fixture.assert_reads(cursor..*parent.sync_target().range.end());
+                cursor = *parent.sync_target().range.end();
+            }
+        }
+        // Once pruning overtakes the cached cursor, recover from the retained interval.
+        let target = parent.sync_target();
+        assert!(*target.range.start() > cursor);
+        fixture.database.prune(&target).await;
+        let snapshot = remote
+            .get_objects(vec![fixture.old_coin, keys[1], fixture.new_coin])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.block.payload, parent.digest());
+        assert_eq!(snapshot.objects.len(), 1);
+        assert!(snapshot.objects.contains_key(&fixture.new_coin));
+        fixture.assert_reads(*target.range.start()..*target.range.end());
         fixture.server.abort();
         let _ = fixture.server.await;
         fixture.archive.abort();
