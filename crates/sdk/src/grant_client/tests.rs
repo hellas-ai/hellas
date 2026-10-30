@@ -234,7 +234,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
 }
 #[tokio::test]
 async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
-    for accepted in [false, true] {
+    for (accepted, interrupted_refusal) in [(false, false), (false, true), (true, false)] {
         let f = Fixture::new().await;
         let mut session = f.session().await;
         let input = f.input();
@@ -354,6 +354,23 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             ))
         ));
         f.clock.set(UnixMillis(2500));
+        if interrupted_refusal {
+            // Simulate a crash after persisting the refusal but before clearing
+            // the still-pending proposal exchange.
+            drop(attempt);
+            let mut marker: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            marker["rejected"] = serde_json::json!(true);
+            hellas_private::write_atomically(
+                &path,
+                ".writing",
+                &serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+            attempt =
+                crate::execution::ExecutionAttempt::open_existing(&path, &tracking_input, terms)
+                    .unwrap();
+        }
         let facts = crate::execution::ExecutionSession::Grant(&mut resumed)
             .recover(&mut attempt)
             .await
@@ -367,9 +384,6 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             }
         );
         if !accepted {
-            // Recreate the crash window between the tombstone and clearing
-            // the pending exchange. Recovery must not resend the proposal.
-            resumed.store.resume(id, UnixMillis(2500)).await.unwrap();
             let facts = crate::execution::ExecutionSession::Grant(&mut resumed)
                 .recover(&mut attempt)
                 .await
