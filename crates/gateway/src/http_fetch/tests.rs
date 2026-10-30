@@ -643,6 +643,8 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
         "backends":{"one":{"models":[], "provider":work.provider, "resource":resource, "channel":channel, "routes":[{
             "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
+        }, {
+            "path":"/v1/audio/transcriptions", "method":"POST", "url":"https://example.com/v1/audio/transcriptions"
         }]}}
     }))
     .unwrap();
@@ -677,6 +679,25 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Opaque multipart remains routable; invalid affinity metadata is still rejected.
+    let multipart =
+        "--audio\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nopaque\r\n--audio--\r\n";
+    for (duplicate, expected) in [(true, StatusCode::BAD_REQUEST), (false, StatusCode::OK)] {
+        let mut request = axum::http::Request::post("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=audio");
+        if duplicate {
+            request = request
+                .header("x-hellas-session-id", "one")
+                .header("x-hellas-session-id", "two");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(multipart)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let response = app
         .oneshot(
             axum::http::Request::post("/v1/responses")
@@ -686,5 +707,5 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
