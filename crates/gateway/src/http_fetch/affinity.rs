@@ -2,7 +2,6 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::io::Read;
 
 /// Decodes a gzip/zstd request body the same way routing does, bounding the
 /// decoded size. Callers that make decisions on body contents must use this
@@ -11,36 +10,15 @@ pub(crate) fn decoded_body<'a>(
     headers: &HeaderMap,
     body: &'a [u8],
 ) -> Result<Cow<'a, [u8]>, &'static str> {
-    let decode = |reader: &mut dyn Read| -> Result<Vec<u8>, &'static str> {
-        hellas_private::read_bounded(reader, 8 * 1024 * 1024).map_err(|error| {
-            if error
-                .get_ref()
-                .is_some_and(|error| error.is::<hellas_private::ReadLimit>())
-            {
-                "decoded request body exceeds limit"
-            } else {
-                "invalid compressed request body"
-            }
-        })
-    };
+    if headers.get_all("content-encoding").iter().count() > 1 {
+        return Err("invalid request encoding");
+    }
     let encoding = headers
         .get("content-encoding")
-        .map(|v| v.to_str().map(|s| s.trim().to_ascii_lowercase()))
+        .map(|v| v.to_str())
         .transpose()
         .map_err(|_| "invalid request encoding")?;
-    Ok(match encoding.as_deref() {
-        None | Some("") | Some("identity") => Cow::Borrowed(body),
-        Some("gzip") => Cow::Owned(decode(&mut flate2::read::MultiGzDecoder::new(body))?),
-        Some("zstd") => {
-            let mut decoder = zstd::stream::read::Decoder::new(body)
-                .map_err(|_| "invalid compressed request body")?;
-            decoder
-                .window_log_max(23)
-                .map_err(|_| "invalid compressed request body")?;
-            Cow::Owned(decode(&mut decoder)?)
-        }
-        _ => return Err("unsupported request encoding for model routing"),
-    })
+    hellas_authority::model::http_usage::decode_request_body(encoding, body)
 }
 
 #[derive(Default)]
@@ -57,7 +35,7 @@ impl Hints {
         let value = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice::<Value>(&bytes)
+            hellas_authority::model::http_usage::unique_json(&bytes)
                 .map_err(|_| "model routing requires a JSON request")?
         };
         fn field(value: Option<&Value>) -> Result<Option<String>, &'static str> {
@@ -107,7 +85,7 @@ impl Hints {
         }
         let conversation = value.get("conversation");
         Ok(Self {
-            model: field(value.get("model"))?,
+            model: hellas_authority::model::http_usage::request_model(&value)?.map(str::to_owned),
             session,
             previous: field(value.get("previous_response_id"))?,
             conversation: field(

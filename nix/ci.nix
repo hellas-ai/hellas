@@ -144,6 +144,17 @@ let
       assert_money_graph -p hellas-channel --no-default-features
       assert_money_graph -p hellas-client --no-default-features --features work
       assert_money_graph -p hellas-chain --no-default-features --features work-watcher
+      # Chain work-watcher already gets zstd through consensus storage. Guard
+      # the lightweight channel and client graphs against adding it here.
+      for package in hellas-channel hellas-client; do
+        features=()
+        if [[ "$package" == hellas-client ]]; then features=(--features work); fi
+        dependencies="$(cargo tree --locked --edges normal,build --prefix none -p "$package" --no-default-features "''${features[@]}")"
+        if grep -Eq '^zstd v' <<< "$dependencies"; then
+          echo "zstd reached a lightweight $package consumer" >&2
+          exit 1
+        fi
+      done
     '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
     # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
     # Channel and authority own the canonical records and durable orchestration.

@@ -583,6 +583,38 @@ async fn https_policy_conversion_rejects_a_non_http_schema() {
 }
 
 #[tokio::test]
+async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
+    let fixture = Fixture::builder().build().await;
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    let template = policy.https.as_mut().unwrap();
+    template.paths.push("/health".into());
+    template.model_policy = Some(vec![
+        hellas_authority::model::grant::resource::PathModelPolicy {
+            path: template.paths[0].clone(),
+            models: vec!["model-a".into()],
+        },
+    ]);
+    let (_, _, routes) = policy_http_routes(&policy).unwrap();
+    let restricted = routes
+        .iter()
+        .find(|route| route.path == "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(
+        restricted.models.as_deref(),
+        Some(["model-a".to_string()].as_slice())
+    );
+    assert!(
+        routes
+            .iter()
+            .find(|route| route.path == "/health")
+            .unwrap()
+            .models
+            .is_none()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let fixture = Fixture::builder().build().await;
     let old = fixture.host.allowance.policies[0].clone();

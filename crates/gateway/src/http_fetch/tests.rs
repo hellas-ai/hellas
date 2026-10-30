@@ -152,6 +152,7 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
         credential: Some("account".into()),
         tls: public_tls(),
         headers: vec![("anthropic-version".into(), "2023-06-01".into())],
+        models: None,
     };
     let incoming = HeaderMap::from_iter([
         (
@@ -229,6 +230,7 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
                 credential: Some("account".into()),
                 tls: public_tls(),
                 headers: vec![(name.into(), "secret".into())],
+                models: None,
             }],
         };
         assert!(config.validate().is_err());

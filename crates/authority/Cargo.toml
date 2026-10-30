@@ -22,6 +22,7 @@ base64.workspace = true
 brotli = "9"
 bytes = { workspace = true, optional = true }
 flate2 = "1"
+zstd = "0.14"
 futures.workspace = true
 getrandom = "0.4"
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }

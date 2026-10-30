@@ -26,6 +26,7 @@ fn resource() -> HttpsResource {
         accounting: AccountingProfile::OpenaiChat,
         max_output_tokens: 16,
         max_response_bytes: 4096,
+        model_policy: None,
     }
 }
 fn request(body: serde_json::Value) -> http_fetch::HttpFetchRequest {
@@ -281,6 +282,141 @@ fn duplicate_request_fields_cannot_bypass_a_token_cap() {
         assert_eq!(resource.prepare(&mut signed), Err(TemplateError::Malformed));
         assert_eq!(signed, original);
     }
+}
+
+#[test]
+fn signed_http_models_are_exact_path_specific_and_bounded() {
+    let mut policy = resource();
+    policy.paths.push("/health".into());
+    policy.methods.push("GET".into());
+    policy.model_policy = Some(vec![PathModelPolicy {
+        path: policy.paths[0].clone(),
+        models: vec!["model-a".into(), "model-b".into()],
+    }]);
+    policy.validate().unwrap();
+    let allowed = request(serde_json::json!({"model":"model-a", "max_tokens":4}));
+    assert_eq!(policy.matches(&allowed), Ok(4));
+    for body in [
+        serde_json::json!({"model":"other", "max_tokens":4}),
+        serde_json::json!({"max_tokens":4}),
+        serde_json::json!({"model":4, "max_tokens":4}),
+    ] {
+        assert_eq!(policy.matches(&request(body)), Err(TemplateError::Model));
+    }
+    let mut duplicate = allowed.clone();
+    duplicate.body_base64 =
+        STANDARD.encode(br#"{"model":"other","model":"model-a","max_tokens":4}"#);
+    assert_eq!(policy.matches(&duplicate), Err(TemplateError::Malformed));
+    let mut health = allowed.clone();
+    health.url = format!("{}/health", policy.origin);
+    health.method = "GET".into();
+    health.body_base64.clear();
+    assert_eq!(policy.matches(&health), Ok(0));
+    let mut invalid = policy.clone();
+    invalid.model_policy.as_mut().unwrap()[0]
+        .models
+        .push("model-a".into());
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+    let mut invalid = policy.clone();
+    let duplicate_policy = invalid.model_policy.as_ref().unwrap()[0].clone();
+    invalid
+        .model_policy
+        .as_mut()
+        .unwrap()
+        .push(duplicate_policy);
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+    let mut invalid = policy.clone();
+    invalid.model_policy.as_mut().unwrap()[0].models = vec!["x".repeat(257)];
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+    let mut invalid = policy.clone();
+    invalid.model_policy.as_mut().unwrap()[0].models = vec![String::new()];
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+    let mut invalid = policy.clone();
+    invalid.model_policy.as_mut().unwrap()[0].models =
+        (0..129).map(|i| format!("model-{i}")).collect();
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+    let mut invalid = policy.clone();
+    invalid.model_policy.as_mut().unwrap()[0].path = "/not-allowed".into();
+    assert_eq!(invalid.validate(), Err(TemplateError::Model));
+}
+
+#[test]
+fn signed_http_models_decode_compressed_bodies_under_a_fixed_limit() {
+    use std::io::Write;
+    let mut policy = resource();
+    policy.model_policy = Some(vec![PathModelPolicy {
+        path: policy.paths[0].clone(),
+        models: vec!["model-a".into()],
+    }]);
+    let body = br#"{"model":"model-a","max_tokens":4}"#;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(body).unwrap();
+    for (encoding, bytes) in [
+        ("gzip", gzip.finish().unwrap()),
+        (
+            "zstd",
+            zstd::stream::encode_all(body.as_slice(), 1).unwrap(),
+        ),
+    ] {
+        let mut req = request(serde_json::json!({}));
+        req.headers
+            .push(("content-encoding".into(), encoding.into()));
+        req.body_base64 = STANDARD.encode(bytes);
+        assert_eq!(policy.matches(&req), Ok(4));
+        assert_eq!(policy.prepare(&mut req), Ok(4));
+        assert!(
+            req.headers
+                .iter()
+                .all(|(name, _)| name != "content-encoding")
+        );
+        assert_eq!(policy.matches(&req), Ok(4));
+    }
+    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let mut req = request(serde_json::json!({}));
+    req.headers.push(("content-encoding".into(), "zstd".into()));
+    req.body_base64 = STANDARD.encode(zstd::stream::encode_all(oversized.as_slice(), 1).unwrap());
+    assert_eq!(policy.matches(&req), Err(TemplateError::Malformed));
+    req.headers[0].1 = "unknown".into();
+    assert_eq!(policy.matches(&req), Err(TemplateError::Malformed));
+}
+
+#[test]
+fn signed_model_policy_is_authenticated_and_old_parsers_reject_it() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct LegacyResource {
+        origin: serde_json::Value,
+        paths: serde_json::Value,
+        methods: serde_json::Value,
+        credential: serde_json::Value,
+        tls: serde_json::Value,
+        accounting: serde_json::Value,
+        max_output_tokens: serde_json::Value,
+        max_response_bytes: serde_json::Value,
+    }
+    let legacy = SignedOffer::decode(
+        include_bytes!("fixtures/legacy-https-offer.cbor"),
+        UnixMillis(1000),
+    )
+    .unwrap();
+    let mut offer = legacy.offer().clone();
+    let template = offer.grant.policies[0].https.as_mut().unwrap();
+    template.model_policy = Some(vec![PathModelPolicy {
+        path: template.paths[0].clone(),
+        models: vec!["model-a".into()],
+    }]);
+    assert!(
+        serde_json::from_value::<LegacyResource>(serde_json::to_value(template).unwrap()).is_err()
+    );
+    let signed = SignedOffer::sign(offer, &principal(1).1).unwrap();
+    let mut bytes = signed.encode().unwrap();
+    let position = bytes
+        .windows(7)
+        .position(|window| window == b"model-a")
+        .unwrap();
+    bytes[position..position + 7].copy_from_slice(b"model-b");
+    assert!(SignedOffer::decode(&bytes, UnixMillis(1000)).is_err());
 }
 
 #[test]

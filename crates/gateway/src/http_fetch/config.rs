@@ -55,6 +55,9 @@ pub struct HttpRoute {
     pub headers: Vec<(String, String)>,
     #[serde(default = "default_response_bytes")]
     pub max_response_bytes: u32,
+    /// Exact model identifiers for this path, when the resource restricts it.
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
 }
 
 fn default_response_bytes() -> u32 {
@@ -87,7 +90,7 @@ impl HttpGatewayConfig {
             if name.is_empty() || name.len() > 64 {
                 return Err(crate::GatewayConfigError::BackendName.into());
             }
-            if !(!backend.models.is_empty()
+            if !((!backend.models.is_empty() || backend.resource.is_some())
                 && backend.models.len() <= 256
                 && backend
                     .models
@@ -107,6 +110,27 @@ impl HttpGatewayConfig {
             }
             validate_routes(&backend.routes)?;
         }
+        let mut grant_paths = BTreeMap::<(&str, &str), (bool, bool)>::new();
+        for backend in self
+            .backends
+            .values()
+            .filter(|backend| backend.resource.is_some())
+        {
+            for route in &backend.routes {
+                let flags = grant_paths.entry((&route.path, &route.method)).or_default();
+                if route.models.is_some() {
+                    flags.0 = true;
+                } else {
+                    flags.1 = true;
+                }
+            }
+        }
+        if grant_paths
+            .values()
+            .any(|(restricted, unrestricted)| *restricted && *unrestricted)
+        {
+            return Err(crate::GatewayConfigError::ModelNames.into());
+        }
         Ok(())
     }
 }
@@ -117,6 +141,17 @@ fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
     }
     let mut paths = std::collections::BTreeSet::new();
     for route in routes {
+        if let Some(models) = &route.models {
+            let mut unique = std::collections::BTreeSet::new();
+            if models.is_empty()
+                || models.len() > 128
+                || models
+                    .iter()
+                    .any(|model| model.is_empty() || model.len() > 256 || !unique.insert(model))
+            {
+                return Err(crate::GatewayConfigError::ModelNames.into());
+            }
+        }
         if !route.path.starts_with('/') || route.path.contains(['?', '#', '{', '}']) {
             return Err(crate::GatewayConfigError::RoutePath.into());
         }

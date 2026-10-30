@@ -208,6 +208,11 @@ fn policy_http_routes(
                     tls: template.tls.clone(),
                     headers: vec![],
                     max_response_bytes: template.max_response_bytes,
+                    models: template
+                        .model_policy
+                        .as_ref()
+                        .and_then(|policies| policies.iter().find(|policy| policy.path == *path))
+                        .map(|policy| policy.models.clone()),
                 })
         })
         .collect();

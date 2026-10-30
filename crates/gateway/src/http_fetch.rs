@@ -87,8 +87,12 @@ pub(super) fn router(
     for backend in &routing.backends {
         for route in &backend.routes {
             let models = paths.entry(route.path.clone()).or_insert(Some(Vec::new()));
-            match (models.as_mut(), backend.models.is_empty()) {
-                (Some(models), false) => models.extend(backend.models.iter().cloned()),
+            let restricted = route.models.as_ref().or_else(|| {
+                (backend.resource.is_none() && !backend.models.is_empty())
+                    .then_some(&backend.models)
+            });
+            match (models.as_mut(), restricted) {
+                (Some(models), Some(restricted)) => models.extend(restricted.iter().cloned()),
                 _ => *models = None,
             }
         }
