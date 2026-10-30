@@ -32,12 +32,22 @@ impl OfferHost {
         metrics_endpoint: Option<String>,
         metrics_address: Option<String>,
     ) -> Self {
+        Self::start_with_identity(metrics_endpoint, metrics_address, None).await
+    }
+    async fn start_with_identity(
+        metrics_endpoint: Option<String>,
+        metrics_address: Option<String>,
+        client_identity: Option<&Path>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let https = Https::start(Some("Bearer fixture-key")).await;
         let mut provider = Cli::new(root, "provider", ROOT_PASSKEY);
         let mut client = Cli::new(root, "client", FRIEND_PASSKEY);
+        if let Some(existing) = client_identity {
+            std::fs::copy(existing, &client.identity).unwrap();
+        }
         provider.metrics_endpoint = metrics_endpoint.clone();
         client.metrics_endpoint = metrics_endpoint;
         provider.metrics_address = metrics_address.clone();
@@ -1019,4 +1029,96 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     gateway.stop().await;
     host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_gateway_opens_two_independent_providers() {
+    use hellas_auth::authority::{CredentialHolder, UnixMillis};
+    use hellas_sdk::access_bundle::AccessBundle;
+    use hellas_sdk::node_control::profile::ClientProfile;
+    use hellas_sdk::trust_policy::{TrustPolicy, TrustPolicyStore};
+
+    let first = OfferHost::start().await;
+    let second = OfferHost::start_with_identity(None, None, Some(&first.client.identity)).await;
+    let root = first.root();
+    let CredentialHolder::Node(holder) = first.client.holder().await else {
+        panic!("expected node-bound client");
+    };
+    assert_eq!(first.client.holder().await, second.client.holder().await);
+    let trust_root = root.join("pool-trust");
+    let mut channels = Vec::new();
+    for (host, name) in [(&first, "first"), (&second, "second")] {
+        let profile = ClientProfile::load(&host.work_profile).unwrap();
+        let bundle = AccessBundle {
+            offers: vec![host.signed_offer.clone()],
+            authority: profile.authority,
+            authorization: profile.authorization,
+            subject: first.client.principal(),
+            holder,
+            credential: profile.credential,
+            expires: UnixMillis(UnixMillis::now().unwrap().0 + 600_000),
+            label: None,
+        };
+        let path = root.join(format!("{name}.access"));
+        bundle.save(&path).unwrap();
+        first
+            .client
+            .run(&["offer", "import-bundle", string(&path), "--name", name])
+            .await;
+        TrustPolicyStore::new(&trust_root)
+            .approve(
+                name,
+                0,
+                TrustPolicy {
+                    provider_genesis: host.provider_enrollment.content_id(),
+                    assurance: hellas_rpc::Assurance::ProducerSigned,
+                    apple: None,
+                },
+                "independent provider approval".into(),
+            )
+            .unwrap();
+        channels.push(json!({
+            "offer": format!("{name}.glm"), "work_profile": name, "trust_policy": name,
+            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
+        }));
+    }
+    let pool = root.join("two-provider-pool.json");
+    std::fs::write(
+        &pool,
+        serde_json::to_vec(&json!({"channels": channels})).unwrap(),
+    )
+    .unwrap();
+    let (profile, token) = gateway_profile(root).await;
+    let mut gateway = first.client.spawn(
+        &[
+            "gateway",
+            "--grant-pool-config",
+            string(&pool),
+            "--trust-store",
+            string(&trust_root),
+            "--port",
+            "0",
+            "--gateway-profile",
+            string(&profile),
+            "--archive-dir",
+            string(&root.join("two-provider-archive")),
+            "--zdr",
+        ],
+        "two-provider-gateway.log",
+    );
+    let address = gateway.wait_for("gateway listening on ").await;
+    let response = post(
+        &gateway_client(&token),
+        &format!("http://{address}/v1/chat/completions"),
+        json!({"messages":[]}),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        first.https.calls.load(Ordering::SeqCst) + second.https.calls.load(Ordering::SeqCst),
+        1
+    );
+    gateway.stop().await;
+    second.stop().await;
+    first.stop().await;
 }
