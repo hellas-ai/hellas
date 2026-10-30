@@ -161,7 +161,8 @@ impl HttpsResource {
             .and_then(|policies| policies.iter().find(|p| p.path == url.path()));
         if policy.is_none()
             && (self.accounting == AccountingProfile::None
-                || (request.body_base64.is_empty() && matches!(request.method.as_str(), "GET" | "HEAD")))
+                || (request.body_base64.is_empty()
+                    && matches!(request.method.as_str(), "GET" | "HEAD")))
         {
             return Ok(0);
         }
