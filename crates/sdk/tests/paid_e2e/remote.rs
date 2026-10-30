@@ -327,8 +327,14 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         "exercise a real nonzero inactivity floor"
     );
     for mode in 1..=3 {
+        relays.source.corrupt.store(0, Ordering::SeqCst);
+        // Each corruption must be read from the transport rather than a
+        // previously verified in-memory object view.
+        let fresh = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
+            .await
+            .unwrap();
         relays.source.corrupt.store(mode, Ordering::SeqCst);
-        let error = client.get_objects(keys.clone()).await.unwrap_err();
+        let error = fresh.get_objects(keys.clone()).await.unwrap_err();
         assert!(
             matches!(error, QueryError::Remote(_)),
             "corrupt, missing or reordered operation witness {mode}: {error}"
@@ -341,10 +347,13 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         }
     }
     relays.source.corrupt.store(0, Ordering::SeqCst);
+    let fresh = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
+        .await
+        .unwrap();
     *relays.source.stale.lock().unwrap() = Some(stale);
     assert!(
         matches!(
-            client.get_objects(keys.clone()).await,
+            fresh.get_objects(keys.clone()).await,
             Err(QueryError::Remote(_))
         ),
         "a genuine old range proof cannot establish current state"
