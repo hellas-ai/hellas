@@ -1,5 +1,6 @@
 //! Reusable paid-work sessions: provider authentication, admission, verified delivery,
 //! journal recovery, payment, and finalized settlement. Journals are client-owned.
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -415,21 +416,16 @@ impl PaidWorkSession {
         owner: Arc<ClientOwner>,
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_with_binding(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            mode,
-            funding,
-            None,
-        ))
+    ) -> impl Future<Output = Result<Self>> {
+        Self::open_with_binding(args, endpoint, settlement_key, owner, mode, funding, None)
     }
 
     /// Bind after selected-policy admission and application reservation, before
     /// owner signing, signed-intent submission, or retained setup signatures.
-    pub(crate) async fn open_with_binding(
+    ///
+    /// Boxed rather than an `async fn`: the opener is reached from deep inside
+    /// a caller's future, and its state must not be composed inline there.
+    pub(crate) fn open_with_binding(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
@@ -437,30 +433,32 @@ impl PaidWorkSession {
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
         binding: Option<(&crate::job::Job, crate::client_owner::FundingBinding<'_>)>,
-    ) -> Result<Self> {
-        let (job, allow_funding) = match mode {
-            SessionOpenMode::Any => (None, true),
-            SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
-            SessionOpenMode::Retained => (None, false),
-        };
-        let (job, before_open) = match binding {
-            Some((tracked_job, bind)) => (Some(Box::new(tracked_job.clone())), Some(bind)),
-            None => (job, None),
-        };
-        Box::pin(Self::open_inner(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            OpenIntent {
-                job,
-                allow_funding,
-                before_open,
-            },
-            None,
-            funding,
-        ))
-        .await
+    ) -> impl Future<Output = Result<Self>> {
+        Box::pin(async move {
+            let (job, allow_funding) = match mode {
+                SessionOpenMode::Any => (None, true),
+                SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
+                SessionOpenMode::Retained => (None, false),
+            };
+            let (job, before_open) = match binding {
+                Some((tracked_job, bind)) => (Some(Box::new(tracked_job.clone())), Some(bind)),
+                None => (job, None),
+            };
+            Box::pin(Self::open_inner(
+                args,
+                endpoint,
+                settlement_key,
+                owner,
+                OpenIntent {
+                    job,
+                    allow_funding,
+                    before_open,
+                },
+                None,
+                funding,
+            ))
+            .await
+        })
     }
 
     /// A gateway limits provider reachability separately from owner funding and
