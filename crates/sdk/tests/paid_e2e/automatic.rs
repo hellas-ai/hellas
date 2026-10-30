@@ -1050,14 +1050,21 @@ async fn compute_and_settle(
     assert_eq!(second_result.credited_cumulative, CREDITED);
 
     // 10: the settled close pays A exactly the credited total.
-    assert_eq!(
-        sealing_while(devnet, Duration::from_millis(100), session.settle())
-            .await
-            .unwrap(),
-        CREDITED
-    );
     session.shutdown().await;
     drop(session);
+    let closed = sealing_while(
+        devnet,
+        Duration::from_millis(100),
+        hellas_sdk::paid_client::settle_channel(
+            &options,
+            original.offer().proposal.bond_edge(),
+            owner.principal(),
+            key,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed.provider_payout, CREDITED);
     let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
         &options,
         original.offer().proposal.bond_edge(),
@@ -1067,6 +1074,7 @@ async fn compute_and_settle(
     .await
     .unwrap()
     .expect("settled channel has finalized evidence");
+    assert_eq!(closed, receipt);
     assert_eq!(receipt.provider_payout, CREDITED);
     assert_eq!(
         receipt.client_returned + receipt.provider_payout,

@@ -1,5 +1,5 @@
-//! Recover exact client returns from certified close transactions. This path
-//! has no funding, provider connection, or transaction submission capability.
+//! Settle retained funding and recover exact certified returns without funding
+//! or connecting to a provider. Evidence recovery alone never submits a transaction.
 use super::*;
 use hellas_auth::{Digest, authority::PrincipalId};
 use hellas_channel::work_close::{FinalizedWork, catch_up};
@@ -40,6 +40,70 @@ async fn finalized_channel_settlement_inner(
     owner: PrincipalId,
     delegate: Key,
 ) -> Result<Option<FinalizedChannelSettlement>> {
+    let mut recovery = open_settlement(args, bond, owner, delegate).await?;
+    let verifier = Secp256k1Verifier::new();
+    // Observing finalized blocks can expire jobs and record closure, but cannot
+    // approve, sign, submit, or pay for any work.
+    if recovery.journal.state().close_settled().is_none() {
+        catch_up(&recovery.chain, &mut recovery.journal, &verifier).await?;
+    }
+    settlement_receipt(&recovery).await
+}
+
+/// Close exactly this retained funded channel using its signed journal and
+/// verified finalized blocks. This requires no live object snapshot, provider
+/// connection, owner funding authority, or new purchase. Callers bound its
+/// lifetime; cancellation preserves the close intent for the next attempt.
+pub async fn settle_channel(
+    args: &PaidWorkOptions,
+    bond: EdgeId,
+    owner: PrincipalId,
+    signer: &Secp256k1Signer,
+) -> Result<FinalizedChannelSettlement> {
+    let recovery = open_settlement(args, bond, owner, signer.party_key()).await?;
+    let mut endpoint = ClientEndpoint::recover(recovery.journal, signer.clone())?;
+    loop {
+        endpoint
+            .advance_close(&recovery.chain, &recovery.chain)
+            .await?;
+        if endpoint.state().close_settled().is_some() {
+            break;
+        }
+        if !endpoint.state().is_closing() {
+            endpoint.prepare_close().await?;
+        }
+        tokio::time::sleep(args.config.poll).await;
+    }
+    // The finalized receipt is verified through the same recovery reader used
+    // after a crash. No requested or merely enqueued close releases funding.
+    let channel = endpoint.state().channel();
+    let settled = endpoint
+        .state()
+        .close_settled()
+        .expect("loop observed finality");
+    receipt(
+        &recovery.chain,
+        channel,
+        recovery.bond,
+        recovery.funding_value,
+        settled,
+    )
+    .await
+}
+
+struct SettlementRecovery {
+    journal: ChannelStore,
+    chain: WorkBlocks<RemoteLightClient>,
+    bond: EdgeId,
+    funding_value: u64,
+}
+
+async fn open_settlement(
+    args: &PaidWorkOptions,
+    bond: EdgeId,
+    owner: PrincipalId,
+    delegate: Key,
+) -> Result<SettlementRecovery> {
     args.validate()?;
     args.config.clone().validate()?;
     let found =
@@ -95,7 +159,7 @@ async fn finalized_channel_settlement_inner(
         .state()
         .origin()
         .ok_or(PaidClientError::MissingState("settlement channel origin"))?;
-    let mut journal = ChannelStore::open(
+    let journal = ChannelStore::open_existing(
         &args.journal_root,
         channel.clone(),
         descriptor.expected_settlement()?,
@@ -105,32 +169,61 @@ async fn finalized_channel_settlement_inner(
         &verifier,
     )
     .await?;
+    if !journal.state().origin_observed() {
+        return Err(PaidClientError::MissingState(
+            "settlement origin observation",
+        ));
+    }
     let timeout = super::read_timeout(args.timeout);
     let remote = crate::client_chain::connect(&args.config, timeout).await?;
     let chain = WorkBlocks::new(remote)
         .with_read_retry(args.config.poll, timeout)
         .with_min_height(journal.state().cursor().0);
-    // Observing finalized blocks can expire jobs and record closure, but cannot
-    // approve, sign, submit, or pay for any work.
-    if journal.state().close_settled().is_none() {
-        catch_up(&chain, &mut journal, &verifier).await?;
-    }
-    let Some(settled) = journal.state().close_settled() else {
+    Ok(SettlementRecovery {
+        journal,
+        chain,
+        bond,
+        funding_value,
+    })
+}
+
+async fn settlement_receipt(
+    recovery: &SettlementRecovery,
+) -> Result<Option<FinalizedChannelSettlement>> {
+    let Some(settled) = recovery.journal.state().close_settled() else {
         return Ok(None);
     };
+    receipt(
+        &recovery.chain,
+        recovery.journal.state().channel(),
+        recovery.bond,
+        recovery.funding_value,
+        settled,
+    )
+    .await
+    .map(Some)
+}
+
+async fn receipt(
+    chain: &WorkBlocks<RemoteLightClient>,
+    channel: &hellas_channel::model::work::PaidChannel,
+    bond: EdgeId,
+    funding_value: u64,
+    settled: hellas_channel::work_store::CloseSettlement,
+) -> Result<FinalizedChannelSettlement> {
     let block = chain
         .block_at(settled.height)
         .await?
         .ok_or(PaidClientError::MissingState("finalized settlement block"))?;
     let (client_returned, provider_payout) = close_payouts(
         &block,
-        &channel,
+        channel,
         settled.height,
         settled.payload,
         settled.provider_payout,
     )?;
-    Ok(Some(FinalizedChannelSettlement {
-        network: args.config.chain.network,
+    Ok(FinalizedChannelSettlement {
+        network: channel.network(),
         channel: channel.id(),
         bond_edge: bond,
         payment_edge: channel.payment_edge(),
@@ -139,7 +232,7 @@ async fn finalized_channel_settlement_inner(
         funding_value,
         client_returned,
         provider_payout,
-    }))
+    })
 }
 
 fn close_payouts(

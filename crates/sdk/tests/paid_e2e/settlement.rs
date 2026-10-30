@@ -1,5 +1,91 @@
 use super::*;
 
+#[test]
+fn paid_settlement_does_not_need_live_object_proofs() {
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            let mut session = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                PaidWorkSession::open(
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+            let bond = session.descriptor().bond_edge();
+            let result = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                session.run(
+                    Some(case.prepared_input.clone()),
+                    &InvocationContent::Ephemeral(Default::default()),
+                    false,
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.credited_cumulative, PRICE);
+            session.shutdown().await;
+            drop(session);
+            case.relays
+                .source
+                .unavailable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let reads = case
+                .relays
+                .source
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let receipt = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipt.provider_payout, PRICE);
+            assert_eq!(
+                case.relays
+                    .source
+                    .attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                reads
+            );
+            assert_eq!(
+                hellas_sdk::paid_client::finalized_channel_settlement(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    case.owner.delegate()
+                )
+                .await
+                .unwrap(),
+                Some(receipt),
+            );
+            case.relays
+                .source
+                .unavailable
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            case.endpoint.close().await;
+            case.provider.shutdown().await.unwrap();
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
 /// Application budgets gate the actual owner funding, not quote discovery or
 /// reopening a channel that has already been funded.
 #[test]
@@ -206,15 +292,117 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 vec![CLIENT_FUNDING, CLIENT_FUNDING]
             );
             assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
-            sealing_while(
-                &mut case.devnet,
-                Duration::from_millis(100),
-                retained.settle(),
+            retained.shutdown().await;
+            drop(retained);
+            let journals = case.options.journal_root.join("journals");
+            let journal = std::fs::read_dir(&journals)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("channel-")
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "sqlite")
+                })
+                .unwrap();
+            let hidden = journal.with_extension("saved");
+            std::fs::rename(&journal, &hidden).unwrap();
+            assert!(
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                !journal.exists(),
+                "settlement never creates replacement accounting"
+            );
+            std::fs::rename(hidden, &journal).unwrap();
+            assert!(
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    ROOT.principal(),
+                    &client_settlement(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &provider_settlement(),
+                )
+                .await
+                .is_err()
+            );
+            case.relays
+                .source
+                .unavailable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let proof_reads = case
+                .relays
+                .source
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    hellas_sdk::paid_client::settle_channel(
+                        &case.options,
+                        bond,
+                        case.owner.principal(),
+                        &client_settlement(),
+                    )
+                )
+                .await
+                .is_err()
+            );
+            let stem = journal.file_stem().unwrap().to_str().unwrap();
+            let (_, replay) = hellas_channel::work_store::journal::Journal::inspect(
+                &case.options.journal_root,
+                stem,
             )
             .await
             .unwrap();
-            retained.shutdown().await;
-            drop(retained);
+            assert!(
+                replay.records.iter().any(|bytes| matches!(
+                    hellas_channel::work_store::ChannelRecord::decode(bytes).unwrap(),
+                    hellas_channel::work_store::ChannelRecord::ClosePrepared { .. }
+                )),
+                "cancellation retains the signed close intent"
+            );
+            let closed = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(closed.client_returned, CLIENT_FUNDING);
+            assert_eq!(closed.provider_payout, 0);
+            assert_eq!(
+                case.relays
+                    .source
+                    .attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                proof_reads,
+                "close and restart require no live object witness"
+            );
             let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
                 &case.options,
                 bond,
@@ -227,6 +415,10 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             assert_eq!(receipt.funding_value, CLIENT_FUNDING);
             assert_eq!(receipt.client_returned, CLIENT_FUNDING);
             assert_eq!(receipt.provider_payout, 0);
+            case.relays
+                .source
+                .unavailable
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             case.relays
                 .source
                 .tips_unavailable
