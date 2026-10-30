@@ -158,39 +158,36 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             eprintln!("retained-budget: ten paid jobs used one funding allocation");
             // Exhaustion does not allocate a replacement. Persist a close, interrupt
             // before any block finalizes it, and reopen that same closing channel.
-            let mut session = PaidWorkSession::open_retained(
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
+            let bond = bond.expect("ten jobs used one retained bond");
+            let verifier = hellas_kernel::Secp256k1Verifier::new();
+            let setup = hellas_channel::work_store::SetupStore::open_existing(
+                &case.options.journal_root,
+                case.options.config.chain.network,
+                bond,
+                hellas_channel::work_store::Role::Client,
+                &verifier,
             )
             .await
             .unwrap();
-            // A timeout can fire before the future reaches its durable write
-            // when several simulated networks run at once. Retry that same
-            // close until the recorded state, rather than elapsed wall time,
-            // proves the interruption point was reached.
-            let mut closing = false;
-            for _ in 0..100 {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(100), session.settle())
-                        .await
-                        .is_err()
-                );
-                closing = session
-                    .with_state(|state| state.is_closing())
-                    .await
+            let descriptor = setup.state().close_descriptor().unwrap().clone();
+            let origin = setup.state().origin().unwrap();
+            drop(setup);
+            let channel = hellas_channel::work_store::ChannelStore::open_existing(
+                &case.options.journal_root,
+                descriptor.channel().clone(),
+                descriptor.expected_settlement().unwrap(),
+                hellas_channel::work_store::Role::Client,
+                origin,
+                hellas_store::ContentStore::new(),
+                &verifier,
+            )
+            .await
+            .unwrap();
+            let mut endpoint =
+                hellas_channel::work::ClientEndpoint::recover(channel, client_settlement())
                     .unwrap();
-                if closing {
-                    break;
-                }
-            }
-            assert!(
-                closing,
-                "close intent was not persisted within the fixture bound"
-            );
-            session.shutdown().await;
-            drop(session);
+            endpoint.prepare_close().await.unwrap();
+            drop(endpoint); // Crash after the close intent is durable, before submission.
             let mut session = PaidWorkSession::open_with_options(
                 case.options.clone(),
                 case.endpoint.clone(),
@@ -204,7 +201,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             )
             .await
             .unwrap();
-            assert_eq!(Some(session.descriptor().bond_edge()), bond);
+            assert_eq!(session.descriptor().bond_edge(), bond);
             assert!(
                 session
                     .with_state(|state| state.is_closing())

@@ -190,7 +190,10 @@ let
         (cargoEnv rustToolchain);
     # Native host composition has one implementation for both funding modes.
     sdk-paid-work = mkCargo "check-sdk-paid-work" ''
-      cargo test -p hellas-sdk
+      # These native cases each start a six-validator devnet. Serializing the
+      # test harness avoids cross-test resource starvation; the cases retain
+      # their own concurrent-client and cancellation assertions.
+      RUST_TEST_THREADS=1 cargo test -p hellas-sdk
       cargo clippy -p hellas-sdk --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
