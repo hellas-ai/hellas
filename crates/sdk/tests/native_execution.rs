@@ -31,6 +31,8 @@ mod pool;
 mod remote;
 #[path = "paid_e2e/settlement.rs"]
 mod settlement_recovery;
+#[path = "paid_e2e/tracked.rs"]
+mod tracked;
 
 use std::sync::Arc;
 use std::time::Duration;

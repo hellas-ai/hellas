@@ -392,15 +392,7 @@ impl Job {
         hash_tuple(FORMAT, &[&self.canonical_bytes()])
     }
     pub fn purchase_nonce(&self, channel: Digest, proposal_nonce: u64) -> [u8; 32] {
-        *hash_tuple(
-            "hellas.job.purchase.v1",
-            &[
-                self.digest().as_bytes(),
-                channel.as_bytes(),
-                &proposal_nonce.to_be_bytes(),
-            ],
-        )
-        .as_bytes()
+        purchase_nonce(self.digest(), channel, proposal_nonce, None)
     }
     pub fn prepare(
         &self,
@@ -596,6 +588,28 @@ impl Job {
         write("job.toml", document.as_bytes())?;
         Ok(())
     }
+}
+
+pub(crate) fn purchase_nonce(
+    job: Digest,
+    channel: Digest,
+    proposal_nonce: u64,
+    attempt: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let counter = proposal_nonce.to_be_bytes();
+    let fields = [
+        job.as_bytes().as_slice(),
+        channel.as_bytes().as_slice(),
+        &counter,
+    ];
+    *match attempt {
+        Some(attempt) => hash_tuple(
+            "hellas.job.attempt.v1",
+            &[fields[0], fields[1], fields[2], attempt],
+        ),
+        None => hash_tuple("hellas.job.purchase.v1", &fields),
+    }
+    .as_bytes()
 }
 #[cfg(test)]
 mod tests;

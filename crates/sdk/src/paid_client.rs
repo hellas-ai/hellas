@@ -335,10 +335,10 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
         .await?
 }
 
-enum OpenIntent {
-    Any,
-    Job(Box<crate::job::Job>),
-    Retained,
+struct OpenIntent<'a> {
+    job: Option<Box<crate::job::Job>>,
+    allow_funding: bool,
+    before_open: Option<crate::client_owner::FundingBinding<'a>>,
 }
 
 /// Admission mode for session opening. Retained opening cannot fund a channel.
@@ -346,15 +346,6 @@ pub enum SessionOpenMode<'a> {
     Any,
     Job(&'a crate::job::Job),
     Retained,
-}
-impl OpenIntent {
-    fn job(&self) -> Option<&crate::job::Job> {
-        if let Self::Job(job) = self {
-            Some(job)
-        } else {
-            None
-        }
-    }
 }
 
 impl PaidWorkSession {
@@ -425,20 +416,51 @@ impl PaidWorkSession {
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        let intent = match mode {
-            SessionOpenMode::Any => OpenIntent::Any,
-            SessionOpenMode::Job(job) => OpenIntent::Job(Box::new(job.clone())),
-            SessionOpenMode::Retained => OpenIntent::Retained,
+        Box::pin(Self::open_with_binding(
+            args,
+            endpoint,
+            settlement_key,
+            owner,
+            mode,
+            funding,
+            None,
+        ))
+    }
+
+    /// Bind after selected-policy admission and application reservation, before
+    /// owner signing, signed-intent submission, or retained setup signatures.
+    pub(crate) async fn open_with_binding(
+        args: PaidWorkOptions,
+        endpoint: Endpoint,
+        settlement_key: Secp256k1Signer,
+        owner: Arc<ClientOwner>,
+        mode: SessionOpenMode<'_>,
+        funding: SessionFundingOptions,
+        binding: Option<(&crate::job::Job, crate::client_owner::FundingBinding<'_>)>,
+    ) -> Result<Self> {
+        let (job, allow_funding) = match mode {
+            SessionOpenMode::Any => (None, true),
+            SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
+            SessionOpenMode::Retained => (None, false),
+        };
+        let (job, before_open) = match binding {
+            Some((tracked_job, bind)) => (Some(Box::new(tracked_job.clone())), Some(bind)),
+            None => (job, None),
         };
         Box::pin(Self::open_inner(
             args,
             endpoint,
             settlement_key,
             owner,
-            intent,
+            OpenIntent {
+                job,
+                allow_funding,
+                before_open,
+            },
             None,
             funding,
         ))
+        .await
     }
 
     /// A gateway limits provider reachability separately from owner funding and
@@ -457,9 +479,11 @@ impl PaidWorkSession {
             endpoint,
             settlement_key,
             owner,
-            job.map_or(OpenIntent::Retained, |job| {
-                OpenIntent::Job(Box::new(job.clone()))
-            }),
+            OpenIntent {
+                job: job.map(|job| Box::new(job.clone())),
+                allow_funding: job.is_some(),
+                before_open: None,
+            },
             Some(connection_timeout),
             funding,
         )
@@ -471,7 +495,7 @@ impl PaidWorkSession {
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
-        intent: OpenIntent,
+        mut intent: OpenIntent<'_>,
         connection_timeout: Option<Duration>,
         funding: SessionFundingOptions,
     ) -> Result<Self> {
@@ -503,7 +527,7 @@ impl PaidWorkSession {
         let reconnect = retained.is_some();
         let (store, signed) = match retained {
             Some(retained) => retained,
-            None if matches!(intent, OpenIntent::Retained) => {
+            None if !intent.allow_funding => {
                 return Err(PaidClientError::NoRetainedChannel);
             }
             None => {
@@ -514,7 +538,7 @@ impl PaidWorkSession {
                 )
                 .await?;
                 funding.check_quote(quote.funding_value)?;
-                if let Some(job) = intent.job() {
+                if let Some(job) = intent.job.as_deref() {
                     job.check_policy(&quote.policy)?;
                 }
                 let signed = offer::fund_offer(
@@ -524,7 +548,12 @@ impl PaidWorkSession {
                     &owner,
                     &remote,
                     quote,
-                    funding.approval.as_deref(),
+                    crate::client_owner::FundingControls {
+                        poll: args.config.poll,
+                        timeout: read_timeout,
+                        approval: funding.approval.as_deref(),
+                        before_sign: intent.before_open.take(),
+                    },
                 )
                 .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
@@ -544,7 +573,7 @@ impl PaidWorkSession {
         let policy = signed.offer().policy.clone();
         let omission_bond = signed.offer().omission_bond;
         offer::check_policy(&args, &policy, omission_bond)?;
-        if let Some(job) = intent.job() {
+        if let Some(job) = intent.job.as_deref() {
             job.check_policy(&policy)?;
         }
         check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
@@ -552,6 +581,9 @@ impl PaidWorkSession {
         // Fresh and retained offers alike must name the addressed enrollment.
         let trust = args.trust()?;
         trust.verify_enrollment(&signed.offer().provider)?;
+        if let Some(bind) = intent.before_open.take() {
+            bind()?;
+        }
         let dialer = ProviderDialer::new(
             args.provider.node,
             args.provider_addrs.clone(),

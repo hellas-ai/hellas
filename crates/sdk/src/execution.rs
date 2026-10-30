@@ -326,8 +326,8 @@ pub struct ExecutionObservers {
 }
 
 impl ExecutionAttempt {
-    /// Preflight a paid job, bind its target before funding, then attach the
-    /// actual channel. Reopening an existing binding permits retained-channel
+    /// Select and preflight a paid channel, then bind its target before funding
+    /// or setup signatures. Reopening an existing binding permits retained-channel
     /// recovery only; it never authorizes fresh funding.
     pub async fn open_paid_session(
         &mut self,
@@ -343,50 +343,44 @@ impl ExecutionAttempt {
         };
         self.matches(input, terms)?;
         let job = Job::from_input(options.expected_price, input.clone())?;
-        let has_target = match &self.record {
-            AttemptRecord::Paid(purchase) => purchase.has_target(),
-            _ => return Err(ExecutionError::Identity),
-        };
-        if !has_target || self.newly_bound {
-            let quote = crate::paid_client::request_paid_quote(
-                &options,
-                &endpoint,
-                &settlement_key,
-                owner.principal(),
-            )
-            .await?;
-            job.check_policy(&quote.policy)?;
-            funding.check_quote(quote.funding_value)?;
-        }
-        self.bind_target(ExecutionTarget {
-            network: options.config.chain.network,
+        let target = PurchaseTarget {
+            network: options.config.chain.network.as_str().into(),
             provider: options.provider,
-        })?;
-        let fresh = std::mem::take(&mut self.newly_bound);
+        };
+        let AttemptRecord::Paid(purchase) = &mut self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        if purchase.has_target() && !purchase.matches_target(&target) {
+            return Err(ExecutionError::Identity);
+        }
+        let fresh = !purchase.has_target() || self.newly_bound;
         let mode = if fresh {
             crate::paid_client::SessionOpenMode::Job(&job)
         } else {
             crate::paid_client::SessionOpenMode::Retained
         };
-        let mut session = PaidWorkSession::open_with_options(
+        let mut session = PaidWorkSession::open_with_binding(
             options,
             endpoint,
             settlement_key,
             owner,
             mode,
             funding,
+            Some((
+                &job,
+                Box::new(|| {
+                    purchase.bind_target(target)?;
+                    self.newly_bound = false;
+                    Ok(())
+                }),
+            )),
         )
         .await?;
         let descriptor = session.descriptor();
-        let result = match &mut self.record {
-            AttemptRecord::Paid(purchase) => purchase
-                .bind_channel(descriptor.channel().id(), descriptor.bond_edge())
-                .map_err(ExecutionError::from),
-            _ => Err(ExecutionError::Identity),
-        };
-        if let Err(error) = result {
+        if let Err(error) = purchase.bind_channel(descriptor.channel().id(), descriptor.bond_edge())
+        {
             session.shutdown().await;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(session)
     }
@@ -874,6 +868,10 @@ impl ExecutionAttempt {
 impl<'a> ExecutionSession<'a> {
     /// Reconcile only the bound work. This never allocates a nonce or proposes
     /// another execution, though a previously verified paid result may be paid.
+    /// Original-format markers with a work ID retain exact-work recovery.
+    /// Without that ID or a per-attempt request binding, a reused channel nonce
+    /// is ambiguous even for identical input. Recovery then returns
+    /// `PurchaseError::Unfinished` and leaves the attempt unchanged.
     pub async fn recover(&mut self, attempt: &mut ExecutionAttempt) -> Result<ExecutionFacts> {
         attempt.newly_bound = false;
         match (self, &mut attempt.record) {
@@ -889,6 +887,14 @@ impl<'a> ExecutionSession<'a> {
                     session.descriptor().channel().id(),
                     session.descriptor().bond_edge(),
                 )?;
+                if purchase.work_id().is_none()
+                    && let Some(work) = session
+                        .with_state(|state| purchase.accepted_work(state))
+                        .await??
+                {
+                    // Persist identity before reconciling a result or payment.
+                    purchase.accepting(work)?;
+                }
                 if !matches!(
                     purchase.status()?,
                     crate::transact::PurchaseStatus::Paid { .. }

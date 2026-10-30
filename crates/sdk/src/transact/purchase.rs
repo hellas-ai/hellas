@@ -63,6 +63,10 @@ struct Record {
     phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<PurchaseTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_commitment: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_nonce: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,7 +141,18 @@ impl Purchase {
                 work: None,
                 phase: Phase::InputBound,
                 target: None,
+                request_commitment: None,
+                attempt_nonce: Some(rand::random()),
             });
+            purchase.persist()?;
+        } else if let Some(record) = &mut purchase.record
+            && record.nonce == 0
+            && record.work.is_none()
+            && record.attempt_nonce.is_none()
+        {
+            // An old marker that has not begun work can acquire an identity.
+            // An already-running legacy intent cannot be upgraded by guessing.
+            record.attempt_nonce = Some(rand::random());
             purchase.persist()?;
         }
         Ok(purchase)
@@ -221,6 +236,8 @@ impl Purchase {
             work: None,
             phase: Phase::TargetBound,
             target: Some(target),
+            request_commitment: None,
+            attempt_nonce: None,
         });
         self.persist()?;
         Ok(true)
@@ -244,9 +261,89 @@ impl Purchase {
             .map(Digest::from_bytes)
     }
 
+    /// Recover the accepted identity after the channel journal was committed
+    /// but before the caller marker's work ID was saved. Channel replay has
+    /// checked both signatures. The request commitment distinguishes this
+    /// intent from a later attempt that reused a nonce never proposed here.
+    pub(crate) fn accepted_work(
+        &self,
+        state: &hellas_channel::work_store::Channel,
+    ) -> Result<Option<Digest>> {
+        let Some(record) = &self.record else {
+            return Ok(None);
+        };
+        if record.nonce == 0 {
+            return Ok(None);
+        }
+        let channel = state.channel().id();
+        if record.channel != *channel.as_bytes() {
+            return Err(PurchaseError::Identity);
+        }
+        let Some(job) = state
+            .jobs()
+            .find(|job| job.authorization().proposal_nonce == record.nonce)
+        else {
+            return if record.nonce <= state.proposal_nonce_high_water() {
+                Err(self.unfinished(
+                    "the proposal nonce was consumed but no active request-bound acceptance remains",
+                ))
+            } else {
+                Ok(None)
+            };
+        };
+        let authorization = job.authorization();
+        if authorization.channel_id != channel || authorization.price != record.price {
+            return Err(PurchaseError::Identity);
+        }
+        if job.provider_signature().is_none() {
+            return Ok(None);
+        }
+        if record.attempt_nonce.is_none() {
+            return Err(self.unfinished(
+                "legacy marker has no attempt binding; a reused nonce may name another purchase",
+            ));
+        }
+        match record.request_commitment {
+            Some(expected) if expected != *authorization.request_commitment.digest().as_bytes() => {
+                return Err(PurchaseError::Identity);
+            }
+            None if job.prepared_input().is_empty() => {
+                return Err(self.unfinished(
+                    "legacy marker has no request binding and the channel retained only metadata",
+                ));
+            }
+            _ => (),
+        }
+        // Retained input additionally checks this job and attempt's request
+        // nonce. The durable commitment carries that binding through replay.
+        if !job.prepared_input().is_empty() {
+            use hellas_rpc::protocol::invocation::{MAX_INVOCATION_BYTES, PreparedInvocation};
+            let prepared = PreparedInvocation::from_canonical_bytes(
+                job.prepared_input(),
+                MAX_INVOCATION_BYTES,
+            )
+            .map_err(|_| PurchaseError::Identity)?;
+            if prepared.request.nonce != self.request_nonce(channel, record.nonce) {
+                return Err(PurchaseError::Identity);
+            }
+        }
+        Ok(Some(job.work_id()))
+    }
+
     /// A recorded nonce is an irrevocable proposal intent for tracked attempts.
     pub(crate) fn has_proposal_intent(&self) -> bool {
         self.record.as_ref().is_some_and(|record| record.nonce != 0)
+    }
+
+    pub(super) fn request_nonce(&self, channel: Digest, nonce: u64) -> [u8; 32] {
+        crate::job::purchase_nonce(
+            Digest::from_bytes(self.job),
+            channel,
+            nonce,
+            self.record
+                .as_ref()
+                .and_then(|record| record.attempt_nonce.as_ref()),
+        )
     }
 
     pub(crate) fn bind_channel(&mut self, channel: Digest, bond: EdgeId) -> Result<()> {
@@ -436,17 +533,37 @@ impl Purchase {
             None => Ok(None),
         }
     }
-    pub(super) fn begin(&mut self, channel: Digest, bond: EdgeId, nonce: u64) -> Result<()> {
+    pub(super) fn begin(
+        &mut self,
+        channel: Digest,
+        bond: EdgeId,
+        nonce: u64,
+        request_commitment: Digest,
+    ) -> Result<()> {
+        let request_commitment = *request_commitment.as_bytes();
         if let Some(record) = &mut self.record {
-            if record.phase == Phase::ChannelBound
-                && record.channel == *channel.as_bytes()
-                && record.bond == bond.to_bytes()
+            if record.channel != *channel.as_bytes()
+                || record.bond != bond.to_bytes()
+                || (record.phase != Phase::ChannelBound && record.nonce != nonce)
+                || record
+                    .request_commitment
+                    .is_some_and(|held| held != request_commitment)
             {
+                return Err(PurchaseError::Identity);
+            }
+            let changed = record.phase == Phase::ChannelBound
+                || (self.tracked && record.request_commitment.is_none());
+            if record.phase == Phase::ChannelBound {
                 record.nonce = nonce;
                 record.phase = Phase::Running;
+            }
+            if changed {
+                // Nonce and its exact request binding must survive together,
+                // before any proposal can leave the process.
+                if self.tracked {
+                    record.request_commitment = Some(request_commitment);
+                }
                 self.persist()?;
-            } else if record.channel != *channel.as_bytes() || record.nonce != nonce {
-                return Err(PurchaseError::Identity);
             }
         } else {
             self.record = Some(Record {
@@ -458,6 +575,8 @@ impl Purchase {
                 work: None,
                 phase: Phase::Running,
                 target: None,
+                request_commitment: self.tracked.then_some(request_commitment),
+                attempt_nonce: None,
             });
             self.persist()?;
         }
@@ -649,7 +768,12 @@ mod tests {
                     .bind_channel(channel, EdgeId::from_bytes([2; 32]))
                     .unwrap();
                 purchase
-                    .begin(channel, EdgeId::from_bytes([2; 32]), 3)
+                    .begin(
+                        channel,
+                        EdgeId::from_bytes([2; 32]),
+                        3,
+                        Digest::from_bytes([4; 32]),
+                    )
                     .unwrap();
                 purchase.accepting(work).unwrap();
                 if reported {
@@ -714,14 +838,43 @@ mod tests {
         let mut attempt = Purchase::open_tracked(&path, &job).unwrap();
         assert!(!attempt.bind_target(target).unwrap());
         assert_eq!(attempt.nonce(channel).unwrap(), None);
-        attempt.begin(channel, bond, 3).unwrap();
+        attempt
+            .begin(channel, bond, 3, Digest::from_bytes([4; 32]))
+            .unwrap();
         assert_eq!(attempt.nonce(channel).unwrap(), Some(3));
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            attempt
+                .begin(channel, bond, 3, Digest::from_bytes([5; 32]))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(attempt.has_proposal_intent());
         drop(attempt);
         assert!(
             Purchase::open_tracked(&path, &job)
                 .unwrap()
                 .has_proposal_intent()
+        );
+    }
+
+    #[test]
+    fn tracked_request_nonces_are_stable_and_distinguish_identical_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let job = job();
+        let channel = Digest::from_bytes([1; 32]);
+        let path = root.path().join("first");
+        let first = Purchase::open_tracked(&path, &job).unwrap();
+        let nonce = first.request_nonce(channel, 1);
+        drop(first);
+        let reopened = Purchase::open_existing_tracked(&path, &job).unwrap();
+        assert_eq!(reopened.request_nonce(channel, 1), nonce);
+        let second = Purchase::open_tracked(&root.path().join("second"), &job).unwrap();
+        assert_ne!(second.request_nonce(channel, 1), nonce);
+        let untracked = Purchase::open(&root.path().join("folder"), &job, false).unwrap();
+        assert_eq!(
+            untracked.request_nonce(channel, 1),
+            job.purchase_nonce(channel, 1)
         );
     }
 
@@ -782,7 +935,12 @@ mod tests {
                 "buy-again cannot bypass the live command lock"
             );
             purchase
-                .begin(Digest::from_bytes([1; 32]), EdgeId::from_bytes([2; 32]), 1)
+                .begin(
+                    Digest::from_bytes([1; 32]),
+                    EdgeId::from_bytes([2; 32]),
+                    1,
+                    Digest::from_bytes([4; 32]),
+                )
                 .unwrap();
             purchase.accepting(work).unwrap();
             purchase.paying(work).unwrap();
@@ -819,7 +977,12 @@ mod tests {
         {
             let mut purchase = Purchase::open(&path, &job, false).unwrap();
             purchase
-                .begin(channel, EdgeId::from_bytes([2; 32]), 3)
+                .begin(
+                    channel,
+                    EdgeId::from_bytes([2; 32]),
+                    3,
+                    Digest::from_bytes([4; 32]),
+                )
                 .unwrap();
         }
         {

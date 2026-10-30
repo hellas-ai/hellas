@@ -25,6 +25,8 @@ use std::{
 #[derive(Debug, thiserror::Error)]
 pub enum ClientOwnerError {
     #[error(transparent)]
+    Purchase(#[from] crate::transact::PurchaseError),
+    #[error(transparent)]
     Approval(#[from] AuthorityError),
     #[error(transparent)]
     Plan(#[from] CoinOwnerError),
@@ -86,10 +88,15 @@ pub(crate) struct FundingIntent {
     pub funding: Funding,
 }
 
+pub(crate) type FundingBinding<'a> =
+    Box<dyn FnOnce() -> Result<(), crate::transact::PurchaseError> + Send + 'a>;
+
 pub(crate) struct FundingControls<'a> {
     pub poll: Duration,
     pub timeout: Duration,
     pub approval: Option<&'a dyn crate::paid_client::FundingApproval>,
+    /// Runs after application reservation, before owner signing or replay submission.
+    pub before_sign: Option<FundingBinding<'a>>,
 }
 
 impl ClientOwner {
@@ -116,6 +123,7 @@ impl ClientOwner {
             poll,
             timeout,
             approval,
+            mut before_sign,
         } = controls;
         tokio::time::timeout(timeout, async {
             let _serial = self.serial.lock().await;
@@ -142,6 +150,9 @@ impl ClientOwner {
                 gate.recover(reservation, record.need)
                     .await
                     .map_err(|_| ClientOwnerError::Record("funding approval recovery denied"))?;
+            }
+            if let Some(bind) = before_sign.take() {
+                bind()?;
             }
             self.finish(
                 chain,
@@ -347,6 +358,7 @@ impl ClientOwner {
                 poll,
                 timeout,
                 approval: None,
+                before_sign: None,
             },
         )
         .await
@@ -375,6 +387,7 @@ impl ClientOwner {
             poll,
             timeout,
             approval,
+            mut before_sign,
         } = controls;
         tokio::time::timeout(timeout, async {
             let _serial = self.serial.lock().await;
@@ -464,6 +477,9 @@ impl ClientOwner {
                                 ClientOwnerError::Record("funding approval recovery denied")
                             })?;
                         }
+                        if let Some(bind) = before_sign.take() {
+                            bind()?;
+                        }
                         let funding = match self
                             .finish(
                                 chain,
@@ -519,6 +535,9 @@ impl ClientOwner {
             } else {
                 None
             };
+            if let Some(bind) = before_sign.take() {
+                bind()?;
+            }
             let assertion = self
                 .authenticator
                 .assert(Digest::from(*plan.payload_hash().as_bytes()))
@@ -826,7 +845,8 @@ mod tests {
                             FundingControls {
                                 poll: Duration::from_millis(10),
                                 timeout: hellas_chain::node::RECOVERY_TIMEOUT,
-                                approval: Some(&Deny)
+                                approval: Some(&Deny),
+                                before_sign: None,
                             },
                         )
                         .await
@@ -845,6 +865,7 @@ mod tests {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
                             approval: Some(&gate),
+                            before_sign: None,
                         },
                     );
                     tokio::pin!(funding);
@@ -866,6 +887,7 @@ mod tests {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
                             approval: Some(&gate),
+                            before_sign: None,
                         },
                     );
                     tokio::pin!(funding);
@@ -924,6 +946,7 @@ mod tests {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
                             approval: Some(&gate),
+                            before_sign: None,
                         },
                     ),
                 )
@@ -954,6 +977,7 @@ mod tests {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
                             approval: Some(&gate),
+                            before_sign: None,
                         },
                     )
                     .await
@@ -971,7 +995,8 @@ mod tests {
                         FundingControls {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
-                            approval: Some(&gate)
+                            approval: Some(&gate),
+                            before_sign: None,
                         }
                     ),
                     owner.fund_with_approval(
@@ -982,7 +1007,8 @@ mod tests {
                         FundingControls {
                             poll: Duration::from_millis(10),
                             timeout: hellas_chain::node::RECOVERY_TIMEOUT,
-                            approval: Some(&gate)
+                            approval: Some(&gate),
+                            before_sign: None,
                         }
                     ),
                 );

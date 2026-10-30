@@ -33,6 +33,7 @@ pub async fn recover_funding_intent(
                 poll: args.config.poll,
                 timeout,
                 approval,
+                before_sign: None,
             },
         )
         .await
