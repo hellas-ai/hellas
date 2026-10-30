@@ -607,6 +607,17 @@ impl<S: WorkSource> WorkGateway<S> {
         ))
     }
 }
+/// Close each distinct live endpoint once. Clones observe the same closed
+/// state, while independently bound endpoints remain individually owned.
+pub(crate) async fn close_endpoints(endpoints: &mut Vec<iroh::Endpoint>) {
+    while let Some(endpoint) = endpoints.last() {
+        if !endpoint.is_closed() {
+            endpoint.close().await;
+        }
+        endpoints.pop();
+    }
+}
+
 impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.source.fetch_routes()
@@ -637,10 +648,8 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
         Box::pin(async move {
             let tasks = self.tasks.drain().await;
             let source = self.source.shutdown().await;
-            let endpoints = std::mem::take(&mut *self.endpoints.lock().await);
-            for endpoint in endpoints {
-                endpoint.close().await;
-            }
+            let mut endpoints = self.endpoints.lock().await;
+            close_endpoints(&mut endpoints).await;
             tasks.and(source)
         })
     }
@@ -651,6 +660,24 @@ mod task_tests {
     use super::WorkTasks;
     use hellas_gateway::WorkShutdownError;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn endpoint_clones_and_distinct_endpoints_are_drained() {
+        use iroh::endpoint::presets;
+        let first = iroh::Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let second = iroh::Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let mut endpoints = vec![first.clone(), first.clone(), second.clone()];
+        super::close_endpoints(&mut endpoints).await;
+        assert!(endpoints.is_empty());
+        assert!(first.is_closed());
+        assert!(second.is_closed());
+    }
 
     #[tokio::test]
     async fn cancelled_drain_keeps_tasks_even_when_state_is_poisoned() {

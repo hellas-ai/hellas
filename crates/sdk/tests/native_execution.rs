@@ -1498,9 +1498,22 @@ async fn paid_finish(case: PaidScenario) {
     .await
     .unwrap();
     Box::pin(check_client_funding(&devnet, &approvals, 2)).await;
-    assert_ne!(second.descriptor().bond_edge(), bond);
+    let second_bond = second.descriptor().bond_edge();
+    assert_ne!(second_bond, bond);
     second.shutdown().await;
     drop(second);
+    let retained = hellas_sdk::paid_client::retained_settlement_channels(
+        &options.journal_root,
+        options.config.chain.network,
+        options.provider,
+        owner.principal(),
+        owner.delegate(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().any(|item| item.bond == bond));
+    assert!(retained.iter().any(|item| item.bond == second_bond));
     let second = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),

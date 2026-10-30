@@ -2,7 +2,7 @@
 //! paid pool. HTTP disconnects never abandon an already signed proposal.
 
 use crate::gateway_work::{
-    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
+    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource, close_endpoints,
 };
 use crate::grant_client::{GrantClientError, GrantSession, GrantSessionOptions, GrantTransport};
 use futures::future::BoxFuture;
@@ -133,18 +133,22 @@ impl GrantPoolOptions {
             return Err(GrantGatewayError::PoolSelection);
         }
         let mut identities = std::collections::HashSet::new();
+        let mut selections = std::collections::HashSet::new();
         let mut count = 0usize;
         for channel in &self.channels {
             if channel.resources.is_empty() {
                 return Err(GrantGatewayError::PoolSelection);
             }
             let offer = channel.session.target.offer();
+            let provider =
+                grant_transport(&offer.provider).map_err(|_| GrantGatewayError::Transport)?;
             if !identities.insert(*channel_id(&channel.session)?.0.as_bytes()) {
                 return Err(GrantGatewayError::PoolSelection);
             }
             let mut resources = std::collections::HashSet::new();
             for resource in &channel.resources {
                 if !resources.insert(*resource)
+                    || !selections.insert((provider, *resource))
                     || !offer
                         .grant
                         .policies
@@ -284,7 +288,7 @@ impl GrantGateway {
         options: GrantPoolOptions,
         transports: Vec<GrantTransport>,
     ) -> Result<Arc<Self>, WorkGatewayError> {
-        let endpoints: Vec<_> = transports
+        let mut endpoints: Vec<_> = transports
             .iter()
             .filter_map(|transport| match transport {
                 GrantTransport::Remote(endpoint) => Some(endpoint.clone()),
@@ -297,9 +301,7 @@ impl GrantGateway {
                 WorkGateway::new(source, 32).with_endpoints(endpoints),
             )),
             Err(error) => {
-                for endpoint in endpoints {
-                    endpoint.close().await;
-                }
+                close_endpoints(&mut endpoints).await;
                 Err(error)
             }
         }

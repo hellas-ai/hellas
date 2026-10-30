@@ -246,6 +246,17 @@ impl ClientArgs {
     ) -> super::CliResult<PaidWorkOptions> {
         let root = self.root(context);
         let config = client::config(self, &root).await?;
+        self.options_with_config(context, price, assurance, config)
+    }
+
+    fn options_with_config(
+        &self,
+        context: &Context,
+        price: u64,
+        assurance: Assurance,
+        config: hellas_sdk::work_config::WorkConfig,
+    ) -> super::CliResult<PaidWorkOptions> {
+        let root = self.root(context);
         let apple_trust = match (&self.trust_store, &self.trust_policy, assurance) {
             (Some(directory), Some(id), _) => Some(
                 hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(

@@ -43,6 +43,96 @@ fn paid_settlement_does_not_need_live_object_proofs() {
                 .source
                 .attempts
                 .load(std::sync::atomic::Ordering::SeqCst);
+            let discovered = hellas_sdk::paid_client::retained_settlement_channels(
+                &case.options.journal_root,
+                case.options.config.chain.network,
+                case.options.provider,
+                case.owner.principal(),
+                case.owner.delegate(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(discovered.len(), 1);
+            assert_eq!(discovered[0].bond, bond);
+            assert_eq!(discovered[0].price, PRICE);
+            assert_eq!(discovered[0].assurance, Assurance::ProducerSigned);
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &case.options.journal_root,
+                    case.options.config.chain.network,
+                    case.options.provider,
+                    ROOT.principal(),
+                    case.owner.delegate(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &case.options.journal_root,
+                    case.options.config.chain.network,
+                    case.options.provider,
+                    case.owner.principal(),
+                    provider_settlement().party_key(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &case.options.journal_root,
+                    case.options.config.chain.network,
+                    other_provider(&case.options).provider,
+                    case.owner.principal(),
+                    case.owner.delegate(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &case.root.path().join("no-journals"),
+                    case.options.config.chain.network,
+                    case.options.provider,
+                    case.owner.principal(),
+                    case.owner.delegate(),
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &case.options.journal_root,
+                    hellas_kernel::NetworkId::new("wrong-network").unwrap(),
+                    case.options.provider,
+                    case.owner.principal(),
+                    case.owner.delegate(),
+                )
+                .await
+                .is_err()
+            );
+            let corrupt = case.root.path().join("corrupt");
+            std::fs::create_dir_all(corrupt.join("journals")).unwrap();
+            std::fs::write(
+                corrupt
+                    .join("journals")
+                    .join(format!("setup-{}.sqlite", "00".repeat(32))),
+                b"not a journal",
+            )
+            .unwrap();
+            assert!(
+                hellas_sdk::paid_client::retained_settlement_channels(
+                    &corrupt,
+                    case.options.config.chain.network,
+                    case.options.provider,
+                    case.owner.principal(),
+                    case.owner.delegate(),
+                )
+                .await
+                .is_err()
+            );
+            case.provider.endpoint().close().await;
             let receipt = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
@@ -573,6 +663,237 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 case.approvals.0.lock().unwrap().len(),
                 1,
                 "metadata recovery never requests another signature"
+            );
+            case.endpoint.close().await;
+            case.provider.shutdown().await.unwrap();
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
+/// Run the public CLI against the same locally simulated paid channel used by
+/// the SDK tests. The Nix CLI gate builds and supplies the executable.
+#[test]
+#[ignore = "requires the CLI executable supplied by the CLI integration gate"]
+fn cli_settles_paid_channel_without_provider_or_object_proofs() {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let binary =
+        std::env::var_os("HELLAS_CLI_TEST_BINARY").expect("CLI integration gate supplies binary");
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            let mut session = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                PaidWorkSession::open(
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+            let bond = session.descriptor().bond_edge();
+            let result = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                session.run(
+                    Some(case.prepared_input.clone()),
+                    &InvocationContent::Ephemeral(Default::default()),
+                    false,
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.credited_cumulative, PRICE);
+            session.shutdown().await;
+            drop(session);
+            let root = case.root.path();
+            let state = root.join("cli-state");
+            let journals = state
+                .join("channels")
+                .join(case.options.provider.to_string());
+            std::fs::create_dir_all(journals.parent().unwrap()).unwrap();
+            std::fs::rename(&case.options.journal_root, &journals).unwrap();
+            case.options.journal_root = journals;
+
+            // The client's already-funded node signer is [0x21; 32]. Encode a
+            // normal private identity containing exactly that signer for the CLI.
+            let root_key = ProducerSigningKey::from_secret_bytes([0x41; 32]).unwrap();
+            let node_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+            let transport = iroh::SecretKey::from_bytes(&[0x42; 32]);
+            let enrollment = enrollment(
+                &root_key,
+                &node_key,
+                *transport.public().as_bytes(),
+                [0x43; 32],
+            );
+            let mut identity = hellas_rpc::DagCborEncoder::new();
+            identity.array(6);
+            identity.str("hellas.provider.identity.persistence.v3");
+            identity.u64(3);
+            identity.array(2);
+            identity.u64(0);
+            identity.bytes(&[0x41; 32]);
+            identity.bytes(&[0x21; 32]);
+            identity.bytes(&[0x42; 32]);
+            identity.bytes(&enrollment.canonical_bytes());
+            let identity_path = root.join("cli-identity");
+            hellas_private::write_atomically(&identity_path, ".writing", &identity.into_bytes())
+                .unwrap();
+            let passkey = root.join("cli-passkey");
+            hellas_private::write_atomically(&passkey, ".writing", &[0x13; 32]).unwrap();
+            let genesis = serde_json::to_vec(case.devnet.genesis()).unwrap();
+            let genesis_path = root.join("cli-genesis.json");
+            std::fs::write(&genesis_path, &genesis).unwrap();
+            let trust = serde_json::json!({
+                "schema_version": 1,
+                "network_id": case.devnet.network().as_str(),
+                "genesis_sha256": hex::encode(Sha256::hash(&genesis)),
+                "epochs": [{"epoch":0,"start_height":0,"end_height":null,
+                            "threshold_identity":hex::encode(&case.devnet.consensus_info().threshold_identity)}],
+            });
+            let trust_path = root.join("cli-trust.json");
+            std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
+            case.provider.endpoint().close().await;
+            case.relays
+                .source
+                .unavailable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let reads = case
+                .relays
+                .source
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    hellas_sdk::paid_client::settle_channel(
+                        &case.options,
+                        bond,
+                        case.owner.principal(),
+                        &client_settlement(),
+                    ),
+                )
+                .await
+                .is_err()
+            );
+            let journal = std::fs::read_dir(case.options.journal_root.join("journals"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("channel-")
+                        && path.extension().is_some_and(|ext| ext == "sqlite")
+                })
+                .unwrap();
+            let stem = journal.file_stem().unwrap().to_str().unwrap();
+            let (_, replay) = hellas_channel::work_store::journal::Journal::inspect(
+                &case.options.journal_root,
+                stem,
+            )
+            .await
+            .unwrap();
+            assert!(
+                replay.records.iter().any(|bytes| matches!(
+                    hellas_channel::work_store::ChannelRecord::decode(bytes).unwrap(),
+                    hellas_channel::work_store::ChannelRecord::ClosePrepared { .. }
+                )),
+                "CLI must resume an already prepared close"
+            );
+            let mut command = tokio::process::Command::new(&binary);
+            command
+                .arg("--identity")
+                .arg(&identity_path)
+                .arg("--passkey")
+                .arg(&passkey)
+                .arg("transact")
+                .arg("--settle")
+                .arg("--provider")
+                .arg(case.options.provider.to_string())
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--trust")
+                .arg(&trust_path)
+                .arg("--genesis")
+                .arg(&genesis_path)
+                .arg("--timeout")
+                .arg("60s");
+            for validator in &case.relays.urls {
+                command.arg("--validator").arg(validator);
+            }
+            let output = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                command.output(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains(&format!("provider payout {PRICE}")),
+                "{stdout}"
+            );
+            assert_eq!(
+                case.relays
+                    .source
+                    .attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                reads
+            );
+            // A different owner must not close this channel, even when the
+            // journal is present and the provider cannot be contacted.
+            let wrong_passkey = root.join("wrong-passkey");
+            hellas_private::write_atomically(&wrong_passkey, ".writing", &[0x11; 32]).unwrap();
+            let mut wrong = tokio::process::Command::new(&binary);
+            wrong
+                .arg("--identity")
+                .arg(&identity_path)
+                .arg("--passkey")
+                .arg(&wrong_passkey)
+                .arg("transact")
+                .arg("--settle")
+                .arg("--provider")
+                .arg(case.options.provider.to_string())
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--trust")
+                .arg(&trust_path)
+                .arg("--genesis")
+                .arg(&genesis_path)
+                .arg("--timeout")
+                .arg("60s");
+            for validator in &case.relays.urls {
+                wrong.arg("--validator").arg(validator);
+            }
+            let wrong = wrong.output().await.unwrap();
+            assert!(!wrong.status.success());
+            assert!(String::from_utf8_lossy(&wrong.stderr).contains("settlement client identity"));
+            let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
+                &case.options,
+                bond,
+                case.owner.principal(),
+                case.owner.delegate(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt.provider_payout, PRICE);
+            assert_eq!(
+                receipt.client_returned + receipt.provider_payout,
+                CLIENT_FUNDING
             );
             case.endpoint.close().await;
             case.provider.shutdown().await.unwrap();

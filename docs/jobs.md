@@ -37,8 +37,12 @@ Those checks and the advertised input limits run before new channel funding.
 Fetch's encoded-input size check uses the largest purchase-nonce encoding,
 reserving up to 32 bytes more than a particular purchase needs. One owner
 approval funds the quoted channel amount; later jobs reuse its balance.
-`--settle` closes the channel after the job. With no `--job`, it closes
-retained channels without requesting new funding.
+`--settle` closes the channel after the job. With no `--job`, it discovers
+retained channels from signed local journals and closes their exact bonds using
+verified finalized blocks. This path resumes an interrupted close without
+contacting the provider, reading live object proofs or requesting new funding.
+Missing, corrupt or mismatched journals stop settlement rather than being
+silently replaced.
 
 ## Results
 

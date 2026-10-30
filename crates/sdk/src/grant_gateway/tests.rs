@@ -93,6 +93,39 @@ async fn explicit_pool_shares_one_channel_and_selects_least_pending_resource() {
         .await
         .is_err()
     );
+    // A second channel from the same provider cannot expose the same
+    // resource as a different account selection.
+    let mut other_offer = options.target.offer().clone();
+    other_offer.grant.id = hellas_auth::authority::GrantId([77; 16]);
+    let signed = SignedOffer::sign(
+        other_offer,
+        &hellas_channel::test_support::actors::PROVIDER.node_key(),
+    )
+    .unwrap();
+    let mut other_options = options.clone();
+    other_options.target = crate::grant_client::UnpinnedOffer::decode(
+        &signed.encode().unwrap(),
+        hellas_auth::authority::UnixMillis(0),
+    )
+    .unwrap()
+    .pin(options.target.trust())
+    .unwrap();
+    assert!(
+        GrantPoolOptions {
+            channels: vec![
+                GrantPoolChannel {
+                    session: options.clone(),
+                    resources: vec![first]
+                },
+                GrantPoolChannel {
+                    session: other_options,
+                    resources: vec![first]
+                },
+            ]
+        }
+        .validate()
+        .is_err()
+    );
     assert_eq!(host.backend.calls.load(Ordering::SeqCst), 0);
     let pool = GrantPool::open_pool(
         GrantPoolOptions {

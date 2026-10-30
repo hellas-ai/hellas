@@ -5,7 +5,7 @@ use hellas_chain::{
     client::RemoteLightClient,
 };
 use hellas_sdk::{
-    paid_client::{PaidClientError, PaidWorkSession, bind_paid_endpoint},
+    paid_client::{finalized_channel_settlement, retained_settlement_channels, settle_channel},
     work_config::{ChainCrossCheck, WorkConfig},
 };
 use std::path::Path;
@@ -127,43 +127,39 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         println!("no open channels with {}", args.provider.address);
         return Ok(());
     }
-    let owner = args.owner(context)?;
-    let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-    let result = async {
-        let mut closed = 0;
-        while let Some((policy, assurance)) = hellas_sdk::paid_client::retained_paid_policy(
-            &config,
-            &journals,
-            args.provider.address,
-            args.timeout,
+    let owner = hellas_auth::authority::PrincipalId::from_public_key(
+        hellas_auth::PublicKey::P256(context.owner.party_key().to_bytes()),
+    )?;
+    let channels = retained_settlement_channels(
+        &journals,
+        config.chain.network,
+        args.provider.address,
+        owner,
+        context.settlement.party_key(),
+    )
+    .await?;
+    let mut closed = 0;
+    for channel in channels {
+        let options =
+            args.options_with_config(context, channel.price, channel.assurance, config.clone())?;
+        if finalized_channel_settlement(
+            &options,
+            channel.bond,
+            owner,
+            context.settlement.party_key(),
         )
         .await?
+        .is_some()
         {
-            let options = args
-                .options(context, policy.payment_policy.fixed_price, assurance)
-                .await?;
-            let mut session = match PaidWorkSession::open_retained(
-                options,
-                endpoint.clone(),
-                context.settlement.clone(),
-                owner.clone(),
-            )
-            .await
-            {
-                Ok(session) => session,
-                Err(PaidClientError::NoRetainedChannel) => break,
-                Err(error) => return Err(error.into()),
-            };
-            let channel = session.descriptor().channel().id();
-            let result = session.settle().await;
-            session.shutdown().await;
-            println!("settled channel {channel}: provider payout {}", result?);
-            closed += 1;
+            continue;
         }
-        println!("settled {closed} channels with {}", args.provider.address);
-        Ok(())
+        let receipt = settle_channel(&options, channel.bond, owner, &context.settlement).await?;
+        println!(
+            "settled channel {}: provider payout {}",
+            receipt.channel, receipt.provider_payout
+        );
+        closed += 1;
     }
-    .await;
-    endpoint.close().await;
-    result
+    println!("settled {closed} channels with {}", args.provider.address);
+    Ok(())
 }

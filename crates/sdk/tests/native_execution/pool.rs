@@ -25,15 +25,15 @@ use std::{
     time::Duration,
 };
 
-struct Provider {
-    options: GrantSessionOptions,
-    service: GrantService,
-    calls: Arc<AtomicUsize>,
-    resource: hellas_auth::authority::ResourceId,
-    endpoint: iroh::EndpointId,
+pub(super) struct Provider {
+    pub(super) options: GrantSessionOptions,
+    pub(super) service: GrantService,
+    pub(super) calls: Arc<AtomicUsize>,
+    pub(super) resource: hellas_auth::authority::ResourceId,
+    pub(super) endpoint: iroh::EndpointId,
 }
 
-async fn provider(root: &Path, seed: u8, model: Option<&str>) -> Provider {
+pub(super) async fn provider(root: &Path, seed: u8, model: Option<&str>) -> Provider {
     let now = UnixMillis(1000);
     let transport = iroh::SecretKey::from_bytes(&[seed; 32]).public();
     let identity = software_enrollment(seed, *transport.as_bytes());

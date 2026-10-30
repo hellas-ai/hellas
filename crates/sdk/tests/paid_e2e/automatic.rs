@@ -232,15 +232,35 @@ impl hellas_executor::catena::driver::Device for HostScalarDevice {
 
 /// Only the device is a double. Setup, Work, journals, clocks and owner
 /// signatures use the native services and the six-validator chain.
+fn composition_policies() -> Vec<hellas_authority::model::grant::records::GrantPolicy> {
+    let mut compute = hellas_authority::test_support::compute::Compute.policy();
+    compute.resource = auth::ResourceId(Digest::hash(b"composition compute"));
+    let mut http = hellas_authority::test_support::definition(
+        auth::GrantId([71; 16]),
+        hellas_channel::test_support::principal(1).0,
+    )
+    .policies
+    .remove(0);
+    http.name = "http".into();
+    let mut template = hellas_authority::test_support::chat_resource("https://provider.fixture", 4);
+    template.accounting = hellas_authority::model::grant::resource::AccountingProfile::None;
+    hellas_authority::test_support::use_https(&mut http, template);
+    vec![compute, http]
+}
+
 struct Provider {
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
     node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
+    funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
+    funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
     endpoint: Endpoint,
     clock: WorkWatcher,
     serving: tokio::task::JoinHandle<()>,
     admin: hellas_authority::grant_service::WorkAdministration,
+    grants: hellas_authority::grant_service::GrantService,
+    grant_calls: Arc<std::sync::atomic::AtomicUsize>,
     compute: HostCompute,
 }
 
@@ -250,6 +270,8 @@ struct RecoveringSetup {
     node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
+    funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
+    funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
 }
 
 impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
@@ -268,6 +290,29 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
                     "held funded-offer read",
                 ));
             }
+            let step = self
+                .funding_refusal
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if step != 0 {
+                self.funding_requests.lock().unwrap().push(request.clone());
+                if step == 1 {
+                    self.funding_refusal
+                        .store(2, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(RequestOfferResponse {
+                        outcome: Some(
+                            hellas_rpc::pb::work::request_offer_response::Outcome::Refused(
+                                hellas_rpc::pb::work::OfferRefused {
+                                    code: OfferRefusalCode::NeedsFunding as i32,
+                                    required: FUNDING,
+                                },
+                            ),
+                        ),
+                    }
+                    .into());
+                }
+                self.funding_refusal
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+            }
             let height = self
                 .funded_height
                 .swap(0, std::sync::atomic::Ordering::SeqCst);
@@ -283,7 +328,7 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
             self.unavailable
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        result
+        result.map(Into::<hellas_rpc::call::WithTrailer<RequestOfferResponse>>::into)
     }
 
     async fn exchange_setup(
@@ -324,20 +369,34 @@ impl Provider {
         )
         .await
         .unwrap();
-        let authority = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1)));
+        let authority =
+            NodeCoordinator::new(store, Arc::new(|| UnixMillis::now().unwrap_or_default()));
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
+        let grant_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let grants = hellas_authority::grant_service::GrantService::from_node(
             authority.clone(),
             &enrollment,
             key.clone(),
-            hellas_authority::test_support::common_node::NoBackend,
+            hellas_channel::test_support::backend::Backend {
+                calls: grant_calls.clone(),
+                signer: key.clone(),
+                finish: hellas_channel::test_support::backend::Completion::Immediate,
+                reply: hellas_channel::test_support::backend::Reply::events(
+                    hellas_channel::test_support::backend::Reply::http(
+                        200,
+                        "application/json",
+                        "{}",
+                    ),
+                ),
+                ..Default::default()
+            },
             vec![],
         )
         .await
         .unwrap();
         let admin = hellas_authority::grant_service::WorkAdministration::new(
-            grants,
-            vec![],
+            grants.clone(),
+            composition_policies(),
             std::num::NonZeroU64::new(5000).unwrap(),
         )
         .unwrap();
@@ -380,13 +439,17 @@ impl Provider {
         let clock = WorkWatcher::spawn(runner);
         let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let unavailable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let funding_refusal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let funding_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let setup = RecoveringSetup {
             inner: setup,
             node: node.clone(),
             funded_height: funded_height.clone(),
             unavailable: unavailable.clone(),
+            funding_refusal: funding_refusal.clone(),
+            funding_requests: funding_requests.clone(),
         };
-        let router = WorkRouter::payment(work);
+        let router = WorkRouter::both(work, grants.clone());
         let open = Arc::new(
             hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, enrollment.clone(), None)
                 .unwrap(),
@@ -422,7 +485,8 @@ impl Provider {
                             return;
                         };
                         while let Ok(Some(inbound)) = transport.accept().await {
-                            if dispatcher.dispatch(inbound).await.is_err() {
+                            if let Err(error) = dispatcher.dispatch(inbound).await {
+                                eprintln!("fixture Work dispatcher stopped: {error}");
                                 break;
                             }
                         }
@@ -438,10 +502,14 @@ impl Provider {
             node,
             funded_height,
             unavailable,
+            funding_refusal,
+            funding_requests,
             endpoint,
             clock,
             serving,
             admin,
+            grants,
+            grant_calls,
             compute,
         }
     }
@@ -1990,6 +2058,211 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     })
 }
 
+/// Exercise paid and granted Compute on one endpoint, then dispatch HTTPS
+/// through that endpoint and a separately authorized second provider.
+fn grant_composition<'a>(
+    provider: &'a Provider,
+    secret: &'a auth::CredentialSecret,
+    root: &'a std::path::Path,
+) -> futures::future::BoxFuture<'a, ()> {
+    Box::pin(async move {
+        use base64::Engine as _;
+        use futures::StreamExt as _;
+        use hellas_authority::model::grant::{
+            budget::{Limit, Meter, Window},
+            records::{Offer, SignedOffer},
+        };
+        use hellas_authority::test_support::{common_node, definition};
+        use hellas_channel::test_support::principal;
+        use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
+        use hellas_sdk::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
+        use hellas_sdk::grant_gateway::{GrantPool, GrantPoolChannel, GrantPoolOptions};
+        use hellas_sdk::node_control::profile::ClientProfile;
+
+        let subject = principal(1).0;
+        let policies = composition_policies();
+        let mut definition = definition(auth::GrantId([71; 16]), subject);
+        definition.policies = policies.clone();
+        let admin = common_node::WorkAdmin::new(provider.grants.clone(), secret, policies).await;
+        admin.capacity(4, vec![]).await;
+        admin
+            .budgets(
+                common_node::POOL,
+                subject,
+                vec![Limit {
+                    meter: Meter::Requests,
+                    window: Window::Total,
+                    amount: 2,
+                }],
+                2,
+            )
+            .await;
+        admin.create(definition.clone()).await;
+        let node = provider.grants.node();
+        let credential =
+            common_node::execution_credential(&node, secret, subject, definition.id).await;
+        let caller = hellas_authority::test_support::session(&node, secret).await;
+        let now = UnixMillis::now().unwrap();
+        let signed = SignedOffer::sign(
+            Offer {
+                network: hellas_authority::model::grant::grant_network(),
+                provider: provider.enrollment.clone(),
+                grant: definition.clone(),
+                generation: 0,
+                sequence: 1,
+                valid_until: UnixMillis(now.0 + 600_000),
+                addresses: provider
+                    .endpoint
+                    .bound_sockets()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
+            &ProducerSigningKey::from_secret_bytes([2; 32]).unwrap(),
+        )
+        .unwrap();
+        let target = UnpinnedOffer::decode(&signed.encode().unwrap(), now)
+            .unwrap()
+            .pin(&hellas_client::ProviderTrustAnchor {
+                expected_genesis: provider.enrollment.content_id(),
+                required_assurance: Assurance::ProducerSigned,
+                apple_app_attest: None,
+            })
+            .unwrap();
+        let options = GrantSessionOptions {
+            target,
+            principal: subject,
+            signer: Arc::new(principal(1).1),
+            application: Arc::new(ClientProfile {
+                authority: caller.authority(),
+                authorization: common_node::EXECUTION_AUTHORIZATION,
+                credential,
+                local: None,
+            }),
+            journal_root: root.join("composition-grant-client"),
+            control_timeout: Duration::from_secs(10),
+        };
+        let transport = bind_paid_endpoint(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let environment = hellas_channel::test_support::channel::environment();
+        let mut content = hellas_channel::content::EphemeralContent::default();
+        content.insert(environment.canonical_bytes().unwrap());
+        let input = hellas_sdk::job::JobInput::Compute {
+            environment,
+            plan: hellas_channel::test_support::channel::plan(),
+            inputs: vec![],
+            content: hellas_channel::content::InvocationContent::Ephemeral(content),
+        };
+        let terms = hellas_sdk::execution::ExecutionTerms::Grant {
+            resource: definition.policies[0].resource,
+        };
+        let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(
+            &root.join("composition-attempt"),
+            &input,
+            terms,
+        )
+        .unwrap();
+        let mut session = attempt
+            .open_grant_session(options.clone(), GrantTransport::Remote(transport.clone()))
+            .await
+            .unwrap();
+        let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
+            .execute(
+                input,
+                terms,
+                &principal(1).1,
+                Default::default(),
+                Some(&mut attempt),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            hellas_sdk::execution::ExecutionResult::Grant(_)
+        ));
+        session.shutdown().await.unwrap();
+        drop(session);
+
+        let other = super::pool::provider(&root.join("composition-other"), 3, None).await;
+        let pool = GrantPool::open_pool(
+            GrantPoolOptions {
+                channels: vec![
+                    GrantPoolChannel {
+                        session: options,
+                        resources: vec![definition.policies[1].resource],
+                    },
+                    GrantPoolChannel {
+                        session: other.options.clone(),
+                        resources: vec![other.resource],
+                    },
+                ],
+            },
+            vec![
+                GrantTransport::Remote(transport),
+                GrantTransport::Local(other.service.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+        let routes = pool.fetch_routes();
+        let first = routes
+            .iter()
+            .find(|route| route.provider == provider.endpoint.id())
+            .unwrap();
+        let second = routes
+            .iter()
+            .find(|route| route.provider == other.endpoint)
+            .unwrap();
+        let request =
+            |route: &hellas_gateway::FetchRoute,
+             policy: &hellas_authority::model::grant::records::GrantPolicy| {
+                let https = policy.https.as_ref().unwrap();
+                let body = hellas_rpc::http_fetch::HttpFetchRequest {
+                    url: format!("{}{}", https.origin, https.paths[0]),
+                    method: "POST".into(),
+                    headers: vec![],
+                    body_base64: base64::engine::general_purpose::STANDARD
+                        .encode(br#"{"model":"fixture"}"#),
+                    tls: https.tls.clone(),
+                    credential: https.credential.clone(),
+                    max_response_bytes: https.max_response_bytes,
+                };
+                WorkFetchRequest {
+                    provider: route.provider,
+                    resource: route.resource,
+                    channel: route.channel,
+                    service: "openai".into(),
+                    method: "responses".into(),
+                    body: serde_json::to_vec(&body).unwrap(),
+                }
+            };
+        let mut crossed = request(first, &definition.policies[1]);
+        crossed.channel = second.channel;
+        assert!(pool.fetch(crossed).is_err());
+        for (route, policy) in [
+            (first, &definition.policies[1]),
+            (second, &other.options.target.offer().grant.policies[0]),
+        ] {
+            let mut stream = pool.fetch(request(route, policy)).unwrap();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+        }
+        let mut exhausted = pool.fetch(request(first, &definition.policies[1])).unwrap();
+        assert!(exhausted.next().await.unwrap().is_err());
+        assert_eq!(
+            provider
+                .grant_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(other.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        pool.drain().await.unwrap();
+        other.service.drain().await.unwrap();
+    })
+}
+
 async fn finish(case: Box<Case>) {
     let Case {
         identity,
@@ -2193,9 +2466,18 @@ async fn finish(case: Box<Case>) {
                 () = async { while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
             }
         }).await.expect("one session retries its funded offer while the provider source is unavailable");
+        provider.funding_refusal.store(1, std::sync::atomic::Ordering::SeqCst);
         provider.funded_height.store(0, std::sync::atomic::Ordering::SeqCst);
         open.await
     }).await.unwrap();
+    {
+        let requests = provider.funding_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one refusal and one retry");
+        assert_eq!(
+            requests[0], requests[1],
+            "retry uses the identical signed request"
+        );
+    }
     assert_ne!(
         fresh.descriptor().bond_edge(),
         third.offer().proposal.bond_edge(),
@@ -2209,6 +2491,8 @@ async fn finish(case: Box<Case>) {
     );
     fresh.shutdown().await;
     drop(fresh);
+    grant_composition(&provider, &secret, root.path()).await;
+    provider.grants.drain().await.unwrap();
     provider.shutdown().await;
     endpoint.close().await;
     devnet.shutdown().await;

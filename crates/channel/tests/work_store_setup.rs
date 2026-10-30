@@ -3307,3 +3307,19 @@ async fn a_terminal_decision_waits_for_the_block_explaining_spent_funding() {
         SetupProgress::Faulted(SetupFault::BondFundingSpent)
     );
 }
+
+#[tokio::test]
+async fn existing_only_setup_never_creates_a_missing_journal() {
+    let dir = temp();
+    let error = SetupStore::open_existing(
+        dir.path(),
+        network(),
+        bond_edge(),
+        Role::Provider,
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect_err("missing setup cannot be recreated for recovery");
+    assert!(matches!(error, WorkStoreError::Journal(_)));
+    assert!(!journal_path(dir.path(), network(), bond_edge()).exists());
+}

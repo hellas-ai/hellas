@@ -19,6 +19,66 @@ pub struct FinalizedChannelSettlement {
     pub provider_payout: u64,
 }
 
+/// A retained client channel identified from its signed setup journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedSettlementChannel {
+    pub bond: EdgeId,
+    pub price: u64,
+    pub assurance: hellas_rpc::Assurance,
+}
+
+/// Enumerate exact retained channels without contacting a provider or reading
+/// live object proofs. Unidentified, incomplete or mismatched journals fail
+/// closed so an existing obligation is never silently ignored.
+pub async fn retained_settlement_channels(
+    root: &std::path::Path,
+    network: NetworkId,
+    provider: hellas_client::ProviderAddress,
+    owner: PrincipalId,
+    delegate: Key,
+) -> Result<Vec<RetainedSettlementChannel>> {
+    let found = hellas_channel::work_store::discover_setups(root, network).await?;
+    if !found.unidentified.is_empty() {
+        return Err(PaidClientError::MissingState("unidentified client journal"));
+    }
+    let verifier = Secp256k1Verifier::new();
+    let mut channels = Vec::new();
+    for entry in found.setups.into_iter().filter(|s| s.role == Role::Client) {
+        let setup =
+            SetupStore::open_existing(root, network, entry.bond_edge, Role::Client, &verifier)
+                .await?;
+        let (_, signed) = setup
+            .state()
+            .offer()
+            .ok_or(PaidClientError::MissingState("settlement signed offer"))?;
+        signed.check()?;
+        let actual = hellas_client::ProviderAddress::of(&signed.offer().provider)?;
+        if actual.node != provider.node {
+            continue;
+        }
+        if actual != provider {
+            return Err(PaidClientError::RetainedEnrollment(provider));
+        }
+        if matches!(
+            setup.state().end(),
+            Some(hellas_channel::work_store::SetupEnd::Aborted(_))
+        ) {
+            continue;
+        }
+        checked_descriptor(&setup, entry.bond_edge, owner, delegate)?;
+        let assurance = match signed.offer().provider.genesis.statement.root_kind {
+            hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
+            _ => hellas_rpc::Assurance::ProducerSigned,
+        };
+        channels.push(RetainedSettlementChannel {
+            bond: entry.bond_edge,
+            price: signed.offer().policy.payment_policy.fixed_price,
+            assurance,
+        });
+    }
+    Ok(channels)
+}
+
 /// Recover a specific channel's settlement from its signed journals and a
 /// freshly verified finalized block. Returns `None` for a channel that has not
 /// closed. Missing or pruned evidence is an error, never a zero-spend result.
@@ -98,6 +158,32 @@ struct SettlementRecovery {
     funding_value: u64,
 }
 
+fn checked_descriptor(
+    setup: &SetupStore,
+    bond: EdgeId,
+    owner: PrincipalId,
+    delegate: Key,
+) -> Result<&hellas_channel::model::setup::CloseDescriptor> {
+    let descriptor = setup
+        .state()
+        .close_descriptor()
+        .ok_or(PaidClientError::MissingState(
+            "settlement channel descriptor",
+        ))?;
+    let client = descriptor.channel().payment_terms().parties().maker();
+    if client.owner().to_bytes() != *owner.as_bytes()
+        || client.signer() != delegate
+        || client.payout_delegate() != Some(delegate)
+        || descriptor.bond_edge() != bond
+    {
+        return Err(PaidClientError::InputMismatch("settlement client identity"));
+    }
+    if setup.state().origin().is_none() {
+        return Err(PaidClientError::MissingState("settlement channel origin"));
+    }
+    Ok(descriptor)
+}
+
 async fn open_settlement(
     args: &PaidWorkOptions,
     bond: EdgeId,
@@ -118,7 +204,7 @@ async fn open_settlement(
         return Err(PaidClientError::MissingState("settlement setup journal"));
     }
     let verifier = Secp256k1Verifier::new();
-    let setup = SetupStore::open(
+    let setup = SetupStore::open_existing(
         &args.journal_root,
         args.config.chain.network,
         bond,
@@ -135,21 +221,8 @@ async fn open_settlement(
     if hellas_client::ProviderAddress::of(&signed.offer().provider)? != args.provider {
         return Err(PaidClientError::RetainedEnrollment(args.provider));
     }
-    let descriptor = setup
-        .state()
-        .close_descriptor()
-        .ok_or(PaidClientError::MissingState(
-            "settlement channel descriptor",
-        ))?;
+    let descriptor = checked_descriptor(&setup, bond, owner, delegate)?;
     let channel = descriptor.channel().clone();
-    let client = channel.payment_terms().parties().maker();
-    if client.owner().to_bytes() != *owner.as_bytes()
-        || client.signer() != delegate
-        || client.payout_delegate() != Some(delegate)
-        || descriptor.bond_edge() != bond
-    {
-        return Err(PaidClientError::InputMismatch("settlement client identity"));
-    }
     let values = signed.offer().policy.expected_payment_values;
     let funding_value = values
         .value()

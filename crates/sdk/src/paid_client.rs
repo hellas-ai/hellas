@@ -12,8 +12,11 @@ pub(crate) mod offer;
 mod settlement;
 pub use error::PaidClientError;
 pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
-pub use offer::{PaidQuote, request_paid_quote, retained_paid_policy};
-pub use settlement::{FinalizedChannelSettlement, finalized_channel_settlement, settle_channel};
+pub use offer::{PaidQuote, request_paid_quote};
+pub use settlement::{
+    FinalizedChannelSettlement, RetainedSettlementChannel, finalized_channel_settlement,
+    retained_settlement_channels, settle_channel,
+};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;

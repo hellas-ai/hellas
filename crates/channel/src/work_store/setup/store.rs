@@ -30,6 +30,28 @@ impl SetupStore {
         role: Role,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(root, network, bond_edge, role, verifier, false).await
+    }
+
+    /// Reopen an existing setup without creating a replacement journal.
+    pub async fn open_existing<V: SigVerifier>(
+        root: &Path,
+        network: NetworkId,
+        bond_edge: EdgeId,
+        role: Role,
+        verifier: &V,
+    ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(root, network, bond_edge, role, verifier, true).await
+    }
+
+    async fn open_inner<V: SigVerifier>(
+        root: &Path,
+        network: NetworkId,
+        bond_edge: EdgeId,
+        role: Role,
+        verifier: &V,
+        existing: bool,
+    ) -> Result<Self, WorkStoreError> {
         let key = setup_key(network, bond_edge);
         let id = JournalId {
             kind: JournalKind::Setup,
@@ -37,7 +59,11 @@ impl SetupStore {
             key: key.into_bytes(),
         };
         let replayed = hellas_rpc::observe::Timing::start();
-        let (journal, replay) = Journal::open_latest(root, &setup_stem(key), id).await?;
+        let (journal, replay) = if existing {
+            Journal::open_existing(root, &setup_stem(key), id).await?
+        } else {
+            Journal::open_latest(root, &setup_stem(key), id).await?
+        };
         let mut state = match &replay.checkpoint {
             Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
             None => SetupState::new(network, bond_edge, role),
