@@ -1070,7 +1070,25 @@ fn expiry_at(
 ///
 /// [`CatchUpError`] for the read, and [`BlockSourceError`] wrapped in
 /// it when the sink will not take the transaction.
-pub async fn advance_close<C, S, T, V>(
+pub fn advance_close<'a, C, S, T, V>(
+    source: &'a S,
+    sink: &'a T,
+    channel: &'a mut C,
+    verifier: &'a V,
+) -> impl Future<Output = Result<CloseProgress, CatchUpError>> + 'a
+where
+    C: CloseChannel + 'a,
+    S: FinalizedBlocks + ?Sized + 'a,
+    T: TxSink + ?Sized + 'a,
+    V: SigVerifier + 'a,
+{
+    // Construct the driver outside its caller's poll frame. Contest history
+    // replay carries bounded kernel witnesses and journal futures that are too
+    // large to compose inline at every call site.
+    Box::pin(advance_close_inner(source, sink, channel, verifier))
+}
+
+async fn advance_close_inner<C, S, T, V>(
     source: &S,
     sink: &T,
     channel: &mut C,
