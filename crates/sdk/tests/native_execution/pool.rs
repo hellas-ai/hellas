@@ -34,6 +34,15 @@ pub(super) struct Provider {
 }
 
 pub(super) async fn provider(root: &Path, seed: u8, model: Option<&str>) -> Provider {
+    provider_with_limit(root, seed, model, 1).await
+}
+
+pub(super) async fn provider_with_limit(
+    root: &Path,
+    seed: u8,
+    model: Option<&str>,
+    request_limit: u64,
+) -> Provider {
     let now = UnixMillis(1000);
     let transport = iroh::SecretKey::from_bytes(&[seed; 32]).public();
     let identity = software_enrollment(seed, *transport.as_bytes());
@@ -76,7 +85,7 @@ pub(super) async fn provider(root: &Path, seed: u8, model: Option<&str>) -> Prov
             vec![Limit {
                 meter: Meter::Requests,
                 window: Window::Total,
-                amount: 1,
+                amount: request_limit,
             }],
             2,
         ),

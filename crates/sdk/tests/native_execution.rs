@@ -19,6 +19,8 @@ fn catena_child() {
 mod automatic;
 #[path = "paid_e2e/budget.rs"]
 mod budget;
+#[path = "native_execution/cli_composition.rs"]
+mod cli_composition;
 #[path = "paid_e2e/gateway.rs"]
 mod gateway;
 #[path = "native_execution/grant.rs"]
@@ -1655,6 +1657,13 @@ async fn provider_close_offline(
 /// never seen through an automatic offer, and pays for it exactly once.
 #[test]
 fn unseen_program_pays_exactly_once() {
+    run(automatic::exercise);
+}
+
+#[test]
+#[ignore = "requires the CLI executable supplied by the CLI integration gate"]
+fn cli_paid_and_grant_two_provider_composition() {
+    assert!(std::env::var_os("HELLAS_CLI_TEST_BINARY").is_some());
     run(automatic::exercise);
 }
 

@@ -2080,6 +2080,10 @@ fn grant_composition<'a>(
         use hellas_sdk::node_control::profile::ClientProfile;
 
         let subject = principal(1).0;
+        let cli_binary = std::env::var_os("HELLAS_CLI_TEST_BINARY");
+        let data_root = root
+            .join("composition-cli-data")
+            .join(format!("p256-{}", hex::encode(subject.as_bytes())));
         let policies = composition_policies();
         let mut definition = definition(auth::GrantId([71; 16]), subject);
         definition.policies = policies.clone();
@@ -2092,7 +2096,7 @@ fn grant_composition<'a>(
                 vec![Limit {
                     meter: Meter::Requests,
                     window: Window::Total,
-                    amount: 2,
+                    amount: if cli_binary.is_some() { 3 } else { 2 },
                 }],
                 2,
             )
@@ -2139,7 +2143,7 @@ fn grant_composition<'a>(
                 credential,
                 local: None,
             }),
-            journal_root: root.join("composition-grant-client"),
+            journal_root: data_root.join("channels"),
             control_timeout: Duration::from_secs(10),
         };
         let transport = bind_paid_endpoint(iroh::SecretKey::generate())
@@ -2184,7 +2188,18 @@ fn grant_composition<'a>(
         session.shutdown().await.unwrap();
         drop(session);
 
-        let other = super::pool::provider(&root.join("composition-other"), 3, None).await;
+        let mut other = super::pool::provider_with_limit(
+            &root.join("composition-other"),
+            3,
+            None,
+            if cli_binary.is_some() { 2 } else { 1 },
+        )
+        .await;
+        other.options.journal_root = data_root.join("channels");
+        if let Some(binary) = cli_binary.as_deref() {
+            super::cli_composition::run_gateway(binary, root, &options, &other, &data_root).await;
+        }
+        let second_before = other.calls.load(std::sync::atomic::Ordering::SeqCst);
         let pool = GrantPool::open_pool(
             GrantPoolOptions {
                 channels: vec![
@@ -2249,15 +2264,33 @@ fn grant_composition<'a>(
                 event.unwrap();
             }
         }
-        let mut exhausted = pool.fetch(request(first, &definition.policies[1])).unwrap();
-        assert!(exhausted.next().await.unwrap().is_err());
+        let mut denied = false;
+        for _ in 0..2 {
+            let mut stream = pool.fetch(request(first, &definition.policies[1])).unwrap();
+            match stream.next().await.unwrap() {
+                Err(_) => {
+                    denied = true;
+                    break;
+                }
+                Ok(_) => {
+                    while let Some(event) = stream.next().await {
+                        event.unwrap();
+                    }
+                }
+            }
+        }
+        assert!(denied, "the first provider's own budget is exhausted");
         assert_eq!(
             provider
                 .grant_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2
+            if cli_binary.is_some() { 3 } else { 2 }
         );
-        assert_eq!(other.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            other.calls.load(std::sync::atomic::Ordering::SeqCst),
+            second_before + 1,
+            "first-provider exhaustion must not execute on the second account"
+        );
         pool.drain().await.unwrap();
         other.service.drain().await.unwrap();
     })
