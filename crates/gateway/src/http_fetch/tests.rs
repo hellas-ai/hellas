@@ -555,3 +555,136 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
         handle.shutdown().await.unwrap();
     }
 }
+
+struct ContinuationBackend {
+    provider: iroh::EndpointId,
+    calls: std::sync::atomic::AtomicUsize,
+    resource: Option<hellas_auth::authority::ResourceId>,
+    channel: Option<hellas_channel::model::grant::ChannelId>,
+}
+impl WorkExecutionBackend for ContinuationBackend {
+    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+        vec![crate::FetchRoute {
+            resource: self.resource,
+            channel: self.channel,
+            provider: self.provider,
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("http".into(), "request".into())),
+        }]
+    }
+    fn fetch(
+        &self,
+        _: WorkFetchRequest,
+    ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::pin(async_stream::try_stream! {
+            yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                status: 200, headers: vec![("content-type".into(), "application/json".into())],
+            })));
+            yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body {
+                base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, br#"{"id":"resp_1","object":"response"}"#),
+            })));
+            yield WorkEvent::Output(OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None });
+        }))
+    }
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn signed_single_route_registers_response_for_followup() {
+    use tower::ServiceExt;
+    let work = Arc::new(ContinuationBackend {
+        provider: iroh::SecretKey::from_bytes(&[19; 32]).public(),
+        calls: 0.into(),
+        resource: None,
+        channel: None,
+    });
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+        "service":"http", "method":"request", "routes":[{
+            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "models":["m"]
+        }]
+    })).unwrap();
+    let (app, _) = router(config, work.clone()).unwrap();
+    for body in [
+        r#"{"model":"m"}"#,
+        r#"{"model":"m","previous_response_id":"resp_1"}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+    }
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn duplicate_session_header_never_discards_an_unknown_continuation() {
+    use tower::ServiceExt;
+    let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"resource"));
+    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
+    let work = Arc::new(ContinuationBackend {
+        provider: iroh::SecretKey::from_bytes(&[20; 32]).public(),
+        calls: 0.into(),
+        resource: Some(resource),
+        channel: Some(channel),
+    });
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+        "backends":{"one":{"models":[], "provider":work.provider, "resource":resource, "channel":channel, "routes":[{
+            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
+        }]}}
+    }))
+    .unwrap();
+    let (app, _) = router(config, work.clone()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("x-hellas-session-id", "one")
+                .header("x-hellas-session-id", "two")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"previous_response_id":"unknown"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"previous_response_id":"unknown"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .body(axum::body::Body::from("opaque request"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

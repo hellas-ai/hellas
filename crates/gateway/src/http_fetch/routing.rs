@@ -323,7 +323,8 @@ impl Routing {
             Hints::read(headers, body)
                 .map_err(|message| Unavailable::new(StatusCode::BAD_REQUEST, message))?
         } else if self.pooled {
-            Hints::read(headers, body).unwrap_or_default()
+            Hints::read_optional(headers, body)
+                .map_err(|message| Unavailable::new(StatusCode::BAD_REQUEST, message))?
         } else {
             Hints::default()
         };
@@ -471,10 +472,16 @@ impl Routing {
         backend: usize,
         path: &str,
     ) -> Option<ResponseBinding> {
-        (self.pooled && family(path).ends_with("/responses")).then(|| ResponseBinding {
-            routing: self.clone(),
-            backend,
-            family: family(path).into(),
+        let model_restricted = self.backends[backend]
+            .routes
+            .iter()
+            .any(|route| route.path == path && route.models.is_some());
+        ((self.pooled || model_restricted) && family(path).ends_with("/responses")).then(|| {
+            ResponseBinding {
+                routing: self.clone(),
+                backend,
+                family: family(path).into(),
+            }
         })
     }
 }

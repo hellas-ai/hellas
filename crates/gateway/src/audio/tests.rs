@@ -452,3 +452,43 @@ async fn audio_waits_without_a_client_deadline_but_keeps_explicit_budgets() {
         );
     }
 }
+
+#[tokio::test]
+async fn zdr_accepts_large_valid_multipart_wav() {
+    let fake = Arc::new(Fake::default());
+    let base = app(&["tiny"], fake.clone()).await;
+    let root = tempfile::tempdir().unwrap();
+    let policy = crate::archive::Policy::new(crate::ArchiveOptions {
+        directory: root.path().into(),
+        zdr: true,
+    });
+    policy.prepare();
+    let app = base.layer(axum::middleware::from_fn_with_state(
+        policy,
+        crate::archive::record,
+    ));
+    // Six seconds of stereo 32-bit PCM at 192 kHz is valid and exceeds 8 MiB.
+    let frames = 192_000u32 * 6;
+    let bytes = frames * 8;
+    let mut wav = Vec::new();
+    wav.extend(b"RIFF");
+    wav.extend((36 + bytes).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(2u16.to_le_bytes());
+    wav.extend(192_000u32.to_le_bytes());
+    wav.extend((192_000u32 * 8).to_le_bytes());
+    wav.extend(8u16.to_le_bytes());
+    wav.extend(32u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend(bytes.to_le_bytes());
+    wav.resize(44 + bytes as usize, 0);
+    assert!(wav.len() > 8 * 1024 * 1024);
+    let response = app
+        .oneshot(request(&[("file", &wav), ("model", b"tiny")]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+}

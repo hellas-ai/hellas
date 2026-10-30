@@ -1237,3 +1237,78 @@ async fn disconnect_during_control_does_not_propose() {
     drop(held);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn single_signed_model_responses_route_tracks_continuation() {
+    let mut template = chat_resource("https://private.fixture", 6);
+    template.paths = vec!["/v1/responses".into()];
+    template.accounting = AccountingProfile::OpenaiResponses;
+    template.model_policy = Some(vec![PathModelPolicy {
+        path: "/v1/responses".into(),
+        models: vec!["m".into()],
+    }]);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
+    use_https(&mut allowance.definition.policies[0], template);
+    let backend = Backend {
+        finish: Completion::Immediate,
+        reply: Reply::events(Reply::http(
+            200,
+            "application/json",
+            r#"{"id":"resp_1","object":"response","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )),
+        ..Backend::default()
+    };
+    let host = crate::test_support::Host::builder()
+        .with_allowance(allowance)
+        .with_backend(backend)
+        .build()
+        .await;
+    let gateway = GrantGateway::open(
+        host.options(vec![]),
+        GrantTransport::Local(host.world.service.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let access = host.gateway_access().await;
+    let bearer = access.bearer();
+    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+        server: hellas_gateway::ServerOptions {
+            archive: hellas_gateway::ArchiveOptions {
+                directory: host.root.path().join("archive"),
+                zdr: true,
+            },
+            host: "127.0.0.1".into(),
+            port: Some(0),
+            access,
+            allow_remote: false,
+            wrap: None,
+            wrap_args: vec![],
+        },
+        work: gateway.clone(),
+        presentations: hellas_gateway::Presentations {
+            http: gateway.http_config().unwrap(),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!({"model":"m", "input":"hi", "max_output_tokens":6}),
+        serde_json::json!({"model":"m", "input":"hi", "max_output_tokens":6, "previous_response_id":"resp_1"}),
+    ] {
+        let response = client
+            .post(format!("http://{}/v1/responses", server.address()))
+            .bearer_auth(&bearer)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 2);
+    server.shutdown().await.unwrap();
+    gateway.drain().await.unwrap();
+}

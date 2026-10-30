@@ -31,12 +31,40 @@ pub(super) struct Hints {
 
 impl Hints {
     pub fn read(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
+        Self::read_inner(headers, body, false)
+    }
+
+    pub fn read_optional(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
+        Self::read_inner(headers, body, true)
+    }
+
+    fn read_inner(
+        headers: &HeaderMap,
+        body: &[u8],
+        allow_opaque: bool,
+    ) -> Result<Self, &'static str> {
         let bytes = decoded_body(headers, body)?;
+        let json_content = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+            });
+        let looks_json = bytes
+            .iter()
+            .copied()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| b == b'{' || b == b'[');
         let value = if bytes.is_empty() {
             Value::Null
         } else {
-            hellas_authority::model::http_usage::unique_json(&bytes)
-                .map_err(|_| "model routing requires a JSON request")?
+            match hellas_authority::model::http_usage::unique_json(&bytes) {
+                Ok(value) => value,
+                Err(_) if allow_opaque && !json_content && !looks_json => Value::Null,
+                Err(_) => return Err("model routing requires a JSON request"),
+            }
         };
         fn field(value: Option<&Value>) -> Result<Option<String>, &'static str> {
             match value {
