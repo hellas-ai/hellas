@@ -166,16 +166,28 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             )
             .await
             .unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), session.settle())
-                    .await
-                    .is_err()
-            );
-            assert!(
-                session
+            // A timeout can fire before the future reaches its durable write
+            // when several simulated networks run at once. Retry that same
+            // close until the recorded state, rather than elapsed wall time,
+            // proves the interruption point was reached.
+            let mut closing = false;
+            for _ in 0..100 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), session.settle())
+                        .await
+                        .is_err()
+                );
+                closing = session
                     .with_state(|state| state.is_closing())
                     .await
-                    .unwrap()
+                    .unwrap();
+                if closing {
+                    break;
+                }
+            }
+            assert!(
+                closing,
+                "close intent was not persisted within the fixture bound"
             );
             session.shutdown().await;
             drop(session);
