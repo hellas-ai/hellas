@@ -980,20 +980,25 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     .unwrap();
     assert_eq!(imported["offers"][0]["name"], "shared.glm");
     assert_eq!(imported["offers"][0]["grant"], hex::encode(host.id.0));
-    let profile = PathBuf::from(imported["work_profile"].as_str().unwrap());
     let trust_root = host.approve_trust().await;
+    let pool = root.join("grant-pool.json");
+    std::fs::write(
+        &pool,
+        serde_json::to_vec(&json!({"channels": [{
+            "offer": "shared.glm", "work_profile": "shared", "trust_policy": "lan",
+            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
     let (gateway_profile, token) = gateway_profile(root).await;
     let mut gateway = host.client.spawn(
         &[
             "gateway",
-            "--offer",
-            "shared.glm",
+            "--grant-pool-config",
+            string(&pool),
             "--trust-store",
             string(&trust_root),
-            "--trust-policy",
-            "lan",
-            "--work-profile",
-            string(&profile),
             "--port",
             "0",
             "--gateway-profile",
