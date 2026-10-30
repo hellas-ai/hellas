@@ -240,3 +240,31 @@ Fetch request/response bodies stay in memory in channel/provider journals.
 An explicitly saved job folder retains caller-owned input, and selected output
 files retain the caller's result. A paid Fetch result lost with the process
 cannot be replayed from those journals.
+
+## Tracked native execution
+
+The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
+`ExecutionSession` for paid or granted work without an HTTP listener. Open an
+attempt at a caller-owned private path with the original `JobInput` and exact
+`ExecutionTerms`. For a new paid attempt, `open_paid_session` checks the quote
+and funding approval before binding and opening the channel. Grant callers use
+`open_grant_session` with the selected resource. Use a new path for each
+intentional execution; an existing path binds the original input, target and
+terms and cannot be used to buy again.
+
+After interruption, use `open_existing`, inspect the local facts, and call
+`recover` on the bound session. Recovery does not propose another job or fund
+another channel. Acceptance, terminal evidence, payment, result availability
+and delivery acknowledgement are separate facts. A grant can be accepted while
+still pending; a paid job can be complete even if its output is unavailable.
+Neither situation authorizes a replacement execution. Call `retain_results(true)`
+when opening the attempt to opt into private result retention; after delivering a
+verified retained result, call `reported`. The acknowledgement survives result
+removal and does not erase the terminal status. Without retained bytes, callers
+must handle unavailable output independently from execution and payment status.
+The executable [native grant example](../crates/sdk/tests/native_execution/grant.rs)
+exercises tracked execution, recovery and acknowledgement.
+
+The CLI persists the same attempt identity. `--buy-again` deliberately creates a
+new attempt and retains the previous tombstone. Payment is fixed per job; the
+channel funding amount is separate from the job price.

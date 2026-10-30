@@ -354,3 +354,10 @@ Counter files alone do not trigger channel funding during startup recovery.
 Work and WorkSetup each reuse an authenticated QUIC connection. Reconnection
 repeats Open with that connection's exporter and the channel's producer pin;
 no new consensus query is added to the per-request path.
+
+The paid gateway and native paid sessions use the same funding and execution
+implementation. A funding cap applies to the actual fresh channel quote, while
+a retained channel can be reused without allocating that amount again. A
+funding approval reserves the quoted channel amount; each successful job pays
+the fixed per-job price. Tracking and recovery behavior is described in
+[Tracked native execution](jobs.md#tracked-native-execution).
