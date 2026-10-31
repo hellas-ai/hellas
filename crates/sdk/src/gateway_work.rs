@@ -321,11 +321,37 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
         )
     }
     pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
+        // The signed transcript is one mandatory evidence record whose size is
+        // fixed by the job's authorised spool, not by how fast the consumer
+        // reads. Charging it against the slow-consumer byte budget made a
+        // verified, already-paid result undeliverable whenever the transcript
+        // exceeded the whole queue, which then suppressed the completion too.
+        // It is moved rather than copied, takes a queue slot, and a consumer
+        // that stops reading still ends the stream.
+        if matches!(&event, Ok(WorkEvent::Transcript(_))) {
+            return self.emit_mandatory(event);
+        }
         let bytes = match &event {
             Ok(event) => event_bytes(event),
             Err(error) => error.to_string().len(),
         };
         emit(&self.sender, &self.overflow, &self.budget, event, bytes);
+    }
+    /// Queues an event whose size is set by the job rather than by the reader.
+    fn emit_mandatory(&self, event: Result<WorkEvent<E>, X>) {
+        if *self.overflow.borrow() || self.sender.is_closed() {
+            return;
+        }
+        let Ok(permits) = self.budget.clone().try_acquire_many_owned(0) else {
+            self.overflow.send_replace(true);
+            return;
+        };
+        if matches!(
+            self.sender.try_send((event, permits)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            self.overflow.send_replace(true);
+        }
     }
     /// Reports the provider's acceptance as it happens, before any output.
     pub(crate) fn accepted(&self) -> crate::transact::Accepted {
@@ -843,6 +869,32 @@ mod output_tests {
         }
         assert_eq!(count, 128);
         assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_transcript_larger_than_the_output_budget_is_delivered() {
+        let (requester, mut response) = TestRequester::new();
+        // A job may be authorised to spool more evidence than the whole
+        // slow-consumer queue holds. That evidence is mandatory and already
+        // resident, so it must not be charged against the reader's budget;
+        // otherwise a verified, already-paid result cannot be delivered and
+        // its completion is suppressed with it.
+        let transcript = vec![0xab; OUTPUT_BUFFER_BYTES + 4096];
+        requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
+        requester.emit(Ok(WorkEvent::Output(text("done"))));
+        drop(requester);
+        assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript),
+            "the whole signed transcript is delivered"
+        );
+        assert!(
+            matches!(
+                response.next().await.unwrap().unwrap(),
+                WorkEvent::Output(_)
+            ),
+            "and the completion follows it"
+        );
+        assert!(response.next().await.is_none());
     }
 
     #[tokio::test]
