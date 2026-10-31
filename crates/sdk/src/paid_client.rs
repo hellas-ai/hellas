@@ -295,7 +295,12 @@ fn spawn_observer(
                 tracing::debug!(%error, "paid client observation unavailable");
                 finalized = None;
                 source_config.validators.rotate_left(1);
-                match crate::client_chain::connect(&source_config, config.max_observation_age).await
+                match crate::client_chain::connect_at(
+                    &source_config,
+                    config.max_observation_age,
+                    floor,
+                )
+                .await
                 {
                     Ok(next) => remote = next,
                     Err(error) => {

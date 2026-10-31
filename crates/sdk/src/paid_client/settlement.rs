@@ -248,7 +248,8 @@ async fn open_settlement(
         ));
     }
     let timeout = super::read_timeout(args.timeout);
-    let remote = crate::client_chain::connect(&args.config, timeout).await?;
+    let remote =
+        crate::client_chain::connect_at(&args.config, timeout, journal.state().cursor().0).await?;
     let chain = WorkBlocks::new(remote)
         .with_read_retry(args.config.poll, timeout)
         .with_min_height(journal.state().cursor().0);

@@ -219,6 +219,60 @@ impl Drop for Relays {
     }
 }
 
+/// Source selection must agree with the caller's own height guard.
+///
+/// A peer that authenticates promptly but is behind the retained journal is
+/// refused, because the caller's guard would reject its state anyway and a
+/// reconnect policy that keeps choosing it never recovers while healthy peers
+/// sit configured beside it. The same peers are selected once they can serve
+/// the floor.
+pub(super) async fn stale_source_selection(runtime: commonware_runtime::tokio::Context) {
+    let root = tempfile::tempdir().unwrap();
+    let mut devnet = Devnet::start(
+        runtime,
+        DevnetConfig {
+            name: "sdk_source_floor",
+            owners: vec![CLIENT_OWNER],
+            full_nodes: 0,
+        },
+    )
+    .await;
+    devnet.seal().await;
+    devnet.seal().await;
+    let mut relays = Relays::start(&devnet).await;
+    let mut config = work_config(&devnet, root.path().join("journal"));
+    config.validators = relays.urls.clone();
+    let tip = devnet.height();
+    assert!(tip > 1, "the fixture finalizes more than one block");
+    let behind = tip - 1;
+    // Every responsive relay now answers Latest with an older finalized block.
+    relays.source.replay.store(behind, Ordering::SeqCst);
+    assert!(
+        matches!(
+            hellas_sdk::client_chain::connect_at(&config, Duration::from_millis(300), tip).await,
+            Err(QueryError::ReadUnavailableTimeout { .. })
+        ),
+        "a responsive source below the journal height is not selected"
+    );
+    let selected = hellas_sdk::client_chain::connect_at(&config, Duration::from_secs(5), behind)
+        .await
+        .expect("a source that serves the journal height is selected");
+    assert_eq!(
+        selected.get_latest_block().await.unwrap().unwrap().height,
+        behind
+    );
+    relays.source.replay.store(0, Ordering::SeqCst);
+    let current = hellas_sdk::client_chain::connect_at(&config, Duration::from_secs(5), tip)
+        .await
+        .expect("the same sources serve the current tip");
+    assert_eq!(
+        current.get_latest_block().await.unwrap().unwrap().height,
+        tip
+    );
+    relays.shutdown().await;
+    devnet.shutdown().await;
+}
+
 pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     use commonware_codec::DecodeExt as _;
     use hellas_chain::{FinalizedBlockView, domain::coin_object_id};

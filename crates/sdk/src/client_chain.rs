@@ -79,6 +79,22 @@ pub async fn connect(
     config: &WorkConfig,
     timeout: Duration,
 ) -> Result<RemoteLightClient, QueryError> {
+    connect_at(config, timeout, 0).await
+}
+
+/// Connects to a verified source that can serve state at or above `min_height`.
+///
+/// Authentication alone does not make a source usable. A peer that answers
+/// fastest may be behind the caller's retained journal, and the caller's own
+/// height guard then rejects its state — so a reconnect policy that keeps
+/// choosing it never recovers while healthy peers sit configured beside it.
+/// Requiring the height here makes the selection agree with that guard instead
+/// of racing against it.
+pub async fn connect_at(
+    config: &WorkConfig,
+    timeout: Duration,
+    min_height: u64,
+) -> Result<RemoteLightClient, QueryError> {
     let genesis = crate::work_config::chain_genesis(config.chain.network, &config.chain.genesis)
         .map_err(invalid)?;
     let pinned = ConsensusInfo {
@@ -110,9 +126,15 @@ pub async fn connect(
                             ));
                         }
                         let client = client.with_consensus_verifier(verifier);
-                        client.get_latest_block().await?.ok_or_else(|| {
+                        let latest = client.get_latest_block().await?.ok_or_else(|| {
                             QueryError::StateUnavailable("chain is catching up".into())
                         })?;
+                        if latest.height < min_height {
+                            return Err(QueryError::StateUnavailable(format!(
+                                "chain is at height {} but the journal requires {min_height}",
+                                latest.height
+                            )));
+                        }
                         Ok(client)
                     })
                     .await

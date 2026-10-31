@@ -1744,3 +1744,8 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
 fn remote_object_reads_verify_current_state_and_reject_forged_witnesses() {
     run(remote::proofs);
 }
+
+#[test]
+fn a_responsive_source_below_the_journal_height_is_not_selected() {
+    run(remote::stale_source_selection);
+}
