@@ -1,6 +1,7 @@
 use super::*;
 use futures::TryStreamExt as _;
 use hellas_gateway::{WorkEvent, WorkExecutionBackend as _};
+use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 use hellas_sdk::paid_gateway::{PaidGateway, PaidGatewayOptions};
 
 #[test]
@@ -62,11 +63,13 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 let endpoint = bind_paid_endpoint(case.client_transport.clone())
                     .await
                     .unwrap();
-                let mut session = PaidWorkSession::open_retained(
+                let mut session = PaidWorkSession::open(
                     case.options.clone(),
                     endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
+                    SessionOpenMode::Retained,
+                    SessionFundingOptions::default(),
                 )
                 .await
                 .unwrap();

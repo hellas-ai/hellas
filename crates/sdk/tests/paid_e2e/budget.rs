@@ -79,7 +79,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 let mut session =
                     sealing_while(&mut case.devnet, Duration::from_millis(100), async {
                         loop {
-                            let opened = PaidWorkSession::open_with_options(
+                            let opened = PaidWorkSession::open(
                                 case.options.clone(),
                                 case.endpoint.clone(),
                                 client_settlement(),
@@ -188,7 +188,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     .unwrap();
             endpoint.prepare_close().await.unwrap();
             drop(endpoint); // Crash after the close intent is durable, before submission.
-            let mut session = PaidWorkSession::open_with_options(
+            let mut session = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
                 client_settlement(),
@@ -237,7 +237,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             budget.0.lock().unwrap().reservation = [8; 16];
             let refused = sealing_while(&mut case.devnet, Duration::from_millis(100), async {
                 loop {
-                    let opened = PaidWorkSession::open_with_options(
+                    let opened = PaidWorkSession::open(
                         case.options.clone(),
                         case.endpoint.clone(),
                         client_settlement(),

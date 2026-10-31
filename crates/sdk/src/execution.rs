@@ -359,21 +359,18 @@ impl ExecutionAttempt {
         } else {
             crate::paid_client::SessionOpenMode::Retained
         };
-        let mut session = PaidWorkSession::open_with_binding(
+        let mut session = PaidWorkSession::open_intent(
             options,
             endpoint,
             settlement_key,
             owner,
             mode,
             funding,
-            Some((
-                &job,
-                Box::new(|| {
-                    purchase.bind_target(target)?;
-                    self.newly_bound = false;
-                    Ok(())
-                }),
-            )),
+            Some(Box::new(|| {
+                purchase.bind_target(target)?;
+                self.newly_bound = false;
+                Ok(())
+            })),
         )
         .await?;
         let descriptor = session.descriptor();

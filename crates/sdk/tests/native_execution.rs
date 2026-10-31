@@ -61,7 +61,9 @@ use hellas_rpc::protocol::invocation::{
     self as invocation, Admission, InvocationPolicy, Limits, PreparedInvocation,
 };
 use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
-use hellas_sdk::paid_client::{PaidWorkOptions, PaidWorkSession, bind_paid_endpoint};
+use hellas_sdk::paid_client::{
+    PaidWorkOptions, PaidWorkSession, SessionFundingOptions, SessionOpenMode, bind_paid_endpoint,
+};
 use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
@@ -169,6 +171,8 @@ async fn check_other_enrollment_refused(
             endpoint.clone(),
             client_settlement(),
             owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
         )
         .await
         .err()
@@ -238,12 +242,13 @@ async fn check_other_contract_refused(
     approvals: &Approvals,
 ) {
     let funded = approvals.0.lock().unwrap().len();
-    let error = PaidWorkSession::open_for_job(
+    let error = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
         client_settlement(),
         owner,
-        &other_contract_job(),
+        SessionOpenMode::Job(&other_contract_job()),
+        SessionFundingOptions::default(),
     )
     .await
     .err()
@@ -989,6 +994,8 @@ async fn paid_setup(
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     );
     tokio::pin!(open);
     // A completed typed timeout is the expected result in the outage case;
@@ -1162,6 +1169,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     );
     tokio::pin!(reopening);
     tokio::select! {
@@ -1185,11 +1194,13 @@ async fn paid_finish(case: PaidScenario) {
     recovered.shutdown().await;
     drop(recovered);
     // Restart recovery re-verifies the retained offer against the address.
-    let error = PaidWorkSession::open_retained(
+    let error = PaidWorkSession::open(
         other_provider(&options),
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Retained,
+        SessionFundingOptions::default(),
     )
     .await
     .err()
@@ -1232,6 +1243,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1294,6 +1307,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1350,6 +1365,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1497,6 +1514,8 @@ async fn paid_finish(case: PaidScenario) {
             endpoint.clone(),
             client_settlement(),
             owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
         ),
     )
     .await
@@ -1523,6 +1542,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();

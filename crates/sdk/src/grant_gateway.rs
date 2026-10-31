@@ -255,10 +255,7 @@ pub struct GrantPoolSource {
 
 /// A shared gateway backed by one or more grant channels.
 pub type GrantPool = WorkGateway<GrantPoolSource>;
-/// The single-channel interface delegates to the same pool implementation.
-pub type GrantGateway = GrantPool;
-
-impl GrantGateway {
+impl GrantPool {
     /// The gateway owns the endpoint lifecycle when given a remote transport.
     pub async fn open(
         options: GrantSessionOptions,
@@ -676,7 +673,7 @@ impl GrantServeOptions {
         self,
         transport: GrantTransport,
     ) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
-        let gateway = GrantGateway::open(self.session, transport, self.policy).await?;
+        let gateway = GrantPool::open(self.session, transport, self.policy).await?;
         serve_grant_gateway(gateway, self.serve).await
     }
 
@@ -711,7 +708,7 @@ impl GrantPoolServeOptions {
 }
 
 async fn serve_grant_gateway(
-    gateway: Arc<GrantGateway>,
+    gateway: Arc<GrantPool>,
     mut serve: crate::GatewayServeOptions,
 ) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
     if serve.http.is_none() {

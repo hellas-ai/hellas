@@ -17,6 +17,7 @@ use hellas_rpc::protocol::invocation::compute::{
     Arg, Bind, Call, Declared, OutputKind, Plan, Step, StepArg, Stop, ValueKind,
 };
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupServer};
+use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 use hellas_sdk::paid_provider::{
     MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher,
 };
@@ -782,6 +783,8 @@ async fn compute_and_settle(
         endpoint.clone(),
         key.clone(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     );
     tokio::pin!(open);
     let mut session = sealing_while(devnet, Duration::from_millis(100), &mut open)
@@ -819,6 +822,8 @@ async fn compute_and_settle(
         endpoint.clone(),
         key.clone(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1070,6 +1075,8 @@ async fn compute_and_settle(
         endpoint.clone(),
         key.clone(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -2490,7 +2497,14 @@ async fn finish(case: Box<Case>) {
     let attempts = provider
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
-    let open = PaidWorkSession::open(fresh_args, endpoint.clone(), keys[3].clone(), agent_owner);
+    let open = PaidWorkSession::open(
+        fresh_args,
+        endpoint.clone(),
+        keys[3].clone(),
+        agent_owner,
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
+    );
     let mut fresh = sealing_while(&mut devnet, Duration::from_millis(100), async {
         tokio::pin!(open);
         tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, async {

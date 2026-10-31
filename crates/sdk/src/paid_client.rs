@@ -361,60 +361,15 @@ impl PaidWorkSession {
             provider: self.args.provider,
         }
     }
+
+    /// Opens a session, admitting `mode`'s job against the actual quote before
+    /// any fresh owner funding.
+    ///
+    /// The admission mode is an argument rather than a default: whether a call
+    /// may allocate funding belongs at the call site, not hidden in a wrapper.
+    /// Boxed rather than an `async fn`: the opener is reached from deep inside a
+    /// caller's future, and its state must not be composed inline there.
     pub fn open(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_with_options(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            SessionOpenMode::Any,
-            SessionFundingOptions::default(),
-        ))
-    }
-
-    /// Reopens an existing channel without requesting fresh owner funding.
-    pub fn open_retained(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_with_options(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            SessionOpenMode::Retained,
-            SessionFundingOptions::default(),
-        ))
-    }
-
-    /// Admits the unsigned job against the actual quote before funding it.
-    pub fn open_for_job(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-        job: &crate::job::Job,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_with_options(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            SessionOpenMode::Job(job),
-            SessionFundingOptions::default(),
-        ))
-    }
-
-    /// Open with one set of funding constraints, admitting a supplied job
-    /// against the actual quote before any fresh owner funding.
-    pub fn open_with_options(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
@@ -422,32 +377,28 @@ impl PaidWorkSession {
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
     ) -> impl Future<Output = Result<Self>> {
-        Self::open_with_binding(args, endpoint, settlement_key, owner, mode, funding, None)
+        Self::open_intent(args, endpoint, settlement_key, owner, mode, funding, None)
     }
 
-    /// Bind after selected-policy admission and application reservation, before
-    /// owner signing, signed-intent submission, or retained setup signatures.
+    /// Opens a session that binds its target before funding or setup signatures.
     ///
-    /// Boxed rather than an `async fn`: the opener is reached from deep inside
-    /// a caller's future, and its state must not be composed inline there.
-    pub(crate) fn open_with_binding(
+    /// `before_open` runs after selected-policy admission and application
+    /// reservation, so a refusal there leaves no signature and no reservation
+    /// behind. The job it belongs to is `mode`'s, not a second copy.
+    pub(crate) fn open_intent(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
-        binding: Option<(&crate::job::Job, crate::client_owner::FundingBinding<'_>)>,
+        before_open: Option<crate::client_owner::FundingBinding<'_>>,
     ) -> impl Future<Output = Result<Self>> {
         Box::pin(async move {
             let (job, allow_funding) = match mode {
                 SessionOpenMode::Any => (None, true),
                 SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
                 SessionOpenMode::Retained => (None, false),
-            };
-            let (job, before_open) = match binding {
-                Some((tracked_job, bind)) => (Some(Box::new(tracked_job.clone())), Some(bind)),
-                None => (job, None),
             };
             Box::pin(Self::open_inner(
                 args,

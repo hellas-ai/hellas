@@ -1,4 +1,5 @@
 use super::*;
+use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 
 #[test]
 fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs() {
@@ -13,6 +14,8 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
+                    SessionOpenMode::Any,
+                    SessionFundingOptions::default(),
                 ),
             )
             .await
@@ -261,7 +264,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 amounts: std::sync::Mutex::new(vec![]),
                 allow: std::sync::atomic::AtomicBool::new(false),
             });
-            let error = PaidWorkSession::open_with_options(
+            let error = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
                 client_settlement(),
@@ -282,7 +285,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 )
             ));
             assert!(gate.amounts.lock().unwrap().is_empty());
-            let error = PaidWorkSession::open_with_options(
+            let error = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
                 client_settlement(),
@@ -343,7 +346,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let mut session = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
-                PaidWorkSession::open_with_options(
+                PaidWorkSession::open(
                     case.options.clone(),
                     case.endpoint.clone(),
                     client_settlement(),
@@ -386,7 +389,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 "open funding cannot be recycled"
             );
             gate.allow.store(false, std::sync::atomic::Ordering::SeqCst);
-            let mut retained = PaidWorkSession::open_with_options(
+            let mut retained = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
                 client_settlement(),
@@ -714,6 +717,8 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                     case.endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
+                    SessionOpenMode::Any,
+                    SessionFundingOptions::default(),
                 ),
             )
             .await
@@ -940,6 +945,8 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                     case.endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
+                    SessionOpenMode::Any,
+                    SessionFundingOptions::default(),
                 ),
             )
             .await

@@ -203,7 +203,7 @@ async fn explicit_pool_shares_one_channel_and_selects_least_pending_resource() {
 }
 struct Fixture {
     host: crate::test_support::Host,
-    gateway: Arc<GrantGateway>,
+    gateway: Arc<GrantPool>,
     template: HttpsResource,
     remote: Option<crate::test_support::RemoteHost>,
 }
@@ -323,7 +323,7 @@ impl FixtureBuilder {
                     .unwrap(),
             ),
         };
-        let gateway = GrantGateway::open(host.options(addresses), transport, None)
+        let gateway = GrantPool::open(host.options(addresses), transport, None)
             .await
             .unwrap();
         Fixture {
@@ -1263,7 +1263,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         .with_backend(backend)
         .build()
         .await;
-    let gateway = GrantGateway::open(
+    let gateway = GrantPool::open(
         host.options(vec![]),
         GrantTransport::Local(host.world.service.clone()),
         None,

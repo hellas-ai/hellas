@@ -3,7 +3,7 @@ use hellas_sdk::execution::{
     Acceptance, ExecutionAttempt, ExecutionError, ExecutionObservers, ExecutionResult,
     ExecutionSession, ExecutionTerms, Payment, Terminal,
 };
-use hellas_sdk::paid_client::{PaidClientError, SessionFundingOptions};
+use hellas_sdk::paid_client::{PaidClientError, SessionFundingOptions, SessionOpenMode};
 
 fn job() -> hellas_sdk::job::Job {
     hellas_sdk::job::Job::fetch(
@@ -26,6 +26,8 @@ async fn fund(case: &mut PaidScenario<()>) {
                 case.endpoint.clone(),
                 client_settlement(),
                 case.owner.clone(),
+                SessionOpenMode::Any,
+                SessionFundingOptions::default(),
             )
             .await
             {
