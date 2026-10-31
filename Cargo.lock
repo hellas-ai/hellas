@@ -667,9 +667,9 @@ dependencies = [
 
 [[package]]
 name = "brotli"
-version = "9.1.0"
+version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6737ce8b81460bf9407909f73ff50bf13f7cb8577e1e76715f57ed0eba58ba44"
+checksum = "627b7cfb0578f0eafce087a90fcd40add1231900b69e4d4de2d456260a4f5d81"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -754,7 +754,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-lang.git?branch=master#d116170a7e66aa6b2786ec3dfe06723ffa50cbb3"
+source = "git+https://github.com/hellas-ai/catena-lang.git?branch=master#88ce6c6b32216e7e385ffa7407657905a5922894"
 dependencies = [
  "anyhow",
  "bincode",
