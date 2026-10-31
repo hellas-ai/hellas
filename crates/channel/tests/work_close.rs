@@ -1569,23 +1569,28 @@ async fn an_unenqueued_answer_outlives_a_backlog_past_the_deadline() {
 
     // Tick three: the block after the retry carries it, still inside the
     // window. A sink holds the answer now, so the rest of the backlog is
-    // read in one pass and nothing is sent a second time.
+    // read in one pass. The response is not sent again; the final close is.
     let landing = inclusion + 2;
     assert!(landing < deadline, "the answer had blocks left to land in");
     let landed = Chain {
-        blocks: std::iter::once(block(landing, vec![taken[0].clone()]))
+        blocks: backlog
+            .blocks
+            .iter()
+            .filter(|block| block.height < landing)
+            .cloned()
+            .chain(std::iter::once(block(landing, vec![taken[0].clone()])))
             .chain(((landing + 1)..=(deadline + 4)).map(|height| block(height, Vec::new())))
             .collect(),
         withheld: None,
     };
     match watcher.provider.advance_close(&landed, &taking).await {
-        Ok(CloseProgress::Opened { start_id }) => assert_eq!(start_id, expected),
+        Ok(CloseProgress::AdjudicationSubmitted { start_id, .. }) => assert_eq!(start_id, expected),
         other => panic!("the contest runs to the tip: {other:?}"),
     }
     assert_eq!(
         taking.taken().len(),
-        1,
-        "an answer a sink took is not offered again",
+        2,
+        "the accepted response is followed by the final adjudicated close",
     );
     assert_eq!(
         watcher.provider.state().cursor().0,
@@ -3756,4 +3761,526 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
         1,
         "an answer that was not built is not an answer that took any time",
     );
+}
+
+/// An old journal needs the exact accepted history, including a same-block
+/// response. Missing or inconsistent evidence cannot authorize a payout.
+#[tokio::test]
+async fn client_replays_contest_history_and_waits_for_finalized_close() {
+    let fixture = paid_job().await;
+    let channel = fixture.ready.channel().clone();
+    let payment = fixture.client.state().last_payment().unwrap();
+    let certificate = (payment.certificate, payment.certificate_signature);
+    let inclusion = CURSOR + 1;
+    let start = close_start(&channel, Party::Maker, CURSOR, None, &client()).unwrap();
+    let id = hellas_kernel::start_id(start_body_digest(&channel, &start), inclusion);
+    let response =
+        hellas_channel::work_close::close_response(&channel, id, certificate, &provider()).unwrap();
+    let opening = block(
+        inclusion,
+        vec![
+            hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start)),
+            hellas_kernel::Tx::move_action(hellas_kernel::Move::RespondPaymentClose(response)),
+        ],
+    );
+    drop(fixture.client);
+    let mut store = store_at(
+        fixture.client_root.path(),
+        &fixture.ready,
+        Role::Client,
+        CURSOR,
+    )
+    .await;
+    commit(
+        &mut store,
+        ChannelRecord::CloseOpened {
+            start_id: id,
+            opener: Party::Maker,
+            response_deadline: inclusion + payment_terms().omit_response_blocks,
+            claimed: 0,
+        },
+    )
+    .await;
+    commit(
+        &mut store,
+        ChannelRecord::CursorAdvanced {
+            height: inclusion,
+            parent: opening.parent,
+            payload: opening.payload,
+        },
+    )
+    .await;
+    store.rotate().await.unwrap(); // pre-extension checkpoint, no history field
+    drop(store);
+    let store = store_at(
+        fixture.client_root.path(),
+        &fixture.ready,
+        Role::Client,
+        CURSOR,
+    )
+    .await;
+    assert!(store.state().close_history().is_none());
+    let mut endpoint = ClientEndpoint::new(fixture.ready.clone(), store, client()).unwrap();
+    let sink = Mempool::default();
+    let mut history = Chain {
+        blocks: vec![opening],
+        withheld: Some(inclusion),
+    };
+    assert!(
+        matches!(endpoint.advance_close(&history, &sink).await, Err(CatchUpError::Missing { height }) if height == inclusion)
+    );
+    assert!(sink.taken().is_empty());
+    history.withheld = None;
+    history.blocks[0].payload[0] ^= 1;
+    assert!(endpoint.advance_close(&history, &sink).await.is_err());
+    assert!(sink.taken().is_empty());
+    history.blocks[0].payload[0] ^= 1;
+    let original = history.blocks[0].txs.clone();
+    history.blocks[0].txs.reverse();
+    assert!(
+        endpoint.advance_close(&history, &sink).await.is_err(),
+        "a response cannot precede its start"
+    );
+    assert!(sink.taken().is_empty());
+    history.blocks[0].txs = original;
+
+    assert!(
+        matches!(endpoint.advance_close(&history, &sink).await.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
+    );
+    let submitted = sink.taken();
+    assert_eq!(submitted.len(), 1);
+    let hellas_kernel::Tx::Close { outputs, .. } = &submitted[0] else {
+        panic!("client submits final close")
+    };
+    assert_eq!(
+        outputs
+            .as_slice()
+            .iter()
+            .find(|payout| payout.owner() == channel.payment_terms().parties().taker().owner())
+            .unwrap()
+            .value(),
+        PRICE + OMISSION_BOND
+    );
+    assert!(
+        endpoint.state().close_settled().is_none(),
+        "submission cannot establish a return"
+    );
+    assert!(matches!(
+        endpoint.advance_close(&history, &sink).await.unwrap(),
+        CloseProgress::AdjudicationSubmitted { .. }
+    ));
+    assert_eq!(
+        sink.taken(),
+        vec![submitted[0].clone(), submitted[0].clone()],
+        "an unfinalized close is retried verbatim"
+    );
+    history.blocks.push(block(inclusion + 1, submitted));
+    assert!(
+        matches!(endpoint.advance_close(&history, &sink).await.unwrap(), CloseProgress::Settled { provider_payout } if provider_payout == PRICE + OMISSION_BOND)
+    );
+}
+
+/// Repeated bounded calls make durable progress through the largest legal
+/// response window, even after rotation of a legacy journal and cancellation.
+#[tokio::test]
+async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
+    use hellas_channel::model::work::PaidChannel;
+    struct DelayedHistory {
+        start: PaymentCloseStart,
+        inclusion: u64,
+        deadline: u64,
+        latest: u64,
+        reads: std::sync::Mutex<Vec<u64>>,
+    }
+    impl FinalizedBlocks for DelayedHistory {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            Ok(Some(self.latest))
+        }
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            assert!(
+                (self.inclusion..=self.deadline).contains(&height),
+                "the already-read quiet tail is not fetched"
+            );
+            self.reads.lock().unwrap().push(height);
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            Ok(Some(block(
+                height,
+                if height == self.inclusion {
+                    vec![hellas_kernel::Tx::move_action(
+                        hellas_kernel::Move::StartPaymentClose(self.start.clone()),
+                    )]
+                } else {
+                    vec![]
+                },
+            )))
+        }
+    }
+    let root = temp();
+    let mut terms = payment_terms();
+    terms.omit_response_blocks = hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS;
+    let channel =
+        PaidChannel::new(network(), payment_edge(), terms, &SALT, channel_policy()).unwrap();
+    let inclusion = CURSOR + 1;
+    let deadline = inclusion + hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS;
+    let latest = deadline + 256;
+    let start = close_start(&channel, Party::Maker, CURSOR, None, &client()).unwrap();
+    let id = hellas_kernel::start_id(start_body_digest(&channel, &start), inclusion);
+    let verifier = Secp256k1Verifier::new();
+    let open = || {
+        ChannelStore::open(
+            root.path(),
+            channel.clone(),
+            settlement(),
+            Role::Client,
+            origin(),
+            hellas_store::ContentStore::new(),
+            &verifier,
+        )
+    };
+    let mut store = open().await.unwrap();
+    advance(&mut store, CURSOR).await;
+    commit(
+        &mut store,
+        ChannelRecord::CloseOpened {
+            start_id: id,
+            opener: Party::Maker,
+            response_deadline: deadline,
+            claimed: 0,
+        },
+    )
+    .await;
+    // Canonical records emitted by the old watcher, before history was retained.
+    for height in inclusion..=latest {
+        commit(
+            &mut store,
+            ChannelRecord::CursorAdvanced {
+                height,
+                parent: payload_at(height - 1),
+                payload: payload_at(height),
+            },
+        )
+        .await;
+    }
+    store.rotate().await.unwrap();
+    drop(store);
+    let source = DelayedHistory {
+        start,
+        inclusion,
+        deadline,
+        latest,
+        reads: Default::default(),
+    };
+    let sink = Mempool::default();
+    let mut previous = inclusion - 1;
+    let mut completed = false;
+    let mut interruptions = 0;
+    for _ in 0..200 {
+        let mut store = open().await.unwrap();
+        let reached = store
+            .state()
+            .close_history()
+            .map_or(inclusion - 1, |history| history.height);
+        assert!(reached >= previous);
+        if interruptions > 0 {
+            assert!(
+                reached > previous,
+                "every cancelled call preserves completed block verification"
+            );
+        }
+        previous = reached;
+        // Exercise checkpoints with and without the extension on every retry.
+        store.rotate().await.unwrap();
+        let mut endpoint = ClientEndpoint::recover(store, client()).unwrap();
+        source.reads.lock().unwrap().clear();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            endpoint.advance_close(&source, &sink),
+        )
+        .await;
+        let queried = source.reads.lock().unwrap().clone();
+        assert_eq!(
+            queried.first().copied(),
+            Some(previous + 1),
+            "retry begins after durable progress"
+        );
+        if let Ok(result) = result {
+            assert!(
+                matches!(result.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
+            );
+            completed = true;
+            break;
+        }
+        assert!(
+            sink.taken().is_empty(),
+            "partial history cannot authorize a payout"
+        );
+        interruptions += 1;
+        drop(endpoint);
+    }
+    assert!(
+        completed,
+        "bounded retries eventually reconstruct all 4097 blocks"
+    );
+    assert!(interruptions > 1);
+    assert_eq!(sink.taken().len(), 1);
+}
+
+#[tokio::test]
+async fn recovered_provider_rereads_a_partial_open_before_adjudicating_a_rejected_answer() {
+    let fixture = paid_job().await;
+    let ready = fixture.ready.clone();
+    let certificate = fixture
+        .client
+        .state()
+        .last_payment()
+        .map(|payment| (payment.certificate, payment.certificate_signature))
+        .unwrap();
+    let Watcher {
+        provider: endpoint,
+        _provider_root,
+        _client_root,
+    } = restarted(fixture).await;
+    drop(endpoint);
+    let inclusion = CURSOR + 1;
+    let deadline = inclusion + payment_terms().omit_response_blocks;
+    let start = close_start(ready.channel(), Party::Maker, CURSOR, None, &client()).unwrap();
+    let id = contest_id(&ready, &start, inclusion);
+    let response =
+        hellas_channel::work_close::close_response(ready.channel(), id, certificate, &provider())
+            .unwrap();
+    let opening = block(
+        inclusion,
+        vec![
+            hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start)),
+            hellas_kernel::Tx::move_action(hellas_kernel::Move::RespondPaymentClose(response)),
+        ],
+    );
+    let mut store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    commit(
+        &mut store,
+        ChannelRecord::CloseOpened {
+            start_id: id,
+            opener: Party::Maker,
+            response_deadline: deadline,
+            claimed: 0,
+        },
+    )
+    .await;
+    drop(store);
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let mut endpoint = ProviderEndpoint::new(ready, store, provider()).unwrap();
+    let chain = CountingChain::over(vec![opening]);
+    let sink = Mempool::answering(hellas_rpc::SubmitTxOutcome::ValidationRejected);
+    assert!(matches!(
+        endpoint.advance_close(&chain, &sink).await.unwrap(),
+        CloseProgress::Opened { .. }
+    ));
+    assert_eq!(
+        chain.reads(),
+        0,
+        "the crash-retained answer is offered before any successor read"
+    );
+    assert_eq!(endpoint.state().cursor().0, CURSOR);
+    assert!(
+        matches!(endpoint.advance_close(&chain, &sink).await.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
+    );
+    assert_eq!(endpoint.state().cursor().0, inclusion);
+    assert!(matches!(
+        sink.taken().last().unwrap(),
+        hellas_kernel::Tx::Close { .. }
+    ));
+    assert!(endpoint.state().close_settled().is_none());
+}
+
+#[tokio::test]
+async fn verified_history_rejects_gaps_identity_changes_and_impossible_responses() {
+    use hellas_channel::work_store::CloseHistory;
+    let root = temp();
+    let ready = ready();
+    let mut store = store_at(root.path(), &ready, Role::Client, CURSOR).await;
+    let inclusion = CURSOR + 1;
+    let owner_start = close_start(ready.channel(), Party::Maker, CURSOR, None, &client()).unwrap();
+    let start = PaymentCloseStart::new(
+        owner_start.payment_edge(),
+        owner_start.terms().clone(),
+        owner_start.opener_role(),
+        (
+            owner_start.valid_from_height(),
+            owner_start.valid_through_height(),
+        ),
+        None,
+        PartyAuth::signer(client().sign(owner_start.digest(network()))),
+    );
+    let pending =
+        hellas_kernel::PendingPaymentClose::from_accepted_start(network(), inclusion, &start)
+            .unwrap();
+    commit(
+        &mut store,
+        ChannelRecord::CloseOpened {
+            start_id: pending.start_id(),
+            opener: Party::Maker,
+            response_deadline: pending.response_deadline(),
+            claimed: 0,
+        },
+    )
+    .await;
+    for height in inclusion..=(inclusion + 2) {
+        commit(
+            &mut store,
+            ChannelRecord::CursorAdvanced {
+                height,
+                parent: payload_at(height - 1),
+                payload: payload_at(height),
+            },
+        )
+        .await;
+    }
+    let initial = CloseHistory {
+        height: inclusion,
+        payload: payload_at(inclusion),
+        pending,
+    };
+    commit(
+        &mut store,
+        ChannelRecord::CloseHistoryAdvanced {
+            parent: payload_at(inclusion - 1),
+            history: initial,
+        },
+    )
+    .await;
+    let next = CloseHistory {
+        height: inclusion + 1,
+        payload: payload_at(inclusion + 1),
+        pending,
+    };
+    let zero = hellas_kernel::EarnedCertificate::new(
+        payment_edge(),
+        ready.channel().payment_terms_hash(),
+        0,
+    );
+    let invalid = hellas_kernel::PaymentCloseResponse::new(
+        payment_edge(),
+        pending.start_id(),
+        Party::Taker,
+        (
+            zero,
+            PartyAuth::owner(client().sign(zero.digest(network()))),
+        ),
+        PartyAuth::owner(provider().sign(response_body_digest(
+            ready.channel(),
+            pending.start_id(),
+            &zero,
+        ))),
+    );
+    let earned = hellas_kernel::EarnedCertificate::new(
+        payment_edge(),
+        ready.channel().payment_terms_hash(),
+        PRICE,
+    );
+    let response = hellas_channel::work_close::close_response(
+        ready.channel(),
+        pending.start_id(),
+        (earned, client().sign(earned.digest(network()))),
+        &provider(),
+    )
+    .unwrap();
+    let changed_owner =
+        hellas_kernel::PendingPaymentClose::from_accepted_start(network(), inclusion, &owner_start)
+            .unwrap()
+            .with_accepted_response(&response);
+    let other = close_start(ready.channel(), Party::Maker, CURSOR + 1, None, &client()).unwrap();
+    for (parent, history) in [
+        (
+            payload_at(inclusion),
+            CloseHistory {
+                height: inclusion + 2,
+                ..next
+            },
+        ),
+        ([0; 32], next),
+        (
+            payload_at(inclusion),
+            CloseHistory {
+                pending: changed_owner,
+                ..next
+            },
+        ),
+        (
+            payload_at(inclusion),
+            CloseHistory {
+                pending: pending.with_accepted_response(&invalid),
+                ..next
+            },
+        ),
+        (
+            payload_at(inclusion),
+            CloseHistory {
+                pending: hellas_kernel::PendingPaymentClose::from_accepted_start(
+                    network(),
+                    inclusion,
+                    &other,
+                )
+                .unwrap(),
+                ..next
+            },
+        ),
+    ] {
+        assert!(
+            store
+                .commit(
+                    ChannelRecord::CloseHistoryAdvanced { parent, history },
+                    &Secp256k1Verifier::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.state().close_history(), Some(initial));
+    }
+    // Only the provider can respond, and its response is exclusive of deadline.
+    for height in (inclusion + 1)..pending.response_deadline() {
+        if store.state().cursor().0 < height {
+            commit(
+                &mut store,
+                ChannelRecord::CursorAdvanced {
+                    height,
+                    parent: payload_at(height - 1),
+                    payload: payload_at(height),
+                },
+            )
+            .await;
+        }
+        commit(
+            &mut store,
+            ChannelRecord::CloseHistoryAdvanced {
+                parent: payload_at(height - 1),
+                history: CloseHistory {
+                    height,
+                    payload: payload_at(height),
+                    pending,
+                },
+            },
+        )
+        .await;
+    }
+    let final_history = store.state().close_history();
+    assert!(
+        store
+            .commit(
+                ChannelRecord::CloseHistoryAdvanced {
+                    parent: payload_at(pending.response_deadline() - 1),
+                    history: CloseHistory {
+                        height: pending.response_deadline(),
+                        payload: payload_at(pending.response_deadline()),
+                        pending: pending.with_accepted_response(&response)
+                    }
+                },
+                &Secp256k1Verifier::new()
+            )
+            .await
+            .is_err()
+    );
+    store.rotate().await.unwrap();
+    drop(store);
+    let store = store_at(root.path(), &ready, Role::Client, CURSOR).await;
+    assert_eq!(store.state().close_history(), final_history);
 }

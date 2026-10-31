@@ -286,3 +286,35 @@ WebSockets must select their HTTP/SSE transport. Archive I/O remains on the
 response path, although its errors no longer fail requests. These are contract
 differences from a general transparent HTTP proxy, even when inference and
 tool-call payloads are preserved exactly.
+
+## Static grant pools
+
+`gateway --grant-pool-config FILE --trust-store DIR` selects explicit resources
+from independently provisioned grant channels. The file contains aliases, not
+credentials, and has the following shape:
+
+```json
+{
+  "channels": [
+    {"offer": "first.chat", "work_profile": "first", "trust_policy": "first", "resources": ["RESOURCE_ID_1"]},
+    {"offer": "second.chat", "work_profile": "second", "trust_policy": "second", "resources": ["RESOURCE_ID_2"]}
+  ]
+}
+```
+
+Replace the placeholders with canonical resource IDs. Import Offers and access
+bundles through the existing private provisioning commands and approve each
+provider's trust policy independently. Credentials are bound to the importing
+principal and device; profiles imported before device-binding metadata was saved
+must be reimported from their access bundle for use in a pool. Run the same
+command with `--check-config` to validate saved aliases, trust and route
+compatibility without contacting providers or proposing work. Saved Offers can
+be expired locators; startup refreshes signed standing before accepting work.
+
+The pool opens one session per channel and keeps selected resources distinct.
+An explicit pool can distribute Compute among admitting resources by least
+pending work; once selected, a request keeps its channel and resource. HTTP
+Fetch uses the signed route and per-path model restrictions, when present.
+Changes to the configuration require a gateway restart. The executable
+[two-channel SDK example](../crates/sdk/tests/native_execution/pool.rs) shows
+constructing the typed pool and exercising independently budgeted providers.

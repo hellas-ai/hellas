@@ -87,6 +87,8 @@ pub(super) struct Backend {
     pub models: Vec<String>,
     pub routes: Vec<HttpRoute>,
     pub provider: iroh::EndpointId,
+    pub resource: Option<hellas_auth::authority::ResourceId>,
+    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     account: Arc<Account>,
 }
 
@@ -239,6 +241,8 @@ impl Routing {
                     routes: vec![route.clone()],
                     max_in_flight: None,
                     provider: None,
+                    resource: None,
+                    channel: None,
                 },
             )
         });
@@ -275,6 +279,8 @@ impl Routing {
                 models: backend.models,
                 routes: backend.routes,
                 provider,
+                resource: backend.resource,
+                channel: backend.channel,
                 account: account.clone(),
             });
         }
@@ -300,8 +306,24 @@ impl Routing {
         body: &[u8],
         connection: Option<&crate::ConnectionId>,
     ) -> Result<Selected, Unavailable> {
-        let hints = if self.pooled {
+        let matching_routes = self.backends.iter().flat_map(|backend| {
+            backend
+                .routes
+                .iter()
+                .filter(move |route| route.path == path && route.method == method)
+                .map(move |route| (backend, route))
+        });
+        let model_routed = matching_routes.clone().any(|(backend, route)| {
+            route.models.is_some() || (backend.resource.is_none() && !backend.models.is_empty())
+        });
+        let signed_model_routed = matching_routes
+            .clone()
+            .any(|(_, route)| route.models.is_some());
+        let hints = if model_routed {
             Hints::read(headers, body)
+                .map_err(|message| Unavailable::new(StatusCode::BAD_REQUEST, message))?
+        } else if self.pooled {
+            Hints::read_optional(headers, body)
                 .map_err(|message| Unavailable::new(StatusCode::BAD_REQUEST, message))?
         } else {
             Hints::default()
@@ -311,17 +333,25 @@ impl Routing {
             .backends
             .iter()
             .enumerate()
-            .filter(|(_, backend)| {
-                model.is_none_or(|model| {
-                    backend.models.is_empty() || backend.models.iter().any(|m| m == model)
-                })
-            })
             .filter_map(|(index, backend)| {
                 backend
                     .routes
                     .iter()
                     .position(|r| r.path == path && r.method == method)
-                    .map(|endpoint| (index, endpoint))
+                    .and_then(|endpoint| {
+                        let route = &backend.routes[endpoint];
+                        let models = route.models.as_deref().or_else(|| {
+                            (backend.resource.is_none() && !backend.models.is_empty())
+                                .then_some(backend.models.as_slice())
+                        });
+                        model
+                            .is_none_or(|model| {
+                                models.is_none_or(|models| {
+                                    models.iter().any(|allowed| allowed == model)
+                                })
+                            })
+                            .then_some((index, endpoint))
+                    })
             })
             .collect();
         if candidates.is_empty() {
@@ -338,7 +368,10 @@ impl Routing {
         .into_iter()
         .filter_map(|(kind, id)| id.as_ref().map(|id| self.key(kind, &[family, id])))
         .collect();
-        if self.pooled && model.is_none() && !body.is_empty() && continuations.is_empty() {
+        if model.is_none()
+            && (signed_model_routed
+                || (model_routed && !body.is_empty() && continuations.is_empty()))
+        {
             return Err(Unavailable::new(
                 StatusCode::BAD_REQUEST,
                 "model is required",
@@ -439,10 +472,16 @@ impl Routing {
         backend: usize,
         path: &str,
     ) -> Option<ResponseBinding> {
-        (self.pooled && family(path).ends_with("/responses")).then(|| ResponseBinding {
-            routing: self.clone(),
-            backend,
-            family: family(path).into(),
+        let model_restricted = self.backends[backend]
+            .routes
+            .iter()
+            .any(|route| route.path == path && route.models.is_some());
+        ((self.pooled || model_restricted) && family(path).ends_with("/responses")).then(|| {
+            ResponseBinding {
+                routing: self.clone(),
+                backend,
+                family: family(path).into(),
+            }
         })
     }
 }

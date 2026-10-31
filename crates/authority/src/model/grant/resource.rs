@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::model::http_usage::AccountingProfile;
+
+/// Exact model identifiers allowed on one existing HTTPS path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathModelPolicy {
+    pub path: String,
+    pub models: Vec<String>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpsResource {
@@ -19,6 +27,9 @@ pub struct HttpsResource {
     pub accounting: AccountingProfile,
     pub max_output_tokens: u64,
     pub max_response_bytes: u32,
+    /// Unlisted paths retain their existing unrestricted model behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<Vec<PathModelPolicy>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum TemplateError {
@@ -81,6 +92,26 @@ impl HttpsResource {
         if self.max_response_bytes == 0 || self.max_response_bytes > MAX_HTTP_RESPONSE_BYTES {
             return Err(TemplateError::ResponseCap);
         }
+        if let Some(policies) = &self.model_policy {
+            let mut paths = std::collections::BTreeSet::new();
+            if policies.is_empty() || policies.len() > 32 {
+                return Err(TemplateError::Model);
+            }
+            for policy in policies {
+                let mut models = std::collections::BTreeSet::new();
+                if !self.paths.contains(&policy.path)
+                    || !paths.insert(&policy.path)
+                    || policy.models.is_empty()
+                    || policy.models.len() > 128
+                    || policy
+                        .models
+                        .iter()
+                        .any(|model| model.is_empty() || model.len() > 256 || !models.insert(model))
+                {
+                    return Err(TemplateError::Model);
+                }
+            }
+        }
         if self.accounting != AccountingProfile::None && self.max_output_tokens == 0 {
             return Err(TemplateError::GenerationCap);
         }
@@ -124,12 +155,36 @@ impl HttpsResource {
         if request.max_response_bytes > self.max_response_bytes {
             return Err(TemplateError::ResponseCap);
         }
-        if self.accounting == AccountingProfile::None {
+        let policy = self
+            .model_policy
+            .as_ref()
+            .and_then(|policies| policies.iter().find(|p| p.path == url.path()));
+        if policy.is_none()
+            && (self.accounting == AccountingProfile::None
+                || (request.body_base64.is_empty()
+                    && matches!(request.method.as_str(), "GET" | "HEAD")))
+        {
             return Ok(0);
         }
-        let body: Value = crate::model::http_usage::unique_json(&request.body()?)
+        let body = request.body()?;
+        let encoding = request_encoding(request)?;
+        let decoded = crate::model::http_usage::decode_request_body(encoding, &body)
             .map_err(|_| TemplateError::Malformed)?;
-        self.generation_cap(&body)
+        let body: Value = crate::model::http_usage::unique_json(&decoded)
+            .map_err(|_| TemplateError::Malformed)?;
+        if let Some(policy) = policy {
+            let model = crate::model::http_usage::request_model(&body)
+                .map_err(|_| TemplateError::Model)?
+                .ok_or(TemplateError::Model)?;
+            if !policy.models.iter().any(|allowed| allowed == model) {
+                return Err(TemplateError::Model);
+            }
+        }
+        if self.accounting == AccountingProfile::None {
+            Ok(0)
+        } else {
+            self.generation_cap(&body)
+        }
     }
     fn generation_cap(&self, body: &Value) -> Result<u64, TemplateError> {
         let object = body.as_object().ok_or(TemplateError::Malformed)?;
@@ -177,10 +232,16 @@ impl HttpsResource {
     /// Called before signing only. Explicit excessive caps are refused, never
     /// silently reduced. An invalid body or stream_options cannot be repaired.
     pub fn prepare(&self, request: &mut HttpFetchRequest) -> Result<u64, TemplateError> {
-        if self.accounting == AccountingProfile::None {
+        if self.accounting == AccountingProfile::None
+            || (request.body()?.is_empty() && matches!(request.method.as_str(), "GET" | "HEAD"))
+        {
             return self.matches(request);
         }
-        let mut body: Value = crate::model::http_usage::unique_json(&request.body()?)
+        let raw = request.body()?;
+        let decoded =
+            crate::model::http_usage::decode_request_body(request_encoding(request)?, &raw)
+                .map_err(|_| TemplateError::Malformed)?;
+        let mut body: Value = crate::model::http_usage::unique_json(&decoded)
             .map_err(|_| TemplateError::Malformed)?;
         let object = body.as_object_mut().ok_or(TemplateError::Malformed)?;
         let field = if self.accounting == AccountingProfile::OpenaiChat {
@@ -207,10 +268,26 @@ impl HttpsResource {
         }
         let cap = self.generation_cap(&body)?;
         let mut candidate = request.clone();
+        candidate
+            .headers
+            .retain(|(name, _)| name != "content-encoding");
         candidate.body_base64 =
             STANDARD.encode(serde_json::to_vec(&body).map_err(|_| TemplateError::Malformed)?);
         self.matches(&candidate)?;
         *request = candidate;
         Ok(cap)
     }
+}
+
+fn request_encoding(request: &HttpFetchRequest) -> Result<Option<&str>, TemplateError> {
+    let mut values = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "content-encoding")
+        .map(|(_, value)| value.as_str());
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(TemplateError::Malformed);
+    }
+    Ok(first)
 }

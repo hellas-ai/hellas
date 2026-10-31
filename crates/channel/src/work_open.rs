@@ -716,7 +716,7 @@ where
                 height: origin.height,
             });
         }
-        apply_finalized_txs(channel, block.height, block.payload, &block.txs, verifier).await?;
+        apply_finalized_txs(channel, &block, verifier).await?;
         channel
             .commit(ChannelRecord::OriginObserved, verifier)
             .await?;

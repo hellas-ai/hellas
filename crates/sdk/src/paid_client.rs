@@ -1,5 +1,6 @@
 //! Reusable paid-work sessions: provider authentication, admission, verified delivery,
 //! journal recovery, payment, and finalized settlement. Journals are client-owned.
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,9 +8,16 @@ use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
 mod error;
+mod funding;
 pub(crate) mod offer;
+mod settlement;
 pub use error::PaidClientError;
-pub use offer::{PaidQuote, request_paid_quote, retained_paid_policy};
+pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
+pub use offer::{PaidQuote, request_paid_quote};
+pub use settlement::{
+    FinalizedChannelSettlement, RetainedSettlementChannel, finalized_channel_settlement,
+    retained_settlement_channels, settle_channel,
+};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;
@@ -65,6 +73,51 @@ pub struct PaidWorkOptions {
     /// Bounds retries while a provider is not ready; `None` waits until done.
     /// A session's overall lifetime is controlled by its caller.
     pub timeout: Option<Duration>,
+}
+
+/// Application approval of the actual channel funding. Implementations must
+/// reserve idempotently for a stable reservation ID, including after a crash
+/// between approval and persistence of the signed funding intent.
+/// A caller must use a distinct reservation for each deliberate funding
+/// attempt and keep the same ID when recovering that attempt.
+pub trait FundingApproval: Send + Sync {
+    fn reservation(
+        &self,
+        network: hellas_kernel::NetworkId,
+        provider: iroh::EndpointId,
+    ) -> [u8; 16];
+    fn reserve(
+        &self,
+        reservation: [u8; 16],
+        amount: u64,
+    ) -> futures::future::BoxFuture<'_, std::result::Result<(), PaidClientError>>;
+    fn recover(
+        &self,
+        reservation: [u8; 16],
+        amount: u64,
+    ) -> futures::future::BoxFuture<'_, std::result::Result<(), PaidClientError>>;
+}
+
+/// Funding constraints shared by native and gateway session opening.
+#[derive(Clone, Default)]
+pub struct SessionFundingOptions {
+    /// Maximum actual funding for a newly quoted channel. Reopening a retained
+    /// channel does not reserve or fund again and does not apply this cap.
+    pub max_funding: Option<u64>,
+    /// Durable application reservation for fresh funding; omitted for callers
+    /// that do not need an application-level reservation.
+    pub approval: Option<Arc<dyn FundingApproval>>,
+}
+
+impl SessionFundingOptions {
+    pub(crate) fn check_quote(&self, funding_value: u64) -> Result<()> {
+        if self.max_funding.is_some_and(|limit| funding_value > limit) {
+            return Err(PaidClientError::InvalidOptions(
+                "quote exceeds caller funding cap",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Chain reads keep their recovery bound even when the caller sets none.
@@ -157,6 +210,8 @@ pub struct PaidWorkResult {
     pub transcript: Vec<u8>,
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub work_id: hellas_auth::Digest,
+    /// Provider co-signature over the accepted work identity.
+    pub acceptance_signature: hellas_kernel::Sig,
     pub credited_cumulative: u64,
     pub job_price: u64,
     pub provider_key: hellas_auth::PublicKey,
@@ -240,7 +295,12 @@ fn spawn_observer(
                 tracing::debug!(%error, "paid client observation unavailable");
                 finalized = None;
                 source_config.validators.rotate_left(1);
-                match crate::client_chain::connect(&source_config, config.max_observation_age).await
+                match crate::client_chain::connect_at(
+                    &source_config,
+                    config.max_observation_age,
+                    floor,
+                )
+                .await
                 {
                     Ok(next) => remote = next,
                     Err(error) => {
@@ -281,71 +341,80 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
         .await?
 }
 
-enum OpenIntent {
-    Any,
-    Job(Box<crate::job::Job>),
-    Retained,
+struct OpenIntent<'a> {
+    job: Option<Box<crate::job::Job>>,
+    allow_funding: bool,
+    before_open: Option<crate::client_owner::FundingBinding<'a>>,
 }
-impl OpenIntent {
-    fn job(&self) -> Option<&crate::job::Job> {
-        if let Self::Job(job) = self {
-            Some(job)
-        } else {
-            None
-        }
-    }
+
+/// Admission mode for session opening. Retained opening cannot fund a channel.
+pub enum SessionOpenMode<'a> {
+    Any,
+    Job(&'a crate::job::Job),
+    Retained,
 }
 
 impl PaidWorkSession {
+    pub(crate) fn execution_target(&self) -> crate::execution::ExecutionTarget {
+        crate::execution::ExecutionTarget {
+            network: self.args.config.chain.network,
+            provider: self.args.provider,
+        }
+    }
+
+    /// Opens a session, admitting `mode`'s job against the actual quote before
+    /// any fresh owner funding.
+    ///
+    /// The admission mode is an argument rather than a default: whether a call
+    /// may allocate funding belongs at the call site, not hidden in a wrapper.
+    /// Boxed rather than an `async fn`: the opener is reached from deep inside a
+    /// caller's future, and its state must not be composed inline there.
     pub fn open(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            OpenIntent::Any,
-            None,
-        ))
+        mode: SessionOpenMode<'_>,
+        funding: SessionFundingOptions,
+    ) -> impl Future<Output = Result<Self>> {
+        Self::open_intent(args, endpoint, settlement_key, owner, mode, funding, None)
     }
 
-    /// Reopens an existing channel without requesting fresh owner funding.
-    pub fn open_retained(
+    /// Opens a session that binds its target before funding or setup signatures.
+    ///
+    /// `before_open` runs after selected-policy admission and application
+    /// reservation, so a refusal there leaves no signature and no reservation
+    /// behind. The job it belongs to is `mode`'s, not a second copy.
+    pub(crate) fn open_intent(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            OpenIntent::Retained,
-            None,
-        ))
-    }
-
-    /// Admits the unsigned job against the actual quote before funding it.
-    pub fn open_for_job(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-        job: &crate::job::Job,
-    ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
-            args,
-            endpoint,
-            settlement_key,
-            owner,
-            OpenIntent::Job(Box::new(job.clone())),
-            None,
-        ))
+        mode: SessionOpenMode<'_>,
+        funding: SessionFundingOptions,
+        before_open: Option<crate::client_owner::FundingBinding<'_>>,
+    ) -> impl Future<Output = Result<Self>> {
+        Box::pin(async move {
+            let (job, allow_funding) = match mode {
+                SessionOpenMode::Any => (None, true),
+                SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
+                SessionOpenMode::Retained => (None, false),
+            };
+            Box::pin(Self::open_inner(
+                args,
+                endpoint,
+                settlement_key,
+                owner,
+                OpenIntent {
+                    job,
+                    allow_funding,
+                    before_open,
+                },
+                None,
+                funding,
+            ))
+            .await
+        })
     }
 
     /// A gateway limits provider reachability separately from owner funding and
@@ -356,14 +425,21 @@ impl PaidWorkSession {
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
         connection_timeout: Duration,
+        funding: SessionFundingOptions,
+        job: Option<&crate::job::Job>,
     ) -> Result<Self> {
         Self::open_inner(
             args,
             endpoint,
             settlement_key,
             owner,
-            OpenIntent::Any,
+            OpenIntent {
+                job: job.map(|job| Box::new(job.clone())),
+                allow_funding: job.is_some(),
+                before_open: None,
+            },
             Some(connection_timeout),
+            funding,
         )
         .await
     }
@@ -373,8 +449,9 @@ impl PaidWorkSession {
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         owner: Arc<ClientOwner>,
-        intent: OpenIntent,
+        mut intent: OpenIntent<'_>,
         connection_timeout: Option<Duration>,
+        funding: SessionFundingOptions,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
@@ -404,7 +481,7 @@ impl PaidWorkSession {
         let reconnect = retained.is_some();
         let (store, signed) = match retained {
             Some(retained) => retained,
-            None if matches!(intent, OpenIntent::Retained) => {
+            None if !intent.allow_funding => {
                 return Err(PaidClientError::NoRetainedChannel);
             }
             None => {
@@ -414,12 +491,25 @@ impl PaidWorkSession {
                     request_paid_quote(&args, &endpoint, &settlement_key, owner.principal()),
                 )
                 .await?;
-                if let Some(job) = intent.job() {
+                funding.check_quote(quote.funding_value)?;
+                if let Some(job) = intent.job.as_deref() {
                     job.check_policy(&quote.policy)?;
                 }
-                let signed =
-                    offer::fund_offer(&args, &endpoint, &settlement_key, &owner, &remote, quote)
-                        .await?;
+                let signed = offer::fund_offer(
+                    &args,
+                    &endpoint,
+                    &settlement_key,
+                    &owner,
+                    &remote,
+                    quote,
+                    crate::client_owner::FundingControls {
+                        poll: args.config.poll,
+                        timeout: read_timeout,
+                        approval: funding.approval.as_deref(),
+                        before_sign: intent.before_open.take(),
+                    },
+                )
+                .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,
@@ -437,7 +527,7 @@ impl PaidWorkSession {
         let policy = signed.offer().policy.clone();
         let omission_bond = signed.offer().omission_bond;
         offer::check_policy(&args, &policy, omission_bond)?;
-        if let Some(job) = intent.job() {
+        if let Some(job) = intent.job.as_deref() {
             job.check_policy(&policy)?;
         }
         check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
@@ -445,6 +535,9 @@ impl PaidWorkSession {
         // Fresh and retained offers alike must name the addressed enrollment.
         let trust = args.trust()?;
         trust.verify_enrollment(&signed.offer().provider)?;
+        if let Some(bind) = intent.before_open.take() {
+            bind()?;
+        }
         let dialer = ProviderDialer::new(
             args.provider.node,
             args.provider_addrs.clone(),
@@ -582,6 +675,54 @@ impl PaidWorkSession {
     /// Identifies the funded channel and its admitted execution policy.
     pub fn descriptor(&self) -> &WorkChannelDescriptor {
         &self.descriptor
+    }
+
+    /// Finish an existing verified payment obligation only. This path never
+    /// proposes work, uploads input, or invokes the provider's backend.
+    pub(crate) async fn recover_verified_payment(
+        &mut self,
+        work: hellas_auth::Digest,
+    ) -> Result<bool> {
+        let payable = self
+            .client
+            .with_state(|state| {
+                state.job_by_id(work).is_some_and(|job| {
+                    job.phase() == hellas_channel::work_store::JobPhase::Verified
+                        && job.result().is_some_and(|(result, _)| {
+                            result.outcome == hellas_channel::model::work::ResultOutcome::Finished
+                        })
+                })
+            })
+            .await?;
+        if !payable {
+            return Ok(false);
+        }
+        pay_when_ready(
+            &self.dialer,
+            &mut self.client,
+            work,
+            self.args.config.poll,
+            self.args.timeout,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn recorded_terminal(
+        &self,
+        work: hellas_auth::Digest,
+    ) -> Result<Option<bool>> {
+        self.client
+            .with_state(|state| {
+                state.terminal_by_id(work).map(|terminal| {
+                    matches!(
+                        terminal.outcome,
+                        hellas_channel::work_store::TerminalOutcome::Certified { .. }
+                    )
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Reads local journal state under a short lock.
@@ -1060,6 +1201,14 @@ async fn execute_paid_job(
             false,
         ),
     };
+    let acceptance_signature = client
+        .with_state(|state| {
+            state
+                .job_by_id(work_id)
+                .and_then(|job| job.provider_signature())
+        })
+        .await?
+        .ok_or(PaidClientError::MissingState("accepted work signature"))?;
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.accepting(work_id)?;
     }
@@ -1160,6 +1309,7 @@ async fn execute_paid_job(
         payment_edge: ready.channel().payment_edge(),
         channel_id: ready.channel().id(),
         work_id,
+        acceptance_signature,
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
         transcript,

@@ -58,6 +58,22 @@ fn observed(
     if resource.accounting == AccountingProfile::None {
         return Some(charge);
     }
+    // Admission permits empty GET/HEAD requests on unmodelled health paths
+    // without reserving output tokens. Classify the same signed request at
+    // settlement so a non-generating response cannot fault the resource.
+    let [artifact] = input.input.artifacts.as_slice() else {
+        return None;
+    };
+    let signed_events: Vec<hellas_rpc::InputEventEnvelope> =
+        hellas_rpc::protocol::value::decode_canonical_dag_cbor(artifact.bytes.as_bytes()).ok()?;
+    let signed = hellas_rpc::fetch::verify_input_events(&signed_events).ok()?;
+    let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(signed.body.as_bytes()).ok()?;
+    if matches!(request.method.as_str(), "GET" | "HEAD")
+        && request.body().ok()?.is_empty()
+        && resource.matches(&request).ok()? == 0
+    {
+        return Some(charge);
+    }
     let mut decoder = UsageDecoder::new(Mode::Strict(resource.accounting), None, None);
     let mut head = false;
     for event in events {

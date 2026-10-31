@@ -138,10 +138,23 @@ async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Respo
             Err(response) => return *response,
         }
     } else {
-        http_fetch::affinity::decoded_body(&parts.headers, &body)
-            .ok()
-            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-            .and_then(|value| value.get("model")?.as_str().map(str::to_owned))
+        let decoded = match http_fetch::affinity::decoded_body(&parts.headers, &body) {
+            Ok(decoded) => decoded,
+            Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+        };
+        let value = match hellas_authority::model::http_usage::unique_json(&decoded) {
+            Ok(value) => value,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "model routing requires a JSON request",
+                );
+            }
+        };
+        match hellas_authority::model::http_usage::request_model(&value) {
+            Ok(model) => model.map(str::to_owned),
+            Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+        }
     };
     let Some(router) = model.and_then(|model| models.get(&model).cloned()) else {
         return json_error(

@@ -238,6 +238,159 @@ impl Fixture {
 }
 
 #[test]
+fn object_witness_reuses_verified_state_and_rejects_corrupt_updates() {
+    run_qmdb(|runtime| async move {
+        let mut fixture = fixture(runtime).await;
+        // Bootstrap without requesting the coin, then read it through a clone.
+        fixture.remote.get_objects(vec![]).await.unwrap().unwrap();
+        assert!(!fixture.operations.lock().unwrap().requests.is_empty());
+        fixture.operations.lock().unwrap().requests.clear();
+        let clone = fixture.remote.clone();
+        let snapshot = clone
+            .get_objects(vec![fixture.old_coin])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.objects.contains_key(&fixture.old_coin));
+        assert!(
+            fixture.operations.lock().unwrap().requests.is_empty(),
+            "a verified checkpoint must not be downloaded again"
+        );
+
+        fixture
+            .database
+            .finalize(fixture.pending.take().unwrap())
+            .await;
+        fixture.operations.lock().unwrap().corrupt = true;
+        let keys = vec![fixture.old_coin, fixture.new_coin];
+        assert!(fixture.remote.get_objects(keys.clone()).await.is_err());
+        fixture.operations.lock().unwrap().corrupt = false;
+        fixture.operations.lock().unwrap().requests.clear();
+        let snapshot = clone.get_objects(keys).await.unwrap().unwrap();
+        assert_eq!(snapshot.block.payload, fixture.archived.digest());
+        assert!(!snapshot.objects.contains_key(&fixture.old_coin));
+        assert!(
+            matches!(snapshot.objects.get(&fixture.new_coin), Some(Object::Coin(coin)) if coin.value == 100)
+        );
+        let mut requests = fixture.operations.lock().unwrap().requests.clone();
+        requests.sort_by_key(|request| request.start);
+        let target = fixture.archived.sync_target();
+        let start = (*fixture.applied.sync_target().range.end()).max(*target.range.start());
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.start)
+                .collect::<Vec<_>>(),
+            (start..*target.range.end()).step_by(64).collect::<Vec<_>>(),
+            "failed update must be fetched again in full"
+        );
+        for request in requests {
+            assert_eq!(
+                request.op_count,
+                *fixture.archived.sync_target().range.end()
+            );
+        }
+        fixture.operations.lock().unwrap().requests.clear();
+        fixture.owners.apply_finalized(&fixture.archived).unwrap();
+        let committee = consensus_fixture(91);
+        let (block, batch) = prepare(
+            &fixture.database,
+            &[(owner_key(41), 100)],
+            &fixture.archived,
+            &committee,
+            vec![],
+        )
+        .await;
+        fixture.database.finalize(batch).await;
+        fixture
+            .chain_indexer
+            .ingest_finalized(block.clone(), finalization(&committee, &block))
+            .await
+            .unwrap();
+        fixture.owners.apply_finalized(&block).unwrap();
+        assert!(block.sync_target().range.start() < target.range.end());
+        let snapshot = clone
+            .get_objects(vec![fixture.new_coin])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.block.payload, block.digest());
+        assert!(snapshot.objects.contains_key(&fixture.new_coin));
+        assert_eq!(
+            fixture.operations.lock().unwrap().requests[0].start,
+            *target.range.end(),
+            "incremental reads begin at the cached cursor"
+        );
+        fixture.server.abort();
+        let _ = fixture.server.await;
+        fixture.archive.abort();
+        let _ = fixture.archive.await;
+    });
+}
+
+#[test]
+fn object_witness_bootstraps_again_after_pruning_overtakes_its_cursor() {
+    run_qmdb(|runtime| async move {
+        let mut fixture = fixture(runtime).await;
+        let keys = vec![fixture.old_coin, fixture.new_coin];
+        fixture
+            .remote
+            .get_objects(keys.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.operations.lock().unwrap().requests.clear();
+        fixture
+            .database
+            .finalize(fixture.pending.take().unwrap())
+            .await;
+        let committee = consensus_fixture(91);
+        let mut parent = fixture.archived.clone();
+        fixture.owners.apply_finalized(&parent).unwrap();
+        for _ in 0..8 {
+            let (block, batch) = prepare(
+                &fixture.database,
+                &[(owner_key(41), 100)],
+                &parent,
+                &committee,
+                vec![],
+            )
+            .await;
+            fixture.database.finalize(batch).await;
+            fixture
+                .chain_indexer
+                .ingest_finalized(block.clone(), finalization(&committee, &block))
+                .await
+                .unwrap();
+            fixture.owners.apply_finalized(&block).unwrap();
+            parent = block;
+        }
+        let target = parent.sync_target();
+        assert!(target.range.start() > fixture.applied.sync_target().range.end());
+        fixture.database.prune(&target).await;
+        let snapshot = fixture.remote.get_objects(keys).await.unwrap().unwrap();
+        assert_eq!(snapshot.block.payload, parent.digest());
+        assert!(!snapshot.objects.contains_key(&fixture.old_coin));
+        assert!(snapshot.objects.contains_key(&fixture.new_coin));
+        assert_eq!(
+            fixture
+                .operations
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .map(|request| request.start)
+                .min(),
+            Some(*target.range.start())
+        );
+        fixture.server.abort();
+        let _ = fixture.server.await;
+        fixture.archive.abort();
+        let _ = fixture.archive.await;
+    });
+}
+
+#[test]
 fn object_witness_uses_a_certified_applied_checkpoint() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;

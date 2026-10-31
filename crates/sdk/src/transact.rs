@@ -8,7 +8,8 @@ use hellas_auth::ProducerSigningKey;
 use hellas_channel::work::PaidProgress;
 use hellas_rpc::ContentRef;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
-pub use purchase::{Purchase, PurchaseError};
+pub(crate) use purchase::PurchaseTarget;
+pub use purchase::{Purchase, PurchaseError, PurchaseRecovery, PurchaseStatus};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +64,12 @@ async fn prepare(
     let channel = descriptor.channel().id();
     let runner = hellas_auth::PublicKey::Secp256k1(descriptor.channel().provider_key().to_bytes());
     let policy = descriptor.invocation_policy();
+    let request_nonce = |nonce| {
+        purchase.map_or_else(
+            || job.purchase_nonce(channel, nonce),
+            |purchase| purchase.request_nonce(channel, nonce),
+        )
+    };
     let (next, retained) = session
         .with_state(|state| {
             (
@@ -84,7 +91,7 @@ async fn prepare(
         .transpose()?
         .flatten()
     {
-        let prepared = job.prepare(key, job.purchase_nonce(channel, nonce), runner, policy)?;
+        let prepared = job.prepare(key, request_nonce(nonce), runner, policy)?;
         let content = ContentRef::for_bytes(&prepared.canonical_bytes()?);
         if retained
             .iter()
@@ -104,7 +111,7 @@ async fn prepare(
         for authorization in retained {
             let prepared = job.prepare(
                 key,
-                job.purchase_nonce(channel, authorization.proposal_nonce),
+                request_nonce(authorization.proposal_nonce),
                 runner,
                 policy,
             )?;
@@ -122,7 +129,7 @@ async fn prepare(
     let nonce = next.ok_or(TransactError::NonceOverflow)?;
     Ok((
         nonce,
-        job.prepare(key, job.purchase_nonce(channel, nonce), runner, policy)?,
+        job.prepare(key, request_nonce(nonce), runner, policy)?,
     ))
 }
 
@@ -132,6 +139,9 @@ pub async fn transact(
     key: &ProducerSigningKey,
     mut options: TransactionOptions<'_>,
 ) -> Result<PaidWorkResult> {
+    if let Some(purchase) = options.purchase.as_deref() {
+        purchase.ensure_executable()?;
+    }
     let quoted = session.descriptor().payment_policy().fixed_price;
     if quoted != job.price() {
         return Err(TransactError::Price {
@@ -150,6 +160,7 @@ pub async fn transact(
             session.descriptor().channel().id(),
             session.descriptor().bond_edge(),
             nonce,
+            prepared.request.commitment()?.digest(),
         )?;
     }
     let content = job.content();

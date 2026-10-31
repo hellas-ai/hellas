@@ -112,6 +112,79 @@ async fn paid_image_burst_is_verified_and_delivered() {
 }
 
 #[test]
+fn paid_image_transcript_uses_the_admitted_spool_bound() {
+    use hellas_channel::test_support::channel as fixture;
+    use hellas_rpc::protocol::invocation::{
+        Artifact, InvocationInput,
+        compute::{OutputKind, RunMetadata},
+        output::{self, InvocationOutput, Outcome},
+    };
+    let mut policy = fixture::work_policy();
+    policy.limits.max_output_bytes = 4 << 20;
+    let mut plan = fixture::plan();
+    plan.outputs[0].kind = OutputKind::Buffer { max_bytes: 3 << 20 };
+    let input = InvocationInput {
+        artifacts: vec![],
+        parameters: hellas_rpc::JsonBytes(plan.canonical_bytes().unwrap()),
+    };
+    let mut request = fixture::invocation_request(1);
+    request.input = input.content_id().unwrap();
+    let prepared = PreparedInvocation::new(
+        request,
+        &fixture::manifest(),
+        input,
+        policy.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    let key = fixture::provider_producer();
+    let caller = PublicKey::Secp256k1(fixture::client().party_key().to_bytes());
+    let expected = InvocationOutput {
+        outcome: Outcome::Succeeded,
+        artifacts: vec![Artifact::new(
+            "answer",
+            "catena.bytes.v1",
+            vec![255; 512 * 512 * 3 * 4],
+        )],
+        metadata: hellas_rpc::JsonBytes(
+            hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                steps: 0,
+                stop: None,
+            })
+            .unwrap(),
+        ),
+    };
+    let events = expected
+        .sign(&prepared.request, &key, output::MAX_CHUNK_BYTES)
+        .unwrap();
+    let transcript = hellas_channel::model::work::encode_transcript(&events).unwrap();
+    assert!(transcript.len() > hellas_channel::work_store::journal::MAX_RECORD_BYTES);
+    assert_eq!(
+        verify_transcript(&prepared, &policy, &caller, &key.public_key(), &transcript)
+            .unwrap()
+            .output,
+        expected,
+    );
+
+    let limit = policy.admit(&prepared, &caller).unwrap().max_spool_bytes as usize;
+    let oversized = vec![0; limit + 1];
+    let error =
+        verify_transcript(&prepared, &policy, &caller, &key.public_key(), &oversized).unwrap_err();
+    assert!(error.to_string().contains("over the authorized limit"));
+    assert!(
+        verify_transcript(
+            &prepared,
+            &policy,
+            &caller,
+            &ProducerSigningKey::from_secret_bytes([3; 32])
+                .unwrap()
+                .public_key(),
+            &transcript,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal() {
     let (mut policy, _, _) = fetch_request(Assurance::ProducerSigned);
     policy.expected_payment_values =

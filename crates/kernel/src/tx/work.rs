@@ -102,52 +102,38 @@ where
     // Checked, not saturating: a deadline that wrapped would be a
     // response window already shut. This is what disables the work
     // profile within one committed window of the height ceiling.
-    let response_deadline = height
-        .checked_add(payment.omit_response_blocks)
+    let record = PendingPaymentClose::from_accepted_start(context.network(), height, start)
         .ok_or_else(|| reject(InvalidMoveReason::DeadlineOverflow))?;
 
-    let claimed = match start.certificate() {
-        None => 0,
-        Some((certificate, _)) => {
-            check_certificate(certificate, input, edge.terms()).map_err(reject)?;
-            // Zero has exactly one encoding, the absent one. Admitting a
-            // present zero would give one claim two spellings and two
-            // start digests.
-            if certificate.earned_cumulative() == 0 {
-                return Err(reject(InvalidMoveReason::CertificateNotPositive));
-            }
-            check_capacity(
-                &edge,
-                payment.omission_bond,
-                certificate.earned_cumulative(),
-            )
-            .map_err(reject)?;
-            certificate.earned_cumulative()
+    if let Some((certificate, _)) = start.certificate() {
+        check_certificate(certificate, input, edge.terms()).map_err(reject)?;
+        // Zero has exactly one encoding, the absent one. Admitting a
+        // present zero would give one claim two spellings and two
+        // start digests.
+        if certificate.earned_cumulative() == 0 {
+            return Err(reject(InvalidMoveReason::CertificateNotPositive));
         }
-    };
+        check_capacity(
+            &edge,
+            payment.omission_bond,
+            certificate.earned_cumulative(),
+        )
+        .map_err(reject)?;
+    }
 
     // Cryptography last: a start that fails a structural check must not
     // also pay for signature verification.
-    let earned_digest = match start.certificate() {
-        None => crate::work::no_earned_digest(input, edge.terms()),
-        Some((certificate, auth)) => {
-            let digest = certificate.digest(context.network());
-            // Only the client signs a certificate. A provider-signed one
-            // would be the provider paying itself.
-            if !verify_party(verifier, auth, edge.parties().maker(), digest) {
-                return Err(reject(InvalidMoveReason::BadCertificateSignature));
-            }
-            digest
-        }
-    };
-    let start_digest = crate::work::start_digest(
-        context.network(),
-        input,
-        edge.terms(),
-        start.opener_role(),
-        (start.valid_from_height(), start.valid_through_height()),
-        earned_digest,
-    );
+    if let Some((certificate, auth)) = start.certificate()
+        && !verify_party(
+            verifier,
+            auth,
+            edge.parties().maker(),
+            certificate.digest(context.network()),
+        )
+    {
+        return Err(reject(InvalidMoveReason::BadCertificateSignature));
+    }
+    let start_digest = start.digest(context.network());
     if !verify_party(
         verifier,
         start.action(),
@@ -157,14 +143,6 @@ where
         return Err(reject(InvalidMoveReason::BadSignature));
     }
 
-    let record = PendingPaymentClose::opened(
-        input,
-        start.opener_role(),
-        crate::work::start_id(start_digest, height),
-        response_deadline,
-        (claimed, payment.omission_bond),
-        start.action().is_owner(),
-    );
     let chunk = record.to_chunk().ok_or_else(|| {
         reject(InvalidMoveReason::ClosePendingFault {
             fault: PendingCloseFault::Body,
@@ -272,10 +250,7 @@ where
         return Err(reject(InvalidMoveReason::BadCertificateSignature));
     }
 
-    Ok(record.responded_at(
-        certificate.earned_cumulative(),
-        response.action().is_owner(),
-    ))
+    Ok(record.with_accepted_response(response))
 }
 
 /// Applies a [`PaymentCloseResponse`].

@@ -95,6 +95,74 @@ fn a_saved_bundle_is_private_and_installs_the_contact_profile() {
 }
 
 #[test]
+fn grant_store_imports_bound_profiles_and_never_rolls_back_standing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut bundle = bundle();
+    bundle.offers.truncate(1);
+    let source = directory.path().join("bundle");
+    bundle.save(&source).unwrap();
+    let store = crate::grant_store::GrantStore::new(directory.path().join("store"));
+    let imported = store
+        .import_bundle(&source, "shared", &bundle.subject, &bundle.holder, false)
+        .unwrap();
+    assert_eq!(imported.offers.len(), 1);
+    let profile = store
+        .load_profile("shared", &bundle.subject, &bundle.holder)
+        .unwrap();
+    assert_eq!(profile.credential.id(), bundle.credential.id());
+    assert!(
+        store
+            .load_profile("shared", &bundle.subject, &node_key(8))
+            .is_err()
+    );
+    assert!(
+        store
+            .load_profile("../shared", &bundle.subject, &bundle.holder)
+            .is_err()
+    );
+    let name = &imported.offers[0].name;
+    let mut newer = bundle.offers[0].offer().clone();
+    newer.sequence += 1;
+    let newer = SignedOffer::sign(newer, &principal(2).1).unwrap();
+    let offer_file = directory.path().join("offer");
+    std::fs::write(&offer_file, newer.encode().unwrap()).unwrap();
+    store.import_offer(&offer_file, name, false).unwrap();
+    assert_eq!(
+        store.load_offer(name).unwrap().encode().unwrap(),
+        newer.encode().unwrap()
+    );
+    std::fs::write(&offer_file, bundle.offers[0].encode().unwrap()).unwrap();
+    assert!(matches!(
+        store.import_offer(&offer_file, name, true),
+        Err(crate::grant_store::GrantStoreError::Rollback)
+    ));
+    assert_eq!(
+        store.load_offer(name).unwrap().encode().unwrap(),
+        newer.encode().unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(store.offer_path(name).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(imported.profile)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
 fn the_wire_carries_the_v2_tag_and_curve_tagged_keys() {
     #[derive(serde::Deserialize)]
     struct Probe {

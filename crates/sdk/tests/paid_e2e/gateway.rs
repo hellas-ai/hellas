@@ -1,6 +1,7 @@
 use super::*;
 use futures::TryStreamExt as _;
 use hellas_gateway::{WorkEvent, WorkExecutionBackend as _};
+use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 use hellas_sdk::paid_gateway::{PaidGateway, PaidGatewayOptions};
 
 #[test]
@@ -24,6 +25,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             let started = tokio::time::Instant::now();
             let request = gateway
                 .fetch(hellas_gateway::WorkFetchRequest {
+                    resource: None,
+                    channel: None,
                     provider: case.options.provider.node,
                     service: "openai".into(),
                     method: "responses".into(),
@@ -43,7 +46,10 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             let stayed_pending = held.is_err();
             assert_eq!(case.devnet.height(), height);
             let result = if stayed_pending {
-                sealing_while(&mut case.devnet, Duration::from_millis(100), &mut request).await
+                // Keep simulated block time realistic: sealing ten blocks per second
+                // can expire the 16-block acceptance window before the provider
+                // processes an otherwise timely request.
+                sealing_while(&mut case.devnet, Duration::from_secs(1), &mut request).await
             } else {
                 held.unwrap()
             };
@@ -57,11 +63,13 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 let endpoint = bind_paid_endpoint(case.client_transport.clone())
                     .await
                     .unwrap();
-                let mut session = PaidWorkSession::open_retained(
+                let mut session = PaidWorkSession::open(
                     case.options.clone(),
                     endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
+                    SessionOpenMode::Retained,
+                    SessionFundingOptions::default(),
                 )
                 .await
                 .unwrap();

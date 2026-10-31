@@ -79,6 +79,11 @@ impl OfferConnection {
             .as_bytes()
             .to_vec();
         let timeout = super::read_timeout(args.timeout);
+        // A verified funding coin can be visible to the client's validators
+        // before the provider's local finalized view catches up. Reuse the
+        // exact signed request; this cannot create another funding signature
+        // or a work proposal.
+        let mut needs_funding = false;
         let response = tokio::time::timeout(timeout, async {
             loop {
                 let response = hellas_rpc::call::unary::<
@@ -90,6 +95,15 @@ impl OfferConnection {
                     // A block may advance between the provider's coherent proof
                     // reads. Retrying this signed request reuses its retained offer.
                     Err(status) if status.code() == hellas_wire::WireCode::Unavailable => {
+                        needs_funding = false;
+                        tokio::time::sleep(args.config.poll).await;
+                    }
+                    Ok(response)
+                        if funding.is_some()
+                            && matches!(response.outcome.as_ref(), Some(Outcome::Refused(refused))
+                                if refused.code == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32) =>
+                    {
+                        needs_funding = true;
                         tokio::time::sleep(args.config.poll).await;
                     }
                     response => {
@@ -101,8 +115,12 @@ impl OfferConnection {
             }
         })
         .await
-        .map_err(|_| PaidClientError::Timeout {
-            stage: "offer availability",
+        .map_err(|_| {
+            if needs_funding {
+                PaidClientError::OfferRefused(hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32)
+            } else {
+                PaidClientError::Timeout { stage: "offer availability" }
+            }
         })??;
         response
             .outcome
@@ -188,16 +206,16 @@ pub(super) async fn fund_offer(
     owner: &crate::client_owner::ClientOwner,
     chain: &RemoteLightClient,
     quote: PaidQuote,
+    controls: crate::client_owner::FundingControls<'_>,
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
     let funding = owner
-        .fund(
+        .fund_with_approval(
             chain,
             args.config.chain.network,
             args.provider.node,
             quote.funding_value,
-            args.config.poll,
-            super::read_timeout(args.timeout),
+            controls,
         )
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;
@@ -310,30 +328,4 @@ pub(crate) async fn retained_offer<
         retained = Some((store, offer));
     }
     Ok(retained)
-}
-
-/// Reads the actual live retained channel's terms without funding or contacting
-/// the provider. Closed historical offers cannot choose the price or assurance.
-pub async fn retained_paid_policy(
-    config: &WorkConfig,
-    journal_root: &std::path::Path,
-    provider: hellas_client::ProviderAddress,
-    timeout: Option<Duration>,
-) -> Result<Option<(ProviderChannelPolicy, hellas_rpc::Assurance)>> {
-    config.clone().validate()?;
-    let timeout = super::read_timeout(timeout);
-    let remote = crate::client_chain::connect(config, timeout).await?;
-    let chain = WorkBlocks::new(remote).with_read_retry(config.poll, timeout);
-    Ok(
-        retained_offer(journal_root, config.chain.network, provider, &chain)
-            .await?
-            .map(|(_, signed)| {
-                let offer = signed.offer();
-                let assurance = match offer.provider.genesis.statement.root_kind {
-                    hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
-                    _ => hellas_rpc::Assurance::ProducerSigned,
-                };
-                (offer.policy.clone(), assurance)
-            }),
-    )
 }

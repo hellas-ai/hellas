@@ -15,11 +15,15 @@ impl WorkExecutionBackend for Recorder {
     fn fetch_routes(&self) -> Vec<FetchRoute> {
         vec![
             FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::HttpV1,
                 sealed: Some(("http".into(), "request".into())),
             },
             FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::StatelessResponsesV1,
                 sealed: Some(("openai".into(), "responses".into())),
@@ -91,6 +95,21 @@ async fn a_shared_path_is_split_by_model() {
     post(&app, "gpt-x").await;
     post(&app, "claude-y").await;
     assert_eq!(post(&app, "unknown").await, StatusCode::NOT_FOUND);
+    for (encoding, body) in [
+        (None, br#"{"model":"gpt-x","model":"claude-y"}"#.as_slice()),
+        (Some("gzip"), b"not-gzip".as_slice()),
+    ] {
+        let mut request = Request::post("/v1/responses").header("content-type", "application/json");
+        if let Some(encoding) = encoding {
+            request = request.header("content-encoding", encoding);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_vec())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     assert_eq!(
         *recorder.seen.lock().unwrap(),
         [

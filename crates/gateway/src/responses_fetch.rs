@@ -77,6 +77,8 @@ impl ExecutionBackend for FetchBackend {
             let mut events = self
                 .work
                 .fetch(WorkFetchRequest {
+                    resource: None,
+                    channel: None,
                     provider: self.options.provider,
                     service: self.options.service.clone(),
                     method: self.options.method.clone(),

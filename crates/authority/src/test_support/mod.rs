@@ -176,6 +176,7 @@ pub fn chat_resource(origin: &str, max_output_tokens: u64) -> resource::HttpsRes
         accounting: resource::AccountingProfile::OpenaiChat,
         max_output_tokens,
         max_response_bytes: 4096,
+        model_policy: None,
     }
 }
 

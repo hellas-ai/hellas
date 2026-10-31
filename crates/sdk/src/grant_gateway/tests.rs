@@ -1,6 +1,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use hellas_authority::model::grant::{budget::*, resource::*};
 use hellas_gateway::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
@@ -23,9 +24,186 @@ fn inspect_chat(request: &hellas_rpc::fetch::FetchInput) {
     assert_eq!(body["max_tokens"], 6);
     assert_eq!(body["stream_options"]["include_usage"], true);
 }
+
+#[tokio::test]
+async fn explicit_pool_shares_one_channel_and_selects_least_pending_resource() {
+    let template = chat_resource("https://private.fixture", 6);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit {
+        meter: Meter::OutputTokens,
+        window: Window::Total,
+        amount: 20,
+    }]);
+    use_https(&mut allowance.definition.policies[0], template.clone());
+    let first = allowance.definition.policies[0].resource;
+    let mut second_policy = allowance.definition.policies[0].clone();
+    second_policy.resource =
+        hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second resource"));
+    second_policy.name = "second".into();
+    let second = second_policy.resource;
+    allowance.definition.policies.push(second_policy);
+    let backend = Backend {
+        finish: Completion::Immediate,
+        reply: Reply::events(Reply::http(
+            200,
+            "application/json",
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )),
+        ..Backend::default()
+    };
+    let host = crate::test_support::Host::builder()
+        .with_allowance(allowance)
+        .with_backend(backend)
+        .build()
+        .await;
+    let options = host.options(vec![]);
+    let duplicate = GrantPoolOptions {
+        channels: vec![GrantPoolChannel {
+            session: options.clone(),
+            resources: vec![first, first],
+        }],
+    };
+    assert!(
+        GrantPool::open_pool(
+            duplicate,
+            vec![GrantTransport::Local(host.world.service.clone())]
+        )
+        .await
+        .is_err()
+    );
+    let duplicate_channel = GrantPoolOptions {
+        channels: vec![
+            GrantPoolChannel {
+                session: options.clone(),
+                resources: vec![first],
+            },
+            GrantPoolChannel {
+                session: options.clone(),
+                resources: vec![second],
+            },
+        ],
+    };
+    assert!(
+        GrantPool::open_pool(
+            duplicate_channel,
+            vec![
+                GrantTransport::Local(host.world.service.clone()),
+                GrantTransport::Local(host.world.service.clone())
+            ]
+        )
+        .await
+        .is_err()
+    );
+    // A second channel from the same provider cannot expose the same
+    // resource as a different account selection.
+    let mut other_offer = options.target.offer().clone();
+    other_offer.grant.id = hellas_auth::authority::GrantId([77; 16]);
+    let signed = SignedOffer::sign(
+        other_offer,
+        &hellas_channel::test_support::actors::PROVIDER.node_key(),
+    )
+    .unwrap();
+    let mut other_options = options.clone();
+    other_options.target = crate::grant_client::UnpinnedOffer::decode(
+        &signed.encode().unwrap(),
+        hellas_auth::authority::UnixMillis(0),
+    )
+    .unwrap()
+    .pin(options.target.trust())
+    .unwrap();
+    assert!(
+        GrantPoolOptions {
+            channels: vec![
+                GrantPoolChannel {
+                    session: options.clone(),
+                    resources: vec![first]
+                },
+                GrantPoolChannel {
+                    session: other_options,
+                    resources: vec![first]
+                },
+            ]
+        }
+        .validate()
+        .is_err()
+    );
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 0);
+    let pool = GrantPool::open_pool(
+        GrantPoolOptions {
+            channels: vec![GrantPoolChannel {
+                session: options,
+                resources: vec![first, second],
+            }],
+        },
+        vec![GrantTransport::Local(host.world.service.clone())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(pool.source.channels.len(), 1);
+    assert_eq!(pool.fetch_routes().len(), 2);
+    let http = hellas_rpc::http_fetch::HttpFetchRequest {
+        url: format!("{}{}", template.origin, template.paths[0]),
+        method: "POST".into(),
+        headers: vec![],
+        body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":6}"#),
+        tls: template.tls,
+        credential: None,
+        max_response_bytes: template.max_response_bytes,
+    };
+    let make_request = || WorkFetchRequest {
+        provider: pool.source.channels[0].provider,
+        resource: None,
+        channel: None,
+        service: "openai".into(),
+        method: "responses".into(),
+        body: serde_json::to_vec(&http).unwrap(),
+    };
+    let legacy = GrantPoolSource {
+        channels: pool.source.channels.clone(),
+        selections: pool
+            .source
+            .selections
+            .iter()
+            .map(|selection| GrantSelection {
+                channel: selection.channel,
+                resource: selection.resource,
+                pending: Arc::new(AtomicUsize::new(0)),
+            })
+            .collect(),
+        explicit: false,
+        choose: std::sync::Mutex::new(()),
+    };
+    assert!(matches!(
+        legacy.request(WorkRequest::Fetch(make_request())),
+        Err(WorkGatewayError::Rejected(_))
+    ));
+    let first_pending = pool
+        .source
+        .request(WorkRequest::Fetch(make_request()))
+        .unwrap();
+    let second_pending = pool
+        .source
+        .request(WorkRequest::Fetch(make_request()))
+        .unwrap();
+    assert_eq!(first_pending.resource, first);
+    assert_eq!(second_pending.resource, second);
+    drop((first_pending, second_pending));
+    let config = pool.http_config().unwrap().unwrap();
+    assert_eq!(config.backends.len(), 2);
+    for resource in [first, second] {
+        let mut request = make_request();
+        request.resource = Some(resource);
+        request.channel = Some(pool.source.channels[0].channel);
+        let mut stream = pool.fetch(request).unwrap();
+        while let Some(event) = within(stream.next()).await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 2);
+    pool.drain().await.unwrap();
+}
 struct Fixture {
     host: crate::test_support::Host,
-    gateway: Arc<GrantGateway>,
+    gateway: Arc<GrantPool>,
     template: HttpsResource,
     remote: Option<crate::test_support::RemoteHost>,
 }
@@ -145,7 +323,7 @@ impl FixtureBuilder {
                     .unwrap(),
             ),
         };
-        let gateway = GrantGateway::open(host.options(addresses), transport, None)
+        let gateway = GrantPool::open(host.options(addresses), transport, None)
             .await
             .unwrap();
         Fixture {
@@ -236,7 +414,9 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
-            provider: self.gateway.source.provider,
+            resource: None,
+            channel: None,
+            provider: self.gateway.source.channels[0].provider,
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
@@ -283,7 +463,13 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
         panic!("the transcript must precede the terminal")
     };
     assert!(terminal.terminal().is_some());
-    let provider = grant_runner(&fixture.gateway.source.offer).unwrap();
+    let provider = PublicKey::Secp256k1(
+        hellas_authority::model::grant::records::grant_producer(
+            &fixture.gateway.source.channels[0].offer.offer().provider,
+        )
+        .unwrap()
+        .to_bytes(),
+    );
     assert_eq!(accepted.provider, provider);
 
     let envelopes = hellas_channel::model::work::decode_transcript(
@@ -300,7 +486,7 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
         .public_key();
     assert!(envelopes[0].verify(&stranger).is_err());
 
-    let session = fixture.gateway.source.session.lock().await;
+    let session = fixture.gateway.source.channels[0].session.lock().await;
     let job = session
         .store()
         .book()
@@ -400,6 +586,313 @@ async fn paused_terms_are_denied_at_the_gateway() {
     assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn refreshed_https_bounds_are_checked_before_proposal() {
+    for change in 0..5 {
+        let fixture = Fixture::builder().build().await;
+        let mut policy = fixture.host.allowance.policies[0].clone();
+        policy.revision.0 += 1;
+        let https = policy.https.as_mut().unwrap();
+        match change {
+            0 => https.origin = "https://changed.fixture".into(),
+            1 => https.credential = Some("changed".into()),
+            2 => https.max_output_tokens = 3,
+            3 => https.paths = vec!["/changed".into()],
+            _ => https.max_response_bytes = 128,
+        }
+        let guard = fixture.gateway.source.channels[0].session.lock().await;
+        let mut stream = fixture.gateway.fetch(fixture.request(Some(6))).unwrap();
+        let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+            fixture.host.world.service.clone(),
+            fixture.host.world.secret(ROOT),
+            vec![policy.clone()],
+        )
+        .await;
+        admin
+            .command(WorkControlCommand::ConfigureResource {
+                policy: policy.name,
+            })
+            .await
+            .unwrap();
+        let grant = &fixture.host.allowance;
+        admin
+            .command(WorkControlCommand::Revise {
+                id: ids::ALLOWANCE,
+                expected_revision: grant.revision,
+                terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                    policies: grant.policies.iter().map(|p| p.name.clone()).collect(),
+                    budget: grant.budget,
+                    max_job_millis: grant.max_job_millis,
+                    enabled: true,
+                    allow_account_backed: grant.allow_account_backed,
+                },
+            })
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(within(stream.next()).await.unwrap().is_err());
+        assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.gateway.source.channels[0]
+                .session
+                .lock()
+                .await
+                .store()
+                .next_nonce()
+                .unwrap(),
+            1
+        );
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn renamed_policy_keeps_the_selected_resource() {
+    let fixture = Fixture::builder().build().await;
+    let journal = tempfile::tempdir().unwrap();
+    let mut options = fixture.host.options(vec![]);
+    options.journal_root = journal.path().to_owned();
+    let source = GrantSource::open(
+        options,
+        GrantTransport::Local(fixture.host.world.service.clone()),
+        Some("chat".into()),
+    )
+    .await
+    .unwrap();
+    let gateway = Arc::new(WorkGateway::new(GrantPoolSource::single(source), 32));
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    policy.revision.0 += 1;
+    policy.name = "renamed".into();
+    let guard = gateway.source.channels[0].session.lock().await;
+    let mut stream = gateway.fetch(fixture.request(None)).unwrap();
+    let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+        fixture.host.world.service.clone(),
+        fixture.host.world.secret(ROOT),
+        vec![policy.clone()],
+    )
+    .await;
+    admin
+        .command(WorkControlCommand::ConfigureResource {
+            policy: policy.name.clone(),
+        })
+        .await
+        .unwrap();
+    let grant = &fixture.host.allowance;
+    admin
+        .command(WorkControlCommand::Revise {
+            id: ids::ALLOWANCE,
+            expected_revision: grant.revision,
+            terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                policies: vec![policy.name],
+                budget: grant.budget,
+                max_job_millis: grant.max_job_millis,
+                enabled: true,
+                allow_account_backed: grant.allow_account_backed,
+            },
+        })
+        .await
+        .unwrap();
+    drop(guard);
+    while let Some(event) = within(stream.next()).await {
+        event.unwrap();
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    gateway.drain().await.unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_resource_or_channel_never_reaches_a_proposal() {
+    let fixture = Fixture::builder().build().await;
+    let resource = fixture.host.allowance.policies[0].resource;
+    let channel = fixture.gateway.source.channels[0].channel;
+    for (selected_resource, selected_channel) in [
+        (
+            Some(hellas_auth::authority::ResourceId(
+                hellas_auth::Digest::hash(b"other"),
+            )),
+            Some(channel),
+        ),
+        (
+            Some(resource),
+            Some(hellas_channel::model::grant::ChannelId(
+                hellas_auth::Digest::hash(b"other"),
+            )),
+        ),
+        (Some(resource), None),
+    ] {
+        let mut request = fixture.request(None);
+        request.resource = selected_resource;
+        request.channel = selected_channel;
+        assert!(fixture.gateway.fetch(request).is_err());
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.gateway.source.channels[0]
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        1
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn https_policy_conversion_rejects_a_non_http_schema() {
+    let fixture = Fixture::builder().build().await;
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    for admission in &mut policy.invocation_policy.admissions {
+        if let Admission::Fetch { admission } = admission {
+            admission.contract = hellas_channel::test_support::test_responses_contract();
+        }
+    }
+    assert!(policy_http_routes(&policy).is_err());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
+    let fixture = Fixture::builder().build().await;
+    let mut policy = fixture.host.allowance.policies[0].clone();
+    let template = policy.https.as_mut().unwrap();
+    template.paths.push("/health".into());
+    template.model_policy = Some(vec![
+        hellas_authority::model::grant::resource::PathModelPolicy {
+            path: template.paths[0].clone(),
+            models: vec!["model-a".into()],
+        },
+    ]);
+    let (_, _, routes) = policy_http_routes(&policy).unwrap();
+    let restricted = routes
+        .iter()
+        .find(|route| route.path == "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(
+        restricted.models.as_deref(),
+        Some(["model-a".to_string()].as_slice())
+    );
+    assert!(
+        routes
+            .iter()
+            .find(|route| route.path == "/health")
+            .unwrap()
+            .models
+            .is_none()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
+    let fixture = Fixture::builder().build().await;
+    let old = fixture.host.allowance.policies[0].clone();
+    let mut renamed = old.clone();
+    renamed.revision.0 += 1;
+    renamed.name = "old-resource".into();
+    let mut replacement = old.clone();
+    replacement.resource =
+        hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
+    let guard = fixture.gateway.source.channels[0].session.lock().await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
+        fixture.host.world.service.clone(),
+        fixture.host.world.secret(ROOT),
+        vec![renamed.clone(), replacement.clone()],
+    )
+    .await;
+    for policy in [renamed.name, replacement.name.clone()] {
+        admin
+            .command(WorkControlCommand::ConfigureResource { policy })
+            .await
+            .unwrap();
+    }
+    let grant = &fixture.host.allowance;
+    admin
+        .command(WorkControlCommand::Revise {
+            id: ids::ALLOWANCE,
+            expected_revision: grant.revision,
+            terms: hellas_authority::model::grant::admin::AllowanceTerms {
+                policies: vec![replacement.name],
+                budget: grant.budget,
+                max_job_millis: grant.max_job_millis,
+                enabled: true,
+                allow_account_backed: grant.allow_account_backed,
+            },
+        })
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(within(stream.next()).await.unwrap().is_err());
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.gateway.source.channels[0]
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        1
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_start_failure_does_not_close_shared_endpoint() {
+    let fixture = Fixture::builder().remote().build().await;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let mut options = fixture
+        .host
+        .options(fixture.remote.as_ref().unwrap().addresses());
+    let journal = tempfile::tempdir().unwrap();
+    options.journal_root = journal.path().to_owned();
+    assert!(
+        GrantSource::open(
+            options.clone(),
+            GrantTransport::Remote(endpoint.clone()),
+            Some("missing".into())
+        )
+        .await
+        .is_err()
+    );
+    assert!(!endpoint.is_closed());
+    let source = GrantSource::open(options, GrantTransport::Remote(endpoint.clone()), None)
+        .await
+        .unwrap();
+    source.session.lock().await.shutdown().await.unwrap();
+    assert!(!endpoint.is_closed());
+    endpoint.close().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_closes_remote_endpoint_after_drain() {
+    let fixture = Fixture::builder().remote().build().await;
+    let endpoint = fixture
+        .gateway
+        .endpoints
+        .lock()
+        .await
+        .first()
+        .unwrap()
+        .clone();
+    assert!(!endpoint.is_closed());
+    fixture.gateway.drain().await.unwrap();
+    assert!(endpoint.is_closed());
+    assert!(fixture.gateway.endpoints.lock().await.is_empty());
+    if let Some(remote) = fixture.remote {
+        remote.shutdown().await;
+    }
 }
 
 struct Http {
@@ -645,7 +1138,7 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.source.session.lock().await;
+        let held = fixture.gateway.source.channels[0].session.lock().await;
         let request = fixture
             .gateway
             .source
@@ -685,9 +1178,7 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         .build()
         .await;
     fixture.result(None).await.unwrap();
-    let channel = fixture
-        .gateway
-        .source
+    let channel = fixture.gateway.source.channels[0]
         .session
         .lock()
         .await
@@ -733,9 +1224,7 @@ async fn disconnect_during_control_does_not_propose() {
     drop(stream);
     assert!(within(run).await.unwrap().is_none());
     assert_eq!(
-        fixture
-            .gateway
-            .source
+        fixture.gateway.source.channels[0]
             .session
             .lock()
             .await
@@ -747,4 +1236,79 @@ async fn disconnect_during_control_does_not_propose() {
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     drop(held);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn single_signed_model_responses_route_tracks_continuation() {
+    let mut template = chat_resource("https://private.fixture", 6);
+    template.paths = vec!["/v1/responses".into()];
+    template.accounting = AccountingProfile::OpenaiResponses;
+    template.model_policy = Some(vec![PathModelPolicy {
+        path: "/v1/responses".into(),
+        models: vec!["m".into()],
+    }]);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
+    use_https(&mut allowance.definition.policies[0], template);
+    let backend = Backend {
+        finish: Completion::Immediate,
+        reply: Reply::events(Reply::http(
+            200,
+            "application/json",
+            r#"{"id":"resp_1","object":"response","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )),
+        ..Backend::default()
+    };
+    let host = crate::test_support::Host::builder()
+        .with_allowance(allowance)
+        .with_backend(backend)
+        .build()
+        .await;
+    let gateway = GrantPool::open(
+        host.options(vec![]),
+        GrantTransport::Local(host.world.service.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let access = host.gateway_access().await;
+    let bearer = access.bearer();
+    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+        server: hellas_gateway::ServerOptions {
+            archive: hellas_gateway::ArchiveOptions {
+                directory: host.root.path().join("archive"),
+                zdr: true,
+            },
+            host: "127.0.0.1".into(),
+            port: Some(0),
+            access,
+            allow_remote: false,
+            wrap: None,
+            wrap_args: vec![],
+        },
+        work: gateway.clone(),
+        presentations: hellas_gateway::Presentations {
+            http: gateway.http_config().unwrap(),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!({"model":"m", "input":"hi", "max_output_tokens":6}),
+        serde_json::json!({"model":"m", "input":"hi", "max_output_tokens":6, "previous_response_id":"resp_1"}),
+    ] {
+        let response = client
+            .post(format!("http://{}/v1/responses", server.address()))
+            .bearer_auth(&bearer)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 2);
+    server.shutdown().await.unwrap();
+    gateway.drain().await.unwrap();
 }

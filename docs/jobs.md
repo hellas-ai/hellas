@@ -37,8 +37,12 @@ Those checks and the advertised input limits run before new channel funding.
 Fetch's encoded-input size check uses the largest purchase-nonce encoding,
 reserving up to 32 bytes more than a particular purchase needs. One owner
 approval funds the quoted channel amount; later jobs reuse its balance.
-`--settle` closes the channel after the job. With no `--job`, it closes
-retained channels without requesting new funding.
+`--settle` closes the channel after the job. With no `--job`, it discovers
+retained channels from signed local journals and closes their exact bonds using
+verified finalized blocks. This path resumes an interrupted close without
+contacting the provider, reading live object proofs or requesting new funding.
+Missing, corrupt or mismatched journals stop settlement rather than being
+silently replaced.
 
 ## Results
 
@@ -240,3 +244,51 @@ Fetch request/response bodies stay in memory in channel/provider journals.
 An explicitly saved job folder retains caller-owned input, and selected output
 files retain the caller's result. A paid Fetch result lost with the process
 cannot be replayed from those journals.
+
+## Tracked native execution
+
+The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
+`ExecutionSession` for paid or granted work without an HTTP listener. Open an
+attempt at a caller-owned private path with the original `JobInput` and exact
+`ExecutionTerms`. For a new paid attempt, `open_paid_session` binds the target
+before selecting its channel. A retained channel uses its signed policy without
+a fresh quote or funding approval; a zero funding cap permits that reuse.
+Fresh funding checks the actual quote and approval before owner signing. Grant callers use
+`open_grant_session` with the selected resource. Use a new path for each
+intentional execution; an existing path binds the original input, target and
+terms and cannot be used to buy again.
+
+After interruption, use `open_existing`, inspect the local facts, and call
+`recover` on the bound session. Recovery does not propose another job or fund
+another channel. Acceptance, terminal evidence, payment, result availability
+and delivery acknowledgement are separate facts. A grant can be accepted while
+still pending; a paid job can be complete even if its output is unavailable.
+Neither situation authorizes a replacement execution. Call `retain_results(true)`
+when opening the attempt to opt into private result retention; after delivering a
+verified retained result, call `reported`. The acknowledgement survives result
+removal and does not erase the terminal status. Without retained bytes, callers
+must handle unavailable output independently from execution and payment status.
+Paid tracked markers store a stable per-attempt nonce and the expected request
+commitment, without request payloads. Recovery can use the channel's signed
+acceptance to restore a work ID lost between the channel journal commit and the
+caller marker update. It preserves the original nonce and does not execute or
+fetch the job again. A missing acceptance or a proposal without the provider's
+signature leaves acceptance unknown and payment pending.
+
+Legacy markers with a recorded work ID keep exact-work recovery. A legacy
+`Running` marker with `work: null` and no per-attempt binding cannot identify
+which purchase owns a reused channel nonce: another deliberate attempt may
+have submitted identical input after the first stopped before proposing.
+Even retained request bytes cannot distinguish those histories. If recovery
+finds an acceptance at that nonce, it returns `PurchaseError::Unfinished` and
+leaves the legacy marker unchanged; it does not claim that acceptance or buy
+again. New tracked markers prevent this ambiguity by including their distinct
+attempt nonce in the signed request commitment.
+
+The executable [native grant example](../crates/sdk/tests/native_execution/grant.rs)
+and [paid tracked regressions](../crates/sdk/tests/paid_e2e/tracked.rs)
+exercise tracked execution, recovery and acknowledgement.
+
+The CLI persists the same attempt identity. `--buy-again` deliberately creates a
+new attempt and retains the previous tombstone. Payment is fixed per job; the
+channel funding amount is separate from the job price.

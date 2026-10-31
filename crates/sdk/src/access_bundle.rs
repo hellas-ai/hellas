@@ -215,11 +215,13 @@ impl AccessBundle {
     /// Install the remote-only client profile and its private credential into a
     /// new or empty directory, returning the profile path.
     pub fn install_profile(&self, directory: &Path) -> Result<PathBuf, AccessBundleError> {
-        Ok(profile::install_remote(
+        Ok(profile::install_remote_bound(
             directory,
             self.authority,
             self.authorization,
             &self.credential,
+            self.subject,
+            self.holder,
         )?)
     }
 

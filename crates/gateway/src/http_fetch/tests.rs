@@ -20,6 +20,8 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
     impl WorkExecutionBackend for Paid {
         fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
             vec![crate::FetchRoute {
+                resource: None,
+                channel: None,
                 provider: self.provider,
                 schema: hellas_rpc::FetchSchema::HttpV1,
                 sealed: Some(("http".into(), "request".into())),
@@ -150,6 +152,7 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
         credential: Some("account".into()),
         tls: public_tls(),
         headers: vec![("anthropic-version".into(), "2023-06-01".into())],
+        models: None,
     };
     let incoming = HeaderMap::from_iter([
         (
@@ -227,6 +230,7 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
                 credential: Some("account".into()),
                 tls: public_tls(),
                 headers: vec![(name.into(), "secret".into())],
+                models: None,
             }],
         };
         assert!(config.validate().is_err());
@@ -283,6 +287,8 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
             ["a", "b"]
                 .into_iter()
                 .map(|method| crate::FetchRoute {
+                    resource: None,
+                    channel: None,
                     provider: self.0,
                     schema: hellas_rpc::FetchSchema::HttpV1,
                     sealed: Some(("http".into(), method.into())),
@@ -328,6 +334,63 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
     ));
 }
 
+#[test]
+fn resource_selection_resolves_same_provider_routes_independently() {
+    let provider = iroh::SecretKey::from_bytes(&[13; 32]).public();
+    let first = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"first"));
+    let second = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
+    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
+    let routes = vec![
+        crate::FetchRoute {
+            provider,
+            resource: Some(first),
+            channel: Some(channel),
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("http".into(), "first".into())),
+        },
+        crate::FetchRoute {
+            provider,
+            resource: Some(second),
+            channel: Some(channel),
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("other".into(), "second".into())),
+        },
+    ];
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({"routes": [{
+        "path": "/v1/test", "method": "POST", "url": "https://example.test/v1/test"
+    }]}))
+    .unwrap();
+    let mut routing = routing::Routing::new(&config, &[provider]).unwrap();
+    let backend = &mut routing.backends[0];
+    assert!(matches!(
+        fetch_route(&routes, backend, None),
+        Err(crate::GatewayConfigError::AmbiguousFetchRoute(_))
+    ));
+    backend.resource = Some(first);
+    backend.channel = Some(channel);
+    assert_eq!(
+        fetch_route(&routes, backend, None).unwrap(),
+        ("http".into(), "first".into())
+    );
+    backend.resource = Some(second);
+    assert_eq!(
+        fetch_route(&routes, backend, None).unwrap(),
+        ("other".into(), "second".into())
+    );
+    assert!(fetch_route(&routes, backend, Some(&("http".into(), "first".into()))).is_err());
+    let mut wrong_schema = routes.clone();
+    wrong_schema[0].schema = hellas_rpc::FetchSchema::StatelessResponsesV1;
+    let http_routes: Vec<_> = wrong_schema
+        .into_iter()
+        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
+        .collect();
+    backend.resource = Some(first);
+    assert!(matches!(
+        fetch_route(&http_routes, backend, None),
+        Err(crate::GatewayConfigError::MissingFetchRoute(_))
+    ));
+}
+
 /// A provider that accepts the request, answers with `status` and the given
 /// body, and signs `transcript`.
 struct Proxied {
@@ -340,6 +403,8 @@ struct Proxied {
 impl WorkExecutionBackend for Proxied {
     fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
         vec![crate::FetchRoute {
+            resource: None,
+            channel: None,
             provider: self.provider,
             schema: hellas_rpc::FetchSchema::HttpV1,
             sealed: Some(("http".into(), "request".into())),
@@ -489,4 +554,158 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
         }
         handle.shutdown().await.unwrap();
     }
+}
+
+struct ContinuationBackend {
+    provider: iroh::EndpointId,
+    calls: std::sync::atomic::AtomicUsize,
+    resource: Option<hellas_auth::authority::ResourceId>,
+    channel: Option<hellas_channel::model::grant::ChannelId>,
+}
+impl WorkExecutionBackend for ContinuationBackend {
+    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+        vec![crate::FetchRoute {
+            resource: self.resource,
+            channel: self.channel,
+            provider: self.provider,
+            schema: hellas_rpc::FetchSchema::HttpV1,
+            sealed: Some(("http".into(), "request".into())),
+        }]
+    }
+    fn fetch(
+        &self,
+        _: WorkFetchRequest,
+    ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::pin(async_stream::try_stream! {
+            yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                status: 200, headers: vec![("content-type".into(), "application/json".into())],
+            })));
+            yield WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body {
+                base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, br#"{"id":"resp_1","object":"response"}"#),
+            })));
+            yield WorkEvent::Output(OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None });
+        }))
+    }
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn signed_single_route_registers_response_for_followup() {
+    use tower::ServiceExt;
+    let work = Arc::new(ContinuationBackend {
+        provider: iroh::SecretKey::from_bytes(&[19; 32]).public(),
+        calls: 0.into(),
+        resource: None,
+        channel: None,
+    });
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+        "service":"http", "method":"request", "routes":[{
+            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "models":["m"]
+        }]
+    })).unwrap();
+    let (app, _) = router(config, work.clone()).unwrap();
+    for body in [
+        r#"{"model":"m"}"#,
+        r#"{"model":"m","previous_response_id":"resp_1"}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+    }
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn duplicate_session_header_never_discards_an_unknown_continuation() {
+    use tower::ServiceExt;
+    let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"resource"));
+    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
+    let work = Arc::new(ContinuationBackend {
+        provider: iroh::SecretKey::from_bytes(&[20; 32]).public(),
+        calls: 0.into(),
+        resource: Some(resource),
+        channel: Some(channel),
+    });
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+        "backends":{"one":{"models":[], "provider":work.provider, "resource":resource, "channel":channel, "routes":[{
+            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
+        }, {
+            "path":"/v1/audio/transcriptions", "method":"POST", "url":"https://example.com/v1/audio/transcriptions"
+        }]}}
+    }))
+    .unwrap();
+    let (app, _) = router(config, work.clone()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("x-hellas-session-id", "one")
+                .header("x-hellas-session-id", "two")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"previous_response_id":"unknown"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"previous_response_id":"unknown"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Opaque multipart remains routable; invalid affinity metadata is still rejected.
+    let multipart =
+        "--audio\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nopaque\r\n--audio--\r\n";
+    for (duplicate, expected) in [(true, StatusCode::BAD_REQUEST), (false, StatusCode::OK)] {
+        let mut request = axum::http::Request::post("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=audio");
+        if duplicate {
+            request = request
+                .header("x-hellas-session-id", "one")
+                .header("x-hellas-session-id", "two");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(multipart)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .body(axum::body::Body::from("opaque request"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

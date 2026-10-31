@@ -113,6 +113,11 @@ let
     # Run command tests locally as well as in the release package builds.
     cli = mkCargo "check-cli" ''
       cargo test -p hellas-cli
+      cargo build -p hellas-cli --bin hellas
+      HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
+      export HELLAS_CLI_TEST_BINARY
+      cargo test -p hellas-sdk --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
+      cargo test -p hellas-sdk --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
       cargo test -p hellas-cli --features otel --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
@@ -144,6 +149,17 @@ let
       assert_money_graph -p hellas-channel --no-default-features
       assert_money_graph -p hellas-client --no-default-features --features work
       assert_money_graph -p hellas-chain --no-default-features --features work-watcher
+      # Chain work-watcher already gets zstd through consensus storage. Guard
+      # the lightweight channel and client graphs against adding it here.
+      for package in hellas-channel hellas-client; do
+        features=()
+        if [[ "$package" == hellas-client ]]; then features=(--features work); fi
+        dependencies="$(cargo tree --locked --edges normal,build --prefix none -p "$package" --no-default-features "''${features[@]}")"
+        if grep -Eq '^zstd v' <<< "$dependencies"; then
+          echo "zstd reached a lightweight $package consumer" >&2
+          exit 1
+        fi
+      done
     '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
     # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
     # Channel and authority own the canonical records and durable orchestration.
@@ -174,7 +190,10 @@ let
         (cargoEnv rustToolchain);
     # Native host composition has one implementation for both funding modes.
     sdk-paid-work = mkCargo "check-sdk-paid-work" ''
-      cargo test -p hellas-sdk
+      # These native cases each start a six-validator devnet. Serializing the
+      # test harness avoids cross-test resource starvation; the cases retain
+      # their own concurrent-client and cancellation assertions.
+      RUST_TEST_THREADS=1 cargo test -p hellas-sdk
       cargo clippy -p hellas-sdk --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which

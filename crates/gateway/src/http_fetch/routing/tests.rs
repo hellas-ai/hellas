@@ -47,6 +47,83 @@ fn every_backend_must_resolve_to_a_configured_paid_provider() {
     ));
 }
 
+#[test]
+fn signed_models_are_selected_per_path_and_legacy_mix_is_rejected() {
+    let mut config = config();
+    config.backends.remove("c");
+    for (name, backend) in &mut config.backends {
+        backend.resource = Some(hellas_auth::authority::ResourceId(
+            hellas_auth::Digest::hash(name.as_bytes()),
+        ));
+        backend.models.clear();
+        backend.routes[0].models = Some(vec![if name == "a" { "alpha" } else { "other" }.into()]);
+        backend.routes[1].models = Some(vec![if name == "a" { "beta" } else { "other" }.into()]);
+        let mut health = backend.routes[0].clone();
+        health.path = "/health".into();
+        health.method = "GET".into();
+        health.url = "https://example.com/health".into();
+        health.models = None;
+        backend.routes.push(health);
+    }
+    config.validate().unwrap();
+    let mut mixed = config.clone();
+    mixed.backends.get_mut("b").unwrap().routes[0].models = None;
+    assert!(mixed.validate().is_err());
+    let routing = routing(config);
+    let select =
+        |path, method, body: &[u8]| routing.select(path, method, &HeaderMap::new(), body, None);
+    assert_eq!(
+        select("/v1/chat/completions", "POST", br#"{"model":"alpha"}"#)
+            .unwrap()
+            .backend,
+        0
+    );
+    assert_eq!(
+        select("/v1/responses", "POST", br#"{"model":"beta"}"#)
+            .unwrap()
+            .backend,
+        0
+    );
+    assert_eq!(
+        select("/v1/responses", "POST", br#"{"model":"alpha"}"#)
+            .err()
+            .unwrap()
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        select("/v1/chat/completions", "POST", br#"{}"#)
+            .err()
+            .unwrap()
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        select(
+            "/v1/responses",
+            "POST",
+            br#"{"previous_response_id":"previous"}"#
+        )
+        .err()
+        .unwrap()
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let headers = HeaderMap::from_iter([(
+        "content-encoding".parse().unwrap(),
+        HeaderValue::from_static("gzip"),
+    )]);
+    assert_eq!(
+        routing
+            .select("/v1/responses", "POST", &headers, b"not gzip", None)
+            .err()
+            .unwrap()
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(select("/health", "GET", b"").is_ok());
+}
+
 fn select(routing: &Routing, model: &str, session: &str) -> Result<Selected, Unavailable> {
     routing.select(
         "/v1/chat/completions",

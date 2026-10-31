@@ -9,7 +9,7 @@ mod observation;
 mod routing;
 pub use routing::RoutingError;
 
-pub use config::{HttpGatewayConfig, HttpRoute};
+pub use config::{HttpBackend, HttpGatewayConfig, HttpRoute};
 #[cfg(test)]
 mod tests;
 
@@ -87,8 +87,12 @@ pub(super) fn router(
     for backend in &routing.backends {
         for route in &backend.routes {
             let models = paths.entry(route.path.clone()).or_insert(Some(Vec::new()));
-            match (models.as_mut(), backend.models.is_empty()) {
-                (Some(models), false) => models.extend(backend.models.iter().cloned()),
+            let restricted = route.models.as_ref().or_else(|| {
+                (backend.resource.is_none() && !backend.models.is_empty())
+                    .then_some(&backend.models)
+            });
+            match (models.as_mut(), restricted) {
+                (Some(models), Some(restricted)) => models.extend(restricted.iter().cloned()),
                 _ => *models = None,
             }
         }
@@ -117,12 +121,24 @@ fn fetch_route(
     backend: &routing::Backend,
     named: Option<&(String, String)>,
 ) -> Result<(String, String), crate::GatewayConfigError> {
+    if backend.resource.is_some() != backend.channel.is_some()
+        || (backend.resource.is_some() && named.is_some())
+    {
+        return Err(crate::GatewayConfigError::FetchRouteMismatch(
+            backend.name.clone(),
+        ));
+    }
     let mut sealed = Vec::new();
     let mut open = false;
-    for route in routes
-        .iter()
-        .filter(|route| route.provider == backend.provider)
-    {
+    for route in routes.iter().filter(|route| {
+        route.provider == backend.provider
+            && backend
+                .resource
+                .is_none_or(|resource| route.resource == Some(resource))
+            && backend
+                .channel
+                .is_none_or(|channel| route.channel == Some(channel))
+    }) {
         match &route.sealed {
             Some(route) => sealed.push(route),
             None => open = true,
@@ -398,6 +414,8 @@ async fn open(
     let (service, method) = &state.fetch_routes[backend];
     let mut stream = state.paid.fetch(WorkFetchRequest {
         provider,
+        resource: state.routing.backends[backend].resource,
+        channel: state.routing.backends[backend].channel,
         service: service.clone(),
         method: method.clone(),
         body: payload,

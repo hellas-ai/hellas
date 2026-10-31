@@ -13,9 +13,9 @@ pub mod setup;
 use hellas_kernel::Cursor;
 
 pub use channel::{
-    Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseSettlement, FinalizedHeight,
-    Funding, JobBook, JobPhase, JobState, JobTerminal, OpenContest, PaidCertificate,
-    PaymentFunding, RespondedContest, TerminalOutcome,
+    Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseHistory, CloseSettlement,
+    FinalizedHeight, Funding, JobBook, JobPhase, JobState, JobTerminal, OpenContest,
+    PaidCertificate, PaymentFunding, RespondedContest, TerminalOutcome,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{

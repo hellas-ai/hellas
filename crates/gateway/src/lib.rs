@@ -40,13 +40,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
 pub use hellas_rpc::compute_event::ComputeEvent;
-pub use http_fetch::{HttpGatewayConfig, HttpRoute, RoutingError};
+pub use http_fetch::{HttpBackend, HttpGatewayConfig, HttpRoute, RoutingError};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 /// A Fetch pinned to one funded provider by the HTTP account router.
 pub struct WorkFetchRequest {
     pub provider: EndpointId,
+    pub resource: Option<hellas_auth::authority::ResourceId>,
+    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     pub service: String,
     pub method: String,
     pub body: Vec<u8>,
@@ -57,6 +59,8 @@ pub struct WorkFetchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchRoute {
     pub provider: EndpointId,
+    pub resource: Option<hellas_auth::authority::ResourceId>,
+    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     pub schema: hellas_rpc::FetchSchema,
     /// `None` for an open Fetch, whose route the caller names.
     pub sealed: Option<(String, String)>,

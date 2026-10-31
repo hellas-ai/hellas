@@ -48,6 +48,40 @@ impl ChannelStore {
         content: hellas_store::ContentStore,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(
+            root, channel, settlement, role, origin, content, verifier, false,
+        )
+        .await
+    }
+
+    /// Replays an initialized channel without creating an empty replacement.
+    /// Settlement callers must never forget a previously signed payment.
+    pub async fn open_existing<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        origin: SetupOrigin,
+        content: hellas_store::ContentStore,
+        verifier: &V,
+    ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(
+            root, channel, settlement, role, origin, content, verifier, true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_inner<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        origin: SetupOrigin,
+        content: hellas_store::ContentStore,
+        verifier: &V,
+        existing: bool,
+    ) -> Result<Self, WorkStoreError> {
         if origin.payment_edge != channel.payment_edge() {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",
@@ -57,16 +91,16 @@ impl ChannelStore {
         let key = channel_key(&channel).into_bytes();
         let stem = format!("channel-{}", hex(key));
         let replayed = hellas_rpc::observe::Timing::start();
-        let (journal, replay) = Journal::open_latest(
-            root,
-            &format!("channel-{}", hex(key)),
-            JournalId {
-                kind: JournalKind::Channel,
-                role,
-                key,
-            },
-        )
-        .await?;
+        let id = JournalId {
+            kind: JournalKind::Channel,
+            role,
+            key,
+        };
+        let (journal, replay) = if existing {
+            Journal::open_existing(root, &stem, id).await?
+        } else {
+            Journal::open_latest(root, &stem, id).await?
+        };
         let mut uploads = crate::content::UploadStore::durable(root, &stem, channel.id(), content)?;
         let mut state = match &replay.checkpoint {
             Some(bytes) => Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?,

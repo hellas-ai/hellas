@@ -11,6 +11,7 @@ enum Case {
     StaleRevision,
     StaleGeneration,
     OutOfScope,
+    Model,
     Origin,
     Path,
     TlsRoots,
@@ -26,7 +27,13 @@ struct RefusalWorld {
 }
 impl Case {
     async fn arrange(self, path: &std::path::Path) -> RefusalWorld {
-        let resource = chat_resource("https://glm.test", 8);
+        let mut resource = chat_resource("https://glm.test", 8);
+        if self == Self::Model {
+            resource.model_policy = Some(vec![crate::model::grant::resource::PathModelPolicy {
+                path: resource.paths[0].clone(),
+                models: vec!["allowed".into()],
+            }]);
+        }
         let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
         use_https(&mut allowance.definition.policies[0], resource.clone());
         allowance.definition.enabled = self != Self::Paused;
@@ -75,7 +82,7 @@ impl Case {
             Self::OutOfScope => {
                 request.authorization.work_policy_digest = Digest::hash(b"ungranted policy")
             }
-            Self::Origin | Self::Path | Self::TlsRoots | Self::Credential => {
+            Self::Origin | Self::Path | Self::TlsRoots | Self::Credential | Self::Model => {
                 let mut http = HttpFetchRequest {
                     url: "https://glm.test/v1/chat/completions".into(),
                     method: "POST".into(),
@@ -94,6 +101,11 @@ impl Case {
                         }
                     }
                     Self::Credential => http.credential = Some("other-account".into()),
+                    Self::Model => {
+                        use base64::Engine as _;
+                        http.body_base64 = base64::engine::general_purpose::STANDARD
+                            .encode(br#"{"model":"denied","max_tokens":8}"#);
+                    }
                     _ => unreachable!(),
                 }
                 let contract = hellas_rpc::FetchContract::http().unwrap();
@@ -162,6 +174,7 @@ async fn grant_refusals_preserve_the_typed_reason() {
         (Case::StaleRevision, C::StaleRevision),
         (Case::StaleGeneration, C::StaleGeneration),
         (Case::OutOfScope, C::OutOfScope),
+        (Case::Model, C::OutOfScope),
         (Case::Origin, C::Origin),
         (Case::Path, C::PathMethod),
         (Case::TlsRoots, C::Tls),

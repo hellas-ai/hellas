@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    io::{self, Write},
+    borrow::Cow,
+    io::{self, Read, Write},
     sync::Arc,
 };
 
@@ -435,8 +436,55 @@ impl UsageDecoder {
     }
 }
 
-pub(crate) fn unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+/// Decode a request body under the same bound for routing and grant checks.
+pub fn decode_request_body<'a>(
+    encoding: Option<&str>,
+    body: &'a [u8],
+) -> Result<Cow<'a, [u8]>, &'static str> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let decode = |reader: &mut dyn Read| {
+        hellas_private::read_bounded(reader, LIMIT).map_err(|error| {
+            if error
+                .get_ref()
+                .is_some_and(|error| error.is::<hellas_private::ReadLimit>())
+            {
+                "decoded request body exceeds limit"
+            } else {
+                "invalid compressed request body"
+            }
+        })
+    };
+    let encoding = encoding.map(|value| value.trim().to_ascii_lowercase());
+    match encoding.as_deref() {
+        None | Some("") | Some("identity") if body.len() <= LIMIT => Ok(Cow::Borrowed(body)),
+        None | Some("") | Some("identity") => Err("decoded request body exceeds limit"),
+        Some("gzip") => Ok(Cow::Owned(decode(&mut flate2::read::MultiGzDecoder::new(
+            body,
+        ))?)),
+        Some("zstd") => {
+            let mut decoder = zstd::stream::read::Decoder::new(body)
+                .map_err(|_| "invalid compressed request body")?;
+            decoder
+                .window_log_max(23)
+                .map_err(|_| "invalid compressed request body")?;
+            Ok(Cow::Owned(decode(&mut decoder)?))
+        }
+        _ => Err("unsupported request encoding for model routing"),
+    }
+}
+
+/// Parse JSON while rejecting duplicate keys at any depth.
+pub fn unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice::<UniqueValue>(bytes).map(|v| v.0)
+}
+
+/// Extract the exact, bounded model identifier from a parsed request.
+pub fn request_model(value: &Value) -> Result<Option<&str>, &'static str> {
+    match value.get("model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(model)) if !model.is_empty() && model.len() <= 1024 => Ok(Some(model)),
+        _ => Err("invalid model identifier"),
+    }
 }
 
 // serde_json normally keeps the last duplicate object field. Strict accounting

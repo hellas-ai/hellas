@@ -44,6 +44,7 @@ pub mod paid_provider;
 pub mod work_config;
 pub mod work_router;
 
+pub mod execution;
 pub mod job;
 pub mod paid_client;
 pub mod transact;
@@ -64,6 +65,7 @@ pub mod node_control;
 mod gateway_work;
 pub use gateway_work::{GatewayServeOptions, WorkGateway, serve_gateway};
 pub mod grant_gateway;
+pub mod grant_store;
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

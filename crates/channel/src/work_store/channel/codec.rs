@@ -134,6 +134,11 @@ impl ChannelRecord {
                 // length.
                 out.extend_from_slice(&encode_kernel(start.as_ref()));
             }
+            Self::CloseHistoryAdvanced { parent, history } => {
+                out.push(tag::CLOSE_HISTORY);
+                out.extend_from_slice(parent);
+                put_close_history(&mut out, history);
+            }
             Self::CloseOpened {
                 start_id,
                 opener,
@@ -218,6 +223,10 @@ impl ChannelRecord {
             },
             tag::CLOSE_PREPARED => Self::ClosePrepared {
                 start: Box::new(decode_kernel(cursor.rest())?),
+            },
+            tag::CLOSE_HISTORY => Self::CloseHistoryAdvanced {
+                parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+                history: take_close_history(&mut cursor)?,
             },
             tag::CLOSE_OPENED => Self::CloseOpened {
                 start_id: StartId::from_bytes(
@@ -439,6 +448,7 @@ impl Channel<PaymentFunding> {
                     origin_observed,
                     close_prepared,
                     close_opened,
+                    close_history,
                     close_responded,
                     close_settled,
                 },
@@ -528,6 +538,11 @@ impl Channel<PaymentFunding> {
         put_option(&mut out, pending_proposal.as_ref(), |out, id| {
             out.extend_from_slice(id.as_bytes())
         });
+        // Optional tail extension. Existing checkpoints without replay progress
+        // retain their exact encoding and decode as no cached contest history.
+        if close_history.is_some() {
+            put_option(&mut out, close_history.as_ref(), put_close_history);
+        }
         out
     }
 
@@ -662,6 +677,18 @@ impl Channel<PaymentFunding> {
             })
         })?;
         let pending_proposal = take_option(&mut cursor, ChannelStateError::Malformed, digest)?;
+        let close_history = if cursor.is_empty() {
+            None
+        } else {
+            Some(
+                take_option(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                    take_close_history,
+                )?
+                .ok_or(ChannelStateError::Malformed)?,
+            )
+        };
         let state = Self {
             funding: PaymentState {
                 channel,
@@ -670,6 +697,7 @@ impl Channel<PaymentFunding> {
                 origin_observed,
                 close_prepared,
                 close_opened,
+                close_history,
                 close_responded,
                 close_settled,
             },
@@ -689,4 +717,18 @@ impl Channel<PaymentFunding> {
             Err(ChannelStateError::Malformed)
         }
     }
+}
+
+fn put_close_history(out: &mut Vec<u8>, history: &CloseHistory) {
+    put_u64(out, history.height);
+    out.extend_from_slice(&history.payload);
+    put_bytes(out, &encode_kernel(&history.pending));
+}
+
+fn take_close_history(cursor: &mut Cursor<'_>) -> Result<CloseHistory, ChannelStateError> {
+    Ok(CloseHistory {
+        height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+        payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+        pending: decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)?,
+    })
 }

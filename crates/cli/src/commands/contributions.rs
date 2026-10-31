@@ -1,9 +1,11 @@
 //! Contacts and private Offers belong to the principal a command acts for.
 use super::{CliResult, read_bounded_regular_file};
 use anyhow::ensure;
-use hellas_auth::authority::{ContactCard, PrincipalId, UnixMillis};
+use hellas_auth::authority::{ContactCard, PrincipalId};
 use hellas_authority::authenticator::Authenticator;
-use hellas_authority::model::grant::records::*;
+use hellas_authority::model::grant::records::{
+    MAX_CONTACT_CARD_BYTES, SignedOffer, decode_contact_card, encode_contact_card,
+};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -73,15 +75,7 @@ pub(crate) fn data_root(principal: &PrincipalId) -> CliResult<PathBuf> {
     Ok(base.join(format!("p256-{}", hex::encode(principal.as_bytes()))))
 }
 fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
-    ensure!(
-        !name.is_empty()
-            && name.len() <= 64
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-        "alias must be 1..64 ASCII letters/digits, dots, underscores or hyphens, starting with a letter or digit"
-    );
+    hellas_sdk::grant_store::validate_alias(name)?;
     Ok(root.join(kind).join(name))
 }
 
@@ -158,19 +152,16 @@ pub fn offer(
 ) -> CliResult<()> {
     let identity = require_principal(passkey)?;
     let root = data_root(&identity)?;
+    let store = hellas_sdk::grant_store::GrantStore::new(root);
     match command {
         OfferCommand::Import {
             file,
             name,
             replace,
         } => {
-            let bytes = read_bounded_regular_file(&file, "offer", MAX_OFFER_BYTES)?;
-            let imported = SignedOffer::decode(&bytes, UnixMillis(0))?;
-            let path = alias(&root, "offers", &name)?;
-            check_offer_alias(&path, &imported, replace)?;
-            save(&path, &bytes)?;
-            println!("{}", hex::encode(imported.offer().grant.id.0));
-            offer_fingerprints(&imported)?;
+            let imported = store.import_offer(&file, &name, replace)?;
+            println!("{}", hex::encode(imported.offer.offer().grant.id.0));
+            offer_fingerprints(&imported.offer)?;
         }
         OfferCommand::ImportBundle {
             file,
@@ -182,65 +173,22 @@ pub fn offer(
                     .ok_or_else(|| anyhow::anyhow!("an access bundle is bound to a device"))?
                     .public_key(),
             )?;
-            let bundle = hellas_sdk::access_bundle::AccessBundle::load(&file, &identity, &node)?;
-            let mut saved = Vec::with_capacity(bundle.offers.len());
-            for offer in &bundle.offers {
-                let policy = offer
-                    .offer()
-                    .grant
-                    .policies
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("a shared offer names a policy"))?;
-                let label = format!("{name}.{}", policy.name);
-                let path = alias(&root, "offers", &label)?;
-                ensure!(
-                    !saved.iter().any(|(other, _, _)| *other == label),
-                    "two shared offers would both be saved as {label}"
-                );
-                check_offer_alias(&path, offer, replace)?;
-                saved.push((label, path, offer));
-            }
-            let profile = bundle.install_profile(&alias(&root, "accesses", &name)?)?;
-            for (_, path, offer) in &saved {
-                save(path, &offer.encode()?)?;
-                offer_fingerprints(offer)?;
+            let imported = store.import_bundle(&file, &name, &identity, &node, replace)?;
+            for item in &imported.offers {
+                offer_fingerprints(&item.offer)?;
             }
             println!(
                 "{}",
                 serde_json::json!({
-                    "offers": saved.iter().map(|(label, _, offer)| serde_json::json!({
-                        "name": label,
-                        "grant": hex::encode(offer.offer().grant.id.0),
+                    "offers": imported.offers.iter().map(|item| serde_json::json!({
+                        "name": item.name,
+                        "grant": hex::encode(item.offer.offer().grant.id.0),
                     })).collect::<Vec<_>>(),
-                    "work_profile": profile,
+                    "work_profile": imported.profile,
                 })
             );
         }
     }
-    Ok(())
-}
-
-fn check_offer_alias(path: &Path, imported: &SignedOffer, replace: bool) -> CliResult<()> {
-    if !path.exists() || replace {
-        return Ok(());
-    }
-    let previous = SignedOffer::decode(
-        &read_bounded_regular_file(path, "offer", MAX_OFFER_BYTES)?,
-        UnixMillis(0),
-    )?;
-    let new = imported.offer();
-    let old = previous.offer();
-    ensure!(
-        new.provider == old.provider && new.grant.id == old.grant.id && new.network == old.network,
-        "offer alias already names another grant; use --replace explicitly"
-    );
-    ensure!(
-        new.grant.revision >= old.grant.revision
-            && new.generation >= old.generation
-            && new.sequence >= old.sequence
-            && new.valid_until >= old.valid_until,
-        "offer import would roll back saved standing"
-    );
     Ok(())
 }
 
@@ -259,11 +207,7 @@ pub fn client_journal_root(identity: &PrincipalId) -> CliResult<PathBuf> {
 /// Saved Offer terms may have expired; only use this as a signed locator.
 /// GrantSession obtains fresh authenticated standing before proposing a job.
 pub fn load_offer(identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
-    let path = alias(&data_root(identity)?, "offers", name)?;
-    Ok(SignedOffer::decode(
-        &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-        UnixMillis(0),
-    )?)
+    Ok(hellas_sdk::grant_store::GrantStore::new(data_root(identity)?).load_offer(name)?)
 }
 
 #[cfg(test)]

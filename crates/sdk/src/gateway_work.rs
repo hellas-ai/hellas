@@ -321,11 +321,37 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
         )
     }
     pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
+        // The signed transcript is one mandatory evidence record whose size is
+        // fixed by the job's authorised spool, not by how fast the consumer
+        // reads. Charging it against the slow-consumer byte budget made a
+        // verified, already-paid result undeliverable whenever the transcript
+        // exceeded the whole queue, which then suppressed the completion too.
+        // It is moved rather than copied, takes a queue slot, and a consumer
+        // that stops reading still ends the stream.
+        if matches!(&event, Ok(WorkEvent::Transcript(_))) {
+            return self.emit_mandatory(event);
+        }
         let bytes = match &event {
             Ok(event) => event_bytes(event),
             Err(error) => error.to_string().len(),
         };
         emit(&self.sender, &self.overflow, &self.budget, event, bytes);
+    }
+    /// Queues an event whose size is set by the job rather than by the reader.
+    fn emit_mandatory(&self, event: Result<WorkEvent<E>, X>) {
+        if *self.overflow.borrow() || self.sender.is_closed() {
+            return;
+        }
+        let Ok(permits) = self.budget.clone().try_acquire_many_owned(0) else {
+            self.overflow.send_replace(true);
+            return;
+        };
+        if matches!(
+            self.sender.try_send((event, permits)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            self.overflow.send_replace(true);
+        }
     }
     /// Reports the provider's acceptance as it happens, before any output.
     pub(crate) fn accepted(&self) -> crate::transact::Accepted {
@@ -470,6 +496,8 @@ pub(crate) fn fetch_routes<'a>(
                 continue;
             };
             let route = hellas_gateway::FetchRoute {
+                resource: None,
+                channel: None,
                 provider,
                 schema: admission.contract.schema(),
                 sealed: match &admission.route {
@@ -538,6 +566,7 @@ pub struct WorkGateway<S> {
     pub(crate) source: Arc<S>,
     pub(crate) admission: Arc<Semaphore>,
     tasks: WorkTasks,
+    pub(crate) endpoints: tokio::sync::Mutex<Vec<iroh::Endpoint>>,
 }
 impl<S: WorkSource> WorkGateway<S> {
     pub(crate) fn new(source: S, max_pending: usize) -> Self {
@@ -545,7 +574,16 @@ impl<S: WorkSource> WorkGateway<S> {
             source: Arc::new(source),
             admission: Arc::new(Semaphore::new(max_pending)),
             tasks: WorkTasks::default(),
+            endpoints: tokio::sync::Mutex::new(Vec::new()),
         }
+    }
+    pub(crate) fn with_endpoint(mut self, endpoint: Option<iroh::Endpoint>) -> Self {
+        self.endpoints = tokio::sync::Mutex::new(endpoint.into_iter().collect());
+        self
+    }
+    pub(crate) fn with_endpoints(mut self, endpoints: Vec<iroh::Endpoint>) -> Self {
+        self.endpoints = tokio::sync::Mutex::new(endpoints);
+        self
     }
     pub(crate) fn submit<E: GatewayEvent>(
         &self,
@@ -595,6 +633,17 @@ impl<S: WorkSource> WorkGateway<S> {
         ))
     }
 }
+/// Close each distinct live endpoint once. Clones observe the same closed
+/// state, while independently bound endpoints remain individually owned.
+pub(crate) async fn close_endpoints(endpoints: &mut Vec<iroh::Endpoint>) {
+    while let Some(endpoint) = endpoints.last() {
+        if !endpoint.is_closed() {
+            endpoint.close().await;
+        }
+        endpoints.pop();
+    }
+}
+
 impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.source.fetch_routes()
@@ -625,6 +674,8 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
         Box::pin(async move {
             let tasks = self.tasks.drain().await;
             let source = self.source.shutdown().await;
+            let mut endpoints = self.endpoints.lock().await;
+            close_endpoints(&mut endpoints).await;
             tasks.and(source)
         })
     }
@@ -635,6 +686,24 @@ mod task_tests {
     use super::WorkTasks;
     use hellas_gateway::WorkShutdownError;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn endpoint_clones_and_distinct_endpoints_are_drained() {
+        use iroh::endpoint::presets;
+        let first = iroh::Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let second = iroh::Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let mut endpoints = vec![first.clone(), first.clone(), second.clone()];
+        super::close_endpoints(&mut endpoints).await;
+        assert!(endpoints.is_empty());
+        assert!(first.is_closed());
+        assert!(second.is_closed());
+    }
 
     #[tokio::test]
     async fn cancelled_drain_keeps_tasks_even_when_state_is_poisoned() {
@@ -800,6 +869,32 @@ mod output_tests {
         }
         assert_eq!(count, 128);
         assert_eq!(budget.available_permits(), OUTPUT_BUFFER_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_transcript_larger_than_the_output_budget_is_delivered() {
+        let (requester, mut response) = TestRequester::new();
+        // A job may be authorised to spool more evidence than the whole
+        // slow-consumer queue holds. That evidence is mandatory and already
+        // resident, so it must not be charged against the reader's budget;
+        // otherwise a verified, already-paid result cannot be delivered and
+        // its completion is suppressed with it.
+        let transcript = vec![0xab; OUTPUT_BUFFER_BYTES + 4096];
+        requester.emit(Ok(WorkEvent::Transcript(transcript.clone())));
+        requester.emit(Ok(WorkEvent::Output(text("done"))));
+        drop(requester);
+        assert!(
+            matches!(response.next().await.unwrap().unwrap(), WorkEvent::Transcript(actual) if actual == transcript),
+            "the whole signed transcript is delivered"
+        );
+        assert!(
+            matches!(
+                response.next().await.unwrap().unwrap(),
+                WorkEvent::Output(_)
+            ),
+            "and the completion follows it"
+        );
+        assert!(response.next().await.is_none());
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url = "2"
+zstd = "0.14"
 
 [dev-dependencies]
 bytes.workspace = true

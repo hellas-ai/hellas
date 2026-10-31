@@ -102,6 +102,7 @@ pub struct PaidPool {
     owner: Arc<crate::client_owner::ClientOwner>,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_auth::ProducerSigningKey,
+    funding: crate::paid_client::SessionFundingOptions,
 }
 
 pub type PaidGateway = WorkGateway<PaidPool>;
@@ -170,6 +171,15 @@ impl PaidGateway {
         identity: crate::NodeIdentity,
         owner: Arc<crate::client_owner::ClientOwner>,
     ) -> Result<Arc<Self>> {
+        Self::open_with_funding(options, identity, owner, Default::default()).await
+    }
+
+    pub async fn open_with_funding(
+        options: PaidGatewayOptions,
+        identity: crate::NodeIdentity,
+        owner: Arc<crate::client_owner::ClientOwner>,
+        funding: crate::paid_client::SessionFundingOptions,
+    ) -> Result<Arc<Self>> {
         options.validate()?;
         for provider in &options.providers {
             provider.config.clone().validate()?;
@@ -211,6 +221,7 @@ impl PaidGateway {
         }
         let gateway = Arc::new(WorkGateway::new(
             PaidPool {
+                funding,
                 providers,
                 // One transport identity has one relay registration, shared by every
                 // provider and request for the lifetime of this gateway.
@@ -287,6 +298,9 @@ impl PaidPool {
                 ));
                 continue;
             }
+            let job = input
+                .map(|input| Job::from_input(provider.args.expected_price, input))
+                .transpose()?;
             if session.is_none() {
                 let opened = before_proposal(requester, streamed, deadline, |_| async {
                     PaidWorkSession::open_for_gateway(
@@ -295,6 +309,8 @@ impl PaidPool {
                         self.settlement_key.clone(),
                         self.owner.clone(),
                         PROVIDER_CONNECTION_TIMEOUT,
+                        self.funding.clone(),
+                        job.as_ref(),
                     )
                     .await
                     .map_err(PoolError::from)
@@ -347,9 +363,6 @@ impl PaidPool {
                 .with_state(|state| state.proposal_nonce_high_water())
                 .await?;
             let request_session = &mut *session;
-            let job = input
-                .map(|input| Job::from_input(provider.args.expected_price, input))
-                .transpose()?;
             let signer = self.producer_key.clone();
             let on_progress = streamed.then(|| progress.clone());
             let on_accepted = streamed.then(|| accepted.clone());
@@ -471,6 +484,13 @@ impl WorkSource for PaidPool {
     /// A pinned request has at most its own provider: account and session
     /// selection is final, so it never fails over.
     fn request(&self, request: WorkRequest) -> Result<PaidRequest> {
+        if matches!(&request, WorkRequest::Fetch(fetch) if fetch.resource.is_some() || fetch.channel.is_some())
+        {
+            return Err(WorkGatewayError::Rejected(Box::new(std::io::Error::other(
+                "paid work has no grant resource selector",
+            )))
+            .into());
+        }
         let pinned = request.pinned();
         let mut refusal = None;
         let mut candidates = self
@@ -809,6 +829,7 @@ mod tests {
     ) -> PaidPool {
         let args = pool_options(fixture).providers.remove(0);
         PaidPool {
+            funding: Default::default(),
             owner: Arc::new(
                 crate::client_owner::ClientOwner::new(
                     Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
@@ -837,6 +858,8 @@ mod tests {
 
     fn fetch(pool: &PaidPool, method: &str) -> WorkRequest {
         WorkRequest::Fetch(WorkFetchRequest {
+            resource: None,
+            channel: None,
             provider: pool.providers[0].args.provider.node,
             service: "openai".into(),
             method: method.into(),

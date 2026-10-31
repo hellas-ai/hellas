@@ -17,10 +17,22 @@ fn catena_child() {
 
 #[path = "paid_e2e/automatic.rs"]
 mod automatic;
+#[path = "paid_e2e/budget.rs"]
+mod budget;
+#[path = "native_execution/cli_composition.rs"]
+mod cli_composition;
 #[path = "paid_e2e/gateway.rs"]
 mod gateway;
+#[path = "native_execution/grant.rs"]
+mod grant;
+#[path = "native_execution/pool.rs"]
+mod pool;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
+#[path = "paid_e2e/settlement.rs"]
+mod settlement_recovery;
+#[path = "paid_e2e/tracked.rs"]
+mod tracked;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,7 +61,9 @@ use hellas_rpc::protocol::invocation::{
     self as invocation, Admission, InvocationPolicy, Limits, PreparedInvocation,
 };
 use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
-use hellas_sdk::paid_client::{PaidWorkOptions, PaidWorkSession, bind_paid_endpoint};
+use hellas_sdk::paid_client::{
+    PaidWorkOptions, PaidWorkSession, SessionFundingOptions, SessionOpenMode, bind_paid_endpoint,
+};
 use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
@@ -157,6 +171,8 @@ async fn check_other_enrollment_refused(
             endpoint.clone(),
             client_settlement(),
             owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
         )
         .await
         .err()
@@ -226,12 +242,13 @@ async fn check_other_contract_refused(
     approvals: &Approvals,
 ) {
     let funded = approvals.0.lock().unwrap().len();
-    let error = PaidWorkSession::open_for_job(
+    let error = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
         client_settlement(),
         owner,
-        &other_contract_job(),
+        SessionOpenMode::Job(&other_contract_job()),
+        SessionFundingOptions::default(),
     )
     .await
     .err()
@@ -632,6 +649,8 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
+                resource: None,
+                channel: None,
                 provider: options.provider.node,
                 service: "openai".into(),
                 method: "wrong-route".into(),
@@ -647,6 +666,8 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
+                resource: None,
+                channel: None,
                 provider: options.provider.node,
                 service: "openai".into(),
                 method: "responses".into(),
@@ -973,6 +994,8 @@ async fn paid_setup(
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     );
     tokio::pin!(open);
     // A completed typed timeout is the expected result in the outage case;
@@ -1146,6 +1169,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     );
     tokio::pin!(reopening);
     tokio::select! {
@@ -1169,11 +1194,13 @@ async fn paid_finish(case: PaidScenario) {
     recovered.shutdown().await;
     drop(recovered);
     // Restart recovery re-verifies the retained offer against the address.
-    let error = PaidWorkSession::open_retained(
+    let error = PaidWorkSession::open(
         other_provider(&options),
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Retained,
+        SessionFundingOptions::default(),
     )
     .await
     .err()
@@ -1216,6 +1243,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1278,6 +1307,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1334,6 +1365,8 @@ async fn paid_finish(case: PaidScenario) {
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1481,19 +1514,36 @@ async fn paid_finish(case: PaidScenario) {
             endpoint.clone(),
             client_settlement(),
             owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
         ),
     )
     .await
     .unwrap();
     Box::pin(check_client_funding(&devnet, &approvals, 2)).await;
-    assert_ne!(second.descriptor().bond_edge(), bond);
+    let second_bond = second.descriptor().bond_edge();
+    assert_ne!(second_bond, bond);
     second.shutdown().await;
     drop(second);
+    let retained = hellas_sdk::paid_client::retained_settlement_channels(
+        &options.journal_root,
+        options.config.chain.network,
+        options.provider,
+        owner.principal(),
+        owner.delegate(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().any(|item| item.bond == bond));
+    assert!(retained.iter().any(|item| item.bond == second_bond));
     let second = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
     .unwrap();
@@ -1634,6 +1684,13 @@ fn unseen_program_pays_exactly_once() {
 }
 
 #[test]
+#[ignore = "requires the CLI executable supplied by the CLI integration gate"]
+fn cli_paid_and_grant_two_provider_composition() {
+    assert!(std::env::var_os("HELLAS_CLI_TEST_BINARY").is_some());
+    run(automatic::exercise);
+}
+
+#[test]
 fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
     use hellas_chain::WorkBlocks;
     use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
@@ -1707,4 +1764,9 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
 #[test]
 fn remote_object_reads_verify_current_state_and_reject_forged_witnesses() {
     run(remote::proofs);
+}
+
+#[test]
+fn a_responsive_source_below_the_journal_height_is_not_selected() {
+    run(remote::stale_source_selection);
 }

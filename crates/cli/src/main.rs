@@ -80,7 +80,7 @@ struct RemoteTrustArgs {
     assurance: hellas_rpc::Assurance,
 
     /// Caller-owned native trust directory.
-    #[arg(long, requires = "trust_policy", conflicts_with = "paid_work_config")]
+    #[arg(long, conflicts_with = "paid_work_config")]
     trust_store: Option<PathBuf>,
     /// Previously approved local policy ID.
     #[arg(long, requires = "trust_store", conflicts_with = "paid_work_config")]
@@ -286,11 +286,17 @@ enum Commands {
         native: compute::ServeArgs,
         /// Run this node's own, already configured allowance in process: no
         /// chain and no remote provider.
-        #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config"])]
+        #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config", "grant_pool_config"])]
         local_grant: Option<String>,
         /// Use a private Offer previously verified by `offer import`.
-        #[arg(long, value_name = "ALIAS", conflicts_with = "paid_work_config")]
+        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["paid_work_config", "grant_pool_config"])]
         offer: Option<String>,
+        /// Use an explicit list of private grant channels and resources.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["offer", "local_grant", "paid_work_config", "grant_policy", "work_profile", "http_fetch_config", "trust_policy"])]
+        grant_pool_config: Option<PathBuf>,
+        /// Check grant pool aliases, trust and saved terms without connecting.
+        #[arg(long, requires = "grant_pool_config")]
+        check_config: bool,
         /// Select one resource when the Offer includes several matching policies.
         #[arg(long)]
         grant_policy: Option<String>,
@@ -462,6 +468,10 @@ fn validate_identity_options(
     let reads_existing_identity = matches!(
         command,
         Commands::Gateway { offer: Some(_), .. }
+            | Commands::Gateway {
+                grant_pool_config: Some(_),
+                ..
+            }
             | Commands::Gateway {
                 local_grant: Some(_),
                 ..
@@ -897,6 +907,8 @@ async fn async_main() {
             native,
             local_grant,
             offer,
+            grant_pool_config,
+            check_config,
             grant_policy,
             work_profile,
             http_fetch_config,
@@ -919,6 +931,36 @@ async fn async_main() {
             wrap_args,
         } => async {
             let assurance = remote_trust.assurance;
+            let pool_options = if let Some(path) = grant_pool_config.as_deref() {
+                let client = commands::contributions::require_principal(passkey)?;
+                let root = commands::contributions::data_root(&client)?;
+                let trust_directory = remote_trust
+                    .trust_store
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--trust-store is required for a grant pool"))?;
+                Some(commands::grant_gateway::load_pool(
+                    path,
+                    &root,
+                    trust_directory,
+                    &local_identity,
+                    client,
+                    assurance,
+                )?)
+            } else {
+                None
+            };
+            if check_config {
+                let pool = pool_options
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--check-config requires a grant pool"))?;
+                hellas_gateway::ResponsesFetch::from_routes(
+                    &pool.fetch_routes()?,
+                    responses_overrides.clone().unwrap_or_default(),
+                    responses_models.clone(),
+                )?;
+                println!("grant pool configuration is valid");
+                return Ok(());
+            }
             let application = work_profile
                 .as_deref()
                 .map(hellas_sdk::node_control::profile::ClientProfile::load)
@@ -1060,7 +1102,19 @@ async fn async_main() {
             if let Some((address, bundle)) = metrics {
                 metrics::spawn_metrics_server(address, bundle).await?;
             }
-            let gateway = if let Some((session, transport)) = grant_source {
+            let gateway = if let Some(pool) = pool_options {
+                let transport =
+                    hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?;
+                let hellas_sdk::grant_client::GrantTransport::Remote(endpoint) = transport else {
+                    unreachable!()
+                };
+                let transports = (0..pool.channels.len())
+                    .map(|_| hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()))
+                    .collect();
+                hellas_sdk::grant_gateway::GrantPoolServeOptions { serve, pool }
+                    .start(transports)
+                    .await?
+            } else if let Some((session, transport)) = grant_source {
                 hellas_sdk::grant_gateway::GrantServeOptions {
                     serve,
                     session,
