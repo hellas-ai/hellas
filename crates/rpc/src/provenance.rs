@@ -27,8 +27,8 @@ pub const TRANSCRIPT_KEY: &str = "x-hellas-transcript";
 
 /// HTTP trailer (a header on a bodyless response) naming the lowercase hex
 /// SHA-256 of the canonical signed bytes when the transcript is too large to
-/// carry inline. The digest detects an omitted transcript and verifies an
-/// out-of-band copy.
+/// carry inline. The digest detects an omitted transcript and verifies a copy
+/// obtained out of band; the gateway neither retains nor serves that copy.
 pub const TRANSCRIPT_DIGEST_KEY: &str = "x-hellas-transcript-digest";
 
 /// Largest base64 `x-hellas-transcript` value carried inline. HTTP stacks

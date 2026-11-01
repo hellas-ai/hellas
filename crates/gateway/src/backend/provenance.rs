@@ -8,7 +8,10 @@ use hellas_rpc::provenance::{
 
 /// The evidence header for a completed job's signed transcript: the base64
 /// canonical bytes while they fit [`MAX_INLINE_TRANSCRIPT_BYTES`], otherwise
-/// the lowercase hex SHA-256 that identifies an out-of-band copy.
+/// the lowercase hex SHA-256 of those bytes. In the latter case the transcript
+/// is not delivered to the HTTP caller: the digest only lets a caller who
+/// obtains the canonical bytes out of band verify them, and the gateway
+/// neither retains nor serves a copy.
 pub(crate) fn transcript_header(transcript: &[u8]) -> (HeaderName, HeaderValue) {
     use base64::Engine as _;
     use sha2::Digest as _;

@@ -2,8 +2,11 @@
 //!
 //! The provider's acceptance heads the response as `x-hellas-commitment-bin`
 //! and `x-hellas-provider`; the signed transcript trails the body as
-//! `x-hellas-transcript` (a header on a bodyless response), or is named by
-//! `x-hellas-transcript-digest` when it is too large to carry inline.
+//! `x-hellas-transcript` (a header on a bodyless response). A transcript too
+//! large to carry inline is not delivered to the HTTP caller: the trailer is
+//! omitted and `x-hellas-transcript-digest` names the lowercase hex SHA-256 of
+//! the canonical signed bytes, which the caller must obtain out of band. The
+//! gateway neither retains nor serves that copy.
 pub(crate) mod affinity;
 mod config;
 mod observation;
