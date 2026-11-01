@@ -320,6 +320,26 @@ where
         }
     };
     let objects = crate::job::content_closure(&policy, &manifest, &program_root, reference)?;
+    // A retained proposal is resumed from the journal alone, so the bytes
+    // its upload needs must outlive this process. Retain the exact closure
+    // in the upload store before any of it leaves: a crash during upload
+    // then leaves a complete local copy to re-send, and one before the
+    // first chunk leaves a job recovery reports as unresolved rather than
+    // one whose missing root parses as an empty program.
+    if authorization.retention == hellas_rpc::Retention::Retain {
+        let client = endpoint.client().await?;
+        client.store.retain_upload(&prepared_bytes)?;
+        if !program_root.is_empty() {
+            client.store.retain_upload(&program_root)?;
+        }
+        for object in &objects {
+            if *object == reference {
+                continue;
+            }
+            let bytes = content.read(*object)?;
+            client.store.retain_upload(&bytes)?;
+        }
+    }
     let client = WorkClientImpl::new(transport);
     for object in objects {
         let mut offset = 0u64;

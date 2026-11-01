@@ -2899,6 +2899,9 @@ async fn proposal_ordering_survives_checkpoint_rotation() {
     let job = job_at(&channel(), 1, 0);
     let mut store = open(dir.path(), Role::Client).await;
     store.commit(job.proposed(), &verifier).await.unwrap();
+    // A real send retains the upload closure before it leaves; without it
+    // the reopened journal would correctly report the proposal unresolved.
+    fixture::retain_proposal_content(&store, &fixture::environment().canonical_bytes().unwrap());
     for pending in [true, false, true] {
         store
             .commit(

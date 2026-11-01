@@ -196,16 +196,102 @@ impl ChannelStore {
             .invocation_content(work, &objects, job.authorization().retention)?)
     }
 
+    /// Reconstructs the upload content a retained job still needs from what
+    /// this journal durably holds.
+    ///
+    /// `None` means the job is not a retained job, or its upload never
+    /// completed: the prepared bundle or one of the closure objects is not
+    /// in the upload store. Missing content is unresolved work, not an empty
+    /// program, and a caller must not treat it as one.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkStoreError`] when the prepared bundle does not parse or the
+    /// upload store reports something other than absence.
+    pub fn recoverable_content(
+        &self,
+        work: Digest,
+    ) -> Result<Option<crate::content::InvocationContent>, WorkStoreError> {
+        let Some(job) = self.state.job_by_id(work) else {
+            return Ok(None);
+        };
+        if job.authorization().retention != hellas_rpc::Retention::Retain
+            || job.prepared_input().is_empty()
+        {
+            return Ok(None);
+        }
+        let input = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)
+        .map_err(ChannelStateError::from)?;
+        let manifest = input
+            .manifest()
+            .map_err(PaidWorkError::from)
+            .map_err(ChannelStateError::from)?;
+        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+            .map_err(PaidWorkError::from)
+            .map_err(ChannelStateError::from)?;
+        // The policy says whether an opening is required at all; a
+        // self-contained program (Fetch) has no root to recover. Anything
+        // else whose root is not retained is unfinished, never empty.
+        let program_root = if policy.content_closure(&manifest, &[]).is_ok() {
+            Vec::new()
+        } else {
+            match self
+                .uploads
+                .root(work, manifest.root(), hellas_rpc::Retention::Retain)
+            {
+                Ok(root) if !root.is_empty() => root,
+                Ok(_) | Err(crate::content::ContentError::Missing) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let objects = match crate::job::content_closure(
+            &policy,
+            &manifest,
+            &program_root,
+            job.authorization().input_content,
+        ) {
+            Ok(objects) => objects,
+            Err(_) => return Ok(None),
+        };
+        match self
+            .uploads
+            .invocation_content(work, &objects, hellas_rpc::Retention::Retain)
+        {
+            Ok(content) => Ok(Some(content)),
+            Err(crate::content::ContentError::Missing) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Retains one content object beside a client's proposal.
+    ///
+    /// A retained proposal is resumed from the journal alone, so the bytes
+    /// its upload needs must outlive this process. The upload store is the
+    /// one durable content home the journal already has.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::content::ContentError`] when the store cannot index the
+    /// bytes.
+    pub(crate) fn retain_upload(&self, bytes: &[u8]) -> Result<(), crate::content::ContentError> {
+        self.uploads.retain(bytes).map(|_| ())
+    }
+
     /// Releases a pending proposal this journal can no longer send.
     ///
-    /// A proposal is resumable only from the exact bytes it was signed over,
-    /// and ephemeral input is never journaled. When those bytes did not
-    /// survive replay, the marker would refuse every later proposal forever
-    /// while the job it names can never leave its half-signed phase except
-    /// by expiry. Clearing the marker is a durable exchange record: the
-    /// nonce stays burned and the job stays open for a late acceptance, so
-    /// this frees the channel's one proposal slot without deciding that the
-    /// provider owes or is owed anything.
+    /// A proposal is resumable only from the exact bytes it was signed over.
+    /// Ephemeral input is never journaled, and retained input can be sent
+    /// only when its whole upload closure survived. When neither holds, the
+    /// marker would refuse every later proposal forever while the job it
+    /// names can never leave its half-signed phase except by expiry.
+    /// Clearing the marker is a durable exchange record: the nonce stays
+    /// burned and the job stays open for a late acceptance, so this frees
+    /// the channel's one proposal slot without deciding that the provider
+    /// owes or is owed anything.
     async fn release_unresumable_proposal<V: SigVerifier>(
         &mut self,
         verifier: &V,
@@ -219,7 +305,9 @@ impl ChannelStore {
         let Some(job) = self.state.job_by_id(work_id) else {
             return Ok(());
         };
-        if job.phase() != JobPhase::HalfSigned || !job.prepared_input().is_empty() {
+        if job.phase() != JobPhase::HalfSigned
+            || (!job.prepared_input().is_empty() && self.recoverable_content(work_id)?.is_some())
+        {
             return Ok(());
         }
         self.commit(

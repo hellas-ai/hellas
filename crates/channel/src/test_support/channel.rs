@@ -1076,3 +1076,14 @@ pub fn program_content() -> crate::content::InvocationContent {
     content.insert(environment().canonical_bytes().unwrap());
     crate::content::InvocationContent::Ephemeral(content)
 }
+
+/// Retains one upload object exactly as a client's proposal upload does.
+///
+/// Fixtures that commit a proposal directly need this to leave the journal
+/// in the state a real send would: the closure is durable, so a restart can
+/// resume the proposal instead of reporting it unresolved.
+pub fn retain_proposal_content(store: &crate::work_store::ChannelStore, bytes: &[u8]) {
+    if let Err(error) = store.retain_upload(bytes) {
+        panic!("the fixture upload retains its content: {error}");
+    }
+}

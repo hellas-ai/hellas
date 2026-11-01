@@ -3142,6 +3142,23 @@ impl ClientEndpoint {
         self.store.state()
     }
 
+    /// Reconstructs the upload content a retained job still needs from this
+    /// journal's durable upload store.
+    ///
+    /// `None` when the job is not retained or its upload never completed.
+    /// That is unresolved work, not an empty program: a caller must report
+    /// it rather than upload a fabricated root.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`ChannelStore::recoverable_content`] refuses.
+    pub fn retained_content(
+        &self,
+        work_id: Digest,
+    ) -> Result<Option<crate::content::InvocationContent>, WorkStoreError> {
+        self.store.recoverable_content(work_id)
+    }
+
     /// Returns the request that proposes this job, making it durable
     /// first.
     ///

@@ -920,6 +920,33 @@ impl PaidWorkSession {
                     }
                     RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, *input),
                 };
+                // A retained half-signed job resumes from its own durable
+                // closure. Missing content is unresolved, never an empty
+                // program: uploading a fabricated root would sign for work
+                // this process cannot produce.
+                let retained_upload = phase == hellas_channel::work_store::JobPhase::HalfSigned
+                    && client
+                        .with_state(|state| {
+                            state.job_by_id(work_id).is_some_and(|job| {
+                                job.authorization().retention == hellas_rpc::Retention::Retain
+                            })
+                        })
+                        .await?;
+                let job_content = if retained_upload {
+                    match client.client().await?.retained_content(work_id)? {
+                        Some(content) => content,
+                        None => {
+                            tracing::warn!(
+                                %work_id,
+                                "retaining an unpaid job whose upload never completed; \
+                                 it is unresolved rather than an empty program"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    content.clone()
+                };
                 check_request(
                     policy,
                     &pending,
@@ -929,7 +956,7 @@ impl PaidWorkSession {
                 let result = execute_paid_job(
                     args,
                     pending,
-                    content,
+                    &job_content,
                     dialer,
                     client,
                     &ready,
