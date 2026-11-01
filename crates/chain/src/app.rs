@@ -49,7 +49,7 @@ use commonware_utils::{SystemTimeExt, non_empty_range};
 #[cfg(feature = "full-node")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
-#[cfg(all(test, feature = "validator"))]
+#[cfg(feature = "validator")]
 use hellas_rpc::SubmitTxOutcome;
 #[cfg(feature = "full-node")]
 use prometheus_client::metrics::gauge::Gauge;
@@ -86,6 +86,22 @@ impl Default for ApplicationConfig {
 #[cfg(feature = "full-node")]
 #[cfg(feature = "validator")]
 pub const GENERAL_MEMPOOL_CAPACITY: usize = 120;
+/// Finalized-state reconciliations that may retain a general-lane entry
+/// before it is evicted as an orphan.
+///
+/// `submit_general` admits without semantic validation and a missing input
+/// is classified as transient, so a never-includable transaction would
+/// otherwise hold capacity forever. Reconciliation re-executes a window of
+/// `RECONCILED_PER_BLOCK` residents and advances it one slot per finalized
+/// block, so each resident is examined on `RECONCILED_PER_BLOCK` consecutive
+/// blocks per rotation of a full pool. A resident that fails every
+/// examination reaches this bound within one rotation plus
+/// `GENERAL_MEMPOOL_MAX_STRIKES` blocks (about `GENERAL_MEMPOOL_CAPACITY +
+/// RESPONSE_MEMPOOL_CAPACITY + GENERAL_MEMPOOL_MAX_STRIKES`). Admission may
+/// evict a resident earlier once reconciliation has retained it at least
+/// once, but never one that has not been examined.
+#[cfg(feature = "full-node")]
+pub const GENERAL_MEMPOOL_MAX_STRIKES: u32 = 8;
 /// Maximum number of finalized-contest response slots resident at once.
 #[cfg(feature = "full-node")]
 #[cfg(feature = "validator")]
@@ -111,6 +127,9 @@ pub const RECONCILED_PER_BLOCK: usize = 32;
 pub(crate) struct MempoolEntry {
     pub(crate) digest: Digest,
     pub(crate) transaction: Transaction,
+    /// Reconciliations that retained this entry. Local scheduling state,
+    /// not part of the transaction, so it is never encoded.
+    pub(crate) strikes: u32,
 }
 
 #[cfg(feature = "full-node")]
@@ -121,6 +140,7 @@ impl MempoolEntry {
         Self {
             digest,
             transaction,
+            strikes: 0,
         }
     }
 }
@@ -136,6 +156,37 @@ pub(crate) struct MempoolState {
 }
 
 #[cfg(feature = "full-node")]
+impl MempoolState {
+    /// Insert a general-lane entry, displacing the oldest resident that
+    /// reconciliation has already retained if the lane is full.
+    ///
+    /// A zero-strike resident has never been examined, so it is never
+    /// displaced: the newcomer is told the lane is full instead.
+    #[cfg(feature = "validator")]
+    pub(crate) fn admit_general(&mut self, entry: MempoolEntry) -> SubmitTxOutcome {
+        if self
+            .general
+            .iter()
+            .any(|resident| resident.digest == entry.digest)
+        {
+            return SubmitTxOutcome::Duplicate;
+        }
+        if self.general.len() >= GENERAL_MEMPOOL_CAPACITY {
+            let Some(index) = self
+                .general
+                .iter()
+                .position(|resident| resident.strikes > 0)
+            else {
+                return SubmitTxOutcome::Full;
+            };
+            self.general.remove(index);
+        }
+        self.general.push_back(entry);
+        SubmitTxOutcome::Enqueued
+    }
+}
+
+#[cfg(feature = "full-node")]
 #[derive(Clone, Default)]
 pub struct Mempool {
     pub(crate) inner: Arc<Mutex<MempoolState>>,
@@ -145,20 +196,7 @@ pub struct Mempool {
 impl Mempool {
     #[cfg(all(test, feature = "validator"))]
     pub(crate) async fn test_submit(&self, tx: Transaction) -> SubmitTxOutcome {
-        let entry = MempoolEntry::new(tx);
-        let mut mempool = self.inner.lock().await;
-        if mempool
-            .general
-            .iter()
-            .any(|resident| resident.digest == entry.digest)
-        {
-            return SubmitTxOutcome::Duplicate;
-        }
-        if mempool.general.len() >= GENERAL_MEMPOOL_CAPACITY {
-            return SubmitTxOutcome::Full;
-        }
-        mempool.general.push_back(entry);
-        SubmitTxOutcome::Enqueued
+        self.inner.lock().await.admit_general(MempoolEntry::new(tx))
     }
 
     #[cfg(all(any(test, feature = "test-support"), feature = "validator"))]
@@ -172,14 +210,48 @@ impl Mempool {
             .collect()
     }
 
-    async fn snapshot(&self) -> Vec<Transaction> {
+    async fn snapshot(&self) -> Vec<MempoolEntry> {
         let mempool = self.inner.lock().await;
         mempool
             .responses
             .values()
             .chain(mempool.general.iter())
-            .map(|entry| entry.transaction.clone())
+            .cloned()
             .collect()
+    }
+
+    /// Count one finalized-state reconciliation that retained each resident.
+    ///
+    /// Only the general lane is strike-tracked: the response lane has its
+    /// own slot sweep and replacement rules, and striking it would change
+    /// that lane's lifetime.
+    async fn strike(&self, digests: &BTreeSet<Digest>) {
+        let mut mempool = self.inner.lock().await;
+        for entry in &mut mempool.general {
+            if digests.contains(&entry.digest) {
+                entry.strikes = entry.strikes.saturating_add(1);
+            }
+        }
+    }
+
+    /// A candidate that executed against committed state is not an orphan;
+    /// forget any strikes it accrued while its inputs were missing.
+    async fn clear_strikes(&self, digests: &BTreeSet<Digest>) {
+        let mut mempool = self.inner.lock().await;
+        for entry in &mut mempool.general {
+            if digests.contains(&entry.digest) {
+                entry.strikes = 0;
+            }
+        }
+    }
+
+    /// Drop general-lane residents that failed reconciliation
+    /// [`GENERAL_MEMPOOL_MAX_STRIKES`] times.
+    async fn evict_orphans(&self) {
+        let mut mempool = self.inner.lock().await;
+        mempool
+            .general
+            .retain(|entry| entry.strikes < GENERAL_MEMPOOL_MAX_STRIKES);
     }
 
     async fn remove(&self, digests: &BTreeSet<Digest>) {
@@ -347,10 +419,7 @@ where
         // A proposed block is not a commitment. Keep resident transactions
         // until finality, but do not execute them twice in one ancestry.
         let finalized_height = self.owner_index.cursor().height;
-        let resident_digests: BTreeSet<_> = snapshot
-            .iter()
-            .map(|tx| Sha256::hash(&tx.encode()))
-            .collect();
+        let resident_digests: BTreeSet<_> = snapshot.iter().map(|entry| entry.digest).collect();
         let mut ancestor_transactions = BTreeSet::new();
         let mut ancestor = Some(parent.clone());
         if !snapshot.is_empty() {
@@ -373,31 +442,34 @@ where
         }
         let pending: Vec<_> = snapshot
             .into_iter()
-            .filter(|tx| !ancestor_transactions.contains(&Sha256::hash(&tx.encode())))
+            .filter(|entry| !ancestor_transactions.contains(&entry.digest))
             .collect();
         let response_count = pending
             .iter()
-            .take_while(|tx| response_slot(tx).is_some())
+            .take_while(|entry| response_slot(&entry.transaction).is_some())
             .count();
         let response_bytes = response_count.saturating_mul(RESPONSE_TRANSACTION_BYTES);
         let general_count_budget = MAX_TXS_PER_BLOCK.saturating_sub(response_count);
         let general_byte_budget = MAX_BLOCK_TX_BYTES.saturating_sub(response_bytes);
         let (responses, general) = pending.split_at(response_count);
-        debug_assert!(responses.iter().all(|transaction| {
-            crate::light_client::canonical_submission_size(transaction)
+        debug_assert!(responses.iter().all(|entry| {
+            crate::light_client::canonical_submission_size(&entry.transaction)
                 == RESPONSE_TRANSACTION_BYTES
         }));
-        let mut candidates = responses.to_vec();
+        let mut candidates: Vec<_> = responses
+            .iter()
+            .map(|entry| entry.transaction.clone())
+            .collect();
         let mut general_bytes = 0_usize;
-        for transaction in general.iter().cloned() {
-            let next_bytes = general_bytes.saturating_add(transaction.encode_size());
+        for entry in general {
+            let next_bytes = general_bytes.saturating_add(entry.transaction.encode_size());
             if candidates.len().saturating_sub(response_count) >= general_count_budget
                 || next_bytes > general_byte_budget
             {
                 break;
             }
             general_bytes = next_bytes;
-            candidates.push(transaction);
+            candidates.push(entry.transaction.clone());
         }
         let block_height = Height::new(parent.height().get() + 1);
         let block_parent = parent.digest();
@@ -559,15 +631,19 @@ where
             // forever. Examine a bounded window instead, starting at an
             // offset derived from the height so the whole pool is still
             // covered, just across several blocks rather than all at once.
+            // A retained resident accrues a strike so repeated failures
+            // bound its lifetime instead of letting it hold capacity
+            // forever.
             let examined = candidates.len().min(RECONCILED_PER_BLOCK);
             let start = if candidates.is_empty() {
                 0
             } else {
                 usize::try_from(block.height().get() % candidates.len() as u64).unwrap_or(0)
             };
+            let mut executable = BTreeSet::new();
+            let mut transient = BTreeSet::new();
             for offset in 0..examined {
-                let transaction = &candidates[(start + offset) % candidates.len()];
-                let digest = Sha256::hash(&transaction.encode());
+                let candidate = &candidates[(start + offset) % candidates.len()];
                 let outcome = execute_proposal(
                     kernel_context(
                         self.network,
@@ -575,7 +651,7 @@ where
                         block.digest(),
                     ),
                     self.verifier.as_ref(),
-                    vec![transaction.clone()],
+                    vec![candidate.transaction.clone()],
                     &self.genesis_allocations,
                     MAX_TXS_PER_BLOCK,
                     MAX_BLOCK_TX_BYTES,
@@ -594,10 +670,17 @@ where
                         break;
                     }
                 };
-                if included.is_empty() && retained.is_empty() {
-                    rejected.insert(digest);
+                if !retained.is_empty() {
+                    transient.insert(candidate.digest);
+                } else if !included.is_empty() {
+                    executable.insert(candidate.digest);
+                } else {
+                    rejected.insert(candidate.digest);
                 }
             }
+            mempool.clear_strikes(&executable).await;
+            mempool.strike(&transient).await;
+            mempool.evict_orphans().await;
             mempool.remove(&rejected).await;
         }
         info!(
@@ -697,7 +780,7 @@ mod tests {
     use super::*;
     use crate::execution::{
         store::{UtxoDatabase, utxo_db_config},
-        test_support::{kernel_fixture, run_qmdb, validator_key},
+        test_support::{kernel_fixture, kernel_fixture_at, run_qmdb, validator_key},
     };
     use commonware_consensus::types::{Epoch, Round, View};
     use commonware_cryptography::Signer as _;
@@ -739,7 +822,7 @@ mod tests {
             )
             .await
             .expect("application proposal");
-        (proposed, mempool.snapshot().await)
+        (proposed, mempool.test_transactions().await)
     }
 
     async fn verifies_from(
@@ -980,6 +1063,99 @@ mod tests {
             )
             .await;
             assert!(mempool.test_transactions().await.is_empty());
+            runtime.stop(0, None).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn reconciliation_evicts_never_includable_general_transactions() {
+        run_qmdb(|runtime| async move {
+            let fixture = kernel_fixture(100).expect("kernel fixture");
+            let mut app = Application::new(
+                runtime.child("app"),
+                crate::domain::TEST_NETWORK,
+                commonware_cryptography::sha256::Digest::from([0; 32]),
+                validator_key(0).public_key(),
+                fixture.allocations.clone(),
+                "orphan_eviction_app",
+                ApplicationConfig {
+                    page_cache_size: 1024,
+                    page_cache_count: 8,
+                },
+            )
+            .await;
+            let database_context = runtime.child("database");
+            let config = utxo_db_config(&database_context, "orphan_eviction_db", 1024, 8);
+            let database =
+                <UtxoDatabase<_> as DatabaseSet<_>>::init(database_context, config).await;
+            let genesis = app.genesis_block();
+            let mempool = app.mempool();
+            // Only the two genesis allocations exist; every fixture below
+            // funds coins beyond them, so admission succeeds but execution
+            // reports a transient missing input forever.
+            for index in 1..=GENERAL_MEMPOOL_CAPACITY {
+                let orphan = kernel_fixture_at(10, (index * 2) as u16, 7, 8)
+                    .expect("distinct missing-input fixture");
+                assert_eq!(
+                    mempool.test_submit(Transaction::Kernel(orphan.open)).await,
+                    SubmitTxOutcome::Enqueued
+                );
+            }
+            let newcomer = kernel_fixture_at(10, 400, 7, 8).expect("overflow fixture");
+            assert_eq!(
+                mempool
+                    .test_submit(Transaction::Kernel(newcomer.open.clone()))
+                    .await,
+                SubmitTxOutcome::Full,
+                "unexamined residents are never displaced",
+            );
+
+            // Finalizing empty blocks drives reconciliation over the pool.
+            let empty_pool = Mempool::default();
+            let mut parent = genesis;
+            for (propose_label, finalized_label) in [
+                ("orphan_propose_0", "orphan_finalized_0"),
+                ("orphan_propose_1", "orphan_finalized_1"),
+                ("orphan_propose_2", "orphan_finalized_2"),
+                ("orphan_propose_3", "orphan_finalized_3"),
+                ("orphan_propose_4", "orphan_finalized_4"),
+                ("orphan_propose_5", "orphan_finalized_5"),
+                ("orphan_propose_6", "orphan_finalized_6"),
+                ("orphan_propose_7", "orphan_finalized_7"),
+            ] {
+                let proposed = app
+                    .propose(
+                        (
+                            runtime.child(propose_label),
+                            next_consensus_context(&parent),
+                        ),
+                        stream::iter([Arc::new(parent.clone())]),
+                        database.new_batches().await,
+                        &mut Some(empty_pool.clone()),
+                    )
+                    .await
+                    .expect("empty proposal");
+                database.finalize(proposed.merkleized).await;
+                app.finalized(
+                    (runtime.child(finalized_label), proposed.block.context()),
+                    &proposed.block,
+                    &database,
+                )
+                .await;
+                parent = proposed.block;
+            }
+
+            assert!(
+                mempool.test_transactions().await.len() < GENERAL_MEMPOOL_CAPACITY,
+                "repeated reconciliation must evict never-includable residents",
+            );
+            assert_eq!(
+                mempool
+                    .test_submit(Transaction::Kernel(newcomer.open))
+                    .await,
+                SubmitTxOutcome::Enqueued,
+                "an executable submission is admitted after eviction",
+            );
             runtime.stop(0, None).await.unwrap();
         });
     }

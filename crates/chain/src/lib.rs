@@ -68,7 +68,7 @@ pub use app::{ActivityReporter, Application, ApplicationConfig};
 /// The mempool and its bounds, which only a validator has: nothing on a
 /// full-node build puts a transaction into one or takes one out.
 #[cfg(feature = "validator")]
-pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
+pub use app::{GENERAL_MEMPOOL_CAPACITY, GENERAL_MEMPOOL_MAX_STRIKES, Mempool};
 #[cfg(feature = "client-core")]
 pub use block::{HellasBlock, UtxoSyncTarget};
 #[cfg(feature = "client-core")]
