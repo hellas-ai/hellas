@@ -18,6 +18,7 @@ fn compressed(bytes: &[u8], encoding: &str) -> Vec<u8> {
             w.write_all(bytes).unwrap();
             w.into_inner()
         }
+        "zstd" => zstd::stream::encode_all(bytes, 0).unwrap(),
         _ => unreachable!(),
     }
 }
@@ -143,6 +144,41 @@ fn decompression_errors_and_bombs_never_leave_chargeable_partial_usage() {
     u.push(&bomb);
     u.finish();
     assert_eq!(u.strict_usage(), Err(UsageFault::Bounds));
+}
+
+#[test]
+fn zstd_usage_matches_identity_and_truncated_frames_are_faulted() {
+    let json = br#"{"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
+    let mut identity = UsageDecoder::new(
+        Mode::Strict(AccountingProfile::OpenaiChat),
+        Some("application/json"),
+        Some("identity"),
+    );
+    identity.push(json);
+    identity.finish();
+    let expected = identity.strict_usage();
+    assert_eq!(expected, Ok((7, 3)));
+    let wire = compressed(json, "zstd");
+    for size in 1..=wire.len() {
+        let mut usage = UsageDecoder::new(
+            Mode::Strict(AccountingProfile::OpenaiChat),
+            Some("application/json"),
+            Some("zstd"),
+        );
+        for chunk in wire.chunks(size) {
+            usage.push(chunk);
+        }
+        usage.finish();
+        assert_eq!(usage.strict_usage(), expected, "fragment {size}");
+    }
+    let mut truncated = UsageDecoder::new(
+        Mode::Strict(AccountingProfile::OpenaiChat),
+        Some("application/json"),
+        Some("zstd"),
+    );
+    truncated.push(&wire[..wire.len() / 2]);
+    truncated.finish();
+    assert_eq!(truncated.strict_usage(), Err(UsageFault::Compression));
 }
 
 #[test]

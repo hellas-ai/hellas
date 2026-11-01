@@ -355,6 +355,7 @@ pub enum UsageDecoder {
     Gzip(flate2::write::GzDecoder<Usage>),
     Deflate(flate2::write::ZlibDecoder<Usage>),
     Brotli(Box<brotli::DecompressorWriter<Usage>>),
+    Zstd(zstd::stream::write::Decoder<'static, Usage>),
 }
 impl Default for UsageDecoder {
     fn default() -> Self {
@@ -369,6 +370,7 @@ impl std::ops::Deref for UsageDecoder {
             Self::Gzip(d) => d.get_ref(),
             Self::Deflate(d) => d.get_ref(),
             Self::Brotli(d) => d.get_ref(),
+            Self::Zstd(d) => d.get_ref(),
         }
     }
 }
@@ -393,6 +395,26 @@ impl UsageDecoder {
             "gzip" => Self::Gzip(flate2::write::GzDecoder::new(usage)),
             "deflate" => Self::Deflate(flate2::write::ZlibDecoder::new(usage)),
             "br" => Self::Brotli(Box::new(brotli::DecompressorWriter::new(usage, 4096))),
+            "zstd" => {
+                // A frame window may not exceed the decoded-byte allowance, so
+                // a hostile frame cannot allocate beyond what it may emit.
+                let decoder = zstd::stream::raw::Decoder::new().and_then(|mut decoder| {
+                    decoder
+                        .set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                            MAX_DECODED_BYTES.trailing_zeros(),
+                        ))
+                        .map(|()| decoder)
+                });
+                match decoder {
+                    Ok(decoder) => {
+                        Self::Zstd(zstd::stream::write::Decoder::with_decoder(usage, decoder))
+                    }
+                    Err(_) => {
+                        usage.fail(UsageFault::Compression);
+                        Self::Identity(usage)
+                    }
+                }
+            }
             _ => {
                 usage.fail(UsageFault::Encoding);
                 Self::Identity(usage)
@@ -405,6 +427,7 @@ impl UsageDecoder {
             Self::Gzip(d) => d.get_mut().observe(observer),
             Self::Deflate(d) => d.get_mut().observe(observer),
             Self::Brotli(d) => d.get_mut().observe(observer),
+            Self::Zstd(d) => d.get_mut().observe(observer),
         }
     }
     pub fn content(&mut self, value: Option<&str>, encoding: Option<&str>) {
@@ -430,6 +453,7 @@ impl UsageDecoder {
             Self::Gzip(d) => d.write_all(bytes),
             Self::Deflate(d) => d.write_all(bytes),
             Self::Brotli(d) => d.write_all(bytes),
+            Self::Zstd(d) => d.write_all(bytes),
         };
         if result.is_err() {
             self.invalidate(UsageFault::Compression);
@@ -466,6 +490,13 @@ impl UsageDecoder {
                 u.fail(UsageFault::Compression);
                 u
             }),
+            Self::Zstd(mut d) => {
+                if d.do_finish().is_err() {
+                    failed(d.get_ref().fault.unwrap_or(UsageFault::Compression))
+                } else {
+                    d.into_inner()
+                }
+            }
         };
         usage.finish();
         *self = Self::Identity(usage);
