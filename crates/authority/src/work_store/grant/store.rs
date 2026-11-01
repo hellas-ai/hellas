@@ -527,6 +527,21 @@ impl State {
                 .terminals
                 .retain(|_, t| t.outcome.authorization.delivery_deadline_ms >= now);
         }
+        // A generation reset makes the previous channel unreachable: the
+        // channel id embeds the generation and admission rejects a stale one.
+        // Retire superseded channels once they hold no job or retained
+        // terminal so repeated resets cannot exhaust MAX_CHANNELS. A
+        // current-generation channel keeps its proposal nonce high-water.
+        let current: std::collections::BTreeMap<GrantId, Option<u64>> = self
+            .channels
+            .values()
+            .map(|c| (c.funding.grant, self.generation(c.funding.grant)))
+            .collect();
+        self.channels.retain(|_, c| {
+            current.get(&c.funding.grant).copied().flatten() == Some(c.funding.generation)
+                || c.book.jobs().next().is_some()
+                || c.book.terminals().next().is_some()
+        });
         let retained: std::collections::BTreeSet<_> = self
             .channels
             .values()

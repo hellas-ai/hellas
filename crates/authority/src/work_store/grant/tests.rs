@@ -120,6 +120,60 @@ async fn standing_discovers_a_stale_generation_without_resetting_usage() {
     assert_eq!(standing(&mut store).await.nodes[0].active, 0);
 }
 #[tokio::test]
+async fn generation_resets_retire_obsolete_idle_channels() {
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
+    let directory = tempfile::tempdir().unwrap();
+    let mut node = work_node(directory.path()).build().await;
+    let first = node.proposal(FRIEND, ids::ALLOWANCE, 1);
+    let mut last = first.authorization.channel_id;
+    // More resets than MAX_CHANNELS: a permanent per-generation identity cap
+    // would fail even though every settled terminal has expired.
+    for nonce in 1..=257 {
+        let now = node.clock.now().0;
+        // This commit also prunes the previous generation after its terminal
+        // expired, so only one channel may remain at each step.
+        node.store
+            .bump_generation(ids::ALLOWANCE, UnixMillis(now))
+            .await
+            .unwrap();
+        let mut request = node.proposal(FRIEND, ids::ALLOWANCE, nonce);
+        request.authorization.acceptance_deadline_ms = UnixMillis(now);
+        request.authorization.terminal_deadline_ms = UnixMillis(now + 1);
+        request.authorization.delivery_deadline_ms = UnixMillis(now + 2);
+        request.signature = FRIEND.node_key().sign_digest(request.work()).unwrap();
+        node.accept(FRIEND, ids::FRIEND_GRANT, &request)
+            .await
+            .unwrap();
+        node.store
+            .release(
+                request.authorization.channel_id,
+                request.work(),
+                UnixMillis(now),
+            )
+            .await
+            .unwrap();
+        last = request.authorization.channel_id;
+        node.clock.set(UnixMillis(now + 3));
+        assert_eq!(node.store.state().channels.len(), 1, "generation {nonce}");
+    }
+    node.store.tick(node.clock.now()).await.unwrap();
+    let state = node.store.state();
+    assert_eq!(state.generation(ids::ALLOWANCE), Some(257));
+    let channel = state.channel(last).unwrap();
+    assert_eq!(channel.funding.generation, 257);
+    assert_eq!(channel.job_book().jobs().count(), 0);
+    assert_eq!(channel.job_book().terminals().count(), 0);
+    // A retired generation's channel id is never re-mounted: admission checks
+    // the current generation before mounting, so the stale proposal is refused.
+    let before = node.snapshot();
+    assert_err!(
+        node.accept(FRIEND, ids::FRIEND_GRANT, &first).await,
+        NodeStoreError::Grant(GrantError::Generation)
+    );
+    assert_eq!(node.snapshot(), before);
+}
+
+#[tokio::test]
 async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
     let dir = tempfile::tempdir().unwrap();
