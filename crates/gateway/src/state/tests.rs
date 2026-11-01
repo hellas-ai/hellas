@@ -77,7 +77,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state.prepare_ids(vec![0], 1, &[], None).unwrap();
+    let mut live = state.prepare_ids(vec![0], 1, None).unwrap();
     let prefix = live.prepared.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
@@ -120,7 +120,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     let state = open(Arc::new(Busy)).await;
     assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
-        .prepare_ids(vec![0], 1, &[], None)
+        .prepare_ids(vec![0], 1, None)
         .err()
         .expect("busy backend must reject admission");
     assert_eq!(
@@ -374,39 +374,6 @@ async fn generation_controls_are_honoured_or_rejected() {
     };
     let prepare = |request: &WireExecutionRequest| state.prepare_wire_execution(request);
 
-    // A single-token stop string reaches the generated job as its token id.
-    let ids = state.presentation.encode("hi").unwrap();
-    assert_eq!(ids.len(), 1);
-    prepare(&chat(json!({
-        "model": "m",
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 1,
-        "stop": "hi"
-    })))
-    .unwrap();
-    let job = work.jobs.lock().unwrap().pop().unwrap();
-    assert!(
-        job.plan
-            .step
-            .as_ref()
-            .unwrap()
-            .stop
-            .any_of
-            .contains(&u64::from(ids[0]))
-    );
-
-    // A stop string spanning several tokens cannot be approximated.
-    let error = prepare(&chat(json!({
-        "model": "m",
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 1,
-        "stop": "hi hi"
-    })))
-    .err()
-    .expect("multi-token stop must be rejected");
-    assert!(matches!(error, BackendError::Rejected(_)));
-    assert!(error.to_string().contains("exactly one token"), "{error}");
-
     for (field, value) in [
         ("temperature", json!(0.5)),
         ("top_p", json!(0.9)),
@@ -454,6 +421,53 @@ async fn generation_controls_are_honoured_or_rejected() {
     turn.feed(call).unwrap();
     let error = turn.feed(call).unwrap_err();
     assert!(error.to_string().contains("parallel_tool_calls"), "{error}");
+}
+
+/// The executor emits the token that matches a stop sequence before it stops,
+/// so native execution would decode that token into the returned text. The
+/// route must refuse the control instead of returning the stop sequence.
+#[tokio::test]
+async fn custom_stop_sequences_are_rejected_before_any_output() {
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(open(work.clone()).await);
+    let response = super::router(state)
+        .oneshot(
+            axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "stop": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("an error body names the refusal");
+    assert!(
+        message.contains("custom stop sequences are not supported"),
+        "{message}"
+    );
+    assert!(
+        work.jobs.lock().unwrap().is_empty(),
+        "a rejected request must submit no job"
+    );
 }
 
 /// Structured output cannot be enforced by native execution yet, so a strict
