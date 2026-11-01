@@ -1770,3 +1770,8 @@ fn remote_object_reads_verify_current_state_and_reject_forged_witnesses() {
 fn a_responsive_source_below_the_journal_height_is_not_selected() {
     run(remote::stale_source_selection);
 }
+
+#[test]
+fn paid_startup_selects_a_source_at_the_retained_journal_floor() {
+    run(remote::paid_startup_uses_the_retained_floor);
+}

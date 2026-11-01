@@ -462,15 +462,21 @@ impl PaidWorkSession {
             ));
         }
         let read_timeout = read_timeout(args.timeout);
-        let remote = crate::client_chain::connect(config, read_timeout).await?;
-        let chain = WorkBlocks::new(remote.clone()).with_read_retry(config.poll, read_timeout);
-
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
                 path: args.journal_root.clone(),
                 source,
             }
         })?;
+        // Retained journals can already depend on a height a fast validator
+        // has not reached. Establish that floor before a source is chosen;
+        // recovery reads below it would only be refused by the same guard.
+        let floor =
+            offer::retained_floor(&args.journal_root, config.chain.network, args.provider).await?;
+        let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
+        let chain = WorkBlocks::new(remote.clone())
+            .with_read_retry(config.poll, read_timeout)
+            .with_min_height(floor);
         let retained = offer::retained_offer(
             &args.journal_root,
             config.chain.network,

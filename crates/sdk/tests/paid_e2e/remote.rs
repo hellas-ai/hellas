@@ -19,6 +19,8 @@ pub(super) struct Source {
     pub forged: Arc<AtomicBool>,
     pub stale: Arc<std::sync::Mutex<Option<hellas_rpc::pb::chain::GetOperationsResponse>>>,
     pub connections: Arc<AtomicUsize>,
+    /// Latency injected into source selection only.
+    pub delay: std::time::Duration,
 }
 
 macro_rules! forward {
@@ -36,7 +38,10 @@ impl hellas_chain::LightClient for Source {
     forward!(get_finalization(payload: hellas_chain::domain::Digest) -> Option<Vec<u8>>);
     forward!(submit_tx(tx: Transaction) -> hellas_chain::SubmitTxOutcome);
     forward!(get_validators() -> Vec<String>);
-    forward!(get_consensus_info() -> ConsensusInfo);
+    async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
+        tokio::time::sleep(self.delay).await;
+        self.local.get_consensus_info().await
+    }
     async fn get_coins_by_owner(
         &self,
         owner: SettlementKey,
@@ -145,17 +150,25 @@ pub(super) struct Relays {
 }
 impl Relays {
     pub async fn start(devnet: &Devnet) -> Self {
+        Self::start_at(devnet, 0, std::time::Duration::ZERO).await
+    }
+
+    /// A relay group that answers `Latest` at `replay` and takes `delay`
+    /// before reporting its consensus identity, so a test can put a fast
+    /// stale group beside a slower current one.
+    pub async fn start_at(devnet: &Devnet, replay: u64, delay: std::time::Duration) -> Self {
         let source = Source {
             local: devnet.validator_light_client(0),
             unavailable: Arc::new(AtomicBool::new(false)),
             tips_unavailable: Arc::new(AtomicBool::new(false)),
             listing_padding: Arc::new(AtomicBool::new(false)),
             attempts: Arc::new(AtomicUsize::new(0)),
-            replay: Arc::new(AtomicU64::new(0)),
+            replay: Arc::new(AtomicU64::new(replay)),
             corrupt: Arc::new(AtomicUsize::new(0)),
             forged: Arc::new(AtomicBool::new(false)),
             stale: Arc::new(std::sync::Mutex::new(None)),
             connections: Arc::new(AtomicUsize::new(0)),
+            delay,
         };
         let (disconnect, _) = tokio::sync::watch::channel(0);
         let mut urls = Vec::new();
@@ -271,6 +284,74 @@ pub(super) async fn stale_source_selection(runtime: commonware_runtime::tokio::C
     );
     relays.shutdown().await;
     devnet.shutdown().await;
+}
+
+/// Paid startup establishes the retained journal's height floor before it
+/// selects a source. A fast validator below that floor is skipped in favour
+/// of a slower configured validator that is current, because recovery's own
+/// reads would refuse the stale one anyway.
+pub(super) async fn paid_startup_uses_the_retained_floor(
+    runtime: commonware_runtime::tokio::Context,
+) {
+    let mut case = paid_fixture(runtime).await;
+    // Retain a complete channel journal through the real opening path.
+    let mut session = sealing_while(
+        &mut case.devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let bond = session.descriptor().bond_edge();
+    session.shutdown().await;
+    drop(session);
+
+    // Every fast relay answers Latest at genesis; the current relays take
+    // longer to report their identity, so selection has to reject the stale
+    // ones on height rather than on speed.
+    let mut stale = Relays::start_at(&case.devnet, 1, Duration::ZERO).await;
+    let mut current = Relays::start_at(&case.devnet, 0, Duration::from_millis(200)).await;
+    let mut options = case.options.clone();
+    // The configured committee is six validators: three fast stale ones
+    // beside three slower current ones.
+    options.config.validators = stale
+        .urls
+        .iter()
+        .take(3)
+        .chain(current.urls.iter().take(3))
+        .cloned()
+        .collect();
+    options.timeout = Some(Duration::from_secs(30));
+    let mut session = sealing_while(
+        &mut case.devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            options,
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Retained,
+            SessionFundingOptions::default(),
+        ),
+    )
+    .await
+    .expect("startup selects a source that serves the retained journal");
+    assert_eq!(session.descriptor().bond_edge(), bond);
+    session.shutdown().await;
+    drop(session);
+
+    stale.shutdown().await;
+    current.shutdown().await;
+    case.endpoint.close().await;
+    case.relays.shutdown().await;
+    case.devnet.shutdown().await;
 }
 
 pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {

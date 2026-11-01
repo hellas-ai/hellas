@@ -194,13 +194,22 @@ impl PaidGateway {
         }
         let mut providers = Vec::with_capacity(options.providers.len());
         for args in options.providers {
-            let remote = crate::client_chain::connect(
+            // Retained policy journals can depend on a height behind a fast
+            // validator; select a source that already serves it.
+            let floor = crate::paid_client::offer::retained_floor(
+                &args.journal_root,
+                args.config.chain.network,
+                args.provider,
+            )
+            .await?;
+            let remote = crate::client_chain::connect_at(
                 &args.config,
                 crate::paid_client::read_timeout(args.timeout),
+                floor,
             )
             .await
             .map_err(PaidClientError::from)?;
-            let chain = hellas_chain::WorkBlocks::new(remote);
+            let chain = hellas_chain::WorkBlocks::new(remote).with_min_height(floor);
             let policy =
                 provider_policy(&args, chain, &endpoint, &settlement_key, owner.principal())
                     .await?;

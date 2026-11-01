@@ -237,19 +237,36 @@ pub(super) async fn fund_offer(
     Ok(offer)
 }
 
-pub(crate) async fn retained_offer<
-    C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
->(
+/// The finalized height one retained setup journal already relies on.
+///
+/// A source below this height cannot answer the journal's own reads, so
+/// source selection has to meet the same floor before it is asked.
+fn journal_floor(store: &SetupStore) -> u64 {
+    store
+        .state()
+        .origin()
+        .map_or(0, |origin| origin.height)
+        .max(store.state().scan_cursor().map_or(0, |scan| scan.height))
+        .max(store.state().scan_armed().map_or(0, |scan| scan.height))
+}
+
+/// One retained client setup addressed to the requested provider, opened
+/// from its own journal.
+struct RetainedSetup {
+    store: SetupStore,
+    offer: SignedPaidOffer,
+}
+
+async fn retained_setups(
     journal_root: &std::path::Path,
     network: hellas_kernel::NetworkId,
     provider: hellas_client::ProviderAddress,
-    chain: &WorkBlocks<C>,
-) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
+) -> Result<Vec<RetainedSetup>> {
     let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
     if !found.unidentified.is_empty() {
         return Err(PaidClientError::MissingState("unidentified client journal"));
     }
-    let mut retained = None;
+    let mut retained = Vec::new();
     for setup in found
         .setups
         .into_iter()
@@ -263,13 +280,6 @@ pub(crate) async fn retained_offer<
             &Secp256k1Verifier::new(),
         )
         .await?;
-        let floor = store
-            .state()
-            .origin()
-            .map_or(0, |origin| origin.height)
-            .max(store.state().scan_cursor().map_or(0, |scan| scan.height))
-            .max(store.state().scan_armed().map_or(0, |scan| scan.height));
-        let chain = chain.clone().with_min_height(floor);
         let Some((_, offer)) = store.state().offer() else {
             return Err(PaidClientError::MissingState("client offer"));
         };
@@ -288,10 +298,47 @@ pub(crate) async fn retained_offer<
         ) {
             continue;
         }
+        let offer = offer.clone();
+        retained.push(RetainedSetup { store, offer });
+    }
+    Ok(retained)
+}
+
+/// The highest finalized height any retained client journal addressed to
+/// `provider` already relies on, discovered without selecting a source.
+///
+/// Paid startup and paid-pool policy loading both read retained journals
+/// before they can do anything useful, so they must choose a source that can
+/// serve this floor rather than a fast one their own height guard will
+/// reject.
+pub(crate) async fn retained_floor(
+    journal_root: &std::path::Path,
+    network: hellas_kernel::NetworkId,
+    provider: hellas_client::ProviderAddress,
+) -> Result<u64> {
+    Ok(retained_setups(journal_root, network, provider)
+        .await?
+        .iter()
+        .map(|retained| journal_floor(&retained.store))
+        .max()
+        .unwrap_or(0))
+}
+
+pub(crate) async fn retained_offer<
+    C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
+>(
+    journal_root: &std::path::Path,
+    network: hellas_kernel::NetworkId,
+    provider: hellas_client::ProviderAddress,
+    chain: &WorkBlocks<C>,
+) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
+    let mut retained = None;
+    for RetainedSetup { store, offer } in retained_setups(journal_root, network, provider).await? {
+        let chain = chain.clone().with_min_height(journal_floor(&store));
         if store.state().end() != Some(hellas_channel::work_store::SetupEnd::Complete) {
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: setup.bond_edge,
+                    bond_edge: store.state().bond_edge(),
                     payment_edge: store.state().payment_edge(),
                     funding: store.state().funding_coins(),
                 })
@@ -308,7 +355,7 @@ pub(crate) async fn retained_offer<
         {
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: setup.bond_edge,
+                    bond_edge: store.state().bond_edge(),
                     payment_edge: Some(payment),
                     funding: Default::default(),
                 })
@@ -324,7 +371,6 @@ pub(crate) async fn retained_offer<
         if retained.is_some() {
             return Err(PaidClientError::AmbiguousRecovery);
         }
-        let offer = offer.clone();
         retained = Some((store, offer));
     }
     Ok(retained)
