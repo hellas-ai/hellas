@@ -147,6 +147,7 @@ impl ChannelStore {
             uploads,
             contents: BTreeMap::new(),
         };
+        store.release_unresumable_proposal(verifier).await?;
         store.gc_uploads()?;
         Ok(store)
     }
@@ -193,6 +194,43 @@ impl ChannelStore {
         Ok(self
             .uploads
             .invocation_content(work, &objects, job.authorization().retention)?)
+    }
+
+    /// Releases a pending proposal this journal can no longer send.
+    ///
+    /// A proposal is resumable only from the exact bytes it was signed over,
+    /// and ephemeral input is never journaled. When those bytes did not
+    /// survive replay, the marker would refuse every later proposal forever
+    /// while the job it names can never leave its half-signed phase except
+    /// by expiry. Clearing the marker is a durable exchange record: the
+    /// nonce stays burned and the job stays open for a late acceptance, so
+    /// this frees the channel's one proposal slot without deciding that the
+    /// provider owes or is owed anything.
+    async fn release_unresumable_proposal<V: SigVerifier>(
+        &mut self,
+        verifier: &V,
+    ) -> Result<(), WorkStoreError> {
+        if self.state.role() != Role::Client {
+            return Ok(());
+        }
+        let Some(work_id) = self.state.job_book().pending_proposal() else {
+            return Ok(());
+        };
+        let Some(job) = self.state.job_by_id(work_id) else {
+            return Ok(());
+        };
+        if job.phase() != JobPhase::HalfSigned || !job.prepared_input().is_empty() {
+            return Ok(());
+        }
+        self.commit(
+            ChannelRecord::ProposalExchange {
+                work_id,
+                pending: false,
+            },
+            verifier,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Returns what this endpoint durably knows.

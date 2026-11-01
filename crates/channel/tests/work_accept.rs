@@ -284,6 +284,71 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
     }
 }
 
+/// A journaled proposal whose body did not survive replay must not occupy
+/// the channel's one proposal slot forever.
+///
+/// Ephemeral input is never written to the journal, so metadata-only
+/// recovery cannot rebuild the request. The job stays half-signed — a late
+/// acceptance is still evidence — but the durable exchange marker is
+/// released, and the next proposal takes a strictly higher nonce rather
+/// than reusing the burned one.
+#[tokio::test]
+async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() {
+    let root = temp();
+    let ready = ready_with_descriptor(descriptor_with_policy(
+        hellas_channel::test_support::channel::fetch_policy(),
+    ));
+    let mut endpoint = ClientEndpoint::new(
+        ready.clone(),
+        hellas_channel::test_support::channel::store_at(root.path(), &ready, Role::Client, CURSOR)
+            .await,
+        client(),
+    )
+    .unwrap();
+    let request = endpoint
+        .propose(&JobProposal {
+            prepared_input: hellas_channel::test_support::channel::fetch_bundle(1),
+            deadlines: deadlines(),
+        })
+        .await
+        .unwrap();
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(ready.channel(), &authorization);
+    assert_eq!(endpoint.state().job_book().pending_proposal(), Some(id));
+    drop(endpoint);
+
+    // Metadata-only replay: the authorization survives, the body does not.
+    let store =
+        hellas_channel::test_support::channel::store_at(root.path(), &ready, Role::Client, CURSOR)
+            .await;
+    assert_eq!(
+        store.state().job_book().pending_proposal(),
+        None,
+        "the unreconstructable proposal no longer holds the slot",
+    );
+    assert_eq!(store.state().proposal_nonce_high_water(), 1);
+    assert_eq!(
+        store.state().job_by_id(id).map(JobState::phase),
+        Some(JobPhase::HalfSigned),
+        "the signed job is kept for a late acceptance",
+    );
+
+    let mut endpoint = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
+    let request = endpoint
+        .propose(&JobProposal {
+            prepared_input: hellas_channel::test_support::channel::fetch_bundle(2),
+            deadlines: deadlines(),
+        })
+        .await
+        .expect("a fresh proposal is admitted after the release");
+    let next = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    assert_eq!(next.proposal_nonce, 2, "the burned nonce is not reused");
+    assert_eq!(
+        endpoint.state().job_book().pending_proposal(),
+        Some(work_id(ready.channel(), &next)),
+    );
+}
+
 #[tokio::test]
 async fn the_service_answers_a_refusal_over_the_same_wire() {
     let provider_root = temp();

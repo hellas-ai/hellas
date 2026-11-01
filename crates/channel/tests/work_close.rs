@@ -1929,6 +1929,71 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
     }
 }
 
+/// A client whose provider accepted and vanished can end the job at its
+/// terminal deadline and close.
+///
+/// The job never produced a receipt, so no result can arrive in time and
+/// nothing is payable. The client's own signed terminal deadline is the
+/// height that says so, and the same watcher that ends a provider's job
+/// ends this one — after which the funded edge can be closed instead of
+/// staying locked behind an active job forever.
+#[tokio::test]
+async fn a_client_ends_an_accepted_job_its_terminal_deadline_has_passed() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = ready();
+    let mut store = store_at(&root.path().join("client"), &ready, Role::Client, CURSOR).await;
+    // The provider co-signed the acceptance and then disappeared: the
+    // client holds an accepted job and no result.
+    let id = accept(&mut [&mut store]).await;
+    assert_eq!(
+        store.state().job_by_id(id).map(JobState::phase),
+        Some(JobPhase::Accepted),
+    );
+
+    advance(&mut store, deadlines().terminal).await;
+    assert!(
+        store.state().job_by_id(id).is_some(),
+        "the terminal deadline itself is inside the signed window",
+    );
+    advance(&mut store, deadlines().terminal + 1).await;
+    assert!(store.state().job_by_id(id).is_none(), "the job is over");
+    assert!(
+        matches!(
+            store
+                .state()
+                .terminals()
+                .next()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Expired { deadline, .. }) if *deadline == deadlines().terminal,
+        ),
+        "the client rests the job at the signed terminal deadline",
+    );
+
+    let mut client = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
+    let start = match client.prepare_close().await {
+        Ok(start) => start,
+        Err(error) => panic!("a client whose job is over closes: {error}"),
+    };
+    assert!(
+        start.certificate().is_none(),
+        "an unpaid channel claims nothing",
+    );
+
+    // Settlement proceeds: the retained start is includable in the very
+    // next finalized block, and reading that block opens the contest.
+    let height = client.state().cursor().0 + 1;
+    let start_tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
+    let chain = Chain {
+        blocks: vec![block(height, vec![start_tx])],
+        withheld: None,
+    };
+    let sink = Mempool::default();
+    match client.advance_close(&chain, &sink).await {
+        Ok(CloseProgress::Opened { .. }) => {}
+        other => panic!("the client's close opens: {other:?}"),
+    }
+}
+
 // ── The signed window ─────────────────────────────────────────────────
 
 /// The same channel under another start-validity span.

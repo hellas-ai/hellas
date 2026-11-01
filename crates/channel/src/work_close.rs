@@ -984,33 +984,72 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
 ///   client signed to pay by has passed.
 ///
 /// Each is an [`TerminalOutcome::Expired`] naming the deadline it crossed
-/// and the finalized block that crossed it. The provider bears whatever
-/// compute or delivery it already spent.
+/// and the finalized block that crossed it. The party that spent compute
+/// or delivery bears it.
 ///
-/// Only a provider applies them. A client ending a job it might still be
-/// paying for would be a client deciding against itself.
+/// Both roles apply the deadlines, because each is conclusive for the
+/// journal that reached it. A provider's job past one can no longer be
+/// paid for. A client's accepted job past its terminal deadline can no
+/// longer receive a receipt, so it is over. A client's half-signed
+/// proposal is over at the same terminal deadline; at its acceptance
+/// deadline it is over only when its exact bytes did not survive replay,
+/// because a proposal that can still be retried may still recover a
+/// co-signature the provider released before that deadline. A client
+/// never ends a job it might still be paying for: a job holding a result
+/// is not ended here.
 fn expiry_at(
     state: &crate::work_store::Channel,
     height: u64,
     payload: [u8; 32],
 ) -> Vec<(hellas_auth::Digest, TerminalOutcome)> {
-    if state.role() != Role::Provider {
-        return Vec::new();
-    }
     state
         .jobs()
         .filter_map(|job| {
             let authorization = job.authorization();
-            let deadline = if height > authorization.payment_deadline {
-                authorization.payment_deadline
-            } else if height > authorization.terminal_deadline && job.result().is_none() {
-                authorization.terminal_deadline
-            } else if height > authorization.acceptance_deadline
-                && job.phase() == JobPhase::HalfSigned
-            {
-                authorization.acceptance_deadline
-            } else {
-                return None;
+            let deadline = match state.role() {
+                Role::Provider => {
+                    if height > authorization.payment_deadline {
+                        authorization.payment_deadline
+                    } else if height > authorization.terminal_deadline && job.result().is_none() {
+                        authorization.terminal_deadline
+                    } else if height > authorization.acceptance_deadline
+                        && job.phase() == JobPhase::HalfSigned
+                    {
+                        authorization.acceptance_deadline
+                    } else {
+                        return None;
+                    }
+                }
+                Role::Client => {
+                    // A half-signed proposal whose exact bytes are gone can
+                    // never be co-signed now: the client cannot even ask.
+                    // One whose bytes survive keeps the acceptance window
+                    // open, because the provider may have co-signed before
+                    // the deadline and the client may still recover that
+                    // signature; ending it would discard a signed
+                    // obligation. Past the terminal deadline no result can
+                    // be paid for by either party, so every unfinished
+                    // phase is over then.
+                    if height > authorization.terminal_deadline
+                        && job.result().is_none()
+                        && matches!(
+                            job.phase(),
+                            JobPhase::HalfSigned
+                                | JobPhase::Accepted
+                                | JobPhase::Running
+                                | JobPhase::Streaming
+                        )
+                    {
+                        authorization.terminal_deadline
+                    } else if height > authorization.acceptance_deadline
+                        && job.phase() == JobPhase::HalfSigned
+                        && job.prepared_input().is_empty()
+                    {
+                        authorization.acceptance_deadline
+                    } else {
+                        return None;
+                    }
+                }
             };
             Some((
                 job.work_id(),
