@@ -30,6 +30,7 @@ let
   ++ lib.optional (cfg.serve.contentIndex != null) cfg.serve.contentIndex
   ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
   ++ lib.optional (cfg.serve.grantConfigFile != null) cfg.serve.grantConfigFile
+  ++ lib.optional (cfg.serve.awaitOwner != null) cfg.serve.awaitOwner
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
   ++ lib.optional (cfg.serve.fetchConfigFile != null) cfg.serve.fetchConfigFile
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;

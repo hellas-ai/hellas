@@ -197,6 +197,7 @@ rec {
     "--gpu-session-asset-bytes"
     "--paid-work-config"
     "--grant-config"
+    "--await-owner"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
@@ -462,6 +463,17 @@ rec {
           --grant-config. Native Compute runs through grants without paid
           work, so this file enables the same content and GPU service setup as
           workConfigFile. Keep it outside the Nix store.
+        '';
+      };
+      awaitOwner = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/var/lib/hellas/await-owner";
+        description = ''
+          Wait for one owner pairing when the grant journal is uninitialized,
+          using this directory for node state, passed as --await-owner. Null
+          disables owner pairing. The directory is operator-managed runtime
+          data and must remain outside the Nix store.
         '';
       };
       passkey = mkOption {
@@ -747,6 +759,7 @@ rec {
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
     ++ optArg "--grant-config" serve.grantConfigFile
+    ++ optArg "--await-owner" serve.awaitOwner
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"

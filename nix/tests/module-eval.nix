@@ -443,6 +443,10 @@ let
     workProfile = "/run/hellas/work-profile.json";
     passkey = "/run/hellas/principal.passkey";
   };
+  awaitOwnerHipProvider = evalProvider {
+    awaitOwner = "/var/lib/hellas/await-owner";
+    gpuBackend = "hip";
+  };
   cudaProvider = evalProvider {
     workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "cuda";
@@ -889,6 +893,25 @@ in
     assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
     assert lib.elem "/run/hellas/grant.json"
       grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--await-owner /var/lib/hellas/await-owner"
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--paid-work-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--grant-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+    assert awaitOwnerHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert awaitOwnerHipProvider.config.systemd.services.hellas.path != [ ];
+    assert
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
+    assert lib.elem "/var/lib/hellas/await-owner"
+      awaitOwnerHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !environmentPathEvaluation.success;
