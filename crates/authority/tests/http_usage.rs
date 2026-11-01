@@ -33,8 +33,8 @@ fn strict_json_and_sse_verify_every_compression_and_fragment_boundary() {
     ];
     for (wire, content) in [
         (&json[..], "application/json"),
-        (&sse[0][..], "text/event-stream"),
-        (&sse[1][..], "text/event-stream"),
+        (sse[0], "text/event-stream"),
+        (sse[1], "text/event-stream"),
     ] {
         for encoding in ["identity", "gzip", "deflate", "br"] {
             let wire = compressed(wire, encoding);
@@ -57,6 +57,31 @@ fn strict_json_and_sse_verify_every_compression_and_fragment_boundary() {
         }
     }
 }
+#[test]
+fn multiline_sse_events_wait_for_the_complete_frame_at_every_fragment() {
+    let lf = b"data: {\"usage\":\ndata: {\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n";
+    let cr = b"data: {\"usage\":\rdata: {\"prompt_tokens\":7,\"completion_tokens\":3}}\r\rdata: [DONE]\r\r";
+    let crlf = b"data: {\"usage\":\r\ndata: {\"prompt_tokens\":7,\"completion_tokens\":3}}\r\n\r\ndata: [DONE]\r\n\r\n";
+    for wire in [&lf[..], &cr[..], &crlf[..]] {
+        for size in 1..=wire.len() {
+            let mut usage = UsageDecoder::new(
+                Mode::Strict(AccountingProfile::OpenaiChat),
+                Some("text/event-stream"),
+                None,
+            );
+            for chunk in wire.chunks(size) {
+                usage.push(chunk);
+            }
+            usage.finish();
+            assert_eq!(
+                usage.strict_usage(),
+                Ok((7, 3)),
+                "fragment {size} of {wire:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn strict_refuses_missing_duplicate_regressing_and_ambiguous_usage() {
     for body in [

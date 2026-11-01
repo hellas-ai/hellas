@@ -123,11 +123,12 @@ impl Usage {
             if !eof && self.pending[end] == b'\r' && end + 1 == self.pending.len() {
                 break;
             }
-            let mut line: Vec<_> = self.pending.drain(..=end).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
+            // CRLF is one terminator even when its bytes arrive in separate
+            // chunks. Consuming only the CR would leave the LF to be read as
+            // the empty line that dispatches a half-built frame.
+            let crlf = self.pending[end] == b'\r' && self.pending.get(end + 1) == Some(&b'\n');
+            let mut line: Vec<_> = self.pending.drain(..end + 1 + usize::from(crlf)).collect();
+            line.truncate(end);
             self.line(&line);
             if self.fault.is_some() {
                 return;
