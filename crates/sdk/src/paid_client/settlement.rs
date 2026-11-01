@@ -173,12 +173,17 @@ pub async fn settle_channel(
         .state()
         .close_settled()
         .expect("loop observed finality");
+    let pending_owner_signed = endpoint
+        .state()
+        .close_history()
+        .map(|history| history.pending.owner_signed());
     receipt(
         &recovery.chain,
         channel,
         recovery.bond,
         recovery.funding_value,
         settled,
+        pending_owner_signed,
     )
     .await
 }
@@ -305,6 +310,11 @@ async fn settlement_receipt(
         recovery.bond,
         recovery.funding_value,
         settled,
+        recovery
+            .journal
+            .state()
+            .close_history()
+            .map(|history| history.pending.owner_signed()),
     )
     .await
     .map(Some)
@@ -316,6 +326,7 @@ async fn receipt(
     bond: EdgeId,
     funding_value: u64,
     settled: hellas_channel::work_store::CloseSettlement,
+    pending_owner_signed: Option<[bool; 2]>,
 ) -> Result<FinalizedChannelSettlement> {
     let block = chain
         .block_at(settled.height)
@@ -327,6 +338,7 @@ async fn receipt(
         settled.height,
         settled.payload,
         settled.provider_payout,
+        pending_owner_signed,
     )?;
     Ok(FinalizedChannelSettlement {
         network: channel.network(),
@@ -341,37 +353,67 @@ async fn receipt(
     })
 }
 
+/// The owner-authority state a finalized close pays under, `[maker, taker]`.
+///
+/// This is the kernel's own rule, read off the close witness. A signature
+/// carrying [`Authority::Owner`](hellas_kernel::Authority::Owner) is that
+/// party exiting its delegation, and the kernel then pays it undelegated; a
+/// `Freeze` also inherits the owner actions recorded on the contest it ends,
+/// and an `Adjudicated` close has no witness of its own, so its destinations
+/// are exactly the retained contest's. Reading the rule here keeps the
+/// receipt from inventing a second one.
+fn close_owner_signed(proof: &hellas_kernel::Proof, pending: Option<[bool; 2]>) -> [bool; 2] {
+    let previous = pending.unwrap_or([false; 2]);
+    match proof {
+        hellas_kernel::Proof::Mutual { maker, taker } => [maker.is_owner(), taker.is_owner()],
+        hellas_kernel::Proof::Freeze { maker, taker, .. } => [
+            maker.is_owner() || previous[0],
+            taker.is_owner() || previous[1],
+        ],
+        // The optional owner witness a timeout may carry is the maker's,
+        // and the kernel pays every output at the owner's bare destination.
+        hellas_kernel::Proof::Timeout { owner, .. } => [owner.is_some(), false],
+        hellas_kernel::Proof::Adjudicated { .. } => previous,
+    }
+}
+
 fn close_payouts(
     block: &FinalizedWork,
     channel: &hellas_channel::model::work::PaidChannel,
     height: u64,
     payload: [u8; 32],
     expected_provider: u64,
+    pending_owner_signed: Option<[bool; 2]>,
 ) -> Result<(u64, u64)> {
     if block.height != height || block.payload != payload {
         return Err(PaidClientError::InputMismatch("settlement finalized block"));
     }
     let mut closes = block.txs.iter().filter_map(|tx| match tx {
-        Tx::Close { input, outputs, .. } if *input == channel.payment_edge() => Some(outputs),
+        Tx::Close {
+            input,
+            proof,
+            outputs,
+        } if *input == channel.payment_edge() => Some((proof, outputs)),
         _ => None,
     });
-    let outputs = closes.next().ok_or(PaidClientError::MissingState(
+    let (proof, outputs) = closes.next().ok_or(PaidClientError::MissingState(
         "settlement close transaction",
     ))?;
     if closes.next().is_some() {
         return Err(PaidClientError::InputMismatch("duplicate settlement close"));
     }
+    // The close's own witness decides which destinations may appear; the
+    // kernel's `PartyKeys::is_destination` checks owner and delegate together,
+    // so an owner-signed exit is accepted undelegated while any other
+    // delegate change is still refused.
+    let owner_signed = close_owner_signed(proof, pending_owner_signed);
     let parties = channel.payment_terms().parties();
     let mut returned = 0u64;
     let mut paid = 0u64;
     for payout in outputs.as_slice() {
-        let total = if payout.owner() == parties.maker().owner()
-            && payout.delegate() == parties.maker().payout_delegate()
-        {
+        let total = if parties.maker().is_destination(*payout, owner_signed[0]) {
             &mut returned
-        } else if payout.owner() == parties.taker().owner()
-            && payout.delegate() == parties.taker().payout_delegate()
-        {
+        } else if parties.taker().is_destination(*payout, owner_signed[1]) {
             &mut paid
         } else {
             return Err(PaidClientError::InputMismatch("settlement payout identity"));
@@ -389,10 +431,16 @@ fn close_payouts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_channel::test_support::channel::{CURSOR, Checked, PRICE, checked_job, payload_at};
+    use hellas_channel::test_support::channel::{
+        CURSOR, Checked, HORIZON, OMISSION_BOND, PRICE, STAKE, bond_edge, bond_terms_for,
+        channel_policy, checked_job, payload_at, payment_edge, payment_terms_for, signer,
+    };
     use hellas_channel::work::admit_payment;
     use hellas_channel::work_close::BlockSourceError;
-    use hellas_kernel::Move;
+    use hellas_kernel::{
+        BlockHeight, List, MAX_EDGE_OUTPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, PartyAuth,
+        PartyKeys, Payout, Proof, Sig,
+    };
     use hellas_rpc::services::work::WorkClientImpl;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -522,5 +570,106 @@ mod tests {
                 .map(|settled| settled.provider_payout),
             Some(PRICE)
         );
+    }
+
+    // ── Finding 9: an owner exit pays undelegated ─────────────────────
+
+    /// A delegated client channel, and the parties its close must pay.
+    fn delegated_channel() -> (
+        hellas_channel::model::work::PaidChannel,
+        Parties,
+        hellas_kernel::Key,
+        hellas_kernel::Key,
+    ) {
+        let owner = signer(0x31).party_key();
+        let delegate = signer(0x32).party_key();
+        let provider = signer(0x33).party_key();
+        let parties = Parties::new(
+            PartyKeys::sole(provider),
+            PartyKeys::new(owner, delegate, Some(delegate)),
+        );
+        let terms = payment_terms_for(
+            bond_edge(),
+            bond_terms_for(
+                parties,
+                BlockHeight::new(HORIZON),
+                Payout::new(provider, STAKE),
+                40,
+            ),
+            hellas_channel::model::work::private_policy_commitment(
+                hellas_channel::test_support::channel::network(),
+                &hellas_channel::test_support::channel::SALT,
+                &channel_policy(),
+            ),
+            MIN_OMIT_RESPONSE_BLOCKS,
+            8,
+            OMISSION_BOND,
+        );
+        let channel = hellas_channel::model::work::PaidChannel::new(
+            hellas_channel::test_support::channel::network(),
+            payment_edge(),
+            terms,
+            &hellas_channel::test_support::channel::SALT,
+            channel_policy(),
+        )
+        .unwrap();
+        let parties = channel.payment_terms().parties();
+        (channel, parties, owner, provider)
+    }
+
+    fn close_block(
+        channel: &hellas_channel::model::work::PaidChannel,
+        proof: Proof,
+        outputs: [Payout; MAX_EDGE_OUTPUTS],
+    ) -> FinalizedWork {
+        FinalizedWork {
+            height: 7,
+            parent: [0; 32],
+            payload: [1; 32],
+            txs: vec![Tx::close(
+                channel.payment_edge(),
+                proof,
+                List::take(outputs, 2),
+            )],
+        }
+    }
+
+    #[test]
+    fn an_owner_signed_close_pays_undelegated_and_a_wrong_delegate_is_refused() {
+        let (channel, parties, owner, provider) = delegated_channel();
+        let provider_payout = parties.taker().payout(40, false);
+        let client_payout = parties.maker().payout(60, true);
+        assert_eq!(client_payout, Payout::new(owner, 60));
+        assert_eq!(provider_payout, Payout::new(provider, 40));
+
+        // The owner signs the maker side; the provider signs its own.
+        let proof = Proof::mutual(
+            PartyAuth::owner(Sig::default()),
+            PartyAuth::signer(Sig::default()),
+        );
+        let mut outputs = [provider_payout; MAX_EDGE_OUTPUTS];
+        outputs[1] = client_payout;
+        let block = close_block(&channel, proof, outputs);
+        assert_eq!(
+            close_payouts(&block, &channel, 7, [1; 32], 40, None).unwrap(),
+            (60, 40)
+        );
+
+        // The same owner-signed close carrying the committed delegate is not
+        // an owner exit and is refused.
+        let mut outputs = [provider_payout; MAX_EDGE_OUTPUTS];
+        outputs[1] = parties.maker().payout(60, false);
+        let block = close_block(
+            &channel,
+            Proof::mutual(
+                PartyAuth::owner(Sig::default()),
+                PartyAuth::signer(Sig::default()),
+            ),
+            outputs,
+        );
+        assert!(matches!(
+            close_payouts(&block, &channel, 7, [1; 32], 40, None),
+            Err(PaidClientError::InputMismatch("settlement payout identity"))
+        ));
     }
 }
