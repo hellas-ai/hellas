@@ -103,10 +103,10 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         assert_eq!(
             job.environment.sources[0],
             ContentRef::new(
-                "a48635a262943cd85bb0896314b92281ef21581b05e710bf3ecaba29812f3861"
+                "67726fa26ddd1e896ae5fbb83f9117014ef1e08011899608dda00f31b0ff27bc"
                     .parse()
                     .unwrap(),
-                347973,
+                348594,
             ),
         );
         assert!(job.content.read(job.environment.sources[0]).is_ok());
