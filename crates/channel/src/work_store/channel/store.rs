@@ -147,6 +147,18 @@ impl ChannelStore {
             uploads,
             contents: BTreeMap::new(),
         };
+        // A journal reopened past a deadline must not keep an active job the
+        // watcher would have ended on the block that crossed it. A crash can
+        // land between the cursor record and the expiry, and a process from
+        // before a conclusive rule existed may have advanced past a deadline
+        // it never applied. The cursor block is the last finalized height
+        // this endpoint read, so it is what says the job is over now.
+        let (height, payload) = store.state().cursor();
+        for (work_id, outcome) in crate::work_close::expiry_at(store.state(), height, payload) {
+            store
+                .commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)
+                .await?;
+        }
         store.release_unresumable_proposal(verifier).await?;
         store.gc_uploads()?;
         Ok(store)

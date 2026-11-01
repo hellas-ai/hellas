@@ -1994,6 +1994,115 @@ async fn a_client_ends_an_accepted_job_its_terminal_deadline_has_passed() {
     }
 }
 
+/// A client that verified a result but did not pay by its payment
+/// deadline can end the job and close; a job it already paid stays paid.
+///
+/// A result-bearing job was excluded from client expiry, so a client that
+/// stopped between verification and payment kept an active job forever and
+/// `prepare_close` refused with `WrongPhase`. The signed payment deadline is
+/// the height that makes the unpaid result conclusively unpayable, and an
+/// already-issued certificate is a terminal record this rule never touches.
+#[tokio::test]
+async fn a_client_ends_a_verified_unpaid_job_its_payment_deadline_has_passed() {
+    let fixture = checked_job().await;
+    let Checked {
+        client_root,
+        ready,
+        service,
+        client: endpoint,
+        id,
+        ..
+    } = fixture;
+    assert_eq!(
+        endpoint.state().job_by_id(id).map(JobState::phase),
+        Some(JobPhase::Verified),
+    );
+    drop(endpoint);
+    drop(service);
+
+    let mut store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    advance(&mut store, deadlines().payment).await;
+    assert!(
+        store.state().job_by_id(id).is_some(),
+        "the payment deadline itself is inside the signed window",
+    );
+    advance(&mut store, deadlines().payment + 1).await;
+    assert!(
+        store.state().job_by_id(id).is_none(),
+        "the unpaid result is over",
+    );
+    assert!(
+        matches!(
+            store
+                .state()
+                .terminals()
+                .next()
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Expired { deadline, .. }) if *deadline == deadlines().payment,
+        ),
+        "the client rests the unpaid result at its payment deadline",
+    );
+    let mut unpaid = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
+    let start = match unpaid.prepare_close().await {
+        Ok(start) => start,
+        Err(error) => panic!("a client whose unpaid result is over closes: {error}"),
+    };
+    assert!(
+        start.certificate().is_none(),
+        "an unpaid channel claims nothing",
+    );
+    drop(unpaid);
+
+    // A job whose payment was issued is already terminal; crossing the
+    // deadline again must not replace its certificate with an expiry.
+    let fixture = paid_job().await;
+    let Checked {
+        client_root,
+        ready,
+        service,
+        client: endpoint,
+        id,
+        ..
+    } = fixture;
+    assert!(
+        endpoint.state().payment(id).is_some(),
+        "the fixture job is paid",
+    );
+    drop(endpoint);
+    drop(service);
+    let mut store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    advance(&mut store, deadlines().payment + 1).await;
+    assert!(
+        matches!(
+            store
+                .state()
+                .terminal_by_id(id)
+                .map(|terminal| &terminal.outcome),
+            Some(TerminalOutcome::Certified { .. }),
+        ),
+        "an issued payment is preserved past its deadline",
+    );
+    assert_eq!(
+        store
+            .state()
+            .payment(id)
+            .map(|payment| payment.certificate.earned_cumulative()),
+        Some(PRICE),
+    );
+    let mut client = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
+    let start = match client.prepare_close().await {
+        Ok(start) => start,
+        Err(error) => panic!("a paid channel closes: {error}"),
+    };
+    assert_eq!(
+        start
+            .certificate()
+            .map(|(certificate, _)| certificate.earned_cumulative()),
+        Some(PRICE),
+        "the close carries the payment that was already issued",
+    );
+}
+
 // ── The signed window ─────────────────────────────────────────────────
 
 /// The same channel under another start-validity span.

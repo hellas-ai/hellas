@@ -981,7 +981,10 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
 ///   client's own journal refuses a receipt, so a result signed now
 ///   could never be paid for.
 /// - **Payment.** A result exists, it was in time, and the height the
-///   client signed to pay by has passed.
+///   client signed to pay by has passed. A client that verified a result
+///   and did not pay by then can no longer pay for it, so the job is over;
+///   a job whose payment was already issued is terminal and is not
+///   touched here.
 ///
 /// Each is an [`TerminalOutcome::Expired`] naming the deadline it crossed
 /// and the finalized block that crossed it. The party that spent compute
@@ -994,10 +997,10 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
 /// proposal is over at the same terminal deadline; at its acceptance
 /// deadline it is over only when its exact bytes did not survive replay,
 /// because a proposal that can still be retried may still recover a
-/// co-signature the provider released before that deadline. A client
-/// never ends a job it might still be paying for: a job holding a result
-/// is not ended here.
-fn expiry_at(
+/// co-signature the provider released before that deadline. A client's
+/// result-bearing job is over at its payment deadline: the result can no
+/// longer be paid for, and an unpaid result is not a funding obligation.
+pub(crate) fn expiry_at(
     state: &crate::work_store::Channel,
     height: u64,
     payload: [u8; 32],
@@ -1046,6 +1049,15 @@ fn expiry_at(
                         && job.prepared_input().is_empty()
                     {
                         authorization.acceptance_deadline
+                    } else if height > authorization.payment_deadline
+                        && job.result().is_some()
+                        && state.payment(job.work_id()).is_none()
+                    {
+                        // The signed window to pay for this result has
+                        // closed. A certified terminal is already off the
+                        // open-job set, so an issued payment is preserved
+                        // untouched rather than re-expired here.
+                        authorization.payment_deadline
                     } else {
                         return None;
                     }
