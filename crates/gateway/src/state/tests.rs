@@ -292,3 +292,54 @@ async fn text_routes_carry_provenance_at_start_and_end() {
         }
     }
 }
+
+struct Capturing {
+    jobs: std::sync::Mutex<Vec<hellas_client::model::ComputeJob>>,
+}
+
+impl WorkExecutionBackend for Capturing {
+    fn run(
+        &self,
+        job: hellas_client::model::ComputeJob,
+    ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
+        self.jobs.lock().unwrap().push(job);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Responses string input is a user message, so it must produce the same
+/// prepared tokens as the equivalent one-message array.
+#[tokio::test]
+async fn responses_string_input_matches_a_user_message_array() {
+    use hellas_adaptors::{RawRequest, WireAdaptor, openai::responses::OpenAiResponsesAdaptor};
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let adaptor = OpenAiResponsesAdaptor;
+    let prepare = |input: serde_json::Value| {
+        let parsed = adaptor
+            .parse(
+                RawRequest::from_value(
+                    json!({"model": "m", "input": input, "max_output_tokens": 1}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request = adaptor.to_execution_request(&parsed).unwrap();
+        state.prepare_wire_execution(&request).unwrap();
+    };
+    prepare(json!("hi"));
+    prepare(json!([{"role": "user", "content": "hi"}]));
+
+    let jobs = work.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].inputs, jobs[1].inputs);
+    assert_eq!(jobs[0].plan, jobs[1].plan);
+}

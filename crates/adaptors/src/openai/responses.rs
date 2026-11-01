@@ -606,7 +606,12 @@ fn response_format_value(object: &JsonMap<String, JsonValue>) -> Option<JsonValu
 
 fn project_input(value: &JsonValue) -> AdaptorResult<Input> {
     match value {
-        JsonValue::String(text) => Ok(Input::Text(text.clone())),
+        // The Responses contract defines string input as a user-role text
+        // input, so it must reach the same chat template as the array form.
+        JsonValue::String(text) => Ok(Input::Items(vec![InputItem::Message(Message::text(
+            "user",
+            text.clone(),
+        ))])),
         JsonValue::Array(items) => Ok(Input::Items(
             items
                 .iter()
@@ -1664,12 +1669,15 @@ mod tests {
     }
 
     #[test]
-    fn projection_handles_string_input() {
+    fn projection_handles_string_input_as_a_user_message() {
         let parsed = adaptor()
             .parse(raw(json!({"model": "m", "input": "hello"})))
             .unwrap();
         let execution = adaptor().to_execution_request(&parsed).unwrap();
-        assert_eq!(execution.canonical.input, Input::Text("hello".to_string()));
+        assert_eq!(
+            execution.canonical.input,
+            Input::Items(vec![InputItem::Message(Message::text("user", "hello"))])
+        );
     }
 
     #[test]
