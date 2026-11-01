@@ -225,35 +225,28 @@ fn audio_error(
 
 /// Keep the transcription's text bytes intact; trail its signed evidence.
 fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
+    use crate::backend::provenance::transcript_header;
     use axum::{
         body::Body,
-        http::{HeaderMap, HeaderName, HeaderValue, header},
+        http::{HeaderMap, HeaderValue, header},
     };
-    use base64::Engine as _;
-    use hellas_rpc::provenance::TRANSCRIPT_KEY;
     use http_body::Frame;
 
     let Some(transcript) = transcript else {
         return text.into_response();
     };
-    let signed =
-        HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(transcript))
-            .expect("base64 is a valid header value");
+    let (name, signed) = transcript_header(transcript);
+    let trailer = HeaderValue::from_str(name.as_str()).expect("a header name is a valid token");
     let frames = futures::stream::iter([
         Ok::<_, std::convert::Infallible>(Frame::data(axum::body::Bytes::from(text))),
-        Ok(Frame::trailers(HeaderMap::from_iter([(
-            HeaderName::from_static(TRANSCRIPT_KEY),
-            signed,
-        )]))),
+        Ok(Frame::trailers(HeaderMap::from_iter([(name, signed)]))),
     ]);
     let mut response = Response::new(Body::new(http_body_util::StreamBody::new(frames)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    response
-        .headers_mut()
-        .insert(header::TRAILER, HeaderValue::from_static(TRANSCRIPT_KEY));
+    response.headers_mut().insert(header::TRAILER, trailer);
     response
 }
 #[cfg(test)]

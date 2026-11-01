@@ -1,6 +1,33 @@
+use axum::http::{HeaderName, HeaderValue};
 use hellas_adaptors::{Provenance, StopReason, Usage};
 use hellas_rpc::protocol::invocation::compute::StopReason as RuntimeStopReason;
-use hellas_rpc::provenance::{ExecutionProvenance, encode_hex, encode_public_key};
+use hellas_rpc::provenance::{
+    ExecutionProvenance, MAX_INLINE_TRANSCRIPT_BYTES, TRANSCRIPT_DIGEST_KEY, TRANSCRIPT_KEY,
+    encode_hex, encode_public_key,
+};
+
+/// The evidence header for a completed job's signed transcript: the base64
+/// canonical bytes while they fit [`MAX_INLINE_TRANSCRIPT_BYTES`], otherwise
+/// the lowercase hex SHA-256 that identifies an out-of-band copy.
+pub(crate) fn transcript_header(transcript: &[u8]) -> (HeaderName, HeaderValue) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    if transcript.len().div_ceil(3) * 4 <= MAX_INLINE_TRANSCRIPT_BYTES {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(transcript);
+        (
+            HeaderName::from_static(TRANSCRIPT_KEY),
+            HeaderValue::from_str(&encoded).expect("base64 is always a valid header value"),
+        )
+    } else {
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&sha2::Sha256::digest(transcript));
+        (
+            HeaderName::from_static(TRANSCRIPT_DIGEST_KEY),
+            HeaderValue::from_str(&encode_hex(&digest))
+                .expect("hex is always a valid header value"),
+        )
+    }
+}
 
 pub(crate) fn json_response(
     status: axum::http::StatusCode,
