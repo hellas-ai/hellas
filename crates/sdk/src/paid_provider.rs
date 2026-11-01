@@ -740,29 +740,36 @@ impl DrivenChannel {
         Ok(())
     }
 
-    async fn accepted_work_id(&self) -> Result<Option<Digest>, PaidProviderError> {
+    async fn accepted_work_ids(&self) -> Result<Vec<Digest>, PaidProviderError> {
         self.service
             .with_state(|state| {
-                let mut jobs = state.jobs();
-                let job = jobs.next()?;
-                (jobs.next().is_none() && job.phase() == JobPhase::Accepted).then(|| job.work_id())
+                state
+                    .jobs()
+                    .filter(|job| job.phase() == JobPhase::Accepted)
+                    .map(|job| job.work_id())
+                    .collect()
             })
             .await
             .map_err(PaidProviderError::from)
     }
 
-    /// Resumes accepted work after a fresh readiness check. The durable `JobRunning`
-    /// record admits one invocation even when a live request races this clock tick.
+    /// Resumes every accepted job after a fresh readiness check. Overlapping
+    /// accepted executions are each dispatched; the durable `JobRunning`
+    /// record admits one invocation per job even when a live request races
+    /// this clock tick.
     async fn resume_accepted(&self) -> Result<bool, PaidProviderError> {
         if !self.node.ready() {
             return Ok(false);
         }
-        let Some(work_id) = self.accepted_work_id().await? else {
+        let work_ids = self.accepted_work_ids().await?;
+        if work_ids.is_empty() {
             return Ok(false);
-        };
+        }
         let driver = self.driver.as_ref().ok_or(PaidProviderError::NoBackend)?;
         let ready = self.service.readiness().await?;
-        driver.spawn(self.service.clone(), ready, work_id);
+        for work_id in work_ids {
+            driver.spawn(self.service.clone(), ready.clone(), work_id);
+        }
         Ok(true)
     }
 }
@@ -1219,6 +1226,113 @@ impl NodeWorkRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{PaidFixture, signer};
+    use hellas_channel::model::work::{PaidJobAuthorizationV2, work_id};
+
+    /// One acceptance over the wire the way a provider's request path
+    /// performs it: the prepared input is uploaded first, then the
+    /// signed proposal is answered.
+    async fn accept_uploaded(
+        fixture: &PaidFixture,
+        service: &WorkService,
+        client: &hellas_channel::work::ClientEndpoint,
+        request: &hellas_rpc::pb::work::AcceptWorkRequest,
+    ) -> hellas_rpc::pb::work::AcceptWorkResponse {
+        let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+        let id = work_id(fixture.ready.channel(), &authorization);
+        let bytes = client
+            .state()
+            .job_by_id(id)
+            .unwrap()
+            .prepared_input()
+            .to_vec();
+        let (wire, uploads) = hellas_channel::test_support::channel::input_uploads(
+            fixture.ready.channel(),
+            request,
+            &bytes,
+        );
+        let context = hellas_wire::TransportContext {
+            open_exporter: Some([7; 32]),
+            ..Default::default()
+        };
+        for mut upload in uploads {
+            upload.chunk_signature = signer(1)
+                .sign(hellas_channel::model::work::signing_hash(
+                    hellas_rpc::protocol::content_upload::chunk_digest(
+                        authorization.channel_id,
+                        id,
+                        authorization.input_content,
+                        upload.offset,
+                        &upload.chunk,
+                        &[7; 32],
+                    ),
+                ))
+                .as_bytes()
+                .to_vec();
+            let response = service.upload(&upload, &context).await.unwrap();
+            assert!(response.refused.is_none(), "{response:?}");
+        }
+        service.accept(&wire).await
+    }
+
+    /// Every durable acceptance is dispatched after a restart, not only
+    /// a lone one. The running gate is the duplicate-execution barrier;
+    /// this asserts the clock reaches it for each job.
+    #[tokio::test]
+    async fn restart_dispatches_every_accepted_job() {
+        let fixture = PaidFixture::new();
+        let service = fixture.provider().await;
+        let mut client = fixture.client().await;
+        let mut accepted = Vec::new();
+        for _ in 0..2 {
+            let request = client.propose(&fixture.proposal()).await.unwrap();
+            let response = accept_uploaded(&fixture, &service, &client, &request).await;
+            accepted.push(client.accepted(&response).await.unwrap());
+        }
+        assert_eq!(
+            service
+                .with_state(|state| state
+                    .jobs()
+                    .filter(|job| job.phase() == JobPhase::Accepted)
+                    .count())
+                .await
+                .unwrap(),
+            2
+        );
+
+        let (seen, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
+        let driver = AcceptedWorkDriver(
+            Arc::new(move |_service, _ready, work_id| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.send(work_id).unwrap();
+                    Ok(RunOutcome::Running)
+                })
+            }),
+            Default::default(),
+        );
+        let channel = DrivenChannel {
+            service,
+            descriptor: Some(fixture.descriptor.clone()),
+            max_observation_age: fixture.config.max_observation_age,
+            driver: Some(driver),
+            node: AdmissionNode::default(),
+        };
+        assert!(channel.resume_accepted().await.unwrap());
+
+        let mut reached = Vec::new();
+        while reached.len() < accepted.len() {
+            reached.push(
+                tokio::time::timeout(Duration::from_secs(5), dispatched.recv())
+                    .await
+                    .expect("every accepted job is dispatched")
+                    .unwrap(),
+            );
+        }
+        reached.sort();
+        accepted.sort();
+        assert_eq!(reached, accepted);
+    }
 
     #[tokio::test]
     async fn poisoned_mounts_are_errors_and_shutdown_still_releases_channels() {
