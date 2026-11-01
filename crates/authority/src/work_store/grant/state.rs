@@ -53,6 +53,13 @@ pub struct ResourceHealth {
     pub quarantined: bool,
 }
 
+/// Namespace of the authority's journal frames.
+///
+/// It names the frame format, so a journal written under different semantics
+/// is refused at the boundary instead of being reinterpreted. Bump it with
+/// any change to [`Frame`] or [`Change`] that is not readable as written.
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v3";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
     pub namespace: String,
@@ -102,15 +109,9 @@ pub(super) enum Change {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Option<Charge>,
-        /// Whether incomplete usage is attributable to the backend. Older
-        /// frames omit this field and decode as `false`; omitting it when
-        /// false keeps their canonical encoding unchanged.
-        #[serde(default, skip_serializing_if = "is_false")]
+        /// Whether incomplete usage is attributable to the backend.
         fault: bool,
     },
-}
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 impl State {
     pub fn paid_policy(&self) -> Option<&hellas_channel::model::paid_policy::StoredPaidPolicy> {
@@ -310,7 +311,7 @@ impl State {
         Ok(())
     }
     pub(super) fn apply(&mut self, frame: &Frame) -> Result<Applied, NodeStoreError> {
-        if frame.namespace != "hellas.node.journal.v2"
+        if frame.namespace != JOURNAL_NAMESPACE
             || frame.now < self.now()
             || frame.changes.is_empty()
             || frame.changes.len() > 16
@@ -804,6 +805,7 @@ impl State {
     pub fn resource_health(&self, id: ResourceId) -> Option<ResourceHealth> {
         self.resources.get(&id).copied()
     }
+    #[allow(clippy::too_many_arguments)]
     fn end(
         &mut self,
         channel: ChannelId,

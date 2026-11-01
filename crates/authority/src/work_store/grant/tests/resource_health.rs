@@ -112,29 +112,18 @@ async fn the_third_consecutive_unknown_result_quarantines() {
 }
 
 #[tokio::test]
-async fn caller_caused_unknown_usage_does_not_quarantine_the_resource() {
-    for profile in [Profile::Responses, Profile::Http] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut node = fixture(directory.path(), profile).await;
-        // A response cut at the caller's signed cap or rejected upstream is
-        // billed conservatively but is not evidence against the backend.
-        for nonce in 1..=3 {
-            settle(&mut node, nonce, Usage::Unknown, false).await;
-            let health = node
-                .store
-                .state()
-                .resource_health(policy().resource)
-                .unwrap();
-            assert_eq!(health.consecutive_faults, 0, "{profile:?} result {nonce}");
-            assert!(!health.quarantined, "{profile:?} result {nonce}");
-        }
-        // A verified 2xx result whose usage cannot be decoded still faults.
-        for nonce in 4..=6 {
-            settle(&mut node, nonce, Usage::Unknown, true).await;
-            assert_eq!(quarantined(&node), nonce == 6, "{profile:?} result {nonce}");
-        }
-        assert_spent(&node, 48);
-    }
+async fn an_explicit_no_fault_terminal_stays_clear_on_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut node = fixture(directory.path(), Profile::Responses).await;
+    settle(&mut node, 1, Usage::Unknown, false).await;
+    let node = node.reopen().await;
+    let health = node
+        .store
+        .state()
+        .resource_health(policy().resource)
+        .unwrap();
+    assert_eq!(health.consecutive_faults, 0);
+    assert!(!health.quarantined);
 }
 
 #[tokio::test]

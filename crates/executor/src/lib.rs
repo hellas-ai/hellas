@@ -22,9 +22,9 @@ pub use fetch_projection::{
     ProjectedFetch,
 };
 pub use fetch_provider::{
-    FetchCall, FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
-    FetchProviderResponseHead, FetchProviderStream, HttpResponseHead, MockFetchProvider,
-    PreparedFetchRequest,
+    FetchCall, FetchProvider, FetchProviderError, FetchProviderErrorKind, FetchProviderFuture,
+    FetchProviderResponse, FetchProviderResponseHead, FetchProviderStream, HttpResponseHead,
+    MockFetchProvider, PreparedFetchRequest,
 };
 pub use fetch_registry::{
     DuplicateFetchRoute, FetchRouteBindingError, FetchRouteEntry, FetchRouteRegistry,

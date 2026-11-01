@@ -325,7 +325,11 @@ impl HttpFetchProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|_| fault("HTTPS response stream failed"))?;
                 received = received.checked_add(chunk.len()).ok_or_else(|| fault("HTTPS response size overflow"))?;
-                if received > limit { Err(fault("HTTPS response exceeds signed byte limit"))?; }
+                if received > limit {
+                    Err(FetchProviderError::caller_limit(
+                        "HTTPS response exceeds signed byte limit",
+                    ))?;
+                }
                 // Flush each upstream delivery. Waiting for a full 16 KiB
                 // record otherwise holds small SSE responses until EOF.
                 for part in chunk.chunks(CHUNK_BYTES) {

@@ -309,6 +309,18 @@ async fn repeated_requests_reuse_https_but_still_validate_each_request() {
 }
 
 #[tokio::test]
+async fn a_response_cut_at_the_signed_cap_is_a_caller_limit() {
+    use hellas_executor::FetchProviderErrorKind;
+    let (mut request, _, _, task) = server(200, b"ok".to_vec(), None).await;
+    request.max_response_bytes = 1;
+    let mut response = provider().run(prepared(&request)).await.unwrap();
+    assert_eq!(response.head.http.unwrap().status, 200);
+    let error = response.stream.next().await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), FetchProviderErrorKind::CallerLimit);
+    task.abort();
+}
+
+#[tokio::test]
 async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() {
     let (mut request, calls, connections, task) = server(200, b"ok".to_vec(), None).await;
     let valid_tls = request.tls.clone();

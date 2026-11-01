@@ -1,6 +1,6 @@
 //! Node authority and Work accounting share one durable writer. Every exported
 //! acceptance is backed by one fsynced frame covering its entire budget path.
-use super::state::{Change, Frame, Snapshot, State};
+use super::state::{Change, Frame, JOURNAL_NAMESPACE, Snapshot, State};
 use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
     SignedResult, ledger,
@@ -400,6 +400,7 @@ impl NodeStore {
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish(
         &mut self,
         channel: ChannelId,
@@ -471,7 +472,7 @@ impl NodeStore {
     ) -> Result<(), NodeStoreError> {
         let now = self.time(now)?;
         let frame = Frame {
-            namespace: "hellas.node.journal.v2".into(),
+            namespace: JOURNAL_NAMESPACE.into(),
             now,
             changes,
         };

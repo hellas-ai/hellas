@@ -5,9 +5,8 @@ use crate::model::grant::{
 };
 use crate::model::http_usage::{AccountingProfile, Mode, UsageDecoder};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hellas_rpc::http_fetch::HttpFetchRequest;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent};
-use hellas_rpc::protocol::invocation::output::InvocationOutput;
+use hellas_rpc::protocol::invocation::output::{FailureReason, InvocationOutput, Outcome};
 
 /// A conservative charge plus whether the incomplete result is evidence
 /// against the shared backend. Caller-selected caps and upstream rejections
@@ -47,11 +46,10 @@ enum Verdict {
 }
 impl Verdict {
     /// A verified 2xx body that still cannot be metered faults the backend;
-    /// a 4xx body or a prefix that reached the caller's signed cap does not.
-    fn incomplete(status: Option<u16>, body_bytes: usize, request: &HttpFetchRequest) -> Self {
-        if body_bytes as u64 >= u64::from(request.max_response_bytes)
-            || status.is_some_and(|status| (400..500).contains(&status))
-        {
+    /// a 4xx body does not. A caller-selected cap is signed on the output as
+    /// [`FailureReason::CallerLimit`] instead of being inferred from bytes.
+    fn incomplete(status: Option<u16>) -> Self {
+        if status.is_some_and(|status| (400..500).contains(&status)) {
             Self::NoFault
         } else {
             Self::Fault
@@ -67,6 +65,11 @@ fn observed(
 ) -> Verdict {
     let mut charge = Charge::default();
     charge.set(Meter::Requests, 1);
+    // The provider that enforced the caller's signed cap signs this reason
+    // into the authenticated output; it is not a backend failure.
+    if matches!(output.outcome, Outcome::Failed(FailureReason::CallerLimit)) {
+        return Verdict::NoFault;
+    }
     if domain == hellas_rpc::protocol::invocation::CapacityDomain::Gpu {
         return Verdict::Observed(charge);
     }
@@ -142,18 +145,17 @@ fn observed(
             return Verdict::Fault;
         }
         // A failed execution still carries its authenticated event prefix.
-        // Inspect that prefix so a caller-capped or rejected exchange is not
-        // mistaken for a corrupt backend.
-        let Some((status, body_bytes)) = failed_prefix(output) else {
+        // Its head distinguishes an upstream rejection from a corrupt backend;
+        // a caller-capped failure already carries its signed reason above.
+        let Some(status) = failed_status(output) else {
             return Verdict::Fault;
         };
-        return Verdict::incomplete(status, body_bytes, &request);
+        return Verdict::incomplete(Some(status));
     };
     let (events, _) = response.output_event_payloads();
     let mut decoder = UsageDecoder::new(Mode::Strict(resource.accounting), None, None);
     let mut head = false;
     let mut status = None;
-    let mut body_bytes = 0usize;
     for event in events {
         match hellas_rpc::fetch::decode_fetch_event_payload(event) {
             Ok(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
@@ -174,10 +176,10 @@ fn observed(
                     values.next().is_none().then_some(value)
                 };
                 let Some(content_type) = header("content-type") else {
-                    return Verdict::incomplete(status, body_bytes, &request);
+                    return Verdict::incomplete(status);
                 };
                 let Some(content_encoding) = header("content-encoding") else {
-                    return Verdict::incomplete(status, body_bytes, &request);
+                    return Verdict::incomplete(status);
                 };
                 decoder.content(content_type, content_encoding);
             }
@@ -188,7 +190,6 @@ fn observed(
                 let Ok(bytes) = STANDARD.decode(base64) else {
                     return Verdict::Fault;
                 };
-                body_bytes = body_bytes.saturating_add(bytes.len());
                 decoder.push(&bytes);
             }
             _ => return Verdict::Fault,
@@ -196,14 +197,14 @@ fn observed(
     }
     decoder.finish();
     let Ok((_, output)) = decoder.strict_usage() else {
-        return Verdict::incomplete(status, body_bytes, &request);
+        return Verdict::incomplete(status);
     };
     charge.set(Meter::OutputTokens, output);
     Verdict::Observed(charge)
 }
-/// The status and complete body bytes carried by a failed execution's
-/// authenticated response-event prefix, if it is structurally readable.
-fn failed_prefix(output: &InvocationOutput) -> Option<(Option<u16>, usize)> {
+/// The status carried by a failed execution's authenticated response-event
+/// prefix, if it is structurally readable.
+fn failed_status(output: &InvocationOutput) -> Option<u16> {
     let [artifact] = output.artifacts.as_slice() else {
         return None;
     };
@@ -214,7 +215,6 @@ fn failed_prefix(output: &InvocationOutput) -> Option<(Option<u16>, usize)> {
     }
     let mut remaining = artifact.bytes.as_bytes();
     let mut status = None;
-    let mut body_bytes = 0usize;
     while !remaining.is_empty() {
         let header = remaining.get(..4)?;
         let len = u32::from_be_bytes(header.try_into().ok()?) as usize;
@@ -229,21 +229,19 @@ fn failed_prefix(output: &InvocationOutput) -> Option<(Option<u16>, usize)> {
                 status: head_status,
                 ..
             })) if status.is_none() => status = Some(head_status),
-            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64 }))
-                if status.is_some() =>
-            {
-                body_bytes = body_bytes.saturating_add(STANDARD.decode(base64).ok()?.len());
-            }
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { .. }))
+                if status.is_some() => {}
             _ => return None,
         }
     }
-    Some((status, body_bytes))
+    status
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hellas_rpc::Assurance;
+    use hellas_rpc::http_fetch::HttpFetchRequest;
 
     fn transcript(usage: Option<hellas_rpc::output::Usage>) -> InvocationOutput {
         let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
@@ -321,6 +319,123 @@ mod tests {
             ),
             Usage::Unknown
         );
+    }
+
+    fn http_input(
+        policy: &GrantPolicy,
+    ) -> (
+        hellas_rpc::protocol::invocation::PreparedInvocation,
+        hellas_auth::ProducerSigningKey,
+    ) {
+        let key = hellas_channel::test_support::principal(2).1;
+        let contract = hellas_rpc::FetchContract::http().unwrap();
+        let request = HttpFetchRequest {
+            url: "https://glm.test/v1/chat/completions".into(),
+            method: "POST".into(),
+            headers: vec![],
+            body_base64: String::new(),
+            tls: hellas_rpc::http_fetch::HttpTls {
+                roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+                spki_sha256: vec![],
+            },
+            credential: None,
+            max_response_bytes: 1,
+        };
+        let events = hellas_rpc::fetch::build_input_events_with_retention(
+            "openai",
+            "responses",
+            &serde_json::to_vec(&request).unwrap(),
+            contract.manifest_id(),
+            Assurance::ProducerSigned,
+            &hellas_channel::test_support::principal(1).1,
+            hellas_rpc::Retention::Ephemeral,
+        )
+        .unwrap();
+        let input = hellas_rpc::protocol::invocation::fetch::prepare(
+            &events,
+            &contract,
+            key.public_key(),
+            policy.invocation_policy.canonical_bytes().unwrap(),
+            [1; 32],
+        )
+        .unwrap();
+        (input, key)
+    }
+
+    /// Sign a failed HTTP result whose authenticated prefix is the response
+    /// head and no body bytes, as the provider produces at a signed cap.
+    fn http_failure(
+        input: &hellas_rpc::protocol::invocation::PreparedInvocation,
+        key: &hellas_auth::ProducerSigningKey,
+        reason: FailureReason,
+    ) -> InvocationOutput {
+        use hellas_rpc::protocol::invocation::output::{OutputStream, verify};
+        let head = hellas_rpc::fetch::encode_fetch_event_payload(&OutputEvent::Adaptor(
+            AdaptorEvent::Http(HttpResponseEvent::Head {
+                status: 200,
+                headers: vec![
+                    ("content-type".into(), "text/event-stream".into()),
+                    ("content-encoding".into(), "identity".into()),
+                ],
+            }),
+        ))
+        .unwrap();
+        let mut framed = (head.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&head);
+        let mut stream = OutputStream::new(&input.request, key, 65_536).unwrap();
+        stream
+            .push(
+                hellas_rpc::protocol::invocation::fetch::RESPONSE_EVENTS,
+                hellas_rpc::protocol::invocation::fetch::RESPONSE_EVENTS_FORMAT,
+                0,
+                &framed,
+            )
+            .unwrap();
+        let (_, events) = stream.fail(reason).unwrap();
+        verify(&input.request, &key.public_key(), &events, 65_536).unwrap()
+    }
+
+    fn http_observation(
+        policy: &GrantPolicy,
+        input: &hellas_rpc::protocol::invocation::PreparedInvocation,
+        key: &hellas_auth::ProducerSigningKey,
+        reason: FailureReason,
+    ) -> UsageObservation {
+        let output = http_failure(input, key, reason);
+        super::usage(
+            policy,
+            hellas_rpc::protocol::invocation::CapacityDomain::Fetch,
+            input,
+            &output,
+            &key.public_key(),
+        )
+    }
+
+    fn http_policy() -> GrantPolicy {
+        let mut policy = crate::test_support::policy();
+        crate::test_support::use_https(
+            &mut policy,
+            crate::test_support::chat_resource("https://glm.test", 8),
+        );
+        policy
+    }
+
+    #[test]
+    fn a_signed_caller_limit_is_not_a_backend_fault() {
+        let policy = http_policy();
+        let (input, key) = http_input(&policy);
+        let observation = http_observation(&policy, &input, &key, FailureReason::CallerLimit);
+        assert_eq!(observation.usage, Usage::Unknown);
+        assert!(!observation.fault);
+    }
+
+    #[test]
+    fn the_same_prefix_with_an_execution_failure_still_faults() {
+        let policy = http_policy();
+        let (input, key) = http_input(&policy);
+        let observation = http_observation(&policy, &input, &key, FailureReason::Execution);
+        assert_eq!(observation.usage, Usage::Unknown);
+        assert!(observation.fault);
     }
 
     #[test]

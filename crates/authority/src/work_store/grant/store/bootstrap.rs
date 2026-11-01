@@ -1,4 +1,5 @@
 //! Native initialization marker and exclusive ownership across journal rotation.
+use super::super::state::JOURNAL_NAMESPACE;
 use super::*;
 use hellas_auth::authority::{
     AuthorityId, AuthorityState, Credential, CredentialHolder, CredentialSecret, GrantId,
@@ -178,7 +179,7 @@ impl NodeStore {
             authority: state.authority.authority(),
         };
         let frame = Frame {
-            namespace: "hellas.node.journal.v2".into(),
+            namespace: JOURNAL_NAMESPACE.into(),
             now,
             changes: vec![Change::Initialize {
                 authority: state.authority.snapshot(),
@@ -421,7 +422,7 @@ fn restore_replay(
         None => {
             let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
             let mut frame: Frame = decode(&bytes)?;
-            if frame.namespace != "hellas.node.journal.v2" || frame.changes.len() != 1 {
+            if frame.namespace != JOURNAL_NAMESPACE || frame.changes.len() != 1 {
                 return Err(NodeStoreError::Malformed);
             }
             let Some(Change::Initialize {
