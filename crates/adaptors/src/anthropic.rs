@@ -304,7 +304,11 @@ impl ParsedAnthropicMessageRequest {
             .map(project_tool)
             .collect::<AdaptorResult<Vec<_>>>()?;
         if let Some(tool_choice) = &self.tool_choice {
-            canonical.tool_choice = project_tool_choice(tool_choice)?;
+            let projected = project_tool_choice(tool_choice)?;
+            canonical.tool_choice = projected.choice;
+            if let Some(parallel_tool_calls) = projected.parallel_tool_calls {
+                canonical.sampling.parallel_tool_calls = Some(parallel_tool_calls);
+            }
         }
         if let Some(thinking) = &self.thinking {
             canonical.reasoning = Some(ReasoningOptions {
@@ -377,21 +381,42 @@ fn project_tool(value: &JsonValue) -> AdaptorResult<ToolSpec> {
     })
 }
 
-fn project_tool_choice(value: &JsonValue) -> AdaptorResult<ToolChoice> {
+/// An Anthropic `tool_choice` and the parallel-call permission it carries.
+struct ProjectedToolChoice {
+    choice: ToolChoice,
+    parallel_tool_calls: Option<bool>,
+}
+
+fn project_tool_choice(value: &JsonValue) -> AdaptorResult<ProjectedToolChoice> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("`tool_choice` must be a JSON object"))?;
-    match required_string(object, "type")?.as_str() {
-        "auto" => Ok(ToolChoice::Auto),
-        "any" => Ok(ToolChoice::Required),
-        "none" => Ok(ToolChoice::None),
-        "tool" => Ok(ToolChoice::Tool {
+    let tool_type = required_string(object, "type")?;
+    let disable_parallel = optional_bool(object, "disable_parallel_tool_use")?;
+    let choice = match tool_type.as_str() {
+        "auto" => ToolChoice::Auto,
+        "any" => ToolChoice::Required,
+        "none" => {
+            if disable_parallel.is_some() {
+                return Err(AdaptorError::invalid_request(
+                    "`disable_parallel_tool_use` is not valid on Anthropic tool_choice type `none`",
+                ));
+            }
+            ToolChoice::None
+        }
+        "tool" => ToolChoice::Tool {
             name: required_string(object, "name")?,
-        }),
-        tool_type => Err(AdaptorError::invalid_request(format!(
-            "unsupported Anthropic tool_choice type `{tool_type}`"
-        ))),
-    }
+        },
+        tool_type => {
+            return Err(AdaptorError::invalid_request(format!(
+                "unsupported Anthropic tool_choice type `{tool_type}`"
+            )));
+        }
+    };
+    Ok(ProjectedToolChoice {
+        choice,
+        parallel_tool_calls: disable_parallel.map(|disable| !disable),
+    })
 }
 
 fn required_object(
