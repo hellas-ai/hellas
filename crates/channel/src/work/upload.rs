@@ -1,5 +1,6 @@
 use super::*;
 use hellas_rpc::{
+    ProgramManifest,
     pb::work::{UploadContentRequest, UploadContentResponse},
     protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
 };
@@ -27,6 +28,78 @@ fn upload_response(result: Result<u64, Refusal>) -> UploadContentResponse {
             }),
         },
     }
+}
+
+/// Asks the provider whether it already holds `object`.
+///
+/// A zero-length chunk at offset zero is the upload handshake's probe: it
+/// stages no content and returns the provider's current offset. A complete
+/// offset means the provider holds the object, so a client that never
+/// possessed it — a model weight, normally — must neither read nor retain
+/// it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The probe carries the signed proposal's fields and the transport's exporter."
+)]
+async fn probe_object<T>(
+    client: &WorkClientImpl<T>,
+    endpoint: &mut impl ClientChannel,
+    request: &AcceptWorkRequest,
+    authorization: &PaidJobAuthorizationV2,
+    id: Digest,
+    manifest: &ProgramManifest,
+    program_root: &[u8],
+    object: ContentRef,
+    exporter: &[u8; 32],
+) -> Result<u64, ProposeError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let chunk_signature = endpoint
+        .client()
+        .await?
+        .signer
+        .sign(signing_hash(chunk_digest(
+            authorization.channel_id,
+            id,
+            object,
+            0,
+            &[],
+            exporter,
+        )));
+    let uploaded = client
+        .upload_content(UploadContentRequest {
+            route: request.route.clone(),
+            authorization: request.authorization.clone(),
+            client_signature: request.client_signature.clone(),
+            program_manifest: manifest.canonical_bytes(),
+            program_root: program_root.to_vec(),
+            content_id: object.id().as_bytes().to_vec(),
+            total_bytes: object.bytes(),
+            offset: 0,
+            chunk: Vec::new(),
+            chunk_signature: chunk_signature.as_bytes().to_vec(),
+        })
+        .await?;
+    if let Some(refusal) = uploaded.refused {
+        let answered = endpoint
+            .client()
+            .await?
+            .accepted(&AcceptWorkResponse {
+                outcome: Some(Outcome::Refused(refusal)),
+            })
+            .await;
+        return match answered {
+            Ok(_) => Err(ProposeError::Malformed("refusal answered as an acceptance")),
+            Err(error) => Err(error),
+        };
+    }
+    if uploaded.next_offset > object.bytes() {
+        return Err(ProposeError::Malformed("upload offset"));
+    }
+    Ok(uploaded.next_offset)
 }
 impl ProviderEndpoint {
     pub fn upload_content(
@@ -320,27 +393,59 @@ where
         }
     };
     let objects = crate::job::content_closure(&policy, &manifest, &program_root, reference)?;
+    let client = WorkClientImpl::new(transport);
     // A retained proposal is resumed from the journal alone, so the bytes
-    // its upload needs must outlive this process. Retain the exact closure
-    // in the upload store before any of it leaves: a crash during upload
-    // then leaves a complete local copy to re-send, and one before the
-    // first chunk leaves a job recovery reports as unresolved rather than
-    // one whose missing root parses as an empty program.
+    // this client supplies must outlive this process. Probe each closure
+    // object first: provider-held assets (model weights, normally) are
+    // objects the client deliberately does not possess, and reading one
+    // here would fail an otherwise ordinary proposal. Only an object the
+    // provider says it needs is read and retained. The ticket records
+    // exactly that client-supplied set before any chunk leaves, so a
+    // restart resumes the same signed proposal without claiming a
+    // provider-held object.
     if authorization.retention == hellas_rpc::Retention::Retain {
-        let client = endpoint.client().await?;
-        client.store.retain_upload(&prepared_bytes)?;
-        if !program_root.is_empty() {
-            client.store.retain_upload(&program_root)?;
+        let program_root_ref =
+            (!program_root.is_empty()).then(|| ContentRef::for_bytes(&program_root));
+        {
+            let client_store = endpoint.client().await?;
+            client_store.store.retain_upload(&prepared_bytes)?;
+            if program_root_ref.is_some() {
+                client_store.store.retain_upload(&program_root)?;
+            }
+        }
+        let mut retained = vec![reference];
+        if let Some(root) = program_root_ref {
+            retained.push(root);
         }
         for object in &objects {
-            if *object == reference {
+            if *object == reference || Some(*object) == program_root_ref {
                 continue;
             }
-            let bytes = content.read(*object)?;
-            client.store.retain_upload(&bytes)?;
+            let next = probe_object(
+                &client,
+                endpoint,
+                &request,
+                &authorization,
+                id,
+                &manifest,
+                &program_root,
+                *object,
+                &exporter,
+            )
+            .await?;
+            if next < object.bytes() {
+                let bytes = content.read(*object)?;
+                endpoint.client().await?.store.retain_upload(&bytes)?;
+                retained.push(*object);
+            }
         }
+        endpoint.client().await?.store.retain_closure(
+            id,
+            &retained,
+            authorization.terminal_deadline,
+            policy.limits.max_upload_bytes,
+        )?;
     }
-    let client = WorkClientImpl::new(transport);
     for object in objects {
         let mut offset = 0u64;
         let mut probing = true;

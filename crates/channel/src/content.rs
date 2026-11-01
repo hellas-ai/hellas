@@ -881,6 +881,43 @@ impl UploadStore {
             .map_err(|e| ContentError::Storage(e.to_string()))?;
         Ok(ContentRef::for_bytes(bytes))
     }
+    /// Records the closure a retained proposal can re-send from local bytes.
+    ///
+    /// The ticket lists only objects this client retained; an object the
+    /// provider already held is deliberately absent. It is written after
+    /// every client-supplied object is durable, so its presence means the
+    /// upload can be resumed and its absence means the provider's share
+    /// was never established.
+    pub(crate) fn retain_closure(
+        &mut self,
+        work: Digest,
+        objects: &[ContentRef],
+        deadline: u64,
+        max_upload_bytes: u64,
+    ) -> Result<(), ContentError> {
+        // A retry may find that the provider gained or lost an object, so
+        // its client-supplied set is not the previous attempt's. Replace
+        // the ticket rather than refusing the proposal over a stale set;
+        // the bytes themselves are content-addressed and stay put.
+        if self.uploads.contains_key(&work) {
+            self.discard(work)?;
+        }
+        self.declare(
+            work,
+            objects,
+            deadline,
+            Retention::Retain,
+            max_upload_bytes,
+            true,
+        )
+    }
+    /// The retained closure recorded for `work`, if this store has one.
+    pub(crate) fn retained_closure(&self, work: Digest) -> Option<Vec<ContentRef>> {
+        match self.uploads.get(&work) {
+            Some(Upload::Retained(upload)) => Some(upload.meta.objects.values().copied().collect()),
+            _ => None,
+        }
+    }
     pub fn discard(&mut self, work: Digest) -> Result<(), ContentError> {
         if let Some(Upload::Retained(upload)) = self.uploads.get(&work) {
             upload.remove_parts()?;

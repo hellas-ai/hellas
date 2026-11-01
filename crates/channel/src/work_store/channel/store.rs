@@ -200,9 +200,16 @@ impl ChannelStore {
     /// this journal durably holds.
     ///
     /// `None` means the job is not a retained job, or its upload never
-    /// completed: the prepared bundle or one of the closure objects is not
-    /// in the upload store. Missing content is unresolved work, not an empty
-    /// program, and a caller must not treat it as one.
+    /// completed: the retention pass never recorded which objects this
+    /// client supplies, or one of those objects is not in the upload store.
+    /// Missing content is unresolved work, not an empty program, and a
+    /// caller must not treat it as one.
+    ///
+    /// The returned source holds exactly the objects the client retained.
+    /// Objects the provider already had when the proposal was sent are
+    /// absent from it and read as [`crate::content::ContentError::Missing`];
+    /// the upload probes the provider before every read, so a provider-held
+    /// object is never asked for locally.
     ///
     /// # Errors
     ///
@@ -233,6 +240,12 @@ impl ChannelStore {
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
             .map_err(PaidWorkError::from)
             .map_err(ChannelStateError::from)?;
+        // The ticket is written only after every client-supplied object is
+        // durable. Without it nothing establishes which objects the provider
+        // held, so the upload is unresolved rather than partially recovered.
+        let Some(retained) = self.uploads.retained_closure(work) else {
+            return Ok(None);
+        };
         // The policy says whether an opening is required at all; a
         // self-contained program (Fetch) has no root to recover. Anything
         // else whose root is not retained is unfinished, never empty.
@@ -257,9 +270,14 @@ impl ChannelStore {
             Ok(objects) => objects,
             Err(_) => return Ok(None),
         };
+        // A retained object outside this signed closure is a ticket for
+        // other bytes, not an upload this job can resume.
+        if retained.iter().any(|object| !objects.contains(object)) {
+            return Ok(None);
+        }
         match self
             .uploads
-            .invocation_content(work, &objects, hellas_rpc::Retention::Retain)
+            .invocation_content(work, &retained, hellas_rpc::Retention::Retain)
         {
             Ok(content) => Ok(Some(content)),
             Err(crate::content::ContentError::Missing) => Ok(None),
@@ -279,6 +297,29 @@ impl ChannelStore {
     /// bytes.
     pub(crate) fn retain_upload(&self, bytes: &[u8]) -> Result<(), crate::content::ContentError> {
         self.uploads.retain(bytes).map(|_| ())
+    }
+
+    /// Records the exact closure a retained proposal can re-send.
+    ///
+    /// The list is the client's share only: an object the provider already
+    /// held when the proposal was sent is not retained and is not listed.
+    /// Writing the ticket is what makes a half-signed job resumable after a
+    /// restart; before it exists, recovery has no evidence of the provider's
+    /// share and reports the upload unresolved.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::content::ContentError`] when the upload store cannot record
+    /// the closure.
+    pub(crate) fn retain_closure(
+        &mut self,
+        work: Digest,
+        objects: &[hellas_rpc::ContentRef],
+        deadline: u64,
+        max_upload_bytes: u64,
+    ) -> Result<(), crate::content::ContentError> {
+        self.uploads
+            .retain_closure(work, objects, deadline, max_upload_bytes)
     }
 
     /// Releases a pending proposal this journal can no longer send.
