@@ -732,7 +732,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
     second
         .seed_provider_offer(dir.path(), admits(), second_route_peer())
         .await;
-    let source = RoutedChain::new([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
+    let source = Chain::routed([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
     let work_mount = MountedWork::default();
     let setup_mount = MountedSetup::default();
     let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount).await;
@@ -829,7 +829,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
-    let source = RoutedChain::new(
+    let source = Chain::routed(
         [first.bond_edge(), second.bond_edge()],
         [
             first.ready_snapshot(ORIGIN, None),
@@ -842,7 +842,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
 
     assert!(runner.tick(&source).await, "both completed routes mount");
     let first_request = first.signed_accept_request();
-    let reads_before_request = source.0.lock().unwrap().snapshot_reads;
+    let reads_before_request = source.snapshot_reads();
     let accepted =
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()).await;
     assert!(
@@ -854,7 +854,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     );
 
     assert_eq!(
-        source.0.lock().unwrap().snapshot_reads,
+        source.snapshot_reads(),
         reads_before_request,
         "acceptance performs no validator reads"
     );
@@ -872,7 +872,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     // permits replies, and those replies cannot initiate validator I/O.
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some(BlockedRead {
+    source.block_next_read(BlockedRead {
         bond: first.bond_edge(),
         entered: entered.clone(),
         release: release.clone(),
@@ -970,7 +970,7 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
     let start_id = write_contested_channel(dir.path()).await;
-    let source = RoutedChain::new(
+    let source = Chain::routed(
         [first.bond_edge(), second.bond_edge()],
         [
             first.channel_snapshot(ORIGIN, None, Some(pending_contest(true))),
@@ -1346,54 +1346,9 @@ fn origin() -> SetupOrigin {
 /// A provider's setup journal, complete and recording where its
 /// channel begins — which is exactly what a restarting node finds.
 async fn write_setup_journal(root: &Path) {
-    let verifier = Secp256k1Verifier::new();
-    let mut store =
-        match SetupStore::open(root, network(), bond_edge(), Role::Provider, &verifier).await {
-            Ok(store) => store,
-            Err(error) => panic!("the fixture setup journal opens: {error}"),
-        };
-    let one = proposed();
-    let two = countersigned(one.clone());
-    let three = completed(two.clone());
-    let Some(terms) = three.payment_terms().cloned() else {
-        panic!("a countersigned payment has terms");
-    };
-    let Some(edge) = three.payment_edge() else {
-        panic!("a countersigned payment has an edge");
-    };
-    let close_descriptor = match provider_policy().describe_close(edge, terms) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture close descriptor opens: {error}"),
-    };
-    for record in [
-        SetupRecord::ScanArmed {
-            height: FLOOR,
-            payload: payload_at(FLOOR),
-        },
-        recorded_offer(
-            one.clone(),
-            default_route_peer(),
-            payment_funding(),
-            provider_policy(),
-        ),
-        SetupRecord::Bundle {
-            bundle: two.encode(),
-        },
-        SetupRecord::ArmedBundle {
-            bundle: three.encode(),
-            close_descriptor: Box::new(close_descriptor),
-        },
-        SetupRecord::Complete {
-            payment_edge: edge,
-            origin_height: ORIGIN,
-            origin_payload: payload_at(ORIGIN),
-            origin_parent: payload_at(ORIGIN - 1),
-        },
-    ] {
-        if let Err(error) = store.commit(record, &verifier).await {
-            panic!("the fixture setup record commits: {error}");
-        }
-    }
+    OfferFixture::first()
+        .write_completed_setup_for(root, default_route_peer())
+        .await;
 }
 
 /// Reopens the channel journal the mount opens, under exactly the
@@ -1548,15 +1503,13 @@ async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     hellas_channel::test_support::channel::commit(store, record).await;
 }
 
-/// The provider journal a process can find after crashing between its
-/// durable acceptance and the detached backend task's first poll.
-async fn write_accepted_channel(root: &Path) -> Digest {
+/// The two records every provider journal holds before work runs.
+async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
     let channel = descriptor().channel().clone();
-    let mut store = open_channel(root).await;
     let job = authorization();
     let id = work_id(&channel, &job);
     commit(
-        &mut store,
+        store,
         ChannelRecord::JobProposed {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
@@ -1568,7 +1521,7 @@ async fn write_accepted_channel(root: &Path) -> Digest {
     )
     .await;
     commit(
-        &mut store,
+        store,
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
@@ -1576,6 +1529,13 @@ async fn write_accepted_channel(root: &Path) -> Digest {
     )
     .await;
     id
+}
+
+/// The provider journal a process can find after crashing between its
+/// durable acceptance and the detached backend task's first poll.
+async fn write_accepted_channel(root: &Path) -> Digest {
+    let mut store = open_channel(root).await;
+    propose_and_accept(&mut store).await
 }
 
 /// The channel journal a restarted provider finds: one job it
@@ -1588,27 +1548,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
     let channel = descriptor().channel().clone();
     let mut store = open_channel(root).await;
     let job = authorization();
-    let id = work_id(&channel, &job);
-    commit(
-        &mut store,
-        ChannelRecord::JobProposed {
-            authorization: job,
-            client_signature: client().sign(signing_hash(id)),
-            prepared_input: match bundle().canonical_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => panic!("the fixture bundle encodes: {error}"),
-            },
-        },
-    )
-    .await;
-    commit(
-        &mut store,
-        ChannelRecord::JobAccepted {
-            work_id: id,
-            provider_signature: provider().sign(signing_hash(id)),
-        },
-    )
-    .await;
+    let id = propose_and_accept(&mut store).await;
     commit(&mut store, ChannelRecord::JobRunning { work_id: id }).await;
     let transcript = answer_transcript();
     let result = match hellas_channel::job::paid_terminal_result(
@@ -1884,234 +1824,153 @@ fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkCh
 
 // ── The chain a test writes down ──────────────────────────────────
 
-/// One coherent finalized read, a tip that never moves, and a sink
-/// that keeps what it was handed.
+/// One finalized source written down by a test: the coherent reads it answers
+/// with, the blocks those reads describe, and a sink that keeps what it was
+/// handed. It has no routing opinion — queries select by their signed channel
+/// identity — so one channel and several are the same fixture.
 #[derive(Clone)]
-struct TestChain(Arc<ChainState>);
+struct Chain(Arc<Mutex<ChainState>>);
 
-struct ChainState {
-    /// Everything a driver submitted, in the order it did.
-    submitted: Mutex<Vec<Tx>>,
-    /// The one coherent finalized channel read this chain answers with.
-    snapshot: Mutex<WorkChannelSnapshot>,
-    /// One permit added as `latest_height` is entered.
-    entered: Semaphore,
-    /// One permit the test adds to let `latest_height` out again.
-    release: Semaphore,
-    /// Whether `latest_height` waits at all.
-    slow: bool,
-}
-
-impl TestChain {
-    fn new() -> Self {
-        Self::with(false)
-    }
-
-    /// A chain whose block read blocks until the test releases it.
-    fn slow() -> Self {
-        Self::with(true)
-    }
-
-    fn with(slow: bool) -> Self {
-        Self(Arc::new(ChainState {
-            submitted: Mutex::new(Vec::new()),
-            snapshot: Mutex::new(channel_snapshot(ORIGIN, None, None)),
-            entered: Semaphore::new(0),
-            release: Semaphore::new(0),
-            slow,
-        }))
-    }
-
-    fn submitted(&self) -> Vec<Tx> {
-        match self.0.submitted.lock() {
-            Ok(held) => held.clone(),
-            Err(error) => panic!("the fixture sink is reachable: {error}"),
-        }
-    }
-
-    fn set_snapshot(&self, snapshot: WorkChannelSnapshot) {
-        match self.0.snapshot.lock() {
-            Ok(mut held) => *held = snapshot,
-            Err(error) => panic!("the fixture snapshot is reachable: {error}"),
-        }
-    }
-
-    /// Waits until a caller is inside the block read.
-    async fn wait_for_read(&self) {
-        match self.0.entered.acquire().await {
-            Ok(permit) => permit.forget(),
-            Err(error) => panic!("the fixture chain is open: {error}"),
-        }
-    }
-
-    fn release(&self) {
-        self.0.release.add_permits(1);
-    }
-}
-
-impl SetupView for TestChain {
-    async fn finalized_setup(
-        &self,
-        _query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        // Both edges consumed and no funding left live. A completed
-        // setup reads its edge only to price the settlement, and an
-        // absent one is what makes the mount fall back to the
-        // descriptor's expectation — the same one this fixture's
-        // journal was written under.
-        Ok(Some(FinalizedSetup {
-            height: ORIGIN,
-            bond: None,
-            payment: None,
-            lease: LeaseSlots::Absent,
-            live_funding: BTreeSet::new(),
-        }))
-    }
-}
-
-impl FinalizedWorkView for TestChain {
-    async fn work_channel_snapshot(
-        &self,
-        query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        let snapshot = match self.0.snapshot.lock() {
-            Ok(held) => held.clone(),
-            Err(error) => {
-                return Err(QueryError::StateUnavailable(format!(
-                    "the fixture snapshot lock failed: {error}",
-                )));
-            }
-        };
-        if snapshot.query() != &query {
-            return Err(QueryError::StateUnavailable(
-                "the fixture was asked for another work channel".to_string(),
-            ));
-        }
-        Ok(Some(snapshot))
-    }
-}
-
-impl FinalizedBlocks for TestChain {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        if self.0.slow {
-            self.0.entered.add_permits(1);
-            match self.0.release.acquire().await {
-                Ok(permit) => permit.forget(),
-                Err(error) => panic!("the fixture chain is open: {error}"),
-            }
-        }
-        let responded = matches!(
-            self.0.snapshot.lock().unwrap().observed_channel().pending,
-            hellas_kernel::PendingSlot::Present(pending) if pending.responded()
-        );
-        Ok(Some(if responded { RESPONSE_HEIGHT } else { ORIGIN }))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        let txs = match height {
-            ORIGIN => vec![completed(countersigned(proposed())).payment_open().unwrap()],
-            CONTEST_HEIGHT => vec![Tx::move_action(Move::StartPaymentClose(contest_start()))],
-            RESPONSE_HEIGHT => vec![Tx::move_action(Move::RespondPaymentClose(
-                contest_response(),
-            ))],
-            _ => return Ok(None),
-        };
-        Ok(Some(FinalizedWork {
-            height,
-            parent: payload_at(height - 1),
-            payload: payload_at(height),
-            txs,
-        }))
-    }
-}
-
-impl TxSink for TestChain {
-    async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
-        match self.0.submitted.lock() {
-            Ok(mut held) => held.push(tx),
-            Err(error) => panic!("the fixture sink is reachable: {error}"),
-        }
-        Ok(SubmitTxOutcome::Enqueued)
-    }
-}
-
-/// One finalized source with independent coherent snapshots for several
-/// channels. It has no clients and no routing opinion: queries select only
-/// by their signed channel identity, while every submission is retained so
-/// one runner tick can be inspected as a whole.
-#[derive(Clone)]
-struct RoutedChain(Arc<Mutex<RoutedChainState>>);
-
+/// One coherent read the source holds until the test releases it.
 struct BlockedRead {
     bond: EdgeId,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
 }
 
-struct RoutedChainState {
-    snapshot_reads: usize,
-    next_read: Option<BlockedRead>,
-    completed_setups: Vec<EdgeId>,
-    snapshots: Vec<WorkChannelSnapshot>,
+struct ChainState {
+    /// Everything a driver submitted, in the order it did.
     submitted: Vec<Tx>,
+    /// Completed setups whose payment Open the origin block carries.
+    completed_setups: Vec<EdgeId>,
+    /// One coherent finalized read per channel.
+    snapshots: Vec<WorkChannelSnapshot>,
+    /// Snapshot reads so far, for tests that assert no validator I/O.
+    snapshot_reads: usize,
+    /// One read to hold until the test releases it.
+    next_read: Option<BlockedRead>,
+    /// One permit added as `latest_height` is entered.
+    entered: Arc<Semaphore>,
+    /// One permit the test adds to let `latest_height` out again.
+    release: Arc<Semaphore>,
+    /// Whether `latest_height` waits at all.
+    slow: bool,
 }
 
-impl RoutedChain {
-    fn new(
+impl Chain {
+    /// The default fixture channel, with a tip that never moves.
+    fn single() -> Self {
+        Self::build([bond_edge()], [channel_snapshot(ORIGIN, None, None)], false)
+    }
+
+    /// The same, with a block read that waits until the test releases it.
+    fn slow() -> Self {
+        Self::build([bond_edge()], [channel_snapshot(ORIGIN, None, None)], true)
+    }
+
+    /// Independent coherent snapshots for several configured channels.
+    fn routed(
         completed_setups: impl IntoIterator<Item = EdgeId>,
         snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
     ) -> Self {
-        Self(Arc::new(Mutex::new(RoutedChainState {
-            snapshot_reads: 0,
-            next_read: None,
+        Self::build(completed_setups, snapshots, false)
+    }
+
+    fn build(
+        completed_setups: impl IntoIterator<Item = EdgeId>,
+        snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
+        slow: bool,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(ChainState {
+            submitted: Vec::new(),
             completed_setups: completed_setups.into_iter().collect(),
             snapshots: snapshots.into_iter().collect(),
-            submitted: Vec::new(),
+            snapshot_reads: 0,
+            next_read: None,
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            slow,
         })))
     }
 
-    fn set_snapshot(&self, snapshot: WorkChannelSnapshot) {
+    fn held(&self) -> std::sync::MutexGuard<'_, ChainState> {
         match self.0.lock() {
-            Ok(mut held) => {
-                let query = snapshot.query().clone();
-                if let Some(existing) = held
-                    .snapshots
-                    .iter_mut()
-                    .find(|existing| existing.query() == &query)
-                {
-                    *existing = snapshot;
-                } else {
-                    held.snapshots.push(snapshot);
-                }
-            }
-            Err(error) => panic!("the routed source is reachable: {error}"),
+            Ok(held) => held,
+            Err(error) => panic!("the fixture chain is reachable: {error}"),
         }
     }
 
     fn submitted(&self) -> Vec<Tx> {
-        match self.0.lock() {
-            Ok(held) => held.submitted.clone(),
-            Err(error) => panic!("the routed sink is reachable: {error}"),
+        self.held().submitted.clone()
+    }
+
+    /// Replaces the read for this snapshot's channel, or adds it.
+    fn set_snapshot(&self, snapshot: WorkChannelSnapshot) {
+        let mut held = self.held();
+        let query = snapshot.query().clone();
+        if let Some(existing) = held
+            .snapshots
+            .iter_mut()
+            .find(|existing| existing.query() == &query)
+        {
+            *existing = snapshot;
+        } else {
+            held.snapshots.push(snapshot);
         }
+    }
+
+    fn snapshot_reads(&self) -> usize {
+        self.held().snapshot_reads
+    }
+
+    /// Holds the next read of `read.bond` until the test releases it.
+    fn block_next_read(&self, read: BlockedRead) {
+        self.held().next_read = Some(read);
+    }
+
+    /// Waits until a caller is inside the block read.
+    async fn wait_for_read(&self) {
+        let entered = self.held().entered.clone();
+        match entered.acquire().await {
+            Ok(permit) => permit.forget(),
+            Err(error) => panic!("the fixture chain is open: {error}"),
+        }
+    }
+
+    fn release(&self) {
+        self.held().release.add_permits(1);
     }
 }
 
-impl SetupView for RoutedChain {
+/// The payment Open the origin block carries for a completed setup.
+fn payment_open_for(bond: EdgeId) -> Option<Tx> {
+    if bond == bond_edge() {
+        return completed(countersigned(proposed())).payment_open();
+    }
+    [OfferFixture::first(), OfferFixture::second()]
+        .into_iter()
+        .find(|route| route.bond_edge() == bond)
+        .and_then(|route| {
+            route
+                .completed(route.countersigned(route.proposed()))
+                .payment_open()
+        })
+}
+
+impl SetupView for Chain {
     async fn finalized_setup(
         &self,
         query: SetupQuery,
     ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        let known = self
-            .0
-            .lock()
-            .map_err(|error| BlockSourceError::new(format!("the setup lock failed: {error}")))?
-            .completed_setups
-            .contains(&query.bond_edge);
-        if !known {
+        if !self.held().completed_setups.contains(&query.bond_edge) {
             return Err(BlockSourceError::new(
-                "the routed source was asked for an unconfigured setup",
+                "the fixture source was asked for an unconfigured setup",
             ));
         }
+        // Both edges consumed and no funding left live. A completed setup reads
+        // its edge only to price the settlement, and an absent one is what makes
+        // the mount fall back to the descriptor's expectation — the same one this
+        // fixture's journal was written under.
         Ok(Some(FinalizedSetup {
             height: ORIGIN,
             bond: None,
@@ -2122,20 +1981,20 @@ impl SetupView for RoutedChain {
     }
 }
 
-impl FinalizedWorkView for RoutedChain {
+impl FinalizedWorkView for Chain {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
         let gate = {
-            let mut state = self.0.lock().unwrap();
-            state.snapshot_reads += 1;
-            if state
+            let mut held = self.held();
+            held.snapshot_reads += 1;
+            if held
                 .next_read
                 .as_ref()
                 .is_some_and(|gate| gate.bond == query.bond_edge)
             {
-                state.next_read.take()
+                held.next_read.take()
             } else {
                 None
             }
@@ -2147,28 +2006,34 @@ impl FinalizedWorkView for RoutedChain {
             entered.add_permits(1);
             release.acquire().await.unwrap().forget();
         }
-        match self.0.lock() {
-            Ok(held) => held
-                .snapshots
-                .iter()
-                .find(|snapshot| snapshot.query() == &query)
-                .cloned()
-                .map(Some)
-                .ok_or_else(|| {
-                    QueryError::StateUnavailable(
-                        "the routed source was asked for another channel".to_string(),
-                    )
-                }),
-            Err(error) => Err(QueryError::StateUnavailable(format!(
-                "the routed snapshot lock failed: {error}",
-            ))),
-        }
+        self.held()
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.query() == &query)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                QueryError::StateUnavailable(
+                    "the fixture source was asked for another channel".to_string(),
+                )
+            })
     }
 }
 
-impl FinalizedBlocks for RoutedChain {
+impl FinalizedBlocks for Chain {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        let responded = self.0.lock().unwrap().snapshots.iter().any(|snapshot| {
+        let (slow, entered, release) = {
+            let held = self.held();
+            (held.slow, held.entered.clone(), held.release.clone())
+        };
+        if slow {
+            entered.add_permits(1);
+            match release.acquire().await {
+                Ok(permit) => permit.forget(),
+                Err(error) => panic!("the fixture chain is open: {error}"),
+            }
+        }
+        let responded = self.held().snapshots.iter().any(|snapshot| {
             matches!(
                 snapshot.observed_channel().pending,
                 hellas_kernel::PendingSlot::Present(pending) if pending.responded()
@@ -2179,19 +2044,12 @@ impl FinalizedBlocks for RoutedChain {
 
     async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
         let txs = match height {
-            ORIGIN => {
-                let completed = &self.0.lock().unwrap().completed_setups;
-                [OfferFixture::first(), OfferFixture::second()]
-                    .into_iter()
-                    .filter(|route| completed.contains(&route.bond_edge()))
-                    .map(|route| {
-                        route
-                            .completed(route.countersigned(route.proposed()))
-                            .payment_open()
-                            .unwrap()
-                    })
-                    .collect()
-            }
+            ORIGIN => self
+                .held()
+                .completed_setups
+                .iter()
+                .filter_map(|bond| payment_open_for(*bond))
+                .collect(),
             CONTEST_HEIGHT => vec![Tx::move_action(Move::StartPaymentClose(contest_start()))],
             RESPONSE_HEIGHT => vec![Tx::move_action(Move::RespondPaymentClose(
                 contest_response(),
@@ -2207,13 +2065,9 @@ impl FinalizedBlocks for RoutedChain {
     }
 }
 
-impl TxSink for RoutedChain {
+impl TxSink for Chain {
     async fn submit(&self, tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
-        self.0
-            .lock()
-            .map_err(|error| BlockSourceError::new(format!("the sink lock failed: {error}")))?
-            .submitted
-            .push(tx);
+        self.held().submitted.push(tx);
         Ok(SubmitTxOutcome::Enqueued)
     }
 }
@@ -2458,7 +2312,7 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
 }
 
 /// The one contest this fixture's sink was handed an answer to.
-fn responded(chain: &TestChain) -> StartId {
+fn responded(chain: &Chain) -> StartId {
     let submitted = chain.submitted();
     let [
         Tx::Move {
@@ -2471,7 +2325,7 @@ fn responded(chain: &TestChain) -> StartId {
     response.start_id()
 }
 
-fn adjudicated_payment_closes(chain: &TestChain) -> usize {
+fn adjudicated_payment_closes(chain: &Chain) -> usize {
     chain
         .submitted()
         .iter()
@@ -2639,6 +2493,16 @@ impl OfferFixture {
     }
 
     async fn write_completed_setup(self, root: &Path) {
+        let peer = if self.client_seed == Self::first().client_seed {
+            first_route_peer()
+        } else {
+            second_route_peer()
+        };
+        self.write_completed_setup_for(root, peer).await;
+    }
+
+    /// The same journal, routed to `peer`.
+    async fn write_completed_setup_for(self, root: &Path, peer: PeerId) {
         let verifier = Secp256k1Verifier::new();
         let mut store =
             match SetupStore::open(root, network(), self.bond_edge(), Role::Provider, &verifier)
@@ -2656,16 +2520,7 @@ impl OfferFixture {
                 height: FLOOR,
                 payload: payload_at(FLOOR),
             },
-            recorded_offer(
-                one.clone(),
-                if self.client_seed == Self::first().client_seed {
-                    first_route_peer()
-                } else {
-                    second_route_peer()
-                },
-                self.payment_funding(),
-                provider_policy(),
-            ),
+            recorded_offer(one.clone(), peer, self.payment_funding(), provider_policy()),
             SetupRecord::Bundle {
                 bundle: two.encode(),
             },
@@ -3456,7 +3311,7 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     let start_id = write_contested_channel(dir.path()).await;
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
 
     assert!(
         mount
@@ -3508,7 +3363,7 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
     let start_id = write_contested_channel(dir.path()).await;
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
     chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(false))));
 
     assert!(runner.tick(&chain).await, "the first coherent read answers");
@@ -3560,7 +3415,7 @@ async fn the_paid_work_clock_returns_the_completed_bond_at_its_horizon() {
     write_setup_journal(dir.path()).await;
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
     chain.set_snapshot(channel_snapshot(
         bond_terms().timeout.get(),
         Some(live_bond()),
@@ -3602,7 +3457,7 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
     write_setup_journal(dir.path()).await;
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
 
     let unmounted: WithTrailer<AdmitCertificateResponse> = UnmountedWork
         .admit_certificate(
@@ -3676,7 +3531,7 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
 fn the_clock_resumes_an_accepted_job_after_restart() {
     let dir = temp();
     let calls = Arc::new(AtomicUsize::new(0));
-    let chain = TestChain::new();
+    let chain = Chain::single();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
     let runtime = || {
         tokio::runtime::Builder::new_multi_thread()
@@ -3849,7 +3704,7 @@ async fn open_result_stream_stops(shutdown: bool) {
     let backend = BlockingPaidBackend::new();
     let mount = MountedWork::with_backend(backend.clone());
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
     assert!(runner.tick(&chain).await);
     backend.wait_for_call().await;
@@ -3940,10 +3795,10 @@ async fn the_clock_does_not_starve_the_request_path() {
     let backend = BlockingPaidBackend::new();
     let mount = MountedWork::with_backend(backend.clone());
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
-    let initial = TestChain::new();
+    let initial = Chain::single();
     initial.set_snapshot(ready_channel_snapshot(ORIGIN, None));
     assert!(runner.tick(&initial).await);
-    let chain = TestChain::slow();
+    let chain = Chain::slow();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
 
     let ticking = {
@@ -4019,7 +3874,7 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     let start_id = write_contested_channel(dir.path()).await;
     let mount = MountedWork::default();
     let runner = runner(dir.path(), provider_policy(), &mount).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
     let (stop, stopped) = oneshot::channel();
     let task = {
         let chain = chain.clone();
@@ -4095,7 +3950,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
-    let source = RoutedChain::new(
+    let source = Chain::routed(
         [first.bond_edge(), second.bond_edge()],
         [
             first.ready_snapshot(ORIGIN, None),
@@ -4104,7 +3959,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     );
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some(BlockedRead {
+    source.block_next_read(BlockedRead {
         bond: first.bond_edge(),
         entered: entered.clone(),
         release,
@@ -4197,7 +4052,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     let original = MountedWork::default();
     let setup = MountedSetup::default();
     let mut runner = discover_two_route_runner(root.path(), &original, &setup).await;
-    let source = RoutedChain::new(
+    let source = Chain::routed(
         [first.bond_edge(), second.bond_edge()],
         [
             first.ready_snapshot(ORIGIN, None),
@@ -4490,7 +4345,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     };
     let mounted = MountedWork::with_backend(backend.clone());
     let mut observer = runner(root.path(), provider_policy(), &mounted).await;
-    let chain = TestChain::new();
+    let chain = Chain::single();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
     assert!(observer.tick(&chain).await);
     let peer = default_route_peer();
