@@ -95,6 +95,21 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "grant execution requires" assertion.message
     ) (throw "missing required Apple trust assertion") evaluation.config.assertions;
+  fundingAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway execution requires exactly one" assertion.message
+    ) (throw "missing gateway funding assertion") evaluation.config.assertions;
+  grantPoolAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway grant pool requires" assertion.message
+    ) (throw "missing grant pool assertion") evaluation.config.assertions;
+  localGrantAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway.localGrant requires" assertion.message
+    ) (throw "missing localGrant assertion") evaluation.config.assertions;
   memoryHeadroomAssertion =
     evaluation:
     lib.findFirst (
@@ -400,6 +415,24 @@ let
   };
   missingRequiredTrust = evalGateway {
     offer = "provider";
+  };
+  grantPoolGateway = evalGateway {
+    grantPoolConfig = "/run/hellas/grant-pool.json";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  grantPoolWithTrustPolicy = evalGateway {
+    grantPoolConfig = "/run/hellas/grant-pool.json";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  localGrantGateway = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    workProfile = "/run/hellas/work-profile.json";
+    passkey = "/run/hellas/principal.passkey";
   };
   cudaProvider = evalProvider {
     workConfigFile = "/run/hellas/work.toml";
@@ -762,6 +795,37 @@ in
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
     assert !(trustPairAssertion incompleteTrust).assertion;
     assert !(trustRequiredAssertion missingRequiredTrust).assertion;
+    assert (grantPoolAssertion grantPoolGateway).assertion;
+    assert !(grantPoolAssertion grantPoolWithTrustPolicy).assertion;
+    assert (localGrantAssertion localGrantGateway).assertion;
+    assert (fundingAssertion grantPoolGateway).assertion;
+    assert (fundingAssertion localGrantGateway).assertion;
+    assert lib.hasInfix "--grant-pool-config /run/hellas/grant-pool.json"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--trust-policy" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--paid-work-config" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--offer" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--local-grant" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert lib.elem "/run/hellas/grant-pool.json"
+      grantPoolGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
+      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--work-profile /run/hellas/work-profile.json"
+      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--paid-work-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--grant-pool-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--offer" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(writableRootAssertion rootJournalGateway).assertion;
