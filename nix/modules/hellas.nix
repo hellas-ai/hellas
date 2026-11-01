@@ -196,6 +196,7 @@ rec {
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
     "--paid-work-config"
+    "--grant-config"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
@@ -450,6 +451,17 @@ rec {
           Runtime TOML paid terms passed as --paid-work-config. The owner
           selected by passkey approves exactly these terms at startup; paid
           work is sold only with this file. Keep it outside the Nix store.
+        '';
+      };
+      grantConfigFile = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/var/lib/hellas/grant.json";
+        description = ''
+          Runtime JSON grant resources and listener configuration passed as
+          --grant-config. Native Compute runs through grants without paid
+          work, so this file enables the same content and GPU service setup as
+          workConfigFile. Keep it outside the Nix store.
         '';
       };
       passkey = mkOption {
@@ -734,6 +746,7 @@ rec {
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
+    ++ optArg "--grant-config" serve.grantConfigFile
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"

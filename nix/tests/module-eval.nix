@@ -442,6 +442,11 @@ let
     workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "hip";
   };
+  grantOnlyHipProvider = evalProvider {
+    contentRoots = [ "/srv/hellas/grant-content" ];
+    grantConfigFile = "/run/hellas/grant.json";
+    gpuBackend = "hip";
+  };
   maxGpuSessionAssetBytes = evalProvider {
     gpuSessionAssetBytes = 4398046511104;
   };
@@ -841,6 +846,20 @@ in
       hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
+    assert lib.hasInfix "--grant-config /run/hellas/grant.json"
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.path != [ ];
+    assert
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
+    assert lib.elem "/run/hellas/grant.json"
+      grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !environmentPathEvaluation.success;

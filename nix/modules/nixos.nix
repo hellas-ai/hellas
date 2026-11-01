@@ -56,7 +56,8 @@ let
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
   ) providerWritablePaths;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
-  providerLocalExecutionEnabled = cfg.workConfigFile != null && hellas.catenaConfigured cfg;
+  providerLocalExecutionEnabled =
+    hellas.catenaConfigured cfg && (cfg.workConfigFile != null || cfg.grantConfigFile != null);
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
@@ -105,6 +106,7 @@ let
   ++ cfg.contentRoots
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
+  ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
   ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
