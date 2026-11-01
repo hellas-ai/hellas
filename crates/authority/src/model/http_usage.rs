@@ -95,17 +95,12 @@ impl Usage {
             self.pending.extend_from_slice(part);
             self.sse |= self.pending.starts_with(b"event:")
                 || self.pending.starts_with(b"data:")
+                || self.pending.starts_with(b"id:")
+                || self.pending.starts_with(b"retry:")
                 || self.pending.starts_with(b":");
-            while self.sse {
-                let Some(end) = self.pending.iter().position(|b| *b == b'\n') else {
-                    break;
-                };
-                let line: Vec<_> = self.pending.drain(..=end).collect();
-                let line = line.strip_suffix(b"\n").unwrap_or(&line);
-                self.line(line.strip_suffix(b"\r").unwrap_or(line));
-                if self.fault.is_some() {
-                    return;
-                }
+            self.lines(false);
+            if self.fault.is_some() {
+                return;
             }
             // JSON responses can use the full decode allowance; only an SSE
             // line/frame has the stricter 512 KiB bound.
@@ -117,23 +112,66 @@ impl Usage {
             }
         }
     }
+    /// Drain complete SSE lines. CRLF, LF and bare CR all terminate a line; a
+    /// trailing CR waits for the next byte so a split CRLF is not misread as
+    /// two terminators. At EOF the remaining bytes are the final line.
+    fn lines(&mut self, eof: bool) {
+        while self.sse {
+            let Some(end) = self.pending.iter().position(|b| matches!(b, b'\n' | b'\r')) else {
+                break;
+            };
+            if !eof && self.pending[end] == b'\r' && end + 1 == self.pending.len() {
+                break;
+            }
+            let mut line: Vec<_> = self.pending.drain(..=end).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.line(&line);
+            if self.fault.is_some() {
+                return;
+            }
+        }
+        if eof && !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.line(&line);
+        }
+    }
     fn line(&mut self, line: &[u8]) {
         if line.is_empty() {
             if !self.frame.is_empty() {
                 let data = std::mem::take(&mut self.frame);
                 self.parse(&data);
             }
-        } else if let Some(data) = line.strip_prefix(b"data:") {
-            if !self.frame.is_empty() {
-                self.frame.push(b'\n');
+            return;
+        }
+        if line[0] == b':' {
+            return;
+        }
+        let (field, value) = match line.iter().position(|b| *b == b':') {
+            Some(colon) => {
+                let value = &line[colon + 1..];
+                (&line[..colon], value.strip_prefix(b" ").unwrap_or(value))
             }
-            self.frame
-                .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
-        } else if !line.starts_with(b"event:")
-            && !line.starts_with(b":")
-            && matches!(self.mode, Mode::Strict(_))
-        {
-            self.fail(UsageFault::Malformed);
+            None => (line, &b""[..]),
+        };
+        match field {
+            b"data" => {
+                if !self.frame.is_empty() {
+                    self.frame.push(b'\n');
+                }
+                self.frame.extend_from_slice(value);
+            }
+            // `event`, `id` and `retry` are transport metadata. `retry` values
+            // are ignored rather than validated so a malformed hint cannot
+            // change billing or fault the route.
+            b"event" | b"id" | b"retry" => {}
+            _ => {
+                if matches!(self.mode, Mode::Strict(_)) {
+                    self.fail(UsageFault::Malformed);
+                }
+            }
         }
     }
     pub fn finish(&mut self) {
@@ -141,15 +179,13 @@ impl Usage {
             return;
         }
         if self.fault.is_none() {
-            let pending = std::mem::take(&mut self.pending);
             if self.sse {
                 // Accept the final data frame without a trailing empty line,
                 // but never infer a missing profile sentinel from EOF.
-                if !pending.is_empty() {
-                    self.line(pending.strip_suffix(b"\r").unwrap_or(&pending));
-                }
+                self.lines(true);
                 self.line(b"");
             } else {
+                let pending = std::mem::take(&mut self.pending);
                 self.parse(&pending);
             }
         }

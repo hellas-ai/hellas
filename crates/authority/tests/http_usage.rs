@@ -24,10 +24,16 @@ fn compressed(bytes: &[u8], encoding: &str) -> Vec<u8> {
 #[test]
 fn strict_json_and_sse_verify_every_compression_and_fragment_boundary() {
     let json = br#"{"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
-    let sse=b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n";
+    let sse = [
+        &b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n"[..],
+        // `id`/`retry` metadata (including a non-numeric retry, which is
+        // ignored) and every accepted line ending, fragmented at every byte.
+        b"id: 7\rretry: 1500\rdata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\r\rdata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\r\n\r\nid: 8\nretry: ignored\ndata: [DONE]\r\n\r\n",
+    ];
     for (wire, content) in [
         (&json[..], "application/json"),
-        (&sse[..], "text/event-stream"),
+        (&sse[0][..], "text/event-stream"),
+        (&sse[1][..], "text/event-stream"),
     ] {
         for encoding in ["identity", "gzip", "deflate", "br"] {
             let wire = compressed(wire, encoding);
@@ -67,6 +73,18 @@ fn strict_refuses_missing_duplicate_regressing_and_ambiguous_usage() {
         for chunk in body.chunks(3){usage.push(chunk);}
         usage.finish();assert!(usage.strict_usage().is_err(),"body {body:?}");
     }
+    let mut unknown = UsageDecoder::new(
+        Mode::Strict(AccountingProfile::OpenaiChat),
+        Some("text/event-stream"),
+        None,
+    );
+    unknown
+        .push(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\nfoo: bar\n\n");
+    unknown.finish();
+    assert!(
+        unknown.strict_usage().is_err(),
+        "unknown SSE field accepted"
+    );
     let mut telemetry = UsageDecoder::default();
     telemetry.push(b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":8}}\n\ndata: {\"usage\":{\"output_tokens\":7}}\n\n");
     telemetry.finish();
