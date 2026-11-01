@@ -455,3 +455,52 @@ async fn generation_controls_are_honoured_or_rejected() {
     let error = turn.feed(call).unwrap_err();
     assert!(error.to_string().contains("parallel_tool_calls"), "{error}");
 }
+
+/// Structured output cannot be enforced by native execution yet, so a strict
+/// schema must be rejected rather than answered with arbitrary text.
+#[tokio::test]
+async fn structured_output_is_rejected_before_native_execution() {
+    use hellas_adaptors::{
+        RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
+    };
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let adaptor = OpenAiChatCompletionsAdaptor;
+    let request = |body: serde_json::Value| {
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let error = state
+        .prepare_wire_execution(&request(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                    "strict": true
+                }
+            }
+        })))
+        .err()
+        .expect("a strict schema must be rejected");
+    assert!(matches!(error, BackendError::Rejected(_)));
+    assert!(error.to_string().contains("json_schema"), "{error}");
+
+    state
+        .prepare_wire_execution(&request(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        })))
+        .unwrap();
+    assert_eq!(work.jobs.lock().unwrap().len(), 1);
+}

@@ -2,7 +2,7 @@
 use super::{TextOptions, WorkExecutionBackend};
 use crate::ComputeEvent;
 use axum::{Router, routing::post};
-use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest};
+use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest, ResponseFormat};
 use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
@@ -94,6 +94,19 @@ impl TextState {
             if present {
                 return Err(BackendError::rejected(format!(
                     "`{name}` is not supported by native text execution"
+                )));
+            }
+        }
+        if let Some(format) = &canonical.response_format {
+            let unsupported = match format {
+                ResponseFormat::Text => None,
+                ResponseFormat::JsonObject => Some("json_object"),
+                ResponseFormat::JsonSchema { .. } => Some("json_schema"),
+                ResponseFormat::Raw(_) => Some("raw"),
+            };
+            if let Some(name) = unsupported {
+                return Err(BackendError::rejected(format!(
+                    "response format `{name}` is not supported by native text execution"
                 )));
             }
         }
