@@ -29,8 +29,8 @@ let
   contextualRuntimePath = builtins.appendContext "/run/hellas/contextual.env" (
     builtins.getContext "${package}"
   );
-  evalGateway =
-    gateway:
+  evalGatewayWithServe =
+    serve: gateway:
     import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.stdenv.hostPlatform.system;
       modules = [
@@ -46,10 +46,12 @@ let
               textModel = "/srv/hellas/test.gguf";
             }
             // gateway;
-          };
+          }
+          // serve;
         }
       ];
     };
+  evalGateway = evalGatewayWithServe { };
   providerAssertion =
     evaluation:
     lib.findFirst (
@@ -428,6 +430,13 @@ let
     passkey = "/run/hellas/principal.passkey";
   };
   localGrantGateway = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    workProfile = "/run/hellas/work-profile.json";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  localGrantHipGateway = evalGatewayWithServe { gpuBackend = "hip"; } {
     localGrant = "00000000000000000000000000000000";
     trustStore = "/var/lib/hellas-gateway/trust";
     trustPolicy = "provider";
@@ -831,6 +840,26 @@ in
       !(lib.hasInfix "--grant-pool-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
     assert
       !(lib.hasInfix "--offer" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH;
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? HIP_PATH;
+    assert !(localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? CUDA_PATH);
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.path != [ ];
+    assert
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+    assert lib.elem "char-drm rw"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+    assert
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK
+      == "infinity";
+    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
+    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(writableRootAssertion rootJournalGateway).assertion;

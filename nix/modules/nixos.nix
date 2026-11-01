@@ -59,6 +59,8 @@ let
   providerLocalExecutionEnabled =
     hellas.catenaConfigured cfg && (cfg.workConfigFile != null || cfg.grantConfigFile != null);
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
+  # The gateway runs the same native executor in process for --local-grant.
+  gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.localGrant != null;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
     if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
@@ -410,6 +412,7 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
+      path = lib.optionals gatewayGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -423,6 +426,7 @@ in
           # Distinguish gateway spans from the node's in shared trace storage.
           OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
         }
+        // lib.optionalAttrs gatewayGpuConfigured gpuEnvironment
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
@@ -444,7 +448,15 @@ in
       }
       // lib.optionalAttrs (gateway.environmentFile != null) {
         EnvironmentFile = gateway.environmentFile;
-      };
+      }
+      // lib.optionalAttrs gatewayGpuConfigured (
+        gpuDeviceAccess
+        // {
+          # The in-process executor locks host pages for upload staging and
+          # driver queues, exactly like the provider's native runtime.
+          LimitMEMLOCK = "infinity";
+        }
+      );
     };
 
     networking.firewall = {
