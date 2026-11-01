@@ -503,7 +503,7 @@ async fn request_bodies_never_enter_provider_journals() {
                 .await
                 .unwrap(),
             Step::Finish => {
-                node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+                node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
                     .await
             }
             Step::Rotate => node.store.rotate().await.unwrap(),
@@ -591,7 +591,7 @@ async fn revising_terms_cannot_reset_spending() {
     node.dispatch(FRIEND, ids::FRIEND_GRANT, &first)
         .await
         .unwrap();
-    node.finish(&first, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+    node.finish(&first, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
         .await;
     let mut terms = node.store.state().grant(ids::ALLOWANCE).unwrap().clone();
     terms.revision.0 += 1;
@@ -699,6 +699,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
             (a.channel_id, work),
             GrantOutcome::Failed,
             Usage::Unknown,
+            true,
             1004,
         )
         .await
@@ -769,6 +770,7 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
         (finished.channel_id, finished_id),
         GrantOutcome::Failed,
         Usage::Observed(Charge([1, 0, 0, 0, 0])),
+        false,
         1000,
     )
     .await

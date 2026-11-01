@@ -181,6 +181,7 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
         (a.channel_id, work),
         GrantOutcome::Failed,
         Usage::Unknown,
+        true,
         1002,
     )
     .await

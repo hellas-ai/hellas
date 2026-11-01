@@ -102,7 +102,15 @@ pub(super) enum Change {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Option<Charge>,
+        /// Whether incomplete usage is attributable to the backend. Older
+        /// frames omit this field and decode as `false`; omitting it when
+        /// false keeps their canonical encoding unchanged.
+        #[serde(default, skip_serializing_if = "is_false")]
+        fault: bool,
     },
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl State {
     pub fn paid_policy(&self) -> Option<&hellas_channel::model::paid_policy::StoredPaidPolicy> {
@@ -485,7 +493,15 @@ impl State {
                     })
                     .collect();
                 for (channel, work) in queued {
-                    self.end(channel, work, GrantOutcome::Released, None, None, now)?;
+                    self.end(
+                        channel,
+                        work,
+                        GrantOutcome::Released,
+                        None,
+                        None,
+                        false,
+                        now,
+                    )?;
                 }
             }
             Change::Budget(def) => {
@@ -543,7 +559,15 @@ impl State {
                         })
                         .collect();
                     for (channel, work) in queued {
-                        self.end(channel, work, GrantOutcome::Released, None, None, now)?;
+                        self.end(
+                            channel,
+                            work,
+                            GrantOutcome::Released,
+                            None,
+                            None,
+                            false,
+                            now,
+                        )?;
                     }
                 }
             }
@@ -700,8 +724,17 @@ impl State {
                 outcome,
                 result,
                 usage,
+                fault,
             } => {
-                self.end(*channel, *work, *outcome, result.clone(), *usage, now)?;
+                self.end(
+                    *channel,
+                    *work,
+                    *outcome,
+                    result.clone(),
+                    *usage,
+                    *fault,
+                    now,
+                )?;
             }
         }
         self.prune();
@@ -778,6 +811,7 @@ impl State {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Option<Charge>,
+        fault: bool,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
         let auth = *self
@@ -869,7 +903,7 @@ impl State {
                 .revision
                 .checked_add(1)
                 .ok_or(NodeStoreError::Malformed)?;
-            if strict_accounting && usage.is_none() {
+            if strict_accounting && usage.is_none() && fault {
                 health.consecutive_faults = health.consecutive_faults.saturating_add(1);
             } else if usage.is_some() {
                 health.consecutive_faults = 0;

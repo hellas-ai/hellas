@@ -87,6 +87,7 @@ impl NodeStore {
                         outcome,
                         result: None,
                         usage: None,
+                        fault: false,
                     },
                     false,
                 )
@@ -406,6 +407,7 @@ impl NodeStore {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Usage,
+        fault: bool,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
         self.commit(
@@ -419,6 +421,7 @@ impl NodeStore {
                     Usage::Unknown => None,
                     Usage::Observed(c) => Some(c),
                 },
+                fault,
             },
             false,
         )
@@ -438,6 +441,7 @@ impl NodeStore {
                 outcome: GrantOutcome::Released,
                 result: None,
                 usage: None,
+                fault: false,
             },
             false,
         )

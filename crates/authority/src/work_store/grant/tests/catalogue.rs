@@ -428,7 +428,7 @@ async fn checkpoints_bind_every_policy_copy_to_its_account() {
     terms.revision.0 += 1;
     terms.policies = vec![changed];
     node.store.define(terms, node.clock.now()).await.unwrap();
-    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
         .await;
     let checkpoint = serde_json::to_value(node.store.state().snapshot().unwrap()).unwrap();
     for copy in PolicyCopy::ALL {

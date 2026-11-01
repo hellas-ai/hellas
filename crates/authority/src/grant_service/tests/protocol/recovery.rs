@@ -100,6 +100,7 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                     },
                     signed.clone(),
                     Usage::Unknown,
+                    true,
                     UnixMillis(1002),
                 )
                 .await

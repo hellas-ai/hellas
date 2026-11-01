@@ -52,6 +52,7 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
         (job.channel_id, work),
         GrantOutcome::Failed,
         Usage::Unknown,
+        true,
         1001,
     )
     .await
