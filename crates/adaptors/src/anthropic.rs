@@ -1,12 +1,13 @@
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::{
-    AdaptorError, AdaptorResult, CanonicalExecution, ExecutionRequest, ExecutionResult, Input,
-    InputItem, ModelRef, OutputEvent, OutputItem, RawRequest, ReasoningOptions, RenderContext,
-    StopReason, TextChannel, WireAdaptor, WireResponse, WireStreamEvent,
+    AdaptorError, AdaptorResult, CanonicalExecution, ContentPart, ExecutionRequest,
+    ExecutionResult, Input, InputItem, Message, ModelRef, OutputEvent, OutputItem, RawRequest,
+    ReasoningOptions, RenderContext, StopReason, TextChannel, ToolChoice, ToolKind, ToolSpec,
+    WireAdaptor, WireResponse, WireStreamEvent,
     json::{
-        attach_hellas, json_to_wire_string, optional_bool, required_array, required_string,
-        structured_delta_string,
+        attach_hellas, json_to_wire_string, optional_array, optional_bool, optional_string,
+        required_array, required_string, structured_delta_string,
     },
 };
 
@@ -20,6 +21,8 @@ pub struct ParsedAnthropicMessageRequest {
     pub messages: Vec<JsonValue>,
     pub max_tokens: u32,
     pub system: Option<JsonValue>,
+    pub tools: Vec<JsonValue>,
+    pub tool_choice: Option<JsonValue>,
     pub stream: Option<bool>,
     pub thinking: Option<JsonValue>,
 }
@@ -253,6 +256,14 @@ impl ParsedAnthropicMessageRequest {
         if let Some(system) = &system {
             validate_system(system)?;
         }
+        let tools = optional_array(object, "tools")?.unwrap_or_default();
+        for tool in &tools {
+            project_tool(tool)?;
+        }
+        let tool_choice = object.get("tool_choice").cloned();
+        if let Some(tool_choice) = &tool_choice {
+            project_tool_choice(tool_choice)?;
+        }
         let stream = optional_bool(object, "stream")?;
         let thinking = object.get("thinking").cloned();
         if let Some(thinking) = &thinking {
@@ -264,6 +275,8 @@ impl ParsedAnthropicMessageRequest {
             messages,
             max_tokens,
             system,
+            tools,
+            tool_choice,
             stream,
             thinking,
         })
@@ -278,11 +291,21 @@ impl ParsedAnthropicMessageRequest {
                 "content": system,
             })));
         }
-        items.extend(self.messages.iter().cloned().map(InputItem::Raw));
+        for message in &self.messages {
+            project_message(message, &mut items)?;
+        }
 
         let mut canonical =
             CanonicalExecution::new(ModelRef::new(self.model.clone()), Input::Items(items));
         canonical.sampling.max_output_tokens = Some(self.max_tokens);
+        canonical.tools = self
+            .tools
+            .iter()
+            .map(project_tool)
+            .collect::<AdaptorResult<Vec<_>>>()?;
+        if let Some(tool_choice) = &self.tool_choice {
+            canonical.tool_choice = project_tool_choice(tool_choice)?;
+        }
         if let Some(thinking) = &self.thinking {
             canonical.reasoning = Some(ReasoningOptions {
                 value: thinking.clone(),
@@ -293,15 +316,129 @@ impl ParsedAnthropicMessageRequest {
     }
 }
 
+fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AdaptorError::invalid_request("Anthropic message must be a JSON object"))?;
+    let role = required_string(object, "role")?;
+    let content = object
+        .get("content")
+        .ok_or_else(|| AdaptorError::invalid_request("Anthropic message missing `content`"))?;
+    match content {
+        JsonValue::String(text) => {
+            items.push(InputItem::Message(Message::text(role, text.clone())));
+        }
+        JsonValue::Array(blocks) => {
+            for block in blocks {
+                let block = block.as_object().ok_or_else(|| {
+                    AdaptorError::invalid_request("Anthropic content block must be a JSON object")
+                })?;
+                match required_string(block, "type")?.as_str() {
+                    "text" => items.push(InputItem::Message(Message::text(
+                        role.clone(),
+                        required_string(block, "text")?,
+                    ))),
+                    "tool_use" => items.push(InputItem::ToolCall {
+                        id: required_string(block, "id")?,
+                        name: required_string(block, "name")?,
+                        arguments: required_object(block, "input", "tool_use")?,
+                    }),
+                    "tool_result" => items.push(InputItem::ToolResult {
+                        call_id: required_string(block, "tool_use_id")?,
+                        output: tool_result_content(block.get("content"))?,
+                    }),
+                    block_type => {
+                        return Err(AdaptorError::invalid_request(format!(
+                            "unsupported Anthropic content block type `{block_type}`"
+                        )));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(AdaptorError::invalid_request(
+                "Anthropic message `content` must be a string or block array",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn project_tool(value: &JsonValue) -> AdaptorResult<ToolSpec> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AdaptorError::invalid_request("Anthropic tool must be a JSON object"))?;
+    Ok(ToolSpec {
+        name: required_string(object, "name")?,
+        description: optional_string(object, "description")?,
+        parameters: required_object(object, "input_schema", "tool")?,
+        kind: ToolKind::Function,
+        raw: value.clone(),
+    })
+}
+
+fn project_tool_choice(value: &JsonValue) -> AdaptorResult<ToolChoice> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AdaptorError::invalid_request("`tool_choice` must be a JSON object"))?;
+    match required_string(object, "type")?.as_str() {
+        "auto" => Ok(ToolChoice::Auto),
+        "any" => Ok(ToolChoice::Required),
+        "none" => Ok(ToolChoice::None),
+        "tool" => Ok(ToolChoice::Tool {
+            name: required_string(object, "name")?,
+        }),
+        tool_type => Err(AdaptorError::invalid_request(format!(
+            "unsupported Anthropic tool_choice type `{tool_type}`"
+        ))),
+    }
+}
+
+fn required_object(
+    object: &JsonMap<String, JsonValue>,
+    key: &str,
+    owner: &str,
+) -> AdaptorResult<JsonValue> {
+    object
+        .get(key)
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            AdaptorError::invalid_request(format!("Anthropic {owner} `{key}` must be an object"))
+        })
+}
+
+fn tool_result_content(value: Option<&JsonValue>) -> AdaptorResult<Vec<ContentPart>> {
+    match value {
+        Some(JsonValue::String(text)) => Ok(vec![ContentPart::Text { text: text.clone() }]),
+        Some(JsonValue::Array(blocks)) => blocks
+            .iter()
+            .map(|block| {
+                let block = block.as_object().ok_or_else(|| {
+                    AdaptorError::invalid_request(
+                        "Anthropic tool_result block must be a JSON object",
+                    )
+                })?;
+                Ok(ContentPart::Text {
+                    text: required_string(block, "text")?,
+                })
+            })
+            .collect(),
+        _ => Err(AdaptorError::invalid_request(
+            "`tool_result` content must be a string or text block array",
+        )),
+    }
+}
+
 fn validate_message(value: &JsonValue) -> AdaptorResult<()> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("Anthropic message must be a JSON object"))?;
-    required_string(object, "role")?;
+    let role = required_string(object, "role")?;
     let content = object
         .get("content")
         .ok_or_else(|| AdaptorError::invalid_request("Anthropic message missing `content`"))?;
-    validate_content(content)
+    validate_content(content, &role)
 }
 
 fn validate_system(value: &JsonValue) -> AdaptorResult<()> {
@@ -319,18 +456,54 @@ fn validate_system(value: &JsonValue) -> AdaptorResult<()> {
     }
 }
 
-fn validate_content(value: &JsonValue) -> AdaptorResult<()> {
+fn validate_content(value: &JsonValue, role: &str) -> AdaptorResult<()> {
     match value {
         JsonValue::String(_) => Ok(()),
         JsonValue::Array(blocks) => {
             for block in blocks {
-                validate_text_block(block, "content block")?;
+                validate_content_block(block, role)?;
             }
             Ok(())
         }
         _ => Err(AdaptorError::invalid_request(
             "Anthropic message `content` must be a string or block array",
         )),
+    }
+}
+
+fn validate_content_block(value: &JsonValue, role: &str) -> AdaptorResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AdaptorError::invalid_request("content block must be a JSON object"))?;
+    match required_string(object, "type")?.as_str() {
+        "text" => {
+            required_string(object, "text")?;
+            Ok(())
+        }
+        "tool_use" => {
+            if role != "assistant" {
+                return Err(AdaptorError::invalid_request(
+                    "`tool_use` blocks are only valid in assistant messages",
+                ));
+            }
+            required_string(object, "id")?;
+            required_string(object, "name")?;
+            required_object(object, "input", "tool_use")?;
+            Ok(())
+        }
+        "tool_result" => {
+            if role != "user" {
+                return Err(AdaptorError::invalid_request(
+                    "`tool_result` blocks are only valid in user messages",
+                ));
+            }
+            required_string(object, "tool_use_id")?;
+            tool_result_content(object.get("content"))?;
+            Ok(())
+        }
+        block_type => Err(AdaptorError::invalid_request(format!(
+            "unsupported Anthropic content block type `{block_type}`"
+        ))),
     }
 }
 

@@ -262,3 +262,112 @@ fn stream_tool_call_events_render_anthropic_blocks() {
     assert_eq!(finish_json["delta"]["stop_reason"], "tool_use");
     assert_eq!(finish[1].name.as_deref(), Some("message_stop"));
 }
+
+#[test]
+fn tools_and_tool_history_reach_canonical_execution() {
+    let request = adaptor()
+        .parse(raw(json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 64,
+            "tools": [{
+                "name": "bash",
+                "description": "Run a command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }],
+            "tool_choice": {"type": "any"},
+            "messages": [
+                {"role": "user", "content": "Check disk usage"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Running."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "bash",
+                     "input": {"command": "df -h"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": "/: 40% used"}
+                ]}
+            ]
+        })))
+        .unwrap();
+    let canonical = adaptor().to_execution_request(&request).unwrap().canonical;
+    assert_eq!(canonical.tools.len(), 1);
+    assert_eq!(canonical.tools[0].name, "bash");
+    assert_eq!(canonical.tools[0].kind, ToolKind::Function);
+    assert_eq!(
+        canonical.tools[0].parameters["required"],
+        json!(["command"])
+    );
+    assert_eq!(canonical.tool_choice, ToolChoice::Required);
+    assert_eq!(
+        canonical.input,
+        Input::Items(vec![
+            InputItem::Message(Message::text("user", "Check disk usage")),
+            InputItem::Message(Message::text("assistant", "Running.")),
+            InputItem::ToolCall {
+                id: "toolu_1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "df -h"}),
+            },
+            InputItem::ToolResult {
+                call_id: "toolu_1".into(),
+                output: vec![ContentPart::Text {
+                    text: "/: 40% used".into(),
+                }],
+            },
+        ])
+    );
+
+    let response = adaptor()
+        .render_response(
+            &request,
+            ExecutionResult {
+                output: vec![OutputItem::ToolCall {
+                    id: "toolu_2".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "ls"}),
+                }],
+                usage: None,
+                stop_reason: StopReason::ToolCall,
+                provenance: None,
+                error: None,
+            },
+            RenderContext::new("msg-test", "msg-test", 0),
+        )
+        .unwrap();
+    let WireBody::Json(body) = response.body else {
+        panic!("expected json body");
+    };
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(
+        body["content"][0],
+        json!({"type": "tool_use", "id": "toolu_2", "name": "bash", "input": {"command": "ls"}})
+    );
+
+    let follow_up = adaptor()
+        .parse(raw(json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "Check disk usage"},
+                {"role": "assistant", "content": body["content"].clone()},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "bin"}
+                ]}
+            ]
+        })))
+        .unwrap();
+    let canonical = adaptor()
+        .to_execution_request(&follow_up)
+        .unwrap()
+        .canonical;
+    assert!(matches!(
+        canonical.input,
+        Input::Items(items) if items.iter().any(|item| {
+            matches!(item, InputItem::ToolCall { id, .. } if id == "toolu_2")
+        })
+    ));
+}
