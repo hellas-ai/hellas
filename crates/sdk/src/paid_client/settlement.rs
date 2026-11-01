@@ -173,17 +173,17 @@ pub async fn settle_channel(
         .state()
         .close_settled()
         .expect("loop observed finality");
-    let pending_owner_signed = endpoint
+    let pending = endpoint
         .state()
         .close_history()
-        .map(|history| history.pending.owner_signed());
+        .map(|history| history.pending);
     receipt(
         &recovery.chain,
         channel,
         recovery.bond,
         recovery.funding_value,
         settled,
-        pending_owner_signed,
+        pending,
     )
     .await
 }
@@ -314,7 +314,7 @@ async fn settlement_receipt(
             .journal
             .state()
             .close_history()
-            .map(|history| history.pending.owner_signed()),
+            .map(|history| history.pending),
     )
     .await
     .map(Some)
@@ -326,7 +326,7 @@ async fn receipt(
     bond: EdgeId,
     funding_value: u64,
     settled: hellas_channel::work_store::CloseSettlement,
-    pending_owner_signed: Option<[bool; 2]>,
+    pending: Option<hellas_kernel::PendingPaymentClose>,
 ) -> Result<FinalizedChannelSettlement> {
     let block = chain
         .block_at(settled.height)
@@ -338,7 +338,7 @@ async fn receipt(
         settled.height,
         settled.payload,
         settled.provider_payout,
-        pending_owner_signed,
+        pending,
     )?;
     Ok(FinalizedChannelSettlement {
         network: channel.network(),
@@ -360,8 +360,8 @@ async fn receipt(
 /// party exiting its delegation, and the kernel then pays it undelegated; a
 /// `Freeze` also inherits the owner actions recorded on the contest it ends,
 /// and an `Adjudicated` close has no witness of its own, so its destinations
-/// are exactly the retained contest's. Reading the rule here keeps the
-/// receipt from inventing a second one.
+/// are exactly the contest's. Reading the rule here keeps the receipt from
+/// inventing a second one.
 fn close_owner_signed(proof: &hellas_kernel::Proof, pending: Option<[bool; 2]>) -> [bool; 2] {
     let previous = pending.unwrap_or([false; 2]);
     match proof {
@@ -377,17 +377,61 @@ fn close_owner_signed(proof: &hellas_kernel::Proof, pending: Option<[bool; 2]>) 
     }
 }
 
+/// Replays the settlement block's contest moves through the kernel's own
+/// transitions, on top of the retained contest record.
+///
+/// The observer stops advancing
+/// [`CloseHistory`](hellas_channel::work_store::CloseHistory) once a channel
+/// settles, so a start or response ordered before the close in the settling
+/// block never reaches the retained record. Applying the same transitions the
+/// kernel applied reproduces the record the close was checked against,
+/// including an owner action that a later freeze inherits.
+fn block_pending(
+    block: &FinalizedWork,
+    channel: &hellas_channel::model::work::PaidChannel,
+    retained: Option<hellas_kernel::PendingPaymentClose>,
+) -> Result<Option<hellas_kernel::PendingPaymentClose>> {
+    let mut pending = retained;
+    for tx in &block.txs {
+        match tx {
+            Tx::Move {
+                action: hellas_kernel::Move::StartPaymentClose(start),
+            } if start.payment_edge() == channel.payment_edge() => {
+                pending = Some(
+                    hellas_kernel::PendingPaymentClose::from_accepted_start(
+                        channel.network(),
+                        block.height,
+                        start,
+                    )
+                    .ok_or(PaidClientError::InputMismatch("settlement close start"))?,
+                );
+            }
+            Tx::Move {
+                action: hellas_kernel::Move::RespondPaymentClose(response),
+            } if response.payment_edge() == channel.payment_edge() => {
+                if let Some(record) = pending {
+                    pending = Some(record.with_accepted_response(response));
+                }
+            }
+            Tx::Close { input, .. } if *input == channel.payment_edge() => break,
+            _ => {}
+        }
+    }
+    Ok(pending)
+}
+
 fn close_payouts(
     block: &FinalizedWork,
     channel: &hellas_channel::model::work::PaidChannel,
     height: u64,
     payload: [u8; 32],
     expected_provider: u64,
-    pending_owner_signed: Option<[bool; 2]>,
+    retained: Option<hellas_kernel::PendingPaymentClose>,
 ) -> Result<(u64, u64)> {
     if block.height != height || block.payload != payload {
         return Err(PaidClientError::InputMismatch("settlement finalized block"));
     }
+    let pending = block_pending(block, channel, retained)?;
     let mut closes = block.txs.iter().filter_map(|tx| match tx {
         Tx::Close {
             input,
@@ -406,7 +450,7 @@ fn close_payouts(
     // kernel's `PartyKeys::is_destination` checks owner and delegate together,
     // so an owner-signed exit is accepted undelegated while any other
     // delegate change is still refused.
-    let owner_signed = close_owner_signed(proof, pending_owner_signed);
+    let owner_signed = close_owner_signed(proof, pending.map(|record| record.owner_signed()));
     let parties = channel.payment_terms().parties();
     let mut returned = 0u64;
     let mut paid = 0u64;
@@ -669,6 +713,73 @@ mod tests {
         );
         assert!(matches!(
             close_payouts(&block, &channel, 7, [1; 32], 40, None),
+            Err(PaidClientError::InputMismatch("settlement payout identity"))
+        ));
+    }
+
+    /// A block that settles the channel in the same transaction sequence as
+    /// the owner's start: the observer never advances the retained close
+    /// history past it, so only the block itself records the owner action a
+    /// delegate-signed freeze inherits.
+    #[test]
+    fn a_same_block_owner_start_pays_undelegated_through_the_freeze() {
+        let (channel, parties, _, _) = delegated_channel();
+        let start = || {
+            Tx::move_action(Move::StartPaymentClose(
+                hellas_kernel::PaymentCloseStart::new(
+                    channel.payment_edge(),
+                    hellas_kernel::Terms::work_payment(channel.payment_terms().clone()),
+                    hellas_kernel::Party::Maker,
+                    (7, 7),
+                    None,
+                    PartyAuth::owner(Sig::default()),
+                ),
+            ))
+        };
+        let proof = Proof::freeze(
+            0,
+            (7, 7),
+            PartyAuth::signer(Sig::default()),
+            PartyAuth::signer(Sig::default()),
+        );
+        let provider_payout = parties.taker().payout(40, false);
+        let mut outputs = [provider_payout; MAX_EDGE_OUTPUTS];
+        outputs[1] = parties.maker().payout(60, true);
+        let block = |txs: Vec<Tx>| FinalizedWork {
+            height: 7,
+            parent: [0; 32],
+            payload: [1; 32],
+            txs,
+        };
+
+        // The owner start and the delegate-signed freeze settle together.
+        let tx = Tx::close(
+            channel.payment_edge(),
+            proof.clone(),
+            List::take(outputs, 2),
+        );
+        assert_eq!(
+            close_payouts(&block(vec![start(), tx]), &channel, 7, [1; 32], 40, None).unwrap(),
+            (60, 40)
+        );
+
+        // Without the start in the block the inherited owner action is gone,
+        // and the same close cannot pay the owner's bare destination.
+        let tx = Tx::close(
+            channel.payment_edge(),
+            proof.clone(),
+            List::take(outputs, 2),
+        );
+        assert!(matches!(
+            close_payouts(&block(vec![tx]), &channel, 7, [1; 32], 40, None),
+            Err(PaidClientError::InputMismatch("settlement payout identity"))
+        ));
+
+        // The start does not license the committed delegate either.
+        outputs[1] = parties.maker().payout(60, false);
+        let tx = Tx::close(channel.payment_edge(), proof, List::take(outputs, 2));
+        assert!(matches!(
+            close_payouts(&block(vec![start(), tx]), &channel, 7, [1; 32], 40, None),
             Err(PaidClientError::InputMismatch("settlement payout identity"))
         ));
     }
