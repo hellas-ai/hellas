@@ -2,9 +2,46 @@
 //! or connecting to a provider. Evidence recovery alone never submits a transaction.
 use super::*;
 use hellas_auth::{Digest, authority::PrincipalId};
-use hellas_channel::work_close::{FinalizedWork, catch_up};
+use hellas_channel::work::ClientChannel;
+use hellas_channel::work_close::{FinalizedBlocks, FinalizedWork, TxSink, catch_up};
 use hellas_channel::work_store::ChannelStore;
 use hellas_kernel::{Key, NetworkId, Tx};
+
+/// Drives one client close to finality.
+///
+/// The loop is shared by the live session and offline settlement because the
+/// two failures it must survive are the same: a start that was not included
+/// before its window closed must be replaced, and a source or sink that
+/// refuses one attempt must not end the wait. `advance_close` resubmits the
+/// retained start and, once a contest exists, offers the answer and the
+/// adjudicated close; `prepare_close` returns the retained start while it can
+/// still land and signs a replacement once it cannot. `poll` is the only
+/// pacing: this loop has no deadline.
+pub(super) async fn settle_close<C, S, T>(
+    client: &mut C,
+    source: &S,
+    sink: &T,
+    poll: std::time::Duration,
+) -> Result<u64>
+where
+    C: ClientChannel + Send,
+    S: FinalizedBlocks + ?Sized,
+    T: TxSink + ?Sized,
+{
+    loop {
+        {
+            let mut endpoint = client.client().await?;
+            endpoint.advance_close(source, sink).await?;
+            if let Some(settled) = endpoint.state().close_settled() {
+                return Ok(settled.provider_payout);
+            }
+            if !endpoint.state().is_closing() {
+                endpoint.prepare_close().await?;
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedChannelSettlement {
@@ -122,18 +159,13 @@ pub async fn settle_channel(
 ) -> Result<FinalizedChannelSettlement> {
     let recovery = open_settlement(args, bond, owner, signer.party_key()).await?;
     let mut endpoint = ClientEndpoint::recover(recovery.journal, signer.clone())?;
-    loop {
-        endpoint
-            .advance_close(&recovery.chain, &recovery.chain)
-            .await?;
-        if endpoint.state().close_settled().is_some() {
-            break;
-        }
-        if !endpoint.state().is_closing() {
-            endpoint.prepare_close().await?;
-        }
-        tokio::time::sleep(args.config.poll).await;
-    }
+    settle_close(
+        &mut endpoint,
+        &recovery.chain,
+        &recovery.chain,
+        args.config.poll,
+    )
+    .await?;
     // The finalized receipt is verified through the same recovery reader used
     // after a crash. No requested or merely enqueued close releases funding.
     let channel = endpoint.state().channel();
@@ -352,4 +384,143 @@ fn close_payouts(
         return Err(PaidClientError::InputMismatch("settlement provider payout"));
     }
     Ok((returned, paid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_channel::test_support::channel::{CURSOR, Checked, PRICE, checked_job, payload_at};
+    use hellas_channel::work::admit_payment;
+    use hellas_channel::work_close::BlockSourceError;
+    use hellas_kernel::Move;
+    use hellas_rpc::services::work::WorkClientImpl;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    // ── Finding 7: an expired start is replaced ───────────────────────
+
+    /// The fixture's one job, paid, so the client's book holds no open job
+    /// and it may sign a close.
+    async fn paid_job() -> Checked {
+        let mut fixture = checked_job().await;
+        let (transport, server) = hellas_channel::test_support::transport::transport_pair();
+        let serving =
+            hellas_channel::test_support::channel::serve_work(server, fixture.service.clone());
+        let id = fixture.id;
+        let paid = admit_payment(&WorkClientImpl::new(transport), &mut fixture.client, id).await;
+        serving.abort();
+        paid.expect("the fixture job is paid");
+        fixture
+    }
+
+    /// A finalized history the test writes: every tip query adds one empty
+    /// block, and every accepted submission rides in the next block. The
+    /// first close start is never admitted, which is the partition this
+    /// regression is about.
+    struct SimChain {
+        state: Mutex<SimState>,
+    }
+
+    struct SimState {
+        height: u64,
+        blocks: BTreeMap<u64, FinalizedWork>,
+        pending: Vec<Tx>,
+        first_start: Option<hellas_kernel::PaymentCloseStart>,
+        starts: Vec<hellas_kernel::PaymentCloseStart>,
+    }
+
+    impl SimChain {
+        fn new(height: u64) -> Self {
+            Self {
+                state: Mutex::new(SimState {
+                    height,
+                    blocks: BTreeMap::new(),
+                    pending: Vec::new(),
+                    first_start: None,
+                    starts: Vec::new(),
+                }),
+            }
+        }
+
+        fn starts(&self) -> Vec<hellas_kernel::PaymentCloseStart> {
+            self.state.lock().unwrap().starts.clone()
+        }
+    }
+
+    impl FinalizedBlocks for SimChain {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            let mut state = self.state.lock().unwrap();
+            state.height += 1;
+            let height = state.height;
+            let txs = std::mem::take(&mut state.pending);
+            state.blocks.insert(
+                height,
+                FinalizedWork {
+                    height,
+                    parent: payload_at(height - 1),
+                    payload: payload_at(height),
+                    txs,
+                },
+            );
+            Ok(Some(height))
+        }
+
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            Ok(self.state.lock().unwrap().blocks.get(&height).cloned())
+        }
+    }
+
+    impl TxSink for SimChain {
+        async fn submit(&self, tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+            let mut state = self.state.lock().unwrap();
+            if let Tx::Move {
+                action: Move::StartPaymentClose(start),
+            } = &tx
+            {
+                let start = start.clone();
+                match &state.first_start {
+                    None => {
+                        state.first_start = Some(start.clone());
+                        state.starts.push(start);
+                        return Ok(hellas_rpc::SubmitTxOutcome::ValidationRejected);
+                    }
+                    Some(first) if *first == start => {
+                        return Ok(hellas_rpc::SubmitTxOutcome::ValidationRejected);
+                    }
+                    Some(_) => state.starts.push(start),
+                }
+            }
+            state.pending.push(tx);
+            Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_close_start_is_replaced_and_settlement_completes() {
+        let fixture = paid_job().await;
+        let mut client = fixture.client;
+        let sim = SimChain::new(CURSOR);
+        let provider_payout = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            settle_close(&mut client, &sim, &sim, std::time::Duration::from_millis(1)),
+        )
+        .await
+        .expect("settlement completes once the replacement lands")
+        .unwrap();
+        assert_eq!(provider_payout, PRICE);
+        let starts = sim.starts();
+        assert_eq!(
+            starts.len(),
+            2,
+            "the expired start is replaced exactly once"
+        );
+        assert_ne!(starts[0], starts[1]);
+        assert_eq!(
+            client
+                .state()
+                .close_settled()
+                .map(|settled| settled.provider_payout),
+            Some(PRICE)
+        );
+    }
 }

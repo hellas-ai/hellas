@@ -738,23 +738,47 @@ impl PaidWorkSession {
         self.needs_recovery
     }
 
-    /// Opens a close; the independent observer drives its finalized payout.
-    /// There is no deadline here: with the observer stopped or validators
-    /// unreachable this waits as long as the process runs. Callers that need
-    /// a bound should wrap it in one.
+    /// Opens a close and drives it to finality.
+    ///
+    /// The same progress loop as offline settlement: a retained start is
+    /// offered again while it can land, replaced once its window has passed,
+    /// and a source that fails is reconnected. There is no deadline here:
+    /// with the observer stopped or validators unreachable this waits as long
+    /// as the process runs. Callers that need a bound should wrap it in one.
     pub async fn settle(&mut self) -> Result<u64> {
-        if !self.client.with_state(|state| state.is_closing()).await? {
-            self.client.client().await?.prepare_close().await?;
+        if let Some(settled) = self
+            .client
+            .with_state(|state| state.close_settled())
+            .await?
+        {
+            return Ok(settled.provider_payout);
         }
+        let poll = self.args.config.poll;
+        let timeout = read_timeout(self.args.timeout);
         loop {
-            if let Some(settlement) = self
-                .client
-                .with_state(|state| state.close_settled())
-                .await?
-            {
-                return Ok(settlement.provider_payout);
+            let floor = self.client.with_state(|state| state.cursor().0).await?;
+            let remote =
+                match crate::client_chain::connect_at(&self.args.config, timeout, floor).await {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        tracing::debug!(%error, "paid settlement is waiting for a chain source");
+                        tokio::time::sleep(poll).await;
+                        continue;
+                    }
+                };
+            let chain = WorkBlocks::new(remote).with_min_height(floor);
+            match settlement::settle_close(&mut self.client, &chain, &chain, poll).await {
+                Ok(provider_payout) => return Ok(provider_payout),
+                Err(PaidClientError::CatchUp(
+                    hellas_channel::work_close::CatchUpError::Source(_)
+                    | hellas_channel::work_close::CatchUpError::Missing { .. },
+                )) => {
+                    // The observer may still reach finality through another
+                    // source; reconnect and let the shared loop observe it.
+                    tokio::time::sleep(poll).await;
+                }
+                Err(error) => return Err(error),
             }
-            tokio::time::sleep(self.args.config.poll).await;
         }
     }
 
