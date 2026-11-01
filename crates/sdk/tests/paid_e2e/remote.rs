@@ -290,6 +290,12 @@ pub(super) async fn stale_source_selection(runtime: commonware_runtime::tokio::C
 /// selects a source. A fast validator below that floor is skipped in favour
 /// of a slower configured validator that is current, because recovery's own
 /// reads would refuse the stale one anyway.
+///
+/// The setup journal is not the only retained floor: a completed setup
+/// stops advancing while the channel journal it mounted keeps observing.
+/// A source that satisfies the setup floor can therefore be behind the
+/// channel cursor by the time the channel is mounted, and startup must
+/// reselect at that cursor rather than keep the fast stale source.
 pub(super) async fn paid_startup_uses_the_retained_floor(
     runtime: commonware_runtime::tokio::Context,
 ) {
@@ -310,13 +316,38 @@ pub(super) async fn paid_startup_uses_the_retained_floor(
     .await
     .unwrap();
     let bond = session.descriptor().bond_edge();
+    // The setup journal stops at the height that completed the handshake;
+    // the channel journal continues to observe. Seal well past that setup
+    // floor so the two retained cursors separate before the restart.
+    let setup_height = case.devnet.height();
+    assert!(
+        setup_height < 50,
+        "the setup floor stays below the stale relay's replay height",
+    );
+    case.devnet.seal_through(100).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let cursor = session
+            .with_state(|state| state.cursor().0)
+            .await
+            .expect("the session journal is readable");
+        if cursor >= 80 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retained channel journal observes the sealed blocks",
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     session.shutdown().await;
     drop(session);
 
-    // Every fast relay answers Latest at genesis; the current relays take
-    // longer to report their identity, so selection has to reject the stale
-    // ones on height rather than on speed.
-    let mut stale = Relays::start_at(&case.devnet, 1, Duration::ZERO).await;
+    // The fast relays are above the setup floor but below the channel
+    // cursor; the current relays take longer to report their identity, so
+    // selection must reject the fast ones on height, first at the setup
+    // floor and then again at the mounted channel's cursor.
+    let mut stale = Relays::start_at(&case.devnet, 50, Duration::ZERO).await;
     let mut current = Relays::start_at(&case.devnet, 0, Duration::from_millis(200)).await;
     let mut options = case.options.clone();
     // The configured committee is six validators: three fast stale ones

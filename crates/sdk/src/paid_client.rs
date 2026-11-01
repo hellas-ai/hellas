@@ -613,7 +613,24 @@ impl PaidWorkSession {
         let setup_service = SetupService::new(setup);
         let (mounted, descriptor) =
             drive_setup(&setup_service, &policy, &chain, config.poll).await?;
-        let chain = chain.with_min_height(mounted.state().cursor().0);
+        // A completed setup journal stops at the height that finished the
+        // handshake, while the channel journal it mounted keeps advancing.
+        // The source chosen for the setup floor can therefore be behind the
+        // channel's own cursor by the time the channel is mounted. Reselect
+        // at that cursor before the readiness read: a source below it is
+        // refused by the journal's own height guard, and waiting for the
+        // same fast source to catch up would never mount.
+        let channel_floor = mounted.state().cursor().0;
+        let (remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
+            let remote =
+                crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
+            let chain = WorkBlocks::new(remote.clone())
+                .with_read_retry(config.poll, read_timeout)
+                .with_min_height(channel_floor);
+            (remote, chain)
+        } else {
+            (remote, chain.with_min_height(channel_floor))
+        };
         let started = hellas_channel::work::ObservationTime::now();
         let ready = match ready_channel(&descriptor, &chain).await {
             Ok(ready) => Some(ready),
