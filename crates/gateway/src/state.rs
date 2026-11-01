@@ -84,15 +84,45 @@ impl TextState {
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, BackendError> {
-        let max_tokens = req
-            .canonical
+        let canonical = &req.canonical;
+        for (name, present) in [
+            ("temperature", canonical.sampling.temperature.is_some()),
+            ("top_p", canonical.sampling.top_p.is_some()),
+            ("top_logprobs", canonical.sampling.top_logprobs.is_some()),
+            ("truncation", canonical.sampling.truncation.is_some()),
+        ] {
+            if present {
+                return Err(BackendError::rejected(format!(
+                    "`{name}` is not supported by native text execution"
+                )));
+            }
+        }
+        let max_tokens = canonical
             .sampling
             .max_output_tokens
             .unwrap_or(self.default_max_tokens);
-        let chat = self.presentation.prepare(&req.canonical).map_err(|err| {
+        let stops = canonical
+            .sampling
+            .stop
+            .iter()
+            .map(|stop| {
+                let ids = self.presentation.encode(stop).map_err(|error| {
+                    BackendError::rejected(format!(
+                        "Failed to encode stop sequence {stop:?}: {error:#}"
+                    ))
+                })?;
+                match ids.as_slice() {
+                    [id] => Ok(u64::from(*id)),
+                    _ => Err(BackendError::rejected(format!(
+                        "stop sequence {stop:?} must encode to exactly one token"
+                    ))),
+                }
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
+        let chat = self.presentation.prepare(canonical).map_err(|err| {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;
-        self.prepare_ids(chat.input_ids, max_tokens, Some(chat.turn))
+        self.prepare_ids(chat.input_ids, max_tokens, &stops, Some(chat.turn))
     }
 
     /// Render a prompt into a text job and start it on the work source.
@@ -100,6 +130,7 @@ impl TextState {
         &self,
         input_ids: Vec<u32>,
         max_tokens: u32,
+        stops: &[u64],
         chat: Option<hellas_presentation::chat::ChatTurn>,
     ) -> Result<PreparedGeneration, BackendError> {
         let deadline = self
@@ -112,7 +143,7 @@ impl TextState {
             .render_job(&hellas_client::model::ModelRequest::Text {
                 prompt_ids: &prompt,
                 max_new: u64::from(max_tokens),
-                stops: &[],
+                stops,
             })
             .map_err(|error| {
                 BackendError::rejected(format!("Failed to prepare model input: {error:#}"))

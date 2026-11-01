@@ -77,7 +77,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state.prepare_ids(vec![0], 1, None).unwrap();
+    let mut live = state.prepare_ids(vec![0], 1, &[], None).unwrap();
     let prefix = live.prepared.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
@@ -120,7 +120,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     let state = open(Arc::new(Busy)).await;
     assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
-        .prepare_ids(vec![0], 1, None)
+        .prepare_ids(vec![0], 1, &[], None)
         .err()
         .expect("busy backend must reject admission");
     assert_eq!(
@@ -342,4 +342,116 @@ async fn responses_string_input_matches_a_user_message_array() {
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[0].inputs, jobs[1].inputs);
     assert_eq!(jobs[0].plan, jobs[1].plan);
+}
+
+/// Every accepted generation control must reach the job or be rejected; none
+/// may be silently dropped between the adaptor and native execution.
+#[tokio::test]
+async fn generation_controls_are_honoured_or_rejected() {
+    use hellas_adaptors::{
+        RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
+        openai::responses::OpenAiResponsesAdaptor,
+    };
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let chat = |body: serde_json::Value| {
+        let adaptor = OpenAiChatCompletionsAdaptor;
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let responses = |body: serde_json::Value| {
+        let adaptor = OpenAiResponsesAdaptor;
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let prepare = |request: &WireExecutionRequest| state.prepare_wire_execution(request);
+
+    // A single-token stop string reaches the generated job as its token id.
+    let ids = state.presentation.encode("hi").unwrap();
+    assert_eq!(ids.len(), 1);
+    prepare(&chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "stop": "hi"
+    })))
+    .unwrap();
+    let job = work.jobs.lock().unwrap().pop().unwrap();
+    assert!(
+        job.plan
+            .step
+            .as_ref()
+            .unwrap()
+            .stop
+            .any_of
+            .contains(&u64::from(ids[0]))
+    );
+
+    // A stop string spanning several tokens cannot be approximated.
+    let error = prepare(&chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "stop": "hi hi"
+    })))
+    .err()
+    .expect("multi-token stop must be rejected");
+    assert!(matches!(error, BackendError::Rejected(_)));
+    assert!(error.to_string().contains("exactly one token"), "{error}");
+
+    for (field, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("top_logprobs", json!(2)),
+    ] {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        });
+        body[field] = value;
+        let error = prepare(&chat(body))
+            .err()
+            .expect("unsupported sampling must be rejected");
+        assert!(
+            matches!(error, BackendError::Rejected(_)),
+            "{field}: {error}"
+        );
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+    let error = prepare(&responses(json!({
+        "model": "m",
+        "input": "hello",
+        "max_output_tokens": 1,
+        "truncation": "auto"
+    })))
+    .err()
+    .expect("truncation must be rejected");
+    assert!(matches!(error, BackendError::Rejected(_)));
+    assert!(error.to_string().contains("truncation"), "{error}");
+
+    // `parallel_tool_calls: false` is enforced by the chat turn.
+    let prepared = prepare(&chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "tools": [{"type": "function", "function": {
+            "name": "bash", "parameters": {"type": "object"}
+        }}],
+        "parallel_tool_calls": false
+    })))
+    .unwrap();
+    let mut turn = prepared.chat.expect("tool request prepares a chat turn");
+    let call = "<tool_call>\n{\"name\":\"bash\",\"arguments\":{}}\n</tool_call>";
+    turn.feed(call).unwrap();
+    let error = turn.feed(call).unwrap_err();
+    assert!(error.to_string().contains("parallel_tool_calls"), "{error}");
 }

@@ -30,6 +30,7 @@ pub struct ChatTurn {
     parser: Box<dyn IncrementalToolCallParser>,
     called: bool,
     require_tool: bool,
+    parallel: bool,
     id: String,
 }
 
@@ -110,6 +111,7 @@ impl TextPresentation {
                 parser,
                 called: false,
                 require_tool,
+                parallel: request.sampling.parallel_tool_calls != Some(false),
                 id: uuid::Uuid::new_v4().simple().to_string(),
             },
         })
@@ -122,6 +124,7 @@ impl ChatTurn {
             parser: Box::new(PassthroughParser),
             called: false,
             require_tool: false,
+            parallel: true,
             id: String::new(),
         }
     }
@@ -159,6 +162,10 @@ impl ChatTurn {
                     channel: TextChannel::Output,
                 },
                 DecodeEvent::ToolCallStart { index, name } => {
+                    ensure!(
+                        self.parallel || !self.called,
+                        "model produced parallel tool calls but `parallel_tool_calls` is false"
+                    );
                     self.called = true;
                     OutputEvent::ToolCallStart(hellas_adaptors::ToolCallStart {
                         index,
