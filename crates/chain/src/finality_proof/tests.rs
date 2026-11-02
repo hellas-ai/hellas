@@ -237,7 +237,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
         let blocks = blocks.clone();
         let encoded = bundle.finalization.clone();
         deterministic::Runner::default().start(|context| async move {
-            let (indexer, _task) = crate::indexer::spawn_trusted_archive(
+            let (indexer, _task) = crate::indexer::fixtures::spawn_trusted_archive(
                 context,
                 "ancestry-epoch-transition",
                 crate::config::Config::default(),
@@ -247,7 +247,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
             .await
             .unwrap();
             indexer
-                .ingest_finalized_proof(blocks[1].clone(), &encoded)
+                .publish_proof(blocks[1].clone(), &encoded)
                 .await
                 .unwrap();
             assert_eq!(indexer.get_latest_block().await.unwrap().unwrap().height, 3);
@@ -268,7 +268,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
 
 #[cfg(feature = "indexer")]
 #[test]
-fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
+fn archive_reconstructs_descendant_finality_for_every_ancestor() {
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     deterministic::Runner::default().start(|context| async move {
         let (verifier, blocks, certificate, _) = fixture();
@@ -281,37 +281,14 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
         )
         .await
         .unwrap();
-        // Use the public ingestion path with the actual ancestor-only proof. Marshal
+        // Seed source history, then exercise production archive proof reconstruction. Marshal
         // archives heights 1 and 2 without certificates and height 3 with its certificate.
         let encoded = encode(&certificate, &blocks[2..]).unwrap();
         source
-            .ingest_finalized_proof(blocks[1].clone(), &encoded)
+            .publish_proof(blocks[1].clone(), &encoded)
             .await
             .unwrap();
         assert_eq!(source.get_latest_block().await.unwrap().unwrap().height, 3);
-        let (replica, _replica_task) = crate::spawn_archive(
-            context.child("replica"),
-            "descendant-replica",
-            crate::config::Config::default(),
-            verifier.clone(),
-            blocks[0].clone(),
-        )
-        .await
-        .unwrap();
-        let tampered = blocks[1].clone().with_owner_root([8; 32]);
-        assert!(
-            replica
-                .ingest_finalized_proof(tampered.clone(), &encoded)
-                .await
-                .is_err()
-        );
-        assert!(
-            replica
-                .get_finalized_block(crate::FinalizedBlockQuery::Height(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
         let answer = source
             .get_finalized_block(crate::FinalizedBlockQuery::Height(1))
             .await
@@ -319,16 +296,8 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
             .unwrap();
         assert_eq!(answer.snapshot.finalization, encoded);
         crate::FinalizedBlockView::decode(&answer).unwrap();
-        replica
-            .ingest_finalized_proof(
-                crate::ChainIndexer::decode_block(&answer.block).unwrap(),
-                &answer.snapshot.finalization,
-            )
-            .await
-            .unwrap();
-        assert_eq!(replica.get_latest_block().await.unwrap().unwrap().height, 3);
         for block in &blocks[1..] {
-            let answer = replica
+            let answer = source
                 .get_finalized_block(crate::FinalizedBlockQuery::Height(block.height().get()))
                 .await
                 .unwrap()
@@ -338,7 +307,7 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
                 .verify_snapshot(&answer.snapshot, &answer.block)
                 .unwrap();
             assert_eq!(
-                replica
+                source
                     .get_finalization(block.digest())
                     .await
                     .unwrap()
@@ -346,13 +315,6 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
                 answer.snapshot.finalization
             );
         }
-        assert_eq!(
-            replica
-                .ingest_finalized_proof(blocks[1].clone(), &encoded)
-                .await
-                .unwrap(),
-            crate::IngestOutcome::Duplicate
-        );
     });
 }
 

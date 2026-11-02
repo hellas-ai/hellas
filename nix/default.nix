@@ -430,7 +430,7 @@ let
       cargoBuildType = "debug";
       buildPhase = ''
         runHook preBuild
-        cargo clippy --workspace --all-targets --features integration-tests --offline -- -D warnings
+        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --offline -- -D warnings
         runHook postBuild
       '';
       doCheck = false;

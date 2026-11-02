@@ -1,19 +1,30 @@
+use super::store::Result;
 use super::*;
+use crate::execution::{
+    ChainVerifier, execute_all_observed,
+    store::{UtxoDatabase, utxo_db_config},
+};
+use crate::proof_verify::{ProofBundle, ProofQuery, ProofVerifier};
+use crate::{FinalizedBlock, FinalizedBlockQuery, HellasBlock};
 use crate::{
-    domain::{self, Digest, Transaction},
-    edge_index::{projection, types::*},
+    domain::{self, Digest, SettlementKey, Transaction},
+    edge_index::projection,
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
     proof_verify::PROOF_SCHEMA_VERSION,
 };
+use commonware_codec::DecodeExt as _;
 use commonware_codec::Encode as _;
+use commonware_consensus::Heightable as _;
 use commonware_consensus::{
     CertifiableBlock as _,
     simplex::types::Context,
     types::{Epoch, Height, Round, View},
 };
+use commonware_cryptography::Digestible as _;
 use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
-use commonware_runtime::{Supervisor as _, tokio};
+use commonware_runtime::{Spawner as _, Supervisor as _, tokio};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
 use hellas_genesis::{
@@ -26,7 +37,7 @@ use hellas_kernel::{
 
 pub(crate) struct Harness {
     pub(crate) producer: UtxoDatabase<tokio::Context>,
-    pub(crate) replay: Replay<tokio::Context>,
+    pub(crate) node: crate::node::FullNode,
     pub(crate) index: EdgeIndex,
     pub(crate) head: HellasBlock,
     pub(crate) committee: ConsensusFixture,
@@ -39,6 +50,14 @@ pub(crate) struct Harness {
     pub(crate) trust: TrustDocument,
 }
 impl Harness {
+    fn funding_index(&self, signer: &Secp256k1Signer) -> u16 {
+        self.allocations
+            .iter()
+            .position(|(key, _)| *key == SettlementKey::from(signer.party_key()))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
     fn check_edge(
         &self,
         response: &GetEdgeDetailResponse,
@@ -159,25 +178,25 @@ impl Harness {
             target,
             crate::genesis_digest(&genesis),
         );
+        let allocations = crate::config::genesis_allocations(&genesis).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let index = EdgeIndex::open(
-            &directory.path().join("index.redb"),
-            HELLAS_DEVNET_1_ID.into(),
-            trust.genesis_sha256.clone(),
-            verifier.trust_sha256().into(),
-        )
-        .unwrap();
-        let replay = Replay::new(
-            runtime.child("replay"),
-            "edge-test",
-            index.clone(),
-            network,
-            allocations.clone(),
-            origin_genesis,
-            &verifier,
+        let node = crate::node::FullNode::start_indexed(
+            crate::node::Config {
+                genesis: genesis.clone(),
+                threshold_identity: committee.assembler.identity().encode().to_vec(),
+                genesis_payload: origin_genesis.digest(),
+                storage_dir: directory.path().join("node"),
+                validators: Vec::new(),
+                peers: Vec::new(),
+                archive_blocks: None,
+            },
+            trust.clone(),
+            genesis_json.clone(),
+            "edge-test".into(),
         )
         .await
         .unwrap();
+        let index = node.publication().unwrap().index;
         let producer = <UtxoDatabase<_> as DatabaseSet<_>>::init(
             runtime.child("producer"),
             utxo_db_config(&runtime, "edge-producer", 1024, 8),
@@ -185,7 +204,7 @@ impl Harness {
         .await;
         Self {
             producer,
-            replay,
+            node,
             index,
             head,
             committee,
@@ -266,13 +285,64 @@ impl Harness {
             epoch: 0,
         }
     }
-    async fn apply(&mut self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
-        let verified = self.verifier.verify(
-            proof,
-            ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
-        )?;
-        self.replay.apply(block, verified).await
+    async fn apply(&self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
+        let incoming = FinalizedBlock {
+            snapshot: crate::LatestBlock {
+                height: proof.height,
+                payload: Digest::decode(hex::decode(&proof.payload)?.as_slice())?,
+                state_root: Digest::decode(hex::decode(&proof.state_root)?.as_slice())?,
+                finalization: proof.finalization,
+            },
+            block: block.encode().to_vec(),
+        };
+        self.node.accept_finalized(&incoming).await?;
+        ::tokio::time::timeout(std::time::Duration::from_secs(10), self.node.wait_ready())
+            .await??;
+        Ok(())
     }
+
+    fn index_path(&self) -> std::path::PathBuf {
+        let mut paths = std::fs::read_dir(self.node.config().storage_dir.clone())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "redb"));
+        let path = paths.next().expect("indexed node store");
+        assert!(paths.next().is_none());
+        path
+    }
+
+    async fn restart(mut self, edit: impl FnOnce(&std::path::Path)) -> Self {
+        let config = self.node.config().clone();
+        let index_path = self.index_path();
+        self.node.shutdown().await.unwrap();
+        drop(self.index);
+        edit(&index_path);
+        self.node = crate::node::FullNode::start_indexed(
+            config,
+            self.trust.clone(),
+            self.genesis_json.clone(),
+            "edge-test".into(),
+        )
+        .await
+        .unwrap();
+        self.index = self.node.publication().unwrap().index;
+        // A fresh certified observation restores live-read readiness after restart.
+        self.node
+            .accept_finalized(&FinalizedBlock {
+                snapshot: crate::LatestBlock {
+                    height: self.head.height().get(),
+                    payload: self.head.digest(),
+                    state_root: self.head.state_root(),
+                    finalization: finalization(&self.committee, &self.head).encode().to_vec(),
+                },
+                block: self.head.encode().to_vec(),
+            })
+            .await
+            .unwrap();
+        self.node.wait_ready().await.unwrap();
+        self
+    }
+
     pub(crate) async fn append(&mut self, txs: Vec<Transaction>) -> ProofBundle {
         let (block, proof, merkleized) = self.candidate(txs).await;
         self.producer.finalize(merkleized).await;
@@ -457,9 +527,9 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 .code,
             "index_not_ready"
         );
-        let (id, terms, tx) = basic(h.network, 0, &maker, &taker);
-        let (id2, terms2, tx2) = basic(h.network, 1, &maker2, &maker2);
-        let (_, _, tx3) = basic(h.network, 2, &maker3, &taker);
+        let (id, terms, tx) = basic(h.network, h.funding_index(&maker), &maker, &taker);
+        let (id2, terms2, tx2) = basic(h.network, h.funding_index(&maker2), &maker2, &maker2);
+        let (_, _, tx3) = basic(h.network, h.funding_index(&maker3), &maker3, &taker);
         let opened = h
             .append(vec![
                 Transaction::Kernel(tx),
@@ -504,28 +574,22 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         bad.state_root = "00".repeat(32);
         let block = HellasBlock::decode(root_bad.canonical_block.as_slice()).unwrap();
         assert!(h.apply(&block, bad).await.is_err());
-        // Typed evidence is valid but must certify the block replay will execute.
-        let other = h
-            .verifier
-            .verify(
-                opened.clone(),
-                ProofQuery::Block(FinalizedBlockQuery::Height(1)),
-            )
-            .unwrap();
-        assert!(h.replay.apply(&block, other).await.is_err());
-        // A typed block from another valid verifier is not this origin's trust anchor.
+        // A certificate for another block cannot authorize this input.
+        assert!(h.apply(&block, opened.clone()).await.is_err());
+        // Read-side proof metadata remains bound to the configured trust document.
         let mut other_trust = h.trust.clone();
         other_trust.epochs[0].end_height = Some(100);
         let other_verifier = ProofVerifier::with_genesis(other_trust, &h.genesis_json).unwrap();
         let mut other_proof = root_bad.clone();
         other_proof.trust_sha256 = other_verifier.trust_sha256().into();
-        let other = other_verifier
-            .verify(
-                other_proof,
-                ProofQuery::Block(FinalizedBlockQuery::Height(2)),
-            )
-            .unwrap();
-        assert!(h.replay.apply(&block, other).await.is_err());
+        assert!(
+            h.verifier
+                .verify(
+                    other_proof,
+                    ProofQuery::Block(FinalizedBlockQuery::Height(2))
+                )
+                .is_err()
+        );
         assert_eq!(
             h.list(64)
                 .envelope
@@ -537,53 +601,8 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 .height,
             1
         );
-        // Even a valid threshold certificate cannot bypass deterministic state replay.
-        let mut target = block.sync_target();
-        target.root = Digest::from([91; 32]);
-        let invalid = HellasBlock::new(
-            block.context(),
-            block.parent(),
-            block.height(),
-            block.timestamp(),
-            target.root,
-            target,
-            block.txs().to_vec(),
-        )
-        .with_owner_root(block.owner_root());
-        let certificate = h.certify(&invalid);
-        h.verifier
-            .verify(
-                certificate.clone(),
-                ProofQuery::Block(FinalizedBlockQuery::Height(2)),
-            )
-            .unwrap();
-        assert!(h.apply(&invalid, certificate).await.is_err());
-        let conflicting_parent = HellasBlock::new(
-            block.context(),
-            Digest::from([92; 32]),
-            block.height(),
-            block.timestamp(),
-            block.state_root(),
-            block.sync_target(),
-            block.txs().to_vec(),
-        )
-        .with_owner_root(block.owner_root());
-        assert!(
-            h.apply(&conflicting_parent, h.certify(&conflicting_parent))
-                .await
-                .is_err()
-        );
-        let gap = HellasBlock::new(
-            block.context(),
-            block.parent(),
-            Height::new(3),
-            block.timestamp(),
-            block.state_root(),
-            block.sync_target(),
-            block.txs().to_vec(),
-        )
-        .with_owner_root(block.owner_root());
-        assert!(h.apply(&gap, h.certify(&gap)).await.is_err());
+        // Certified execution failures and missing ancestry are exercised through
+        // the production node's halt/catch-up contract in node::tests.
         let mut conflict = opened.clone();
         conflict.payload = "fe".repeat(32);
         assert!(h.apply(&h.head.clone(), conflict).await.is_err());
@@ -703,77 +722,46 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 .code,
             "snapshot_unavailable"
         );
-        let index_path = h.directory.path().join("index.redb");
+        let index_path = h.index_path();
         assert!(index_path.exists());
         let owner = SettlementKey::from(maker2.party_key());
         let committed_owner = h
-            .replay
+            .node
             .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
-        // Crash after writing the intent, before QMDB finalize: recovery discards it.
         let transactions = vec![Transaction::Kernel(
             Tx::timeout_close(id2, &terms2).unwrap(),
         )];
-        let (_, proof, _) = h.candidate(transactions.clone()).await;
+        let (block, proof, merkleized) = h.candidate(transactions.clone()).await;
         let tx_digest = hex::encode(crate::proof_verify::transaction_digest(&transactions[0]));
-        let context = hellas_kernel::Context::with_fees(
-            h.network,
-            BlockHeight::new(proof.height),
-            hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
-            domain::KERNEL_FEES,
-        );
         let (_, changes) = execute_all_observed(
-            context,
+            hellas_kernel::Context::with_fees(
+                h.network,
+                BlockHeight::new(proof.height),
+                hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
+                domain::KERNEL_FEES,
+            ),
             &ChainVerifier::new(),
             &transactions,
             &h.allocations,
-            h.replay.database.new_batches().await,
+            h.producer.new_batches().await,
         )
         .await
         .unwrap();
         assert!(!changes.is_empty());
-        h.index.store.prepare(proof.clone(), changes).unwrap();
-        assert!(
-            h.index
-                .store
-                .transaction_height(&tx_digest)
-                .unwrap()
-                .is_none()
-        );
-        let genesis = h.replay.genesis.clone();
+
+        // Persist the next intent without executing it. Real node startup must
+        // discard it against the recovered checkpoint, with no visible events.
+        h.index
+            .store
+            .prepare(proof.clone(), changes.clone())
+            .unwrap();
         let previous_height = h.head.height().get();
-        drop(h.replay);
-        let recovered = Replay::new(
-            runtime.child("recovered"),
-            "edge-test",
-            h.index.clone(),
-            h.network,
-            h.allocations.clone(),
-            genesis.clone(),
-            &h.verifier,
-        )
-        .await
-        .unwrap();
-        assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
+        h = h.restart(|_| {}).await;
+        assert_eq!(h.node.status().executed_height(), previous_height);
         assert!(h.index.store.intent().unwrap().is_none());
-        assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
-        let read = h.index.store.read(None).unwrap();
-        assert!(read.object(id2.as_bytes()).unwrap().is_some());
-        assert!(
-            read.edge(&hex::encode(id2.as_bytes()))
-                .unwrap()
-                .unwrap()
-                .closed
-                .is_none()
-        );
-        assert_eq!(
-            read.events(&hex::encode(id2.as_bytes()), None, 64)
-                .unwrap()
-                .len(),
-            1
-        );
         assert!(
             h.index
                 .store
@@ -781,96 +769,90 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 .unwrap()
                 .is_none()
         );
-        drop(read);
-        let owner_before_finalize = recovered
+        let before = h
+            .node
             .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            owner_before_finalize.bundle().page,
-            committed_owner.bundle().page
-        );
-        assert_eq!(
-            owner_before_finalize.block().bundle().height,
-            previous_height
-        );
+        assert_eq!(before.bundle().page, committed_owner.bundle().page);
         h.verifier
-            .verify_address(owner_before_finalize.bundle().clone(), owner, 0, 64)
+            .verify_address(before.bundle().clone(), owner, 0, 64)
             .unwrap();
-        // Crash after QMDB finalize but before the index transaction: recover the exact
-        // certified intent and expose its rows/cursor together, once.
-        let context = hellas_kernel::Context::with_fees(
-            h.network,
-            BlockHeight::new(proof.height),
-            hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
-            domain::KERNEL_FEES,
-        );
-        let (batch, changes) = execute_all_observed(
-            context,
-            &ChainVerifier::new(),
-            &transactions,
-            &h.allocations,
-            recovered.database.new_batches().await,
-        )
-        .await
-        .unwrap();
-        let merkleized = batch.merkleize().await.unwrap();
-        assert_eq!(hex::encode(merkleized.root()), proof.state_root);
+        {
+            let read = h.index.store.read(None).unwrap();
+            assert!(read.object(id2.as_bytes()).unwrap().is_some());
+            assert!(
+                read.edge(&hex::encode(id2.as_bytes()))
+                    .unwrap()
+                    .unwrap()
+                    .closed
+                    .is_none()
+            );
+            assert_eq!(
+                read.events(&hex::encode(id2.as_bytes()), None, 64)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        // Capture the durable pre-publication index. Let the real runtime commit
+        // the block, then restore that index image while the node is stopped.
+        // This creates the committed-database/pending-index crash state without
+        // substituting a consumer execution or recovery implementation.
         h.index.store.prepare(proof.clone(), changes).unwrap();
-        recovered.database.finalize(merkleized).await;
-        drop(recovered);
-        let recovered = Replay::new(
-            runtime.child("recovered_after_finalize"),
-            "edge-test",
-            h.index.clone(),
-            h.network,
-            h.allocations,
-            genesis,
-            &h.verifier,
-        )
-        .await
-        .unwrap();
-        assert_eq!(recovered.next_height().unwrap(), proof.height + 1);
-        let read = h.index.store.read(None).unwrap();
-        assert!(read.object(id2.as_bytes()).unwrap().is_none());
-        assert_eq!(
-            read.edge(&hex::encode(id2.as_bytes()))
-                .unwrap()
-                .unwrap()
-                .closed
-                .unwrap()
-                .height,
-            proof.height
-        );
-        assert_eq!(
-            read.events(&hex::encode(id2.as_bytes()), None, 64)
-                .unwrap()
-                .len(),
-            2
-        );
+        let pending = h.directory.path().join("pending-index.redb");
+        std::fs::copy(h.index_path(), &pending).unwrap();
+        h.producer.finalize(merkleized).await;
+        h.apply(&block, proof.clone()).await.unwrap();
+        h.head = block;
+        h = h
+            .restart(|path| {
+                std::fs::copy(&pending, path).unwrap();
+            })
+            .await;
+        assert!(h.index.store.intent().unwrap().is_none());
         assert_eq!(
             h.index.store.transaction_height(&tx_digest).unwrap(),
             Some(proof.height)
         );
-        drop(read);
         assert_eq!(
             h.index.store.latest().unwrap().unwrap().payload,
             proof.payload
         );
-        let owner_after_finalize = recovered
+        let after = h
+            .node
             .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(
-            owner_after_finalize.bundle().page,
-            committed_owner.bundle().page
-        );
-        assert_eq!(owner_after_finalize.block().bundle().payload, proof.payload);
+        assert_ne!(after.bundle().page, committed_owner.bundle().page);
+        assert_eq!(after.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(owner_after_finalize.bundle().clone(), owner, 0, 64)
+            .verify_address(after.bundle().clone(), owner, 0, 64)
             .unwrap();
+        let events = h
+            .index
+            .store
+            .read(None)
+            .unwrap()
+            .events(&hex::encode(id2.as_bytes()), None, 64)
+            .unwrap();
+        h = h.restart(|_| {}).await;
+        assert_eq!(
+            serde_json::to_value(
+                h.index
+                    .store
+                    .read(None)
+                    .unwrap()
+                    .events(&hex::encode(id2.as_bytes()), None, 64)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(events).unwrap()
+        );
+        h.node.shutdown().await.unwrap();
     });
 }
 struct WorkPair {
@@ -885,7 +867,7 @@ struct WorkPair {
 }
 fn work_pair(
     network: hellas_kernel::NetworkId,
-    first: u16,
+    h: &Harness,
     client_secret: u8,
     provider_secret: u8,
 ) -> WorkPair {
@@ -901,7 +883,7 @@ fn work_pair(
         max_job_price: 4,
     };
     let bond_terms = Terms::work_stake_bond(body.clone());
-    let bond_funding = funding(first + 1);
+    let bond_funding = funding(h.funding_index(&provider));
     let bond = Tx::edge_id_of(&bond_funding, &bond_terms);
     let bond_open = open(
         network,
@@ -918,7 +900,7 @@ fn work_pair(
         start_validity_blocks: 8,
         omission_bond: 2,
     });
-    let payment_funding = funding(first);
+    let payment_funding = funding(h.funding_index(&client));
     let payment = Tx::edge_id_of(&payment_funding, &terms);
     let payment_open = open(network, payment_funding, terms.clone(), &client, &provider);
     WorkPair {
@@ -936,15 +918,15 @@ fn work_pair(
 fn native_edge_index_bond_reverse_link_requires_payment_opening_evidence() {
     run_qmdb(|runtime| async move {
         let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
-        let a = work_pair(network, 0, 31, 32);
-        let b = work_pair(network, 2, 33, 34);
         let allocations = vec![
-            (SettlementKey::from(a.client.party_key()), 100),
-            (SettlementKey::from(a.provider.party_key()), 12),
-            (SettlementKey::from(b.client.party_key()), 100),
-            (SettlementKey::from(b.provider.party_key()), 12),
+            (SettlementKey::from(signer(31).party_key()), 100),
+            (SettlementKey::from(signer(32).party_key()), 12),
+            (SettlementKey::from(signer(33).party_key()), 100),
+            (SettlementKey::from(signer(34).party_key()), 12),
         ];
         let mut h = Harness::new(runtime.child("h"), allocations, "reverse-link").await;
+        let a = work_pair(network, &h, 31, 32);
+        let b = work_pair(network, &h, 33, 34);
         h.append(vec![
             Transaction::Kernel(a.bond_open.clone()),
             Transaction::Kernel(b.bond_open.clone()),
@@ -1000,15 +982,15 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             Proof, RegistryChunk,
         };
         let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
-        let a = work_pair(network, 0, 31, 32);
-        let b = work_pair(network, 2, 33, 34);
         let allocations = vec![
-            (SettlementKey::from(a.client.party_key()), 100),
-            (SettlementKey::from(a.provider.party_key()), 12),
-            (SettlementKey::from(b.client.party_key()), 100),
-            (SettlementKey::from(b.provider.party_key()), 12),
+            (SettlementKey::from(signer(31).party_key()), 100),
+            (SettlementKey::from(signer(32).party_key()), 12),
+            (SettlementKey::from(signer(33).party_key()), 100),
+            (SettlementKey::from(signer(34).party_key()), 12),
         ];
         let mut h = Harness::new(runtime.child("h"), allocations, "work").await;
+        let a = work_pair(network, &h, 31, 32);
+        let b = work_pair(network, &h, 33, 34);
         let opened = h
             .append(
                 vec![
@@ -1452,7 +1434,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
 }
 
 #[test]
-fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
+fn native_edge_index_cold_open_serves_current_owners_without_remote_history() {
     run_qmdb(|runtime| async move {
         let maker = signer(31);
         let taker = signer(32);
@@ -1465,34 +1447,13 @@ fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
             "cold-owners",
         )
         .await;
-        let genesis = h.head.clone();
-        let (id, _, opened) = basic(h.network, 0, &maker, &taker);
+        let (id, _, opened) = basic(h.network, h.funding_index(&maker), &maker, &taker);
         let first = h.append(vec![Transaction::Kernel(opened)]).await;
         let latest = h.append(Vec::new()).await;
-        let path = h.directory.path().join("index.redb");
-        drop(h.replay);
-        drop(h.index);
-        // Reopen both persistent stores. No follower, archive, or historical
-        // block callback exists in this test or in the owner-proof interface.
-        let index = EdgeIndex::open(
-            &path,
-            HELLAS_DEVNET_1_ID.into(),
-            h.trust.genesis_sha256.clone(),
-            h.verifier.trust_sha256().into(),
-        )
-        .unwrap();
-        let recovered = Replay::new(
-            runtime.child("reopened"),
-            "edge-test",
-            index.clone(),
-            h.network,
-            h.allocations,
-            genesis,
-            &h.verifier,
-        )
-        .await
-        .unwrap();
-        assert_eq!(recovered.next_height().unwrap(), latest.height + 1);
+        h = h.restart(|_| {}).await;
+        let recovered = &h.node;
+        let index = &h.index;
+        assert_eq!(recovered.status().executed_height(), latest.height);
         let listing = index
             .list_edges(ListEdgesRequest {
                 schema_version: crate::edge_index::SCHEMA_VERSION,
@@ -1555,23 +1516,18 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             "owner-publication",
         )
         .await;
-        let (archive, handle) = crate::spawn_archive(
-            runtime.child("archive"),
-            "owner-publication-archive",
-            crate::config::Config::default(),
-            h.committee.verifier.clone(),
-            h.replay.genesis.clone(),
-        )
-        .await
-        .unwrap();
-        let publication = crate::edge_index::Publication {
-            index: h.index.clone(),
-            verifier: std::sync::Arc::new(
-                ProofVerifier::with_genesis(h.trust.clone(), &h.genesis_json).unwrap(),
-            ),
-            archive,
-        };
         let previous = h.append(Vec::new()).await;
+        let mut publication = h.node.publication().unwrap();
+        let snapshot = h.directory.path().join("publication-component.redb");
+        std::fs::copy(h.index_path(), &snapshot).unwrap();
+        let identity = &h.index.store.identity;
+        publication.index = EdgeIndex::open(
+            &snapshot,
+            identity.network_id.clone(),
+            identity.genesis_sha256.clone(),
+            identity.trust_sha256.clone(),
+        )
+        .unwrap();
         let (block, proof, _) = h.candidate(Vec::new()).await;
         let (batch, changes) = execute_all_observed(
             hellas_kernel::Context::with_fees(
@@ -1583,25 +1539,29 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             &ChainVerifier::new(),
             block.txs(),
             &h.allocations,
-            h.replay.database.new_batches().await,
+            h.producer.new_batches().await,
         )
         .await
         .unwrap();
         let batch = batch.merkleize().await.unwrap();
         assert_ne!(previous.state_root, proof.state_root);
         assert_eq!(hex::encode(batch.root()), proof.state_root);
-        h.index.store.prepare(proof.clone(), changes).unwrap();
+        publication
+            .index
+            .store
+            .prepare(proof.clone(), changes)
+            .unwrap();
         let before = publication
-            .owner_proof(&h.replay.database, owner, 0, 64, None)
+            .owner_proof(&h.producer, owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(before.block().bundle().payload, previous.payload);
 
         // Stop exactly after the QMDB commit, before publishing EdgeIndex.
-        h.replay.database.finalize(batch).await;
+        h.producer.finalize(batch).await;
         let during = publication
-            .owner_proof(&h.replay.database, owner, 0, 64, Some(&proof.payload))
+            .owner_proof(&h.producer, owner, 0, 64, Some(&proof.payload))
             .await
             .unwrap()
             .unwrap();
@@ -1610,12 +1570,12 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .verify_address(during.bundle().clone(), owner, 0, 64)
             .unwrap();
         assert_eq!(
-            h.index.store.latest().unwrap().unwrap().payload,
+            publication.index.store.latest().unwrap().unwrap().payload,
             previous.payload
         );
         assert!(
             publication
-                .owner_proof(&h.replay.database, owner, 0, 64, Some(&previous.payload))
+                .owner_proof(&h.producer, owner, 0, 64, Some(&previous.payload))
                 .await
                 .unwrap()
                 .is_none()
@@ -1624,35 +1584,143 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         // A matching root alone must not turn corrupted evidence into a proof.
         let mut corrupt = proof.clone();
         corrupt.state_root = "ff".repeat(32);
-        h.index.store.prepare(corrupt, Vec::new()).unwrap();
+        publication
+            .index
+            .store
+            .prepare(corrupt, Vec::new())
+            .unwrap();
         assert!(
             publication
-                .owner_proof(&h.replay.database, owner, 0, 64, None)
+                .owner_proof(&h.producer, owner, 0, 64, None)
                 .await
                 .is_err()
         );
         let mut corrupt = proof.clone();
         corrupt.finalization[0] ^= 1;
-        h.index.store.prepare(corrupt, Vec::new()).unwrap();
+        publication
+            .index
+            .store
+            .prepare(corrupt, Vec::new())
+            .unwrap();
         assert!(
             publication
-                .owner_proof(&h.replay.database, owner, 0, 64, None)
+                .owner_proof(&h.producer, owner, 0, 64, None)
                 .await
                 .is_err()
         );
-        h.index.store.prepare(proof.clone(), Vec::new()).unwrap();
         publication
-            .finalized(&block, &h.replay.database)
-            .await
+            .index
+            .store
+            .prepare(proof.clone(), Vec::new())
             .unwrap();
+        publication.finalized(&block, &h.producer).await.unwrap();
         let after = publication
-            .owner_proof(&h.replay.database, owner, 0, 64, None)
+            .owner_proof(&h.producer, owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(after.page(), during.page());
         assert_eq!(after.block().bundle().payload, proof.payload);
-        handle.abort();
-        let _ = handle.await;
+        h.node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn indexed_restart_replays_published_unacknowledged_checkpoint_before_backlog() {
+    fn read_partition(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+    fn restore_partition(path: &std::path::Path, files: &[(std::ffi::OsString, Vec<u8>)]) {
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(path.join(name), bytes).unwrap();
+        }
+    }
+    run_qmdb(|runtime| async move {
+        let mut h = Harness::new(runtime, Vec::new(), "published-before-ack").await;
+        h.append(Vec::new()).await;
+        let archive = h.node.publication().unwrap().archive;
+        ::tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while archive
+                .marshal
+                .get_processed_height()
+                .await
+                .map_or(0, |height| height.get())
+                < 1
+            {
+                ::tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut acknowledged = Vec::new();
+        let mut sync_metadata = Vec::new();
+        h = h
+            .restart(|index| {
+                acknowledged =
+                    read_partition(&index.parent().unwrap().join("chain-application-metadata"));
+                sync_metadata =
+                    read_partition(&index.parent().unwrap().join("chainstate_sync_metadata"));
+            })
+            .await;
+        let published = h.append(Vec::new()).await;
+        let mut index_bytes = Vec::new();
+        let mut databases = Vec::new();
+        h = h
+            .restart(|index| {
+                index_bytes = std::fs::read(index).unwrap();
+                for entry in std::fs::read_dir(index.parent().unwrap()).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("chain_utxo_")
+                    {
+                        databases.push((entry.file_name(), read_partition(&entry.path())));
+                    }
+                }
+                assert!(!databases.is_empty());
+            })
+            .await;
+        let tip = h.append(Vec::new()).await;
+        // Stage the durable crash prefix: block 2 was committed and published,
+        // only block 1 acknowledged, and block 3 already archived for delivery.
+        // Restore real on-disk snapshots; startup must use production replay.
+        h = h
+            .restart(|index| {
+                let directory = index.parent().unwrap();
+                std::fs::write(index, &index_bytes).unwrap();
+                restore_partition(&directory.join("chain-application-metadata"), &acknowledged);
+                restore_partition(&directory.join("chainstate_sync_metadata"), &sync_metadata);
+                for (name, files) in &databases {
+                    restore_partition(&directory.join(name), files);
+                }
+            })
+            .await;
+        assert_eq!(h.node.status().executed_height(), tip.height);
+        assert_eq!(
+            h.index.store.latest().unwrap().unwrap().payload,
+            tip.payload
+        );
+        assert_eq!(
+            h.index
+                .store
+                .read(None)
+                .unwrap()
+                .proof(published.height)
+                .unwrap()
+                .payload,
+            published.payload
+        );
+        assert!(h.index.store.intent().unwrap().is_none());
+        h.node.shutdown().await.unwrap();
     });
 }

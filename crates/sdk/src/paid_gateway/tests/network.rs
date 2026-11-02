@@ -71,7 +71,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 .unwrap();
             let owner = hellas_auth::test_support::actors::FRIEND.principal();
             let key = signer(1);
-            node.require_finalized_height_for_test(devnet.height() + 1);
+            let chain = chain.with_min_height(devnet.height() + 1);
             let policy = {
                 let read = provider_policy(
                     &args,
@@ -98,7 +98,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
             };
             assert_eq!(policy, fixture.policy);
             args.timeout = Some(Duration::from_millis(100));
-            node.require_finalized_height_for_test(devnet.height() + 1);
+            let chain = chain.with_min_height(devnet.height() + 1);
             let started = tokio::time::Instant::now();
             let error = tokio::time::timeout(
                 Duration::from_secs(5),

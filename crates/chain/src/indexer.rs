@@ -2,21 +2,12 @@
 mod retention;
 #[cfg(feature = "indexer-api")]
 pub(crate) mod trusted_epochs;
-#[cfg(any(test, feature = "indexer-api", feature = "test-support"))]
-use crate::ConsensusVerifier;
-#[cfg(any(test, feature = "test-support"))]
-use crate::domain::PublicKey;
 use crate::{
     app::{HellasBlock, MarshalMailbox},
-    consensus::ConsensusVerificationError,
     light_client::{FinalizedBlock, FinalizedBlockQuery, LatestBlock, QueryError},
 };
 #[cfg(any(test, feature = "full-node"))]
 use crate::{config::Config, consensus::Finalization, domain::Scheme};
-#[cfg(any(test, feature = "test-support"))]
-use commonware_actor::Feedback;
-#[cfg(any(test, feature = "test-support"))]
-use commonware_codec::DecodeExt;
 use commonware_codec::Encode;
 use commonware_consensus::{
     Block as _, CertifiableBlock, Heightable, marshal::Identifier as MarshalIdentifier,
@@ -29,18 +20,13 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digestible, sha256::Digest};
 #[cfg(any(test, feature = "full-node"))]
-use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 #[cfg(any(test, feature = "full-node"))]
 use commonware_utils::NZU64;
-#[cfg(any(test, feature = "test-support"))]
-use commonware_utils::sync::AsyncMutex;
 #[cfg(any(test, feature = "full-node"))]
 use rand_core::CryptoRng;
 #[cfg(any(test, feature = "full-node"))]
 use std::{num::NonZeroUsize, sync::Arc};
-use thiserror::Error;
-#[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
-use trusted_epochs::TrustedEpochs;
 
 #[cfg(any(test, feature = "full-node"))]
 pub(crate) type Archive<E, V> = retention::Retained<
@@ -128,62 +114,13 @@ where
 #[derive(Clone)]
 pub struct ChainIndexer {
     pub(crate) marshal: MarshalMailbox,
-    #[cfg(any(test, feature = "test-support"))]
-    verifier: Option<ConsensusVerifier>,
-    #[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
-    schedule: Option<TrustedEpochs>,
-    #[cfg(any(test, feature = "test-support"))]
-    ingest_lock: Arc<AsyncMutex<()>>,
-    #[cfg(any(test, feature = "test-support"))]
-    fixture_source: FixtureSource,
     #[cfg(feature = "full-node")]
     retained_from: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(any(test, feature = "full-node"))]
     storage_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestOutcome {
-    Applied,
-    Duplicate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IngestError {
-    #[error("consensus verifier is not configured")]
-    MissingVerifier,
-    #[error("invalid trust schedule or finalized epoch: {0}")]
-    TrustSchedule(String),
-    #[error("{0}")]
-    Consensus(#[from] ConsensusVerificationError),
-    #[error("invalid block")]
-    InvalidBlock,
-    #[error("block context round did not match finalization round")]
-    RoundMismatch,
-    #[error("finalized height {height} already has a different payload")]
-    ConflictingHeight {
-        height: u64,
-        existing: Digest,
-        incoming: Digest,
-    },
-    #[error("finalized payload is already indexed at a different height")]
-    ConflictingPayload {
-        payload: Digest,
-        existing_height: u64,
-        incoming_height: u64,
-    },
-    #[error("marshal actor closed while persisting block")]
-    MarshalClosed,
-    #[error("marshal did not store the finalized block")]
-    NotStored { height: u64 },
-}
-
 impl ChainIndexer {
-    #[cfg(all(test, feature = "full-node"))]
-    pub(crate) fn prune_before(&self, height: u64) {
-        self.retain_from(height, height);
-    }
-
     #[cfg(feature = "full-node")]
     pub(crate) fn retain_from(&self, public_floor: u64, recovery_floor: u64) {
         self.retained_from
@@ -196,192 +133,10 @@ impl ChainIndexer {
     pub fn new(marshal: MarshalMailbox) -> Self {
         Self {
             marshal,
-            #[cfg(any(test, feature = "test-support"))]
-            verifier: None,
-            #[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
-            schedule: None,
-            #[cfg(any(test, feature = "test-support"))]
-            ingest_lock: Arc::new(AsyncMutex::new(())),
-            #[cfg(any(test, feature = "test-support"))]
-            fixture_source: FixtureSource::default(),
             #[cfg(feature = "full-node")]
             retained_from: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(any(test, feature = "full-node"))]
             storage_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_verifier(mut self, verifier: ConsensusVerifier) -> Self {
-        self.verifier = Some(verifier);
-        self
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn decode_block(bytes: &[u8]) -> Result<HellasBlock, IngestError> {
-        HellasBlock::decode(bytes).map_err(|_| IngestError::InvalidBlock)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn ingest_finalized(
-        &self,
-        block: HellasBlock,
-        finalization: Finalization,
-    ) -> Result<IngestOutcome, IngestError> {
-        self.ingest_proven_blocks(
-            block,
-            crate::finality_proof::FinalityProof {
-                certificate: finalization,
-                descendants: Vec::new(),
-            },
-        )
-        .await
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn ingest_finalized_proof(
-        &self,
-        block: HellasBlock,
-        encoded_proof: &[u8],
-    ) -> Result<IngestOutcome, IngestError> {
-        self.ingest_proven_blocks(
-            block,
-            crate::finality_proof::FinalityProof::decode(encoded_proof)?,
-        )
-        .await
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    async fn ingest_proven_blocks(
-        &self,
-        block: HellasBlock,
-        proof: crate::finality_proof::FinalityProof,
-    ) -> Result<IngestOutcome, IngestError> {
-        let _guard = self.ingest_lock.lock().await;
-        let terminal = proof.descendants.last().unwrap_or(&block);
-        #[cfg(feature = "indexer-api")]
-        let finalization = &proof.certificate;
-        #[cfg(feature = "indexer-api")]
-        let scheduled = self
-            .schedule
-            .as_ref()
-            .map(|schedule| {
-                // Every block's epoch must agree with the authenticated height schedule.
-                for candidate in std::iter::once(&block).chain(proof.descendants.iter()) {
-                    schedule.verifier(candidate.height(), candidate.context().round.epoch())?;
-                }
-                schedule.verifier(terminal.height(), finalization.proposal.round.epoch())
-            })
-            .transpose()?;
-        #[cfg(feature = "indexer-api")]
-        let verifier = scheduled
-            .or(self.verifier.as_ref())
-            .ok_or(IngestError::MissingVerifier)?;
-        #[cfg(not(feature = "indexer-api"))]
-        let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
-        proof.verify(
-            verifier,
-            &LatestBlock {
-                height: block.height().get(),
-                payload: block.digest(),
-                state_root: block.state_root(),
-                finalization: Vec::new(),
-            },
-        )?;
-        proof
-            .verify_terminal_context(terminal)
-            .map_err(|_| IngestError::RoundMismatch)?;
-        let terminal_height = terminal.height();
-        let terminal_payload = terminal.digest();
-        {
-            let mut values = self.fixture_source.0.lock().unwrap();
-            values.insert(
-                ResolverKey::Finalized {
-                    height: terminal_height,
-                },
-                (proof.certificate.clone(), terminal.clone()).encode(),
-            );
-            for candidate in std::iter::once(&block).chain(&proof.descendants) {
-                values.insert(ResolverKey::Block(candidate.digest()), candidate.encode());
-            }
-        }
-        let mut pending = Vec::new();
-        let mut expected_parent = None;
-        for candidate in std::iter::once(block).chain(proof.descendants) {
-            let height = candidate.height();
-            let payload = candidate.digest();
-            if let Some((_, existing_payload)) = self.marshal.get_info(height).await {
-                if existing_payload != payload {
-                    return Err(IngestError::ConflictingHeight {
-                        height: height.get(),
-                        existing: existing_payload,
-                        incoming: payload,
-                    });
-                }
-                expected_parent = Some(payload);
-                continue;
-            }
-            if let Some((existing_height, _)) = self.marshal.get_info(&payload).await {
-                return Err(IngestError::ConflictingPayload {
-                    payload,
-                    existing_height: existing_height.get(),
-                    incoming_height: height.get(),
-                });
-            }
-            let parent = match expected_parent {
-                Some(parent) => parent,
-                None => {
-                    self.marshal
-                        .get_info(Height::new(
-                            height
-                                .get()
-                                .checked_sub(1)
-                                .ok_or(IngestError::InvalidBlock)?,
-                        ))
-                        .await
-                        .ok_or(IngestError::InvalidBlock)?
-                        .1
-                }
-            };
-            if candidate.parent() != parent {
-                return Err(IngestError::InvalidBlock);
-            }
-            expected_parent = Some(payload);
-            pending.push(candidate);
-        }
-        if pending.is_empty() {
-            return Ok(IngestOutcome::Duplicate);
-        }
-        // Marshal must know the entire authenticated ancestry before the terminal
-        // certificate triggers its normal ancestor finalization and persistence.
-        for candidate in pending {
-            if !self
-                .marshal
-                .verified(candidate.context().round, candidate)
-                .await
-            {
-                return Err(IngestError::MarshalClosed);
-            }
-        }
-        let mut marshal = self.marshal.clone();
-        if !marshal
-            .report(Activity::Finalization(proof.certificate))
-            .accepted()
-        {
-            return Err(IngestError::MarshalClosed);
-        }
-        match self.marshal.get_info(terminal_height).await {
-            Some((_, stored_payload)) if stored_payload == terminal_payload => {
-                Ok(IngestOutcome::Applied)
-            }
-            Some((_, existing)) => Err(IngestError::ConflictingHeight {
-                height: terminal_height.get(),
-                existing,
-                incoming: terminal_payload,
-            }),
-            None => Err(IngestError::NotStored {
-                height: terminal_height.get(),
-            }),
         }
     }
 
@@ -499,124 +254,6 @@ impl ChainIndexer {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub async fn spawn_archive<E>(
-    context: E,
-    partition_prefix: &str,
-    config: Config,
-    verifier: ConsensusVerifier,
-    genesis_block: HellasBlock,
-) -> Result<(ChainIndexer, Handle<()>), IngestError>
-where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
-{
-    let provider = ConstantProvider::new(verifier.scheme().clone());
-    let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
-    spawn_archive_with_provider(
-        context,
-        partition_prefix,
-        config,
-        verifier,
-        genesis_block,
-        provider,
-        epocher,
-    )
-    .await
-}
-
-#[cfg(all(test, feature = "indexer-api"))]
-pub async fn spawn_trusted_archive<E>(
-    context: E,
-    partition_prefix: &str,
-    config: Config,
-    trust: hellas_genesis::TrustDocument,
-    genesis_block: HellasBlock,
-) -> Result<(ChainIndexer, Handle<()>), IngestError>
-where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
-{
-    spawn_trusted_archive_with_genesis(
-        context,
-        partition_prefix,
-        config,
-        trust,
-        hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes(),
-        genesis_block,
-    )
-    .await
-}
-
-/// Initialize a follower using an independently provisioned genesis document and trust schedule.
-#[cfg(all(test, feature = "indexer-api"))]
-pub async fn spawn_trusted_archive_with_genesis<E>(
-    context: E,
-    partition_prefix: &str,
-    config: Config,
-    trust: hellas_genesis::TrustDocument,
-    genesis_json: &[u8],
-    genesis_block: HellasBlock,
-) -> Result<(ChainIndexer, Handle<()>), IngestError>
-where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
-{
-    let schedule = TrustedEpochs::with_genesis(trust, genesis_json)?;
-    let verifier = schedule
-        .verifier(Height::zero(), commonware_consensus::types::Epoch::zero())?
-        .clone();
-    let (mut indexer, handle) = spawn_archive_with_provider(
-        context,
-        partition_prefix,
-        config,
-        verifier,
-        genesis_block,
-        schedule.clone(),
-        schedule.clone(),
-    )
-    .await?;
-    indexer.schedule = Some(schedule);
-    Ok((indexer, handle))
-}
-
-#[cfg(any(test, feature = "test-support"))]
-async fn spawn_archive_with_provider<E, P, H>(
-    context: E,
-    partition_prefix: &str,
-    config: Config,
-    verifier: ConsensusVerifier,
-    genesis_block: HellasBlock,
-    provider: P,
-    epocher: H,
-) -> Result<(ChainIndexer, Handle<()>), IngestError>
-where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
-    P: commonware_cryptography::certificate::Provider<
-            Scope = commonware_consensus::types::Epoch,
-            Scheme = Scheme,
-        >,
-    H: commonware_consensus::types::Epocher,
-{
-    let (actor, indexer, _) = init(
-        context.child("archive"),
-        partition_prefix,
-        &config,
-        Start::Genesis(genesis_block),
-        provider,
-        epocher,
-    )
-    .await;
-    let mailbox_size = NonZeroUsize::new(config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
-    let (resolver_rx, handler) = handler::init(context.child("marshal_resolver"), mailbox_size);
-    let resolver = commonware_resolver::opaque::init::<_, _, _, PublicKey>(
-        context.child("fixture_resolver"),
-        indexer.fixture_source.clone(),
-        handler,
-        mailbox_size,
-        std::time::Duration::from_secs(1),
-    );
-    let handle = actor.start_unbuffered(AutoAckApplication, (resolver_rx, resolver));
-    Ok((indexer.with_verifier(verifier), handle))
-}
-
 fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
     FinalizedBlock {
         snapshot: LatestBlock {
@@ -630,52 +267,6 @@ fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock 
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Copy)]
-struct AutoAckApplication;
-
-#[cfg(any(test, feature = "test-support"))]
-impl Reporter for AutoAckApplication {
-    type Activity = Update<HellasBlock>;
-
-    fn report(&mut self, update: Self::Activity) -> Feedback {
-        if let Update::Block(_, ack) = update {
-            ack.acknowledge();
-        }
-        Feedback::Ok
-    }
-}
-
-// Test producers expose their certified blocks through an in-memory source.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Default)]
-struct FixtureSource(
-    Arc<std::sync::Mutex<std::collections::BTreeMap<ResolverKey<Digest>, bytes::Bytes>>>,
-);
-#[cfg(any(test, feature = "test-support"))]
-impl commonware_resolver::opaque::Fetcher for FixtureSource {
-    type Key = ResolverKey<Digest>;
-    type Value = bytes::Bytes;
-    async fn fetch(&self, key: Self::Key) -> Option<Self::Value> {
-        self.0.lock().unwrap().get(&key).cloned()
-    }
-}
-
-#[cfg(test)]
+pub(crate) mod fixtures;
+#[cfg(all(test, feature = "full-node"))]
 mod tests;
-
-#[cfg(any(test, feature = "test-support"))]
-use commonware_consensus::{
-    Reporter,
-    marshal::{
-        Update,
-        resolver::handler::{self, Key as ResolverKey},
-    },
-    simplex::types::Activity,
-    types::FixedEpocher,
-};
-#[cfg(any(test, feature = "test-support"))]
-use commonware_cryptography::certificate::ConstantProvider;
-#[cfg(any(test, feature = "test-support"))]
-use commonware_utils::Acknowledgement;
-#[cfg(any(test, feature = "test-support"))]
-use std::num::NonZeroU64;

@@ -251,8 +251,8 @@ fn composition_policies() -> Vec<hellas_authority::model::grant::records::GrantP
 
 struct Provider {
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
-    node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
+    offer_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
     funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
     funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
@@ -270,6 +270,7 @@ struct RecoveringSetup {
     inner: MountedSetup,
     node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
+    offer_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
     funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
     funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
@@ -282,8 +283,15 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
         context: hellas_wire::TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
     {
+        let height = self.node.status().executed_height();
+        if height < self.offer_height.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(WireStatus::new(
+                hellas_wire::WireCode::Unavailable,
+                "held offer response",
+            ));
+        }
         if !request.funding_coins.is_empty() {
-            if self.funded_height.load(std::sync::atomic::Ordering::SeqCst) == u64::MAX {
+            if height < self.funded_height.load(std::sync::atomic::Ordering::SeqCst) {
                 self.unavailable
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return Err(WireStatus::new(
@@ -313,12 +321,6 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
                 }
                 self.funding_refusal
                     .store(0, std::sync::atomic::Ordering::SeqCst);
-            }
-            let height = self
-                .funded_height
-                .swap(0, std::sync::atomic::Ordering::SeqCst);
-            if height != 0 {
-                self.node.require_finalized_height_for_test(height);
             }
         }
         let result = self.inner.request_offer(request, context).await;
@@ -439,6 +441,7 @@ impl Provider {
         );
         let clock = WorkWatcher::spawn(runner);
         let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let offer_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let unavailable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let funding_refusal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let funding_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -446,6 +449,7 @@ impl Provider {
             inner: setup,
             node: node.clone(),
             funded_height: funded_height.clone(),
+            offer_height: offer_height.clone(),
             unavailable: unavailable.clone(),
             funding_refusal: funding_refusal.clone(),
             funding_requests: funding_requests.clone(),
@@ -500,8 +504,8 @@ impl Provider {
         });
         Self {
             enrollment,
-            node,
             funded_height,
+            offer_height,
             unavailable,
             funding_refusal,
             funding_requests,
@@ -741,8 +745,8 @@ async fn compute_and_settle_inner(
         .copied()
         .unwrap();
     provider
-        .node
-        .require_finalized_height_for_test(devnet.height() + 1);
+        .offer_height
+        .store(devnet.height() + 1, std::sync::atomic::Ordering::SeqCst);
     let mut unavailable_args = options.clone();
     unavailable_args.timeout = Some(Duration::from_millis(100));
     let started = tokio::time::Instant::now();

@@ -10,9 +10,10 @@ use crate::{
             run_qmdb,
         },
     },
-    indexer::spawn_archive,
+    indexer::fixtures::spawn_archive,
     owner_index::ApplyOutcome,
 };
+use commonware_codec::Encode as _;
 use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
@@ -26,7 +27,7 @@ struct ResponseFixture {
     client: LocalLightClient,
     database: UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: OwnerIndex,
-    chain_indexer: ChainIndexer,
+    chain_indexer: crate::indexer::fixtures::ArchiveSource,
     allocations: Vec<(SettlementKey, u64)>,
     contest: crate::HellasBlock,
     valid: PaymentCloseResponse,
@@ -239,7 +240,7 @@ async fn response_fixture_with_contests(
     .expect("chain indexer");
     for block in [&floor, &contest] {
         chain_indexer
-            .ingest_finalized(block.clone(), finalization(&consensus, block))
+            .publish_proof(block.clone(), &finalization(&consensus, block).encode())
             .await
             .expect("finalized ingest");
     }
@@ -256,7 +257,7 @@ async fn response_fixture_with_contests(
         database.clone(),
         owner_index.clone(),
         Mempool::default(),
-        chain_indexer.clone(),
+        chain_indexer.archive.clone(),
         ConsensusInfo {
             validators: Vec::new(),
             threshold_identity: Vec::new(),
@@ -485,7 +486,10 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
         let consensus = consensus_fixture(95);
         fixture
             .chain_indexer
-            .ingest_finalized(answered.clone(), finalization(&consensus, &answered))
+            .publish_proof(
+                answered.clone(),
+                &finalization(&consensus, &answered).encode(),
+            )
             .await
             .expect("answered block finalizes");
         assert_eq!(
@@ -591,7 +595,10 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
         let consensus = consensus_fixture(95);
         fixture
             .chain_indexer
-            .ingest_finalized(answered.clone(), finalization(&consensus, &answered))
+            .publish_proof(
+                answered.clone(),
+                &finalization(&consensus, &answered).encode(),
+            )
             .await
             .expect("answered block finalizes");
         assert_eq!(
@@ -623,7 +630,7 @@ async fn finalized_payload_indexer(
     context: commonware_runtime::tokio::Context,
     genesis: crate::HellasBlock,
     finalized: crate::HellasBlock,
-) -> (ChainIndexer, Handle<()>) {
+) -> (crate::indexer::fixtures::ArchiveSource, Handle<()>) {
     let fixture = consensus_fixture(91);
     let config = Config {
         mailbox_size: 32,
@@ -643,7 +650,10 @@ async fn finalized_payload_indexer(
     .await
     .expect("chain indexer");
     indexer
-        .ingest_finalized(finalized.clone(), finalization(&fixture, &finalized))
+        .publish_proof(
+            finalized.clone(),
+            &finalization(&fixture, &finalized).encode(),
+        )
         .await
         .expect("finalized floor ingest");
     (indexer, handle)
@@ -810,7 +820,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         .expect("chain indexer");
         for block in [&floor_block, &open_block] {
             chain_indexer
-                .ingest_finalized(block.clone(), finalization(&fixture, block))
+                .publish_proof(block.clone(), &finalization(&fixture, block).encode())
                 .await
                 .expect("finalized ingest");
         }
@@ -1301,7 +1311,7 @@ fn delegated_coin_rpc_lists_funding_without_owned_balance() {
             database.clone(),
             index.clone(),
             Mempool::default(),
-            chain_indexer.clone(),
+            chain_indexer.archive.clone(),
             ConsensusInfo {
                 validators: vec![],
                 threshold_identity: vec![],
@@ -1361,7 +1371,10 @@ fn delegated_coin_rpc_lists_funding_without_owned_balance() {
         let next_root = apply(&database, &[(owner, 100)], 2, std::slice::from_ref(&sweep)).await;
         let next = index_block(&block, next_root, vec![sweep]);
         chain_indexer
-            .ingest_finalized(next.clone(), finalization(&consensus_fixture(91), &next))
+            .publish_proof(
+                next.clone(),
+                &finalization(&consensus_fixture(91), &next).encode(),
+            )
             .await
             .unwrap();
         index.apply_finalized(&next).unwrap();
@@ -1391,7 +1404,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
             database.clone(),
             index.clone(),
             Mempool::default(),
-            chain_indexer.clone(),
+            chain_indexer.archive.clone(),
             ConsensusInfo {
                 validators: vec![],
                 threshold_identity: vec![],
@@ -1408,7 +1421,10 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         let root = apply(&database, &allocations, 2, std::slice::from_ref(&reshape)).await;
         let next = index_block(&floor, root, vec![reshape]);
         chain_indexer
-            .ingest_finalized(next.clone(), finalization(&consensus_fixture(91), &next))
+            .publish_proof(
+                next.clone(),
+                &finalization(&consensus_fixture(91), &next).encode(),
+            )
             .await
             .unwrap();
         assert_ne!(index.cursor().state_root, root);

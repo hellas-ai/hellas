@@ -132,7 +132,7 @@ fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds(
         .await
         .expect("the ChainSync server stopped");
         let (indexer, events, endpoint, database, verifier) = (
-            validator.indexer.clone(),
+            validator.indexer.archive.clone(),
             devnet.activity[0].clone(),
             validator.sync_endpoint.clone(),
             validator.database.clone(),

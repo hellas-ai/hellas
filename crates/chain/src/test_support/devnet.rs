@@ -1,10 +1,9 @@
-//! Six independently executing validators on one genesis document.
+//! Certified-history producer with six independent kernel databases.
 //!
-//! Only block ordering is a fixture: [`Devnet::seal`] plays the proposer,
-//! and every validator executes each block with its own kernel against its
-//! own QMDB. Each validator serves the light-client protocol over
-//! WebSocket and certified history over iroh ChainSync, so a test can run
-//! full nodes against it or a remote light client with no node at all.
+//! Ordering, signing, database commits and source publication are fixture-owned.
+//! This does not exercise live consensus or the validator's Stateful orchestration.
+//! The source serves the real light-client protocol and ChainSync; configured
+//! full nodes consume that history through production verification and execution.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -34,7 +33,7 @@ use crate::execution::store::{UtxoDatabase, utxo_db_config};
 use crate::execution::test_support::{ConsensusFixture, finalization, reshape_authorized};
 use crate::execution::{ChainVerifier, execute_all};
 use crate::genesis::GENESIS_SCHEMA_VERSION;
-use crate::indexer::spawn_archive;
+use crate::indexer::fixtures::spawn_archive;
 use crate::light_client::{ConsensusInfo, LightClient as _};
 use crate::owner_index::{ApplyOutcome, OwnerIndex};
 use crate::rpc::LocalLightClient;
@@ -182,7 +181,7 @@ pub struct DevnetConfig<'a> {
 struct Validator {
     database: UtxoDatabase<Runtime>,
     index: OwnerIndex,
-    indexer: crate::indexer::ChainIndexer,
+    indexer: crate::indexer::fixtures::ArchiveSource,
     mempool: Mempool,
     task: Handle<()>,
     light_client_url: String,
@@ -351,7 +350,7 @@ impl Devnet {
                 #[cfg(all(test, feature = "integration-tests"))]
                 let sync_endpoint = endpoint.clone();
                 let _sync_task = rpc.spawn(crate::node::transport::serve_validator_endpoint(
-                    indexer.clone(),
+                    indexer.archive.clone(),
                     events.clone(),
                     endpoint,
                     database.clone(),
@@ -365,7 +364,7 @@ impl Devnet {
                         database.clone(),
                         index.clone(),
                         mempool.clone(),
-                        indexer.clone(),
+                        indexer.archive.clone(),
                         consensus_info.clone(),
                     ),
                     events,
@@ -489,7 +488,7 @@ impl Devnet {
             validator.database.clone(),
             validator.index.clone(),
             validator.mempool.clone(),
-            validator.indexer.clone(),
+            validator.indexer.archive.clone(),
             self.consensus_info.clone(),
         )
     }
@@ -531,9 +530,8 @@ impl Devnet {
     /// since the last block goes into the next one, and all six execute
     /// it.
     ///
-    /// This is the simulated part, and it is simulated in exactly one
-    /// direction: the *ordering* is this function's, and the *execution*
-    /// is each validator's own kernel. A block whose six state roots
+    /// The fixture supplies ordering, certificates, commits and source publication;
+    /// execution uses each source database's actual kernel. A block whose six state roots
     /// disagree is refused here rather than finalized, so nothing a test
     /// asserts can rest on one validator's private opinion of the state.
     /// Returns once every full node this devnet started has executed it.
@@ -627,7 +625,7 @@ impl Devnet {
             for (validator, executed) in self.validators.iter().zip(executed) {
                 validator
                     .indexer
-                    .ingest_finalized(block.clone(), certificate.clone())
+                    .publish_proof(block.clone(), &certificate.clone().encode())
                     .await
                     .expect("a certified block is ingested");
                 validator.database.finalize(executed).await;

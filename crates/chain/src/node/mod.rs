@@ -6,7 +6,7 @@ use crate::{
     domain::{Digest, PublicKey},
     rpc::LocalLightClient,
 };
-#[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
+#[cfg(feature = "indexer-api")]
 use crate::{domain::SettlementKey, execution::store::UtxoDatabase};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
@@ -22,7 +22,10 @@ use std::{
 };
 use tokio::sync::watch;
 
+mod input;
 pub(crate) mod replication;
+#[cfg(feature = "indexer-api")]
+mod startup;
 pub(crate) mod transport;
 pub use transport::FullNode;
 
@@ -67,8 +70,6 @@ pub enum Error {
     Config(String),
     #[error("invalid finalized block: {0}")]
     InvalidBlock(String),
-    #[error("certified block execution failed: {0}")]
-    Execution(String),
     #[error("chain storage failed: {0}")]
     Storage(String),
     #[error(transparent)]
@@ -101,16 +102,54 @@ impl Config {
     }
 }
 
+/// Execution readiness relative to verified observations, never untrusted peer claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeStatus {
+    CatchingUp {
+        observed: Option<u64>,
+        executed: u64,
+    },
+    Ready {
+        height: u64,
+    },
+    Stopped {
+        observed: Option<u64>,
+        executed: u64,
+    },
+}
+
+impl NodeStatus {
+    pub fn executed_height(self) -> u64 {
+        match self {
+            Self::CatchingUp { executed, .. } | Self::Stopped { executed, .. } => executed,
+            Self::Ready { height } => height,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Readiness {
-    #[cfg(feature = "test-support")]
-    pub(crate) read_attempts: AtomicU64,
     seen: AtomicU64,
     pub(crate) applied: AtomicU64,
     observed: AtomicBool,
     halted: AtomicBool,
 }
 impl Readiness {
+    fn status(&self) -> NodeStatus {
+        let executed = self.applied.load(Ordering::Acquire);
+        let observed = self
+            .observed
+            .load(Ordering::Acquire)
+            .then(|| self.seen.load(Ordering::Acquire));
+        if self.halted.load(Ordering::Acquire) {
+            NodeStatus::Stopped { observed, executed }
+        } else if observed.is_some_and(|height| executed >= height) {
+            NodeStatus::Ready { height: executed }
+        } else {
+            NodeStatus::CatchingUp { observed, executed }
+        }
+    }
+
     pub(crate) fn running(&self) -> Result<(), QueryError> {
         if self.halted.load(Ordering::Acquire) {
             return Err(QueryError::StateUnavailable(
@@ -120,17 +159,15 @@ impl Readiness {
         Ok(())
     }
     pub(crate) fn check(&self) -> Result<(), QueryError> {
-        #[cfg(feature = "test-support")]
-        self.read_attempts.fetch_add(1, Ordering::AcqRel);
-        self.running()?;
-        if !self.observed.load(Ordering::Acquire)
-            || self.applied.load(Ordering::Acquire) < self.seen.load(Ordering::Acquire)
-        {
-            return Err(QueryError::StateUnavailable(
+        match self.status() {
+            NodeStatus::Ready { .. } => Ok(()),
+            NodeStatus::CatchingUp { .. } => Err(QueryError::StateUnavailable(
                 "chain node is catching up".into(),
-            ));
+            )),
+            NodeStatus::Stopped { .. } => Err(QueryError::StateUnavailable(
+                "chain execution halted".into(),
+            )),
         }
-        Ok(())
     }
 }
 
@@ -286,10 +323,9 @@ pub(crate) struct Core {
     _lock: std::fs::File,
     indexer: ChainIndexer,
     client: LocalLightClient,
-    #[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
+    #[cfg(feature = "indexer-api")]
     database: UtxoDatabase<runtime::Context>,
-    #[cfg(all(test, feature = "integration-tests"))]
-    trust: Trust,
+    input: input::FinalizedInput,
     #[cfg(feature = "indexer-api")]
     publication: Option<crate::edge_index::Publication>,
     readiness: Arc<Readiness>,
@@ -405,13 +441,6 @@ impl Core {
                     verifier.trust_sha256().into(),
                 )
                 .map_err(storage)?;
-                let recovered = startup
-                    .into_iter()
-                    .chain(processed)
-                    .map(|h| h.get())
-                    .max()
-                    .unwrap_or(0);
-                crate::edge_index::Publication::check_start(&index, recovered).map_err(storage)?;
                 if plan.floor().is_some() {
                     return Err(Error::Config(
                         "historical indexing requires replay from genesis".into(),
@@ -451,25 +480,105 @@ impl Core {
             NZUsize!(256),
             std::time::Duration::from_millis(500),
         );
+        #[cfg(feature = "indexer-api")]
+        let recovery_target = publication
+            .as_ref()
+            .map(|index| {
+                index.recovery_height().map(|height| {
+                    height.max(
+                        startup
+                            .into_iter()
+                            .chain(processed)
+                            .map(|h| h.get())
+                            .max()
+                            .unwrap_or(0),
+                    )
+                })
+            })
+            .transpose()
+            .map_err(storage)?;
+        #[cfg(feature = "indexer-api")]
+        let delivery =
+            recovery_target.map(|height| startup::Delivery::new(mailbox.clone(), height));
+        #[cfg(feature = "indexer-api")]
+        let archive_task = match &delivery {
+            Some(delivery) => actor.start_unbuffered(delivery.clone(), (receiver, resolver)),
+            None => actor.start_unbuffered(mailbox.clone(), (receiver, resolver)),
+        };
+        #[cfg(not(feature = "indexer-api"))]
         let archive_task = actor.start_unbuffered(mailbox.clone(), (receiver, resolver));
         let execution_task = execution.start();
-        let (feed_network, feed_indexer, feed_readiness) =
-            (network.clone(), indexer.clone(), readiness.clone());
-        let feed_task = context.child("live_feed").spawn(move |_| async move {
-            feed_network.feed(feed_indexer, feed_readiness).await;
-        });
-        let mut tasks = Tasks(vec![archive_task, execution_task, feed_task]);
+        let input =
+            input::FinalizedInput::new(indexer.clone(), readiness.clone(), network.trust.clone());
+        let mut tasks = Tasks(vec![archive_task, execution_task]);
+        // Fast state sync follows live targets during startup. Historical indexing
+        // replays from genesis and must reconcile publication before new input.
+        let defer_feed = {
+            #[cfg(feature = "indexer-api")]
+            {
+                publication.is_some()
+            }
+            #[cfg(not(feature = "indexer-api"))]
+            {
+                false
+            }
+        };
+        if !defer_feed {
+            let (network, input) = (network.clone(), input.clone());
+            tasks
+                .0
+                .push(context.child("live_feed").spawn(move |_| async move {
+                    network.feed(input).await;
+                }));
+        }
         let database = tokio::select! {
             database = mailbox.subscribe_databases() => database,
             _ = &mut *stopped => { tasks.stop(&context).await; return Err(Error::Query(QueryError::ChannelClosed)); }
         };
-        let restored = crate::execution::pipeline::restore(
-            &indexer,
-            &database,
-            &owner,
-            startup.into_iter().chain(processed).max(),
-        )
-        .await;
+        let restore = || {
+            crate::execution::pipeline::restore(
+                &indexer,
+                &database,
+                &owner,
+                startup.into_iter().chain(processed).max(),
+                &genesis,
+            )
+        };
+        #[cfg(feature = "indexer-api")]
+        if let Some(target) = recovery_target {
+            let recovery = async {
+                let mut changes = progress.subscribe();
+                let initial = restore().await?;
+                if initial < target {
+                    if indexer
+                        .marshal
+                        .get_block(commonware_consensus::types::Height::new(target))
+                        .await
+                        .is_none()
+                    {
+                        return Err(QueryError::StateUnavailable(
+                            "published checkpoint is absent from the archive".into(),
+                        ));
+                    }
+                    while *changes.borrow_and_update() < target {
+                        changes
+                            .changed()
+                            .await
+                            .map_err(|_| QueryError::ChannelClosed)?;
+                    }
+                }
+                Ok::<_, QueryError>(())
+            };
+            let result = tokio::select! {
+                result = tokio::time::timeout(RECOVERY_TIMEOUT, recovery) => result.map_err(storage).and_then(|result| result.map_err(Error::from)),
+                _ = &mut *stopped => Err(Error::Query(QueryError::ChannelClosed)),
+            };
+            if let Err(error) = result {
+                tasks.stop(&context).await;
+                return Err(error);
+            }
+        }
+        let restored = restore().await;
         let restored = match restored {
             Ok(height) => height,
             Err(error) => {
@@ -477,8 +586,49 @@ impl Core {
                 return Err(error.into());
             }
         };
+        #[cfg(feature = "indexer-api")]
+        if let Some(publication) = &publication {
+            let checkpoint = if restored == 0 {
+                genesis.clone()
+            } else {
+                match indexer
+                    .marshal
+                    .get_block(commonware_consensus::types::Height::new(restored))
+                    .await
+                {
+                    Some(block) => block,
+                    None => {
+                        tasks.stop(&context).await;
+                        return Err(storage("recovered index checkpoint is absent from archive"));
+                    }
+                }
+            };
+            if let Err(error) = publication.recover(&database, &checkpoint).await {
+                tasks.stop(&context).await;
+                return Err(storage(error));
+            }
+        }
+        #[cfg(feature = "indexer-api")]
+        if let Some(delivery) = &delivery
+            && let Err(error) = delivery.resume()
+        {
+            tasks.stop(&context).await;
+            return Err(error);
+        }
+        if defer_feed {
+            let (network, input) = (network.clone(), input.clone());
+            tasks
+                .0
+                .push(context.child("live_feed").spawn(move |_| async move {
+                    network.feed(input).await;
+                }));
+        }
         readiness.applied.fetch_max(restored, Ordering::AcqRel);
-        progress.send_replace(restored);
+        progress.send_if_modified(|height| {
+            let advanced = *height < restored;
+            *height = (*height).max(restored);
+            advanced
+        });
         if let Some(retain) = config.archive_blocks {
             let height = readiness.applied.load(Ordering::Acquire);
             indexer.retain_from(
@@ -498,24 +648,15 @@ impl Core {
             _lock: lock,
             indexer,
             client,
-            #[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
+            #[cfg(feature = "indexer-api")]
             database,
-            #[cfg(all(test, feature = "integration-tests"))]
-            trust: network.trust.clone(),
+            input,
             readiness,
             progress,
             #[cfg(feature = "indexer-api")]
             publication,
             tasks: std::sync::Mutex::new(tasks),
         }))
-    }
-    #[cfg(all(test, feature = "integration-tests"))]
-    fn applied(&self) -> u64 {
-        self.readiness.applied.load(Ordering::Acquire)
-    }
-    #[cfg(all(test, feature = "integration-tests"))]
-    fn observe(&self, incoming: &FinalizedBlock) -> Result<HellasBlock, Error> {
-        self.readiness.observe(&self.trust, incoming)
     }
 }
 impl Readiness {

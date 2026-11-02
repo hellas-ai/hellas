@@ -1,25 +1,16 @@
-use crate::ConsensusInfo;
 use crate::HellasBlock;
-use crate::consensus::{ConsensusVerifier, Finalization};
-use crate::domain::{
-    ObjectId, PrivateKey, PublicKey, Scheme, SettlementKey, ThresholdVariant, Transaction,
-    genesis_object_id,
-};
+use crate::domain::{ObjectId, PrivateKey, SettlementKey, Transaction, genesis_object_id};
 use crate::execution::store::UtxoSyncTarget;
-use commonware_codec::Encode;
 use commonware_consensus::{
     CertifiableBlock, Heightable,
-    simplex::types::{Context, Finalize, Proposal},
+    simplex::types::Context,
     types::{Epoch, Height, Round, View},
 };
-use commonware_cryptography::{
-    Digest as _, Digestible, Signer as _, bls12381::dkg::feldman_desmedt::deal, ed25519,
-};
-use commonware_parallel::Sequential;
+use commonware_cryptography::{Digest as _, Digestible, Signer as _, ed25519};
 #[cfg(any(feature = "validator", feature = "full-node"))]
 use commonware_runtime::{Runner as _, tokio};
 use commonware_storage::{merkle::Location, mmr};
-use commonware_utils::{N3f1, non_empty_range, ordered::Set};
+use commonware_utils::non_empty_range;
 #[cfg(any(feature = "validator", feature = "full-node"))]
 use core::future::Future;
 use hellas_kernel::{
@@ -27,92 +18,13 @@ use hellas_kernel::{
     MAX_PARTY_INPUTS, Parties, PartyAuth, PartyKeys, Payout, Proof, ProtocolCode, SoftPasskey,
     SoftPasskeyError, Terms, Tx,
 };
-use rand::{SeedableRng, rngs::StdRng};
 
-pub(crate) struct ConsensusFixture {
-    pub(crate) schemes: Vec<Scheme>,
-    pub(crate) assembler: Scheme,
-    pub(crate) verifier: ConsensusVerifier,
-    pub(crate) leaders: Vec<PublicKey>,
-}
+#[cfg(feature = "full-node")]
+mod consensus;
+#[cfg(feature = "full-node")]
+pub(crate) use consensus::*;
 
-pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
-    consensus_fixture_of(seed, 4)
-}
-
-/// The same committee, at a caller-chosen size.
-///
-/// The count is a parameter because the shipped devnet document names
-/// six validators and the suites written before it named four; a
-/// fixture that could only be four would make "the shipped validator
-/// count" untestable.
-pub(crate) fn consensus_fixture_of(seed: u64, validators: u64) -> ConsensusFixture {
-    consensus_fixture_in(
-        seed,
-        validators,
-        crate::domain::TEST_NETWORK,
-        [0; 32].into(),
-    )
-}
-
-pub(crate) fn consensus_fixture_in(
-    seed: u64,
-    validators: u64,
-    network: hellas_kernel::NetworkId,
-    genesis: commonware_cryptography::sha256::Digest,
-) -> ConsensusFixture {
-    let namespace = crate::consensus_namespace(network, genesis);
-    let private_keys = (0..validators)
-        .map(|offset| ed25519::PrivateKey::from_seed(seed + offset))
-        .collect::<Vec<_>>();
-    let leaders = private_keys
-        .iter()
-        .map(|key| key.public_key())
-        .collect::<Vec<_>>();
-    let participants = Set::try_from(leaders.clone()).expect("unique participants");
-    let mut rng = StdRng::seed_from_u64(seed);
-    let (output, shares) =
-        deal::<ThresholdVariant, _, N3f1>(&mut rng, Default::default(), participants.clone())
-            .expect("threshold deal");
-    let polynomial = output.public().clone();
-    let schemes = private_keys
-        .iter()
-        .map(|key| {
-            let share = shares.get_value(&key.public_key()).expect("share").clone();
-            Scheme::signer(&namespace, participants.clone(), polynomial.clone(), share)
-                .expect("scheme")
-        })
-        .collect::<Vec<_>>();
-    let assembler = Scheme::verifier(&namespace, participants, polynomial);
-    let info = ConsensusInfo {
-        network_id: network.as_str().to_string(),
-        validators: leaders
-            .iter()
-            .map(|public_key| hex::encode(public_key.encode()))
-            .collect(),
-        threshold_identity: assembler.identity().encode().to_vec(),
-    };
-    let verifier = ConsensusVerifier::new(&info, genesis).expect("verifier");
-    ConsensusFixture {
-        schemes,
-        assembler,
-        verifier,
-        leaders,
-    }
-}
-
-pub(crate) fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> Finalization {
-    let context = block.context();
-    let proposal = Proposal::new(context.round, context.parent.0, block.digest());
-    let votes = fixture
-        .schemes
-        .iter()
-        .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("finalize vote"))
-        .collect::<Vec<_>>();
-    Finalization::from_finalizes(&fixture.assembler, &votes, &Sequential).expect("finalization")
-}
-
-// Drives a QMDB runtime for the app and replay tests; the `indexer`-only
+// Drives a QMDB runtime for the app and indexed-node tests; the `indexer`-only
 // build compiles neither.
 #[cfg(any(feature = "validator", feature = "full-node"))]
 pub(crate) fn run_qmdb<F, Fut, T>(test: F) -> T

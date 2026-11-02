@@ -27,7 +27,8 @@ Their release checks
 (`check-validator`, `check-chain-setup`, `check-sdk-paid-work`, `check-cli`)
 enable it explicitly; validator-backed suites run serially. The full integration
 suite remains a mandatory PR check (`check-regressions`), using workspace feature
-selection and serial test execution. Existing tests requiring a GPU, model
+selection plus `hellas-chain/indexer-api` and serial test execution. Indexed
+startup and HTTP tests exercise the same production node as the deployed API. Existing tests requiring a GPU, model
 files or a special process environment remain individually ignored.
 
 `check-model-programs` explicitly runs the ignored Qwen3/Whisper/Flux compilation

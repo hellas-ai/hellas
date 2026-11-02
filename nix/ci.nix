@@ -78,7 +78,7 @@ let
     ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
     regressions = mkCargo "check-regressions" ''
-      cargo test --locked --workspace --features integration-tests -- --test-threads=1
+      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api -- --test-threads=1
     '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
@@ -88,7 +88,7 @@ let
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy =
       mkCargo "check-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests -- -D warnings"
+        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api -- -D warnings"
         (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.
@@ -225,7 +225,7 @@ let
         (cargoEnv rustToolchain);
     chain-indexer-lint =
       mkCargo "check-chain-indexer-lint"
-        "cargo clippy -p hellas-chain --no-default-features --features indexer --all-targets -- -D warnings && cargo clippy -p hellas-chain --no-default-features --features indexer-api --all-targets -- -D warnings"
+        "cargo clippy -p hellas-chain --no-default-features --features indexer --all-targets -- -D warnings && cargo clippy -p hellas-chain --no-default-features --features indexer-api,integration-tests --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The finalized-block codec without a database or a mempool: the
     # feature an endpoint enables to read the block its channel opened
@@ -255,7 +255,7 @@ let
     # during its bounded readiness wait.
     chain-setup =
       mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,integration-tests -- --test-threads=1"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,indexer-api,integration-tests -- --test-threads=1"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
@@ -351,7 +351,7 @@ let
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
     clippy =
       mkCargo "fix-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests --fix --allow-dirty --allow-staged"
+        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };

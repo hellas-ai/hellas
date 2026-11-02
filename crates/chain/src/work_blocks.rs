@@ -458,10 +458,11 @@ mod tests {
         consensus_fixture, finalization, index_genesis, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
-    use crate::indexer::spawn_archive;
+    use crate::indexer::fixtures::spawn_archive;
     use crate::light_client::ConsensusInfo;
     use crate::owner_index::{ApplyOutcome, OwnerIndex};
     use crate::rpc::LocalLightClient;
+    use commonware_codec::Encode as _;
     use commonware_cryptography::Digestible as _;
 
     /// What the client funds its payment channel with.
@@ -591,7 +592,7 @@ mod tests {
     struct Chain {
         database: UtxoDatabase<commonware_runtime::tokio::Context>,
         index: OwnerIndex,
-        indexer: crate::indexer::ChainIndexer,
+        indexer: crate::indexer::fixtures::ArchiveSource,
         mempool: Mempool,
         fixture: crate::execution::test_support::ConsensusFixture,
         allocations: Vec<(SettlementKey, u64)>,
@@ -656,7 +657,7 @@ mod tests {
                 self.database.clone(),
                 self.index.clone(),
                 self.mempool.clone(),
-                self.indexer.clone(),
+                self.indexer.archive.clone(),
                 ConsensusInfo {
                     validators: Vec::new(),
                     threshold_identity: Vec::new(),
@@ -709,7 +710,7 @@ mod tests {
                 fresh,
             );
             self.indexer
-                .ingest_finalized(block.clone(), finalization(&self.fixture, &block))
+                .publish_proof(block.clone(), &finalization(&self.fixture, &block).encode())
                 .await
                 .expect("finalized ingest");
             self.database.finalize(merkleized).await;

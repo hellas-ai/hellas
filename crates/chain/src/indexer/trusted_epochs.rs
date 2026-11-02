@@ -1,7 +1,17 @@
 use super::*;
+use crate::ConsensusVerifier;
+
 use commonware_consensus::types::{Epoch, EpochInfo, Epocher};
 use commonware_cryptography::certificate::{Provider, Scoped};
 use hellas_genesis::TrustDocument;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TrustError {
+    #[error("invalid trust schedule: {0}")]
+    Schedule(String),
+    #[error(transparent)]
+    Consensus(#[from] crate::consensus::ConsensusVerificationError),
+}
 
 #[derive(Clone)]
 pub(crate) struct TrustedEpochs {
@@ -10,12 +20,12 @@ pub(crate) struct TrustedEpochs {
 }
 impl TrustedEpochs {
     #[cfg(test)]
-    pub fn new(trust: TrustDocument) -> Result<Self, IngestError> {
+    pub fn new(trust: TrustDocument) -> Result<Self, TrustError> {
         Self::with_genesis(trust, hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes())
     }
-    pub fn with_genesis(trust: TrustDocument, genesis_json: &[u8]) -> Result<Self, IngestError> {
+    pub fn with_genesis(trust: TrustDocument, genesis_json: &[u8]) -> Result<Self, TrustError> {
         crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)
-            .map_err(|error| IngestError::TrustSchedule(error.to_string()))?;
+            .map_err(|error| TrustError::Schedule(error.to_string()))?;
         // Marshal's transition logic asks for epoch.next(), so native ingestion requires
         // consecutive round epochs even though an offline verifier can inspect sparse IDs.
         if trust
@@ -24,12 +34,12 @@ impl TrustedEpochs {
             .enumerate()
             .any(|(position, epoch)| epoch.epoch != position as u64)
         {
-            return Err(IngestError::TrustSchedule(
+            return Err(TrustError::Schedule(
                 "native marshal requires consecutive epochs beginning at zero".into(),
             ));
         }
         let genesis = serde_json::from_slice(genesis_json)
-            .map_err(|e| IngestError::TrustSchedule(e.to_string()))?;
+            .map_err(|e| TrustError::Schedule(e.to_string()))?;
         let genesis_digest = crate::genesis_digest(&genesis);
         let verifiers = trust
             .epochs
@@ -50,25 +60,6 @@ impl TrustedEpochs {
             trust: Arc::new(trust),
             verifiers: Arc::new(verifiers),
         })
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn verifier(
-        &self,
-        height: Height,
-        epoch: Epoch,
-    ) -> Result<&ConsensusVerifier, IngestError> {
-        let selected = self
-            .trust
-            .epoch_at(height.get())
-            .map_err(|error| IngestError::TrustSchedule(error.to_string()))?;
-        if selected.epoch != epoch.get() {
-            return Err(IngestError::TrustSchedule(
-                "certificate epoch disagrees with finalized height".into(),
-            ));
-        }
-        self.verifiers
-            .get(epoch.get() as usize)
-            .ok_or_else(|| IngestError::TrustSchedule("unknown certificate epoch".into()))
     }
 }
 impl Epocher for TrustedEpochs {
@@ -118,8 +109,8 @@ mod tests {
     use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustEpoch};
 
     #[test]
-    fn follower_accepts_rotated_threshold_keys_only_at_the_scheduled_height() {
-        deterministic::Runner::default().start(|context| async move {
+    fn proof_verifier_accepts_rotated_threshold_keys_only_at_the_scheduled_height() {
+        deterministic::Runner::default().start(|_context| async move {
             let first = crate::execution::test_support::consensus_fixture_in(
                 501,
                 4,
@@ -171,31 +162,23 @@ mod tests {
                 base.sync_target(),
                 Vec::new(),
             );
-            let (indexer, _handle) =
-                spawn_trusted_archive(context, "rotated-origin", Config::default(), trust, genesis)
-                    .await
-                    .unwrap();
-            indexer
-                .ingest_finalized(block1.clone(), finalization(&first, &block1))
-                .await
-                .unwrap();
-            assert!(
-                indexer
-                    .ingest_finalized(block2.clone(), finalization(&first, &block2))
-                    .await
-                    .is_err()
-            );
-            assert!(matches!(
-                indexer
-                    .ingest_finalized(base.clone(), finalization(&second, &base))
-                    .await,
-                Err(IngestError::TrustSchedule(_))
-            ));
-            indexer
-                .ingest_finalized(block2.clone(), finalization(&second, &block2))
-                .await
-                .unwrap();
-            assert_eq!(indexer.get_latest_block().await.unwrap().unwrap().height, 2);
+            let verifier = crate::proof_verify::ProofVerifier::new(trust).unwrap();
+            let check = |block: &HellasBlock, committee| {
+                let bundle = verifier.bundle(super::finalized_block(
+                    block.clone(),
+                    finalization(committee, block).encode().to_vec(),
+                ));
+                verifier.verify(
+                    bundle,
+                    crate::proof_verify::ProofQuery::Block(crate::FinalizedBlockQuery::Height(
+                        block.height().get(),
+                    )),
+                )
+            };
+            check(&block1, &first).unwrap();
+            assert!(check(&block2, &first).is_err());
+            assert!(check(&base, &second).is_err());
+            check(&block2, &second).unwrap();
         });
     }
 }
