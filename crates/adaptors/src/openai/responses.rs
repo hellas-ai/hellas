@@ -642,6 +642,7 @@ fn project_input_item(value: &JsonValue) -> AdaptorResult<InputItem> {
                 role,
                 content: project_content(content)?,
                 name: optional_string(object, "name")?,
+                tool_calls: Vec::new(),
             }))
         }
         "function_call_output" => Ok(InputItem::ToolResult {

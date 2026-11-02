@@ -36,9 +36,9 @@ pub use backend::{
 };
 pub use error::{AdaptorError, AdaptorResult};
 pub use execution::{
-    CanonicalExecution, ContentPart, ExecutionErrorInfo, ExecutionRequest, ExecutionResult, Input,
-    InputItem, Message, ModelRef, OutputItem, Provenance, ReasoningOptions, ResponseFormat,
-    SamplingOptions, ToolChoice, ToolKind, ToolSpec,
+    CanonicalExecution, ContentPart, ExecutionErrorInfo, ExecutionRequest, ExecutionResult,
+    HistoricalToolCall, Input, InputItem, Message, ModelRef, OutputItem, Provenance,
+    ReasoningOptions, ResponseFormat, SamplingOptions, ToolChoice, ToolKind, ToolSpec,
 };
 // The streaming vocabulary the adaptors produce and consume is protocol
 // surface owned by hellas-rpc (it is committed inside signed fetch
