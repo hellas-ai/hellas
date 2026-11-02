@@ -257,121 +257,120 @@ struct RetainedSetup {
     offer: SignedPaidOffer,
 }
 
-async fn retained_setups(
-    journal_root: &std::path::Path,
-    network: hellas_kernel::NetworkId,
+/// Open setup journals retained through source selection, so the floor and
+/// selected offer come from the same discovery and journal locks.
+pub(crate) struct RetainedSetups {
+    setups: Vec<RetainedSetup>,
     provider: hellas_client::ProviderAddress,
-) -> Result<Vec<RetainedSetup>> {
-    let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
-    if !found.unidentified.is_empty() {
-        return Err(PaidClientError::MissingState("unidentified client journal"));
-    }
-    let mut retained = Vec::new();
-    for setup in found
-        .setups
-        .into_iter()
-        .filter(|setup| setup.role == Role::Client)
-    {
-        let store = SetupStore::open(
-            journal_root,
-            network,
-            setup.bond_edge,
-            Role::Client,
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
-        let Some((_, offer)) = store.state().offer() else {
-            return Err(PaidClientError::MissingState("client offer"));
-        };
-        if hellas_authority::model::grant::records::grant_transport(&offer.offer().provider)
-            .map_err(|_| PaidClientError::ProviderIdentityChanged)?
-            != *provider.node.as_bytes()
+}
+
+impl RetainedSetups {
+    pub(crate) async fn discover(
+        journal_root: &std::path::Path,
+        network: hellas_kernel::NetworkId,
+        provider: hellas_client::ProviderAddress,
+    ) -> Result<Self> {
+        let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
+        if !found.unidentified.is_empty() {
+            return Err(PaidClientError::MissingState("unidentified client journal"));
+        }
+        let mut retained = Vec::new();
+        for setup in found
+            .setups
+            .into_iter()
+            .filter(|setup| setup.role == Role::Client)
         {
-            continue;
-        }
-        if matches!(
-            store.state().end(),
-            Some(
-                hellas_channel::work_store::SetupEnd::Aborted(_)
-                    | hellas_channel::work_store::SetupEnd::Faulted(_)
+            let store = SetupStore::open(
+                journal_root,
+                network,
+                setup.bond_edge,
+                Role::Client,
+                &Secp256k1Verifier::new(),
             )
-        ) {
-            continue;
-        }
-        let offer = offer.clone();
-        retained.push(RetainedSetup { store, offer });
-    }
-    Ok(retained)
-}
-
-/// The highest finalized height any retained client journal addressed to
-/// `provider` already relies on, discovered without selecting a source.
-///
-/// Paid startup and paid-pool policy loading both read retained journals
-/// before they can do anything useful, so they must choose a source that can
-/// serve this floor rather than a fast one their own height guard will
-/// reject.
-pub(crate) async fn retained_floor(
-    journal_root: &std::path::Path,
-    network: hellas_kernel::NetworkId,
-    provider: hellas_client::ProviderAddress,
-) -> Result<u64> {
-    Ok(retained_setups(journal_root, network, provider)
-        .await?
-        .iter()
-        .map(|retained| journal_floor(&retained.store))
-        .max()
-        .unwrap_or(0))
-}
-
-pub(crate) async fn retained_offer<
-    C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
->(
-    journal_root: &std::path::Path,
-    network: hellas_kernel::NetworkId,
-    provider: hellas_client::ProviderAddress,
-    chain: &WorkBlocks<C>,
-) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
-    let mut retained = None;
-    for RetainedSetup { store, offer } in retained_setups(journal_root, network, provider).await? {
-        let chain = chain.clone().with_min_height(journal_floor(&store));
-        if store.state().end() != Some(hellas_channel::work_store::SetupEnd::Complete) {
-            let snapshot = chain
-                .work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: store.state().bond_edge(),
-                    payment_edge: store.state().payment_edge(),
-                    funding: store.state().funding_coins(),
-                })
-                .await?
-                .ok_or(PaidClientError::MissingState("finalized incomplete setup"))?;
-            if snapshot.block().height >= offer.offer().proposal.bond_terms().timeout.get()
-                && snapshot.payment().is_none()
+            .await?;
+            let Some((_, offer)) = store.state().offer() else {
+                return Err(PaidClientError::MissingState("client offer"));
+            };
+            if hellas_authority::model::grant::records::grant_transport(&offer.offer().provider)
+                .map_err(|_| PaidClientError::ProviderIdentityChanged)?
+                != *provider.node.as_bytes()
             {
                 continue;
             }
-        }
-        if let Some(payment) = store.state().payment_edge()
-            && store.state().end() == Some(hellas_channel::work_store::SetupEnd::Complete)
-        {
-            let snapshot = chain
-                .work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: store.state().bond_edge(),
-                    payment_edge: Some(payment),
-                    funding: Default::default(),
-                })
-                .await?
-                .ok_or(PaidClientError::MissingState("finalized client channel"))?;
-            if snapshot.payment().is_none() {
+            if matches!(
+                store.state().end(),
+                Some(
+                    hellas_channel::work_store::SetupEnd::Aborted(_)
+                        | hellas_channel::work_store::SetupEnd::Faulted(_)
+                )
+            ) {
                 continue;
             }
+            let offer = offer.clone();
+            retained.push(RetainedSetup { store, offer });
         }
-        if offer.offer().provider.content_id() != provider.enrollment {
-            return Err(PaidClientError::RetainedEnrollment(provider));
-        }
-        if retained.is_some() {
-            return Err(PaidClientError::AmbiguousRecovery);
-        }
-        retained = Some((store, offer));
+        Ok(Self {
+            setups: retained,
+            provider,
+        })
     }
-    Ok(retained)
+
+    pub(crate) fn floor(&self) -> u64 {
+        self.setups
+            .iter()
+            .map(|entry| journal_floor(&entry.store))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) async fn select<
+        C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
+    >(
+        self,
+        chain: &WorkBlocks<C>,
+    ) -> Result<Option<(SetupStore, SignedPaidOffer)>> {
+        let provider = self.provider;
+        let mut retained = None;
+        for RetainedSetup { store, offer } in self.setups {
+            let chain = chain.clone().with_min_height(journal_floor(&store));
+            if store.state().end() != Some(hellas_channel::work_store::SetupEnd::Complete) {
+                let snapshot = chain
+                    .work_channel_snapshot(WorkChannelQuery {
+                        bond_edge: store.state().bond_edge(),
+                        payment_edge: store.state().payment_edge(),
+                        funding: store.state().funding_coins(),
+                    })
+                    .await?
+                    .ok_or(PaidClientError::MissingState("finalized incomplete setup"))?;
+                if snapshot.block().height >= offer.offer().proposal.bond_terms().timeout.get()
+                    && snapshot.payment().is_none()
+                {
+                    continue;
+                }
+            }
+            if let Some(payment) = store.state().payment_edge()
+                && store.state().end() == Some(hellas_channel::work_store::SetupEnd::Complete)
+            {
+                let snapshot = chain
+                    .work_channel_snapshot(WorkChannelQuery {
+                        bond_edge: store.state().bond_edge(),
+                        payment_edge: Some(payment),
+                        funding: Default::default(),
+                    })
+                    .await?
+                    .ok_or(PaidClientError::MissingState("finalized client channel"))?;
+                if snapshot.payment().is_none() {
+                    continue;
+                }
+            }
+            if offer.offer().provider.content_id() != provider.enrollment {
+                return Err(PaidClientError::RetainedEnrollment(provider));
+            }
+            if retained.is_some() {
+                return Err(PaidClientError::AmbiguousRecovery);
+            }
+            retained = Some((store, offer));
+        }
+        Ok(retained)
+    }
 }

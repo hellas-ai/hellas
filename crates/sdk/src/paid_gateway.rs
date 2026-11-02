@@ -131,6 +131,7 @@ async fn provider_policy<
     C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
 >(
     args: &PaidWorkOptions,
+    setups: crate::paid_client::offer::RetainedSetups,
     chain: hellas_chain::WorkBlocks<C>,
     endpoint: &Endpoint,
     settlement_key: &Secp256k1Signer,
@@ -140,27 +141,18 @@ async fn provider_policy<
         args.config.poll,
         crate::paid_client::read_timeout(args.timeout),
     );
-    Ok(
-        match crate::paid_client::offer::retained_offer(
-            &args.journal_root,
-            args.config.chain.network,
-            args.provider,
-            &chain,
-        )
-        .await?
-        {
-            Some((_, signed)) => signed.offer().policy.clone(),
-            None => {
-                tokio::time::timeout(
-                    request_timeout(args),
-                    crate::paid_client::request_paid_quote(args, endpoint, settlement_key, owner),
-                )
-                .await
-                .map_err(|_| PoolError::ConnectionTimeout(request_timeout(args)))??
-                .policy
-            }
-        },
-    )
+    Ok(match setups.select(&chain).await? {
+        Some((_, signed)) => signed.offer().policy.clone(),
+        None => {
+            tokio::time::timeout(
+                request_timeout(args),
+                crate::paid_client::request_paid_quote(args, endpoint, settlement_key, owner),
+            )
+            .await
+            .map_err(|_| PoolError::ConnectionTimeout(request_timeout(args)))??
+            .policy
+        }
+    })
 }
 
 impl PaidGateway {
@@ -196,12 +188,13 @@ impl PaidGateway {
         for args in options.providers {
             // Retained policy journals can depend on a height behind a fast
             // validator; select a source that already serves it.
-            let floor = crate::paid_client::offer::retained_floor(
+            let setups = crate::paid_client::offer::RetainedSetups::discover(
                 &args.journal_root,
                 args.config.chain.network,
                 args.provider,
             )
             .await?;
+            let floor = setups.floor();
             let remote = crate::client_chain::connect_at(
                 &args.config,
                 crate::paid_client::read_timeout(args.timeout),
@@ -210,9 +203,15 @@ impl PaidGateway {
             .await
             .map_err(PaidClientError::from)?;
             let chain = hellas_chain::WorkBlocks::new(remote).with_min_height(floor);
-            let policy =
-                provider_policy(&args, chain, &endpoint, &settlement_key, owner.principal())
-                    .await?;
+            let policy = provider_policy(
+                &args,
+                setups,
+                chain,
+                &endpoint,
+                &settlement_key,
+                owner.principal(),
+            )
+            .await?;
             if policy.payment_policy.fixed_price != args.expected_price {
                 return Err(PoolError::Price {
                     provider: args.provider,
@@ -773,7 +772,20 @@ mod tests {
                 let key = signer(1);
                 node.require_finalized_height_for_test(devnet.height() + 1);
                 let policy = {
-                    let read = provider_policy(&args, chain.clone(), &endpoint, &key, owner);
+                    let read = provider_policy(
+                        &args,
+                        crate::paid_client::offer::RetainedSetups::discover(
+                            &args.journal_root,
+                            args.config.chain.network,
+                            args.provider,
+                        )
+                        .await
+                        .unwrap(),
+                        chain.clone(),
+                        &endpoint,
+                        &key,
+                        owner,
+                    );
                     tokio::pin!(read);
                     assert!(
                         tokio::time::timeout(args.config.poll, &mut read)
@@ -789,7 +801,20 @@ mod tests {
                 let started = tokio::time::Instant::now();
                 let error = tokio::time::timeout(
                     Duration::from_secs(5),
-                    provider_policy(&args, chain, &endpoint, &key, owner),
+                    provider_policy(
+                        &args,
+                        crate::paid_client::offer::RetainedSetups::discover(
+                            &args.journal_root,
+                            args.config.chain.network,
+                            args.provider,
+                        )
+                        .await
+                        .unwrap(),
+                        chain,
+                        &endpoint,
+                        &key,
+                        owner,
+                    ),
                 )
                 .await
                 .unwrap()

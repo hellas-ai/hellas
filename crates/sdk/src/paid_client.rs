@@ -471,19 +471,18 @@ impl PaidWorkSession {
         // Retained journals can already depend on a height a fast validator
         // has not reached. Establish that floor before a source is chosen;
         // recovery reads below it would only be refused by the same guard.
-        let floor =
-            offer::retained_floor(&args.journal_root, config.chain.network, args.provider).await?;
+        let setups = offer::RetainedSetups::discover(
+            &args.journal_root,
+            config.chain.network,
+            args.provider,
+        )
+        .await?;
+        let floor = setups.floor();
         let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
         let chain = WorkBlocks::new(remote.clone())
             .with_read_retry(config.poll, read_timeout)
             .with_min_height(floor);
-        let retained = offer::retained_offer(
-            &args.journal_root,
-            config.chain.network,
-            args.provider,
-            &chain,
-        )
-        .await?;
+        let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
         let (store, signed) = match retained {
             Some(retained) => retained,
