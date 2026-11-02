@@ -48,6 +48,7 @@ pub struct Usage {
     pub overflow: bool,
     mode: Mode,
     pending: Vec<u8>,
+    line_scan: usize,
     frame: Vec<u8>,
     decoded_bytes: usize,
     usage_chunks: usize,
@@ -74,6 +75,7 @@ impl Usage {
         self.cached = None;
         self.cache_write = None;
         self.pending.clear();
+        self.line_scan = 0;
         self.frame.clear();
     }
     pub fn push(&mut self, bytes: &[u8]) {
@@ -116,26 +118,37 @@ impl Usage {
     /// trailing CR waits for the next byte so a split CRLF is not misread as
     /// two terminators. At EOF the remaining bytes are the final line.
     fn lines(&mut self, eof: bool) {
+        let mut consumed = 0;
+        let mut scan = self.line_scan;
         while self.sse {
-            let Some(end) = self.pending.iter().position(|b| matches!(b, b'\n' | b'\r')) else {
+            let Some(offset) = self.pending[scan..]
+                .iter()
+                .position(|b| matches!(b, b'\n' | b'\r'))
+            else {
+                scan = self.pending.len();
                 break;
             };
+            let end = scan + offset;
             if !eof && self.pending[end] == b'\r' && end + 1 == self.pending.len() {
+                // Revisit this CR when the following byte determines whether
+                // it is a CRLF pair or a bare CR terminator.
+                scan = end;
                 break;
             }
-            // CRLF is one terminator even when its bytes arrive in separate
-            // chunks. Consuming only the CR would leave the LF to be read as
-            // the empty line that dispatches a half-built frame.
             let crlf = self.pending[end] == b'\r' && self.pending.get(end + 1) == Some(&b'\n');
-            let mut line: Vec<_> = self.pending.drain(..end + 1 + usize::from(crlf)).collect();
-            line.truncate(end);
+            let line = self.pending[consumed..end].to_vec();
+            consumed = end + 1 + usize::from(crlf);
+            scan = consumed;
             self.line(&line);
             if self.fault.is_some() {
                 return;
             }
         }
+        self.pending.drain(..consumed);
+        self.line_scan = scan - consumed;
         if eof && !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
+            self.line_scan = 0;
             self.line(&line);
         }
     }

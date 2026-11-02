@@ -230,3 +230,24 @@ fn strict_identity_decode_and_sse_pending_limits_cannot_be_bypassed() {
         assert_eq!(usage.strict_usage(), Err(UsageFault::Bounds));
     }
 }
+
+#[test]
+fn long_fragmented_sse_line_keeps_usage_and_split_crlf_semantics() {
+    let body = serde_json::json!({
+        "padding": "x".repeat(64 * 1024),
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+    });
+    let wire = format!("data: {body}\r\n\r\ndata: [DONE]\r\n\r\n");
+    for size in [1, 2, 3, 127, 16 * 1024, wire.len()] {
+        let mut usage = UsageDecoder::new(
+            Mode::Strict(AccountingProfile::OpenaiChat),
+            Some("text/event-stream"),
+            None,
+        );
+        for chunk in wire.as_bytes().chunks(size) {
+            usage.push(chunk);
+        }
+        usage.finish();
+        assert_eq!(usage.strict_usage(), Ok((7, 3)), "chunk size {size}");
+    }
+}

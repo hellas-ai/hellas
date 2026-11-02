@@ -1096,15 +1096,13 @@ impl ProviderEndpoint {
         Ok((result, signature))
     }
 
-    /// A retained terminal needs authentication, but no permission to admit
-    /// new work. Actual delivery still uses this endpoint's readiness, or
-    /// the explicitly supplied decision checked against it below.
-    async fn release_ready(
+    /// Authenticate and durably authorize release without copying the result.
+    /// Every streamed frame rechecks this endpoint's current readiness.
+    async fn reserve_ready_release(
         &mut self,
         request: &StreamResultRequest,
-        ready: Option<&ReadyChannel>,
         exporter: &[u8; 32],
-    ) -> Result<Delivery, DeliverError> {
+    ) -> Result<Digest, DeliverError> {
         if !request
             .route
             .as_ref()
@@ -1139,14 +1137,8 @@ impl ProviderEndpoint {
         if self.state().is_closing() {
             return Err(EndpointError::NotAdmitting.into());
         }
-        let admitted = self.admitting()?.clone();
-        let ready = ready.unwrap_or(&admitted);
-        let Some((result, signature)) = job.result() else {
-            return Err(DeliverError::NoResult { phase: job.phase() });
-        };
-        let (result, signature) = (*result, *signature);
-        let transcript = job.transcript().to_vec();
-        if transcript.is_empty() {
+        let ready = self.admitting()?.clone();
+        if job.result().is_none() || job.transcript().is_empty() {
             return Err(DeliverError::NoResult { phase: job.phase() });
         }
         crate::model::work::check_payment_policy_binding(
@@ -1156,12 +1148,12 @@ impl ProviderEndpoint {
         )?;
         let terminal_deadline = job.authorization().terminal_deadline;
 
-        bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
-        if ready.invocation_policy() != admitted.invocation_policy()
-            || ready.payment_policy() != admitted.payment_policy()
-        {
-            return Err(DeliverError::Policy);
-        }
+        bind(
+            &ready,
+            &self.close.store,
+            &self.close.signer,
+            Role::Provider,
+        )?;
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
@@ -1172,11 +1164,7 @@ impl ProviderEndpoint {
                 &Secp256k1Verifier::new(),
             )
             .await?;
-        Ok(Delivery {
-            result,
-            signature,
-            transcript,
-        })
+        Ok(work_id)
     }
 
     /// Admits one client payment, and returns what it credited only once
@@ -2923,12 +2911,27 @@ impl WorkService {
         let exporter = context
             .open_exporter
             .ok_or_else(|| Refusal::from(DeliverError::Unbindable))?;
-        self.endpoint()
+        let mut endpoint = self
+            .endpoint()
             .await
-            .map_err(|e| Refusal::new(endpoint_refusal(e), e.to_string()))?
-            .release_ready(request, None, &exporter)
+            .map_err(|e| Refusal::new(endpoint_refusal(e), e.to_string()))?;
+        let work_id = endpoint
+            .reserve_ready_release(request, &exporter)
             .await
-            .map_err(Refusal::from)
+            .map_err(Refusal::from)?;
+        // The endpoint remains locked from authorization through this snapshot.
+        let job = endpoint
+            .state()
+            .job_by_id(work_id)
+            .ok_or_else(|| Refusal::from(DeliverError::NoSuchJob))?;
+        let (result, signature) = job
+            .result()
+            .ok_or_else(|| Refusal::from(DeliverError::NoResult { phase: job.phase() }))?;
+        Ok(Delivery {
+            result: *result,
+            signature: *signature,
+            transcript: job.transcript().to_vec(),
+        })
     }
 
     /// Admits one payment, or says why not.

@@ -18,7 +18,40 @@ pub enum ProgressError {
 #[derive(Debug, Default)]
 pub(super) struct Progress {
     events: Vec<OutputEventEnvelope>,
-    bytes: usize,
+    size: TranscriptSize,
+}
+
+// DAG-CBOR arrays encode each member independently; only the array header
+// changes as events arrive. Count each envelope once instead of re-encoding
+// the entire prefix for every output event. This preserves the wire format.
+#[derive(Clone, Copy, Debug, Default)]
+struct TranscriptSize {
+    events: u64,
+    members: usize,
+}
+
+impl TranscriptSize {
+    fn appended(self, event: &OutputEventEnvelope) -> Result<Self, PaidWorkError> {
+        let overflow = || PaidWorkError::Overflow {
+            field: "transcript length",
+        };
+        let bytes = hellas_rpc::value::canonical_dag_cbor(event)
+            .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
+        Ok(Self {
+            events: self.events.checked_add(1).ok_or_else(overflow)?,
+            members: self.members.checked_add(bytes.len()).ok_or_else(overflow)?,
+        })
+    }
+
+    fn encoded_len(self) -> Result<usize, PaidWorkError> {
+        let mut header = hellas_rpc::value::DagCborEncoder::new();
+        header.array(self.events);
+        self.members
+            .checked_add(header.into_bytes().len())
+            .ok_or(PaidWorkError::Overflow {
+                field: "transcript length",
+            })
+    }
 }
 
 // The terminal authenticates the complete stream without repeating it in one frame.
@@ -56,19 +89,28 @@ fn prefix_batches(
         if events.is_empty() {
             return None;
         }
-        let mut count = 1;
-        while count < events.len() {
-            let Ok(bytes) = encode_transcript(&events[..count + 1]) else {
+        let mut count = 0;
+        let mut size = TranscriptSize::default();
+        for event in events {
+            let Ok(next) = size.appended(event) else {
                 break;
             };
-            let frame = WorkStreamEvent {
-                outcome: Some(work_stream_event::Outcome::Prefix(bytes)),
+            let Ok(bytes) = next.encoded_len() else {
+                break;
             };
-            if frame.encoded_len() > (frame_limit as usize).min(64 * 1024) {
+            // WorkStreamEvent.prefix is length-delimited protobuf field 1.
+            let frame_bytes = prost::encoding::key_len(1)
+                + prost::encoding::encoded_len_varint(bytes as u64)
+                + bytes;
+            if frame_bytes > (frame_limit as usize).min(64 * 1024) {
                 break;
             }
             count += 1;
+            size = next;
         }
+        // An oversized or unencodable single event is returned for the caller
+        // to reject, rather than silently dropping it or stalling the iterator.
+        let count = count.max(1);
         let (batch, rest) = events.split_at(count);
         events = rest;
         Some(batch)
@@ -98,7 +140,7 @@ impl ProviderEndpoint {
         exporter: &[u8; 32],
     ) -> Result<(), DeliverError> {
         // This authenticates route, caller and connection before any phase is disclosed.
-        match self.release_ready(request, None, exporter).await {
+        match self.reserve_ready_release(request, exporter).await {
             Ok(_) => return Ok(()),
             Err(DeliverError::NoResult {
                 phase: JobPhase::Running | JobPhase::Streaming,
@@ -213,15 +255,16 @@ impl WorkService {
             .lock()
             .map_err(|_| BackendFault::caused_by(ProgressError::Poisoned))?;
         let progress = jobs.entry(work_id).or_default();
-        let mut events = progress.events.clone();
-        events.push(event.clone());
-        let bytes = encode_transcript(&events)
-            .map_err(BackendFault::caused_by)?
-            .len();
-        if bytes as u64 > facts.max_spool_bytes || events.len() as u64 >= facts.max_output_events {
+        let size = progress
+            .size
+            .appended(&event)
+            .map_err(BackendFault::caused_by)?;
+        if size.encoded_len().map_err(BackendFault::caused_by)? as u64 > facts.max_spool_bytes
+            || size.events >= facts.max_output_events
+        {
             return Err(BackendFault::caused_by(ProgressError::SpoolBound));
         }
-        progress.bytes = bytes;
+        progress.size = size;
         progress.events.push(event);
         drop(jobs);
         self.changed.notify_waiters();
@@ -352,6 +395,7 @@ where
     )
     .map_err(PaidWorkError::from)?;
     let mut events = Vec::new();
+    let mut size = TranscriptSize::default();
     let mut stream = WorkClientImpl::new(transport)
         .stream_result(request)
         .await?;
@@ -386,9 +430,9 @@ where
             if terminal.is_none() && verifier.terminal_seen() {
                 return Err(DeliverError::Malformed("terminal in prefix frame"));
             }
-            events.push(event.clone());
-            if events.len() as u64 > facts.max_output_events
-                || encode_transcript(&events)?.len() as u64 > facts.max_spool_bytes
+            size = size.appended(&event)?;
+            if size.events > facts.max_output_events
+                || size.encoded_len()? as u64 > facts.max_spool_bytes
             {
                 return Err(DeliverError::Malformed(
                     "live result exceeds authorized output",
@@ -397,6 +441,7 @@ where
             if terminal.is_none() {
                 progress(&event)?;
             }
+            events.push(event);
         }
         if let Some(terminal) = terminal {
             if stream.next().await.transpose()?.is_some() {
@@ -433,6 +478,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_spool_size_matches_wire_encoding_at_array_boundaries() {
+        use crate::test_support::channel as fixture;
+        let sample = fixture::transcript_for(&fixture::invocation_request(1), &[0, 255, u32::MAX]);
+        let mut events = Vec::new();
+        let mut size = TranscriptSize::default();
+        for count in 0..=256 {
+            if [0, 1, 23, 24, 255, 256].contains(&count) {
+                assert_eq!(
+                    size.encoded_len().unwrap(),
+                    encode_transcript(&events).unwrap().len()
+                );
+            }
+            let event = sample[count % sample.len()].clone();
+            size = size.appended(&event).unwrap();
+            events.push(event);
+        }
+    }
 
     #[tokio::test]
     async fn disconnect_during_plaintext_append_cannot_poison_the_provider_journal() {
@@ -884,7 +948,15 @@ mod tests {
             provider_signature: vec![4; 64],
             transcript: encode_transcript(&events).unwrap(),
         };
-        for limit in [4096, 65536] {
+        let exact = WorkStreamEvent {
+            outcome: Some(work_stream_event::Outcome::Prefix(
+                encode_transcript(&events[..24]).unwrap(),
+            )),
+        }
+        .encoded_len() as u32;
+        assert_eq!(prefix_batches(&events, exact).next().unwrap().len(), 24);
+        assert_eq!(prefix_batches(&events, exact - 1).next().unwrap().len(), 23);
+        for limit in [4096, 65536, exact, exact - 1] {
             // Resuming after an arbitrary prefix must skip envelopes, not batches.
             for position in [0, 1, 47, 100] {
                 let frames = result_frames(&delivered, &events[position..], limit)

@@ -39,23 +39,26 @@ pub(crate) fn fetch_prefix(
     }
     pending.extend_from_slice(chunk.bytes.as_bytes());
     let mut events = Vec::new();
-    while let Some(header) = pending.get(..4) {
+    let mut consumed = 0;
+    while let Some(header) = pending.get(consumed..consumed + 4) {
         let length = u32::from_be_bytes(header.try_into().map_err(output_error)?) as usize;
         if length > hellas_rpc::fetch::MAX_FETCH_OUTPUT_PAYLOAD_BYTES {
             return Err(output_error(std::io::Error::other(
                 "Fetch frame exceeds payload bound",
             )));
         }
-        let end = 4 + length;
+        let start = consumed + 4;
+        let end = start + length;
         if pending.len() < end {
             break;
         }
         events.push(
-            hellas_rpc::fetch::decode_fetch_event_payload(&pending[4..end])
+            hellas_rpc::fetch::decode_fetch_event_payload(&pending[start..end])
                 .map_err(output_error)?,
         );
-        pending.drain(..end);
+        consumed = end;
     }
+    pending.drain(..consumed);
     Ok(events)
 }
 pub(crate) fn fetch_terminal(
@@ -773,6 +776,47 @@ mod output_tests {
     use futures::StreamExt;
 
     type TestRequester = Requester<OutputEvent, WorkGatewayError>;
+
+    #[test]
+    fn fetch_prefix_preserves_batched_events_and_split_trailing_frames() {
+        use hellas_rpc::protocol::invocation::fetch;
+        let expected: Vec<_> = (0..100)
+            .map(|index| OutputEvent::TextDelta {
+                index,
+                delta: format!("delta {index}"),
+                channel: hellas_rpc::output::TextChannel::Output,
+            })
+            .collect();
+        let wire: Vec<_> = expected
+            .iter()
+            .flat_map(|event| {
+                fetch::frame_event(&hellas_rpc::fetch::encode_fetch_event_payload(event).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        for size in [1, 3, 127, wire.len() - 1, wire.len()] {
+            let mut pending = Vec::new();
+            let mut actual = Vec::new();
+            let mut offset = 0;
+            for bytes in wire.chunks(size) {
+                actual.extend(
+                    fetch_prefix(
+                        ArtifactChunk {
+                            name: fetch::RESPONSE_EVENTS.into(),
+                            format: fetch::RESPONSE_EVENTS_FORMAT.into(),
+                            offset,
+                            bytes: hellas_rpc::JsonBytes(bytes.to_vec()),
+                        },
+                        &mut pending,
+                    )
+                    .unwrap(),
+                );
+                offset += bytes.len() as u64;
+            }
+            assert_eq!(actual, expected, "chunk size {size}");
+            assert!(pending.is_empty());
+        }
+    }
 
     #[test]
     fn compute_preserves_named_buffers_and_raw_emissions() {

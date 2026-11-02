@@ -76,39 +76,46 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             })));
             let mut bond = None;
             for n in 0..10 {
-                let mut session =
-                    sealing_while(&mut case.devnet, Duration::from_millis(100), async {
-                        loop {
-                            let opened = PaidWorkSession::open(
-                                case.options.clone(),
-                                case.endpoint.clone(),
-                                client_settlement(),
-                                case.owner.clone(),
-                                SessionOpenMode::Job(&job),
-                                SessionFundingOptions {
-                                    max_funding: Some(if n == 0 { 1000 } else { 0 }),
-                                    approval: Some(budget.clone()),
-                                },
-                            )
-                            .await;
-                            // The client can verify funding before the provider's
-                            // full node applies that block. Resume the signed intent
-                            // on the next opening attempt; never reserve/sign twice.
-                            match opened {
-                                Err(hellas_sdk::paid_client::PaidClientError::OfferRefused(
-                                    code,
-                                )) if code
+                let open = async {
+                    loop {
+                        let opened = PaidWorkSession::open(
+                            case.options.clone(),
+                            case.endpoint.clone(),
+                            client_settlement(),
+                            case.owner.clone(),
+                            SessionOpenMode::Job(&job),
+                            SessionFundingOptions {
+                                max_funding: Some(if n == 0 { 1000 } else { 0 }),
+                                approval: Some(budget.clone()),
+                            },
+                        )
+                        .await;
+                        // The client can verify funding before the provider's
+                        // full node applies that block. Resume the signed intent
+                        // on the next opening attempt; never reserve/sign twice.
+                        match opened {
+                            Err(hellas_sdk::paid_client::PaidClientError::OfferRefused(code))
+                                if code
                                     == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding
                                         as i32 =>
-                                {
-                                    tokio::time::sleep(case.options.config.poll).await;
-                                }
-                                result => break result,
+                            {
+                                tokio::time::sleep(case.options.config.poll).await;
                             }
+                            result => break result,
                         }
-                    })
-                    .await
-                    .unwrap_or_else(|error| panic!("opening job {n}: {error}"));
+                    }
+                };
+                // Only the first opening funds a channel. Reconnecting to it
+                // needs no blocks: sealing on a wall-clock timer here would
+                // age the bond according to the CI runner's network speed.
+                let opened = if n == 0 {
+                    sealing_while(&mut case.devnet, Duration::from_millis(100), open).await
+                } else {
+                    tokio::time::timeout(Duration::from_secs(120), open)
+                        .await
+                        .expect("retained channel reopens without advancing the chain")
+                };
+                let mut session = opened.unwrap_or_else(|error| panic!("opening job {n}: {error}"));
                 assert_eq!(
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
