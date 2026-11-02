@@ -939,8 +939,9 @@ fn verify(
     .map_err(|_| GrantError::Signature.into())
 }
 
-/// Namespace of a journal checkpoint snapshot.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v2";
+/// Snapshots retain health decisions made under the frame accounting semantics.
+/// Refuse pre-v3 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v3";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
