@@ -164,3 +164,29 @@ fn sse_decoder_enforces_the_aggregate_response_byte_limit() {
     let error = decoder.push(b"x").unwrap_err();
     assert!(error.to_string().contains("response exceeds"));
 }
+
+#[test]
+fn fragmented_large_frames_preserve_payloads_and_framing_counters() {
+    let payload = "x".repeat(32 * 1024) + "é";
+    let wire = format!(
+        "event: delta\r\ndata: {payload}\r\n\r\nevent: done\ndata: ok\n\nevent: eof\ndata: tail"
+    );
+    let expected = vec![
+        WireStreamEvent::text(Some("delta".into()), payload),
+        WireStreamEvent::text(Some("done".into()), "ok"),
+        WireStreamEvent::text(Some("eof".into()), "tail"),
+    ];
+    for size in [1, 2, 3, 127, 16 * 1024, wire.len()] {
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        for chunk in wire.as_bytes().chunks(size) {
+            events.extend(decoder.push(chunk).unwrap());
+        }
+        events.extend(decoder.finish().unwrap());
+        assert_eq!(events, expected, "chunk size {size}");
+        assert!(decoder.pending_bytes().is_empty());
+        assert_eq!(decoder.frame_count(), 3);
+        assert_eq!(decoder.ignored_line_count(), 0);
+        assert_eq!(decoder.noncanonical_line_count(), 0);
+    }
+}

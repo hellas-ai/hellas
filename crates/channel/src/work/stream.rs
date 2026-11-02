@@ -89,19 +89,28 @@ fn prefix_batches(
         if events.is_empty() {
             return None;
         }
-        let mut count = 1;
-        while count < events.len() {
-            let Ok(bytes) = encode_transcript(&events[..count + 1]) else {
+        let mut count = 0;
+        let mut size = TranscriptSize::default();
+        for event in events {
+            let Ok(next) = size.appended(event) else {
                 break;
             };
-            let frame = WorkStreamEvent {
-                outcome: Some(work_stream_event::Outcome::Prefix(bytes)),
+            let Ok(bytes) = next.encoded_len() else {
+                break;
             };
-            if frame.encoded_len() > (frame_limit as usize).min(64 * 1024) {
+            // WorkStreamEvent.prefix is length-delimited protobuf field 1.
+            let frame_bytes = prost::encoding::key_len(1)
+                + prost::encoding::encoded_len_varint(bytes as u64)
+                + bytes;
+            if frame_bytes > (frame_limit as usize).min(64 * 1024) {
                 break;
             }
             count += 1;
+            size = next;
         }
+        // An oversized or unencodable single event is returned for the caller
+        // to reject, rather than silently dropping it or stalling the iterator.
+        let count = count.max(1);
         let (batch, rest) = events.split_at(count);
         events = rest;
         Some(batch)
@@ -131,7 +140,7 @@ impl ProviderEndpoint {
         exporter: &[u8; 32],
     ) -> Result<(), DeliverError> {
         // This authenticates route, caller and connection before any phase is disclosed.
-        match self.release_ready(request, None, exporter).await {
+        match self.reserve_ready_release(request, exporter).await {
             Ok(_) => return Ok(()),
             Err(DeliverError::NoResult {
                 phase: JobPhase::Running | JobPhase::Streaming,
@@ -939,7 +948,15 @@ mod tests {
             provider_signature: vec![4; 64],
             transcript: encode_transcript(&events).unwrap(),
         };
-        for limit in [4096, 65536] {
+        let exact = WorkStreamEvent {
+            outcome: Some(work_stream_event::Outcome::Prefix(
+                encode_transcript(&events[..24]).unwrap(),
+            )),
+        }
+        .encoded_len() as u32;
+        assert_eq!(prefix_batches(&events, exact).next().unwrap().len(), 24);
+        assert_eq!(prefix_batches(&events, exact - 1).next().unwrap().len(), 23);
+        for limit in [4096, 65536, exact, exact - 1] {
             // Resuming after an arbitrary prefix must skip envelopes, not batches.
             for position in [0, 1, 47, 100] {
                 let frames = result_frames(&delivered, &events[position..], limit)

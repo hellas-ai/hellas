@@ -85,6 +85,7 @@ pub enum WireEventData {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    scanned: usize,
     received_bytes: usize,
     frames: u64,
     events: u64,
@@ -177,9 +178,19 @@ impl SseDecoder {
             if buffered > buffer_limit {
                 return Err(sse_frame_limit_error());
             }
-            self.buffer.try_reserve_exact(appended).map_err(|_| {
-                AdaptorError::invalid_response("SSE frame buffer allocation failed")
-            })?;
+            if buffered > self.buffer.capacity() {
+                let capacity = self
+                    .buffer
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(buffered)
+                    .min(buffer_limit);
+                self.buffer
+                    .try_reserve_exact(capacity - self.buffer.len())
+                    .map_err(|_| {
+                        AdaptorError::invalid_response("SSE frame buffer allocation failed")
+                    })?;
+            }
             self.buffer.extend_from_slice(&bytes[..appended]);
             bytes = &bytes[appended..];
 
@@ -191,6 +202,7 @@ impl SseDecoder {
     }
 
     pub fn finish(&mut self) -> AdaptorResult<Vec<WireStreamEvent>> {
+        self.scanned = 0;
         if self.buffer.len() > MAX_SSE_FRAME_BYTES {
             return Err(sse_frame_limit_error());
         }
@@ -211,12 +223,13 @@ impl SseDecoder {
 
     fn drain_complete_frames(&mut self, events: &mut Vec<WireStreamEvent>) -> AdaptorResult<()> {
         let mut consumed = 0;
-        while let Some((frame_len, delimiter_len)) = find_sse_delimiter(&self.buffer[consumed..]) {
-            if frame_len > MAX_SSE_FRAME_BYTES {
+        let mut scan = self.scanned;
+        while let Some((offset, delimiter_len)) = find_sse_delimiter(&self.buffer[scan..]) {
+            let frame_end = scan + offset;
+            if frame_end - consumed > MAX_SSE_FRAME_BYTES {
                 return Err(sse_frame_limit_error());
             }
             self.record_frame()?;
-            let frame_end = consumed + frame_len;
             let (event, ignored_lines, noncanonical_lines) =
                 parse_sse_frame(&self.buffer[consumed..frame_end])?;
             self.ignored_lines = self.ignored_lines.saturating_add(ignored_lines);
@@ -226,7 +239,16 @@ impl SseDecoder {
                 events.push(event);
             }
             consumed = frame_end + delimiter_len;
+            scan = consumed;
         }
+        // A delimiter may straddle the next push. Revisit only its possible
+        // three-byte prefix, never the already scanned frame contents.
+        self.scanned = self
+            .buffer
+            .len()
+            .saturating_sub(MAX_SSE_DELIMITER_BYTES - 1)
+            .max(consumed)
+            - consumed;
         self.buffer.drain(..consumed);
         Ok(())
     }
