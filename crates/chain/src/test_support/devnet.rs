@@ -833,6 +833,10 @@ mod tests {
     use crate::light_client::FinalizedBlockQuery;
 
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn a_public_faucet_passkey_spends_on_all_six_validators() {
         run(|runtime| async move {
             let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
@@ -919,6 +923,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds() {
         run(|runtime| async move {
             let owner = GenesisOwner {
@@ -1002,6 +1010,10 @@ mod tests {
     /// refuses the same answers, so the agreement is the verifier's and
     /// not merely the wire's.
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
         run(|runtime| async move {
             let owner = GenesisOwner {

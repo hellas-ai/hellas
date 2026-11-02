@@ -17,13 +17,22 @@ nix run .#check-unit
 nix run .#check-release  # all test, feature and model-checking checks locally
 ```
 
-The unit suite includes library and CLI command tests, chain codecs and proof
-verification, the pure kernel tests and canonical payment vectors. Live chain
-tests, four SDK scenarios that start validator networks, paid end-to-end tests,
-full Qwen3/Whisper/Flux compilation and CLI process tests belong to release
-validation. `check-model-programs` compiles shipped and upstream programs for
-both CUDA and HIP and compares them; CLI and GPU releases require this check.
-The unit commands are shared with Hydra in `nix/unit-tests.sh`.
+The default suite is `cargo test --locked --workspace`: unit tests, lightweight
+integration tests and doctests, without local validator networks or model
+compilation. Hydra runs it through the standard nixpkgs Cargo check hook.
+
+The `integration-tests` feature on `hellas-chain`, `hellas-sdk` and `hellas-cli`
+opts in to local node and complete host-process suites. Their release checks
+(`check-validator`, `check-chain-setup`, `check-sdk-paid-work`, `check-cli`)
+enable it explicitly; validator-backed suites run serially. The targeted paid
+regressions remain mandatory PR checks. Existing tests requiring a GPU, model
+files or a special process environment remain individually ignored.
+
+`check-model-programs` explicitly runs the ignored Qwen3/Whisper/Flux compilation
+tests for CUDA and HIP; CLI and GPU releases require this check. The consensus
+release also runs `check-kernel` with all features, including the Quint replay
+and optional authentication suites. Do not use a blanket `--include-ignored`
+for default CI: opt in through the appropriate release check instead.
 
 ## Independent component releases
 

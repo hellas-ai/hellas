@@ -480,13 +480,13 @@ let
 
   hydraUnit = nativePkg.mkHellasPackage {
     pname = "hellas-check-unit";
-    cargoBuildType = "debug";
-    buildPhase = ''
-      runHook preBuild
-      ${ci.unitTestCommand}
-      runHook postBuild
-    '';
-    doCheck = false;
+    buildType = "debug";
+    dontBuild = true;
+    doCheck = true;
+    cargoTestFlags = [
+      "--locked"
+      "--workspace"
+    ];
     installPhase = ''
       mkdir -p "$out"
       touch "$out/passed"

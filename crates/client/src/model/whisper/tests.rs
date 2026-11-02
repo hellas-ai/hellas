@@ -136,6 +136,7 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
 }
 
 #[test]
+#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
 fn shipped_whisper_program_matches_catena_models() {
     let model =
         ModelPackage::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))

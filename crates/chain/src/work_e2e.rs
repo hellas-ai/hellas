@@ -917,6 +917,10 @@ fn payment_close_coins(allocations: &Allocations) -> (CoinId, CoinId) {
 /// `12 != 10` on purpose. A test whose stake and price were the same
 /// number could pass on principal alone.
 #[test]
+#[cfg_attr(
+    not(feature = "integration-tests"),
+    ignore = "starts local nodes; run with --features integration-tests"
+)]
 fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
     for owners in [OwnerKind::Native, OwnerKind::Passkey] {
         for locked in [false, true] {
@@ -1092,6 +1096,10 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
 /// 86`. The understated claim of `0` pays the provider nothing and is
 /// what the response overrides.
 #[test]
+#[cfg_attr(
+    not(feature = "integration-tests"),
+    ignore = "starts local nodes; run with --features integration-tests"
+)]
 fn an_understated_close_is_answered_and_pays_the_certificate() {
     for owners in [OwnerKind::Native, OwnerKind::Passkey] {
         for owner_exit in [false, true] {

@@ -798,6 +798,10 @@ mod tests {
         }).await.unwrap()
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn durable_funding_retries_one_signature_and_reserves_other_providers() {
         run(|runtime| {
             Box::pin(async move {
@@ -1058,6 +1062,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
         run(|runtime| {
             Box::pin(async move {

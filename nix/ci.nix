@@ -69,8 +69,6 @@ let
     ++ pkgs.stdenv.initialPath
     ++ workspaceNativeBuildInputs;
 
-  unitTestCommand = builtins.readFile ./unit-tests.sh;
-
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
@@ -78,7 +76,7 @@ let
       pkgs.actionlint
       pkgs.shellcheck
     ];
-    unit = mkCargo "check-unit" unitTestCommand (cargoEnv rustToolchain);
+    unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
     regressions = mkCargo "check-regressions" (builtins.readFile ./regression-tests.sh) (
       cargoEnv rustToolchain
     );
@@ -98,6 +96,7 @@ let
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
         (
           [
+            "integration-tests"
             "indexer"
             "otel"
           ]
@@ -115,13 +114,13 @@ let
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
     cli = mkCargo "check-cli" ''
-      cargo test -p hellas-cli
+      cargo test -p hellas-cli --features integration-tests
       cargo build -p hellas-cli --bin hellas
       HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
       export HELLAS_CLI_TEST_BINARY
-      cargo test -p hellas-sdk --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
-      cargo test -p hellas-sdk --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
-      cargo test -p hellas-cli --features otel --test grant_http metrics_scrape_observes_gateway_and_serve_work
+      cargo test -p hellas-sdk --features integration-tests --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
+      cargo test -p hellas-sdk --features integration-tests --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
+      cargo test -p hellas-cli --features otel,integration-tests --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
       cargo test -p hellas-cloud
@@ -184,7 +183,7 @@ let
     # upstream. These CPU compiler checks belong to CLI/GPU release validation.
     model-programs =
       mkCargo "check-model-programs"
-        "cargo test --locked -p hellas-client --features models --lib shipped_"
+        "cargo test --locked -p hellas-client --features models --lib shipped_ -- --ignored"
         (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
     http-fetch =
@@ -196,8 +195,8 @@ let
       # These native cases each start a six-validator devnet. Serializing the
       # test harness avoids cross-test resource starvation; the cases retain
       # their own concurrent-client and cancellation assertions.
-      RUST_TEST_THREADS=1 cargo test -p hellas-sdk
-      cargo clippy -p hellas-sdk --all-targets -- -D warnings
+      RUST_TEST_THREADS=1 cargo test -p hellas-sdk --features integration-tests
+      cargo clippy -p hellas-sdk --features integration-tests --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
@@ -210,7 +209,8 @@ let
         "cargo test -p hellas-rpc --features chain && cargo clippy -p hellas-rpc --features chain --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     validator =
-      mkCargo "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
+      mkCargo "check-validator"
+        "cargo test -p hellas-chain --no-default-features --features validator,integration-tests -- --test-threads=1"
         (cargoEnv rustToolchain);
     # `check-validator` above runs tests, where `dead_code` is only a
     # warning, so the two feature sets a node actually ships in were the
@@ -250,11 +250,11 @@ let
     # two dimensions above runs a test with the other's code compiled
     # in. This is the only line that runs a paid channel being opened
     # against real finalized blocks. Each paid scenario owns six validators and
-    # two full nodes; run that group separately and serially to avoid competing
-    # runtimes in the same test process during its bounded readiness wait.
+    # two full nodes; run the opted-in suite serially to avoid competing runtimes
+    # during its bounded readiness wait.
     chain-setup =
       mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher -- --skip work_e2e && cargo test -p hellas-chain --no-default-features --features validator,work-watcher work_e2e -- --test-threads=1"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,integration-tests -- --test-threads=1"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
@@ -386,7 +386,6 @@ in
     checks
     fixes
     mergeChecks
-    unitTestCommand
     ;
   builds = ciBuilds;
   checkAll = mkAggregate "check-all" (lib.attrValues mergeChecks);

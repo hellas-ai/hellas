@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+# Opt in to tests that start local nodes or exercise complete host processes.
+integration-tests = []
 default = []
 otel = ["hellas-rpc?/otel"]
 # Chain/light-client domain vocabulary: settlement keys and transactions.

@@ -698,6 +698,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "integration-tests"),
+        ignore = "starts local nodes; run with --features integration-tests"
+    )]
     fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
         use crate::test_support::{PaidFixture, signer};
         use hellas_chain::test_support::devnet::{
