@@ -597,7 +597,7 @@ fn contest_after_block(
     pending.ok_or(Malformed)
 }
 
-/// Resume legacy contest reconstruction from its canonical journal checkpoint.
+/// Resume contest reconstruction from its canonical journal checkpoint.
 /// Every verified block is committed before the next result is consumed, so a
 /// bounded caller can cancel repeatedly without discarding completed progress.
 async fn finalized_contest<C, S, V>(
