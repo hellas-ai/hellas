@@ -1034,8 +1034,7 @@ pub(crate) fn check_authorization_core(
 
 /// Canonical signed-envelope bytes named by the receipt's transcript reference.
 pub fn encode_transcript(transcript: &[OutputEventEnvelope]) -> Result<Vec<u8>, PaidWorkError> {
-    canonical_dag_cbor(&transcript.to_vec())
-        .map_err(|error| PaidWorkError::Transcript(error.to_string()))
+    canonical_dag_cbor(&transcript).map_err(|error| PaidWorkError::Transcript(error.to_string()))
 }
 
 /// Reads a transcript back, refusing anything over `budget`.
