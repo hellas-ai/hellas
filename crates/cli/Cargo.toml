@@ -19,7 +19,6 @@ path = "src/main.rs"
 # Opt in to tests that start local nodes or exercise complete host processes.
 integration-tests = []
 default = []
-test-support = ["hellas-cloud/test-support"]
 
 indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]

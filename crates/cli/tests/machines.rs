@@ -1,5 +1,3 @@
-#![cfg(feature = "test-support")]
-
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -8,15 +6,26 @@ use std::{
 };
 
 #[tokio::test]
-async fn generic_machine_commands_use_the_documented_provider_and_real_http_driver() {
+async fn machine_commands_use_configured_runpod_endpoint() {
+    exercise(false).await;
+}
+
+#[tokio::test]
+async fn machine_commands_use_runpod_endpoint_from_environment() {
+    exercise(true).await;
+}
+
+async fn exercise(from_environment: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut documented: Value =
         serde_json::from_str(include_str!("../../../docs/machine-provider.json")).unwrap();
     let image = format!("registry/hellas@sha256:{}", "a".repeat(64));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let configuration = &mut documented["config"];
-    configuration["api_base"] = json!(base);
+    if !from_environment {
+        configuration["base_url"] = json!(base);
+    }
     let template = configuration["template"].as_str().unwrap().to_owned();
     let source = root.path().join("source.json");
     let secret = root.path().join("account.json");
@@ -72,7 +81,7 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
             stream.read_exact(&mut body).unwrap();
             let response = match step {
                 0 => {
-                    assert!(headers.starts_with(&format!("GET /templates/{template} ")));
+                    assert!(headers.starts_with(&format!("GET /v1/templates/{template} ")));
                     json!({
                         "id": template,
                         "imageName": image,
@@ -82,7 +91,7 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
                     })
                 }
                 1 => {
-                    assert!(headers.starts_with("POST /pods "));
+                    assert!(headers.starts_with("POST /v1/pods "));
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(
                         body,
@@ -99,15 +108,15 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
                     json!({"id": "machine1"})
                 }
                 2 => {
-                    assert!(headers.starts_with("GET /pods/machine1 "));
+                    assert!(headers.starts_with("GET /v1/pods/machine1 "));
                     pod.clone()
                 }
                 3 => {
-                    assert!(headers.starts_with("GET /pods "));
+                    assert!(headers.starts_with("GET /v1/pods "));
                     json!([pod])
                 }
                 _ => {
-                    assert!(headers.starts_with("DELETE /pods/machine1 "));
+                    assert!(headers.starts_with("DELETE /v1/pods/machine1 "));
                     Value::Null
                 }
             }
@@ -132,6 +141,11 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
                 ])
                 .args(&command)
                 .env("OTEL_SDK_DISABLED", "true")
+                // The explicit configuration must take precedence over the environment.
+                .env(
+                    "RUNPOD_BASE_URL",
+                    if from_environment { &base } else { "not a URL" },
+                )
                 .kill_on_drop(true)
                 .output(),
         )
