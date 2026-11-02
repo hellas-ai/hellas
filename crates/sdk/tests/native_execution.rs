@@ -1164,25 +1164,62 @@ async fn paid_finish(case: PaidScenario) {
         .source
         .attempts
         .load(std::sync::atomic::Ordering::SeqCst);
-    let reopening = PaidWorkSession::open(
-        options.clone(),
-        endpoint.clone(),
-        client_settlement(),
-        owner.clone(),
-        SessionOpenMode::Any,
-        SessionFundingOptions::default(),
+    // Selection refuses a source below the retained floor before requesting
+    // object proofs. With every relay stale, recovery must return its typed
+    // bounded error rather than wait for a proof read that cannot occur.
+    let source_timeout = Duration::from_secs(1);
+    let mut stale_options = options.clone();
+    stale_options.timeout = Some(source_timeout);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        PaidWorkSession::open(
+            stale_options,
+            endpoint.clone(),
+            client_settlement(),
+            owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
+        ),
+    )
+    .await
+    .expect("stale-source selection remains bounded")
+    .err()
+    .expect("a source below the journal floor cannot reopen the channel");
+    assert!(
+        matches!(
+            &error,
+            hellas_sdk::paid_client::PaidClientError::Query(
+                hellas_chain::QueryError::ReadUnavailableTimeout { timeout, reason }
+            ) if *timeout == source_timeout
+                && reason.contains("chain is at height 2 but the journal requires ")
+        ),
+        "expected a below-floor source timeout: {error}",
     );
-    tokio::pin!(reopening);
-    tokio::select! {
-        result = &mut reopening => panic!("certified pre-open replay ended recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
-    }
+    assert_eq!(
+        relays
+            .source
+            .attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        attempts,
+        "a stale source is rejected before reading object proofs",
+    );
     assert_eq!(approvals.0.lock().unwrap().len(), 1);
     relays
         .source
         .replay
         .store(0, std::sync::atomic::Ordering::SeqCst);
-    let mut recovered = reopening.await.unwrap();
+    let mut recovered = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+        SessionOpenMode::Retained,
+        SessionFundingOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.descriptor().bond_edge(), bond);
+    assert_eq!(approvals.0.lock().unwrap().len(), 1);
     assert_eq!(
         recovered
             .with_state(|state| state.cursor().0)
