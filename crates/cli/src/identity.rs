@@ -23,8 +23,6 @@ const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
     pub(crate) node_key: ProducerSigningKey,
-    #[cfg(test)]
-    pub(crate) genesis: SignedProviderGenesis,
     pub(crate) enrollment: ProviderEnrollmentBundle,
     open_identity: Arc<ProviderOpen<ProducerSigningKey>>,
 }
@@ -172,7 +170,7 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
         root_proof: root.prove(&statement.canonical_bytes())?,
         statement,
     };
-    let enrollment = enrollment_bundle(&root, genesis.clone());
+    let enrollment = enrollment_bundle(&root, genesis);
     let stored_root = match root.as_ref() {
         PlatformRoot::Software(key) => StoredRoot::Software(key.to_secret_bytes()),
     };
@@ -187,8 +185,6 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
     let identity = LocalIdentity {
         transport_key,
         node_key,
-        #[cfg(test)]
-        genesis,
         enrollment,
         open_identity,
     };
@@ -238,7 +234,7 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         statement,
         root_proof,
     };
-    let enrollment = enrollment_bundle(&root, genesis.clone());
+    let enrollment = enrollment_bundle(&root, genesis);
     if enrollment != stored.enrollment {
         bail!("stored provider enrollment does not match the persisted keys");
     }
@@ -246,8 +242,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     Ok(LocalIdentity {
         transport_key,
         node_key,
-        #[cfg(test)]
-        genesis,
         enrollment,
         open_identity,
     })

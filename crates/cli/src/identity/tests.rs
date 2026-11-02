@@ -17,23 +17,24 @@ fn creates_and_reloads_one_identity() {
         second.transport_key.to_bytes()
     );
     assert_eq!(first.node_key.producer_id(), second.node_key.producer_id());
-    assert_eq!(first.genesis, second.genesis);
     assert_eq!(first.enrollment, second.enrollment);
-    assert_eq!(first.enrollment.genesis, first.genesis);
     assert_eq!(first.enrollment.platform, PlatformEnrollment::Absent);
-    assert_eq!(first.genesis.statement.root_kind, RootKind::Software);
     assert_eq!(
-        first.genesis.statement.transport_public_key,
+        first.enrollment.genesis.statement.root_kind,
+        RootKind::Software
+    );
+    assert_eq!(
+        first.enrollment.genesis.statement.transport_public_key,
         PublicKey::Ed25519(*first.transport_key.public().as_bytes())
     );
     assert_eq!(
-        first.genesis.statement.producer_public_key,
+        first.enrollment.genesis.statement.producer_public_key,
         first.node_key.public_key()
     );
     let other = load_or_create(Some(&dir.path().join("other"))).unwrap();
     assert_ne!(
-        first.genesis.statement.installation_nonce,
-        other.genesis.statement.installation_nonce
+        first.enrollment.genesis.statement.installation_nonce,
+        other.enrollment.genesis.statement.installation_nonce
     );
     #[cfg(unix)]
     {
