@@ -676,7 +676,24 @@ fn revision_two(
         .unwrap()
 }
 
-async fn compute_and_settle(
+// Construct the large scenario future outside its parent's poll frame. Boxing
+// it at the await site still leaves debug construction temporaries on that
+// parent's stack while setup polls and decodes finalized transactions.
+fn compute_and_settle<'a>(
+    devnet: &'a mut Devnet,
+    options: PaidWorkOptions,
+    endpoint: &'a Endpoint,
+    key: &'a Secp256k1Signer,
+    root: &'a std::path::Path,
+    provider: &'a Provider,
+    original: &'a SignedPaidOffer,
+) -> impl std::future::Future<Output = ()> + 'a {
+    Box::pin(compute_and_settle_inner(
+        devnet, options, endpoint, key, root, provider, original,
+    ))
+}
+
+async fn compute_and_settle_inner(
     devnet: &mut Devnet,
     options: PaidWorkOptions,
     endpoint: &Endpoint,
@@ -2336,7 +2353,7 @@ async fn finish(case: Box<Case>) {
         payment_blocks: 32,
         timeout: Some(Duration::from_secs(120)),
     };
-    Box::pin(compute_and_settle(
+    compute_and_settle(
         &mut devnet,
         options.clone(),
         &endpoint,
@@ -2344,7 +2361,7 @@ async fn finish(case: Box<Case>) {
         root.path(),
         &provider,
         &first,
-    ))
+    )
     .await;
     assert_eq!(compute.calls(), 5);
     assert_eq!(
