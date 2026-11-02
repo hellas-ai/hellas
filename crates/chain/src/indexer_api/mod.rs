@@ -59,10 +59,6 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
     let genesis_json = options
         .genesis_json
         .unwrap_or_else(|| HELLAS_DEVNET_1_JSON.as_bytes().to_vec());
-    let verifier = Arc::new(ProofVerifier::with_genesis(
-        options.trust.clone(),
-        &genesis_json,
-    )?);
     let genesis: Genesis = serde_json::from_slice(&genesis_json)?;
     let runtime = tokio::Config::new()
         .with_storage_directory(&options.storage_dir)
@@ -102,15 +98,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             options.partition_prefix,
         )
         .await?;
-        let indexer = node.archive();
-        let edge_index = node.index().ok_or("node did not open its read index")?;
-        let state = OriginState {
-            edge_index,
-            owner_proofs: OwnerProofSource::Node(node.clone()),
-            indexer: indexer.clone(),
-            verifier,
-            network_id: info.network_id.clone(),
-        };
+        let state = OriginState::new(node.clone())?;
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
         let result = axum::serve(listener, app).await.map_err(Into::into);
@@ -125,34 +113,21 @@ struct OriginState {
     indexer: ChainIndexer,
     verifier: Arc<ProofVerifier>,
     network_id: String,
-    owner_proofs: OwnerProofSource,
+    owner_proofs: crate::node::FullNode,
 }
 
-#[derive(Clone)]
-enum OwnerProofSource {
-    Node(crate::node::FullNode),
-    #[cfg(test)]
-    Constructed(Arc<::tokio::sync::Mutex<crate::edge_index::Replay<tokio::Context>>>),
-}
-impl OwnerProofSource {
-    async fn owner_proof(
-        &self,
-        owner: crate::domain::SettlementKey,
-        offset: u64,
-        limit: u32,
-        payload: Option<&str>,
-    ) -> OriginResult<Option<crate::proof_verify::VerifiedAddress>> {
-        match self {
-            Self::Node(node) => Ok(node.owner_proof(owner, offset, limit, payload).await?),
-            #[cfg(test)]
-            Self::Constructed(replay) => {
-                replay
-                    .lock()
-                    .await
-                    .owner_proof(owner, offset, limit, payload)
-                    .await
-            }
-        }
+impl OriginState {
+    fn new(node: crate::node::FullNode) -> OriginResult<Self> {
+        let publication = node
+            .publication()
+            .ok_or("node did not open its read index")?;
+        Ok(Self {
+            edge_index: publication.index,
+            indexer: publication.archive,
+            verifier: publication.verifier,
+            network_id: node.config().genesis.network_id.clone(),
+            owner_proofs: node,
+        })
     }
 }
 
@@ -547,46 +522,24 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
     state.verifier.bundle(finalized)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::execution::test_support::finalization;
     use commonware_cryptography::Digestible as _;
     use hellas_genesis::HELLAS_DEVNET_1_ID;
     use tower::ServiceExt as _;
 
-    async fn published_router(context: tokio::Context) -> (Router, commonware_runtime::Handle<()>) {
-        let mut h =
-            crate::edge_index::ReplayHarness::new(context.child("h"), Vec::new(), "browser-test")
-                .await;
-        let genesis = h.head.clone();
+    async fn published_router(
+        context: tokio::Context,
+    ) -> (Router, crate::edge_index::IndexedNodeHarness) {
+        let mut h = crate::edge_index::IndexedNodeHarness::new(
+            context.child("h"),
+            Vec::new(),
+            "browser-test",
+        )
+        .await;
         h.append(Vec::new()).await;
-        let (indexer, handle) = crate::spawn_archive(
-            context.child("archive"),
-            "browser-archive",
-            Config::default(),
-            h.committee.verifier.clone(),
-            genesis,
-        )
-        .await
-        .unwrap();
-        indexer
-            .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
-            .await
-            .unwrap();
-        (
-            router(OriginState {
-                edge_index: h.index,
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: Arc::new(h.verifier),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            }),
-            handle,
-        )
+        (router(OriginState::new(h.node.clone()).unwrap()), h)
     }
 
     #[test]
@@ -700,30 +653,13 @@ mod tests {
                     .unwrap()
                     .party_key(),
             );
-            let h = crate::edge_index::ReplayHarness::new(
+            let h = crate::edge_index::IndexedNodeHarness::new(
                 context.child("h"),
                 vec![(owner, 100)],
                 "origin-ws-cap",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_archive(
-                context.child("follower"),
-                "origin-ws-cap-test",
-                Config::default(),
-                h.committee.verifier.clone(),
-                h.head,
-            )
-            .await
-            .unwrap();
-            let app = router(OriginState {
-                edge_index: h.index,
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: Arc::new(h.verifier),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            });
+            let app = router(OriginState::new(h.node.clone()).unwrap());
             let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
@@ -807,30 +743,13 @@ mod tests {
                     .unwrap()
                     .party_key(),
             );
-            let h = crate::edge_index::ReplayHarness::new(
+            let h = crate::edge_index::IndexedNodeHarness::new(
                 context.child("h"),
                 vec![(owner, 100)],
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_archive(
-                context.child("follower"),
-                "origin-empty-test",
-                Config::default(),
-                h.committee.verifier.clone(),
-                h.head,
-            )
-            .await
-            .unwrap();
-            let app = router(OriginState {
-                edge_index: h.index,
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: Arc::new(h.verifier),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            });
+            let app = router(OriginState::new(h.node.clone()).unwrap());
             for suffix in ["", "/proof"] {
                 let response = app
                     .clone()
@@ -878,27 +797,27 @@ mod tests {
             let maker = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
             let taker = hellas_kernel::Secp256k1Signer::from_secret_scalar([20; 32]).unwrap();
             let owner = crate::domain::SettlementKey::from(maker.party_key());
-            let mut h = crate::edge_index::ReplayHarness::new(
+            let mut h = crate::edge_index::IndexedNodeHarness::new(
                 context.child("h"),
                 vec![(owner, 100)],
                 "origin-http",
             )
             .await;
             assert!(
-                h.replay
+                h.node
                     .owner_proof(owner, 0, 64, None)
                     .await
                     .unwrap()
                     .is_none()
             );
-            let genesis = h.head.clone();
-            let (_, _, transaction) = crate::edge_index::replay_basic(h.network, 0, &maker, &taker);
+            let (_, _, transaction) =
+                crate::edge_index::indexed_basic(h.network, 0, &maker, &taker);
             let first = h
                 .append(vec![crate::domain::Transaction::Kernel(transaction)])
                 .await;
             let first_block = h.head.clone();
             let first_address = h
-                .replay
+                .node
                 .owner_proof(owner, 0, 64, Some(&first.payload))
                 .await
                 .unwrap()
@@ -912,37 +831,9 @@ mod tests {
                 1
             );
             let latest = h.append(Vec::new()).await;
-            let (indexer, _handle) = crate::spawn_archive(
-                context.child("follower"),
-                "origin-test",
-                Config::default(),
-                h.committee.verifier.clone(),
-                genesis,
-            )
-            .await
-            .unwrap();
-            indexer
-                .ingest_finalized(
-                    first_block.clone(),
-                    finalization(&h.committee, &first_block),
-                )
-                .await
-                .unwrap();
-            indexer
-                .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
-                .await
-                .unwrap();
             let tx = crate::proof_verify::transaction_digest(&first_block.txs()[0]);
-            let verifier = Arc::new(h.verifier);
-            let state = OriginState {
-                edge_index: h.index.clone(),
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: verifier.clone(),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            };
+            let state = OriginState::new(h.node.clone()).unwrap();
+            let verifier = state.verifier.clone();
             let app = router(state);
             for pin in [None, Some(latest.payload.as_str())] {
                 let query = pin.map_or(String::new(), |pin| format!("?payload={pin}"));
@@ -1111,30 +1002,13 @@ mod tests {
                     .unwrap()
                     .party_key(),
             );
-            let h = crate::edge_index::ReplayHarness::new(
+            let h = crate::edge_index::IndexedNodeHarness::new(
                 context.child("h"),
                 vec![(owner, 100)],
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_archive(
-                context.child("follower"),
-                "origin-empty-test",
-                Config::default(),
-                h.committee.verifier.clone(),
-                h.head,
-            )
-            .await
-            .unwrap();
-            let app = router(OriginState {
-                edge_index: h.index,
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: Arc::new(h.verifier),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            });
+            let app = router(OriginState::new(h.node.clone()).unwrap());
             let request =
                 axum::http::Request::builder().uri("/api/v1/addresses/not-an-owner/proof");
             let response = app
@@ -1164,30 +1038,13 @@ mod tests {
                     .unwrap()
                     .party_key(),
             );
-            let h = crate::edge_index::ReplayHarness::new(
+            let h = crate::edge_index::IndexedNodeHarness::new(
                 context.child("h"),
                 vec![(owner, 100)],
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_archive(
-                context.child("follower"),
-                "origin-empty-test",
-                Config::default(),
-                h.committee.verifier.clone(),
-                h.head,
-            )
-            .await
-            .unwrap();
-            let app = router(OriginState {
-                edge_index: h.index,
-                indexer,
-                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
-                    h.replay,
-                ))),
-                verifier: Arc::new(h.verifier),
-                network_id: HELLAS_DEVNET_1_ID.into(),
-            });
+            let app = router(OriginState::new(h.node.clone()).unwrap());
             let request = axum::http::Request::builder()
                 .uri("/api/v1/transactions/0000000000000000000000000000000000000000000000000000000000000000/proof?height=bad");
             let request = request.header(header::ACCEPT, "application/x-protobuf");

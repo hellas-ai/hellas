@@ -1154,6 +1154,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             &databases,
             &owner_index,
             startup.into_iter().chain(processed).max(),
+            &genesis_block,
         )
         .await
         .expect("executed chain checkpoint");

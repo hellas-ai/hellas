@@ -3,9 +3,9 @@
 //! The provider creates its offer over RPC under its owner-approved policy; the client runs `transact`, then settles
 //! through a recovered `PaidWorkSession`.
 //! Both parties hold genesis allocations owned by software passkeys and
-//! authenticate remote reads; only the provider runs a full node. Only block ordering (the
-//! devnet's proposer) and the upstream HTTP response are fixtures; the
-//! money is read back out of the validators' finalized state.
+//! authenticate remote reads; only the provider runs a full node. The devnet
+//! produces signed source history and the upstream HTTP response is a fixture.
+//! Money is read back from the finalized source state and the real executing node.
 
 // The executor re-executes this binary as its Catena compile child.
 #[ctor::ctor(unsafe)]
@@ -1728,7 +1728,7 @@ fn cli_paid_and_grant_two_provider_composition() {
 }
 
 #[test]
-fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
+fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
     use hellas_chain::WorkBlocks;
     use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
     use hellas_channel::work_open::{SetupQuery, SetupView as _};
@@ -1755,11 +1755,7 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
             funding: Default::default(),
         };
         let next = devnet.height() + 1;
-        node.require_finalized_height_for_test(next);
-        assert!(matches!(
-            client.get_latest_block().await,
-            Err(hellas_chain::QueryError::StateUnavailable(_))
-        ));
+        let source = source.with_min_height(next);
         let read = source.finalized_setup(query.clone());
         tokio::pin!(read);
         assert!(tokio::time::timeout(poll, &mut read).await.is_err());
@@ -1781,7 +1777,7 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
         );
         drop(block);
 
-        node.require_finalized_height_for_test(next + 1);
+        let source = source.clone().with_min_height(next + 1);
         let started = tokio::time::Instant::now();
         let error = tokio::time::timeout(timeout.saturating_mul(2), source.finalized_setup(query))
             .await
@@ -1792,8 +1788,7 @@ fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
             if elapsed == timeout)
         );
         assert!(started.elapsed() >= timeout);
-        // A failed read never advances a journal or makes the stale node usable.
-        assert!(node.view().is_err());
+        assert_eq!(node.status().executed_height(), next);
         devnet.shutdown().await;
     });
 }

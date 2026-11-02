@@ -3,9 +3,7 @@ use super::*;
 use crate::execution::store::UtxoDatabase;
 use bytes::Bytes;
 use commonware_codec::Decode;
-use commonware_consensus::{
-    CertifiableBlock, Reporter, marshal::resolver::handler, simplex::types::Activity,
-};
+use commonware_consensus::marshal::resolver::handler;
 use commonware_resolver::opaque;
 use commonware_storage::{mmr, qmdb::sync::resolver as state};
 use commonware_utils::channel::oneshot;
@@ -261,7 +259,7 @@ impl Network {
             self.discover_all().await;
         }
     }
-    pub async fn feed(&self, indexer: ChainIndexer, readiness: Arc<Readiness>) {
+    pub(super) async fn feed(&self, input: super::input::FinalizedInput) {
         let mut tasks = FuturesUnordered::new();
         let mut running = std::collections::BTreeSet::new();
         let mut discovery = tokio::time::interval(Duration::from_secs(1));
@@ -271,8 +269,8 @@ impl Network {
                     for id in self.ids() {
                         if running.len() >= MAX_PEERS { break; }
                         if running.insert(id) {
-                            let (network, indexer, readiness) = (self.clone(), indexer.clone(), readiness.clone());
-                            tasks.push(async move { network.feed_peer(id, indexer, readiness).await; id });
+                            let (network, input) = (self.clone(), input.clone());
+                            tasks.push(async move { network.feed_peer(id, input).await; id });
                         }
                     }
                 }
@@ -280,12 +278,7 @@ impl Network {
             }
         }
     }
-    async fn feed_peer(
-        &self,
-        id: iroh::EndpointId,
-        indexer: ChainIndexer,
-        readiness: Arc<Readiness>,
-    ) {
+    async fn feed_peer(&self, id: iroh::EndpointId, input: super::input::FinalizedInput) {
         let mut failures = 0u32;
         while self.ids().contains(&id) {
             let result: Result<(), Error> = async {
@@ -311,22 +304,7 @@ impl Network {
                     if self.manager().is_blocked(peer(id)) {
                         return Err(invalid("peer quarantined"));
                     }
-                    readiness.observe(&self.trust, &block)?;
-                    let proof =
-                        crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization)
-                            .map_err(invalid)?;
-                    let first = HellasBlock::decode(block.block.as_slice()).map_err(invalid)?;
-                    for candidate in std::iter::once(first).chain(proof.descendants) {
-                        if !indexer
-                            .marshal
-                            .verified(candidate.context().round, candidate)
-                            .await
-                        {
-                            return Err(storage("marshal closed"));
-                        }
-                    }
-                    let mut marshal = indexer.marshal.clone();
-                    marshal.report(Activity::Finalization(proof.certificate));
+                    input.accept(&block).await?;
                     failures = 0;
                 }
             }

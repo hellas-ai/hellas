@@ -154,6 +154,7 @@ fn image_job_bundles_three_stages_and_passes_state_in_slots() {
 }
 
 #[test]
+#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
 fn shipped_flux_program_matches_catena_models() {
     let request = request();
     let package = ModelPackage::open(&fixture()).unwrap();

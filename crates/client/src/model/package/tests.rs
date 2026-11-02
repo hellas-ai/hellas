@@ -34,6 +34,7 @@ fn canonical_qwen3_job_bytes_are_stable() {
 }
 
 #[test]
+#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
 fn shipped_qwen3_program_matches_catena_models() {
     let package = ModelPackage::open(&fixture()).unwrap();
     let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();

@@ -55,7 +55,12 @@ pub mod validator;
 #[cfg(feature = "work-watcher")]
 pub mod work_blocks;
 /// The end-to-end money claim, against a real chain. Test-only.
-#[cfg(all(test, feature = "validator", feature = "work-watcher"))]
+#[cfg(all(
+    test,
+    feature = "integration-tests",
+    feature = "validator",
+    feature = "work-watcher"
+))]
 mod work_e2e;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub mod work_view;
@@ -85,7 +90,7 @@ pub use hellas_rpc::{
     MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES, SubmitTxOutcome,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]
-pub use indexer::{ChainIndexer, IngestError, IngestOutcome};
+pub use indexer::ChainIndexer;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
     CoinListing, ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState,
@@ -140,4 +145,4 @@ mod genesis_reexport {
 }
 
 #[cfg(all(test, feature = "indexer"))]
-pub(crate) use indexer::spawn_archive;
+pub(crate) use indexer::fixtures::spawn_archive;

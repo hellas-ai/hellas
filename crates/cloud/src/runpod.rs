@@ -16,32 +16,39 @@ pub(crate) fn open(credential: HttpSecretConfig, config: Config) -> Result<Box<d
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub template: Option<String>,
-    #[cfg(feature = "test-support")]
-    pub api_base: Option<String>,
+    /// API endpoint; overrides RUNPOD_BASE_URL when specified.
+    pub base_url: Option<String>,
 }
 
 impl Config {
     fn base(&self) -> Result<String> {
-        #[cfg(feature = "test-support")]
-        if let Some(base) = &self.api_base {
-            let url = reqwest::Url::parse(base).map_err(|_| Error::Invalid("test API base"))?;
-            if url.scheme() != "http"
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || !url
-                    .host_str()
-                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                    .is_some_and(|ip| ip.is_loopback())
-            {
-                return Err(Error::Invalid(
-                    "test API base must be a loopback HTTP endpoint",
-                ));
+        let environment = if self.base_url.is_none() {
+            match std::env::var("RUNPOD_BASE_URL") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => return Err(Error::Invalid("RUNPOD_BASE_URL is not valid Unicode")),
             }
-            return Ok(base.trim_end_matches('/').into());
+        } else {
+            None
+        };
+        let base = self
+            .base_url
+            .as_deref()
+            .or(environment.as_deref())
+            .unwrap_or("https://rest.runpod.io/v1");
+        let url = reqwest::Url::parse(base).map_err(|_| Error::Invalid("RunPod base URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Error::Invalid(
+                "RunPod base URL must be HTTP(S) without credentials, query or fragment",
+            ));
         }
-        Ok("https://rest.runpod.io/v1".into())
+        Ok(url.as_str().trim_end_matches('/').into())
     }
 }
 
@@ -289,8 +296,7 @@ mod tests {
     fn config() -> Config {
         Config {
             template: Some("template".into()),
-            #[cfg(feature = "test-support")]
-            api_base: None,
+            base_url: Some("https://rest.runpod.io/v1".into()),
         }
     }
 
@@ -299,16 +305,43 @@ mod tests {
         let request = json!({"name":"worker","image":spec().image,"accelerator":"NVIDIA L4",
             "accelerator_count":1,"template":"template"});
         assert!(serde_json::from_value::<CreateMachine>(request).is_err());
-        let settings = json!({"template":"template","api_base":"http://127.0.0.1:1234"});
-        #[cfg(not(feature = "test-support"))]
-        assert!(serde_json::from_value::<Config>(settings).is_err());
-        #[cfg(feature = "test-support")]
+        let settings = json!({"template":"template","base_url":"http://127.0.0.1:1234"});
         assert_eq!(
             serde_json::from_value::<Config>(settings)
                 .unwrap()
                 .base()
                 .unwrap(),
             "http://127.0.0.1:1234"
+        );
+    }
+
+    #[test]
+    fn endpoint_configuration_preserves_api_paths_and_rejects_ambiguous_urls() {
+        for base in [
+            "",
+            "relative/path",
+            "file:///tmp/runpod",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?token=x",
+            "https://example.com/v1#fragment",
+        ] {
+            assert!(
+                Config {
+                    base_url: Some(base.into()),
+                    ..config()
+                }
+                .base()
+                .is_err()
+            );
+        }
+        assert_eq!(
+            Config {
+                base_url: Some("https://example.com/custom/v1/".into()),
+                ..config()
+            }
+            .base()
+            .unwrap(),
+            "https://example.com/custom/v1"
         );
     }
 
@@ -394,21 +427,14 @@ mod tests {
                 respond(&mut socket, "200 OK", &response.to_string());
             }
         });
-        #[cfg(feature = "test-support")]
         let provider = crate::open(
             source(&path),
             crate::ProviderConfig::RunPod(Config {
-                api_base: Some(format!("http://{address}")),
+                base_url: Some(format!("http://{address}")),
                 ..config()
             }),
         )
         .unwrap();
-        #[cfg(not(feature = "test-support"))]
-        let provider = {
-            let mut provider = RunPod::new(source(&path), config()).unwrap();
-            provider.base = format!("http://{address}");
-            provider
-        };
         let created = provider.create(&spec()).await.unwrap();
         assert_eq!(created.id, "pod1");
         assert!(
@@ -467,8 +493,14 @@ mod tests {
                 respond(&mut socket, "200 OK", &value.to_string());
             }
         });
-        let mut provider = RunPod::new(source(&path), config()).unwrap();
-        provider.base = format!("http://{address}");
+        let provider = RunPod::new(
+            source(&path),
+            Config {
+                base_url: Some(format!("http://{address}")),
+                ..config()
+            },
+        )
+        .unwrap();
         assert!(
             matches!(provider.create(&spec()).await, Err(Error::Allocated { id, .. }) if id == "pod1")
         );
@@ -492,8 +524,14 @@ mod tests {
                     respond(&mut socket, "200 OK", &"x".repeat(1024 * 1024 + 1));
                 }
             });
-            let mut provider = RunPod::new(source(&path), config()).unwrap();
-            provider.base = format!("http://{address}");
+            let provider = RunPod::new(
+                source(&path),
+                Config {
+                    base_url: Some(format!("http://{address}")),
+                    ..config()
+                },
+            )
+            .unwrap();
             let result = provider.list().await;
             if redirect {
                 assert!(matches!(result, Err(Error::HttpStatus(_))));

@@ -3,11 +3,13 @@ use super::{EdgeIndex, store::Result};
 use crate::{
     ChainIndexer, FinalizedBlockQuery, HellasBlock,
     domain::{Digest, Object, SettlementKey},
-    execution::store::UtxoDatabase,
+    execution::store::{UtxoDatabase, UtxoDb},
     proof_verify::{ProofQuery, ProofVerifier, VerifiedAddress},
 };
-use commonware_consensus::Heightable;
+use commonware_codec::DecodeExt as _;
+use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::Digestible;
+use commonware_glue::stateful::db::ManagedDb;
 use commonware_runtime::Spawner;
 use commonware_storage::Context;
 use std::sync::Arc;
@@ -19,9 +21,75 @@ pub(crate) struct Publication {
     pub(crate) archive: ChainIndexer,
 }
 impl Publication {
-    pub(crate) fn check_start(index: &EdgeIndex, recovered: u64) -> Result<()> {
-        if index.store.latest()?.map_or(0, |p| p.height) < recovered {
-            return Err("historical indexing requires a directory indexed from genesis".into());
+    /// Publication can be one block ahead of Marshal's durable acknowledgment.
+    /// Replay that certified checkpoint before reconciling the recovered stores.
+    pub(crate) fn recovery_height(&self) -> Result<u64> {
+        let Some(proof) = self.index.store.latest()? else {
+            return Ok(0);
+        };
+        let height = proof.height;
+        self.verifier.verify(
+            proof,
+            ProofQuery::Block(FinalizedBlockQuery::Height(height)),
+        )?;
+        Ok(height)
+    }
+
+    /// Reconcile the published index only after Stateful has restored execution,
+    /// before live input or query service starts. The checkpoint is the executed
+    /// archive block, not a height inferred from the index's own metadata.
+    pub(crate) async fn recover<E: Context + Spawner + Send + Sync + 'static>(
+        &self,
+        database: &UtxoDatabase<E>,
+        checkpoint: &HellasBlock,
+    ) -> Result<()> {
+        let reader = database.read().await;
+        if reader.root() != checkpoint.state_root() {
+            return Err("index recovery checkpoint differs from executed state".into());
+        }
+        let target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&reader);
+        if target.root != checkpoint.sync_target().root
+            || target.range != checkpoint.sync_target().range
+            || crate::execution::owner_tree::stored_root(&reader).await? != checkpoint.owner_root()
+        {
+            return Err("index recovery checkpoint differs from executed database metadata".into());
+        }
+        if let Some(intent) = self.index.store.intent()? {
+            let verified = self.verifier.verify(
+                intent.proof.clone(),
+                ProofQuery::Block(FinalizedBlockQuery::Height(intent.proof.height)),
+            )?;
+            let block = HellasBlock::decode(intent.proof.canonical_block.as_slice())?;
+            if verified.view().payload() == checkpoint.digest() {
+                self.index.store.publish_intent()?;
+            } else if checkpoint.height().get().checked_add(1) == Some(block.height().get())
+                && block.parent() == checkpoint.digest()
+            {
+                self.index.store.clear_intent()?;
+            } else {
+                return Err(
+                    "index intent is not bound to the recovered execution checkpoint".into(),
+                );
+            }
+        }
+        match self.index.store.latest()? {
+            Some(proof) => {
+                let verified = self.verifier.verify(
+                    proof.clone(),
+                    ProofQuery::Block(FinalizedBlockQuery::Height(proof.height)),
+                )?;
+                if verified.view().payload() != checkpoint.digest()
+                    || verified.view().state_root() != reader.root()
+                {
+                    return Err(
+                        "index publication differs from the recovered execution checkpoint".into(),
+                    );
+                }
+            }
+            None if checkpoint.height().get() == 0 => {}
+            None => {
+                return Err("historical indexing requires a directory indexed from genesis".into());
+            }
         }
         Ok(())
     }

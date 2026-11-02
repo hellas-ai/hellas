@@ -1,6 +1,5 @@
 use super::*;
 use crate::{HellasBlock, client::RemoteLightClient};
-use commonware_codec::Encode as _;
 use commonware_consensus::{
     CertifiableBlock as _, Heightable as _,
     simplex::types::Context,
@@ -81,7 +80,7 @@ struct Fixture {
     new_coin: ObjectId,
     server: tokio::task::JoinHandle<()>,
     archive: Handle<()>,
-    chain_indexer: ChainIndexer,
+    chain_indexer: crate::indexer::fixtures::ArchiveSource,
     operations: Arc<Mutex<Operations>>,
 }
 
@@ -155,7 +154,10 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
     let (applied, batch) = prepare(&database, &allocations, &genesis, &committee, vec![]).await;
     database.finalize(batch).await;
     archive
-        .ingest_finalized(applied.clone(), finalization(&committee, &applied))
+        .publish_proof(
+            applied.clone(),
+            &finalization(&committee, &applied).encode(),
+        )
         .await
         .unwrap();
     owners.apply_finalized(&applied).unwrap();
@@ -169,14 +171,17 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
         prepare(&database, &allocations, &applied, &committee, vec![reshape]).await;
     // Marshal has the real certificate, but Stateful has not committed this batch.
     archive
-        .ingest_finalized(archived.clone(), finalization(&committee, &archived))
+        .publish_proof(
+            archived.clone(),
+            &finalization(&committee, &archived).encode(),
+        )
         .await
         .unwrap();
     let local = LocalLightClient::new(
         database.clone(),
         owners.clone(),
         Mempool::default(),
-        archive.clone(),
+        archive.archive.clone(),
         ConsensusInfo {
             validators: vec![],
             threshold_identity: committee.assembler.identity().encode().to_vec(),
@@ -304,7 +309,7 @@ fn object_witness_reuses_verified_state_and_rejects_corrupt_updates() {
         fixture.database.finalize(batch).await;
         fixture
             .chain_indexer
-            .ingest_finalized(block.clone(), finalization(&committee, &block))
+            .publish_proof(block.clone(), &finalization(&committee, &block).encode())
             .await
             .unwrap();
         fixture.owners.apply_finalized(&block).unwrap();
@@ -359,7 +364,7 @@ fn object_witness_bootstraps_again_after_pruning_overtakes_its_cursor() {
             fixture.database.finalize(batch).await;
             fixture
                 .chain_indexer
-                .ingest_finalized(block.clone(), finalization(&committee, &block))
+                .publish_proof(block.clone(), &finalization(&committee, &block).encode())
                 .await
                 .unwrap();
             fixture.owners.apply_finalized(&block).unwrap();
@@ -477,7 +482,7 @@ fn object_witness_uses_a_certified_applied_checkpoint() {
             fixture.database.finalize(batch).await;
             fixture
                 .chain_indexer
-                .ingest_finalized(block.clone(), finalization(&committee, &block))
+                .publish_proof(block.clone(), &finalization(&committee, &block).encode())
                 .await
                 .unwrap();
             fixture.owners.apply_finalized(&block).unwrap();

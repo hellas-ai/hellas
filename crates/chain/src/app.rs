@@ -902,7 +902,7 @@ mod tests {
             )
             .await;
             let genesis = app.genesis_block();
-            let (archive, task) = crate::indexer::spawn_archive(
+            let (archive, task) = crate::indexer::fixtures::spawn_archive(
                 runtime.child("archive"),
                 "publication_archive",
                 crate::config::Config::default(),
@@ -913,7 +913,7 @@ mod tests {
             .unwrap();
             let (progress, mut receiver) = ::tokio::sync::watch::channel(0);
             app.publication = Some(crate::execution::pipeline::Publication {
-                archive,
+                archive: archive.archive,
                 retention: None,
                 readiness: Arc::default(),
                 progress,

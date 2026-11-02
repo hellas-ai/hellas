@@ -1,7 +1,7 @@
-//! Paid setup, work and settlement across six independently executing
-//! validators and two full nodes. Only block ordering and the model backend
-//! are fixtures. Providers and clients read their own executed QMDB, fetch
-//! certified history over the network, and submit to validator mempools.
+//! Paid setup, work and settlement against a signed-history devnet and two
+//! production full nodes. The devnet constructs and publishes source state;
+//! providers and clients read their own executed QMDB, fetch certified history
+//! over the network, and submit to fixture validator mempools.
 
 use hellas_channel::test_support::channel::serve_work as serve;
 use hellas_channel::test_support::channel::{AnsweringBackend, work_policy};

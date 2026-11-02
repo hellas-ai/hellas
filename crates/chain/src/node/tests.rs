@@ -2,10 +2,10 @@ use super::*;
 use crate::LightClient as _;
 use crate::execution::{
     ChainVerifier,
-    store::{empty_state, utxo_db_config},
+    store::{UtxoDatabase, empty_state, utxo_db_config},
 };
 use crate::{
-    domain,
+    domain::{self, SettlementKey},
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
 };
 use commonware_codec::Decode as _;
@@ -151,13 +151,139 @@ impl Fixture {
 }
 
 #[test]
+fn recovery_finds_the_first_committed_block_before_its_archive_acknowledgment() {
+    use commonware_actor::Feedback;
+    use commonware_consensus::{
+        marshal::{Start, Update, resolver::handler},
+        types::FixedEpocher,
+    };
+    use commonware_utils::NZUsize;
+    #[derive(Clone)]
+    struct HoldAcknowledgment(tokio::sync::mpsc::UnboundedSender<Update<HellasBlock>>);
+    impl Reporter for HoldAcknowledgment {
+        type Activity = Update<HellasBlock>;
+        fn report(&mut self, update: Self::Activity) -> Feedback {
+            self.0.send(update).unwrap();
+            Feedback::Ok
+        }
+    }
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime.child("producer"), directory.path()).await;
+        let genesis = fixture.head.clone();
+        let owner = crate::owner_index::OwnerIndex::new(
+            domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
+        let trust = Trust::Genesis(Arc::new(fixture.committee.verifier.clone()));
+        let (actor, archive, _) = crate::indexer::init(
+            runtime.child("archive"),
+            "unacknowledged",
+            &ArchiveConfig::default(),
+            Start::Genesis(genesis.clone()),
+            trust.clone(),
+            FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap()),
+        )
+        .await;
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let network = replication::Network::new(endpoint.clone(), trust.clone());
+        let (receiver, handler) = handler::init(runtime.child("handler"), NZUsize!(256));
+        let resolver = commonware_resolver::opaque::init::<_, _, _, PublicKey>(
+            runtime.child("resolver"),
+            network,
+            handler,
+            NZUsize!(256),
+            Duration::from_millis(500),
+        );
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let task = actor.start_unbuffered(HoldAcknowledgment(send), (receiver, resolver));
+        let block = fixture.next().await;
+        let input = input::FinalizedInput::new(archive.clone(), Arc::default(), trust);
+        input.accept(&block).await.unwrap();
+        let acknowledgment = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let update = receive.recv().await.expect("archive remained open");
+                if matches!(update, Update::Block(..)) {
+                    break update;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            archive
+                .marshal
+                .get_processed_height()
+                .await
+                .map_or(0, |h| h.get()),
+            0
+        );
+        assert_eq!(owner.cursor().height, 0);
+        assert_eq!(
+            crate::execution::pipeline::restore(
+                &archive,
+                &fixture.database,
+                &owner,
+                None,
+                &genesis
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(owner.cursor().payload, block.snapshot.payload);
+        // Stop the source without releasing its durable acknowledgment.
+        task.abort();
+        let _ = task.await;
+        drop(acknowledgment);
+        endpoint.close().await;
+    });
+}
+
+#[test]
+fn certified_future_history_suspends_retained_reads_until_ancestry_executes() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start(fixture.config.clone()).await.unwrap();
+        apply(&node, fixture.next().await).await.unwrap();
+        let retained = node.view().unwrap().client();
+        let parent = fixture.next().await;
+        let tip = fixture.next().await;
+        node.accept_finalized(&tip).await.unwrap();
+        assert_eq!(
+            node.status(),
+            NodeStatus::CatchingUp {
+                observed: Some(3),
+                executed: 1
+            }
+        );
+        assert!(matches!(
+            retained.get_latest_block().await,
+            Err(QueryError::StateUnavailable(_))
+        ));
+        node.accept_finalized(&parent).await.unwrap();
+        apply(&node, tip.clone()).await.unwrap();
+        assert_eq!(
+            retained.get_latest_block().await.unwrap().unwrap().payload,
+            tip.snapshot.payload
+        );
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn full_nodes_exchange_executed_state_without_a_validator() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, &directory.path().join("a")).await;
         let seed = FullNode::start(fixture.config.clone()).await.unwrap();
         let block = fixture.next().await;
-        seed.0.core.apply(block.clone()).await.unwrap();
+        apply(&seed, block.clone()).await.unwrap();
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
         config.storage_dir = directory.path().join("relay");
@@ -167,9 +293,9 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
             .await
             .unwrap()
             .unwrap();
-        seed.0.core.apply(block2.clone()).await.unwrap();
+        apply(&seed, block2.clone()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(20), async {
-            while a.0.core.applied() != 2 {
+            while a.status().executed_height() != 2 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -206,14 +332,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
             b.view().unwrap().client().get_state_root().await.unwrap(),
             Some(block2.snapshot.state_root)
         );
-        assert!(
-            b.0.core
-                .indexer
-                .get_finalized_block(FinalizedBlockQuery::Height(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!archived(&b, 1).await);
         let local = b.view().unwrap().client();
         let historical = tokio::time::timeout(
             Duration::from_secs(15),
@@ -260,23 +379,25 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
         let mut corrupt = first.clone();
         corrupt.block[0] ^= 1;
         assert!(matches!(
-            node.0.core.apply(corrupt).await,
+            apply(&node, corrupt).await,
             Err(Error::InvalidBlock(_))
         ));
         let mut corrupt = first.clone();
         corrupt.snapshot.finalization[0] ^= 1;
         assert!(matches!(
-            node.0.core.apply(corrupt).await,
+            apply(&node, corrupt).await,
             Err(Error::InvalidBlock(_))
         ));
-        assert_eq!(node.0.core.readiness.seen.load(Ordering::Acquire), 0);
-        assert_eq!(node.0.core.applied(), 0);
-        node.0.core.apply(first).await.unwrap();
-        let retained = node.view().unwrap();
+        assert_eq!(
+            node.status(),
+            NodeStatus::CatchingUp {
+                observed: None,
+                executed: 0
+            }
+        );
+        assert_eq!(node.status().executed_height(), 0);
+        apply(&node, first).await.unwrap();
         let second = fixture.next().await;
-        node.0.core.observe(&second).unwrap();
-        assert!(node.view().is_err());
-        assert!(retained.client().get_state_root().await.is_err());
         let block = HellasBlock::decode(second.block.as_slice()).unwrap();
         let bad = HellasBlock::new(
             block.context().clone(),
@@ -289,12 +410,12 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
         )
         .with_owner_root(block.owner_root());
         assert!(matches!(
-            node.0.core.apply(fixture.certify(bad)).await,
-            Err(Error::Execution(_))
+            apply(&node, fixture.certify(bad)).await,
+            Err(Error::Query(_))
         ));
-        assert_eq!(node.0.core.applied(), 1);
+        assert_eq!(node.status().executed_height(), 1);
         assert!(node.view().is_err());
-        assert!(node.0.core.apply(second).await.is_err());
+        assert!(apply(&node, second).await.is_err());
         assert!(node.shutdown().await.is_err());
     });
 }
@@ -307,22 +428,14 @@ fn pruned_archive_restarts_with_live_owner_state() {
         fixture.config.archive_blocks = NonZeroU64::new(2);
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         let mut last = fixture.next().await;
-        node.0.core.apply(last.clone()).await.unwrap();
+        apply(&node, last.clone()).await.unwrap();
         for _ in 1..260 {
             last = fixture.next().await;
-            node.0.core.apply(last.clone()).await.unwrap();
+            apply(&node, last.clone()).await.unwrap();
         }
         // Marshal's pruning request is processed asynchronously.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while node
-                .0
-                .core
-                .indexer
-                .get_finalized_block(FinalizedBlockQuery::Height(1))
-                .await
-                .unwrap()
-                .is_some()
-            {
+            while archived(&node, 1).await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -334,8 +447,8 @@ fn pruned_archive_restarts_with_live_owner_state() {
             node.view().is_err(),
             "restart needs a freshly verified head observation"
         );
-        node.0.core.observe(&last).unwrap();
-        assert_eq!(node.0.core.applied(), 260);
+        node.accept_finalized(&last).await.unwrap();
+        assert_eq!(node.status().executed_height(), 260);
         let coins = node
             .view()
             .unwrap()
@@ -346,8 +459,8 @@ fn pruned_archive_restarts_with_live_owner_state() {
             .unwrap();
         assert_eq!(coins.coins[0].1, 5000);
         assert_eq!(coins.snapshot.payload, last.snapshot.payload);
-        node.0.core.apply(fixture.next().await).await.unwrap();
-        assert_eq!(node.0.core.applied(), 261);
+        apply(&node, fixture.next().await).await.unwrap();
+        assert_eq!(node.status().executed_height(), 261);
         node.shutdown().await.unwrap();
     });
 }
@@ -368,7 +481,7 @@ fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
             FullNode::start(fixture.config.clone()).await,
             Err(Error::Storage(_))
         ));
-        node.0.core.apply(fixture.next().await).await.unwrap();
+        apply(&node, fixture.next().await).await.unwrap();
         let view = node.view().unwrap();
         node.shutdown().await.unwrap();
         assert!(view.client().get_state_root().await.is_err());
@@ -522,8 +635,14 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             .await
             .unwrap();
             assert!(node.view().is_err());
-            assert_eq!(node.0.core.applied(), 0);
-            assert_eq!(node.0.core.readiness.seen.load(Ordering::Acquire), 0);
+            assert_eq!(node.status().executed_height(), 0);
+            assert_eq!(
+                node.status(),
+                NodeStatus::CatchingUp {
+                    observed: None,
+                    executed: 0
+                }
+            );
             let registry = node.peer_registry().unwrap();
             let entry = registry
                 .get(PeerId::from_bytes(*endpoint.id().as_bytes()))
@@ -582,10 +701,10 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
         .await
         .unwrap();
         let mut last = fixture.next().await;
-        node.0.core.apply(last.clone()).await.unwrap();
+        apply(&node, last.clone()).await.unwrap();
         for _ in 1..3 {
             last = fixture.next().await;
-            node.0.core.apply(last.clone()).await.unwrap();
+            apply(&node, last.clone()).await.unwrap();
         }
         let owner = fixture.allocations[0].0;
         let proof = node.owner_proof(owner, 0, 32, None).await.unwrap().unwrap();
@@ -600,13 +719,7 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
             .unwrap();
         assert_eq!(coins.snapshot.payload, proof.block().view().payload());
         assert_eq!(coins.coins.len(), 1);
-        assert!(
-            node.archive()
-                .get_finalized_block(FinalizedBlockQuery::Height(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
         let node = FullNode::start_indexed(fixture.config.clone(), trust, json, "read".into())
             .await
@@ -615,7 +728,7 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
         let recovered = node.owner_proof(owner, 0, 32, None).await.unwrap().unwrap();
         assert_eq!(recovered.page(), proof.page());
         assert_eq!(recovered.block().view().payload(), last.snapshot.payload);
-        node.0.core.apply(fixture.next().await).await.unwrap();
+        apply(&node, fixture.next().await).await.unwrap();
         assert_eq!(
             node.owner_proof(owner, 0, 32, None)
                 .await
@@ -639,7 +752,7 @@ fn validator_archive_seeds_execution_over_iroh() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime.child("producer"), directory.path()).await;
-        let (archive, handle) = crate::indexer::spawn_archive(
+        let (archive, handle) = crate::indexer::fixtures::spawn_archive(
             runtime.child("seed"),
             "seed",
             ArchiveConfig::default(),
@@ -667,7 +780,7 @@ fn validator_archive_seeds_execution_over_iroh() {
         fixture.config.peers = vec![endpoint.addr()];
         let (activity, _) = tokio::sync::broadcast::channel(4);
         let serving = tokio::spawn(super::transport::serve_validator_endpoint(
-            archive.clone(),
+            archive.archive.clone(),
             activity,
             endpoint.clone(),
             fixture.database.clone(),
@@ -675,7 +788,7 @@ fn validator_archive_seeds_execution_over_iroh() {
         ));
         let block = fixture.next().await;
         archive
-            .ingest_finalized_proof(
+            .publish_proof(
                 HellasBlock::decode(block.block.as_slice()).unwrap(),
                 &block.snapshot.finalization,
             )
@@ -700,42 +813,27 @@ fn validator_archive_seeds_execution_over_iroh() {
     });
 }
 
-// Test producers submit certificates through marshal; production sources do the
-// same after transport verification. Stateful owns every database mutation.
-impl Core {
-    async fn apply(&self, incoming: FinalizedBlock) -> Result<(), Error> {
-        use commonware_consensus::simplex::types::Activity;
-        self.readiness.running()?;
-        let block = self.observe(&incoming)?;
-        let height = incoming.snapshot.height;
-        let proof = crate::finality_proof::FinalityProof::decode(&incoming.snapshot.finalization)
-            .map_err(invalid)?;
-        for candidate in std::iter::once(block).chain(proof.descendants) {
-            if !self
-                .indexer
-                .marshal
-                .verified(candidate.context().round, candidate)
-                .await
-            {
-                return Err(storage("marshal closed"));
-            }
-        }
-        self.indexer
-            .marshal
-            .clone()
-            .report(Activity::Finalization(proof.certificate));
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.applied() < height {
-                if self.readiness.running().is_err() {
-                    return Err(Error::Execution("node halted".into()));
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            Ok(())
-        })
+// Fixtures submit certified input through the normal node interface and wait for
+// its published read view; they never execute or finalize the consumer database.
+async fn apply(node: &FullNode, incoming: FinalizedBlock) -> Result<(), Error> {
+    node.accept_finalized(&incoming).await?;
+    tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
         .await
-        .map_err(storage)?
-    }
+        .expect("node execution is bounded")?;
+    Ok(())
+}
+
+async fn archived(node: &FullNode, height: u64) -> bool {
+    hellas_rpc::services::chain_sync::ChainSyncHandler::get_finalized_block(
+        node,
+        hellas_rpc::pb::chain::GetFinalizedBlockRequest {
+            query: Some(hellas_rpc::pb::chain::get_finalized_block_request::Query::Height(height)),
+        },
+    )
+    .await
+    .unwrap()
+    .block
+    .is_some()
 }
 
 #[test]
@@ -745,7 +843,7 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         let mut fixture = Fixture::new(runtime, &directory.path().join("seed")).await;
         let seed = FullNode::start(fixture.config.clone()).await.unwrap();
         let block = fixture.next().await;
-        seed.0.core.apply(block.clone()).await.unwrap();
+        apply(&seed, block.clone()).await.unwrap();
         let mut endpoints = Vec::new();
         let old_count = *HellasBlock::decode(block.block.as_slice())
             .unwrap()
@@ -776,15 +874,21 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
             .await
             .unwrap();
         let block = fixture.next().await;
-        seed.0.core.apply(block.clone()).await.unwrap();
+        apply(&seed, block.clone()).await.unwrap();
         let node = tokio::time::timeout(Duration::from_secs(30), starting)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(node.0.core.applied(), 2);
+        assert_eq!(node.status().executed_height(), 2);
         assert_eq!(
-            node.0.core.database.read().await.root(),
+            node.view()
+                .unwrap()
+                .client()
+                .get_state_root()
+                .await
+                .unwrap()
+                .unwrap(),
             block.snapshot.state_root
         );
         assert!(
@@ -866,7 +970,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         let first = fixture.next().await;
         let second = fixture.next().await;
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
-        node.0.core.apply(first.clone()).await.unwrap();
+        apply(&node, first.clone()).await.unwrap();
         node.shutdown().await.unwrap();
         let config = fixture.config.clone();
         let signer = fixture.committee.schemes[0].clone();
@@ -915,7 +1019,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                     context.child("archive"),
                     "chain",
                     &settings,
-                    plan.marshal_start(genesis),
+                    plan.marshal_start(genesis.clone()),
                     provider,
                     FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap()),
                 )
@@ -955,6 +1059,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                             &database,
                             &owner,
                             startup.into_iter().chain(processed).max(),
+                            &genesis,
                         )
                         .await
                         .unwrap();
@@ -1015,7 +1120,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         .await
         .unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
-        node.0.core.observe(&second).unwrap();
+        node.accept_finalized(&second).await.unwrap();
         let view = tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
             .await
             .unwrap()
@@ -1024,7 +1129,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
             view.client().get_state_root().await.unwrap(),
             Some(second.snapshot.state_root)
         );
-        node.0.core.apply(fixture.next().await).await.unwrap();
+        apply(&node, fixture.next().await).await.unwrap();
         node.shutdown().await.unwrap();
     });
 }
@@ -1063,7 +1168,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         let mut fixture = Fixture::new(runtime, &directory.path().join("seed")).await;
         let seed = FullNode::start(fixture.config.clone()).await.unwrap();
         let block = fixture.next().await;
-        seed.0.core.apply(block.clone()).await.unwrap();
+        apply(&seed, block.clone()).await.unwrap();
         let requested = Arc::new(StateRequests {
             old_count: 0,
             requested: Default::default(),
@@ -1097,9 +1202,15 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(node.0.core.applied(), 1);
+        assert_eq!(node.status().executed_height(), 1);
         assert_eq!(
-            node.0.core.database.read().await.root(),
+            node.view()
+                .unwrap()
+                .client()
+                .get_state_root()
+                .await
+                .unwrap()
+                .unwrap(),
             block.snapshot.state_root
         );
         node.shutdown().await.unwrap();
@@ -1170,11 +1281,11 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             client.close().await;
             let follower = FullNode::start(target.config).await.unwrap();
             assert!(matches!(
-                follower.0.core.apply(incoming.clone()).await,
+                apply(&follower, incoming.clone()).await,
                 Err(Error::InvalidBlock(_))
             ));
-            assert_eq!(follower.0.core.applied(), 0);
-            assert!(follower.0.core.readiness.running().is_ok());
+            assert_eq!(follower.status().executed_height(), 0);
+            assert!(!matches!(follower.status(), NodeStatus::Stopped { .. }));
             follower.shutdown().await.unwrap();
         }
         serving.abort();

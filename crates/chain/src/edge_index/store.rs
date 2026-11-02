@@ -194,7 +194,6 @@ impl IndexStore {
         write.commit()?;
         Ok(())
     }
-    #[cfg(test)]
     pub fn clear_intent(&self) -> Result<()> {
         let write = self.db.begin_write()?;
         write.open_table(META)?.remove("intent")?;
@@ -616,49 +615,14 @@ mod tests {
         assert_eq!(details.code, "index_storage_error");
     }
 
-    #[test]
-    fn inconsistent_persisted_edge_is_corruption_not_catch_up() {
-        crate::execution::test_support::run_qmdb(|context| async move {
-            let maker = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
-            let taker = hellas_kernel::Secp256k1Signer::from_secret_scalar([20; 32]).unwrap();
-            let owner = crate::domain::SettlementKey::from(maker.party_key());
-            let mut h =
-                crate::edge_index::ReplayHarness::new(context, vec![(owner, 100)], "corrupt-edge")
-                    .await;
-            let (_, _, tx) = crate::edge_index::replay_basic(h.network, 0, &maker, &taker);
-            h.append(vec![Transaction::Kernel(tx)]).await;
-            let page = h
-                .index
-                .list_edges(ListEdgesRequest {
-                    schema_version: super::super::SCHEMA_VERSION,
-                    ..Default::default()
-                })
-                .unwrap();
-            let id = &page.data.unwrap().items[0].edge_id;
-            let write = h.index.store.db.begin_write().unwrap();
-            write
-                .open_table(OBJECTS)
-                .unwrap()
-                .remove(hex::decode(id).unwrap().as_slice())
-                .unwrap();
-            write.commit().unwrap();
-            let error = h
-                .index
-                .get_edge_detail(super::super::types::GetEdgeDetailRequest {
-                    schema_version: super::super::SCHEMA_VERSION,
-                    edge_id: id.clone(),
-                    payload: None,
-                })
-                .unwrap_err();
-            assert_eq!((error.status, error.code), (500, "index_corrupt"));
-            assert!(error.message.contains("history/object state mismatch"));
-        });
-    }
+    #[cfg(feature = "integration-tests")]
+    #[path = "integration.rs"]
+    mod integration;
 
     #[test]
     fn native_edge_index_open_queries_do_not_scan_closed_history() {
         // Synthetic lookup stress: the certificate/root checks are covered by the
-        // execution-backed replay tests. Here the adversary is a large cold history
+        // indexed-node tests. Here the adversary is a large cold history
         // prefix, and the open query must never visit any of its rows.
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(

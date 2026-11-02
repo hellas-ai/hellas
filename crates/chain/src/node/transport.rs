@@ -149,12 +149,8 @@ impl FullNode {
         })))
     }
     #[cfg(feature = "indexer-api")]
-    pub(crate) fn index(&self) -> Option<crate::edge_index::EdgeIndex> {
-        self.0.core.publication.as_ref().map(|p| p.index.clone())
-    }
-    #[cfg(feature = "indexer-api")]
-    pub(crate) fn archive(&self) -> ChainIndexer {
-        self.0.core.indexer.clone()
+    pub(crate) fn publication(&self) -> Option<crate::edge_index::Publication> {
+        self.0.core.publication.clone()
     }
     #[cfg(feature = "indexer-api")]
     pub(crate) async fn owner_proof(
@@ -163,7 +159,10 @@ impl FullNode {
         offset: u64,
         limit: u32,
         payload: Option<&str>,
-    ) -> Result<Option<crate::proof_verify::VerifiedAddress>, Error> {
+    ) -> Result<
+        Option<crate::proof_verify::VerifiedAddress>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         self.0.core.readiness.running()?;
         self.0
             .core
@@ -172,7 +171,6 @@ impl FullNode {
             .ok_or_else(|| storage("node has no read index"))?
             .owner_proof(&self.0.core.database, owner, offset, limit, payload)
             .await
-            .map_err(storage)
     }
     /// Serve the finalized chain subset on a host's authenticated iroh
     /// connection. Streams and reads share the connection concurrently.
@@ -240,25 +238,22 @@ impl FullNode {
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
         self.0.endpoint.addr()
     }
+    /// Verify certified history against this node's configured trust and enqueue it
+    /// for execution. Acceptance is not publication: observe `finalized` and use
+    /// `view` for reads. Missing ancestry is fetched through the configured peers.
+    pub async fn accept_finalized(&self, block: &FinalizedBlock) -> Result<(), Error> {
+        self.0.core.input.accept(block).await
+    }
+
+    /// Snapshot of execution readiness. Retained read handles still recheck it.
+    pub fn status(&self) -> NodeStatus {
+        self.0.core.readiness.status()
+    }
+
+    /// The last executed and published finalized height, including later updates.
     pub fn finalized(&self) -> watch::Receiver<u64> {
         self.0.core.progress.subscribe()
     }
-    /// Requires the real executor to reach `height` before test reads can resume.
-    #[cfg(feature = "test-support")]
-    pub fn require_finalized_height_for_test(&self, height: u64) {
-        self.0
-            .core
-            .readiness
-            .seen
-            .fetch_max(height, Ordering::AcqRel);
-    }
-
-    /// Readiness checks attempted by this node's readers, for deterministic tests.
-    #[cfg(feature = "test-support")]
-    pub fn read_attempts_for_test(&self) -> u64 {
-        self.0.core.readiness.read_attempts.load(Ordering::Acquire)
-    }
-
     pub async fn wait_ready(&self) -> Result<ChainView, QueryError> {
         let mut progress = self.finalized();
         loop {

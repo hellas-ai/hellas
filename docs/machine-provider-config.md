@@ -51,3 +51,10 @@ worker. The common bound is 64 KiB per secret; Windows Credential Manager's
 native limit is 2,560 bytes. Oversize values fail rather than being split or
 written elsewhere. Linux stores base64 internally to preserve arbitrary bytes
 with Secret Service implementations that accept only UTF-8.
+
+The RunPod API endpoint defaults to `https://rest.runpod.io/v1`. Set
+`config.base_url` in the provider configuration or `RUNPOD_BASE_URL` in the
+process environment to use another HTTP(S) endpoint, including its API path
+prefix. An explicit configuration value takes precedence over the environment.
+URLs containing credentials, query strings or fragments are rejected; redirects
+are not followed. The configured provider credential is sent to this endpoint.

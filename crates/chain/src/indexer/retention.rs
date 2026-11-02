@@ -4,6 +4,7 @@ use super::*;
 use commonware_consensus::marshal::store::{Blocks, Certificates};
 use commonware_consensus::simplex::types::Finalization as Certificate;
 use commonware_cryptography::Digestible;
+use commonware_runtime::Handle;
 use commonware_storage::{
     archive::{Identifier, prunable},
     translator::EightCap,

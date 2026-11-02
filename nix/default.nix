@@ -430,7 +430,7 @@ let
       cargoBuildType = "debug";
       buildPhase = ''
         runHook preBuild
-        cargo clippy --workspace --all-targets --offline -- -D warnings
+        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --offline -- -D warnings
         runHook postBuild
       '';
       doCheck = false;
@@ -480,13 +480,13 @@ let
 
   hydraUnit = nativePkg.mkHellasPackage {
     pname = "hellas-check-unit";
-    cargoBuildType = "debug";
-    buildPhase = ''
-      runHook preBuild
-      ${ci.unitTestCommand}
-      runHook postBuild
-    '';
-    doCheck = false;
+    buildType = "debug";
+    dontBuild = true;
+    doCheck = true;
+    cargoTestFlags = [
+      "--locked"
+      "--workspace"
+    ];
     installPhase = ''
       mkdir -p "$out"
       touch "$out/passed"

@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+# Opt in to tests that start local nodes or exercise complete host processes.
+integration-tests = []
+
 [dependencies]
 async-stream = { workspace = true }
 futures = { workspace = true }
@@ -91,3 +95,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "native_execution"
+required-features = ["integration-tests"]

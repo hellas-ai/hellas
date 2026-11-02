@@ -183,6 +183,7 @@ pub(crate) async fn restore(
     database: &UtxoDatabase<Context>,
     owner: &crate::owner_index::OwnerIndex,
     startup: Option<commonware_consensus::types::Height>,
+    genesis: &HellasBlock,
 ) -> Result<u64, crate::QueryError> {
     use commonware_consensus::types::Height;
     let processed = archive.marshal.get_processed_height().await;
@@ -193,13 +194,15 @@ pub(crate) async fn restore(
         .chain([owner.cursor().height])
         .max()
         .unwrap_or(0);
-    if height == 0 {
-        return Ok(0);
-    }
     let reader = database.read().await;
     // At most one finalized application can precede marshal's durable ack.
     for candidate in [height.saturating_add(1), height] {
-        if let Some(block) = archive.marshal.get_block(Height::new(candidate)).await
+        let block = if candidate == 0 {
+            Some(genesis.clone())
+        } else {
+            archive.marshal.get_block(Height::new(candidate)).await
+        };
+        if let Some(block) = block
             && reader.root() == block.state_root()
             && block.sync_target().root == reader.root()
             && super::owner_tree::stored_root(&reader)
