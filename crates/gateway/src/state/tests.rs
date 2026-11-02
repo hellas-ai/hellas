@@ -518,3 +518,82 @@ async fn structured_output_is_rejected_before_native_execution() {
         .unwrap();
     assert_eq!(work.jobs.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn native_capabilities_reject_every_unimplemented_control() {
+    use hellas_adaptors::{Input, ModelRef, ResponseFormat};
+    use serde_json::json;
+
+    let base = CanonicalExecution::new(ModelRef::new("m"), Input::Text("hello".into()));
+    validate_native_text_request(&base).unwrap();
+    for (key, value) in [
+        ("temperature", json!(0.4)),
+        ("top_p", json!(0.8)),
+        ("top_logprobs", json!(2)),
+        ("truncation", json!("auto")),
+        ("stop", json!(["END"])),
+    ] {
+        let mut encoded = serde_json::to_value(&base).unwrap();
+        encoded["sampling"][key] = value;
+        let request = serde_json::from_value(encoded).unwrap();
+        assert!(
+            matches!(
+                validate_native_text_request(&request),
+                Err(BackendError::Rejected(_))
+            ),
+            "accepted {key}"
+        );
+    }
+    for format in [
+        ResponseFormat::JsonObject,
+        ResponseFormat::JsonSchema {
+            name: None,
+            schema: json!({"type":"object"}),
+            strict: Some(true),
+        },
+        ResponseFormat::Raw(json!({"type":"custom"})),
+    ] {
+        let mut request = base.clone();
+        request.response_format = Some(format);
+        assert!(validate_native_text_request(&request).is_err());
+    }
+    let mut plain = base;
+    plain.response_format = Some(ResponseFormat::Text);
+    validate_native_text_request(&plain).unwrap();
+}
+
+#[tokio::test]
+async fn anthropic_controls_are_rejected_before_submitting_a_job() {
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let router = super::router(Arc::new(open(work.clone()).await));
+    for (field, value) in [
+        ("temperature", json!(0.4)),
+        ("top_p", json!(0.8)),
+        ("stop_sequences", json!(["END"])),
+    ] {
+        let mut body =
+            json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hello"}]});
+        body[field] = value;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "accepted {field}"
+        );
+    }
+    assert!(work.jobs.lock().unwrap().is_empty());
+}

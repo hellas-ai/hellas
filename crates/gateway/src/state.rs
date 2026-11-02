@@ -2,12 +2,49 @@
 use super::{TextOptions, WorkExecutionBackend};
 use crate::ComputeEvent;
 use axum::{Router, routing::post};
-use hellas_adaptors::{BackendError, ExecutionRequest as WireExecutionRequest, ResponseFormat};
+use hellas_adaptors::{
+    BackendError, CanonicalExecution, ExecutionRequest as WireExecutionRequest, ResponseFormat,
+};
 use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::{error::Error as StdError, sync::Arc};
 use tokio::time::Duration;
+
+/// Reject controls the native executor cannot enforce before creating a job.
+fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), BackendError> {
+    if !canonical.sampling.stop.is_empty() {
+        return Err(BackendError::rejected(
+            "custom stop sequences are not supported by native text execution",
+        ));
+    }
+    for (name, present) in [
+        ("temperature", canonical.sampling.temperature.is_some()),
+        ("top_p", canonical.sampling.top_p.is_some()),
+        ("top_logprobs", canonical.sampling.top_logprobs.is_some()),
+        ("truncation", canonical.sampling.truncation.is_some()),
+    ] {
+        if present {
+            return Err(BackendError::rejected(format!(
+                "`{name}` is not supported by native text execution"
+            )));
+        }
+    }
+    if let Some(format) = &canonical.response_format {
+        let unsupported = match format {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some("json_object"),
+            ResponseFormat::JsonSchema { .. } => Some("json_schema"),
+            ResponseFormat::Raw(_) => Some("raw"),
+        };
+        if let Some(name) = unsupported {
+            return Err(BackendError::rejected(format!(
+                "response format `{name}` is not supported by native text execution"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The paths the text presentation serves.
 pub(super) const PATHS: [&str; 4] = [
@@ -85,36 +122,7 @@ impl TextState {
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, BackendError> {
         let canonical = &req.canonical;
-        if !canonical.sampling.stop.is_empty() {
-            return Err(BackendError::rejected(
-                "custom stop sequences are not supported by native text execution",
-            ));
-        }
-        for (name, present) in [
-            ("temperature", canonical.sampling.temperature.is_some()),
-            ("top_p", canonical.sampling.top_p.is_some()),
-            ("top_logprobs", canonical.sampling.top_logprobs.is_some()),
-            ("truncation", canonical.sampling.truncation.is_some()),
-        ] {
-            if present {
-                return Err(BackendError::rejected(format!(
-                    "`{name}` is not supported by native text execution"
-                )));
-            }
-        }
-        if let Some(format) = &canonical.response_format {
-            let unsupported = match format {
-                ResponseFormat::Text => None,
-                ResponseFormat::JsonObject => Some("json_object"),
-                ResponseFormat::JsonSchema { .. } => Some("json_schema"),
-                ResponseFormat::Raw(_) => Some("raw"),
-            };
-            if let Some(name) = unsupported {
-                return Err(BackendError::rejected(format!(
-                    "response format `{name}` is not supported by native text execution"
-                )));
-            }
-        }
+        validate_native_text_request(canonical)?;
         let max_tokens = canonical
             .sampling
             .max_output_tokens
