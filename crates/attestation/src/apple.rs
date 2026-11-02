@@ -15,9 +15,13 @@ use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha256};
 use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert, ring};
 use x509_cert::Certificate;
+
 use x509_cert::der::Decode;
 
 use crate::{AnchorTime, AttestationError, Binding};
+
+/// Canonical tag of an Apple App Attest credential.
+const CREDENTIAL_TAG: &str = "hellas.apple.app-attest.credential.v1";
 
 const APP_ATTEST_EKU: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x04, 0x18];
 const APP_ATTEST_EKU_DER: &[u8] = &[
@@ -66,7 +70,7 @@ impl AppleCredential {
     pub fn content_id(&self) -> ContentId {
         let mut e = DagCborEncoder::new();
         e.array(3);
-        e.str("hellas.apple.app-attest.credential.v1");
+        e.str(CREDENTIAL_TAG);
         e.bytes(&self.attestation);
         e.bytes(&self.client_data_hash);
         ContentId::hash(&e.into_bytes())

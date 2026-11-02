@@ -142,6 +142,13 @@ impl ProviderGenesisStatement {
     }
 }
 
+/// Canonical tag of a provider enrollment bundle.
+const ENROLLMENT_BUNDLE_TAG: &str = "hellas.provider.enrollment.bundle.v1";
+/// Canonical tag of a signed provider genesis statement.
+const GENESIS_STATEMENT_TAG: &str = "hellas.provider.genesis.statement.v2";
+/// Canonical tag of a signed provider genesis envelope.
+const GENESIS_SIGNED_TAG: &str = "hellas.provider.genesis.signed.v2";
+
 impl SignedProviderGenesis {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut e = DagCborEncoder::new();
@@ -154,7 +161,7 @@ impl ProviderEnrollmentBundle {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut e = DagCborEncoder::new();
         e.array(3);
-        e.str("hellas.provider.enrollment.bundle.v1");
+        e.str(ENROLLMENT_BUNDLE_TAG);
         encode_signed(&mut e, &self.genesis);
         encode_platform_enrollment(&mut e, &self.platform);
         e.into_bytes()
@@ -167,7 +174,7 @@ impl ProviderEnrollmentBundle {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProviderGenesisDecodeError> {
         let mut decoder = Decoder::new(bytes);
         decoder.array(3, "provider enrollment bundle")?;
-        decoder.tag("hellas.provider.enrollment.bundle.v1")?;
+        decoder.tag(ENROLLMENT_BUNDLE_TAG)?;
         let bundle = Self {
             genesis: decode_signed(&mut decoder)?,
             platform: decode_platform_enrollment(&mut decoder)?,
@@ -184,7 +191,7 @@ impl ProviderEnrollmentBundle {
 
 fn encode_statement(e: &mut DagCborEncoder, s: &ProviderGenesisStatement) {
     e.array(7);
-    e.str("hellas.provider.genesis.statement.v2");
+    e.str(GENESIS_STATEMENT_TAG);
     e.u64(s.root_kind as u64);
     encode_public_key(e, &s.root_public_key);
     encode_public_key(e, &s.producer_public_key);
@@ -205,7 +212,7 @@ fn encode_statement(e: &mut DagCborEncoder, s: &ProviderGenesisStatement) {
 
 fn encode_signed(e: &mut DagCborEncoder, genesis: &SignedProviderGenesis) {
     e.array(3);
-    e.str("hellas.provider.genesis.signed.v2");
+    e.str(GENESIS_SIGNED_TAG);
     encode_statement(e, &genesis.statement);
     match &genesis.root_proof {
         RootProof::AppleAppAttest(proof) => encode_proof(e, 1, proof),
@@ -269,7 +276,7 @@ fn decode_signed(
     decoder: &mut Decoder<'_>,
 ) -> Result<SignedProviderGenesis, ProviderGenesisDecodeError> {
     decoder.array(3, "signed provider genesis")?;
-    decoder.tag("hellas.provider.genesis.signed.v2")?;
+    decoder.tag(GENESIS_SIGNED_TAG)?;
     let statement = decode_statement(decoder)?;
     let root_proof = decode_proof(decoder)?;
     Ok(SignedProviderGenesis {
@@ -282,7 +289,7 @@ fn decode_statement(
     decoder: &mut Decoder<'_>,
 ) -> Result<ProviderGenesisStatement, ProviderGenesisDecodeError> {
     decoder.array(7, "provider genesis statement")?;
-    decoder.tag("hellas.provider.genesis.statement.v2")?;
+    decoder.tag(GENESIS_STATEMENT_TAG)?;
     let root_kind = match decoder.u64("root kind")? {
         1 => RootKind::SecureEnclave,
         3 => RootKind::Software,

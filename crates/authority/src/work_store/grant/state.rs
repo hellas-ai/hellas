@@ -939,6 +939,9 @@ fn verify(
     .map_err(|_| GrantError::Signature.into())
 }
 
+/// Namespace of a journal checkpoint snapshot.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v2";
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
     namespace: String,
@@ -979,7 +982,7 @@ struct StoredJob {
 impl State {
     pub(super) fn snapshot(&self) -> Result<Snapshot, NodeStoreError> {
         Ok(Snapshot {
-            namespace: "hellas.node.checkpoint.v2".into(),
+            namespace: CHECKPOINT_NAMESPACE.into(),
             network: self.network,
             authority: self.authority.snapshot(),
             last_administration: self.last_administration.clone(),
@@ -1030,7 +1033,7 @@ impl State {
         })
     }
     pub(super) fn restore(s: Snapshot) -> Result<Self, NodeStoreError> {
-        if s.namespace != "hellas.node.checkpoint.v2"
+        if s.namespace != CHECKPOINT_NAMESPACE
             || s.grants.len() > MAX_ALLOWANCES
             || s.generations.len() != s.grants.len()
             || s.channels.len() > MAX_CHANNELS

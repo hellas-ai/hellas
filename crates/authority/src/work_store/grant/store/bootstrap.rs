@@ -21,6 +21,9 @@ impl Drop for IdentityLock {
     }
 }
 
+/// Namespace of the bootstrap ownership marker.
+const IDENTITY_NAMESPACE: &str = "hellas.node.identity.v1";
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Marker {
@@ -174,7 +177,7 @@ impl NodeStore {
         )?;
         let state = State::initialized(network, authority, provider.clone())?;
         let marker = Marker {
-            namespace: "hellas.node.identity.v1".into(),
+            namespace: IDENTITY_NAMESPACE.into(),
             network,
             authority: state.authority.authority(),
         };
@@ -405,7 +408,7 @@ fn read_marker(
         },
     )?;
     let marker: Marker = decode(&bytes)?;
-    if marker.namespace != "hellas.node.identity.v1" || marker.network != network {
+    if marker.namespace != IDENTITY_NAMESPACE || marker.network != network {
         return Err(NodeStoreError::Malformed);
     }
     Ok((identity_lock, marker))

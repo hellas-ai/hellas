@@ -532,10 +532,10 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 response: rust_path(&m.response_proto_type),
                 shape,
                 connection_bound: connection_bound(&service.package),
-                bounded_submit_tx: service.package == "hellas.chain.v1"
+                bounded_submit_tx: service.package == CHAIN_PACKAGE
                     && service.proto_name == "LightClient"
                     && m.proto_name == "SubmitTx",
-                bounded_work_response: service.package == "hellas.chain.v1"
+                bounded_work_response: service.package == CHAIN_PACKAGE
                     && service.proto_name == "LightClient"
                     && m.proto_name == "SubmitWorkResponse",
             }
@@ -569,8 +569,13 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
 /// Every other package authenticates what it is asked, not who is
 /// asking, and a context those handlers ignored would be a parameter
 /// that looked like a check.
+/// Protobuf package of the chain service.
+const CHAIN_PACKAGE: &str = "hellas.chain.v1";
+/// Protobuf package of the work service.
+const WORK_PACKAGE: &str = "hellas.work.v1";
+
 fn connection_bound(package: &str) -> bool {
-    package == "hellas.work.v1"
+    package == WORK_PACKAGE
 }
 
 fn build_method_schema(service_fqn: &str, method: &RpcMethod, index: &SchemaIndex) -> MethodSchema {
@@ -986,8 +991,8 @@ fn feature_for_package(package: &str) -> &'static str {
         "hellas.fetch.v1" => "fetch",
         "hellas.swarm.v1" => "swarm",
         "hellas.evaluate.v1" => "evaluate",
-        "hellas.chain.v1" => "chain",
-        "hellas.work.v1" => "work",
+        CHAIN_PACKAGE => "chain",
+        WORK_PACKAGE => "work",
         "hellas.host.v1" => "host-control",
         _ => panic!("no rpc-crate feature defined for protobuf package {package}"),
     }
