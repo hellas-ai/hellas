@@ -375,8 +375,7 @@ impl TestNode {
                 request.work(),
                 crate::work_store::grant::GrantOutcome::Failed,
                 None,
-                usage,
-                fault,
+                crate::model::grant::budget::UsageObservation::for_test(usage, fault),
                 self.clock.now(),
             )
             .await

@@ -9,7 +9,7 @@ use crate::model::grant::records::GrantPolicy;
 use crate::model::grant::records::grant_producer;
 use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
 use crate::model::grant::{
-    budget::{BudgetNode, Charge, Meter, Usage, Window},
+    budget::{BudgetNode, Charge, Meter, UsageObservation, Window},
     grant_work_id,
     records::{GrantError, Offer, SignedOffer},
 };
@@ -400,17 +400,16 @@ impl NodeStore {
         )
         .await
     }
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish(
         &mut self,
         channel: ChannelId,
         work: Digest,
         outcome: GrantOutcome,
         result: Option<SignedResult>,
-        usage: Usage,
-        fault: bool,
+        observation: UsageObservation,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
+        let (usage, fault) = observation.journal_fields();
         self.commit(
             now,
             Change::Terminal {
@@ -418,10 +417,7 @@ impl NodeStore {
                 work,
                 outcome,
                 result,
-                usage: match usage {
-                    Usage::Unknown => None,
-                    Usage::Observed(c) => Some(c),
-                },
+                usage,
                 fault,
             },
             false,

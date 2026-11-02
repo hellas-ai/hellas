@@ -5,7 +5,7 @@ use crate::model::grant::grant_work_id;
 use crate::model::grant::records::grant_producer;
 use crate::model::grant::{
     ChannelClient, ChannelId, GrantJobAuthorizationV1,
-    budget::Usage,
+    budget::UsageObservation,
     records::{GrantError, GrantPolicy},
     standing::StandingLocator,
 };
@@ -747,7 +747,7 @@ impl GrantService {
     ) -> Result<(), NodeStoreError> {
         let mut store = self.node.writer().await?;
         let now = self.node.observed_time(&store);
-        let (a, phase, usage, fault, completion) = {
+        let (a, phase, observation, completion) = {
             let mut held = self
                 .inner
                 .lock()
@@ -772,30 +772,24 @@ impl GrantService {
             } else {
                 None
             };
-            let observation = verified.as_ref().map_or(
-                accounting::UsageObservation {
-                    usage: Usage::Unknown,
-                    fault: true,
-                },
-                |(_, _, output)| {
-                    accounting::usage(
-                        &live.policy,
-                        live.facts.capacity_domain,
-                        input,
-                        output,
-                        &input.request.runner_public_key,
-                    )
-                },
-            );
-            let usage = observation.usage;
-            let fault = verified.is_none() || observation.fault;
+            let observation =
+                verified
+                    .as_ref()
+                    .map_or(UsageObservation::BackendFault, |(_, _, output)| {
+                        accounting::usage(
+                            &live.policy,
+                            live.facts.capacity_domain,
+                            input,
+                            output,
+                            &input.request.runner_public_key,
+                        )
+                    });
             // Seal progress before persistence, without holding the RAM lock over I/O.
             live.phase = LivePhase::Completing;
             (
                 a,
                 phase,
-                usage,
-                fault,
+                observation,
                 verified.filter(|_| now <= a.terminal_deadline_ms),
             )
         };
@@ -817,8 +811,7 @@ impl GrantService {
                         GrantOutcome::Failed
                     },
                     completion.as_ref().map(|(_, signed, _)| signed.clone()),
-                    usage,
-                    fault,
+                    observation,
                     now,
                 )
                 .await?;

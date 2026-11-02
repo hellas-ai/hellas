@@ -1,6 +1,6 @@
 //! Meter only fully verified application output. Generic invocations cost one request.
 use crate::model::grant::{
-    budget::{Charge, Meter, Usage},
+    budget::{Charge, Meter, UsageObservation},
     records::GrantPolicy,
 };
 use crate::model::http_usage::{AccountingProfile, Mode, UsageDecoder};
@@ -8,12 +8,17 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent};
 use hellas_rpc::protocol::invocation::output::{FailureReason, InvocationOutput, Outcome};
 
-/// A conservative charge plus whether the incomplete result is evidence
-/// against the shared backend. Caller-selected caps and upstream rejections
-/// settle as unknown without quarantining a healthy resource.
-pub(super) struct UsageObservation {
-    pub usage: Usage,
-    pub fault: bool,
+impl UsageObservation {
+    /// A verified 2xx body that still cannot be metered faults the backend;
+    /// a 4xx body does not. A caller-selected cap is signed on the output as
+    /// [`FailureReason::CallerLimit`] instead of being inferred from bytes.
+    fn incomplete(status: Option<u16>) -> Self {
+        if status.is_some_and(|status| (400..500).contains(&status)) {
+            Self::Unknown
+        } else {
+            Self::BackendFault
+        }
+    }
 }
 pub(super) fn usage(
     policy: &GrantPolicy,
@@ -22,81 +27,40 @@ pub(super) fn usage(
     output: &InvocationOutput,
     provider: &hellas_auth::PublicKey,
 ) -> UsageObservation {
-    match observed(policy, domain, input, output, provider) {
-        Verdict::Observed(charge) => UsageObservation {
-            usage: Usage::Observed(charge),
-            fault: false,
-        },
-        Verdict::NoFault => UsageObservation {
-            usage: Usage::Unknown,
-            fault: false,
-        },
-        Verdict::Fault => UsageObservation {
-            usage: Usage::Unknown,
-            fault: true,
-        },
-    }
-}
-enum Verdict {
-    Observed(Charge),
-    /// Incomplete for reasons the caller or the upstream exchange controls.
-    NoFault,
-    /// The provider's result is missing, unverifiable or unaccountable.
-    Fault,
-}
-impl Verdict {
-    /// A verified 2xx body that still cannot be metered faults the backend;
-    /// a 4xx body does not. A caller-selected cap is signed on the output as
-    /// [`FailureReason::CallerLimit`] instead of being inferred from bytes.
-    fn incomplete(status: Option<u16>) -> Self {
-        if status.is_some_and(|status| (400..500).contains(&status)) {
-            Self::NoFault
-        } else {
-            Self::Fault
-        }
-    }
-}
-fn observed(
-    policy: &GrantPolicy,
-    domain: hellas_rpc::protocol::invocation::CapacityDomain,
-    input: &hellas_rpc::protocol::invocation::PreparedInvocation,
-    output: &InvocationOutput,
-    provider: &hellas_auth::PublicKey,
-) -> Verdict {
     let mut charge = Charge::default();
     charge.set(Meter::Requests, 1);
     // The provider that enforced the caller's signed cap signs this reason
     // into the authenticated output; it is not a backend failure.
     if matches!(output.outcome, Outcome::Failed(FailureReason::CallerLimit)) {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     }
     if domain == hellas_rpc::protocol::invocation::CapacityDomain::Gpu {
-        return Verdict::Observed(charge);
+        return UsageObservation::Observed(charge);
     }
     let Ok(parameters) = hellas_rpc::protocol::invocation::fetch::Parameters::from_canonical_bytes(
         input.input.parameters.as_bytes(),
     ) else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     if policy.responses.is_none() && policy.https.is_none() {
-        return Verdict::Observed(charge);
+        return UsageObservation::Observed(charge);
     }
     if parameters.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1 {
         let Ok(response) = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider)
         else {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         };
         let (_, terminal) = response.output_event_payloads();
         let Ok(hellas_rpc::fetch::FetchTerminalPayload::Finished { usage, .. }) =
             hellas_rpc::fetch::decode_fetch_terminal_payload(terminal)
         else {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         };
         let Some(usage) = usage else {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         };
         let Some(output) = usage.output_tokens else {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         };
         if let Some(total) = usage.total_tokens
             && (total < output
@@ -104,53 +68,53 @@ fn observed(
                     .input_tokens
                     .is_some_and(|input| input.checked_add(output) != Some(total)))
         {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         }
         charge.set(Meter::OutputTokens, output);
-        return Verdict::Observed(charge);
+        return UsageObservation::Observed(charge);
     }
     let Some(resource) = policy.https.as_ref() else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     if resource.accounting == AccountingProfile::None {
-        return Verdict::Observed(charge);
+        return UsageObservation::Observed(charge);
     }
     // Admission permits empty GET/HEAD requests on unmodelled health paths
     // without reserving output tokens. Classify the same signed request at
     // settlement so a non-generating response cannot fault the resource.
     let [artifact] = input.input.artifacts.as_slice() else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     let Ok(signed_events) =
         hellas_rpc::protocol::value::decode_canonical_dag_cbor::<Vec<_>>(artifact.bytes.as_bytes())
     else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     let Ok(signed) = hellas_rpc::fetch::verify_input_events(&signed_events) else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     let Ok(request) = hellas_rpc::http_fetch::HttpFetchRequest::decode(signed.body.as_bytes())
     else {
-        return Verdict::NoFault;
+        return UsageObservation::Unknown;
     };
     if matches!(request.method.as_str(), "GET" | "HEAD")
         && request.body().is_ok_and(|body| body.is_empty())
         && resource.matches(&request).ok() == Some(0)
     {
-        return Verdict::Observed(charge);
+        return UsageObservation::Observed(charge);
     }
     let Ok(response) = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider)
     else {
         if output.is_success() {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         }
         // A failed execution still carries its authenticated event prefix.
         // Its head distinguishes an upstream rejection from a corrupt backend;
         // a caller-capped failure already carries its signed reason above.
         let Some(status) = failed_status(output) else {
-            return Verdict::Fault;
+            return UsageObservation::BackendFault;
         };
-        return Verdict::incomplete(Some(status));
+        return UsageObservation::incomplete(Some(status));
     };
     let (events, _) = response.output_event_payloads();
     let mut decoder = UsageDecoder::new(Mode::Strict(resource.accounting), None, None);
@@ -163,7 +127,7 @@ fn observed(
                 headers,
             }))) => {
                 if head {
-                    return Verdict::Fault;
+                    return UsageObservation::BackendFault;
                 }
                 head = true;
                 status = Some(head_status);
@@ -176,31 +140,31 @@ fn observed(
                     values.next().is_none().then_some(value)
                 };
                 let Some(content_type) = header("content-type") else {
-                    return Verdict::incomplete(status);
+                    return UsageObservation::incomplete(status);
                 };
                 let Some(content_encoding) = header("content-encoding") else {
-                    return Verdict::incomplete(status);
+                    return UsageObservation::incomplete(status);
                 };
                 decoder.content(content_type, content_encoding);
             }
             Ok(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64 }))) => {
                 if !head {
-                    return Verdict::Fault;
+                    return UsageObservation::BackendFault;
                 }
                 let Ok(bytes) = STANDARD.decode(base64) else {
-                    return Verdict::Fault;
+                    return UsageObservation::BackendFault;
                 };
                 decoder.push(&bytes);
             }
-            _ => return Verdict::Fault,
+            _ => return UsageObservation::BackendFault,
         }
     }
     decoder.finish();
     let Ok((_, output)) = decoder.strict_usage() else {
-        return Verdict::incomplete(status);
+        return UsageObservation::incomplete(status);
     };
     charge.set(Meter::OutputTokens, output);
-    Verdict::Observed(charge)
+    UsageObservation::Observed(charge)
 }
 /// The status carried by a failed execution's authenticated response-event
 /// prefix, if it is structurally readable.
@@ -240,6 +204,7 @@ fn failed_status(output: &InvocationOutput) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::grant::budget::Usage;
     use hellas_rpc::Assurance;
     use hellas_rpc::http_fetch::HttpFetchRequest;
 
@@ -280,7 +245,9 @@ mod tests {
             output,
             &provider,
         )
-        .usage
+        .journal_fields()
+        .0
+        .map_or(Usage::Unknown, Usage::Observed)
     }
 
     #[test]
@@ -425,8 +392,7 @@ mod tests {
         let policy = http_policy();
         let (input, key) = http_input(&policy);
         let observation = http_observation(&policy, &input, &key, FailureReason::CallerLimit);
-        assert_eq!(observation.usage, Usage::Unknown);
-        assert!(!observation.fault);
+        assert_eq!(observation, UsageObservation::Unknown);
     }
 
     #[test]
@@ -434,8 +400,7 @@ mod tests {
         let policy = http_policy();
         let (input, key) = http_input(&policy);
         let observation = http_observation(&policy, &input, &key, FailureReason::Execution);
-        assert_eq!(observation.usage, Usage::Unknown);
-        assert!(observation.fault);
+        assert_eq!(observation, UsageObservation::BackendFault);
     }
 
     #[test]

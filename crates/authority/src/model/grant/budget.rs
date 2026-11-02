@@ -115,3 +115,36 @@ pub enum Usage {
     Observed(Charge),
     Unknown,
 }
+
+/// Accounting evidence and backend attribution travel together until journal encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UsageObservation {
+    Observed(Charge),
+    /// Incomplete usage attributable to the caller or upstream rejection.
+    Unknown,
+    /// Missing, unverifiable or unaccountable provider output.
+    BackendFault,
+}
+impl UsageObservation {
+    pub(crate) const fn journal_fields(self) -> (Option<Charge>, bool) {
+        match self {
+            Self::Observed(charge) => (Some(charge), false),
+            Self::Unknown => (None, false),
+            Self::BackendFault => (None, true),
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn for_test(usage: Usage, fault: bool) -> Self {
+        match usage {
+            Usage::Observed(charge) => {
+                assert!(
+                    !fault,
+                    "observed usage cannot be a backend accounting fault"
+                );
+                Self::Observed(charge)
+            }
+            Usage::Unknown if fault => Self::BackendFault,
+            Usage::Unknown => Self::Unknown,
+        }
+    }
+}

@@ -99,8 +99,7 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                         GrantOutcome::Failed
                     },
                     signed.clone(),
-                    Usage::Unknown,
-                    true,
+                    crate::model::grant::budget::UsageObservation::BackendFault,
                     UnixMillis(1002),
                 )
                 .await

@@ -433,7 +433,14 @@ pub async fn finish(
     now: u64,
 ) -> Result<(), crate::work_store::grant::NodeStoreError> {
     store
-        .finish(job.0, job.1, outcome, None, usage, fault, UnixMillis(now))
+        .finish(
+            job.0,
+            job.1,
+            outcome,
+            None,
+            crate::model::grant::budget::UsageObservation::for_test(usage, fault),
+            UnixMillis(now),
+        )
         .await
 }
 pub fn used(store: &NodeStore, node: BudgetNode, meter: Meter) -> u64 {
