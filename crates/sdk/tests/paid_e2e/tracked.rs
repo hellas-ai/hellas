@@ -304,7 +304,7 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
 }
 
 #[test]
-fn tracked_recovery_requires_request_binding_and_preserves_ambiguous_legacy_intents() {
+fn tracked_recovery_requires_attempt_and_request_bindings() {
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
@@ -343,32 +343,7 @@ fn tracked_recovery_requires_request_binding_and_preserves_ambiguous_legacy_inte
             prefix["work"] = serde_json::Value::Null;
             assert!(prefix["request_commitment"].is_array());
             assert!(prefix["attempt_nonce"].is_array());
-            // A legacy marker with the already-recorded work ID still recovers.
-            // Without that ID, even live request bytes cannot distinguish two
-            // identical-input intents that reused an unproposed channel nonce.
-            let mut legacy = prefix.clone();
-            legacy.as_object_mut().unwrap().remove("request_commitment");
-            legacy.as_object_mut().unwrap().remove("attempt_nonce");
-            let legacy_live_path = case.root.path().join("legacy-live");
-            write_marker(&legacy_live_path, &legacy);
-            let mut legacy_attempt =
-                ExecutionAttempt::open_existing(&legacy_live_path, job.input(), terms).unwrap();
-            assert_legacy_unresolved(&mut session, &mut legacy_attempt).await;
-            drop(legacy_attempt);
-            let mut legacy_known = legacy.clone();
-            legacy_known["work"] = serde_json::json!(work.as_bytes());
-            let legacy_known_path = case.root.path().join("legacy-known");
-            write_marker(&legacy_known_path, &legacy_known);
-            let mut legacy_attempt =
-                ExecutionAttempt::open_existing(&legacy_known_path, job.input(), terms).unwrap();
-            let facts = ExecutionSession::Paid(&mut session)
-                .recover(&mut legacy_attempt)
-                .await
-                .unwrap();
-            assert_eq!(facts.work, Some(work));
-            assert_eq!(facts.acceptance, Acceptance::Accepted);
-            assert_eq!(facts.payment, Payment::Pending);
-            drop(legacy_attempt);
+            assert_missing_bindings_refused(case.root.path(), &prefix, work);
             // While input bytes are present, a different caller job must not attach
             // to this acceptance even if its marker names this channel and nonce.
             let other = hellas_sdk::job::Job::fetch(
@@ -421,19 +396,6 @@ fn tracked_recovery_requires_request_binding_and_preserves_ambiguous_legacy_inte
                     .unwrap(),
                 "this restart exercises metadata-only replay"
             );
-            let legacy_replay_path = case.root.path().join("legacy-metadata");
-            write_marker(&legacy_replay_path, &legacy);
-            let mut legacy_attempt =
-                ExecutionAttempt::open_existing(&legacy_replay_path, job.input(), terms).unwrap();
-            assert_legacy_unresolved(&mut session, &mut legacy_attempt).await;
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(
-                    &std::fs::read(&legacy_replay_path).unwrap()
-                )
-                .unwrap(),
-                legacy
-            );
-            drop(legacy_attempt);
             for field in ["channel", "bond", "network", "provider"] {
                 let mut wrong = prefix.clone();
                 match field {
@@ -922,20 +884,37 @@ fn reused_nonce_scenario(
     })
 }
 
-async fn assert_legacy_unresolved(session: &mut PaidWorkSession, attempt: &mut ExecutionAttempt) {
-    assert!(matches!(
-        ExecutionSession::Paid(session).recover(attempt).await,
-        Err(ExecutionError::Purchase(
-            hellas_sdk::transact::PurchaseError::Unfinished {
-                reason: "legacy marker has no attempt binding; a reused nonce may name another purchase",
-                ..
-            }
-        ))
-    ));
-    let facts = attempt.inspect().unwrap();
-    assert_eq!(facts.work, None);
-    assert_eq!(facts.acceptance, Acceptance::Unknown);
-    assert_eq!(facts.payment, Payment::Pending);
+fn assert_missing_bindings_refused(
+    root: &std::path::Path,
+    prefix: &serde_json::Value,
+    work: Digest,
+) {
+    let job = job();
+    for field in ["attempt_nonce", "request_commitment"] {
+        for known_work in [false, true] {
+            let mut record = prefix.clone();
+            record.as_object_mut().unwrap().remove(field);
+            record["work"] = if known_work {
+                serde_json::json!(work.as_bytes())
+            } else {
+                serde_json::Value::Null
+            };
+            let path = root.join(format!("missing-{field}-{known_work}"));
+            write_marker(&path, &record);
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                ExecutionAttempt::open_existing(
+                    &path,
+                    job.input(),
+                    ExecutionTerms::Paid { price: PRICE },
+                ),
+                Err(ExecutionError::Purchase(
+                    hellas_sdk::transact::PurchaseError::Identity
+                ))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
 }
 
 #[derive(Default)]

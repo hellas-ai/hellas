@@ -128,6 +128,12 @@ impl Purchase {
 
     fn open_tracked_inner(path: &Path, job: &Job, create: bool) -> Result<Self> {
         let mut purchase = Self::open_identity(path, job.digest(), job.price(), true)?;
+        if let Some(record) = &purchase.record
+            && (record.attempt_nonce.is_none()
+                || (record.nonce != 0 && record.request_commitment.is_none()))
+        {
+            return Err(PurchaseError::Identity);
+        }
         if purchase.record.is_none() {
             if !create {
                 return Err(PurchaseError::Identity);
@@ -698,6 +704,84 @@ impl PurchaseRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracked_open_requires_attempt_and_proposed_request_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attempt");
+        let job = job();
+        drop(Purchase::open_tracked(&path, &job).unwrap());
+        let initial: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for phase in [
+            Phase::InputBound,
+            Phase::TargetBound,
+            Phase::ChannelBound,
+            Phase::Running,
+        ] {
+            for work in [None, Some([7; 32])] {
+                let mut record = initial.clone();
+                record.phase = phase;
+                record.work = work;
+                if phase == Phase::Running {
+                    record.nonce = 1;
+                    record.request_commitment = Some([4; 32]);
+                }
+                for field in ["attempt_nonce", "request_commitment"] {
+                    if field == "request_commitment" && record.nonce == 0 {
+                        continue;
+                    }
+                    let mut missing = record.clone();
+                    if field == "attempt_nonce" {
+                        missing.attempt_nonce = None;
+                    } else {
+                        missing.request_commitment = None;
+                    }
+                    let bytes = serde_json::to_vec(&missing).unwrap();
+                    hellas_private::write_atomically(&path, ".writing", &bytes).unwrap();
+                    assert!(
+                        matches!(
+                            Purchase::open_existing_tracked(&path, &job),
+                            Err(PurchaseError::Identity)
+                        ),
+                        "{phase:?} {field}, known work: {}",
+                        work.is_some()
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
+        // An unproposed current attempt has an attempt identity but no request yet.
+        for phase in [Phase::InputBound, Phase::TargetBound, Phase::ChannelBound] {
+            let mut record = initial.clone();
+            record.phase = phase;
+            hellas_private::write_atomically(
+                &path,
+                ".writing",
+                &serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            drop(Purchase::open_existing_tracked(&path, &job).unwrap());
+        }
+        // Untracked purchases are a current mode, not old tracked records.
+        let path = root.path().join("untracked");
+        let mut purchase = Purchase::open(&path, &job, false).unwrap();
+        purchase
+            .begin(
+                Digest::from_bytes([1; 32]),
+                EdgeId::from_bytes([2; 32]),
+                1,
+                Digest::from_bytes([4; 32]),
+            )
+            .unwrap();
+        drop(purchase);
+        assert_eq!(
+            PurchaseRecovery::open(&path, job.digest(), job.price())
+                .unwrap()
+                .inspect()
+                .unwrap(),
+            PurchaseStatus::Running { work: None }
+        );
+    }
 
     #[test]
     fn tracked_terminal_records_survive_reopen_and_cannot_execute_again() {
