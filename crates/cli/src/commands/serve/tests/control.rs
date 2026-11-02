@@ -258,7 +258,21 @@ impl Daemon {
                     .borrow()
                     .as_ref()
                     .unwrap()
-                    .bound_sockets(),
+                    .bound_sockets()
+                    .into_iter()
+                    .map(|mut address| {
+                        // A wildcard listen address is not a portable dial target.
+                        // These tests connect to the daemon on this same host.
+                        if address.ip().is_unspecified() {
+                            address.set_ip(if address.is_ipv4() {
+                                std::net::Ipv4Addr::LOCALHOST.into()
+                            } else {
+                                std::net::Ipv6Addr::LOCALHOST.into()
+                            });
+                        }
+                        address
+                    })
+                    .collect(),
                 ..args
             },
             passkey,
