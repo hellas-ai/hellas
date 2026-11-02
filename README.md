@@ -89,6 +89,16 @@ must be available to A: index local files with `serve --content FILE` or
 Both commands default to the same store (`HELLAS_STORE_DIR` or
 `~/.hellas/store`).
 
+To prepare specific files outside daemon startup, run
+`hellas store index --records /private/content.fastresume /assets/weights.bin`
+as the provider's service user, then start it with `--content /assets/weights.bin`,
+`--content-index /private/content.fastresume` and `--require-content-index`.
+This refuses missing or stale index records instead of hashing at startup.
+Without the required-index flag, changed file identities trigger verification
+again. Use `store index --recheck` to force verification. Keep weights on persistent local
+storage when mount identities can change, and avoid a broad `--content-root`
+if only a few files are needed.
+
 Indexed provider content is an immutable local-cache assumption. Hellas pins
 the verified read-only descriptor and detects path/inode replacement; it does
 not defend against a separate local process that already holds a writable

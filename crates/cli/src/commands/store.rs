@@ -16,6 +16,16 @@ use crate::commands::CliResult;
 
 #[derive(Subcommand)]
 pub enum StoreCommand {
+    /// Index exact local files before starting a provider; never walk a cache.
+    Index {
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        records: Option<PathBuf>,
+        /// Hash these files again, ignoring their existing records.
+        #[arg(long)]
+        recheck: bool,
+    },
     /// Index a HuggingFace cache without copying its contents
     Adopt {
         /// Cache root (default: HF_HUB_CACHE, else HF_HOME/hub, else
@@ -56,6 +66,22 @@ pub enum StoreCommand {
 pub async fn run(command: StoreCommand, root: Option<PathBuf>) -> CliResult {
     let default_records = root.as_deref().map(hellas_store::state::records_path_at);
     match command {
+        StoreCommand::Index {
+            paths,
+            records,
+            recheck,
+        } => {
+            let records = records_path(records.or(default_records))?;
+            let mode = if recheck {
+                crate::compute::IndexMode::Recheck
+            } else {
+                crate::compute::IndexMode::Resume
+            };
+            let store = crate::compute::index_content(&paths, &[], &records, mode)?;
+            println!("contents   {} distinct", store.len());
+            println!("records    {}", records.display());
+            Ok(())
+        }
         StoreCommand::Adopt {
             cache,
             records,
