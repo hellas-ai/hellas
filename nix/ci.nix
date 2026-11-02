@@ -79,6 +79,9 @@ let
       pkgs.shellcheck
     ];
     unit = mkCargo "check-unit" unitTestCommand (cargoEnv rustToolchain);
+    regressions = mkCargo "check-regressions" (builtins.readFile ./regression-tests.sh) (
+      cargoEnv rustToolchain
+    );
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
@@ -308,6 +311,7 @@ let
       else
         builtins.removeAttrs baseChecks [
           "validator"
+          "regressions"
           "chain-setup"
           # Same reason as `validator` above: validators are deployed on x86
           # only, so the feature set is not built on other hosts. Linting it
