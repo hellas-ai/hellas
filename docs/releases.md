@@ -22,10 +22,12 @@ integration tests and doctests, without local validator networks or model
 compilation. Hydra runs it through the standard nixpkgs Cargo check hook.
 
 The `integration-tests` feature on `hellas-chain`, `hellas-sdk` and `hellas-cli`
-opts in to local node and complete host-process suites. Their release checks
+opts in to separate local-node test modules and complete host-process targets.
+Their release checks
 (`check-validator`, `check-chain-setup`, `check-sdk-paid-work`, `check-cli`)
-enable it explicitly; validator-backed suites run serially. The targeted paid
-regressions remain mandatory PR checks. Existing tests requiring a GPU, model
+enable it explicitly; validator-backed suites run serially. The full integration
+suite remains a mandatory PR check (`check-regressions`), using workspace feature
+selection and serial test execution. Existing tests requiring a GPU, model
 files or a special process environment remain individually ignored.
 
 `check-model-programs` explicitly runs the ignored Qwen3/Whisper/Flux compilation

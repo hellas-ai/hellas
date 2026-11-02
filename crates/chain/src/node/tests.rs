@@ -151,10 +151,6 @@ impl Fixture {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn full_nodes_exchange_executed_state_without_a_validator() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -255,10 +251,6 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -308,10 +300,6 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn pruned_archive_restarts_with_live_owner_state() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -365,10 +353,6 @@ fn pruned_archive_restarts_with_live_owner_state() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -504,10 +488,6 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
     use hellas_wire::peers::{PeerId, ServiceStatus};
     run_qmdb(|runtime| async move {
@@ -569,10 +549,6 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
 
 #[cfg(feature = "indexer-api")]
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state() {
     use commonware_cryptography::{Hasher as _, Sha256};
     run_qmdb(|runtime| async move {
@@ -656,10 +632,6 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
 
 #[cfg(feature = "validator")]
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn validator_archive_seeds_execution_over_iroh() {
     use commonware_cryptography::{Signer as _, ed25519};
     use hellas_rpc::services::{chain_sync::ChainSync, node::Node};
@@ -767,10 +739,6 @@ impl Core {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -856,10 +824,6 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn provisioned_anchor_and_directory_identity_cannot_be_replaced_by_a_peer() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -887,10 +851,6 @@ fn provisioned_anchor_and_directory_identity_cannot_be_replaced_by_a_peer() {
 
 #[cfg(feature = "validator")]
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn full_node_and_validator_execution_roles_share_the_same_directory() {
     use crate::execution::pipeline;
     use commonware_consensus::{
@@ -1097,10 +1057,6 @@ async fn serve_source(server: CorruptSource) -> (iroh::Endpoint, tokio::task::Jo
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -1155,19 +1111,11 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn shared_committee_foreign_genesis_is_rejected_before_follower_execution() {
     rejects_foreign_chain(domain::TEST_NETWORK, 5001);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "integration-tests"),
-    ignore = "starts local nodes; run with --features integration-tests"
-)]
 fn shared_committee_foreign_network_is_rejected_before_follower_execution() {
     rejects_foreign_chain(
         hellas_kernel::NetworkId::new("another-chain").unwrap(),

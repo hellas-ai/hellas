@@ -77,18 +77,19 @@ let
       pkgs.shellcheck
     ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
-    regressions = mkCargo "check-regressions" (builtins.readFile ./regression-tests.sh) (
-      cargoEnv rustToolchain
-    );
+    regressions = mkCargo "check-regressions" ''
+      cargo test --locked --workspace --features integration-tests -- --test-threads=1
+    '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
       mkCargo "check-cargo-sources" "cargo metadata --locked --format-version 1 > /dev/null"
         [ rustToolchain ];
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
-    clippy = mkCargo "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
-      cargoEnv rustToolchain
-    );
+    clippy =
+      mkCargo "check-clippy"
+        "cargo clippy --workspace --all-targets --features integration-tests -- -D warnings"
+        (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.
     clippy-features = mkCargo "check-clippy-features" (builtins.concatStringsSep " && " (
@@ -349,7 +350,8 @@ let
   fixes = {
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
     clippy =
-      mkCargo "fix-clippy" "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
+      mkCargo "fix-clippy"
+        "cargo clippy --workspace --all-targets --features integration-tests --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };

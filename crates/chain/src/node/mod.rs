@@ -6,7 +6,7 @@ use crate::{
     domain::{Digest, PublicKey},
     rpc::LocalLightClient,
 };
-#[cfg(any(test, feature = "indexer-api"))]
+#[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
 use crate::{domain::SettlementKey, execution::store::UtxoDatabase};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
@@ -286,9 +286,9 @@ pub(crate) struct Core {
     _lock: std::fs::File,
     indexer: ChainIndexer,
     client: LocalLightClient,
-    #[cfg(any(test, feature = "indexer-api"))]
+    #[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
     database: UtxoDatabase<runtime::Context>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     trust: Trust,
     #[cfg(feature = "indexer-api")]
     publication: Option<crate::edge_index::Publication>,
@@ -498,9 +498,9 @@ impl Core {
             _lock: lock,
             indexer,
             client,
-            #[cfg(any(test, feature = "indexer-api"))]
+            #[cfg(any(all(test, feature = "integration-tests"), feature = "indexer-api"))]
             database,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "integration-tests"))]
             trust: network.trust.clone(),
             readiness,
             progress,
@@ -509,11 +509,11 @@ impl Core {
             tasks: std::sync::Mutex::new(tasks),
         }))
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     fn applied(&self) -> u64 {
         self.readiness.applied.load(Ordering::Acquire)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration-tests"))]
     fn observe(&self, incoming: &FinalizedBlock) -> Result<HellasBlock, Error> {
         self.readiness.observe(&self.trust, incoming)
     }
@@ -534,5 +534,5 @@ impl Readiness {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 mod tests;
