@@ -196,6 +196,8 @@ rec {
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
     "--paid-work-config"
+    "--grant-config"
+    "--await-owner"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
@@ -209,6 +211,8 @@ rec {
     "--metrics-port"
     "--metrics-addr"
     "--paid-work-config"
+    "--grant-pool-config"
+    "--local-grant"
     "--gateway-profile"
     "--identity"
     "--log-file"
@@ -450,6 +454,28 @@ rec {
           work is sold only with this file. Keep it outside the Nix store.
         '';
       };
+      grantConfigFile = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/var/lib/hellas/grant.json";
+        description = ''
+          Runtime JSON grant resources and listener configuration passed as
+          --grant-config. Native Compute runs through grants without paid
+          work, so this file enables the same content and GPU service setup as
+          workConfigFile. Keep it outside the Nix store.
+        '';
+      };
+      awaitOwner = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/var/lib/hellas/await-owner";
+        description = ''
+          Wait for one owner pairing when the grant journal is uninitialized,
+          using this directory for node state, passed as --await-owner. Null
+          disables owner pairing. The directory is operator-managed runtime
+          data and must remain outside the Nix store.
+        '';
+      };
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -519,6 +545,30 @@ rec {
         type = types.nullOr runtimePath;
         default = null;
         description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement.";
+      };
+      grantPoolConfig = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/run/hellas/grant-pool.json";
+        description = ''
+          Runtime JSON grant pool selecting explicit resources from
+          independently provisioned grant channels, passed as
+          --grant-pool-config. Requires trustStore and passkey; conflicts with
+          offer, localGrant, paidWorkConfig, trustPolicy, grantPolicy,
+          workProfile and httpFetchConfig. Keep it outside the Nix store.
+        '';
+      };
+      localGrant = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "00000000000000000000000000000000";
+        description = ''
+          Hex ID of this node's already configured allowance, passed as
+          --local-grant and served in process with the native content and GPU
+          flags. Requires trustStore, trustPolicy, workProfile and passkey, and
+          producer-signed assurance. Conflicts with offer, paidWorkConfig and
+          grantPoolConfig.
+        '';
       };
       paidWorkJournalRoots = mkOption {
         type = types.listOf runtimePath;
@@ -708,6 +758,8 @@ rec {
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
+    ++ optArg "--grant-config" serve.grantConfigFile
+    ++ optArg "--await-owner" serve.awaitOwner
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"
@@ -749,6 +801,8 @@ rec {
     ++ optArg "--trust-store" gateway.trustStore
     ++ optArg "--trust-policy" gateway.trustPolicy
     ++ optArg "--offer" gateway.offer
+    ++ optArg "--grant-pool-config" gateway.grantPoolConfig
+    ++ optArg "--local-grant" gateway.localGrant
     ++ optArg "--passkey" gateway.passkey
     ++ optArg "--work-profile" gateway.workProfile
     ++ optArg "--grant-policy" gateway.grantPolicy

@@ -145,15 +145,6 @@ impl Purchase {
                 attempt_nonce: Some(rand::random()),
             });
             purchase.persist()?;
-        } else if let Some(record) = &mut purchase.record
-            && record.nonce == 0
-            && record.work.is_none()
-            && record.attempt_nonce.is_none()
-        {
-            // An old marker that has not begun work can acquire an identity.
-            // An already-running legacy intent cannot be upgraded by guessing.
-            record.attempt_nonce = Some(rand::random());
-            purchase.persist()?;
         }
         Ok(purchase)
     }
@@ -298,20 +289,14 @@ impl Purchase {
         if job.provider_signature().is_none() {
             return Ok(None);
         }
-        if record.attempt_nonce.is_none() {
-            return Err(self.unfinished(
-                "legacy marker has no attempt binding; a reused nonce may name another purchase",
-            ));
+        if self.tracked && record.attempt_nonce.is_none() {
+            return Err(PurchaseError::Identity);
         }
         match record.request_commitment {
             Some(expected) if expected != *authorization.request_commitment.digest().as_bytes() => {
                 return Err(PurchaseError::Identity);
             }
-            None if job.prepared_input().is_empty() => {
-                return Err(self.unfinished(
-                    "legacy marker has no request binding and the channel retained only metadata",
-                ));
-            }
+            None if self.tracked => return Err(PurchaseError::Identity),
             _ => (),
         }
         // Retained input additionally checks this job and attempt's request
@@ -715,35 +700,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_purchase_records_decode() {
-        for (bytes, phase) in [
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/running.json").as_slice(),
-                Phase::Running,
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/paying.json").as_slice(),
-                Phase::Paying,
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/paid.json").as_slice(),
-                Phase::Paid,
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/reported.json").as_slice(),
-                Phase::Reported,
-            ),
-        ] {
-            let record: Record = serde_json::from_slice(bytes).unwrap();
-            assert_eq!(record.phase, phase);
-            assert_eq!(record.price, 20);
-            assert_eq!(record.nonce, 3);
-            assert_eq!(record.work, (phase != Phase::Running).then_some([7; 32]));
-            assert_eq!(serde_json::to_vec(&record).unwrap(), bytes);
-        }
-    }
-
-    #[test]
     fn tracked_terminal_records_survive_reopen_and_cannot_execute_again() {
         let root = tempfile::tempdir().unwrap();
         let job = job();
@@ -876,47 +832,6 @@ mod tests {
             untracked.request_nonce(channel, 1),
             job.purchase_nonce(channel, 1)
         );
-    }
-
-    #[test]
-    fn recovery_reads_legacy_phases_without_the_original_payload() {
-        let root = tempfile::tempdir().unwrap();
-        let job = job();
-        for (bytes, expected) in [
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/running.json").as_slice(),
-                PurchaseStatus::Running { work: None },
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/paying.json").as_slice(),
-                PurchaseStatus::Paying {
-                    work: Digest::from_bytes([7; 32]),
-                },
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/paid.json").as_slice(),
-                PurchaseStatus::Paid {
-                    work: Digest::from_bytes([7; 32]),
-                    reported: false,
-                },
-            ),
-            (
-                include_bytes!("../../tests/fixtures/legacy-purchase/reported.json").as_slice(),
-                PurchaseStatus::Paid {
-                    work: Digest::from_bytes([7; 32]),
-                    reported: true,
-                },
-            ),
-        ] {
-            let path = root.path().join("purchase");
-            hellas_private::write_atomically(&path, ".writing", bytes).unwrap();
-            let recovery = PurchaseRecovery::open(&path, job.digest(), job.price()).unwrap();
-            assert_eq!(recovery.inspect().unwrap(), expected);
-        }
-        let absent =
-            PurchaseRecovery::open(&root.path().join("missing"), job.digest(), job.price())
-                .unwrap();
-        assert_eq!(absent.inspect().unwrap(), PurchaseStatus::Absent);
     }
 
     fn job() -> Job {

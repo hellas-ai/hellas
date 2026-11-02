@@ -29,7 +29,7 @@ async fn fixture(path: &std::path::Path, profile: Profile) -> TestNode {
         .build()
         .await
 }
-async fn settle(node: &mut TestNode, nonce: u64, usage: Usage) {
+async fn settle(node: &mut TestNode, nonce: u64, usage: Usage, fault: bool) {
     let mut request = node.proposal(FRIEND, ids::ALLOWANCE, nonce);
     let now = node.clock.now().0;
     request.authorization.acceptance_deadline_ms = UnixMillis(now + 1000);
@@ -42,7 +42,7 @@ async fn settle(node: &mut TestNode, nonce: u64, usage: Usage) {
     node.dispatch(FRIEND, ids::FRIEND_GRANT, &request)
         .await
         .unwrap();
-    node.finish(&request, usage).await;
+    node.finish(&request, usage, fault).await;
 }
 fn quarantined(node: &TestNode) -> bool {
     node.store
@@ -70,7 +70,13 @@ async fn an_observed_overrun_quarantines_the_resource() {
     for profile in [Profile::Responses, Profile::Http] {
         let directory = tempfile::tempdir().unwrap();
         let mut node = fixture(directory.path(), profile).await;
-        settle(&mut node, 1, Usage::Observed(Charge([1, 0, 9, 0, 0]))).await;
+        settle(
+            &mut node,
+            1,
+            Usage::Observed(Charge([1, 0, 9, 0, 0])),
+            false,
+        )
+        .await;
         assert!(quarantined(&node), "{profile:?}");
         assert_spent(&node, 9);
         let request = node.proposal(FRIEND, ids::ALLOWANCE, 2);
@@ -89,7 +95,7 @@ async fn the_third_consecutive_unknown_result_quarantines() {
         let directory = tempfile::tempdir().unwrap();
         let mut node = fixture(directory.path(), profile).await;
         for nonce in 1..=3 {
-            settle(&mut node, nonce, Usage::Unknown).await;
+            settle(&mut node, nonce, Usage::Unknown, true).await;
             assert_eq!(quarantined(&node), nonce == 3, "{profile:?} result {nonce}");
         }
         assert_spent(&node, 24);
@@ -106,6 +112,21 @@ async fn the_third_consecutive_unknown_result_quarantines() {
 }
 
 #[tokio::test]
+async fn an_explicit_no_fault_terminal_stays_clear_on_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut node = fixture(directory.path(), Profile::Responses).await;
+    settle(&mut node, 1, Usage::Unknown, false).await;
+    let node = node.reopen().await;
+    let health = node
+        .store
+        .state()
+        .resource_health(policy().resource)
+        .unwrap();
+    assert_eq!(health.consecutive_faults, 0);
+    assert!(!health.quarantined);
+}
+
+#[tokio::test]
 async fn observed_usage_resets_the_consecutive_unknown_count() {
     let directory = tempfile::tempdir().unwrap();
     let mut node = fixture(directory.path(), Profile::Http).await;
@@ -115,7 +136,7 @@ async fn observed_usage_resets_the_consecutive_unknown_count() {
         } else {
             Usage::Unknown
         };
-        settle(&mut node, index as u64 + 1, usage).await;
+        settle(&mut node, index as u64 + 1, usage, usage == Usage::Unknown).await;
         let health = node
             .store
             .state()
@@ -130,7 +151,13 @@ async fn observed_usage_resets_the_consecutive_unknown_count() {
 async fn only_explicit_repair_clears_persisted_quarantine() {
     let directory = tempfile::tempdir().unwrap();
     let mut node = fixture(directory.path(), Profile::Responses).await;
-    settle(&mut node, 1, Usage::Observed(Charge([1, 0, 99, 0, 0]))).await;
+    settle(
+        &mut node,
+        1,
+        Usage::Observed(Charge([1, 0, 99, 0, 0])),
+        false,
+    )
+    .await;
     let mut terms = node.store.state().grant(ids::ALLOWANCE).unwrap().clone();
     let mut budget = node
         .store
@@ -183,7 +210,13 @@ async fn only_explicit_repair_clears_persisted_quarantine() {
         .unwrap();
     assert!(!quarantined(&node));
     assert_spent(&node, 99);
-    settle(&mut node, 2, Usage::Observed(Charge([1, 0, 2, 0, 0]))).await;
+    settle(
+        &mut node,
+        2,
+        Usage::Observed(Charge([1, 0, 2, 0, 0])),
+        false,
+    )
+    .await;
     assert!(!quarantined(&node));
     assert_spent(&node, 101);
 }
@@ -241,7 +274,7 @@ async fn accepted_policy_history_survives_current_policy_changes() {
             .unwrap(),
         &original
     );
-    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
         .await;
     assert_eq!(node.used(BudgetNode::Machine, Meter::Requests), 1);
     node.store.rotate().await.unwrap();

@@ -1,3 +1,5 @@
+set -euo pipefail
+
 # Library and CLI command tests, excluding the chain's live-node suite and
 # the four SDK scenarios that start a validator network, and full model
 # compilation. Release checks run these through check-chain-setup,

@@ -1,8 +1,12 @@
 //! HTTP bytes over authenticated Fetch, without translating vendor schemas.
 //!
 //! The provider's acceptance heads the response as `x-hellas-commitment-bin`
-//! and `x-hellas-provider`; the base64 signed transcript trails the body as
-//! `x-hellas-transcript` (a header on a bodyless response).
+//! and `x-hellas-provider`; the signed transcript trails the body as
+//! `x-hellas-transcript` (a header on a bodyless response). A transcript too
+//! large to carry inline is not delivered to the HTTP caller: the trailer is
+//! omitted and `x-hellas-transcript-digest` names the lowercase hex SHA-256 of
+//! the canonical signed bytes, which the caller must obtain out of band. The
+//! gateway neither retains nor serves that copy.
 pub(crate) mod affinity;
 mod config;
 mod observation;
@@ -22,12 +26,13 @@ use axum::{
 };
 use futures::StreamExt;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
-use hellas_rpc::provenance::{ExecutionProvenance, TRANSCRIPT_KEY};
+use hellas_rpc::provenance::{ExecutionProvenance, TRANSCRIPT_DIGEST_KEY, TRANSCRIPT_KEY};
 use http_body::Frame;
 use std::sync::Arc;
 use tracing::Instrument;
 
 use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
+use crate::backend::provenance::transcript_header;
 use hellas_adaptors::BackendError;
 
 #[derive(Clone)]
@@ -301,7 +306,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         let mut end = events.next().instrument(observed.span.clone()).await;
         let mut transcript = None;
         if let Some(Ok(WorkEvent::Transcript(signed))) = end {
-            transcript = Some(transcript_value(&signed));
+            transcript = Some(signed);
             end = events.next().instrument(observed.span.clone()).await;
         }
         if !matches!(
@@ -317,7 +322,8 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         observed.complete();
         // Without a body there is nowhere to trail it; the head waited for it.
         if let Some(transcript) = transcript {
-            headers.insert(TRANSCRIPT_KEY, transcript);
+            let (name, value) = transcript_header(&transcript);
+            headers.insert(name, value);
         }
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::from_u16(status).unwrap();
@@ -337,7 +343,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             let event = match event {
                 WorkEvent::Output(event) => event,
                 WorkEvent::Transcript(signed) => {
-                    transcript = Some(transcript_value(&signed));
+                    transcript = Some(signed);
                     continue;
                 }
                 WorkEvent::Accepted(_) => continue,
@@ -359,7 +365,8 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                 OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None } => {
                     observed.complete();
                     if let Some(transcript) = transcript.take() {
-                        yield Frame::trailers(HeaderMap::from_iter([(axum::http::HeaderName::from_static(TRANSCRIPT_KEY), transcript)]));
+                        let (name, value) = transcript_header(&transcript);
+                        yield Frame::trailers(HeaderMap::from_iter([(name, value)]));
                     }
                     return;
                 }
@@ -371,10 +378,12 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     let stream: futures::stream::BoxStream<'static, Result<Frame<Bytes>, std::io::Error>> =
         Box::pin(stream);
     // Announce the trailer: HTTP/1.1 sends it to clients that accept
-    // trailers (`TE: trailers`).
+    // trailers (`TE: trailers`). Which of the two evidence fields arrives
+    // depends on the transcript's size, which is not known yet.
     headers.insert(
         axum::http::header::TRAILER,
-        HeaderValue::from_static(TRANSCRIPT_KEY),
+        HeaderValue::from_str(&format!("{TRANSCRIPT_KEY}, {TRANSCRIPT_DIGEST_KEY}"))
+            .expect("header names are valid trailer tokens"),
     );
     let mut response = Response::new(Body::new(http_body_util::StreamBody::new(stream)));
     *response.status_mut() = StatusCode::from_u16(status).unwrap();
@@ -388,13 +397,6 @@ fn provenanced(mut response: Response, accepted: Option<ExecutionProvenance>) ->
         response.extensions_mut().insert(accepted);
     }
     response
-}
-
-/// The signed transcript as a header value: base64 of its canonical bytes.
-fn transcript_value(transcript: &[u8]) -> HeaderValue {
-    use base64::Engine as _;
-    HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(transcript))
-        .expect("base64 is always a valid header value")
 }
 
 /// The provider's acceptance, if reported, and the upstream response head.

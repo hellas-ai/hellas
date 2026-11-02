@@ -9,7 +9,7 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     let owner = cli.owner.load().unwrap().unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let paid = PaidWork::load(&example, root.path().join("provider"), owner).unwrap();
+    let paid = PaidWork::load(&example, root.path().join("provider"), owner, None).unwrap();
     assert_eq!(paid.chain.chain.network.as_str(), "hellas-devnet-1");
     assert_eq!(paid.policy.payment_policy.fixed_price, 20);
     assert_eq!(paid.policy.expected_payment_values.value(), 401);
@@ -100,4 +100,87 @@ fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn paid_fetch_admission_derives_the_configured_route_contract() {
+    use hellas_executor::FetchAdaptorFactory as _;
+    let root = tempfile::tempdir().unwrap();
+    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
+    let owner = cli.owner.load().unwrap().unwrap();
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let mut terms: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&example).unwrap()).unwrap();
+    terms["compute"] = toml::Value::Boolean(false);
+    terms["fetch"]["route"] =
+        toml::from_str("[SealedRoute]\nservice = \"codex\"\nmethod = \"responses\"\n").unwrap();
+    let terms_path = root.path().join("paid.toml");
+    std::fs::write(&terms_path, toml::to_string(&terms).unwrap()).unwrap();
+    let fetch_path = root.path().join("fetch.json");
+    std::fs::write(
+        &fetch_path,
+        serde_json::json!({
+            "routes": [{
+                "service": "codex",
+                "method": "responses",
+                "destination": {
+                    "type": "codex-responses",
+                    "auth_path": "target/hellas-test-codex-auth.json"
+                }
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let paid = PaidWork::load(
+        &terms_path,
+        root.path().join("provider"),
+        owner,
+        Some(&fetch_path),
+    )
+    .unwrap();
+    let admission = paid
+        .policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .find_map(|admission| match admission {
+            Admission::Fetch { admission } => Some(admission),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        admission.contract,
+        hellas_providers::codex_responses_contract().unwrap()
+    );
+    assert_eq!(
+        admission.contract.manifest_id(),
+        hellas_providers::CodexResponsesAdaptorFactory::new()
+            .unwrap()
+            .execution_environment()
+    );
+
+    // An HTTP destination derives the generic contract instead.
+    let http_path = root.path().join("http.json");
+    std::fs::write(
+        &http_path,
+        serde_json::json!({
+            "routes": [{
+                "service": "http",
+                "method": "request",
+                "destination": {"type": "http", "config": {}}
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let http = paid_fetch_contract(
+        Some(&http_path),
+        &hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::sealed_route("http", "request")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(http, hellas_rpc::FetchContract::http().unwrap());
 }

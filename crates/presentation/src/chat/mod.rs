@@ -30,6 +30,7 @@ pub struct ChatTurn {
     parser: Box<dyn IncrementalToolCallParser>,
     called: bool,
     require_tool: bool,
+    parallel: bool,
     id: String,
 }
 
@@ -110,6 +111,7 @@ impl TextPresentation {
                 parser,
                 called: false,
                 require_tool,
+                parallel: request.sampling.parallel_tool_calls != Some(false),
                 id: uuid::Uuid::new_v4().simple().to_string(),
             },
         })
@@ -122,6 +124,7 @@ impl ChatTurn {
             parser: Box::new(PassthroughParser),
             called: false,
             require_tool: false,
+            parallel: true,
             id: String::new(),
         }
     }
@@ -159,6 +162,10 @@ impl ChatTurn {
                     channel: TextChannel::Output,
                 },
                 DecodeEvent::ToolCallStart { index, name } => {
+                    ensure!(
+                        self.parallel || !self.called,
+                        "model produced parallel tool calls but `parallel_tool_calls` is false"
+                    );
                     self.called = true;
                     OutputEvent::ToolCallStart(hellas_adaptors::ToolCallStart {
                         index,
@@ -322,6 +329,68 @@ mod tests {
                 .unwrap();
             assert!(rendered.contains(&output));
             assert!(rendered.ends_with("<|im_start|>user\n<tool_response>\n/home: 74% used\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        }
+    }
+
+    /// Anthropic expresses "at most one tool call" as
+    /// `disable_parallel_tool_use`; dropping it let the turn emit a second call.
+    #[test]
+    fn anthropic_disable_parallel_tool_use_rejects_a_second_call() {
+        use hellas_adaptors::anthropic::AnthropicMessagesAdaptor;
+
+        let parse = |tool_choice: serde_json::Value| {
+            AnthropicMessagesAdaptor.parse(
+                RawRequest::from_value(json!({
+                    "model": "claude-3-5-sonnet",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "Inspect disk usage"}],
+                    "tools": [{"name": "bash", "description": "Run a command",
+                        "input_schema": {"type": "object", "properties": {
+                            "command": {"type": "string"}}, "required": ["command"]}}],
+                    "tool_choice": tool_choice
+                }))
+                .unwrap(),
+            )
+        };
+        let canonical = |tool_choice: serde_json::Value| {
+            AnthropicMessagesAdaptor
+                .to_execution_request(&parse(tool_choice).unwrap())
+                .unwrap()
+                .canonical
+        };
+        let call =
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"df -h\"}}\n</tool_call>";
+        let mut turn = presentation()
+            .prepare(&canonical(json!({
+                "type": "any",
+                "disable_parallel_tool_use": true
+            })))
+            .unwrap()
+            .turn;
+        turn.feed(call).unwrap();
+        let error = turn.feed(call).unwrap_err();
+        assert!(error.to_string().contains("parallel_tool_calls"), "{error}");
+
+        let mut turn = presentation()
+            .prepare(&canonical(json!({"type": "any"})))
+            .unwrap()
+            .turn;
+        turn.feed(call).unwrap();
+        let events = turn.feed(call).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OutputEvent::ToolCallStart(_)))
+                .count(),
+            1
+        );
+
+        // The flag is a boolean, and only auto/any/tool accept it.
+        for invalid in [
+            json!({"type": "any", "disable_parallel_tool_use": "yes"}),
+            json!({"type": "none", "disable_parallel_tool_use": true}),
+        ] {
+            assert!(parse(invalid.clone()).is_err(), "accepted {invalid}");
         }
     }
 

@@ -58,3 +58,30 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: nix run --accept-flake-config .#check-unit
+
+  protocol-regressions:
+    name: Protocol regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make room for Nix and Rust
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      - uses: actions/cache@v4
+        with:
+          path: target/check
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'nix/**') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'nix/**') }}-
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: Protocol regressions
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: nix run --accept-flake-config .#check-regressions
+      - name: Nix module evaluation
+        run: >-
+          nix build --accept-flake-config
+          .#nixosTests.x86_64-linux.provider-content-index-eval
+          .#nixosTests.x86_64-linux.validator-module-eval

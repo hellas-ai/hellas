@@ -140,11 +140,14 @@ pub(super) struct Prefix {
     count: usize,
     digest: Digest,
 }
+/// Domain separator of the grant-prefix digest chain.
+const PREFIX_DOMAIN: &str = "hellas.work.grant.prefix.v1";
+
 impl Default for Prefix {
     fn default() -> Self {
         Self {
             count: 0,
-            digest: Digest::hash(b"hellas.work.grant.prefix.v1"),
+            digest: Digest::hash(PREFIX_DOMAIN.as_bytes()),
         }
     }
 }
@@ -154,10 +157,7 @@ impl Prefix {
         event: &OutputEventEnvelope,
     ) -> Result<(), hellas_channel::model::work::PaidWorkError> {
         let encoded = encode_transcript(std::slice::from_ref(event))?;
-        self.digest = hellas_auth::hash_tuple(
-            "hellas.work.grant.prefix.v1",
-            &[self.digest.as_bytes(), &encoded],
-        );
+        self.digest = hellas_auth::hash_tuple(PREFIX_DOMAIN, &[self.digest.as_bytes(), &encoded]);
         self.count = self.count.saturating_add(1);
         Ok(())
     }

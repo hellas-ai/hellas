@@ -24,6 +24,9 @@ const FAILURE_PAYLOAD_BYTES: usize = 40;
 pub enum FailureReason {
     Compilation,
     Execution,
+    /// The caller's signed response limit rejected bytes before they were
+    /// delivered. This is not evidence against the provider.
+    CallerLimit,
     Cancelled,
     ExecutionTimeout,
     OutputLimit,
@@ -983,9 +986,10 @@ mod tests {
         assert!(verifier.push(events[0].clone()).unwrap().is_some());
         assert_eq!(verifier.events.len(), 1);
     }
-    const REASONS: [FailureReason; 6] = [
+    const REASONS: [FailureReason; 7] = [
         FailureReason::Compilation,
         FailureReason::Execution,
+        FailureReason::CallerLimit,
         FailureReason::Cancelled,
         FailureReason::ExecutionTimeout,
         FailureReason::OutputLimit,

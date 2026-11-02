@@ -212,16 +212,43 @@ impl FetchProvider for MockFetchProvider {
     }
 }
 
-/// A provider error always means the provider actually failed. Routing
-/// happens in [`crate::FetchRouteRegistry`] before a provider is invoked,
-/// so there is no "not my route" rejection variant.
+/// Why a provider call did not complete. Only [`Self::CallerLimit`] says the
+/// caller's own signed limit rejected the response; every other failure is
+/// evidence against the provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchProviderErrorKind {
+    Failed,
+    CallerLimit,
+}
+
+/// A provider error carries a closed attribution alongside its message.
+/// Routing happens in [`crate::FetchRouteRegistry`] before a provider is
+/// invoked, so there is no "not my route" rejection variant.
 #[derive(Debug, thiserror::Error)]
-#[error("fetch provider failed: {0}")]
-pub struct FetchProviderError(String);
+#[error("fetch provider failed: {message}")]
+pub struct FetchProviderError {
+    kind: FetchProviderErrorKind,
+    message: String,
+}
 
 impl FetchProviderError {
     pub fn failed(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            kind: FetchProviderErrorKind::Failed,
+            message: message.into(),
+        }
+    }
+
+    /// The caller's signed byte cap rejected bytes before they were yielded.
+    pub fn caller_limit(message: impl Into<String>) -> Self {
+        Self {
+            kind: FetchProviderErrorKind::CallerLimit,
+            message: message.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> FetchProviderErrorKind {
+        self.kind
     }
 }
 

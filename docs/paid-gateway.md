@@ -41,7 +41,13 @@ and multipart fields are validated before submitting work.
 Responses identify the accepted job and provider in `x-hellas-commitment-bin` and
 `x-hellas-provider`. JSON includes the signed transcript in its `hellas` object;
 plain text carries it in the `x-hellas-transcript` trailer (HTTP/1.1 clients must
-send `TE: trailers` to receive trailers).
+send `TE: trailers` to receive trailers). For response formats that trail the
+evidence instead of embedding it, a transcript whose base64 encoding exceeds
+8 KiB is not delivered to the HTTP caller at all: `x-hellas-transcript` is
+omitted and `x-hellas-transcript-digest` names its lowercase hex SHA-256
+instead. The digest identifies the canonical signed bytes so a caller who
+obtains them out of band can verify them; the gateway does not retain or serve
+those bytes, so no HTTP request can retrieve an oversized transcript.
 
 For a single paid job without an HTTP server:
 

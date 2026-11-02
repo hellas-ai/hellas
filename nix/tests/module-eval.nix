@@ -29,8 +29,8 @@ let
   contextualRuntimePath = builtins.appendContext "/run/hellas/contextual.env" (
     builtins.getContext "${package}"
   );
-  evalGateway =
-    gateway:
+  evalGatewayWithServe =
+    serve: gateway:
     import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.stdenv.hostPlatform.system;
       modules = [
@@ -46,10 +46,12 @@ let
               textModel = "/srv/hellas/test.gguf";
             }
             // gateway;
-          };
+          }
+          // serve;
         }
       ];
     };
+  evalGateway = evalGatewayWithServe { };
   providerAssertion =
     evaluation:
     lib.findFirst (
@@ -95,6 +97,21 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "grant execution requires" assertion.message
     ) (throw "missing required Apple trust assertion") evaluation.config.assertions;
+  fundingAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway execution requires exactly one" assertion.message
+    ) (throw "missing gateway funding assertion") evaluation.config.assertions;
+  grantPoolAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway grant pool requires" assertion.message
+    ) (throw "missing grant pool assertion") evaluation.config.assertions;
+  localGrantAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway.localGrant requires" assertion.message
+    ) (throw "missing localGrant assertion") evaluation.config.assertions;
   memoryHeadroomAssertion =
     evaluation:
     lib.findFirst (
@@ -401,12 +418,46 @@ let
   missingRequiredTrust = evalGateway {
     offer = "provider";
   };
+  grantPoolGateway = evalGateway {
+    grantPoolConfig = "/run/hellas/grant-pool.json";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  grantPoolWithTrustPolicy = evalGateway {
+    grantPoolConfig = "/run/hellas/grant-pool.json";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  localGrantGateway = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    workProfile = "/run/hellas/work-profile.json";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  localGrantHipGateway = evalGatewayWithServe { gpuBackend = "hip"; } {
+    localGrant = "00000000000000000000000000000000";
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    workProfile = "/run/hellas/work-profile.json";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  awaitOwnerHipProvider = evalProvider {
+    awaitOwner = "/var/lib/hellas/await-owner";
+    gpuBackend = "hip";
+  };
   cudaProvider = evalProvider {
     workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "cuda";
   };
   hipProvider = evalProvider {
     workConfigFile = "/run/hellas/work.toml";
+    gpuBackend = "hip";
+  };
+  grantOnlyHipProvider = evalProvider {
+    contentRoots = [ "/srv/hellas/grant-content" ];
+    grantConfigFile = "/run/hellas/grant.json";
     gpuBackend = "hip";
   };
   maxGpuSessionAssetBytes = evalProvider {
@@ -762,6 +813,57 @@ in
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
     assert !(trustPairAssertion incompleteTrust).assertion;
     assert !(trustRequiredAssertion missingRequiredTrust).assertion;
+    assert (grantPoolAssertion grantPoolGateway).assertion;
+    assert !(grantPoolAssertion grantPoolWithTrustPolicy).assertion;
+    assert (localGrantAssertion localGrantGateway).assertion;
+    assert (fundingAssertion grantPoolGateway).assertion;
+    assert (fundingAssertion localGrantGateway).assertion;
+    assert lib.hasInfix "--grant-pool-config /run/hellas/grant-pool.json"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
+      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--trust-policy" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--paid-work-config" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--offer" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--local-grant" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert lib.elem "/run/hellas/grant-pool.json"
+      grantPoolGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
+      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--work-profile /run/hellas/work-profile.json"
+      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--paid-work-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--grant-pool-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--offer" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH;
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? HIP_PATH;
+    assert !(localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? CUDA_PATH);
+    assert localGrantHipGateway.config.systemd.services.hellas-gateway.path != [ ];
+    assert
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+    assert lib.elem "char-drm rw"
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+    assert
+      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK
+      == "infinity";
+    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
+    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(writableRootAssertion rootJournalGateway).assertion;
@@ -777,6 +879,39 @@ in
       hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
+    assert lib.hasInfix "--grant-config /run/hellas/grant.json"
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.path != [ ];
+    assert
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
+    assert lib.elem "/run/hellas/grant.json"
+      grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--await-owner /var/lib/hellas/await-owner"
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--paid-work-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--grant-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+    assert awaitOwnerHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert awaitOwnerHipProvider.config.systemd.services.hellas.path != [ ];
+    assert
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
+        "render"
+        "video"
+      ];
+    assert lib.elem "/dev/kfd rw"
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert
+      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
+    assert lib.elem "/var/lib/hellas/await-owner"
+      awaitOwnerHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !environmentPathEvaluation.success;

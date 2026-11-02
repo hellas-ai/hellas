@@ -368,14 +368,14 @@ impl TestNode {
             )
             .await
     }
-    pub async fn finish(&mut self, request: &Proposal, usage: Usage) {
+    pub async fn finish(&mut self, request: &Proposal, usage: Usage, fault: bool) {
         self.store
             .finish(
                 request.authorization.channel_id,
                 request.work(),
                 crate::work_store::grant::GrantOutcome::Failed,
                 None,
-                usage,
+                crate::model::grant::budget::UsageObservation::for_test(usage, fault),
                 self.clock.now(),
             )
             .await

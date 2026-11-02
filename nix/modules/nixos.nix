@@ -56,8 +56,12 @@ let
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
   ) providerWritablePaths;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
-  providerLocalExecutionEnabled = cfg.workConfigFile != null && hellas.catenaConfigured cfg;
+  providerLocalExecutionEnabled =
+    hellas.catenaConfigured cfg
+    && (cfg.workConfigFile != null || cfg.grantConfigFile != null || cfg.awaitOwner != null);
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
+  # The gateway runs the same native executor in process for --local-grant.
+  gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.localGrant != null;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
     if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
@@ -105,6 +109,8 @@ let
   ++ cfg.contentRoots
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
+  ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
+  ++ lib.optional (cfg.awaitOwner != null) cfg.awaitOwner
   ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
@@ -113,6 +119,7 @@ let
     ++ [ gateway.identityPath ]
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
+    ++ lib.optional (gateway.grantPoolConfig != null) gateway.grantPoolConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
     ++ lib.optional (gateway.workProfile != null) gateway.workProfile
     ++ lib.optional (gateway.passkey != null) gateway.passkey
@@ -252,34 +259,66 @@ in
         message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds on this platform.";
       }
       {
-        assertion = !gateway.enable || gateway.offer != null || gateway.paidWorkConfig != null;
-        message = "services.hellas.gateway execution requires an offer or paidWorkConfig.";
+        assertion =
+          !gateway.enable
+          ||
+            lib.count (target: target != null) [
+              gateway.offer
+              gateway.paidWorkConfig
+              gateway.grantPoolConfig
+              gateway.localGrant
+            ] == 1;
+        message = "services.hellas.gateway execution requires exactly one of offer, paidWorkConfig, grantPoolConfig or localGrant.";
       }
       {
         assertion =
           gateway.paidWorkConfig == null
           || (
-            gateway.offer == null
-            && gateway.trustStore == null
-            && gateway.trustPolicy == null
-            && gateway.assurance == "producer-signed"
+            gateway.trustStore == null && gateway.trustPolicy == null && gateway.assurance == "producer-signed"
           );
-        message = "services.hellas.gateway.paidWorkConfig requires producer-signed execution without an offer or trust policy.";
-      }
-      {
-        assertion = !gateway.enable || (gateway.trustStore == null) == (gateway.trustPolicy == null);
-        message = "services.hellas.gateway.trustStore and trustPolicy must be configured together.";
+        message = "services.hellas.gateway.paidWorkConfig requires producer-signed execution without a trust policy.";
       }
       {
         assertion =
           !gateway.enable
-          || gateway.offer == null
-          || (gateway.trustPolicy != null && gateway.workProfile != null && gateway.passkey != null);
-        message = "services.hellas.gateway grant execution requires trustPolicy, workProfile and passkey.";
+          || gateway.grantPoolConfig != null
+          || (gateway.trustStore == null) == (gateway.trustPolicy == null);
+        message = "services.hellas.gateway.trustStore and trustPolicy must be configured together.";
       }
       {
-        assertion = gateway.offer == null || gateway.paidWorkConfig == null;
-        message = "services.hellas.gateway must select only one funding target.";
+        assertion =
+          gateway.offer == null
+          || (
+            gateway.trustStore != null
+            && gateway.trustPolicy != null
+            && gateway.workProfile != null
+            && gateway.passkey != null
+          );
+        message = "services.hellas.gateway grant execution requires trustStore, trustPolicy, workProfile and passkey.";
+      }
+      {
+        assertion =
+          gateway.grantPoolConfig == null
+          || (
+            gateway.trustStore != null
+            && gateway.passkey != null
+            && gateway.trustPolicy == null
+            && gateway.grantPolicy == null
+            && gateway.workProfile == null
+          );
+        message = "services.hellas.gateway grant pool requires trustStore and passkey without trustPolicy, grantPolicy or workProfile.";
+      }
+      {
+        assertion =
+          gateway.localGrant == null
+          || (
+            gateway.trustStore != null
+            && gateway.trustPolicy != null
+            && gateway.workProfile != null
+            && gateway.passkey != null
+            && gateway.assurance == "producer-signed"
+          );
+        message = "services.hellas.gateway.localGrant requires trustStore, trustPolicy, workProfile and passkey with producer-signed assurance.";
       }
     ];
 
@@ -375,6 +414,7 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
+      path = lib.optionals gatewayGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -388,6 +428,7 @@ in
           # Distinguish gateway spans from the node's in shared trace storage.
           OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
         }
+        // lib.optionalAttrs gatewayGpuConfigured gpuEnvironment
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
@@ -409,7 +450,15 @@ in
       }
       // lib.optionalAttrs (gateway.environmentFile != null) {
         EnvironmentFile = gateway.environmentFile;
-      };
+      }
+      // lib.optionalAttrs gatewayGpuConfigured (
+        gpuDeviceAccess
+        // {
+          # The in-process executor locks host pages for upload staging and
+          # driver queues, exactly like the provider's native runtime.
+          LimitMEMLOCK = "infinity";
+        }
+      );
     };
 
     networking.firewall = {

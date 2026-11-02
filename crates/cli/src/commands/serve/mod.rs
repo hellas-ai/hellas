@@ -229,11 +229,53 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::i
     Ok(tokio::signal::ctrl_c())
 }
 
-fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
+fn read_fetch_config(path: &std::path::Path) -> CliResult<FetchConfigFile> {
     let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let file: FetchConfigFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// The Fetch contract a paid admission must name for `route`.
+///
+/// The executor compares an admission's contract manifest with the manifest of
+/// the route entry it dispatches to, so the admission is derived from the
+/// destination that route is configured with. `OpenFetch` is defined only over
+/// the generic HTTP contract; a sealed route is either defined by the served
+/// `--fetch-config` or is the built-in `http/request` route registered when no
+/// file is supplied.
+fn paid_fetch_contract(
+    fetch_config: Option<&std::path::Path>,
+    route: &hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+) -> CliResult<hellas_rpc::FetchContract> {
+    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
+    match route {
+        FetchRoutePolicy::OpenFetch { .. } => Ok(hellas_rpc::FetchContract::http()?),
+        FetchRoutePolicy::SealedRoute { service, method } => {
+            let Some(path) = fetch_config else {
+                anyhow::ensure!(
+                    service == "http" && method == "request",
+                    "paid Fetch admits sealed route {service}/{method}, but no --fetch-config defines it"
+                );
+                return Ok(hellas_rpc::FetchContract::http()?);
+            };
+            let file = read_fetch_config(path)?;
+            let configured = file
+                .routes
+                .iter()
+                .find(|configured| configured.service == *service && configured.method == *method)
+                .with_context(|| {
+                    format!(
+                        "paid Fetch admits sealed route {service}/{method}, but {} does not define it",
+                        path.display()
+                    )
+                })?;
+            configured.destination.contract()
+        }
+    }
+}
+
+fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
+    let file = read_fetch_config(path)?;
 
     let mut registry = FetchRouteRegistry::new();
     for route in file.routes {
@@ -294,6 +336,14 @@ enum FetchDestination {
 }
 
 impl FetchDestination {
+    /// The sealed contract this destination's trusted adaptor implements.
+    fn contract(&self) -> CliResult<hellas_rpc::FetchContract> {
+        match self {
+            Self::Http { .. } => Ok(hellas_rpc::FetchContract::http()?),
+            Self::CodexResponses { .. } => Ok(hellas_providers::codex_responses_contract()?),
+        }
+    }
+
     fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
         let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
             Self::Http { config } => return Ok(config.into_entry(capabilities)?),

@@ -22,6 +22,7 @@ use crate::{
     context::Cost,
     terms::Terms,
     tx::PartyAuth,
+    work::PendingPaymentClose,
 };
 
 // Tag numbers are fixed consensus assignments, not positions. 2 and 5
@@ -313,6 +314,19 @@ pub enum Proof {
     },
 }
 
+/// The freeze's witnesses and its contest jointly determine owner exits.
+pub(super) fn freeze_owner_signed(
+    maker: &PartyAuth,
+    taker: &PartyAuth,
+    pending: Option<&PendingPaymentClose>,
+) -> [bool; 2] {
+    let previous = pending.map_or([false; 2], PendingPaymentClose::owner_signed);
+    [
+        maker.is_owner() || previous[0],
+        taker.is_owner() || previous[1],
+    ]
+}
+
 impl Proof {
     /// Creates a cooperative close witness.
     #[must_use]
@@ -348,6 +362,27 @@ impl Proof {
     #[must_use]
     pub const fn adjudicated(contest_commitment: PaymentContestCommitment) -> Self {
         Self::Adjudicated { contest_commitment }
+    }
+
+    /// Owner exits carried by a work-payment close, ordered maker then taker.
+    ///
+    /// A freeze inherits owner actions from the contest it ends. An
+    /// adjudicated close requires that contest and uses its actions alone.
+    /// Mutual and timeout proofs are not payment exits and return `None`,
+    /// as does an adjudicated proof without a pending contest.
+    ///
+    /// This interprets authority only; callers must separately establish the
+    /// proof's inclusion, signatures, contest binding and payout amounts.
+    #[must_use]
+    pub fn payment_close_owner_signed(
+        &self,
+        pending: Option<&PendingPaymentClose>,
+    ) -> Option<[bool; 2]> {
+        match self {
+            Self::Freeze { maker, taker, .. } => Some(freeze_owner_signed(maker, taker, pending)),
+            Self::Adjudicated { .. } => pending.map(PendingPaymentClose::owner_signed),
+            Self::Mutual { .. } | Self::Timeout { .. } => None,
+        }
     }
 
     /// Returns the close witness kind.
@@ -480,6 +515,56 @@ impl Decode for Proof {
 #[allow(clippy::indexing_slicing, reason = "test constants are in-bounds")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payment_authority_preserves_each_partys_owner_actions() {
+        use crate::{EdgeId, Party, Sig, StartId};
+
+        let authorization = |owner| {
+            if owner {
+                PartyAuth::owner(Sig::default())
+            } else {
+                PartyAuth::signer(Sig::default())
+            }
+        };
+        let adjudicated = Proof::adjudicated(PaymentContestCommitment::from_bytes([0; 32]));
+        assert_eq!(adjudicated.payment_close_owner_signed(None), None);
+        for maker_owner in [false, true] {
+            for taker_owner in [false, true] {
+                let freeze = Proof::freeze(
+                    9,
+                    (1, 2),
+                    authorization(maker_owner),
+                    authorization(taker_owner),
+                );
+                assert_eq!(
+                    freeze.payment_close_owner_signed(None),
+                    Some([maker_owner, taker_owner])
+                );
+                for maker_started in [false, true] {
+                    for taker_responded in [false, true] {
+                        let pending = PendingPaymentClose::opened(
+                            EdgeId::from_bytes([1; EdgeId::LENGTH]),
+                            Party::Maker,
+                            StartId::from_bytes([2; StartId::LENGTH]),
+                            10,
+                            (5, 2),
+                            maker_started,
+                        )
+                        .responded_at(9, taker_responded);
+                        assert_eq!(
+                            freeze.payment_close_owner_signed(Some(&pending)),
+                            Some([maker_owner || maker_started, taker_owner || taker_responded]),
+                        );
+                        assert_eq!(
+                            adjudicated.payment_close_owner_signed(Some(&pending)),
+                            Some([maker_started, taker_responded]),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Consensus assignments. A close kind's tag is its `Proof` variant
     /// number and its set bit position; all three move together or the

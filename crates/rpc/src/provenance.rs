@@ -25,6 +25,17 @@ pub const PROVIDER_KEY: &str = "x-hellas-provider";
 /// canonical bytes of the provider-signed transcript.
 pub const TRANSCRIPT_KEY: &str = "x-hellas-transcript";
 
+/// HTTP trailer (a header on a bodyless response) naming the lowercase hex
+/// SHA-256 of the canonical signed bytes when the transcript is too large to
+/// carry inline. The digest detects an omitted transcript and verifies a copy
+/// obtained out of band; the gateway neither retains nor serves that copy.
+pub const TRANSCRIPT_DIGEST_KEY: &str = "x-hellas-transcript-digest";
+
+/// Largest base64 `x-hellas-transcript` value carried inline. HTTP stacks
+/// bound trailer sizes (reqwest rejects trailers over 16 KiB), so a transcript
+/// whose encoding exceeds this bound travels as [`TRANSCRIPT_DIGEST_KEY`].
+pub const MAX_INLINE_TRANSCRIPT_BYTES: usize = 8 * 1024;
+
 /// The job identity a provider accepted, known before its first output: the
 /// work id it signed and the key that signs its transcript. Scheme result
 /// commitments live in signed terminal output events, not in this struct.

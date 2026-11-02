@@ -300,16 +300,20 @@ pub fn validate_output(
 }
 
 pub const ADAPTOR: &str = "compute-0.0.1";
+/// Canonical tag of a compute environment.
+const ENVIRONMENT_DOMAIN: &str = "hellas.compute.environment.v1";
+/// Canonical tag of a compute plan.
+const PLAN_DOMAIN: &str = "hellas.compute.plan.v1";
 impl Environment {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
-        super::encode(&("hellas.compute.environment.v1", self))
+        super::encode(&(ENVIRONMENT_DOMAIN, self))
     }
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, crate::value::CanonicalDecodeError> {
         use crate::protocol::value::CanonicalDecoder;
         super::bound(bytes, MAX_ENVIRONMENT_BYTES)?;
         let mut decoder = CanonicalDecoder::new(bytes);
         decoder.array_exact(2)?;
-        decoder.expect_str("hellas.compute.environment.v1")?;
+        decoder.expect_str(ENVIRONMENT_DOMAIN)?;
         decoder.map_exact(2)?;
         decoder.expect_str("assets")?;
         let assets_len = decoder.array_len()?;
@@ -406,12 +410,12 @@ impl Plan {
         Ok(output)
     }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
-        super::encode(&("hellas.compute.plan.v1", self))
+        super::encode(&(PLAN_DOMAIN, self))
     }
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, crate::value::CanonicalDecodeError> {
         super::bound(bytes, 1 << 20)?;
         let (domain, plan): (String, Self) = crate::value::decode_canonical_dag_cbor(bytes)?;
-        super::domain_is(&domain, "hellas.compute.plan.v1")?;
+        super::domain_is(&domain, PLAN_DOMAIN)?;
         Ok(plan)
     }
 }

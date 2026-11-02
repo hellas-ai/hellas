@@ -429,10 +429,18 @@ pub async fn finish(
     job: (ChannelId, Digest),
     outcome: crate::work_store::grant::GrantOutcome,
     usage: Usage,
+    fault: bool,
     now: u64,
 ) -> Result<(), crate::work_store::grant::NodeStoreError> {
     store
-        .finish(job.0, job.1, outcome, None, usage, UnixMillis(now))
+        .finish(
+            job.0,
+            job.1,
+            outcome,
+            None,
+            crate::model::grant::budget::UsageObservation::for_test(usage, fault),
+            UnixMillis(now),
+        )
         .await
 }
 pub fn used(store: &NodeStore, node: BudgetNode, meter: Meter) -> u64 {

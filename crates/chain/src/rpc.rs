@@ -135,20 +135,11 @@ impl LocalLightClient {
 
     #[cfg(feature = "validator")]
     async fn submit_general(&self, tx: Transaction) -> SubmitTxOutcome {
-        let entry = MempoolEntry::new(tx);
-        let mut mempool = self.mempool().inner.lock().await;
-        if mempool
-            .general
-            .iter()
-            .any(|resident| resident.digest == entry.digest)
-        {
-            return SubmitTxOutcome::Duplicate;
-        }
-        if mempool.general.len() >= crate::GENERAL_MEMPOOL_CAPACITY {
-            return SubmitTxOutcome::Full;
-        }
-        mempool.general.push_back(entry);
-        SubmitTxOutcome::Enqueued
+        self.mempool()
+            .inner
+            .lock()
+            .await
+            .admit_general(MempoolEntry::new(tx))
     }
 
     #[cfg(feature = "validator")]

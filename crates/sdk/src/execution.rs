@@ -10,6 +10,11 @@ use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Format tag of a persisted grant attempt record.
+const GRANT_ATTEMPT_FORMAT: &str = "hellas.grant-attempt.v1";
+/// Format tag of a persisted completion receipt.
+const WORK_COMPLETION_FORMAT: &str = "hellas.work-completion.v1";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionTerms {
     Paid { price: u64 },
@@ -206,7 +211,7 @@ impl ExecutionAttempt {
                     Ok(bytes) => (serde_json::from_slice::<GrantRecord>(&bytes)?, false),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => (
                         GrantRecord {
-                            format: "hellas.grant-attempt.v1".into(),
+                            format: GRANT_ATTEMPT_FORMAT.into(),
                             input: *digest.as_bytes(),
                             resource,
                             target: None,
@@ -219,7 +224,7 @@ impl ExecutionAttempt {
                     ),
                     Err(error) => return Err(error.into()),
                 };
-                if record.format != "hellas.grant-attempt.v1"
+                if record.format != GRANT_ATTEMPT_FORMAT
                     || record.input != *digest.as_bytes()
                     || record.resource != resource
                     || record.authorization.is_some() != record.work.is_some()
@@ -603,7 +608,7 @@ impl ExecutionAttempt {
             Err(error) => return Err(error.into()),
         };
         let receipt: CompletionReceipt = serde_json::from_slice(&bytes)?;
-        if receipt.format != "hellas.work-completion.v1"
+        if receipt.format != WORK_COMPLETION_FORMAT
             || receipt.input != *self.input.as_bytes()
             || receipt.terms != self.terms
             || (matches!(self.terms, ExecutionTerms::Paid { .. }) && !receipt.finished)
@@ -647,7 +652,7 @@ impl ExecutionAttempt {
             hellas_private::write_atomically(&path, ".writing", &bytes)?;
         }
         let receipt = CompletionReceipt {
-            format: "hellas.work-completion.v1".into(),
+            format: WORK_COMPLETION_FORMAT.into(),
             input: *self.input.as_bytes(),
             terms: self.terms,
             work: *work.as_bytes(),

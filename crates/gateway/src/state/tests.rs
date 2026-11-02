@@ -292,3 +292,308 @@ async fn text_routes_carry_provenance_at_start_and_end() {
         }
     }
 }
+
+struct Capturing {
+    jobs: std::sync::Mutex<Vec<hellas_client::model::ComputeJob>>,
+}
+
+impl WorkExecutionBackend for Capturing {
+    fn run(
+        &self,
+        job: hellas_client::model::ComputeJob,
+    ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
+        self.jobs.lock().unwrap().push(job);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Responses string input is a user message, so it must produce the same
+/// prepared tokens as the equivalent one-message array.
+#[tokio::test]
+async fn responses_string_input_matches_a_user_message_array() {
+    use hellas_adaptors::{RawRequest, WireAdaptor, openai::responses::OpenAiResponsesAdaptor};
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let adaptor = OpenAiResponsesAdaptor;
+    let prepare = |input: serde_json::Value| {
+        let parsed = adaptor
+            .parse(
+                RawRequest::from_value(
+                    json!({"model": "m", "input": input, "max_output_tokens": 1}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request = adaptor.to_execution_request(&parsed).unwrap();
+        state.prepare_wire_execution(&request).unwrap();
+    };
+    prepare(json!("hi"));
+    prepare(json!([{"role": "user", "content": "hi"}]));
+
+    let jobs = work.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].inputs, jobs[1].inputs);
+    assert_eq!(jobs[0].plan, jobs[1].plan);
+}
+
+/// Every accepted generation control must reach the job or be rejected; none
+/// may be silently dropped between the adaptor and native execution.
+#[tokio::test]
+async fn generation_controls_are_honoured_or_rejected() {
+    use hellas_adaptors::{
+        RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
+        openai::responses::OpenAiResponsesAdaptor,
+    };
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let chat = |body: serde_json::Value| {
+        let adaptor = OpenAiChatCompletionsAdaptor;
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let responses = |body: serde_json::Value| {
+        let adaptor = OpenAiResponsesAdaptor;
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let prepare = |request: &WireExecutionRequest| state.prepare_wire_execution(request);
+
+    for (field, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("top_logprobs", json!(2)),
+    ] {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        });
+        body[field] = value;
+        let error = prepare(&chat(body))
+            .err()
+            .expect("unsupported sampling must be rejected");
+        assert!(
+            matches!(error, BackendError::Rejected(_)),
+            "{field}: {error}"
+        );
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+    let error = prepare(&responses(json!({
+        "model": "m",
+        "input": "hello",
+        "max_output_tokens": 1,
+        "truncation": "auto"
+    })))
+    .err()
+    .expect("truncation must be rejected");
+    assert!(matches!(error, BackendError::Rejected(_)));
+    assert!(error.to_string().contains("truncation"), "{error}");
+
+    // `parallel_tool_calls: false` is enforced by the chat turn.
+    let prepared = prepare(&chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "tools": [{"type": "function", "function": {
+            "name": "bash", "parameters": {"type": "object"}
+        }}],
+        "parallel_tool_calls": false
+    })))
+    .unwrap();
+    let mut turn = prepared.chat.expect("tool request prepares a chat turn");
+    let call = "<tool_call>\n{\"name\":\"bash\",\"arguments\":{}}\n</tool_call>";
+    turn.feed(call).unwrap();
+    let error = turn.feed(call).unwrap_err();
+    assert!(error.to_string().contains("parallel_tool_calls"), "{error}");
+}
+
+/// The executor emits the token that matches a stop sequence before it stops,
+/// so native execution would decode that token into the returned text. The
+/// route must refuse the control instead of returning the stop sequence.
+#[tokio::test]
+async fn custom_stop_sequences_are_rejected_before_any_output() {
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(open(work.clone()).await);
+    let response = super::router(state)
+        .oneshot(
+            axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1,
+                        "stop": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("an error body names the refusal");
+    assert!(
+        message.contains("custom stop sequences are not supported"),
+        "{message}"
+    );
+    assert!(
+        work.jobs.lock().unwrap().is_empty(),
+        "a rejected request must submit no job"
+    );
+}
+
+/// Structured output cannot be enforced by native execution yet, so a strict
+/// schema must be rejected rather than answered with arbitrary text.
+#[tokio::test]
+async fn structured_output_is_rejected_before_native_execution() {
+    use hellas_adaptors::{
+        RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
+    };
+    use serde_json::json;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = open(work.clone()).await;
+    let adaptor = OpenAiChatCompletionsAdaptor;
+    let request = |body: serde_json::Value| {
+        let parsed = adaptor
+            .parse(RawRequest::from_value(body).unwrap())
+            .unwrap();
+        adaptor.to_execution_request(&parsed).unwrap()
+    };
+    let error = state
+        .prepare_wire_execution(&request(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                    "strict": true
+                }
+            }
+        })))
+        .err()
+        .expect("a strict schema must be rejected");
+    assert!(matches!(error, BackendError::Rejected(_)));
+    assert!(error.to_string().contains("json_schema"), "{error}");
+
+    state
+        .prepare_wire_execution(&request(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        })))
+        .unwrap();
+    assert_eq!(work.jobs.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn native_capabilities_reject_every_unimplemented_control() {
+    use hellas_adaptors::{Input, ModelRef, ResponseFormat};
+    use serde_json::json;
+
+    let base = CanonicalExecution::new(ModelRef::new("m"), Input::Text("hello".into()));
+    validate_native_text_request(&base).unwrap();
+    for (key, value) in [
+        ("temperature", json!(0.4)),
+        ("top_p", json!(0.8)),
+        ("top_logprobs", json!(2)),
+        ("truncation", json!("auto")),
+        ("stop", json!(["END"])),
+    ] {
+        let mut encoded = serde_json::to_value(&base).unwrap();
+        encoded["sampling"][key] = value;
+        let request = serde_json::from_value(encoded).unwrap();
+        assert!(
+            matches!(
+                validate_native_text_request(&request),
+                Err(BackendError::Rejected(_))
+            ),
+            "accepted {key}"
+        );
+    }
+    for format in [
+        ResponseFormat::JsonObject,
+        ResponseFormat::JsonSchema {
+            name: None,
+            schema: json!({"type":"object"}),
+            strict: Some(true),
+        },
+        ResponseFormat::Raw(json!({"type":"custom"})),
+    ] {
+        let mut request = base.clone();
+        request.response_format = Some(format);
+        assert!(validate_native_text_request(&request).is_err());
+    }
+    let mut plain = base;
+    plain.response_format = Some(ResponseFormat::Text);
+    validate_native_text_request(&plain).unwrap();
+}
+
+#[tokio::test]
+async fn anthropic_controls_are_rejected_before_submitting_a_job() {
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let router = super::router(Arc::new(open(work.clone()).await));
+    for (field, value) in [
+        ("temperature", json!(0.4)),
+        ("top_p", json!(0.8)),
+        ("stop_sequences", json!(["END"])),
+    ] {
+        let mut body =
+            json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hello"}]});
+        body[field] = value;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "accepted {field}"
+        );
+    }
+    assert!(work.jobs.lock().unwrap().is_empty());
+}

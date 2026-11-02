@@ -462,22 +462,27 @@ impl PaidWorkSession {
             ));
         }
         let read_timeout = read_timeout(args.timeout);
-        let remote = crate::client_chain::connect(config, read_timeout).await?;
-        let chain = WorkBlocks::new(remote.clone()).with_read_retry(config.poll, read_timeout);
-
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
                 path: args.journal_root.clone(),
                 source,
             }
         })?;
-        let retained = offer::retained_offer(
+        // Retained journals can already depend on a height a fast validator
+        // has not reached. Establish that floor before a source is chosen;
+        // recovery reads below it would only be refused by the same guard.
+        let setups = offer::RetainedSetups::discover(
             &args.journal_root,
             config.chain.network,
             args.provider,
-            &chain,
         )
         .await?;
+        let floor = setups.floor();
+        let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
+        let chain = WorkBlocks::new(remote.clone())
+            .with_read_retry(config.poll, read_timeout)
+            .with_min_height(floor);
+        let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
         let (store, signed) = match retained {
             Some(retained) => retained,
@@ -607,7 +612,24 @@ impl PaidWorkSession {
         let setup_service = SetupService::new(setup);
         let (mounted, descriptor) =
             drive_setup(&setup_service, &policy, &chain, config.poll).await?;
-        let chain = chain.with_min_height(mounted.state().cursor().0);
+        // A completed setup journal stops at the height that finished the
+        // handshake, while the channel journal it mounted keeps advancing.
+        // The source chosen for the setup floor can therefore be behind the
+        // channel's own cursor by the time the channel is mounted. Reselect
+        // at that cursor before the readiness read: a source below it is
+        // refused by the journal's own height guard, and waiting for the
+        // same fast source to catch up would never mount.
+        let channel_floor = mounted.state().cursor().0;
+        let (remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
+            let remote =
+                crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
+            let chain = WorkBlocks::new(remote.clone())
+                .with_read_retry(config.poll, read_timeout)
+                .with_min_height(channel_floor);
+            (remote, chain)
+        } else {
+            (remote, chain.with_min_height(channel_floor))
+        };
         let started = hellas_channel::work::ObservationTime::now();
         let ready = match ready_channel(&descriptor, &chain).await {
             Ok(ready) => Some(ready),
@@ -738,23 +760,47 @@ impl PaidWorkSession {
         self.needs_recovery
     }
 
-    /// Opens a close; the independent observer drives its finalized payout.
-    /// There is no deadline here: with the observer stopped or validators
-    /// unreachable this waits as long as the process runs. Callers that need
-    /// a bound should wrap it in one.
+    /// Opens a close and drives it to finality.
+    ///
+    /// The same progress loop as offline settlement: a retained start is
+    /// offered again while it can land, replaced once its window has passed,
+    /// and a source that fails is reconnected. There is no deadline here:
+    /// with the observer stopped or validators unreachable this waits as long
+    /// as the process runs. Callers that need a bound should wrap it in one.
     pub async fn settle(&mut self) -> Result<u64> {
-        if !self.client.with_state(|state| state.is_closing()).await? {
-            self.client.client().await?.prepare_close().await?;
+        if let Some(settled) = self
+            .client
+            .with_state(|state| state.close_settled())
+            .await?
+        {
+            return Ok(settled.provider_payout);
         }
+        let poll = self.args.config.poll;
+        let timeout = read_timeout(self.args.timeout);
         loop {
-            if let Some(settlement) = self
-                .client
-                .with_state(|state| state.close_settled())
-                .await?
-            {
-                return Ok(settlement.provider_payout);
+            let floor = self.client.with_state(|state| state.cursor().0).await?;
+            let remote =
+                match crate::client_chain::connect_at(&self.args.config, timeout, floor).await {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        tracing::debug!(%error, "paid settlement is waiting for a chain source");
+                        tokio::time::sleep(poll).await;
+                        continue;
+                    }
+                };
+            let chain = WorkBlocks::new(remote).with_min_height(floor);
+            match settlement::settle_close(&mut self.client, &chain, &chain, poll).await {
+                Ok(provider_payout) => return Ok(provider_payout),
+                Err(PaidClientError::CatchUp(
+                    hellas_channel::work_close::CatchUpError::Source(_)
+                    | hellas_channel::work_close::CatchUpError::Missing { .. },
+                )) => {
+                    // The observer may still reach finality through another
+                    // source; reconnect and let the shared loop observe it.
+                    tokio::time::sleep(poll).await;
+                }
+                Err(error) => return Err(error),
             }
-            tokio::time::sleep(self.args.config.poll).await;
         }
     }
 
@@ -920,6 +966,33 @@ impl PaidWorkSession {
                     }
                     RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, *input),
                 };
+                // A retained half-signed job resumes from its own durable
+                // closure. Missing content is unresolved, never an empty
+                // program: uploading a fabricated root would sign for work
+                // this process cannot produce.
+                let retained_upload = phase == hellas_channel::work_store::JobPhase::HalfSigned
+                    && client
+                        .with_state(|state| {
+                            state.job_by_id(work_id).is_some_and(|job| {
+                                job.authorization().retention == hellas_rpc::Retention::Retain
+                            })
+                        })
+                        .await?;
+                let job_content = if retained_upload {
+                    match client.client().await?.retained_content(work_id)? {
+                        Some(content) => content,
+                        None => {
+                            tracing::warn!(
+                                %work_id,
+                                "retaining an unpaid job whose upload never completed; \
+                                 it is unresolved rather than an empty program"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    content.clone()
+                };
                 check_request(
                     policy,
                     &pending,
@@ -929,7 +1002,7 @@ impl PaidWorkSession {
                 let result = execute_paid_job(
                     args,
                     pending,
-                    content,
+                    &job_content,
                     dialer,
                     client,
                     &ready,

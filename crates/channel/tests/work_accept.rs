@@ -284,6 +284,166 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
     }
 }
 
+/// A retained Compute proposal keeps the closure its upload needs, so a
+/// restart can send the same signed proposal again; one that never
+/// retained it is unresolved, not an empty program.
+#[tokio::test]
+async fn a_retained_compute_proposal_resumes_its_upload_after_a_restart() {
+    // Crash during upload: the proposal and its closure are durable, but
+    // the provider takes none of it.
+    let client_root = temp();
+    let provider_root = temp();
+    let service = WorkService::new(provider_endpoint(provider_root.path()).await);
+    service
+        .set_upload_quota(hellas_channel::content::UploadQuota::new(0))
+        .await
+        .unwrap();
+    let (client_transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let mut endpoint = client_endpoint(client_root.path()).await;
+    let failed = propose_work(
+        client_transport,
+        &mut endpoint,
+        &proposal(1),
+        &hellas_channel::test_support::channel::program_content(),
+    )
+    .await;
+    serving.abort();
+    let _ = serving.await;
+    assert!(
+        matches!(failed, Err(ProposeError::Refused { .. })),
+        "the provider refuses the upload: {failed:?}",
+    );
+    let id = endpoint.state().jobs().next().unwrap().work_id();
+    assert_eq!(
+        endpoint.state().job_by_id(id).unwrap().phase(),
+        JobPhase::HalfSigned,
+    );
+    drop(endpoint);
+
+    // The reopened journal can rebuild the exact upload closure from its
+    // own store, so the same signed proposal is retryable.
+    let store = store_at_cursor(client_root.path(), Role::Client).await;
+    let content = store
+        .recoverable_content(id)
+        .expect("the retained closure reads")
+        .expect("the upload retained its closure");
+    assert!(matches!(
+        content,
+        hellas_channel::content::InvocationContent::Retained(_)
+    ));
+
+    service
+        .set_upload_quota(hellas_channel::content::UploadQuota::default())
+        .await
+        .unwrap();
+    let (client_transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service);
+    let mut endpoint = ClientEndpoint::new(ready(), store, client()).unwrap();
+    let resumed =
+        hellas_channel::work::resume_work_proposal(client_transport, &mut endpoint, id, &content)
+            .await;
+    serving.abort();
+    let _ = serving.await;
+    assert_eq!(
+        resumed.expect("the retained proposal is accepted"),
+        id,
+        "the provider holds the same signed job",
+    );
+    assert_eq!(
+        endpoint.state().job_by_id(id).unwrap().phase(),
+        JobPhase::Accepted,
+    );
+    assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+
+    // A proposal journaled before its closure was retained is unresolved:
+    // recovery reports it, and the next proposal still takes a new nonce.
+    let unresolved_root = temp();
+    let mut endpoint = client_endpoint(unresolved_root.path()).await;
+    let request = endpoint.propose(&proposal(2)).await.unwrap();
+    let stalled = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let stalled_id = work_id(ready().channel(), &stalled);
+    drop(endpoint);
+    let store = store_at_cursor(unresolved_root.path(), Role::Client).await;
+    assert!(
+        store.recoverable_content(stalled_id).unwrap().is_none(),
+        "missing closure bytes are unresolved, never an empty root",
+    );
+    assert_eq!(store.state().job_book().pending_proposal(), None);
+    let mut endpoint = ClientEndpoint::new(ready(), store, client()).unwrap();
+    let request = endpoint.propose(&proposal(3)).await.unwrap();
+    let next = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    assert_eq!(
+        next.proposal_nonce, 2,
+        "the stalled proposal burned nonce 1"
+    );
+}
+
+/// A journaled proposal whose body did not survive replay must not occupy
+/// the channel's one proposal slot forever.
+///
+/// Ephemeral input is never written to the journal, so metadata-only
+/// recovery cannot rebuild the request. The job stays half-signed — a late
+/// acceptance is still evidence — but the durable exchange marker is
+/// released, and the next proposal takes a strictly higher nonce rather
+/// than reusing the burned one.
+#[tokio::test]
+async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() {
+    let root = temp();
+    let ready = ready_with_descriptor(descriptor_with_policy(
+        hellas_channel::test_support::channel::fetch_policy(),
+    ));
+    let mut endpoint = ClientEndpoint::new(
+        ready.clone(),
+        hellas_channel::test_support::channel::store_at(root.path(), &ready, Role::Client, CURSOR)
+            .await,
+        client(),
+    )
+    .unwrap();
+    let request = endpoint
+        .propose(&JobProposal {
+            prepared_input: hellas_channel::test_support::channel::fetch_bundle(1),
+            deadlines: deadlines(),
+        })
+        .await
+        .unwrap();
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(ready.channel(), &authorization);
+    assert_eq!(endpoint.state().job_book().pending_proposal(), Some(id));
+    drop(endpoint);
+
+    // Metadata-only replay: the authorization survives, the body does not.
+    let store =
+        hellas_channel::test_support::channel::store_at(root.path(), &ready, Role::Client, CURSOR)
+            .await;
+    assert_eq!(
+        store.state().job_book().pending_proposal(),
+        None,
+        "the unreconstructable proposal no longer holds the slot",
+    );
+    assert_eq!(store.state().proposal_nonce_high_water(), 1);
+    assert_eq!(
+        store.state().job_by_id(id).map(JobState::phase),
+        Some(JobPhase::HalfSigned),
+        "the signed job is kept for a late acceptance",
+    );
+
+    let mut endpoint = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
+    let request = endpoint
+        .propose(&JobProposal {
+            prepared_input: hellas_channel::test_support::channel::fetch_bundle(2),
+            deadlines: deadlines(),
+        })
+        .await
+        .expect("a fresh proposal is admitted after the release");
+    let next = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    assert_eq!(next.proposal_nonce, 2, "the burned nonce is not reused");
+    assert_eq!(
+        endpoint.state().job_book().pending_proposal(),
+        Some(work_id(ready.channel(), &next)),
+    );
+}
+
 #[tokio::test]
 async fn the_service_answers_a_refusal_over_the_same_wire() {
     let provider_root = temp();
@@ -995,6 +1155,14 @@ async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     drop(endpoint);
     let mut reopened = client_endpoint(root.path()).await;
+    // The proposal was never sent, so its upload closure was never
+    // retained: recovery releases the slot instead of refusing every
+    // later proposal forever. The exact request is still retryable, and
+    // resuming it takes the slot back.
+    assert_eq!(reopened.state().job_book().pending_proposal(), None);
+    assert_eq!(reopened.state().proposal_nonce_high_water(), 1);
+    assert_eq!(reopened.resume_proposal(id).await.unwrap(), request);
+    assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
     assert!(matches!(
         reopened.propose(&proposal(2)).await,
         Err(ProposeError::Conflict)
@@ -1006,8 +1174,6 @@ async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
             .is_err()
     );
     assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
-    assert_eq!(reopened.resume_proposal(id).await.unwrap(), request);
-    assert_eq!(reopened.state().proposal_nonce_high_water(), 1);
 }
 
 #[tokio::test]

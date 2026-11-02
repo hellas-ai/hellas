@@ -3,6 +3,7 @@ use hellas_rpc::{
     pb::work::{UploadContentRequest, UploadContentResponse},
     protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
 };
+use std::collections::BTreeMap;
 
 pub(super) fn content_refusal(error: crate::content::ContentError) -> Refusal {
     let code = match error {
@@ -26,6 +27,77 @@ fn upload_response(result: Result<u64, Refusal>) -> UploadContentResponse {
                 grant: None,
             }),
         },
+    }
+}
+
+/// The signed fields shared by every probe and chunk of one proposal.
+struct ProposalUpload {
+    request: AcceptWorkRequest,
+    authorization: PaidJobAuthorizationV2,
+    id: Digest,
+    manifest: Vec<u8>,
+    program_root: Vec<u8>,
+    exporter: [u8; 32],
+}
+impl ProposalUpload {
+    async fn send_chunk<T>(
+        &self,
+        client: &WorkClientImpl<T>,
+        endpoint: &mut impl ClientChannel,
+        object: ContentRef,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<u64, ProposeError>
+    where
+        T: StreamTransport + Sync,
+        T::Error: std::error::Error + Send + Sync + 'static,
+        T::Stream: 'static,
+    {
+        let signature = endpoint
+            .client()
+            .await?
+            .signer
+            .sign(signing_hash(chunk_digest(
+                self.authorization.channel_id,
+                self.id,
+                object,
+                offset,
+                &chunk,
+                &self.exporter,
+            )));
+        let end = offset + chunk.len() as u64;
+        let probing = chunk.is_empty();
+        let uploaded = client
+            .upload_content(UploadContentRequest {
+                route: self.request.route.clone(),
+                authorization: self.request.authorization.clone(),
+                client_signature: self.request.client_signature.clone(),
+                program_manifest: self.manifest.clone(),
+                program_root: self.program_root.clone(),
+                content_id: object.id().as_bytes().to_vec(),
+                total_bytes: object.bytes(),
+                offset,
+                chunk,
+                chunk_signature: signature.as_bytes().to_vec(),
+            })
+            .await?;
+        if let Some(refusal) = uploaded.refused {
+            return match endpoint
+                .client()
+                .await?
+                .accepted(&AcceptWorkResponse {
+                    outcome: Some(Outcome::Refused(refusal)),
+                })
+                .await
+            {
+                Ok(_) => Err(ProposeError::Malformed("refusal answered as an acceptance")),
+                Err(error) => Err(error),
+            };
+        }
+        if uploaded.next_offset > object.bytes() || (!probing && uploaded.next_offset < end) {
+            return Err(ProposeError::Malformed("upload offset"));
+        }
+        Ok(uploaded.next_offset)
     }
 }
 impl ProviderEndpoint {
@@ -321,67 +393,121 @@ where
     };
     let objects = crate::job::content_closure(&policy, &manifest, &program_root, reference)?;
     let client = WorkClientImpl::new(transport);
+    let upload = ProposalUpload {
+        request,
+        authorization,
+        id,
+        manifest: manifest.canonical_bytes(),
+        program_root,
+        exporter,
+    };
+    let mut offsets = BTreeMap::new();
+    let retained_content = if upload.authorization.retention == hellas_rpc::Retention::Retain {
+        let (target, previous) = {
+            let endpoint = endpoint.client().await?;
+            let previous = endpoint.store.uploads.retained_closure(id);
+            if previous
+                .as_ref()
+                .is_some_and(|retained| retained.iter().any(|object| !objects.contains(object)))
+            {
+                return Err(ProposeError::Malformed(
+                    "retained closure differs from proposal",
+                ));
+            }
+            (endpoint.store.uploads.retention_target()?, previous)
+        };
+        if previous.is_some() {
+            for object in &objects {
+                let next = upload
+                    .send_chunk(&client, endpoint, *object, 0, Vec::new())
+                    .await?;
+                offsets.insert(object.id(), next);
+            }
+            // A prior acceptance answers every probe as complete, even after
+            // the provider's input content expires. Recover its co-signature
+            // without rewriting a ticket or demanding local asset bytes.
+            if objects
+                .iter()
+                .all(|object| offsets.get(&object.id()) == Some(&object.bytes()))
+            {
+                let response = client.accept_work(upload.request).await?;
+                return endpoint.client().await?.accepted(&response).await;
+            }
+        }
+        let root =
+            (!upload.program_root.is_empty()).then(|| ContentRef::for_bytes(&upload.program_root));
+        let mut seed = crate::content::EphemeralContent::default();
+        seed.insert(prepared_bytes.clone());
+        if root.is_some() {
+            seed.insert(upload.program_root.clone());
+        }
+        let seed = crate::content::InvocationContent::Ephemeral(seed);
+        target.retain(seed.clone(), reference).await?;
+        let mut retained = vec![reference];
+        if let Some(root) = root {
+            target.retain(seed, root).await?;
+            retained.push(root);
+        }
+        // Probe assets before reading them: model weights may exist only at
+        // the provider. Keep the returned offsets for transmission, so each
+        // object is probed once. Input/root are already retained locally and
+        // can wait until transmission for their probes.
+        for object in &objects {
+            if *object == reference || Some(*object) == root {
+                continue;
+            }
+            let next = match offsets.get(&object.id()) {
+                Some(next) => *next,
+                None => {
+                    let next = upload
+                        .send_chunk(&client, endpoint, *object, 0, Vec::new())
+                        .await?;
+                    offsets.insert(object.id(), next);
+                    next
+                }
+            };
+            if next < object.bytes() {
+                target.retain(content.clone(), *object).await?;
+                retained.push(*object);
+            }
+        }
+        // Publish a complete recovery ticket before transmitting any body
+        // chunks or asking for acceptance. A retry preserves the old ticket
+        // until its replacement is durable.
+        endpoint.client().await?.store.retain_closure(
+            id,
+            &retained,
+            upload.authorization.terminal_deadline,
+        )?;
+        Some(target.content())
+    } else {
+        None
+    };
+    let source = retained_content.as_ref().unwrap_or(content);
     for object in objects {
-        let mut offset = 0u64;
-        let mut probing = true;
-        loop {
-            let chunk = if probing {
-                Vec::new()
-            } else if object == reference {
+        let mut offset = match offsets.remove(&object.id()) {
+            Some(offset) => offset,
+            None => {
+                upload
+                    .send_chunk(&client, endpoint, object, 0, Vec::new())
+                    .await?
+            }
+        };
+        while offset < object.bytes() {
+            let chunk = if object == reference && retained_content.is_none() {
                 let end = (offset as usize + CONTENT_CHUNK_BYTES).min(prepared_bytes.len());
                 prepared_bytes
                     .get(offset as usize..end)
                     .ok_or(ProposeError::Malformed("upload offset"))?
                     .to_vec()
             } else {
-                content.read_chunk(object, offset, CONTENT_CHUNK_BYTES)?
+                source.read_chunk(object, offset, CONTENT_CHUNK_BYTES)?
             };
-            let chunk_signature = endpoint
-                .client()
-                .await?
-                .signer
-                .sign(signing_hash(chunk_digest(
-                    authorization.channel_id,
-                    id,
-                    object,
-                    offset,
-                    &chunk,
-                    &exporter,
-                )));
-            let end = offset + chunk.len() as u64;
-            let uploaded = client
-                .upload_content(UploadContentRequest {
-                    route: request.route.clone(),
-                    authorization: request.authorization.clone(),
-                    client_signature: request.client_signature.clone(),
-                    program_manifest: manifest.canonical_bytes(),
-                    program_root: program_root.clone(),
-                    content_id: object.id().as_bytes().to_vec(),
-                    total_bytes: object.bytes(),
-                    offset,
-                    chunk,
-                    chunk_signature: chunk_signature.as_bytes().to_vec(),
-                })
+            offset = upload
+                .send_chunk(&client, endpoint, object, offset, chunk)
                 .await?;
-            if let Some(refusal) = uploaded.refused {
-                return endpoint
-                    .client()
-                    .await?
-                    .accepted(&AcceptWorkResponse {
-                        outcome: Some(Outcome::Refused(refusal)),
-                    })
-                    .await;
-            }
-            if uploaded.next_offset > object.bytes() || (!probing && uploaded.next_offset < end) {
-                return Err(ProposeError::Malformed("upload offset"));
-            }
-            if uploaded.next_offset == object.bytes() {
-                break;
-            }
-            offset = uploaded.next_offset;
-            probing = false;
         }
     }
-    let response = client.accept_work(request).await?;
+    let response = client.accept_work(upload.request).await?;
     endpoint.client().await?.accepted(&response).await
 }

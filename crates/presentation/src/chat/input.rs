@@ -77,6 +77,7 @@ pub(super) fn text_chat_messages(
                         role: "tool".into(),
                         content: output.clone(),
                         name: None,
+                        tool_calls: Vec::new(),
                     })?,
                 });
             }
@@ -90,6 +91,10 @@ fn text_chat_message(message: &Message) -> anyhow::Result<ChatMessage> {
         message.name.is_none(),
         "text chat does not support named messages"
     );
+    anyhow::ensure!(
+        message.tool_calls.is_empty() || message.role == "assistant",
+        "only assistant messages may call tools"
+    );
     let mut content = String::new();
     for part in &message.content {
         match part {
@@ -100,7 +105,15 @@ fn text_chat_message(message: &Message) -> anyhow::Result<ChatMessage> {
     Ok(ChatMessage {
         role: message.role.clone(),
         content,
-        ..Default::default()
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "name": call.name, "arguments": call.arguments
+                })
+            })
+            .collect(),
     })
 }
 
@@ -210,5 +223,131 @@ mod tests {
         )
         .unwrap();
         assert!(ChatTemplate::Qwen3.render(&[malformed]).is_err());
+    }
+    use hellas_adaptors::{
+        HistoricalToolCall, RawRequest, WireAdaptor, anthropic::AnthropicMessagesAdaptor,
+    };
+    use serde_json::json;
+
+    fn anthropic(content: serde_json::Value, role: &str) -> Input {
+        let adaptor = AnthropicMessagesAdaptor;
+        let request = adaptor
+            .parse(
+                RawRequest::from_value(json!({
+                    "model":"m", "max_tokens":8, "messages":[{"role":role,"content":content}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        adaptor
+            .to_execution_request(&request)
+            .unwrap()
+            .canonical
+            .input
+    }
+
+    #[test]
+    fn anthropic_text_blocks_have_the_same_template_message_as_string_input() {
+        let a = text_chat_messages(&anthropic(json!("hello world"), "user"), None).unwrap();
+        let b = text_chat_messages(
+            &anthropic(
+                json!([
+                    {"type":"text","text":"hello"}, {"type":"text","text":" world"}
+                ]),
+                "user",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].role, b[0].role);
+        assert_eq!(a[0].content, b[0].content);
+        assert_eq!(a[0].tool_calls, b[0].tool_calls);
+        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
+            assert_eq!(template.render(&a).unwrap(), template.render(&b).unwrap());
+        }
+    }
+
+    #[test]
+    fn assistant_text_and_calls_lower_to_one_template_turn() {
+        let input = anthropic(
+            json!([
+                {"type":"text","text":"Checking."},
+                {"type":"tool_use","id":"a","name":"first","input":{"n":1}},
+                {"type":"tool_use","id":"b","name":"second","input":{"n":2}}
+            ]),
+            "assistant",
+        );
+        let Input::Items(items) = &input else {
+            panic!()
+        };
+        let InputItem::Message(message) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let messages = text_chat_messages(&input, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "Checking.");
+        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
+            let mut conversation = text_chat_messages(&input, None).unwrap();
+            conversation.insert(
+                0,
+                ChatMessage {
+                    role: "user".into(),
+                    content: "Check both.".into(),
+                    ..Default::default()
+                },
+            );
+            let prompt = template.render(&conversation).unwrap();
+            // One historical assistant turn and the generation prompt.
+            assert_eq!(prompt.matches("<|im_start|>assistant").count(), 2);
+            assert_eq!(prompt.matches("<tool_call>").count(), 2);
+        }
+        assert_eq!(
+            messages[0].tool_calls,
+            vec![
+                json!({"name":"first","arguments":{"n":1}}),
+                json!({"name":"second","arguments":{"n":2}})
+            ]
+        );
+    }
+
+    #[test]
+    fn standalone_tool_call_items_keep_their_individual_turns() {
+        let input = Input::Items(vec![
+            InputItem::ToolCall {
+                id: "a".into(),
+                name: "first".into(),
+                arguments: json!({}),
+            },
+            InputItem::ToolCall {
+                id: "b".into(),
+                name: "second".into(),
+                arguments: json!({}),
+            },
+        ]);
+        let messages = text_chat_messages(&input, None).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn canonical_calls_require_an_assistant_message() {
+        let mut message = Message::text("user", "hello");
+        message.tool_calls.push(HistoricalToolCall {
+            id: "a".into(),
+            name: "f".into(),
+            arguments: json!({}),
+        });
+        assert!(text_chat_message(&message).is_err());
     }
 }

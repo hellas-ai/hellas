@@ -222,7 +222,7 @@ async fn creating_an_allowance_cannot_hide_spending_by_the_same_subject() {
         run(&mut house.node, caller, request).await;
         house
             .node
-            .finish(request, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+            .finish(request, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
             .await;
     }
     house

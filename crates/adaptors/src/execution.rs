@@ -66,11 +66,21 @@ pub enum Input {
     Items(Vec<InputItem>),
 }
 
+/// A tool call belonging to one historical assistant message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: JsonValue,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: Vec<ContentPart>,
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<HistoricalToolCall>,
 }
 
 impl Message {
@@ -79,6 +89,7 @@ impl Message {
             role: role.into(),
             content: vec![ContentPart::Text { text: text.into() }],
             name: None,
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -268,5 +279,21 @@ mod tests {
                 text: "hi".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn historical_tool_calls_round_trip_without_changing_plain_message_encoding() {
+        let plain = Message::text("assistant", "hi");
+        let encoded = serde_json::to_value(&plain).unwrap();
+        assert!(encoded.get("tool_calls").is_none());
+        assert_eq!(serde_json::from_value::<Message>(encoded).unwrap(), plain);
+        let mut message = plain;
+        message.tool_calls.push(HistoricalToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({"q":"tea"}),
+        });
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(serde_json::from_value::<Message>(encoded).unwrap(), message);
     }
 }

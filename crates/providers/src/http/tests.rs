@@ -309,6 +309,18 @@ async fn repeated_requests_reuse_https_but_still_validate_each_request() {
 }
 
 #[tokio::test]
+async fn a_response_cut_at_the_signed_cap_is_a_caller_limit() {
+    use hellas_executor::FetchProviderErrorKind;
+    let (mut request, _, _, task) = server(200, b"ok".to_vec(), None).await;
+    request.max_response_bytes = 1;
+    let mut response = provider().run(prepared(&request)).await.unwrap();
+    assert_eq!(response.head.http.unwrap().status, 200);
+    let error = response.stream.next().await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), FetchProviderErrorKind::CallerLimit);
+    task.abort();
+}
+
+#[tokio::test]
 async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() {
     let (mut request, calls, connections, task) = server(200, b"ok".to_vec(), None).await;
     let valid_tls = request.tls.clone();
@@ -395,6 +407,56 @@ async fn redirects_are_returned_without_following_them() {
     assert_eq!(target_calls.load(Ordering::SeqCst), 0);
     origin_task.abort();
     target_task.abort();
+}
+
+#[tokio::test]
+async fn signed_heads_keep_representation_length_only_for_head_and_not_modified() {
+    fn content_length(headers: &[(String, String)]) -> Option<&str> {
+        headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .map(|(_, value)| value.as_str())
+    }
+    let (not_modified, _, _, not_modified_task) = server(304, vec![], None).await;
+    let (get, _, _, get_task) = server(200, b"representation".to_vec(), None).await;
+    for (request, expected) in [(not_modified, Some("0")), (get, None)] {
+        let head = provider()
+            .run(prepared(&request))
+            .await
+            .unwrap()
+            .head
+            .http
+            .unwrap();
+        assert_eq!(content_length(&head.headers), expected);
+    }
+    // A HEAD response reaches the signed events with its length intact.
+    let (mut head_request, _, _, head_task) = server(200, b"representation".to_vec(), None).await;
+    head_request.method = "HEAD".into();
+    let call = FetchCall::new(
+        "http",
+        "request",
+        JsonBytes::new(serde_json::to_vec(&head_request).unwrap()),
+        InputCommitment::from_digest(Digest::from_bytes([1; 32])),
+    );
+    let session = HttpFetchAdaptorFactory::new()
+        .unwrap()
+        .create(&call)
+        .unwrap();
+    let mut projector = session.projector;
+    let response = provider().run(session.provider_request).await.unwrap();
+    let projected = projector.begin(response.head).unwrap();
+    let ProjectedFetch::Event(bytes) = &projected[0] else {
+        panic!("expected a signed head event");
+    };
+    let OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { headers, .. })) =
+        hellas_rpc::fetch::decode_fetch_event_payload(bytes).unwrap()
+    else {
+        panic!("expected an HTTP head event");
+    };
+    assert_eq!(content_length(&headers), Some("14"));
+    head_task.abort();
+    not_modified_task.abort();
+    get_task.abort();
 }
 
 #[tokio::test]

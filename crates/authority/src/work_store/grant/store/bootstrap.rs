@@ -1,4 +1,5 @@
 //! Native initialization marker and exclusive ownership across journal rotation.
+use super::super::state::JOURNAL_NAMESPACE;
 use super::*;
 use hellas_auth::authority::{
     AuthorityId, AuthorityState, Credential, CredentialHolder, CredentialSecret, GrantId,
@@ -19,6 +20,9 @@ impl Drop for IdentityLock {
         let _ = self.0.unlock();
     }
 }
+
+/// Namespace of the bootstrap ownership marker.
+const IDENTITY_NAMESPACE: &str = "hellas.node.identity.v1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,12 +177,12 @@ impl NodeStore {
         )?;
         let state = State::initialized(network, authority, provider.clone())?;
         let marker = Marker {
-            namespace: "hellas.node.identity.v1".into(),
+            namespace: IDENTITY_NAMESPACE.into(),
             network,
             authority: state.authority.authority(),
         };
         let frame = Frame {
-            namespace: "hellas.node.journal.v2".into(),
+            namespace: JOURNAL_NAMESPACE.into(),
             now,
             changes: vec![Change::Initialize {
                 authority: state.authority.snapshot(),
@@ -404,7 +408,7 @@ fn read_marker(
         },
     )?;
     let marker: Marker = decode(&bytes)?;
-    if marker.namespace != "hellas.node.identity.v1" || marker.network != network {
+    if marker.namespace != IDENTITY_NAMESPACE || marker.network != network {
         return Err(NodeStoreError::Malformed);
     }
     Ok((identity_lock, marker))
@@ -421,7 +425,7 @@ fn restore_replay(
         None => {
             let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
             let mut frame: Frame = decode(&bytes)?;
-            if frame.namespace != "hellas.node.journal.v2" || frame.changes.len() != 1 {
+            if frame.namespace != JOURNAL_NAMESPACE || frame.changes.len() != 1 {
                 return Err(NodeStoreError::Malformed);
             }
             let Some(Change::Initialize {

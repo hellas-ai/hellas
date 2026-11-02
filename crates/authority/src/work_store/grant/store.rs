@@ -1,6 +1,6 @@
 //! Node authority and Work accounting share one durable writer. Every exported
 //! acceptance is backed by one fsynced frame covering its entire budget path.
-use super::state::{Change, Frame, Snapshot, State};
+use super::state::{Change, Frame, JOURNAL_NAMESPACE, Snapshot, State};
 use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
     SignedResult, ledger,
@@ -9,7 +9,7 @@ use crate::model::grant::records::GrantPolicy;
 use crate::model::grant::records::grant_producer;
 use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
 use crate::model::grant::{
-    budget::{BudgetNode, Charge, Meter, Usage, Window},
+    budget::{BudgetNode, Charge, Meter, UsageObservation, Window},
     grant_work_id,
     records::{GrantError, Offer, SignedOffer},
 };
@@ -87,6 +87,7 @@ impl NodeStore {
                         outcome,
                         result: None,
                         usage: None,
+                        fault: false,
                     },
                     false,
                 )
@@ -405,9 +406,10 @@ impl NodeStore {
         work: Digest,
         outcome: GrantOutcome,
         result: Option<SignedResult>,
-        usage: Usage,
+        observation: UsageObservation,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
+        let (usage, fault) = observation.journal_fields();
         self.commit(
             now,
             Change::Terminal {
@@ -415,10 +417,8 @@ impl NodeStore {
                 work,
                 outcome,
                 result,
-                usage: match usage {
-                    Usage::Unknown => None,
-                    Usage::Observed(c) => Some(c),
-                },
+                usage,
+                fault,
             },
             false,
         )
@@ -438,6 +438,7 @@ impl NodeStore {
                 outcome: GrantOutcome::Released,
                 result: None,
                 usage: None,
+                fault: false,
             },
             false,
         )
@@ -467,7 +468,7 @@ impl NodeStore {
     ) -> Result<(), NodeStoreError> {
         let now = self.time(now)?;
         let frame = Frame {
-            namespace: "hellas.node.journal.v2".into(),
+            namespace: JOURNAL_NAMESPACE.into(),
             now,
             changes,
         };
@@ -523,6 +524,21 @@ impl State {
                 .terminals
                 .retain(|_, t| t.outcome.authorization.delivery_deadline_ms >= now);
         }
+        // A generation reset makes the previous channel unreachable: the
+        // channel id embeds the generation and admission rejects a stale one.
+        // Retire superseded channels once they hold no job or retained
+        // terminal so repeated resets cannot exhaust MAX_CHANNELS. A
+        // current-generation channel keeps its proposal nonce high-water.
+        let current: std::collections::BTreeMap<GrantId, Option<u64>> = self
+            .channels
+            .values()
+            .map(|c| (c.funding.grant, self.generation(c.funding.grant)))
+            .collect();
+        self.channels.retain(|_, c| {
+            current.get(&c.funding.grant).copied().flatten() == Some(c.funding.generation)
+                || c.book.jobs().next().is_some()
+                || c.book.terminals().next().is_some()
+        });
         let retained: std::collections::BTreeSet<_> = self
             .channels
             .values()

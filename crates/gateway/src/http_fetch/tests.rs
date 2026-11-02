@@ -470,6 +470,41 @@ async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
     String::from_utf8(response).unwrap()
 }
 
+/// A gateway serving the HTTP Fetch presentation, with archiving enabled so
+/// trailers must pass through it too. The directory stays alive with the test.
+async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) {
+    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+        "service": "http", "method": "request", "routes": [{
+            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
+        }]
+    }))
+    .unwrap();
+    let archive = tempfile::tempdir().unwrap();
+    let fixture = crate::access::tests::Fixture::new().await;
+    let handle = crate::start(crate::GatewayOptions {
+        server: crate::ServerOptions {
+            archive: crate::ArchiveOptions {
+                directory: archive.path().into(),
+                zdr: false,
+            },
+            host: "127.0.0.1".into(),
+            port: Some(0),
+            access: fixture.access,
+            allow_remote: false,
+            wrap: None,
+            wrap_args: Vec::new(),
+        },
+        work: paid,
+        presentations: crate::Presentations {
+            http: Some(config),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    (handle, archive)
+}
+
 /// Proxied HTTPS responses name the accepted job and its provider in their
 /// head, and trail the body with the transcript that provider signed. A
 /// bodyless response, whose head waits for completion, carries it as a header.
@@ -486,36 +521,7 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
             body,
             transcript: transcript.clone(),
         });
-        let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-            "service": "http", "method": "request", "routes": [{
-                "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
-            }]
-        }))
-        .unwrap();
-        let archive = tempfile::tempdir().unwrap();
-        let fixture = crate::access::tests::Fixture::new().await;
-        let handle = crate::start(crate::GatewayOptions {
-            server: crate::ServerOptions {
-                // Archive the exchange, so trailers must pass the archive too.
-                archive: crate::ArchiveOptions {
-                    directory: archive.path().into(),
-                    zdr: false,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                access: fixture.access,
-                allow_remote: false,
-                wrap: None,
-                wrap_args: Vec::new(),
-            },
-            work: paid,
-            presentations: crate::Presentations {
-                http: Some(config),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+        let (handle, _archive) = proxy(paid).await;
         let wire = exchange(handle.address(), handle.bearer()).await;
         let (head, rest) = wire.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{head}");
@@ -534,7 +540,9 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
         match body {
             Some(body) => {
                 assert!(
-                    head.contains("\r\ntrailer: x-hellas-transcript\r\n"),
+                    head.contains(
+                        "\r\ntrailer: x-hellas-transcript, x-hellas-transcript-digest\r\n"
+                    ),
                     "{head}"
                 );
                 assert!(!head.contains("x-hellas-transcript:"), "{head}");
@@ -547,6 +555,55 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
             None => {
                 assert!(
                     head.contains(&format!("\r\nx-hellas-transcript: {encoded}\r\n")),
+                    "{head}"
+                );
+                assert!(rest.is_empty(), "{rest:?}");
+            }
+        }
+        handle.shutdown().await.unwrap();
+    }
+}
+
+/// Evidence larger than the inline bound travels as its digest, so a
+/// successful response remains consumable by clients with bounded trailers.
+#[tokio::test]
+async fn oversized_transcripts_are_named_by_digest_instead_of_inlined() {
+    use hellas_rpc::provenance::{MAX_INLINE_TRANSCRIPT_BYTES, TRANSCRIPT_DIGEST_KEY, encode_hex};
+    use sha2::Digest as _;
+    let transcript = vec![b't'; MAX_INLINE_TRANSCRIPT_BYTES];
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(&sha2::Sha256::digest(&transcript));
+    let digest = encode_hex(&digest);
+    for (status, body) in [(200, Some("streamed body")), (204, None)] {
+        let paid = Arc::new(Proxied {
+            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
+            status,
+            body,
+            transcript: transcript.clone(),
+        });
+        let (handle, _archive) = proxy(paid).await;
+        let wire = exchange(handle.address(), handle.bearer()).await;
+        let (head, rest) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{head}");
+        assert!(!head.contains("x-hellas-transcript:"), "{head}");
+        match body {
+            Some(_) => {
+                assert!(
+                    head.contains(
+                        "\r\ntrailer: x-hellas-transcript, x-hellas-transcript-digest\r\n"
+                    ),
+                    "{head}"
+                );
+                assert!(
+                    rest.ends_with(&format!(
+                        "\r\n0\r\n{TRANSCRIPT_DIGEST_KEY}: {digest}\r\n\r\n"
+                    )),
+                    "{rest:?}"
+                );
+            }
+            None => {
+                assert!(
+                    head.contains(&format!("\r\n{TRANSCRIPT_DIGEST_KEY}: {digest}\r\n")),
                     "{head}"
                 );
                 assert!(rest.is_empty(), "{rest:?}");

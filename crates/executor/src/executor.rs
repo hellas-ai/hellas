@@ -490,7 +490,10 @@ impl ExecutorHandle {
                 Some(Ok(ProjectedFetch::Terminal(terminal))) => break Ok(terminal),
                 Some(Err(error)) => {
                     tracing::warn!(position = error.position, error = %error.error, "Fetch provider failed");
-                    break Err(FailureReason::Execution);
+                    break Err(match error.error.kind() {
+                        crate::FetchProviderErrorKind::CallerLimit => FailureReason::CallerLimit,
+                        crate::FetchProviderErrorKind::Failed => FailureReason::Execution,
+                    });
                 }
                 None => break Err(FailureReason::Execution),
             }

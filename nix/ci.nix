@@ -79,6 +79,9 @@ let
       pkgs.shellcheck
     ];
     unit = mkCargo "check-unit" unitTestCommand (cargoEnv rustToolchain);
+    regressions = mkCargo "check-regressions" (builtins.readFile ./regression-tests.sh) (
+      cargoEnv rustToolchain
+    );
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
@@ -308,6 +311,7 @@ let
       else
         builtins.removeAttrs baseChecks [
           "validator"
+          "regressions"
           "chain-setup"
           # Same reason as `validator` above: validators are deployed on x86
           # only, so the feature set is not built on other hosts. Linting it
@@ -334,9 +338,12 @@ let
     "xet-no-alloc"
   ];
   lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;
-  mergeChecks = lintChecks // {
-    inherit (checks) unit;
-  };
+  mergeChecks =
+    lintChecks
+    // {
+      inherit (checks) unit;
+    }
+    // lib.optionalAttrs isValidatorHost { inherit (checks) regressions; };
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {

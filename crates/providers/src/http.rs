@@ -246,6 +246,10 @@ impl HttpFetchProvider {
             .method
             .parse()
             .map_err(|_| fault("invalid HTTP method"))?;
+        // HEAD and 304 responses describe the selected representation, so
+        // their Content-Length is end-to-end metadata rather than this
+        // connection's framing.
+        let representation_length = method == reqwest::Method::HEAD;
         let mut outbound = client.request(method, url.clone());
         for (name, value) in &request.headers {
             outbound = outbound.header(
@@ -277,6 +281,7 @@ impl HttpFetchProvider {
         // The signed head carries end-to-end headers only: hop-by-hop and
         // framing headers describe this connection, not the response, and a
         // content-length could contradict the body the events actually carry.
+        // HEAD and 304 are the exception: there it sizes the representation.
         let headers = response
             .headers()
             .iter()
@@ -292,8 +297,9 @@ impl HttpFetchProvider {
                         | "trailer"
                         | "transfer-encoding"
                         | "upgrade"
-                        | "content-length"
-                )
+                ) && (k.as_str() != "content-length"
+                    || representation_length
+                    || response.status().as_u16() == 304)
             })
             .map(|(k, v)| {
                 Ok((
@@ -319,7 +325,11 @@ impl HttpFetchProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|_| fault("HTTPS response stream failed"))?;
                 received = received.checked_add(chunk.len()).ok_or_else(|| fault("HTTPS response size overflow"))?;
-                if received > limit { Err(fault("HTTPS response exceeds signed byte limit"))?; }
+                if received > limit {
+                    Err(FetchProviderError::caller_limit(
+                        "HTTPS response exceeds signed byte limit",
+                    ))?;
+                }
                 // Flush each upstream delivery. Waiting for a full 16 KiB
                 // record otherwise holds small SSE responses until EOF.
                 for part in chunk.chunks(CHUNK_BYTES) {

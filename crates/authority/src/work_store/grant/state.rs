@@ -53,6 +53,13 @@ pub struct ResourceHealth {
     pub quarantined: bool,
 }
 
+/// Namespace of the authority's journal frames.
+///
+/// It names the frame format, so a journal written under different semantics
+/// is refused at the boundary instead of being reinterpreted. Bump it with
+/// any change to [`Frame`] or [`Change`] that is not readable as written.
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v3";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
     pub namespace: String,
@@ -102,6 +109,8 @@ pub(super) enum Change {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Option<Charge>,
+        /// Whether incomplete usage is attributable to the backend.
+        fault: bool,
     },
 }
 impl State {
@@ -302,7 +311,7 @@ impl State {
         Ok(())
     }
     pub(super) fn apply(&mut self, frame: &Frame) -> Result<Applied, NodeStoreError> {
-        if frame.namespace != "hellas.node.journal.v2"
+        if frame.namespace != JOURNAL_NAMESPACE
             || frame.now < self.now()
             || frame.changes.is_empty()
             || frame.changes.len() > 16
@@ -485,7 +494,15 @@ impl State {
                     })
                     .collect();
                 for (channel, work) in queued {
-                    self.end(channel, work, GrantOutcome::Released, None, None, now)?;
+                    self.end(
+                        channel,
+                        work,
+                        GrantOutcome::Released,
+                        None,
+                        None,
+                        false,
+                        now,
+                    )?;
                 }
             }
             Change::Budget(def) => {
@@ -543,7 +560,15 @@ impl State {
                         })
                         .collect();
                     for (channel, work) in queued {
-                        self.end(channel, work, GrantOutcome::Released, None, None, now)?;
+                        self.end(
+                            channel,
+                            work,
+                            GrantOutcome::Released,
+                            None,
+                            None,
+                            false,
+                            now,
+                        )?;
                     }
                 }
             }
@@ -700,8 +725,17 @@ impl State {
                 outcome,
                 result,
                 usage,
+                fault,
             } => {
-                self.end(*channel, *work, *outcome, result.clone(), *usage, now)?;
+                self.end(
+                    *channel,
+                    *work,
+                    *outcome,
+                    result.clone(),
+                    *usage,
+                    *fault,
+                    now,
+                )?;
             }
         }
         self.prune();
@@ -771,6 +805,7 @@ impl State {
     pub fn resource_health(&self, id: ResourceId) -> Option<ResourceHealth> {
         self.resources.get(&id).copied()
     }
+    #[allow(clippy::too_many_arguments)]
     fn end(
         &mut self,
         channel: ChannelId,
@@ -778,6 +813,7 @@ impl State {
         outcome: GrantOutcome,
         result: Option<SignedResult>,
         usage: Option<Charge>,
+        fault: bool,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
         let auth = *self
@@ -869,7 +905,7 @@ impl State {
                 .revision
                 .checked_add(1)
                 .ok_or(NodeStoreError::Malformed)?;
-            if strict_accounting && usage.is_none() {
+            if strict_accounting && usage.is_none() && fault {
                 health.consecutive_faults = health.consecutive_faults.saturating_add(1);
             } else if usage.is_some() {
                 health.consecutive_faults = 0;
@@ -902,6 +938,10 @@ fn verify(
     )
     .map_err(|_| GrantError::Signature.into())
 }
+
+/// Snapshots retain health decisions made under the frame accounting semantics.
+/// Refuse pre-v3 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v3";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -943,7 +983,7 @@ struct StoredJob {
 impl State {
     pub(super) fn snapshot(&self) -> Result<Snapshot, NodeStoreError> {
         Ok(Snapshot {
-            namespace: "hellas.node.checkpoint.v2".into(),
+            namespace: CHECKPOINT_NAMESPACE.into(),
             network: self.network,
             authority: self.authority.snapshot(),
             last_administration: self.last_administration.clone(),
@@ -994,7 +1034,7 @@ impl State {
         })
     }
     pub(super) fn restore(s: Snapshot) -> Result<Self, NodeStoreError> {
-        if s.namespace != "hellas.node.checkpoint.v2"
+        if s.namespace != CHECKPOINT_NAMESPACE
             || s.grants.len() > MAX_ALLOWANCES
             || s.generations.len() != s.grants.len()
             || s.channels.len() > MAX_CHANNELS

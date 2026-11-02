@@ -103,6 +103,29 @@ impl InvocationContent {
             Self::Ephemeral(_) => None,
         }
     }
+    /// Opens an owned reader without materializing a file-backed object.
+    pub(crate) fn reader(
+        &self,
+        reference: ContentRef,
+    ) -> Result<Box<dyn std::io::Read + Send>, ContentError> {
+        match self {
+            Self::Ephemeral(store) if store.objects.contains_key(&reference.id()) => {
+                Ok(Box::new(MemoryReader {
+                    bytes: store.read(reference)?,
+                    offset: 0,
+                }))
+            }
+            Self::Ephemeral(store) => Ok(Box::new(store.held_file(reference)?.into_file())),
+            Self::Retained(store) => Ok(Box::new(
+                store
+                    .open_verified(reference.id().digest(), reference.bytes())
+                    .map_err(|e| ContentError::Storage(e.to_string()))?
+                    .ok_or(ContentError::Missing)?
+                    .into_file(),
+            )),
+        }
+    }
+
     pub fn read(&self, reference: ContentRef) -> Result<Arc<Vec<u8>>, ContentError> {
         match self {
             Self::Ephemeral(store) => store.read(reference),
@@ -170,6 +193,18 @@ impl InvocationContent {
         }
     }
 }
+struct MemoryReader {
+    bytes: Arc<Vec<u8>>,
+    offset: usize,
+}
+impl std::io::Read for MemoryReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let n = (&self.bytes[self.offset..]).read(output)?;
+        self.offset += n;
+        Ok(n)
+    }
+}
+
 fn read_file(file: hellas_store::VerifiedFile) -> Result<Arc<Vec<u8>>, ContentError> {
     let len = file.len();
     let mut bytes = Vec::new();

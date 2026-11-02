@@ -832,6 +832,7 @@ async fn async_main() {
                         owner.clone().ok_or_else(|| {
                             anyhow::anyhow!("--paid-work-config requires --passkey, --faucet or --faucet-account")
                         })?,
+                        fetch_config_file.as_deref(),
                     )
                 })
                 .transpose()

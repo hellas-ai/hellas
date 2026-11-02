@@ -150,7 +150,7 @@ async fn settlement_uses_the_signed_price() {
     .await;
 
     // The backend's money field is untrusted; verified token usage is rated locally.
-    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 999])))
+    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 999])), false)
         .await;
 
     counters(&node, 4, 0);
@@ -198,7 +198,7 @@ async fn priced_checkpoint(path: &std::path::Path) -> serde_json::Value {
         &[ids::ALLOWANCE],
     )
     .await;
-    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])))
+    node.finish(&request, Usage::Observed(Charge([1, 0, 2, 0, 0])), false)
         .await;
     serde_json::to_value(node.store.state().snapshot().unwrap()).unwrap()
 }
@@ -286,7 +286,7 @@ async fn a_verified_money_overflow_saturates_spending() {
     let request = running_request(&mut node, 1).await;
     counters(&node, 0, u64::MAX);
 
-    node.finish(&request, Usage::Observed(Charge([1, 0, 9, 0, 0])))
+    node.finish(&request, Usage::Observed(Charge([1, 0, 9, 0, 0])), false)
         .await;
 
     counters(&node, u64::MAX, 0);

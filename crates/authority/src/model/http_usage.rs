@@ -95,17 +95,12 @@ impl Usage {
             self.pending.extend_from_slice(part);
             self.sse |= self.pending.starts_with(b"event:")
                 || self.pending.starts_with(b"data:")
+                || self.pending.starts_with(b"id:")
+                || self.pending.starts_with(b"retry:")
                 || self.pending.starts_with(b":");
-            while self.sse {
-                let Some(end) = self.pending.iter().position(|b| *b == b'\n') else {
-                    break;
-                };
-                let line: Vec<_> = self.pending.drain(..=end).collect();
-                let line = line.strip_suffix(b"\n").unwrap_or(&line);
-                self.line(line.strip_suffix(b"\r").unwrap_or(line));
-                if self.fault.is_some() {
-                    return;
-                }
+            self.lines(false);
+            if self.fault.is_some() {
+                return;
             }
             // JSON responses can use the full decode allowance; only an SSE
             // line/frame has the stricter 512 KiB bound.
@@ -117,23 +112,67 @@ impl Usage {
             }
         }
     }
+    /// Drain complete SSE lines. CRLF, LF and bare CR all terminate a line; a
+    /// trailing CR waits for the next byte so a split CRLF is not misread as
+    /// two terminators. At EOF the remaining bytes are the final line.
+    fn lines(&mut self, eof: bool) {
+        while self.sse {
+            let Some(end) = self.pending.iter().position(|b| matches!(b, b'\n' | b'\r')) else {
+                break;
+            };
+            if !eof && self.pending[end] == b'\r' && end + 1 == self.pending.len() {
+                break;
+            }
+            // CRLF is one terminator even when its bytes arrive in separate
+            // chunks. Consuming only the CR would leave the LF to be read as
+            // the empty line that dispatches a half-built frame.
+            let crlf = self.pending[end] == b'\r' && self.pending.get(end + 1) == Some(&b'\n');
+            let mut line: Vec<_> = self.pending.drain(..end + 1 + usize::from(crlf)).collect();
+            line.truncate(end);
+            self.line(&line);
+            if self.fault.is_some() {
+                return;
+            }
+        }
+        if eof && !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.line(&line);
+        }
+    }
     fn line(&mut self, line: &[u8]) {
         if line.is_empty() {
             if !self.frame.is_empty() {
                 let data = std::mem::take(&mut self.frame);
                 self.parse(&data);
             }
-        } else if let Some(data) = line.strip_prefix(b"data:") {
-            if !self.frame.is_empty() {
-                self.frame.push(b'\n');
+            return;
+        }
+        if line[0] == b':' {
+            return;
+        }
+        let (field, value) = match line.iter().position(|b| *b == b':') {
+            Some(colon) => {
+                let value = &line[colon + 1..];
+                (&line[..colon], value.strip_prefix(b" ").unwrap_or(value))
             }
-            self.frame
-                .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
-        } else if !line.starts_with(b"event:")
-            && !line.starts_with(b":")
-            && matches!(self.mode, Mode::Strict(_))
-        {
-            self.fail(UsageFault::Malformed);
+            None => (line, &b""[..]),
+        };
+        match field {
+            b"data" => {
+                if !self.frame.is_empty() {
+                    self.frame.push(b'\n');
+                }
+                self.frame.extend_from_slice(value);
+            }
+            // `event`, `id` and `retry` are transport metadata. `retry` values
+            // are ignored rather than validated so a malformed hint cannot
+            // change billing or fault the route.
+            b"event" | b"id" | b"retry" => {}
+            _ => {
+                if matches!(self.mode, Mode::Strict(_)) {
+                    self.fail(UsageFault::Malformed);
+                }
+            }
         }
     }
     pub fn finish(&mut self) {
@@ -141,15 +180,13 @@ impl Usage {
             return;
         }
         if self.fault.is_none() {
-            let pending = std::mem::take(&mut self.pending);
             if self.sse {
                 // Accept the final data frame without a trailing empty line,
                 // but never infer a missing profile sentinel from EOF.
-                if !pending.is_empty() {
-                    self.line(pending.strip_suffix(b"\r").unwrap_or(&pending));
-                }
+                self.lines(true);
                 self.line(b"");
             } else {
+                let pending = std::mem::take(&mut self.pending);
                 self.parse(&pending);
             }
         }
@@ -319,6 +356,7 @@ pub enum UsageDecoder {
     Gzip(flate2::write::GzDecoder<Usage>),
     Deflate(flate2::write::ZlibDecoder<Usage>),
     Brotli(Box<brotli::DecompressorWriter<Usage>>),
+    Zstd(zstd::stream::write::Decoder<'static, Usage>),
 }
 impl Default for UsageDecoder {
     fn default() -> Self {
@@ -333,6 +371,7 @@ impl std::ops::Deref for UsageDecoder {
             Self::Gzip(d) => d.get_ref(),
             Self::Deflate(d) => d.get_ref(),
             Self::Brotli(d) => d.get_ref(),
+            Self::Zstd(d) => d.get_ref(),
         }
     }
 }
@@ -357,6 +396,26 @@ impl UsageDecoder {
             "gzip" => Self::Gzip(flate2::write::GzDecoder::new(usage)),
             "deflate" => Self::Deflate(flate2::write::ZlibDecoder::new(usage)),
             "br" => Self::Brotli(Box::new(brotli::DecompressorWriter::new(usage, 4096))),
+            "zstd" => {
+                // A frame window may not exceed the decoded-byte allowance, so
+                // a hostile frame cannot allocate beyond what it may emit.
+                let decoder = zstd::stream::raw::Decoder::new().and_then(|mut decoder| {
+                    decoder
+                        .set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                            MAX_DECODED_BYTES.trailing_zeros(),
+                        ))
+                        .map(|()| decoder)
+                });
+                match decoder {
+                    Ok(decoder) => {
+                        Self::Zstd(zstd::stream::write::Decoder::with_decoder(usage, decoder))
+                    }
+                    Err(_) => {
+                        usage.fail(UsageFault::Compression);
+                        Self::Identity(usage)
+                    }
+                }
+            }
             _ => {
                 usage.fail(UsageFault::Encoding);
                 Self::Identity(usage)
@@ -369,6 +428,7 @@ impl UsageDecoder {
             Self::Gzip(d) => d.get_mut().observe(observer),
             Self::Deflate(d) => d.get_mut().observe(observer),
             Self::Brotli(d) => d.get_mut().observe(observer),
+            Self::Zstd(d) => d.get_mut().observe(observer),
         }
     }
     pub fn content(&mut self, value: Option<&str>, encoding: Option<&str>) {
@@ -394,6 +454,7 @@ impl UsageDecoder {
             Self::Gzip(d) => d.write_all(bytes),
             Self::Deflate(d) => d.write_all(bytes),
             Self::Brotli(d) => d.write_all(bytes),
+            Self::Zstd(d) => d.write_all(bytes),
         };
         if result.is_err() {
             self.invalidate(UsageFault::Compression);
@@ -430,6 +491,13 @@ impl UsageDecoder {
                 u.fail(UsageFault::Compression);
                 u
             }),
+            Self::Zstd(mut d) => {
+                if d.do_finish().is_err() {
+                    failed(d.get_ref().fault.unwrap_or(UsageFault::Compression))
+                } else {
+                    d.into_inner()
+                }
+            }
         };
         usage.finish();
         *self = Self::Identity(usage);

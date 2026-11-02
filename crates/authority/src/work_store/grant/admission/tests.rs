@@ -9,7 +9,7 @@ use hellas_auth::authority::{AdministrationCommand, GrantCommand};
 use {
     crate::work_store::grant::GrantOutcome, crate::work_store::grant::NodeStore,
     crate::work_store::grant::state::Change, crate::work_store::grant::state::Frame,
-    hellas_channel::work_store::Applied,
+    crate::work_store::grant::state::JOURNAL_NAMESPACE, hellas_channel::work_store::Applied,
 };
 
 const ROOT: GrantId = GrantId([0; 16]);
@@ -181,6 +181,7 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
         (a.channel_id, work),
         GrantOutcome::Failed,
         Usage::Unknown,
+        true,
         1002,
     )
     .await
@@ -273,7 +274,7 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
     ] {
         assert_err!(
             before.clone().apply(&Frame {
-                namespace: "hellas.node.journal.v2".into(),
+                namespace: JOURNAL_NAMESPACE.into(),
                 now: UnixMillis(1000),
                 changes: vec![change]
             }),
@@ -354,7 +355,7 @@ impl Accepted {
     }
     fn frame(&self, execution: ExecutionRecord) -> Frame {
         Frame {
-            namespace: "hellas.node.journal.v2".into(),
+            namespace: JOURNAL_NAMESPACE.into(),
             now: self.node.clock.now(),
             changes: vec![Change::Accepted {
                 authorization: self.request.authorization,

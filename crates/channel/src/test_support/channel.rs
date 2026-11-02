@@ -1076,3 +1076,32 @@ pub fn program_content() -> crate::content::InvocationContent {
     content.insert(environment().canonical_bytes().unwrap());
     crate::content::InvocationContent::Ephemeral(content)
 }
+
+/// Retains one upload object exactly as a client's proposal upload does.
+///
+/// Fixtures that commit a proposal directly need this to leave the journal
+/// in the state a real send would: the closure is durable, so a restart can
+/// resume the proposal instead of reporting it unresolved.
+pub fn retain_proposal_content(store: &mut crate::work_store::ChannelStore, bytes: &[u8]) {
+    let work = store
+        .state()
+        .job_book()
+        .pending_proposal()
+        .expect("the fixture has a pending proposal");
+    let job = store
+        .state()
+        .job_by_id(work)
+        .expect("the pending proposal is an open job");
+    let deadline = job.authorization().terminal_deadline;
+    let reference = hellas_rpc::ContentRef::for_bytes(job.prepared_input());
+    if let Err(error) = store.retain_upload(bytes) {
+        panic!("the fixture upload retains its content: {error}");
+    }
+    if let Err(error) = store.retain_closure(
+        work,
+        &[reference, hellas_rpc::ContentRef::for_bytes(bytes)],
+        deadline,
+    ) {
+        panic!("the fixture upload records its closure: {error}");
+    }
+}

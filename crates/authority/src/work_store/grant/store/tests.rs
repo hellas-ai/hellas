@@ -58,3 +58,25 @@ async fn a_poisoned_writer_refuses_new_acceptance_until_reopen() {
         .await
         .unwrap();
 }
+
+/// A rotated journal has no initialization frame to enforce the frame version.
+/// Its snapshot must reject state produced under the old attribution rules too.
+#[tokio::test]
+async fn old_checkpoint_cannot_bypass_the_journal_format_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, _) = setup(directory.path()).await;
+    let mut snapshot = serde_json::to_value(store.state.snapshot().unwrap()).unwrap();
+    snapshot["namespace"] = serde_json::json!("hellas.node.checkpoint.v2");
+    let snapshot: Snapshot = serde_json::from_value(snapshot).unwrap();
+    store
+        .journal
+        .rotate(&encode(&snapshot).unwrap())
+        .await
+        .unwrap();
+    drop(store);
+    assert!(matches!(
+        NodeStore::open_initialized(directory.path(), hellas_channel::test_support::network())
+            .await,
+        Err(NodeStoreError::Malformed)
+    ));
+}

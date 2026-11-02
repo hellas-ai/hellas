@@ -79,7 +79,7 @@ fn publish(path: &Path, bytes: &[u8]) -> CliResult<()> {
 }
 
 impl PaidWorkFile {
-    fn policy(self) -> CliResult<PaidPolicy> {
+    fn policy(self, fetch_contract: Option<hellas_rpc::FetchContract>) -> CliResult<PaidPolicy> {
         let capacity = self
             .payment
             .fixed_price
@@ -97,7 +97,7 @@ impl PaidWorkFile {
         if let Some(fetch) = self.fetch {
             admissions.push(Admission::Fetch {
                 admission: FetchAdmission {
-                    contract: hellas_rpc::FetchContract::http()?,
+                    contract: fetch_contract.context("paid Fetch terms have no route contract")?,
                     route: fetch.route,
                     limits: fetch.limits,
                 },
@@ -122,7 +122,16 @@ impl PaidWorkFile {
 
 impl PaidWork {
     /// Read and check the whole file before anything binds.
-    pub fn load(path: &Path, root: PathBuf, owner: SoftPasskey) -> CliResult<Self> {
+    ///
+    /// `fetch_config` is the same `--fetch-config` this node will serve: the
+    /// paid Fetch admission's contract is the route's actual sealed contract,
+    /// not an assumed one.
+    pub fn load(
+        path: &Path,
+        root: PathBuf,
+        owner: SoftPasskey,
+        fetch_config: Option<&Path>,
+    ) -> CliResult<Self> {
         let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let file: PaidWorkFile =
@@ -132,8 +141,13 @@ impl PaidWork {
             Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
             None => hellas_sdk::client_chain::devnet(&root)?,
         };
+        let fetch_contract = file
+            .fetch
+            .as_ref()
+            .map(|fetch| paid_fetch_contract(fetch_config, &fetch.route))
+            .transpose()?;
         let policy = file
-            .policy()
+            .policy(fetch_contract)
             .with_context(|| format!("invalid paid terms in {}", path.display()))?;
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
@@ -183,6 +197,7 @@ impl PaidWork {
                     .into_entry(hellas_executor::FetchRoutePolicy::default())?,
             )?;
         }
+        self.validate_fetch_admission(&provider.executor.fetch_routes)?;
         let host =
             super::configuration::start_host(provider, Some(grants), path, transport).await?;
         let ready = async {
@@ -199,6 +214,42 @@ impl PaidWork {
             return Err(error);
         }
         Ok(host)
+    }
+
+    /// Every paid Fetch admission names the trusted manifest the executor
+    /// compares against the route it dispatches to. Check that the routes this
+    /// node actually serves implement the derived contract before binding.
+    fn validate_fetch_admission(&self, routes: &FetchRouteRegistry) -> CliResult<()> {
+        use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
+        for admission in &self.policy.invocation_policy.admissions {
+            let Admission::Fetch { admission } = admission else {
+                continue;
+            };
+            let expected = admission.contract.manifest_id();
+            match &admission.route {
+                FetchRoutePolicy::SealedRoute { service, method } => {
+                    let entry = routes
+                        .entry(&FetchRoute::new(service, method))
+                        .with_context(|| {
+                            format!(
+                                "paid Fetch admits route {service}/{method}, but this node does not serve it"
+                            )
+                        })?;
+                    ensure!(
+                        entry.execution_environment() == expected,
+                        "paid Fetch admission names contract {expected}, but route {service}/{method} implements {}",
+                        entry.execution_environment()
+                    );
+                }
+                FetchRoutePolicy::OpenFetch { .. } => {
+                    ensure!(
+                        routes.has_environment(expected),
+                        "paid Fetch admission names the HTTP contract {expected}, but this node serves no route that implements it"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A lowered stake cap needs an already delegated coin that fits it.
