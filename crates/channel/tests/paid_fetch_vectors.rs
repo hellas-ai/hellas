@@ -341,14 +341,14 @@ fn golden_fetch_invocation_digests_are_pinned() {
         ("result", result_digest(&channel(), &r).to_string()),
     ];
     let expected = [
-        "8efceb77b1bed4f24ee83a81f1928280ab60df68f9f678ad5e2313e7a919332c",
-        "3e77bb082e940350604f12cfbefad39075da18fbc4ed6fd619fdba35801e337a",
+        "ee04b6bee03ee2e0a874b44f0061da24f31cab970afc2a0aeee2ec889d3e5e7d",
+        "3e6ce25bf54e270b3b4a27710fdd524fe170a1afd6378577bfb14a4d3531fe86",
         "49de467ef4334be374b748326d015ed07fb439b7b8f16df04f8b9a3a41100198",
-        "c2d5c2e82fadb86b81e85bd3b54fd4e713abbd90d9fe77f73894d20e3164ba4a",
+        "060368615e68c89ca8fd87b604ec09eee7c5bc79de7a5da90082b153a027f71c",
         "bccf5d4dd97b81660d9c0296f4039922ae875fa067a21b0e6940b5fccc679297",
         "413bc901a9367bc949f5d53dfbe151e10aa0d9b7da9d748436496b576bc4c368",
         "6e223dd82ad6548d1fa38373aaec2b6dc9baf3e856b1910f17e8c776ddcec1f0",
-        "d90b861fba773436e1808b3405f8f751f242d11c0c3919b0949e30c279204a69",
+        "96fd9d2c35f6117d49e7af395150c689506841e93229c6c811b99b0c5a1d1a29",
     ];
     assert_eq!(
         values.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),

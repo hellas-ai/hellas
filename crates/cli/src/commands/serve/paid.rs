@@ -6,7 +6,7 @@ use hellas_auth::{Digest, authority::*};
 use hellas_chain::{LightClient as _, domain::Transaction};
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
 use hellas_rpc::protocol::invocation::{
-    Admission, InvocationPolicy, Limits,
+    Admission, ComputePrograms, InvocationPolicy, Limits,
     fetch::{FetchAdmission, FetchLimits},
 };
 use hellas_sdk::node_control::profile;
@@ -35,8 +35,8 @@ struct PaidWorkFile {
     channel: PaidChannelPolicyV1,
     offers: OfferPolicy,
     limits: Limits,
-    /// Admit Catena compute jobs.
-    compute: bool,
+    /// Explicitly admit any Compute program or only selected manifests.
+    compute: Option<ComputePrograms>,
     /// Admit caller-signed HTTPS Fetch under these bounds.
     fetch: Option<FetchFile>,
 }
@@ -89,9 +89,10 @@ impl PaidWorkFile {
             .checked_add(self.offers.omission_bond)
             .context("paid funding overflow")?;
         let mut admissions = Vec::new();
-        if self.compute {
+        if let Some(programs) = self.compute {
             admissions.push(Admission::Compute {
                 evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+                programs,
             });
         }
         if let Some(fetch) = self.fetch {

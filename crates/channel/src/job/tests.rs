@@ -344,6 +344,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
         let mut other = policy.clone();
         other.admissions = vec![Admission::Compute {
             evaluator: "other/evaluator".into(),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }];
         policies.push(other);
         for changed in policies {

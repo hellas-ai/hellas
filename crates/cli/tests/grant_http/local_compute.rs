@@ -53,6 +53,7 @@ impl LocalCompute {
             invocation_policy: InvocationPolicy {
                 admissions: vec![Admission::Compute {
                     evaluator: compute::EVALUATOR.into(),
+                    programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
                 }],
                 limits,
             },

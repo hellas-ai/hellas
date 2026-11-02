@@ -1622,6 +1622,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     policy.invocation_policy = InvocationPolicy {
         admissions: vec![Admission::Compute {
             evaluator: invocation::compute::EVALUATOR.into(),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }],
         limits: Limits {
             max_upload_bytes: 1 << 20,
