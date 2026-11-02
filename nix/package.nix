@@ -118,7 +118,22 @@ let
   }
   // crossEnv;
 
-  mkHellasPackage = overrides: rustPlatform.buildRustPackage (commonArgs // overrides);
+  mkHellasPackage =
+    overrides:
+    rustPlatform.buildRustPackage (
+      commonArgs
+      # Debug packages are Hydra's unit, lint and component validation jobs.
+      # Their Cargo commands bypass buildRustPackage's normal -j setting. Bound
+      # concurrency and avoid filling RAM-backed build directories with debug
+      # and incremental artifacts; keep the same test semantics as GitHub CI.
+      // lib.optionalAttrs ((overrides.cargoBuildType or "release") == "debug") {
+        CARGO_BUILD_JOBS = "4";
+        CARGO_INCREMENTAL = "0";
+        CARGO_PROFILE_DEV_DEBUG = "0";
+        CARGO_PROFILE_TEST_DEBUG = "0";
+      }
+      // overrides
+    );
 in
 {
   inherit
