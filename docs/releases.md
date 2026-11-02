@@ -23,9 +23,15 @@ The unit commands are shared with Hydra in `nix/unit-tests.sh`.
 
 ## Independent component releases
 
-Each component has its own Hydra jobset, selected revision and channel. A
-release or hotfix of one component does not advance the others. They share a
-source repository; they do not need to use the same source commit.
+CLI and GPU jobsets track `master`; the consensus jobset tracks `devnet`.
+Hydra polls these sources and resolves each evaluation to a full commit SHA.
+All checks, artifacts and release metadata in that evaluation use that exact
+revision, even if the branch advances during the build. Separate source branches
+for CLI and GPU are unnecessary.
+
+Each component retains its own validation, artifacts and release channel.
+Publishing or deploying one component does not advance the others: promotion
+selects a successful evaluation, rather than changing the source branch.
 
 | Jobset in Hydra project `hellas` | Flake output | Artifacts and additional validation |
 | --- | --- | --- |
@@ -48,23 +54,33 @@ tests does not establish that a model executed correctly on hardware.
 
 ## Build and promote a release
 
-1. Choose a reviewed, public full commit SHA for the component. In infra,
-   set only that component in `services/ci/hellas-release-candidates.json`.
-   A `null` candidate disables that jobset. Apply the reviewed CI configuration
-   and explicitly evaluate the selected jobset in Hydra. Jobsets do not poll
-   a moving branch.
-2. Wait for its `channel` job to succeed. Each platform's `release` job
+1. Merge reviewed CLI/GPU changes to `master`, or consensus changes to `devnet`.
+   The corresponding Hydra jobsets evaluate automatically. Their source mapping
+   lives in infra's `services/ci/hellas-release-jobsets.nix`; no candidate JSON
+   or per-component source branch is required.
+2. Select a successful component evaluation at the full commit SHA intended for
+   release. Its `channel` job must have succeeded: each platform's `release` job
    depends on all its checks and artifacts and rejects Hydra's failed-test
-   marker. Release JSON records the source SHA and artifact store paths;
-   archive outputs include SHA256 checksums.
-3. Record the successful evaluation/build ID, full SHA, artifact checksums and
-   any hardware smoke results. Keep the promoted build in Hydra so garbage
-   collection cannot remove it. Promotion selects this specific evaluation;
-   a channel's latest-successful pointer is not a deployment approval.
-4. Distribute the selected artifacts. If publishing a container, copy its
-   Docker archive to a commit-specific registry tag and record the resulting
-   digest. Deploy by digest. This configuration builds downloadable image
-   archives; it does not publish registry tags automatically.
+   marker. Release JSON records the source SHA and artifact store paths; archive
+   outputs include SHA256 checksums. A standalone CI artifact is useful for
+   testing but does not replace the complete component release gate.
+3. Record the evaluation/build ID, full SHA, artifact checksums and any required
+   GPU hardware results. Keep that build in Hydra so garbage collection cannot
+   remove its artifacts. Never resolve a moving branch or latest-successful
+   channel again during publication.
+4. Publish the existing verified artifacts without rebuilding. An immutable
+   release tag names that exact source commit; attach the matching archives and
+   checksums. Copy a selected container archive to a commit-specific registry tag
+   and record its image digest. Refuse a tag or asset that already names different
+   content. Components may publish different successful commits independently.
+5. Update deployment pins to the published commit or image digest through infra.
+   Building, publishing and deploying are separate actions; a new successful
+   build does not change a running deployment.
+
+The repository currently builds Hydra artifacts and CI artifacts; automated
+GitHub Release/registry publication is a separate implementation task. Any
+publisher must consume a selected successful evaluation under the contract
+above, not start another build from `master`.
 
 Hydra's Channels tab exposes a Nix channel for each jobset. Its expression
 pins that successful source revision and exposes the component's artifacts.
@@ -75,9 +91,9 @@ build cannot silently change a running environment.
 
 `master` is the integration branch. Chain branches, currently `devnet`, track
 consensus rollout. Merge reviewed master changes into the chain branch and
-select its exact consensus candidate; merging alone does not deploy anything.
-CLI and GPU releases can be cut independently from reviewed revisions or
-hotfix branches.
+select its successful consensus evaluation; merging alone does not deploy
+anything. CLI and GPU promotion independently selects successful `master`
+evaluations. Hotfixes follow the same reviewed-source and validation process.
 
 Infra's `hellas-cli` and `hellas-consensus` inputs select their releases
 independently. Update only the relevant public pin, for example:
