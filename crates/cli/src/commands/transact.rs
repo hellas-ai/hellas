@@ -19,6 +19,7 @@ use std::{
 };
 
 mod client;
+mod grant;
 mod run;
 mod transcribe;
 pub use run::{RunArgs, run as run_program};
@@ -122,6 +123,8 @@ pub struct TransactArgs {
     /// Write the signed transcript and decoded outputs to this directory.
     #[arg(short = 'o', long = "output", requires = "job", value_name = "DIR")]
     output: Option<PathBuf>,
+    #[command(flatten)]
+    grant: grant::GrantArgs,
 }
 
 #[derive(Debug, Args)]
@@ -452,6 +455,9 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     let job = args.job.as_deref().map(Job::load).transpose()?;
     bounded(args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
+        if args.grant.offer.is_some() {
+            return grant::run(&args.grant, &args.client, &context, &job, args.output.as_deref()).await;
+        }
         let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
         if let Some(directory) = args.output { save_outputs(&directory, &job, &result)?; }
         else if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1) {
@@ -649,6 +655,14 @@ impl FetchArgs {
 }
 
 fn http_body(job: &Job, result: &PaidWorkResult) -> super::CliResult<Vec<u8>> {
+    decode_http_body(job, &result.output, &result.provider_key)
+}
+
+fn decode_http_body(
+    job: &Job,
+    output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
+    provider_key: &hellas_auth::PublicKey,
+) -> super::CliResult<Vec<u8>> {
     let JobInput::Fetch {
         contract, request, ..
     } = job.input()
@@ -660,10 +674,7 @@ fn http_body(job: &Job, result: &PaidWorkResult) -> super::CliResult<Vec<u8>> {
         "not an HTTPS Fetch contract"
     );
     let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)?;
-    let output = hellas_rpc::protocol::invocation::fetch::decode_output(
-        &result.output,
-        &result.provider_key,
-    )?;
+    let output = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider_key)?;
     Ok(hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &output)?.body)
 }
 
@@ -676,11 +687,23 @@ fn save_outputs(directory: &Path, job: &Job, result: &PaidWorkResult) -> super::
             &serde_json::json!({"job": job.digest().to_string(), "work": result.work_id.to_string(), "channel": result.channel_id.to_string(), "paid": result.job_price, "settled": result.settled_provider_payout.is_some()}),
         )?,
     )?;
+    save_invocation_outputs(directory, job, &result.output, &result.provider_key)
+}
+
+fn save_invocation_outputs(
+    directory: &Path,
+    job: &Job,
+    output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
+    provider_key: &hellas_auth::PublicKey,
+) -> super::CliResult<()> {
     if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1)
     {
-        write(&directory.join("output-0000"), &http_body(job, result)?)?;
+        write(
+            &directory.join("output-0000"),
+            &decode_http_body(job, output, provider_key)?,
+        )?;
     } else {
-        for (index, artifact) in result.output.artifacts.iter().enumerate() {
+        for (index, artifact) in output.artifacts.iter().enumerate() {
             write(
                 &directory.join(format!("output-{index:04}")),
                 artifact.bytes.as_bytes(),
@@ -688,7 +711,7 @@ fn save_outputs(directory: &Path, job: &Job, result: &PaidWorkResult) -> super::
         }
         write(
             &directory.join("output.json"),
-            &serde_json::to_vec_pretty(&result.output)?,
+            &serde_json::to_vec_pretty(output)?,
         )?;
     }
     Ok(())

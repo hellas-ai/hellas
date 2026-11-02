@@ -1,4 +1,28 @@
-# Paid jobs
+# Jobs
+
+To execute an existing job using an allowance, import its access bundle for
+the current principal and device, then select the exact resource:
+
+```sh
+hellas --passkey owner.key offer import-bundle access.bundle --name shared
+hellas --passkey owner.key transact --job ./job \
+  --provider ENROLLMENT_ID@NODE_ID --offer shared.model \
+  --work-profile /path/printed/by/import/profile.json --resource RESOURCE_ID \
+  --attempt ./attempt.json --output ./result
+```
+
+Authenticate the provider enrollment and node ID independently before using
+them. The grant route checks that pin, the device-bound credential and the
+resource's invocation policy. It starts no chain client and spends no coins;
+the job folder's price is used only by paid execution. Reusing the attempt
+returns its retained result without executing again. An unresolved attempt
+reports its recorded status instead of submitting new work. A new attempt
+path is an explicit request to execute again and consume the allowance.
+Grant channel journals share the imported offers' data directory with the
+gateway (`HELLAS_GRANT_DATA_DIR`); `--state-dir` is for paid execution.
+Grant Compute uses ephemeral provider retention, which disables the persistent
+compiler cache. Each new grant job compiles its program again. A signed failed
+result makes the command fail on both first delivery and saved-result replay.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`

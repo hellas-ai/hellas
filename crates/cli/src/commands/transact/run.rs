@@ -159,6 +159,7 @@ pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()>
             client: args.client,
             job: Some(directory),
             output: args.output,
+            grant: Default::default(),
         },
         context,
     )
