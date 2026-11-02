@@ -30,10 +30,7 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      releaseSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
+      releaseSystems = systems;
       forAllSystems = nixpkgs.lib.genAttrs systems;
       forReleaseSystems = nixpkgs.lib.genAttrs releaseSystems;
       perSystem = forAllSystems (

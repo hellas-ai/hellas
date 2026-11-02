@@ -14,6 +14,7 @@
 }:
 let
   x86 = system == "x86_64-linux";
+  darwin = pkgs.stdenv.hostPlatform.isDarwin;
   revision = self.rev or self.dirtyRev or "unknown";
   archive =
     name: package:
@@ -24,6 +25,33 @@ let
       sha256sum *.tar.gz > SHA256SUMS
       echo "file binary-dist $out/hellas-${name}-${revision}.tar.gz" > nix-support/hydra-build-products
     '';
+  # Keep the normal Nix package intact. Only the downloadable Darwin binary
+  # uses macOS's libiconv; reject new non-system dependencies instead of shipping
+  # an archive that happens to work on the builder's Nix installation.
+  portableDarwin =
+    pkgs.runCommand "hellas-cli-portable-${system}"
+      {
+        nativeBuildInputs = [ pkgs.darwin.cctools ];
+      }
+      ''
+        mkdir -p "$out/bin"
+        cp ${nativePackages.cli}/bin/hellas "$out/bin/hellas"
+        chmod u+w "$out/bin/hellas"
+        otool -L "$out/bin/hellas" | awk 'NR > 1 { print $1 }' > dependencies
+        while IFS= read -r dependency; do
+          case "$dependency" in
+            /nix/store/*/lib/libiconv.2.dylib)
+              install_name_tool -change "$dependency" /usr/lib/libiconv.2.dylib "$out/bin/hellas"
+              ;;
+            /usr/lib/*|/System/Library/*) ;;
+            *) echo "Unsupported portable Darwin dependency: $dependency" >&2; exit 1 ;;
+          esac
+        done < dependencies
+        source ${pkgs.darwin.signingUtils}
+        sign "$out/bin/hellas"
+        "$out/bin/hellas" --version
+        "$out/bin/hellas" --help > /dev/null
+      '';
   image =
     backend:
     let
@@ -43,7 +71,6 @@ let
         "cli"
         "cloud"
         "client-work"
-        "model-programs"
         "http-fetch"
         "rpc-work"
         "sdk-paid-work"
@@ -51,9 +78,10 @@ let
         "wasm-rpc"
         "wasm-chain"
         "wasm-xet"
-      ];
+      ]
+      ++ lib.optional (!darwin) "model-programs";
       artifacts = {
-        native = archive "cli-${system}" nativePackages.cli;
+        native = archive "cli-${system}" (if darwin then portableDarwin else nativePackages.cli);
       }
       // lib.optionalAttrs x86 {
         static-x86_64 = archive "cli-x86_64-linux-musl" crossPackages.cross-x86_64-linux-musl-cli;

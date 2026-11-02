@@ -1,7 +1,11 @@
 # Checks and releases
 
 Pull requests into `master` or `devnet` run lints and unit tests on GitHub-hosted
-Ubuntu runners. The same checks run after a merge to `master`. Rust outputs
+Ubuntu runners. A native macOS ARM64 job also builds the portable CLI release
+artifact, verifies its checksum and signature, checks its architecture and dynamic
+libraries, and runs the unpacked executable with a clean environment. It uploads
+the archive and checksum as the `hellas-cli-aarch64-darwin` workflow artifact.
+The same checks run after a merge to `master`. Rust outputs
 are cached separately per job and dependency lock. Nix dependencies use the
 public binary caches. Hydra handles component releases and the explicit
 Windows jobset; it does not evaluate pull requests.
@@ -29,14 +33,24 @@ source repository; they do not need to use the same source commit.
 
 | Jobset in Hydra project `hellas` | Flake output | Artifacts and additional validation |
 | --- | --- | --- |
-| `hellas-cli` | `releaseJobs.cli` | Native Linux packages, portable x86/ARM binaries, network image and RPC WASM library; CLI, SDK, paid-work, feature and discovery tests |
+| `hellas-cli` | `releaseJobs.cli` | Native Linux/macOS packages, portable Linux x86/ARM and macOS ARM64 binaries, network image and RPC WASM library; CLI, SDK, paid-work, feature and discovery tests |
 | `hellas-gpu` | `releaseJobs.gpu` | CUDA and HIP images; executor, client-work and provider tests |
 | `hellas-consensus` | `releaseJobs.consensus` | Validator package; chain, settlement, validator VM and kernel model checks |
 
-All three also require lints and unit tests. CLI covers x86 and ARM Linux;
-GPU and consensus cover x86 Linux. The exact test selection lives in
-`nix/releases.nix`. Native archives require their Nix runtime closure; the
-musl archives are the portable binaries.
+All three also require lints and unit tests. CLI covers x86 and ARM Linux and
+ARM64 macOS; GPU and consensus cover x86 Linux. CUDA/HIP model compilation
+runs on Linux, while the remaining CLI checks run on each release platform.
+The exact test selection lives in `nix/releases.nix`. Native Linux archives require
+their Nix runtime closure. The musl and Darwin archives run without Nix. Darwin packaging uses the macOS system libiconv and ad-hoc
+signs the executable; it is not Developer ID signed or notarized.
+
+```sh
+nix build .#releaseJobs.cli.aarch64-darwin.artifacts.native
+```
+
+This is the same derivation built by Hydra and the macOS GitHub job. It requires
+a native Darwin builder, which Nix/Hydra schedules through their configured
+build machines; no SSH packaging or publication script is needed.
 
 Docker is an artifact format: the network image follows the CLI release,
 while CUDA/HIP images follow the GPU release. A push to `master` or `devnet`
