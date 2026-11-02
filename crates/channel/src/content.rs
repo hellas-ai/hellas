@@ -224,7 +224,11 @@ impl DurableUpload {
         for object in self.meta.objects.values() {
             bytes.extend_from_slice(&encode_reference(*object));
         }
+        #[cfg(test)]
+        ticket_publication_boundary(false)?;
         hellas_private::write_atomically(&self.ticket(), ".pending", &bytes)?;
+        #[cfg(test)]
+        ticket_publication_boundary(true)?;
         self.persisted = true;
         Ok(())
     }
@@ -350,6 +354,56 @@ impl std::fmt::Debug for UploadStore {
             .finish()
     }
 }
+/// Owned retention destination, usable off the async worker without holding
+/// the endpoint lock. Published objects remain independent of caller files.
+#[derive(Clone)]
+pub(crate) struct ContentRetention {
+    root: PathBuf,
+    store: ContentStore,
+}
+impl ContentRetention {
+    pub(crate) async fn retain(
+        &self,
+        source: InvocationContent,
+        object: ContentRef,
+    ) -> Result<(), ContentError> {
+        let target = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Even an indexed caller file may be mutable. Always verify the
+            // owned copy; only an already-owned object can skip the copy.
+            let path = target.root.join("objects").join(object.id().to_string());
+            if path.try_exists()? {
+                let indexed = target
+                    .store
+                    .index(&path)
+                    .map_err(|e| ContentError::Storage(e.to_string()))?;
+                if indexed.id != object.id().digest() || indexed.len != object.bytes() {
+                    return Err(ContentError::Hash);
+                }
+                hellas_private::open_nofollow(&path)?.sync_all()?;
+                hellas_private::sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
+                hellas_private::sync_directory(&target.root)?;
+                return Ok(());
+            }
+            target
+                .store
+                .put_reader(
+                    &target.root,
+                    object.id().digest(),
+                    object.bytes(),
+                    source.reader(object)?,
+                )
+                .map_err(|e| ContentError::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ContentError::Storage(e.to_string()))?
+    }
+    pub(crate) fn content(&self) -> InvocationContent {
+        InvocationContent::Retained(self.store.clone())
+    }
+}
+
 impl UploadStore {
     /// A memory-only store. `content` is the provider's held content, which
     /// ephemeral jobs may read instead of uploading; it is never written.
@@ -874,6 +928,17 @@ impl UploadStore {
         }
         Ok(bytes)
     }
+    pub(crate) fn retention_target(&self) -> Result<ContentRetention, ContentError> {
+        Ok(ContentRetention {
+            root: self
+                .files
+                .as_ref()
+                .ok_or(ContentError::Invalid)?
+                .content_root
+                .clone(),
+            store: self.content.clone(),
+        })
+    }
     pub fn retain(&self, bytes: &[u8]) -> Result<ContentRef, ContentError> {
         let files = self.files.as_ref().ok_or(ContentError::Invalid)?;
         self.content
@@ -883,38 +948,63 @@ impl UploadStore {
     }
     /// Records the closure a retained proposal can re-send from local bytes.
     ///
-    /// The ticket lists only objects this client retained; an object the
-    /// provider already held is deliberately absent. It is written after
+    /// The ticket lists objects this client retained across its attempts;
+    /// provider-only objects are absent. It is written after
     /// every client-supplied object is durable, so its presence means the
     /// upload can be resumed and its absence means the provider's share
-    /// was never established.
+    /// was never established. These already-owned bytes reserve no staging
+    /// space; the provider enforces the signed upload cap during preflight.
     pub(crate) fn retain_closure(
         &mut self,
         work: Digest,
         objects: &[ContentRef],
         deadline: u64,
-        max_upload_bytes: u64,
     ) -> Result<(), ContentError> {
-        // A retry may find that the provider gained or lost an object, so
-        // its client-supplied set is not the previous attempt's. Replace
-        // the ticket rather than refusing the proposal over a stale set;
-        // the bytes themselves are content-addressed and stay put.
-        if self.uploads.contains_key(&work) {
-            self.discard(work)?;
+        let mut objects = objects.to_vec();
+        if let Some(previous) = self.uploads.get(&work) {
+            if previous.retention() != Retention::Retain || previous.meta().deadline != deadline {
+                return Err(ContentError::Invalid);
+            }
+            objects.extend(previous.meta().objects.values().copied());
+        } else if self.uploads.len() >= 256 {
+            return Err(ContentError::ProposalLimit);
         }
-        self.declare(
-            work,
-            objects,
-            deadline,
-            Retention::Retain,
-            max_upload_bytes,
-            true,
-        )
+        objects.sort_unstable_by_key(|object| object.id());
+        objects.dedup();
+        let meta = UploadMeta::new(work, deadline, &objects)?;
+        // This ticket certifies already-durable client bytes. Unlike a
+        // provider's staging declaration it cannot name missing objects.
+        for object in meta.objects.values() {
+            if self.held_file(*object)?.is_none() {
+                return Err(ContentError::Missing);
+            }
+        }
+        if self.uploads.get(&work).is_some_and(|old|
+            matches!(old, Upload::Retained(upload) if upload.persisted && upload.meta == meta))
+        {
+            return Ok(());
+        }
+        let mut replacement = DurableUpload {
+            meta,
+            files: self.files.clone().ok_or(ContentError::Invalid)?,
+            persisted: false,
+        };
+        // All bytes are held, so this adds no staging reservation. Preserve
+        // previous refs (and any parts) until the atomic metadata replacement
+        // is durable; a failed retry must never unlink the old ticket.
+        let published = replacement.persist();
+        // On an uncertain publication failure retain the union in RAM but
+        // mark it incomplete. A live retry must publish it again, even if
+        // the provider has since gained the newly retained objects.
+        self.uploads.insert(work, Upload::Retained(replacement));
+        published
     }
     /// The retained closure recorded for `work`, if this store has one.
     pub(crate) fn retained_closure(&self, work: Digest) -> Option<Vec<ContentRef>> {
         match self.uploads.get(&work) {
-            Some(Upload::Retained(upload)) => Some(upload.meta.objects.values().copied().collect()),
+            Some(Upload::Retained(upload)) if upload.persisted => {
+                Some(upload.meta.objects.values().copied().collect())
+            }
             _ => None,
         }
     }
@@ -988,6 +1078,26 @@ impl Drop for UploadStore {
     }
 }
 #[cfg(test)]
+thread_local! { static FAIL_TICKET_PUBLICATION: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+fn ticket_publication_boundary(published: bool) -> Result<(), ContentError> {
+    if FAIL_TICKET_PUBLICATION.with(|failure| {
+        if failure.get() == Some(published) {
+            failure.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(ContentError::Storage(
+            "injected ticket publication failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 thread_local! { static FAIL_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 fn finalize_publication(destination: &Path) -> Result<(), ContentError> {
@@ -1058,6 +1168,96 @@ mod tests {
     fn id(byte: u8) -> Digest {
         Digest::from_bytes([byte; 32])
     }
+    #[test]
+    fn retained_closure_replacement_preserves_recovery_at_publication_boundaries() {
+        for published in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store =
+                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+            let first = store.retain(b"original-client-object").unwrap();
+            store.retain_closure(id(2), &[first], 100).unwrap();
+            let second = store.retain(b"new-client-object").unwrap();
+            FAIL_TICKET_PUBLICATION.with(|failure| failure.set(Some(published)));
+            assert!(store.retain_closure(id(2), &[first, second], 100).is_err());
+            drop(store);
+            let store =
+                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+            let retained = store
+                .retained_closure(id(2))
+                .expect("an interrupted retry retains a complete ticket");
+            assert!(retained.contains(&first));
+            assert_eq!(retained.contains(&second), published);
+            assert_eq!(store.retained(first).unwrap(), b"original-client-object");
+        }
+    }
+
+    #[test]
+    fn retained_closure_retry_never_forgets_a_previously_retained_object() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store =
+            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+        let first = store
+            .retain(b"client-object-now-also-held-by-provider")
+            .unwrap();
+        let second = store.retain(b"prepared-input").unwrap();
+        store.retain_closure(id(2), &[first, second], 100).unwrap();
+        FAIL_TICKET_PUBLICATION.with(|failure| failure.set(Some(false)));
+        store.retain_closure(id(2), &[second], 100).unwrap();
+        assert_eq!(
+            FAIL_TICKET_PUBLICATION.with(|failure| failure.replace(None)),
+            Some(false),
+            "an identical union does not rewrite its ticket"
+        );
+        drop(store);
+        let store =
+            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+        assert!(store.retained_closure(id(2)).unwrap().contains(&first));
+    }
+
+    #[tokio::test]
+    async fn client_retention_copies_file_content_into_its_owned_store() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("mutable-source");
+        std::fs::write(&source_path, b"original").unwrap();
+        let source = ContentStore::new();
+        source.index(&source_path).unwrap();
+        let object = ContentRef::for_bytes(b"original");
+        let store =
+            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+        let target = store.retention_target().unwrap();
+        target
+            .retain(InvocationContent::Retained(source), object)
+            .await
+            .unwrap();
+        std::fs::write(&source_path, b"modified").unwrap();
+        assert_eq!(
+            target.content().read(object).unwrap().as_slice(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn a_live_retry_finishes_an_uncertain_ticket_replacement() {
+        for published in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store =
+                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+            let first = store.retain(b"old-object").unwrap();
+            let second = store.retain(b"new-object").unwrap();
+            store.retain_closure(id(2), &[first], 100).unwrap();
+            FAIL_TICKET_PUBLICATION.with(|failure| failure.set(Some(published)));
+            assert!(store.retain_closure(id(2), &[second], 100).is_err());
+            assert!(store.retained_closure(id(2)).is_none());
+            // The provider gained the new object during the failed attempt.
+            store.retain_closure(id(2), &[first], 100).unwrap();
+            drop(store);
+            let store =
+                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+            let retained = store.retained_closure(id(2)).unwrap();
+            assert!(retained.contains(&first) && retained.contains(&second));
+        }
+    }
+
     fn all_bytes(root: &Path) -> Vec<Vec<u8>> {
         let mut bytes = Vec::new();
         for entry in std::fs::read_dir(root).unwrap() {

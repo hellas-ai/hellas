@@ -1101,7 +1101,6 @@ pub fn retain_proposal_content(store: &mut crate::work_store::ChannelStore, byte
         work,
         &[reference, hellas_rpc::ContentRef::for_bytes(bytes)],
         deadline,
-        u64::MAX / 2,
     ) {
         panic!("the fixture upload records its closure: {error}");
     }

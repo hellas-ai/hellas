@@ -328,10 +328,8 @@ impl ChannelStore {
         work: Digest,
         objects: &[hellas_rpc::ContentRef],
         deadline: u64,
-        max_upload_bytes: u64,
     ) -> Result<(), crate::content::ContentError> {
-        self.uploads
-            .retain_closure(work, objects, deadline, max_upload_bytes)
+        self.uploads.retain_closure(work, objects, deadline)
     }
 
     /// Releases a pending proposal this journal can no longer send.
