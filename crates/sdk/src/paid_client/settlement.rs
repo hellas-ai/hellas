@@ -353,30 +353,6 @@ async fn receipt(
     })
 }
 
-/// The owner-authority state a finalized close pays under, `[maker, taker]`.
-///
-/// This is the kernel's own rule, read off the close witness. A signature
-/// carrying [`Authority::Owner`](hellas_kernel::Authority::Owner) is that
-/// party exiting its delegation, and the kernel then pays it undelegated; a
-/// `Freeze` also inherits the owner actions recorded on the contest it ends,
-/// and an `Adjudicated` close has no witness of its own, so its destinations
-/// are exactly the contest's. Reading the rule here keeps the receipt from
-/// inventing a second one.
-fn close_owner_signed(proof: &hellas_kernel::Proof, pending: Option<[bool; 2]>) -> [bool; 2] {
-    let previous = pending.unwrap_or([false; 2]);
-    match proof {
-        hellas_kernel::Proof::Mutual { maker, taker } => [maker.is_owner(), taker.is_owner()],
-        hellas_kernel::Proof::Freeze { maker, taker, .. } => [
-            maker.is_owner() || previous[0],
-            taker.is_owner() || previous[1],
-        ],
-        // The optional owner witness a timeout may carry is the maker's,
-        // and the kernel pays every output at the owner's bare destination.
-        hellas_kernel::Proof::Timeout { owner, .. } => [owner.is_some(), false],
-        hellas_kernel::Proof::Adjudicated { .. } => previous,
-    }
-}
-
 /// Replays the settlement block's contest moves through the kernel's own
 /// transitions, on top of the retained contest record.
 ///
@@ -450,7 +426,9 @@ fn close_payouts(
     // kernel's `PartyKeys::is_destination` checks owner and delegate together,
     // so an owner-signed exit is accepted undelegated while any other
     // delegate change is still refused.
-    let owner_signed = close_owner_signed(proof, pending.map(|record| record.owner_signed()));
+    let owner_signed = proof
+        .payment_close_owner_signed(pending.as_ref())
+        .ok_or(PaidClientError::InputMismatch("settlement payment proof"))?;
     let parties = channel.payment_terms().parties();
     let mut returned = 0u64;
     let mut paid = 0u64;
@@ -679,6 +657,30 @@ mod tests {
     }
 
     #[test]
+    fn payment_receipts_require_a_payment_proof_and_its_contest() {
+        let (channel, parties, _, _) = delegated_channel();
+        let mut outputs = [parties.taker().payout(40, false); MAX_EDGE_OUTPUTS];
+        outputs[1] = parties.maker().payout(60, false);
+        for proof in [
+            Proof::mutual(
+                PartyAuth::signer(Sig::default()),
+                PartyAuth::signer(Sig::default()),
+            ),
+            Proof::timeout(
+                hellas_kernel::Terms::work_payment(channel.payment_terms().clone()),
+                None,
+            ),
+            Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes([0; 32])),
+        ] {
+            let block = close_block(&channel, proof, outputs);
+            assert!(matches!(
+                close_payouts(&block, &channel, 7, [1; 32], 40, None),
+                Err(PaidClientError::InputMismatch("settlement payment proof"))
+            ));
+        }
+    }
+
+    #[test]
     fn an_owner_signed_close_pays_undelegated_and_a_wrong_delegate_is_refused() {
         let (channel, parties, owner, provider) = delegated_channel();
         let provider_payout = parties.taker().payout(40, false);
@@ -687,7 +689,9 @@ mod tests {
         assert_eq!(provider_payout, Payout::new(provider, 40));
 
         // The owner signs the maker side; the provider signs its own.
-        let proof = Proof::mutual(
+        let proof = Proof::freeze(
+            40,
+            (7, 7),
             PartyAuth::owner(Sig::default()),
             PartyAuth::signer(Sig::default()),
         );
@@ -705,7 +709,9 @@ mod tests {
         outputs[1] = parties.maker().payout(60, false);
         let block = close_block(
             &channel,
-            Proof::mutual(
+            Proof::freeze(
+                40,
+                (7, 7),
                 PartyAuth::owner(Sig::default()),
                 PartyAuth::signer(Sig::default()),
             ),
@@ -737,7 +743,7 @@ mod tests {
             ))
         };
         let proof = Proof::freeze(
-            0,
+            40,
             (7, 7),
             PartyAuth::signer(Sig::default()),
             PartyAuth::signer(Sig::default()),

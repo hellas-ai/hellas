@@ -412,11 +412,7 @@ where
     };
     // An owner signing the freeze, or an owner that acted on the contest
     // it ends, exits only its own delegation.
-    let previous = pending.map_or([false; 2], |record| record.owner_signed());
-    let owner_signed = [
-        maker_auth.is_owner() || previous[0],
-        taker_auth.is_owner() || previous[1],
-    ];
+    let owner_signed = super::proof::freeze_owner_signed(maker_auth, taker_auth, pending.as_ref());
     check_split(edge.parties(), (total, provider), owner_signed, outputs)?;
 
     let digest =
