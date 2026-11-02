@@ -338,9 +338,12 @@ let
     "xet-no-alloc"
   ];
   lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;
-  mergeChecks = lintChecks // {
-    inherit (checks) unit;
-  };
+  mergeChecks =
+    lintChecks
+    // {
+      inherit (checks) unit;
+    }
+    // lib.optionalAttrs isValidatorHost { inherit (checks) regressions; };
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {
