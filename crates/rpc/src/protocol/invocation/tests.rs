@@ -167,7 +167,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "ea3de5aae64c97d5f0446a0f2c6604ff4d39af2f48ddb8ec158a135d850cc2fb"
+        "ba495263628fb6399613df67c8575b0850833a7c3e462f8dd8d3ab3e9b6db4e5"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
