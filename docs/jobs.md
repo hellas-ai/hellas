@@ -20,9 +20,9 @@ reports its recorded status instead of submitting new work. A new attempt
 path is an explicit request to execute again and consume the allowance.
 Grant channel journals share the imported offers' data directory with the
 gateway (`HELLAS_GRANT_DATA_DIR`); `--state-dir` is for paid execution.
-Grant Compute uses ephemeral provider retention, which disables the persistent
-compiler cache. Each new grant job compiles its program again. A signed failed
-result makes the command fail on both first delivery and saved-result replay.
+Grant Compute uses ephemeral provider retention for job payloads. Compiled
+programs are cached independently of payload retention. A signed failed result
+makes the command fail on both first delivery and saved-result replay.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
@@ -106,7 +106,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-88ce6c6b3221"
+evaluator = "hellas/catena-721edd0a567d"
 adaptor = "compute-0.0.1"
 
 [payment]

@@ -40,25 +40,56 @@ fn provider_requires_the_program_to_ship_its_stdlib() {
     assert!(compile::compile_sources(&missing, dialect).is_err());
     assert!(compile::compile_sources(&complete, dialect).is_ok());
     let exe = std::env::current_exe().unwrap();
-    for retention in [
-        hellas_rpc::Retention::Ephemeral,
-        hellas_rpc::Retention::Retain,
-    ] {
-        let compile = |sources: &[String]| {
-            compile::compile_cancellable(
-                sources,
-                &exe,
-                &super::Cancellation::default(),
-                retention,
-                dialect,
-            )
-        };
-        assert!(compile(&missing).is_err(), "missing stdlib: {retention:?}");
+    let compile = |sources: &[String]| {
+        compile::compile_cancellable(sources, &exe, &super::Cancellation::default(), dialect)
+    };
+    assert!(compile(&missing).is_err());
+    assert!(compile(&complete).is_ok());
+}
+
+#[test]
+fn ephemeral_retention_does_not_disable_program_cache() {
+    const CHILD: &str = "HELLAS_TEST_PROGRAM_CACHE_BY_DEFAULT";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "catena::tests::ephemeral_retention_does_not_disable_program_cache",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CATENA_GPU_CACHE_DIR", directory.path())
+            .env("CATENA_GPU_CACHE", "1")
+            .env("CATENA_HEX_CACHE", "1")
+            .output()
+            .unwrap();
         assert!(
-            compile(&complete).is_ok(),
-            "complete program: {retention:?}"
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+        return;
     }
+    let sources = complete_sources(SOURCE);
+    let executable = std::env::current_exe().unwrap();
+    let first = compile::compile_cancellable(
+        &sources,
+        &executable,
+        &super::Cancellation::default(),
+        GpuDialect::Hip,
+    )
+    .unwrap();
+    let unavailable = executable.with_file_name("no-compiler-executable");
+    let second = compile::compile_cancellable(
+        &sources,
+        &unavailable,
+        &super::Cancellation::default(),
+        GpuDialect::Hip,
+    )
+    .expect("an ephemeral job must reuse the compiled program");
+    assert_eq!(first, second);
 }
 fn limits() -> Limits {
     Limits {
@@ -457,7 +488,6 @@ fn hip_unseen_program_and_kill_respawn() {
             &complete_sources(source),
             &exe,
             &Cancellation::default(),
-            hellas_rpc::Retention::Ephemeral,
             dialect,
         )
         .unwrap()

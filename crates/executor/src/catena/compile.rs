@@ -4,7 +4,6 @@ use catena_lang::{
     report::CompileReport,
     runtime::{ModuleCache, RuntimeModule},
 };
-use hellas_rpc::Retention;
 use hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES;
 use std::{
     io::{Read, Write},
@@ -68,20 +67,13 @@ pub fn compile(
     executable: &Path,
     dialect: GpuDialect,
 ) -> Result<RuntimeModule> {
-    compile_cancellable(
-        sources,
-        executable,
-        &Cancellation::default(),
-        Retention::Retain,
-        dialect,
-    )
+    compile_cancellable(sources, executable, &Cancellation::default(), dialect)
 }
 
 pub fn compile_cancellable(
     sources: &[String],
     executable: &Path,
     cancel: &Cancellation,
-    retention: Retention,
     dialect: GpuDialect,
 ) -> Result<RuntimeModule> {
     use std::sync::{
@@ -109,11 +101,7 @@ pub fn compile_cancellable(
         return Err("sources exceed compile limit".into());
     }
     let texts: Vec<_> = sources.iter().map(String::as_str).collect();
-    let cache = if retention == Retention::Retain {
-        ModuleCache::from_sources(&texts, CodegenKind::Default, dialect)
-    } else {
-        None
-    };
+    let cache = ModuleCache::from_sources(&texts, CodegenKind::Default, dialect);
     let Some(cache) = cache else {
         check_cancelled()?;
         let result = compile_child(sources, executable, cancel.clone(), dialect);

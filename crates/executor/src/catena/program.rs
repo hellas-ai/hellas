@@ -70,13 +70,7 @@ impl BoundProgram {
                 Ok(std::str::from_utf8(&bytes)?.to_owned())
             })
             .collect::<Result<Vec<_>>>()?;
-        let module = compile::compile_cancellable(
-            &sources,
-            executable,
-            cancel,
-            content.retention(),
-            dialect,
-        )?;
+        let module = compile::compile_cancellable(&sources, executable, cancel, dialect)?;
         validate::validate(&module, &environment, &inputs, &plan, limits, content)?;
         Ok(Self {
             environment,
