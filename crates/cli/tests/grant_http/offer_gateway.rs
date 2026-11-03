@@ -39,6 +39,20 @@ impl OfferHost {
         metrics_address: Option<String>,
         client_identity: Option<&Path>,
     ) -> Self {
+        Self::start_with_policy(
+            metrics_endpoint,
+            metrics_address,
+            client_identity,
+            http_invocation_policy(),
+        )
+        .await
+    }
+    async fn start_with_policy(
+        metrics_endpoint: Option<String>,
+        metrics_address: Option<String>,
+        client_identity: Option<&Path>,
+        invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -142,7 +156,7 @@ impl OfferHost {
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
         }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":http_invocation_policy(),
+        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
         let mut node = provider.spawn(
             &[
@@ -862,7 +876,14 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     use hellas_auth::authority as auth;
-    let host = OfferHost::start().await;
+    let mut policy = http_invocation_policy();
+    policy
+        .admissions
+        .push(hellas_rpc::protocol::invocation::Admission::Compute {
+            evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+        });
+    let host = OfferHost::start_with_policy(None, None, None, policy).await;
     let root = host.root();
     let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
         .unwrap()
@@ -990,6 +1011,110 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     .unwrap();
     assert_eq!(imported["offers"][0]["name"], "shared.glm");
     assert_eq!(imported["offers"][0]["grant"], hex::encode(host.id.0));
+    // The same imported bundle works directly through the CLI, without an
+    // HTTP gateway or any chain funding. Retry must not consume it twice.
+    let request = hellas_rpc::http_fetch::HttpFetchRequest {
+        url: format!("{}/v1/chat/completions", host.https.origin),
+        method: "POST".into(),
+        headers: vec![("content-type".into(), "application/json".into())],
+        body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":8}"#),
+        tls: hellas_rpc::http_fetch::HttpTls {
+            roots: hellas_rpc::http_fetch::HttpTrustRoots::Certificates {
+                der_base64: vec![host.https.root_der.clone()],
+            },
+            spki_sha256: vec![],
+        },
+        credential: Some("glm-account".into()),
+        max_response_bytes: 65536,
+    };
+    let job = hellas_sdk::job::Job::fetch(
+        20,
+        hellas_rpc::FetchContract::http().unwrap(),
+        "http".into(),
+        "request".into(),
+        serde_json::to_vec(&request).unwrap(),
+        hellas_rpc::Assurance::ProducerSigned,
+    )
+    .unwrap();
+    let job_dir = root.join("grant-job");
+    job.save(&job_dir).unwrap();
+    let provider = hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
+        .unwrap()
+        .to_string();
+    let resource = host.signed_offer.offer().grant.policies[0]
+        .resource
+        .0
+        .to_string();
+    let attempt = root.join("grant-attempt.json");
+    let result_dir = root.join("grant-result");
+    let args = [
+        "transact",
+        "--provider",
+        &provider,
+        "--offer",
+        "shared.glm",
+        "--work-profile",
+        imported["work_profile"].as_str().unwrap(),
+        "--resource",
+        &resource,
+        "--attempt",
+        string(&attempt),
+        "--job",
+        string(&job_dir),
+        "--output",
+        string(&result_dir),
+    ];
+    let wrong_resource = hellas_auth::Digest::hash(b"another resource").to_string();
+    let wrong_provider = hellas_sdk::client::ProviderAddress {
+        enrollment: hellas_rpc::ContentId::from_bytes([99; 32]),
+        node: hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
+            .unwrap()
+            .node,
+    }
+    .to_string();
+    for (flag, value) in [
+        ("--resource", &wrong_resource),
+        ("--provider", &wrong_provider),
+    ] {
+        let mut refused = args.to_vec();
+        let at = refused.iter().position(|arg| *arg == flag).unwrap();
+        refused[at + 1] = value;
+        assert!(!host.client.output(&refused).await.status.success());
+        assert!(!attempt.exists());
+    }
+    assert!(!other_device.output(&args).await.status.success());
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
+    for _ in 0..2 {
+        host.client.run(&args).await;
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(result_dir.join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["funding"], "grant");
+        assert!(metadata.get("paid").is_none());
+        let response: Value =
+            serde_json::from_slice(&std::fs::read(result_dir.join("output-0000")).unwrap())
+                .unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
+    }
+    let mut changed_input = job.input().clone();
+    let hellas_sdk::job::JobInput::Fetch { request, .. } = &mut changed_input else {
+        unreachable!()
+    };
+    let mut changed_request: hellas_rpc::http_fetch::HttpFetchRequest =
+        serde_json::from_slice(request).unwrap();
+    changed_request.body_base64 = STANDARD.encode(br#"{"messages":[],"max_tokens":7}"#);
+    *request = serde_json::to_vec(&changed_request).unwrap();
+    let changed_dir = root.join("changed-grant-job");
+    hellas_sdk::job::Job::from_input(20, changed_input)
+        .unwrap()
+        .save(&changed_dir)
+        .unwrap();
+    let mut changed_args = args.to_vec();
+    let at = changed_args.iter().position(|arg| *arg == "--job").unwrap();
+    changed_args[at + 1] = string(&changed_dir);
+    assert!(!host.client.output(&changed_args).await.status.success());
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
     let trust_root = host.approve_trust().await;
     let pool = root.join("grant-pool.json");
     std::fs::write(
@@ -1026,8 +1151,57 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         json!({"messages":[]}),
     )
     .await;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_http_response(
+        response,
+        reqwest::StatusCode::OK,
+        &[&gateway.log, &host.node.log],
+        &host.https,
+    )
+    .await;
     gateway.stop().await;
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 2);
+    let next_attempt = root.join("next-grant-attempt.json");
+    let mut next_args = args.to_vec();
+    let at = next_args
+        .iter()
+        .position(|arg| *arg == "--attempt")
+        .unwrap();
+    next_args[at + 1] = string(&next_attempt);
+    host.client.run(&next_args).await;
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 3);
+    // A signed compilation failure is a failed command, including on replay.
+    let mut content = hellas_channel::content::EphemeralContent::default();
+    let source = content.insert(b"invalid Hex source".to_vec());
+    let environment = hellas_rpc::protocol::invocation::compute::Environment {
+        sources: vec![source],
+        assets: vec![],
+    };
+    content.insert(environment.canonical_bytes().unwrap());
+    let invalid_job = hellas_sdk::job::Job::compute(
+        20,
+        environment,
+        hellas_channel::test_support::channel::plan(),
+        vec![],
+        hellas_channel::content::InvocationContent::Ephemeral(content),
+    )
+    .unwrap();
+    let invalid_dir = root.join("invalid-compute-job");
+    invalid_job.save(&invalid_dir).unwrap();
+    let failed_attempt = root.join("failed-compute-attempt.json");
+    let mut failed_args = args.to_vec();
+    for (flag, path) in [("--job", &invalid_dir), ("--attempt", &failed_attempt)] {
+        let at = failed_args.iter().position(|arg| *arg == flag).unwrap();
+        failed_args[at + 1] = string(path);
+    }
+    for _ in 0..2 {
+        let failed = host.client.output(&failed_args).await;
+        assert!(
+            !failed.status.success(),
+            "a failed computation returned success"
+        );
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("Compilation"));
+        assert!(!String::from_utf8_lossy(&failed.stdout).contains("completed"));
+    }
     host.stop().await;
 }
 

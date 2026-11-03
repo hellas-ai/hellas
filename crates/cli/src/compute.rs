@@ -20,6 +20,10 @@ pub(crate) struct ServeArgs {
     /// Fast-resume index for local content.
     #[arg(long = "content-index", value_name = "FILE")]
     pub(crate) content_index: Option<PathBuf>,
+    /// Refuse unindexed or changed content instead of hashing at startup.
+    /// Prepare files with `store index`; directory adoption is not supported.
+    #[arg(long, conflicts_with = "content_roots")]
+    pub(crate) require_content_index: bool,
     /// GPU runtime: auto, hip, or cuda.
     #[arg(long = "gpu-backend", default_value = "auto", value_parser = parse_gpu_backend)]
     pub(crate) gpu_backend: GpuDialect,
@@ -48,7 +52,13 @@ impl ServeArgs {
             .ok_or_else(|| {
                 anyhow::anyhow!("no store location; set HELLAS_STORE_DIR or --store-dir")
             })?;
-        executor.content_store = index_content(&self.content_paths, &self.content_roots, &index)?;
+        let mode = if self.require_content_index {
+            IndexMode::Require
+        } else {
+            IndexMode::Resume
+        };
+        executor.content_store =
+            index_content(&self.content_paths, &self.content_roots, &index, mode)?;
         Ok(())
     }
 }
@@ -62,30 +72,34 @@ fn parse_gpu_backend(value: &str) -> Result<GpuDialect, String> {
     }
 }
 
-pub fn index_content(
+pub(crate) enum IndexMode {
+    Resume,
+    Recheck,
+    Require,
+}
+
+pub(crate) fn index_content(
     paths: &[PathBuf],
     roots: &[PathBuf],
     index_path: &Path,
+    mode: IndexMode,
 ) -> CliResult<ContentStore> {
-    populate_content(paths, roots, Some(index_path), false)
-}
-
-fn populate_content(
-    paths: &[PathBuf],
-    roots: &[PathBuf],
-    index_path: Option<&Path>,
-    recheck: bool,
-) -> CliResult<ContentStore> {
+    anyhow::ensure!(
+        roots.is_empty() || !matches!(mode, IndexMode::Require),
+        "required content indexes support explicit files only"
+    );
     let store = ContentStore::new();
-    let remembered = if recheck {
+    let remembered = if matches!(mode, IndexMode::Recheck) {
         0
     } else {
-        index_path.map_or(0, |path| store.records().load(path))
+        store.records().load(index_path)
     };
     for path in paths {
-        store
-            .index(path)
-            .with_context(|| format!("failed to index local content {}", path.display()))?;
+        match mode {
+            IndexMode::Require => store.index_remembered(path),
+            _ => store.index(path),
+        }
+        .with_context(|| format!("failed to index local content {}", path.display()))?;
     }
     let mut adopted = 0usize;
     for root in roots {
@@ -94,7 +108,7 @@ fn populate_content(
             .with_context(|| format!("failed to adopt local content root {}", root.display()))?
             .len();
     }
-    if let Some(index_path) = index_path {
+    if !matches!(mode, IndexMode::Require) {
         store
             .records()
             .save(index_path)

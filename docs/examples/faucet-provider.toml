@@ -10,8 +10,10 @@
 jobs_per_channel = 10
 # Kernel minimum (MIN_OMIT_RESPONSE_BLOCKS).
 min_omit_response_blocks = 16
-# Admit Catena compute jobs.
-compute = true
+# Omit this table to disable Compute. Use mode = "only" and a nonempty
+# manifests = ["<64-hex program manifest id>", ...] to restrict programs.
+[compute]
+mode = "any"
 
 [payment]
 fixed_price = 20

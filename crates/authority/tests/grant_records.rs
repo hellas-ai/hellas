@@ -78,20 +78,10 @@ fn signed_template_is_exact_and_only_client_repairs_generation() {
         assert_eq!(req, before);
     }
 }
-#[test]
-fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
-    let key = principal(1).1;
-    let provider = software_enrollment(1, [1; 32]);
-    let (client_principal, _) = principal(2);
-    let client = software_enrollment(2, [2; 32]);
-    let (stranger, _) = principal(3);
-    let mut bad = client.clone();
-    bad.genesis.statement.transport_public_key = PublicKey::Ed25519([9; 32]);
-    assert!(matches!(
-        verify_software_enrollment(&bad),
-        Err(GrantError::Signature)
-    ));
+fn https_offer() -> Offer {
     let network = NetworkId::new("grant-fixture").unwrap();
+    let provider = software_enrollment(1, [1; 32]);
+    let client_principal = principal(2).0;
     let route = FetchRoutePolicy::sealed_route("http", "request").unwrap();
     let policy = GrantPolicy {
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
@@ -138,7 +128,7 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         enabled: true,
         allow_account_backed: true,
     };
-    let offer = Offer {
+    Offer {
         network,
         provider: provider.clone(),
         grant,
@@ -146,7 +136,23 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         sequence: 1,
         valid_until: UnixMillis(2000),
         addresses: vec![],
-    };
+    }
+}
+#[test]
+fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
+    let key = principal(1).1;
+    let provider = software_enrollment(1, [1; 32]);
+    let (client_principal, _) = principal(2);
+    let client = software_enrollment(2, [2; 32]);
+    let (stranger, _) = principal(3);
+    let mut bad = client.clone();
+    bad.genesis.statement.transport_public_key = PublicKey::Ed25519([9; 32]);
+    assert!(matches!(
+        verify_software_enrollment(&bad),
+        Err(GrantError::Signature)
+    ));
+    let network = NetworkId::new("grant-fixture").unwrap();
+    let offer = https_offer();
     let signed = SignedOffer::sign(offer, &key).unwrap();
     let mut empty = signed.offer().clone();
     empty.grant.policies.clear();
@@ -251,21 +257,17 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
 }
 
 #[test]
-fn legacy_https_offer_preserves_canonical_bytes_and_signature() {
+fn obsolete_invocation_policy_offer_is_refused() {
     // Captured from the legacy signer, not constructed using the current policy types.
     let bytes = include_bytes!("fixtures/legacy-https-offer.cbor");
     assert_eq!(
         ContentId::hash(bytes).to_string(),
         "407ab41916d8b50b93e8bb85e088a8ef6284c464db4103534f77144644659d41"
     );
-    let signed = SignedOffer::decode(bytes, UnixMillis(1000)).unwrap();
-    assert_eq!(signed.encode().unwrap(), bytes);
     assert_eq!(
-        signed.offer().provider.content_id(),
-        software_enrollment(1, [1; 32]).content_id()
+        SignedOffer::decode(bytes, UnixMillis(1000)),
+        Err(GrantError::Malformed)
     );
-    let https = signed.offer().grant.policies[0].https.as_ref().unwrap();
-    assert_eq!(https.paths, ["/v1/chat/completions"]);
 }
 
 #[test]
@@ -395,12 +397,7 @@ fn signed_model_policy_is_authenticated_and_old_parsers_reject_it() {
         max_output_tokens: serde_json::Value,
         max_response_bytes: serde_json::Value,
     }
-    let legacy = SignedOffer::decode(
-        include_bytes!("fixtures/legacy-https-offer.cbor"),
-        UnixMillis(1000),
-    )
-    .unwrap();
-    let mut offer = legacy.offer().clone();
+    let mut offer = https_offer();
     let template = offer.grant.policies[0].https.as_mut().unwrap();
     template.model_policy = Some(vec![PathModelPolicy {
         path: template.paths[0].clone(),

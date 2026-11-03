@@ -2,6 +2,54 @@ use super::*;
 use clap::Parser as _;
 
 #[test]
+fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
+    let provider = provider();
+    let resource = hellas_auth::Digest::hash(b"resource").to_string();
+    let base = [
+        "hellas",
+        "transact",
+        "--job",
+        "job",
+        "--provider",
+        &provider,
+    ];
+    let grant = [
+        "--offer",
+        "shared.model",
+        "--work-profile",
+        "profile.json",
+        "--resource",
+        &resource,
+        "--attempt",
+        "attempt.json",
+    ];
+    let parse = |extra: &[&str]| {
+        crate::Cli::try_parse_from(base.iter().chain(grant.iter()).chain(extra.iter()).copied())
+    };
+    assert!(parse(&[]).is_ok());
+    for extra in [
+        &["--settle"][..],
+        &["--buy-again"],
+        &["--validator", "ws://localhost"],
+        &["--trust", "chain.json"],
+        &["--address", "127.0.0.1:1"],
+        &["--state-dir", "paid-state"],
+    ] {
+        assert!(parse(extra).is_err(), "{extra:?}");
+    }
+    for missing in [0, 2, 4, 6] {
+        let mut args = base.to_vec();
+        args.extend(
+            grant
+                .iter()
+                .enumerate()
+                .filter_map(|(i, value)| (!(missing..missing + 2).contains(&i)).then_some(*value)),
+        );
+        assert!(crate::Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
 fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     let request = fetch_args(&[]).request().unwrap();
     let job = Job::fetch(

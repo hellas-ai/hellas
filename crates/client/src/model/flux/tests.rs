@@ -15,6 +15,28 @@ fn request() -> ImageRequest<'static> {
     }
 }
 
+#[test]
+fn shared_stage_helpers_must_have_identical_types_and_definitions() {
+    let helper = "(def program flux.shared : unit -> unit = identity)";
+    let model = bundle_stages([helper, helper]).unwrap();
+    let raw =
+        metacat::theory::RawTheorySet::from_texts(catena_models::catena::runtime_sources(&model))
+            .unwrap()
+            .with_extensions()
+            .unwrap();
+    assert!(
+        raw.theories[&"program".parse().unwrap()]
+            .arrows
+            .contains_key(&"stdlib.flux.shared".parse().unwrap())
+    );
+    for conflict in [
+        "(def program flux.shared : unit -> unit = different)",
+        "(def program flux.shared : unit -> other = identity)",
+    ] {
+        assert!(bundle_stages([helper, conflict]).is_err());
+    }
+}
+
 /// The same FluxPipeline used by catena-models' flux2-klein command, with its
 /// native seeded noise and then the client's exported --noise input.
 #[test]

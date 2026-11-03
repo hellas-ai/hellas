@@ -1,6 +1,45 @@
 use super::*;
 use clap::Parser as _;
 
+#[test]
+fn paid_compute_program_selection_survives_config_parsing() {
+    let example = include_str!("../../../../../../docs/examples/faucet-provider.toml");
+    let environment = hellas_rpc::protocol::invocation::compute::Environment {
+        sources: vec![hellas_rpc::ContentRef::for_bytes(b"approved program")],
+        assets: vec![],
+    };
+    let manifest = environment.manifest().unwrap();
+    let selected = example.replace(
+        "mode = \"any\"",
+        &format!(
+            "mode = \"only\"\nmanifests = [\"{}\"]",
+            manifest.content_id()
+        ),
+    );
+    let file: PaidWorkFile = toml::from_str(&selected).unwrap();
+    let policy = file
+        .policy(Some(hellas_rpc::FetchContract::http().unwrap()))
+        .unwrap();
+    policy
+        .invocation_policy
+        .classify_manifest(&manifest)
+        .unwrap();
+    let other = hellas_rpc::ProgramManifest::new(
+        manifest.application().clone(),
+        hellas_rpc::ContentId::hash(b"other"),
+    );
+    assert!(policy.invocation_policy.classify_manifest(&other).is_err());
+    let empty = selected.replace(&format!("\"{}\"", manifest.content_id()), "");
+    assert!(
+        toml::from_str::<PaidWorkFile>(&empty)
+            .unwrap()
+            .policy(Some(hellas_rpc::FetchContract::http().unwrap()))
+            .is_err()
+    );
+    let ambiguous = selected.replace("mode = \"only\"", "mode = \"any\"");
+    assert!(toml::from_str::<PaidWorkFile>(&ambiguous).is_err());
+}
+
 #[tokio::test]
 async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls() {
     let root = tempfile::tempdir().unwrap();
@@ -112,7 +151,7 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let mut terms: toml::Value =
         toml::from_str(&std::fs::read_to_string(&example).unwrap()).unwrap();
-    terms["compute"] = toml::Value::Boolean(false);
+    terms.as_table_mut().unwrap().remove("compute");
     terms["fetch"]["route"] =
         toml::from_str("[SealedRoute]\nservice = \"codex\"\nmethod = \"responses\"\n").unwrap();
     let terms_path = root.path().join("paid.toml");

@@ -17,6 +17,49 @@ fn opened(path: &Path) -> (std::fs::File, fastresume::FileIdentity) {
     (file, identity)
 }
 
+#[cfg(unix)]
+#[test]
+fn required_records_never_hash_missing_changed_or_replaced_content() {
+    let dir = scratch("required-records");
+    let path = dir.join("weights");
+    let records = dir.join("content.fastresume");
+    std::fs::write(&path, b"weights").unwrap();
+    let empty = ContentStore::new();
+    let before = HASH_CALLS.get();
+    assert!(matches!(
+        empty.index_remembered(&path),
+        Err(StoreError::Unindexed { .. })
+    ));
+    assert_eq!(HASH_CALLS.get(), before);
+    let prepared = ContentStore::new();
+    let expected = prepared.index(&path).unwrap();
+    prepared.records().save(&records).unwrap();
+    let resumed = ContentStore::new();
+    assert_eq!(resumed.records().load(&records), 1);
+    let before = HASH_CALLS.get();
+    assert_eq!(resumed.index_remembered(&path).unwrap().id, expected.id);
+    assert_eq!(resumed.locate(expected.id).unwrap(), path);
+    assert_eq!(HASH_CALLS.get(), before);
+    std::fs::write(&path, b"changed weights").unwrap();
+    assert!(matches!(
+        resumed.index_remembered(&path),
+        Err(StoreError::Unindexed { .. })
+    ));
+    std::fs::write(dir.join("replacement"), b"weights").unwrap();
+    std::fs::rename(dir.join("replacement"), &path).unwrap();
+    assert!(matches!(
+        resumed.index_remembered(&path),
+        Err(StoreError::Unindexed { .. })
+    ));
+    assert_eq!(HASH_CALLS.get(), before);
+    // An explicit preparation permits the replacement on the next restart.
+    resumed.index(&path).unwrap();
+    assert_eq!(HASH_CALLS.get(), before + 1);
+    assert_eq!(resumed.index_remembered(&path).unwrap().id, expected.id);
+    assert_eq!(HASH_CALLS.get(), before + 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Hashing is bounded by the descriptor length captured before the read.
 /// Mutations are injected between real file reads, so growth is found by
 /// the one-byte sentinel and truncation by an early EOF.

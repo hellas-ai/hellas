@@ -21,6 +21,7 @@ fn policy() -> InvocationPolicy {
         admissions: vec![
             Admission::Compute {
                 evaluator: compute::EVALUATOR.into(),
+                programs: ComputePrograms::Any {},
             },
             Admission::Fetch {
                 admission: fetch_admission(),
@@ -54,6 +55,7 @@ fn every_policy_term_changes_the_committed_identity() {
         |p| {
             p.admissions[0] = Admission::Compute {
                 evaluator: "another/evaluator-1".into(),
+                programs: ComputePrograms::Any {},
             }
         },
         |p| fetch_mut(p).route = FetchRoutePolicy::open_fetch(true, vec!["example.com".into()]),
@@ -165,7 +167,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "c13c5aa6d8fdd3080aa5ccb960ac6676a07aa04e8521963f7496428730519942"
+        "ba495263628fb6399613df67c8575b0850833a7c3e462f8dd8d3ab3e9b6db4e5"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
@@ -622,6 +624,7 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     let mut forged = p;
     forged.admissions = vec![Admission::Compute {
         evaluator: crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
+        programs: ComputePrograms::Any {},
     }];
     assert!(
         forged
@@ -634,8 +637,136 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     );
     forged.admissions = vec![Admission::Compute {
         evaluator: "unknown/evaluator".into(),
+        programs: ComputePrograms::Any {},
     }];
     assert!(forged.classify_manifest(&unknown).is_err());
+}
+
+#[test]
+fn compute_program_selection_binds_sources_and_weights_before_admission() {
+    let environment = compute::Environment {
+        sources: vec![crate::ContentRef::for_bytes(b"approved program")],
+        assets: vec![compute::NamedAsset {
+            name: "weights".into(),
+            object: crate::ContentRef::for_bytes(b"approved weights"),
+        }],
+    };
+    let manifest = environment.manifest().unwrap();
+    let mut restricted = policy();
+    restricted.admissions[0] = Admission::Compute {
+        evaluator: compute::EVALUATOR.into(),
+        programs: ComputePrograms::Only {
+            manifests: vec![manifest.content_id()],
+        },
+    };
+    assert_ne!(
+        restricted.content_id().unwrap(),
+        policy().content_id().unwrap()
+    );
+    let bytes = restricted.canonical_bytes().unwrap();
+    assert_eq!(
+        InvocationPolicy::from_canonical_bytes(&bytes).unwrap(),
+        restricted
+    );
+    let json = serde_json::to_value(&restricted).unwrap();
+    assert_eq!(
+        json["admissions"][0]["programs"]["manifests"][0],
+        manifest.content_id().to_string()
+    );
+    assert_eq!(
+        serde_json::from_value::<InvocationPolicy>(json.clone()).unwrap(),
+        restricted
+    );
+    // Printable operator IDs must not become a second signed representation.
+    assert!(
+        InvocationPolicy::from_canonical_bytes(
+            &encode(&("hellas.invocation.policy.v2", json)).unwrap()
+        )
+        .is_err()
+    );
+    let original = compute_prepared(&restricted, &step_plan());
+    let prepare = |manifest: &crate::ProgramManifest, mut input: InvocationInput, retain| {
+        // Different request data remains legal for the same program.
+        input.artifacts.push(Artifact::new(
+            "prompt",
+            "catena.u64le.v1",
+            7_u64.to_le_bytes().to_vec(),
+        ));
+        PreparedInvocation::new(
+            InvocationRequest {
+                execution_environment: manifest.content_id(),
+                input: input.content_id().unwrap(),
+                retain,
+                ..original.request.clone()
+            },
+            manifest,
+            input,
+            bytes.clone(),
+        )
+        .unwrap()
+    };
+    // Paid requests retain results; grant requests may be ephemeral. Both use
+    // the same program restriction at staging and at prepared-input admission.
+    for retain in [true, false] {
+        let good = prepare(&manifest, original.input.clone(), retain);
+        restricted.classify_manifest(&manifest).unwrap();
+        restricted.admit(&good, &caller()).unwrap();
+        for change in [0, 1, 2] {
+            let mut changed = environment.clone();
+            match change {
+                0 => changed.sources[0] = crate::ContentRef::for_bytes(b"other program"),
+                1 => changed.assets[0].object = crate::ContentRef::for_bytes(b"other weights"),
+                _ => {
+                    let asset = changed.assets[0].object;
+                    changed.assets[0].object =
+                        crate::ContentRef::new(asset.id(), asset.bytes() + 1);
+                }
+            }
+            let other = changed.manifest().unwrap();
+            let request = prepare(&other, original.input.clone(), retain);
+            assert!(restricted.classify_manifest(&other).is_err());
+            assert!(restricted.admit(&request, &caller()).is_err());
+            // A caller cannot expand the owner policy in its request.
+            let mut forged = request;
+            forged.application_policy = JsonBytes(policy().canonical_bytes().unwrap());
+            assert!(restricted.admit(&forged, &caller()).is_err());
+            policy().classify_manifest(&other).unwrap();
+        }
+    }
+}
+
+#[test]
+fn compute_program_selection_is_explicit_and_bounded() {
+    let mut p = policy();
+    let id = ContentId::hash(b"manifest");
+    for manifests in [
+        vec![],
+        vec![id, id],
+        (0..=policy::MAX_COMPUTE_PROGRAMS)
+            .map(|n| ContentId::hash(&n.to_le_bytes()))
+            .collect(),
+    ] {
+        p.admissions[0] = Admission::Compute {
+            evaluator: compute::EVALUATOR.into(),
+            programs: ComputePrograms::Only { manifests },
+        };
+        assert!(p.canonical_bytes().is_err());
+    }
+    let mut value = serde_json::to_value(policy()).unwrap();
+    value["admissions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("programs");
+    assert!(serde_json::from_value::<InvocationPolicy>(value).is_err());
+    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"any","manifests":[]}"#).is_err());
+    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"only"}"#).is_err());
+    // Old policy bytes are never silently interpreted as unrestricted compute.
+    assert!(
+        InvocationPolicy::from_canonical_bytes(
+            &encode(&("hellas.invocation.policy.v1", policy())).unwrap()
+        )
+        .is_err()
+    );
 }
 
 #[test]

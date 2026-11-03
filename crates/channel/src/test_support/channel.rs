@@ -518,6 +518,7 @@ pub fn work_policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![Admission::Compute {
             evaluator: compute::EVALUATOR.into(),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }],
         limits: Limits {
             max_upload_bytes: 1 << 20,

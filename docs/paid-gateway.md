@@ -72,8 +72,15 @@ startup, unless the authority already holds them, and delegate the stake its
 offers bond. Paid work is sold only with this file; nothing has a built-in
 default. [`faucet-provider.toml`](examples/faucet-provider.toml) is a complete
 example: price, jobs per channel, channel credit, offer bounds, upload/output
-limits, maximum steps, the execution limit, `compute = true` and an optional
-`[fetch]` section. `--faucet` selects only the owner key from the public
+limits, maximum steps, the execution limit, `[compute]` with `mode = "any"` and an optional
+`[fetch]` section. To restrict Compute to reviewed programs, use
+`[compute]` with `mode = "only"` and a nonempty `manifests` list of exact
+program manifest content IDs. These bind the rendered code and asset hashes;
+request inputs and plans still vary within the configured limits. Omit
+`[compute]` to disable Compute. The same explicit `programs` selection applies
+to Compute admissions in owner-issued grant policies.
+
+`--faucet` selects only the owner key from the public
 devnet faucet allocation; it never sets price or limits. Restarts with the same
 file change nothing. A lower stake cap is refused before changing policy if no
 already-delegated coin fits it; use the explicit owner `chain delegate --split`

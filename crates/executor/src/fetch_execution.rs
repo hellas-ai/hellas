@@ -554,6 +554,7 @@ mod tests {
         let compute_policy = InvocationPolicy {
             admissions: vec![Admission::Compute {
                 evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+                programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
             }],
             limits,
         };

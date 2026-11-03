@@ -99,12 +99,28 @@ impl Config {
         let text = text::generated_source(&self.text)?;
         let denoise = graph::transformer(&self.transformer, height, width, steps, false)?;
         let vae = graph::vae(&self.vae, height, width, false)?;
-        // The shared helpers must be added only once across the three stages.
-        Ok(graph::bundle(&format!(
-            "{text}\n{}\n{}",
-            denoise.source, vae.source
-        )))
+        bundle_stages([text.as_str(), &denoise.source, &vae.source])
     }
+}
+
+fn bundle_stages<'a>(stages: impl IntoIterator<Item = &'a str>) -> Result<String> {
+    let mut raw = metacat::theory::RawTheorySet::from_texts(stages)?;
+    let mut shared = std::collections::BTreeMap::new();
+    // Upstream stages each carry their WMMA helpers. Keep one definition,
+    // but refuse a stage that gives a shared name a different meaning.
+    for extension in &mut raw.extensions {
+        for (name, arrow) in std::mem::take(&mut extension.arrows) {
+            let definition = (arrow.type_maps.clone(), arrow.definition.clone());
+            if let Some(previous) =
+                shared.insert((extension.theory.clone(), name.clone()), definition.clone())
+            {
+                ensure!(previous == definition, "conflicting Flux definition {name}");
+            } else {
+                extension.arrows.insert(name, arrow);
+            }
+        }
+    }
+    Ok(graph::bundle(&raw.to_hexpr_text()))
 }
 
 /// Convert a local distilled Klein 4B snapshot into immutable provider assets

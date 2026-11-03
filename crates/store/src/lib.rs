@@ -200,6 +200,8 @@ pub enum StoreError {
     },
     #[error("{path} is cache debris, not content")]
     Debris { path: PathBuf },
+    #[error("{path} has no matching content-index record; prepare it with `hellas store index`")]
+    Unindexed { path: PathBuf },
     #[error("{path} changed while it was being read")]
     Raced { path: PathBuf },
     #[error("{path} now names a different file than the one that was read")]
@@ -283,12 +285,18 @@ impl ContentStore {
     /// file is hashed once: [`fastresume`] remembers the result against
     /// the file's identity.
     pub fn index(&self, path: &Path) -> Result<Indexed> {
-        self.index_open(path).map(|(indexed, _file)| indexed)
+        self.index_open(path, false).map(|(indexed, _file)| indexed)
+    }
+
+    /// Registers an unchanged, previously hashed file without reading its bytes.
+    /// Missing or stale records are errors; this never falls back to hashing.
+    pub fn index_remembered(&self, path: &Path) -> Result<Indexed> {
+        self.index_open(path, true).map(|(indexed, _file)| indexed)
     }
 
     /// Indexes `path` while retaining the descriptor whose bytes justified
     /// the result.
-    fn index_open(&self, path: &Path) -> Result<(Indexed, std::fs::File)> {
+    fn index_open(&self, path: &Path, require_record: bool) -> Result<(Indexed, std::fs::File)> {
         use std::io::Seek as _;
 
         if fastresume::is_cache_debris(path) {
@@ -308,6 +316,11 @@ impl ContentStore {
         let remembered = self.records.get(&before);
         let indexed = match remembered.clone() {
             Some(indexed) => indexed,
+            None if require_record => {
+                return Err(StoreError::Unindexed {
+                    path: path.to_path_buf(),
+                });
+            }
             None => hash_exact_length(&mut file, before.len())
                 .map_err(read_err)?
                 .ok_or_else(|| StoreError::Raced {
@@ -456,7 +469,7 @@ impl ContentStore {
             let Some(path) = substituter.locate(id) else {
                 continue;
             };
-            let (indexed, file) = self.index_open(&path)?;
+            let (indexed, file) = self.index_open(&path, false)?;
             if indexed.id != id {
                 return Err(StoreError::WrongContent {
                     expected: id.to_string(),

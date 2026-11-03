@@ -1058,6 +1058,7 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let mut policy = work_policy();
     policy.admissions[0] = hellas_rpc::protocol::invocation::Admission::Compute {
         evaluator: "other/evaluator".into(),
+        programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
     };
     let changed = ready_with_descriptor(descriptor_with_policy(policy));
     let reopened = at_height(

@@ -6,9 +6,84 @@ use super::{bound, compute, domain_is, encode, error, fetch::FetchAdmission};
 use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
 use crate::{Application, ContentId, ProgramManifest, Retention};
 
-const DOMAIN: &str = "hellas.invocation.policy.v1";
+const DOMAIN: &str = "hellas.invocation.policy.v2";
 pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 pub const MAX_ADMISSIONS: usize = 64;
+pub const MAX_COMPUTE_PROGRAMS: usize = 64;
+
+/// Explicit owner choice between general Compute and exact program manifests.
+/// A manifest commits the rendered sources and asset identities, while request
+/// inputs and plans remain variable within the invocation limits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ComputePrograms {
+    Any {},
+    Only {
+        #[serde(with = "manifest_ids")]
+        manifests: Vec<ContentId>,
+    },
+}
+
+/// Operator files use printable IDs; signed DAG-CBOR keeps exact byte strings.
+mod manifest_ids {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        ids: &[ContentId],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .serialize(serializer)
+        } else {
+            ids.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<ContentId>, D::Error> {
+        // Internally tagged enum buffering loses the format's human-readable
+        // flag. Canonical policy decoding independently requires byte-for-byte
+        // re-encoding, so text IDs cannot enter signed DAG-CBOR policy bytes.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Ids {
+            Text(Vec<String>),
+            Bytes(Vec<ContentId>),
+        }
+        match Ids::deserialize(deserializer)? {
+            Ids::Text(ids) => ids
+                .into_iter()
+                .map(|id| id.parse().map_err(serde::de::Error::custom))
+                .collect(),
+            Ids::Bytes(ids) => Ok(ids),
+        }
+    }
+}
+impl ComputePrograms {
+    pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
+        if let Self::Only { manifests } = self {
+            if manifests.is_empty() || manifests.len() > MAX_COMPUTE_PROGRAMS {
+                return Err(error(
+                    "compute admission requires a bounded, nonempty manifest list",
+                ));
+            }
+            if manifests.iter().collect::<BTreeSet<_>>().len() != manifests.len() {
+                return Err(error("duplicate compute manifest"));
+            }
+        }
+        Ok(())
+    }
+    fn admits(&self, manifest: &ProgramManifest) -> bool {
+        match self {
+            Self::Any {} => true,
+            Self::Only { manifests } => manifests.contains(&manifest.content_id()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,8 +115,13 @@ pub enum CapacityDomain {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Admission {
-    Compute { evaluator: String },
-    Fetch { admission: FetchAdmission },
+    Compute {
+        evaluator: String,
+        programs: ComputePrograms,
+    },
+    Fetch {
+        admission: FetchAdmission,
+    },
 }
 impl Admission {
     pub const fn capacity_domain(&self) -> CapacityDomain {
@@ -60,20 +140,27 @@ impl Admission {
     }
     pub fn admits_manifest(&self, manifest: &ProgramManifest) -> bool {
         match self {
-            Self::Compute { evaluator } => {
+            Self::Compute {
+                evaluator,
+                programs,
+            } => {
                 evaluator == compute::EVALUATOR
                     && manifest.application().evaluator() == evaluator
                     && manifest.application().adaptor() == compute::ADAPTOR
+                    && programs.admits(manifest)
             }
             Self::Fetch { admission } => manifest == &admission.contract.manifest(),
         }
     }
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         match self {
-            Self::Compute { evaluator } => {
+            Self::Compute {
+                evaluator,
+                programs,
+            } => {
                 Application::new(evaluator.clone(), compute::ADAPTOR)
                     .map_err(|e| error(e.to_string()))?;
-                Ok(())
+                programs.validate()
             }
             Self::Fetch { admission } => admission.validate(),
         }
