@@ -185,7 +185,7 @@ enum Commands {
     #[cfg(unix)]
     /// Create, list and destroy machines through a configured provider.
     Machines(machines::MachinesArgs),
-    /// Introduce the principal with a signed contact card, or save a friend's.
+    /// Introduce the principal with a signed contact card, or save a contact's.
     Contact {
         #[command(subcommand)]
         command: commands::contributions::ContactCommand,

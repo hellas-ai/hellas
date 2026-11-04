@@ -27,11 +27,11 @@ passkey session; without it, the node key of `--identity` opens a daily session:
 ```sh
 hellas --identity node.identity admin --profile operator.json status
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
 hellas --identity node.identity admin --profile operator.json work allowance.json
-hellas --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
+hellas --identity node.identity admin --profile operator.json work export.json --offer-out recipient.offer
 hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
@@ -304,39 +304,85 @@ secrets. `credential_claimed` is an unverified locator; only `verified=true` sup
 an actor validated by this node. A revoked credential or wrong session binding cannot
 attribute a request to that actor.
 
-## Access bundles
+## Share a resource
 
-An access bundle shares allowances with one contact device: one signed offer per
-allowance, the authority ID, the contact's Auth grant ID, the credential subject,
-the node key of the contact's device, the credential ID and secret, the expiry and
-an optional provider label of at most 64 bytes. It contains no provider trust; the
-contact still approves a trust policy with `hellas trust` before running work.
+`admin share` gives one principal metered access to one resource declared by the
+node's grant configuration. It uses a verified contact card as the subject and
+an explicit `CredentialHolder` for the receiving device. A principal can have
+many devices; a contact card never chooses one. Sharing with yourself follows
+the same metered path.
+
+On the receiving device, export its principal's contact card and device holder:
 
 ```sh
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
-hellas --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
+hellas --passkey me.passkey contact export --display-name me --out me.contact
+hellas --identity laptop.identity identity show-holder > me.holder
 ```
 
-`export-bundle` takes `--allowance` once per shared allowance, at most 16. The
-credential scope must grant `work.execute` on each of them; `--grant-id` names the
-contact's existing grant with those permissions, not an allowance ID. It exports
-each allowance's offer (`work.offer.export`), then prepares one credential bounded
-by the scope, held by the contact device named by `--holder`. It saves the bundle
-before submitting the verifier, exactly as `issue-credential` does. The bundle is canonical DAG-CBOR tagged
-`hellas.access-bundle.v2`. Its subject and holder carry their curve tags. It is
-written as a new private file that never replaces an existing one. A failed or
-unconfirmed issuance leaves that bundle pending; inspect its reported credential
-ID before sharing it. The secret is never printed.
+Give both files to the node administrator. The administrator selects the
+configured resource name; its account comes from the node's configuration:
 
-`offer import-bundle` accepts the received bundle file as it is; delete it after
-importing, since it holds the credential. It refuses a bundle whose subject is not
-the `--passkey` principal or whose holder is not this device's node key, and verifies
-each offer's provider signature. It saves each offer as `NAME.POLICY`, after the
-offer's first policy, as `offer import` does, and installs one remote-only Work
-profile (`profile.json` and a private `credential`) under `accesses/NAME` in the
-principal's data directory, refusing a non-empty directory. It prints each saved
-offer name with its grant ID, and the profile path; use that path as
-`--work-profile` together with `--offer NAME.POLICY`.
+```sh
+hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+  share --contact me.contact --holder me.holder --resource klein \
+  --limit requests:total:100 --max-job 15m --expires 30d --label "My node" --out me.access
+```
+
+The command derives one pool, allowance and Auth grant per
+(authority, principal, resource). It creates the pool under the resource's
+configured account, then a subject budget with the supplied limits and one job
+in flight. The allowance admits only that resource, including its configured
+upstream account when applicable. Its grant carries only `work.execute` on the
+allowance. The node's machine and account limits continue to apply.
+
+Repeat `--limit METER:WINDOW:AMOUNT` for different meter/window pairs. Meters are
+`requests`, `input-tokens`, `output-tokens`, `device-millis` and `usd-micros`;
+windows are `hour`, `day`, `week` and `total`. Duplicate pairs are refused.
+Omitting all limits bounds concurrency and job duration only. `--max-job` is
+required and cannot exceed the node's configured maximum. Durations accept
+`ms`, `s`, `m`, `h` and `d`; `--expires` defaults to `30d` and must fit the
+administrator's issuance ceiling.
+
+A rerun uses the same identifiers and changes only differing budget/allowance
+terms with checked revisions, preserving usage and reservations. It resumes after
+an interrupted creation. With the same validity duration, an unchanged live grant
+keeps its original expiry, so a second device's share does not invalidate the
+first. A changed duration or an expired grant starts a new validity period on the
+same grant. A revoked grant stays revoked. Concurrent edits fail their revision
+check; inspect and rerun. Each successful call issues a new credential for the
+explicit holder, so use a new output path.
+
+## Access bundles
+
+`share` exports one signed offer and one new device-bound credential into a
+private access bundle. It also carries the authority, grant and subject IDs,
+holder, expiry and optional provider label (at most 64 bytes). It contains no
+provider trust. The bundle is canonical DAG-CBOR tagged
+`hellas.access-bundle.v2`; the secret is never printed.
+
+The bundle is saved before the credential verifier is submitted, as with
+`issue-credential`. The output never replaces an existing file. Failed or
+unconfirmed issuance leaves that bundle pending: inspect its reported credential
+ID before distributing it or retrying issuance.
+
+On the receiving device:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey offer import-bundle me.access --name box
+```
+
+Import refuses a different principal or device and verifies the provider's offer
+signature. It installs offers as `NAME.POLICY` and a remote Work profile under
+`accesses/NAME` in the principal's data directory, refusing a non-empty profile
+directory. It prints the offer names, grant IDs and profile path. Delete the
+received bundle after importing, since it contains the credential secret.
+
+Use the printed profile path as `--work-profile` with the imported offer,
+its exact `--resource` ID and a durable `--attempt` record when executing
+`transact --job DIR --offer NAME.POLICY`.
+
+`admin work` and `admin grant` remain the typed primitive commands for custom
+administration.
 
 ## Explicit offline initialization and recovery
 

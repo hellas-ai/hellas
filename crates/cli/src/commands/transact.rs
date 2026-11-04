@@ -56,22 +56,26 @@ impl std::str::FromStr for Provider {
     }
 }
 
-fn duration(value: &str) -> Result<Duration, String> {
+pub(crate) fn duration(value: &str) -> Result<Duration, String> {
     let (digits, scale) = if let Some(value) = value.strip_suffix("ms") {
         (value, 1)
     } else if let Some(value) = value.strip_suffix('s') {
         (value, 1000)
     } else if let Some(value) = value.strip_suffix('m') {
         (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
+    } else if let Some(value) = value.strip_suffix('d') {
+        (value, 86_400_000)
     } else {
-        return Err("timeout needs a unit: ms, s or m".into());
+        return Err("duration needs a unit: ms, s, m, h or d".into());
     };
     let millis = digits
         .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(scale))
         .filter(|n| *n > 0)
-        .ok_or("timeout must be positive and bounded")?;
+        .ok_or("duration must be positive and bounded")?;
     Ok(Duration::from_millis(millis))
 }
 

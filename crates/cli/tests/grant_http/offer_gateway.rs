@@ -860,54 +860,23 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         });
     let host = OfferHost::start_with_policy(None, None, None, policy).await;
-    let root = host.root();
+    let root_path = host.root().to_path_buf();
+    let root = root_path.as_path();
     let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
         .unwrap()
         .authority;
-    let now = auth::UnixMillis::now().unwrap_or_default();
-    let scope = auth::GrantSpec {
-        authority,
-        subject: host.client.principal(),
-        permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
-                .unwrap(),
-            resource: hellas_authority::grant_service::allowance_resource(authority, host.id),
-        }]
-        .into(),
-        not_before: now,
-        expires: auth::UnixMillis(now.0 + 600_000),
-        delegation_depth: 0,
-        issuance: None,
-    };
-    let shared = GrantId([5; 16]);
-    let grant = request_file(
-        root,
-        &auth::GrantCommand::Issue {
-            authorization: host.root_grant,
-            id: shared,
-            spec: scope.clone(),
-        },
-    );
-    host.provider
-        .run(&[
-            "admin",
-            "--profile",
-            string(&host.provider_profile),
-            "--control-socket",
-            string(&host.socket),
-            "grant",
-            string(&grant),
-        ])
-        .await;
-    let scope_file = root.join("bundle-scope.json");
-    std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
     let bundle = root.join("client.access");
-    let export = |allowance: String, out: PathBuf, holder: PathBuf| {
-        let (provider, profile, socket, scope_file) = (
+    let contact = root.join("contact");
+    let export = |resource: String,
+                  out: PathBuf,
+                  holder: PathBuf,
+                  limit: &'static str,
+                  max_job: &'static str| {
+        let (provider, profile, socket, contact) = (
             &host.provider,
             host.provider_profile.clone(),
             host.socket.clone(),
-            scope_file.clone(),
+            contact.clone(),
         );
         async move {
             provider
@@ -917,13 +886,17 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
                     string(&profile),
                     "--control-socket",
                     string(&socket),
-                    "export-bundle",
-                    "--allowance",
-                    &allowance,
-                    "--grant-id",
-                    &hex::encode(shared.0),
-                    "--credential-scope",
-                    string(&scope_file),
+                    "share",
+                    "--contact",
+                    string(&contact),
+                    "--resource",
+                    &resource,
+                    "--limit",
+                    limit,
+                    "--max-job",
+                    max_job,
+                    "--expires",
+                    "5m",
                     "--holder",
                     string(&holder),
                     "--out",
@@ -932,25 +905,188 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
                 .await
         }
     };
-    // A scope without work.execute on an allowance cannot share it.
     let refused = export(
-        hex::encode([77; 16]),
+        "missing".into(),
         root.join("refused.access"),
         host.client.holder_file().await,
+        "requests:total:100",
+        "5s",
     )
     .await;
     assert!(!refused.status.success());
     assert!(!root.join("refused.access").exists());
+    let holder_file = host.client.holder_file().await;
+    // Failure after budgets were created is resumable: the corrected call
+    // reuses them at revision 1 and creates only the missing allowance/grant.
+    let interrupted = export(
+        "glm".into(),
+        root.join("interrupted.access"),
+        holder_file.clone(),
+        "requests:total:100",
+        "11s",
+    )
+    .await;
+    assert!(!interrupted.status.success());
+    assert!(!root.join("interrupted.access").exists());
     let exported = export(
-        hex::encode(host.id.0),
+        "glm".into(),
         bundle.clone(),
-        host.client.holder_file().await,
+        holder_file.clone(),
+        "requests:total:100",
+        "5s",
     )
     .await;
     assert!(
         exported.status.success(),
         "{}",
         String::from_utf8_lossy(&exported.stderr)
+    );
+    let shared: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let allowance: GrantId = shared["allowance"].as_str().unwrap().parse().unwrap();
+    let grant: GrantId = shared["grant"].as_str().unwrap().parse().unwrap();
+    assert_eq!(shared["authority"], authority.to_string());
+    assert_eq!(shared["subject"], host.client.principal().to_string());
+    let inspect = |query| {
+        let path = request_file(root, &query);
+        let host = &host;
+        async move {
+            serde_json::from_str::<auth::AuthorityInspection>(
+                &host
+                    .provider
+                    .run(&[
+                        "admin",
+                        "--profile",
+                        string(&host.provider_profile),
+                        "--control-socket",
+                        string(&host.socket),
+                        "inspect",
+                        string(&path),
+                    ])
+                    .await,
+            )
+            .unwrap()
+        }
+    };
+    let grant_before = inspect(auth::InspectionQuery::Grant { id: grant }).await;
+    let unchanged = export(
+        "glm".into(),
+        root.join("unchanged.access"),
+        holder_file.clone(),
+        "requests:total:100",
+        "5s",
+    )
+    .await;
+    assert!(
+        unchanged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+    let repeated: Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    for field in ["pool", "allowance", "grant", "expires"] {
+        assert_eq!(shared[field], repeated[field]);
+    }
+    let grant_after = inspect(auth::InspectionQuery::Grant { id: grant }).await;
+    let auth::InspectionRecords::Grants {
+        records: before, ..
+    } = grant_before.records
+    else {
+        panic!()
+    };
+    let auth::InspectionRecords::Grants { records: after, .. } = grant_after.records else {
+        panic!()
+    };
+    assert_eq!(
+        before, after,
+        "an unchanged share does not revise the grant"
+    );
+    let WorkControlReply::Status {
+        allowance: current, ..
+    } = admin(
+        &host.provider,
+        &host.provider_profile,
+        &host.socket,
+        WorkControlCommand::Inspect { id: allowance },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(current.revision, auth::Revision(1));
+    // Resume after the allowance was paused, and revise limits and max job on
+    // the same identifiers rather than creating fresh counters.
+    admin(
+        &host.provider,
+        &host.provider_profile,
+        &host.socket,
+        WorkControlCommand::Revise {
+            id: allowance,
+            expected_revision: current.revision,
+            terms: AllowanceTerms {
+                policies: current.policies.clone(),
+                budget: current.budget,
+                max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
+                enabled: false,
+                allow_account_backed: true,
+            },
+        },
+    )
+    .await;
+    let revised = export(
+        "glm".into(),
+        root.join("revised.access"),
+        holder_file.clone(),
+        "requests:total:101",
+        "6s",
+    )
+    .await;
+    assert!(
+        revised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    let revised: Value = serde_json::from_slice(&revised.stdout).unwrap();
+    for field in ["pool", "allowance", "grant"] {
+        assert_eq!(shared[field], revised[field]);
+    }
+    let WorkControlReply::Status {
+        allowance: current, ..
+    } = admin(
+        &host.provider,
+        &host.provider_profile,
+        &host.socket,
+        WorkControlCommand::Inspect { id: allowance },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(current.revision, auth::Revision(3));
+    let WorkControlReply::Budget { definition, .. } = admin(
+        &host.provider,
+        &host.provider_profile,
+        &host.socket,
+        WorkControlCommand::InspectBudget {
+            node: current.budget,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(definition.revision, auth::Revision(2));
+    assert_eq!(definition.limits[0].amount, 101);
+    // An existing output is never replaced, even when the rest is resumable.
+    assert!(
+        !export(
+            "glm".into(),
+            bundle.clone(),
+            holder_file,
+            "requests:total:101",
+            "6s"
+        )
+        .await
+        .status
+        .success()
     );
     // Another device of the same principal cannot import the credential.
     let other_device = Cli::new(root, "client-laptop", FRIEND_PASSKEY);
@@ -972,6 +1108,25 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
     );
+    // A second device gets its own credential on the same share. The first
+    // device's original credential must continue to execute below.
+    let laptop = export(
+        "glm".into(),
+        root.join("laptop.access"),
+        other_device.holder_file().await,
+        "requests:total:101",
+        "6s",
+    )
+    .await;
+    assert!(
+        laptop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&laptop.stderr)
+    );
+    let laptop: Value = serde_json::from_slice(&laptop.stdout).unwrap();
+    assert_eq!(laptop["grant"], shared["grant"]);
+    assert_eq!(laptop["allowance"], shared["allowance"]);
+    assert_ne!(laptop["credential_id"], shared["credential_id"]);
     let imported: Value = serde_json::from_str(
         &host
             .client
@@ -986,7 +1141,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     )
     .unwrap();
     assert_eq!(imported["offers"][0]["name"], "shared.glm");
-    assert_eq!(imported["offers"][0]["grant"], hex::encode(host.id.0));
+    assert_eq!(imported["offers"][0]["grant"], hex::encode(allowance.0));
     // The same imported bundle works directly through the CLI, without an
     // HTTP gateway or any chain funding. Retry must not consume it twice.
     let request = hellas_rpc::http_fetch::HttpFetchRequest {
@@ -1040,7 +1195,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "--output",
         string(&result_dir),
     ];
-    let wrong_resource = hellas_auth::Digest::hash(b"another resource").to_string();
     let wrong_provider = hellas_sdk::client::ProviderAddress {
         enrollment: hellas_rpc::ContentId::from_bytes([99; 32]),
         node: hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
@@ -1048,16 +1202,11 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             .node,
     }
     .to_string();
-    for (flag, value) in [
-        ("--resource", &wrong_resource),
-        ("--provider", &wrong_provider),
-    ] {
-        let mut refused = args.to_vec();
-        let at = refused.iter().position(|arg| *arg == flag).unwrap();
-        refused[at + 1] = value;
-        assert!(!host.client.output(&refused).await.status.success());
-        assert!(!attempt.exists());
-    }
+    let mut refused = args.to_vec();
+    let at = refused.iter().position(|arg| *arg == "--provider").unwrap();
+    refused[at + 1] = &wrong_provider;
+    assert!(!host.client.output(&refused).await.status.success());
+    assert!(!attempt.exists());
     assert!(!other_device.output(&args).await.status.success());
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
     for _ in 0..2 {

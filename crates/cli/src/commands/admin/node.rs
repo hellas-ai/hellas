@@ -20,11 +20,10 @@ use hellas_rpc::{
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
 };
-use hellas_sdk::{
-    access_bundle::{AccessBundle, MAX_BUNDLE_OFFERS, MAX_LABEL_BYTES},
-    node_control::{self, profile},
-};
+use hellas_sdk::node_control::{self, profile};
+mod share;
 use hellas_wire::{ServiceMarker, StreamTransport};
+use share::{ShareRequest, share};
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -279,92 +278,32 @@ where
                 })
             );
         }
-        AdminCommand::ExportBundle {
-            allowances,
-            grant_id,
-            credential_scope,
+        AdminCommand::Share {
+            contact,
             holder,
+            resource,
+            limits,
+            max_job,
+            expires,
             label,
             out,
         } => {
-            ensure!(!out.try_exists()?, "bundle output already exists");
-            ensure!(
-                label
-                    .as_ref()
-                    .is_none_or(|label| label.len() <= MAX_LABEL_BYTES),
-                "label exceeds {MAX_LABEL_BYTES} bytes"
-            );
-            ensure!(
-                allowances.len() <= MAX_BUNDLE_OFFERS,
-                "a bundle shares at most {MAX_BUNDLE_OFFERS} allowances"
-            );
-            let grant: GrantId = grant_id
-                .parse()
-                .context("grant ID must be 16 bytes of hex")?;
-            let scope: GrantSpec = read(&credential_scope)?;
-            let CredentialHolder::Node(holder) = read(&holder)? else {
-                anyhow::bail!("a contact's credential is held by the contact's device");
-            };
-            let mut offers = Vec::with_capacity(allowances.len());
-            for allowance in &allowances {
-                let allowance: GrantId = allowance
-                    .parse()
-                    .context("allowance must be 16 bytes of hex")?;
-                ensure!(
-                    scope.permissions.iter().any(|p| {
-                        p.operation.as_str() == hellas_authority::grant_service::WORK_EXECUTE
-                            && p.resource
-                                == hellas_authority::grant_service::allowance_resource(
-                                    scope.authority,
-                                    allowance,
-                                )
-                    }),
-                    "the credential scope must grant work.execute on allowance {allowance}"
-                );
-                let request = WorkControlCommand::Offers {
-                    id: Some(allowance),
-                };
-                let WorkControlReply::Offers(found) =
-                    work(&client, authorization, &request).await?
-                else {
-                    anyhow::bail!("offer reply required")
-                };
-                let Ok([offer]) = <[_; 1]>::try_from(found) else {
-                    anyhow::bail!("allowance {allowance} needs one active offer")
-                };
-                offers.push(offer);
-            }
-            let (prepared, credential) =
-                Credential::prepare(scope.clone(), CredentialHolder::Node(holder), generation)?;
-            let id = hex::encode(credential.id().0);
-            let bundle = AccessBundle {
-                offers,
-                authority: scope.authority,
-                authorization: grant,
-                subject: scope.subject,
-                holder,
-                credential,
-                expires: scope.expires,
+            let request = ShareRequest {
+                contact: hellas_authority::model::grant::records::decode_contact_card(
+                    &hellas_private::read_bounded_regular_file(
+                        &contact,
+                        hellas_authority::model::grant::records::MAX_CONTACT_CARD_BYTES,
+                    )?,
+                )?,
+                holder: read(&holder)?,
+                resource,
+                limits,
+                max_job,
+                expires,
                 label,
+                out,
             };
-            bundle.save(&out)?;
-            issue(&client, authorization, &prepared).await.with_context(|| format!(
-                "bundle credential {id} is retained at {} pending confirmation; inspect Credential {{ id }} before sharing it or retrying issuance",
-                out.display(),
-            ))?;
-            for offer in &bundle.offers {
-                offer_fingerprints(offer)?;
-            }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "credential_id": id, "revision": 1, "bundle_file": out,
-                    "subject": hex::encode(scope.subject.as_bytes()),
-                    "subject_fingerprint": scope.subject.fingerprint(),
-                    "authority": hex::encode(scope.authority.0.as_bytes()),
-                    "allowances": allowances,
-                })
-            );
+            share(&client, authorization, generation, request).await?;
         }
         AdminCommand::RevokeCredential {
             credential_id,
