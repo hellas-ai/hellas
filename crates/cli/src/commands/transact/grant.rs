@@ -38,7 +38,7 @@ impl GrantResult {
             &directory.join("result.json"),
             &serde_json::to_vec_pretty(&serde_json::json!({
                 "job": job.digest().to_string(), "provider": self.provider.to_string(),
-                "funding": "grant", "resource": self.resource.0.to_string(),
+                "funding": "grant", "resource": self.resource.to_string(),
                 "work": self.attempt.inspect()?.work.context("completed grant has no work ID")?.to_string(),
                 "outcome": self.retained.output.outcome,
             }))?,
