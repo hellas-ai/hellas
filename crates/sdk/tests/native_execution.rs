@@ -1156,19 +1156,15 @@ async fn paid_finish(case: PaidScenario) {
     Box::pin(advance_offline(&mut devnet, &relays)).await;
     let offline_tip = devnet.height();
     assert_eq!(offline_tip - old_cursor, 3);
-    relays
-        .source
-        .replay
-        .store(2, std::sync::atomic::Ordering::SeqCst);
-    let attempts = relays
-        .source
-        .attempts
-        .load(std::sync::atomic::Ordering::SeqCst);
+    // Only the reopening client uses these listeners; the live provider keeps
+    // polling its original source without contaminating the proof-read count.
+    let mut stale_relays = remote::Relays::start_at(&devnet, 2, Duration::ZERO).await;
     // Selection refuses a source below the retained floor before requesting
     // object proofs. With every relay stale, recovery must return its typed
     // bounded error rather than wait for a proof read that cannot occur.
     let source_timeout = Duration::from_secs(1);
     let mut stale_options = options.clone();
+    stale_options.config.validators = stale_relays.urls.clone();
     stale_options.timeout = Some(source_timeout);
     let error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1196,18 +1192,15 @@ async fn paid_finish(case: PaidScenario) {
         "expected a below-floor source timeout: {error}",
     );
     assert_eq!(
-        relays
+        stale_relays
             .source
             .attempts
             .load(std::sync::atomic::Ordering::SeqCst),
-        attempts,
+        0,
         "a stale source is rejected before reading object proofs",
     );
     assert_eq!(approvals.0.lock().unwrap().len(), 1);
-    relays
-        .source
-        .replay
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    stale_relays.shutdown().await;
     let mut recovered = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
