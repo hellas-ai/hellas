@@ -27,6 +27,8 @@ pub enum Error {
     },
     #[error("provider returned HTTP {0}; response body withheld")]
     HttpStatus(reqwest::StatusCode),
+    #[error("RunPod reports no instances available for the requested GPU and cloud tier")]
+    CapacityUnavailable,
     #[error("provider response exceeds the size limit")]
     ResponseBound,
     #[error("invalid provider response")]
