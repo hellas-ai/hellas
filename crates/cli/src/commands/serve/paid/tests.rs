@@ -56,9 +56,11 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
         Arc::new(|| UnixMillis::now().unwrap()),
     )
     .unwrap();
-    let admin =
-        WorkAdministration::new(service, vec![], std::num::NonZeroU64::new(90_000).unwrap())
-            .unwrap();
+    let admin = WorkAdministration::new(
+        service,
+        Default::default(),
+        std::num::NonZeroU64::new(90_000).unwrap(),
+    );
     // A daemon with only its node identity cannot install or alter paid terms.
     assert!(paid.configure(&admin, Some(&credential)).await.is_err());
     assert!(admin.node().paid_policy().await.unwrap().is_none());
