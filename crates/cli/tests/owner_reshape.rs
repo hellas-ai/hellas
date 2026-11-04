@@ -268,6 +268,54 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         let found = coin(&client, swept).await;
         assert_eq!(found.owner.into_kernel(), owner);
         assert_eq!(found.delegate, None);
+        if owner == passkey.party_key() {
+            assert!(
+                OwnerReshape::pay(&client, network, owner, &[swept], native.party_key(), 0)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                OwnerReshape::pay(&client, network, owner, &[swept], native.party_key(), 1001)
+                    .await
+                    .is_err()
+            );
+            let mut send = command(home.path());
+            send.arg("--passkey")
+                .arg(&key_path)
+                .args(["chain", "send", "--rpc", &rpc, "--genesis"])
+                .arg(&genesis_path)
+                .arg("--trust")
+                .arg(&trust_path)
+                .args([
+                    "--coin",
+                    &hex::encode(swept.to_bytes()),
+                    "--to",
+                    &SettlementKey::from(native.party_key()).to_string(),
+                    "--amount",
+                    "37",
+                ]);
+            let output = output(send);
+            let ids: Vec<_> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("coin_id "))
+                .map(|id| CoinId::from_bytes(hex::decode(id).unwrap().try_into().unwrap()))
+                .collect();
+            assert_eq!(ids.len(), 2);
+            let payment = coin(&client, ids[0]).await;
+            let change = coin(&client, ids[1]).await;
+            assert_eq!(payment.owner.into_kernel(), native.party_key());
+            assert_eq!(payment.value, 37);
+            assert_eq!(payment.delegate, None);
+            assert_eq!(change.owner.into_kernel(), owner);
+            assert_eq!(change.value, 963);
+            assert_eq!(change.delegate, None);
+            assert!(
+                OwnerReshape::pay(&client, network, owner, &[swept], native.party_key(), 37)
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
 

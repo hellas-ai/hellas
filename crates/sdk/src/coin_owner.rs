@@ -24,6 +24,8 @@ pub enum CoinOwnerError {
     Missing(CoinId),
     #[error("split requires a positive delegated value within the selected balance")]
     Split,
+    #[error("payment must be positive and no greater than the selected balance")]
+    Payment,
     #[error("selected coin values overflow")]
     ValueOverflow,
     #[error("chain network does not match the requested signing network")]
@@ -33,7 +35,7 @@ pub enum CoinOwnerError {
 }
 
 /// The exact inputs and output an owner is asked to authorize.
-/// The output stays with that owner; only its delegation changes.
+/// Outputs either retain ownership or pay an explicitly selected recipient.
 #[derive(Debug, Clone)]
 pub struct OwnerReshape {
     network: NetworkId,
@@ -44,6 +46,32 @@ pub struct OwnerReshape {
 }
 
 impl OwnerReshape {
+    /// Pay a recipient from verified owner coins, returning undelegated change.
+    pub async fn pay<C: LightClient>(
+        chain: &C,
+        network: NetworkId,
+        owner: Key,
+        selected: &[CoinId],
+        recipient: Key,
+        amount: u64,
+    ) -> Result<Self, CoinOwnerError> {
+        let mut plan = Self::prepare(chain, network, owner, selected, None, None).await?;
+        let balance = plan.outputs.as_slice()[0].value();
+        if amount == 0 || amount > balance {
+            return Err(CoinOwnerError::Payment);
+        }
+        let mut outputs = [Payout::new(owner, 0); MAX_EDGE_OUTPUTS];
+        outputs[0] = Payout::new(recipient, amount);
+        let count = if amount < balance {
+            outputs[1] = Payout::new(owner, balance - amount);
+            2
+        } else {
+            1
+        };
+        plan.outputs = List::take(outputs, count);
+        Ok(plan)
+    }
+
     /// Read the selected live coins at one finalized block. `None` reclaims
     /// them without a delegate; `Some(node)` delegates the resulting coin.
     pub async fn prepare<C: LightClient>(
