@@ -659,9 +659,14 @@ async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access
     let loader: host::GatewayAccessLoader = {
         let loads = loads.clone();
         Arc::new(move || {
-            loads.fetch_add(1, Ordering::SeqCst);
+            let attempt = loads.fetch_add(1, Ordering::SeqCst);
             let access = access.clone();
-            Box::pin(async move { Ok(access) })
+            Box::pin(async move {
+                if attempt == 0 {
+                    return Err(std::io::Error::other("transient loader failure").into());
+                }
+                Ok(access)
+            })
         })
     };
     let (tls, client_tls) = tls_configs();
@@ -698,6 +703,19 @@ async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access
     .await
     .unwrap()
     .0;
+    assert_eq!(
+        client
+            .set_gateway_state(gateway_state(true))
+            .await
+            .unwrap_err()
+            .code(),
+        WireCode::Unavailable
+    );
+    let failed = client
+        .get_host_status(read_request(ROOT_GRANT))
+        .await
+        .unwrap();
+    assert_eq!(failed.gateway.unwrap().state, RuntimeState::Failed as i32);
     for enabled in [true, false, true, false] {
         let result = client
             .set_gateway_state(gateway_state(enabled))
@@ -712,7 +730,7 @@ async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access
             } as i32
         );
     }
-    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
     host.shutdown().await.unwrap();
     remote.shutdown().await;
 }
