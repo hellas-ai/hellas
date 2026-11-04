@@ -18,51 +18,9 @@ pub const MAX_COMPUTE_PROGRAMS: usize = 64;
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ComputePrograms {
     Any {},
-    Only {
-        #[serde(with = "manifest_ids")]
-        manifests: Vec<ContentId>,
-    },
+    Only { manifests: Vec<ContentId> },
 }
 
-/// Operator files use printable IDs; signed DAG-CBOR keeps exact byte strings.
-mod manifest_ids {
-    use super::*;
-
-    pub fn serialize<S: serde::Serializer>(
-        ids: &[ContentId],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            ids.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .serialize(serializer)
-        } else {
-            ids.serialize(serializer)
-        }
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<ContentId>, D::Error> {
-        // Internally tagged enum buffering loses the format's human-readable
-        // flag. Canonical policy decoding independently requires byte-for-byte
-        // re-encoding, so text IDs cannot enter signed DAG-CBOR policy bytes.
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Ids {
-            Text(Vec<String>),
-            Bytes(Vec<ContentId>),
-        }
-        match Ids::deserialize(deserializer)? {
-            Ids::Text(ids) => ids
-                .into_iter()
-                .map(|id| id.parse().map_err(serde::de::Error::custom))
-                .collect(),
-            Ids::Bytes(ids) => Ok(ids),
-        }
-    }
-}
 impl ComputePrograms {
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         if let Self::Only { manifests } = self {

@@ -84,12 +84,69 @@ impl fmt::Debug for PublicKey {
     }
 }
 
+impl SignatureKind {
+    /// The curve name in a key's printable form.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Secp256k1 => "secp256k1",
+            Self::Ed25519 => "ed25519",
+            Self::P256 => "p256",
+        }
+    }
+}
+
+impl PublicKey {
+    fn from_parts(kind: SignatureKind, bytes: &[u8]) -> Result<Self, String> {
+        match kind {
+            SignatureKind::Secp256k1 => fixed(bytes, "secp256k1 public key").map(Self::Secp256k1),
+            SignatureKind::Ed25519 => fixed(bytes, "Ed25519 public key").map(Self::Ed25519),
+            SignatureKind::P256 => fixed(bytes, "P-256 public key").map(Self::P256),
+        }
+    }
+}
+
+/// `<curve>:<lowercase hex>`, e.g. `p256:03d5…`.
+impl fmt::Display for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.kind().name(), hex::encode(self.bytes()))
+    }
+}
+
+impl std::str::FromStr for PublicKey {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (name, key) = text
+            .split_once(':')
+            .ok_or("public keys are written <curve>:<hex>")?;
+        let kind = [
+            SignatureKind::Secp256k1,
+            SignatureKind::Ed25519,
+            SignatureKind::P256,
+        ]
+        .into_iter()
+        .find(|kind| kind.name() == name)
+        .ok_or_else(|| format!("unknown public key curve {name:?}"))?;
+        if key.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("public keys are lowercase hexadecimal".into());
+        }
+        let bytes = hex::decode(key).map_err(|error| format!("invalid public key hex: {error}"))?;
+        Self::from_parts(kind, &bytes)
+    }
+}
+
+/// Human-readable formats carry the printable form; binary formats keep the
+/// tagged byte string.
 impl Serialize for PublicKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        (self.kind(), serde_bytes::Bytes::new(self.bytes())).serialize(serializer)
+        if serializer.is_human_readable() {
+            serializer.collect_str(self)
+        } else {
+            (self.kind(), serde_bytes::Bytes::new(self.bytes())).serialize(serializer)
+        }
     }
 }
 
@@ -98,19 +155,14 @@ impl<'de> Deserialize<'de> for PublicKey {
     where
         D: Deserializer<'de>,
     {
+        if deserializer.is_human_readable() {
+            return String::deserialize(deserializer)?
+                .parse()
+                .map_err(D::Error::custom);
+        }
         let (kind, bytes): (SignatureKind, serde_bytes::ByteBuf) =
             Deserialize::deserialize(deserializer)?;
-        match kind {
-            SignatureKind::Secp256k1 => fixed(bytes.as_ref(), "secp256k1 public key")
-                .map(Self::Secp256k1)
-                .map_err(D::Error::custom),
-            SignatureKind::Ed25519 => fixed(bytes.as_ref(), "Ed25519 public key")
-                .map(Self::Ed25519)
-                .map_err(D::Error::custom),
-            SignatureKind::P256 => fixed(bytes.as_ref(), "P-256 public key")
-                .map(Self::P256)
-                .map_err(D::Error::custom),
-        }
+        Self::from_parts(kind, bytes.as_ref()).map_err(D::Error::custom)
     }
 }
 

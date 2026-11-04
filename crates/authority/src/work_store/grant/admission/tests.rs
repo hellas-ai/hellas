@@ -34,7 +34,7 @@ async fn reserved_checkpoint_space_covers_maximum_metadata() {
     for field in ["generation", "before", "credential_revision", "at"] {
         caller[field] = serde_json::json!(u64::MAX);
     }
-    caller["credential"] = serde_json::json!(vec![255u8; 16]);
+    caller["credential"] = serde_json::json!(hellas_auth::authority::CredentialId([255; 16]));
     execution.caller = serde_json::from_value(caller).unwrap();
     execution.lineage = (0..=MAX_DELEGATION_DEPTH)
         .map(|n| (GrantId([255 - n; 16]), Revision(u64::MAX)))
