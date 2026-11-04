@@ -117,11 +117,22 @@ curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/${ar
 curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf "$archive"
-./bin/hellas --version
+export PATH="$PWD/bin:$PATH"
+hellas --version
 ```
 
-Stage 0 is your own worker. Prepare its resource configuration, machine/account
-budgets, model content and owner bootstrap scopes as described in
+Stage 0 is your own worker. Use Whisper tiny and a short `speech.wav` recording.
+Follow the [Whisper conversion recipe](docs/paid-gateway.md) to create the client
+package:
+
+```sh
+hellas convert-whisper --checkpoint ./whisper-tiny-original --output ./whisper-tiny
+```
+
+Keep that converted directory on the client. Put its `weights.bf16` under
+`/srv/hellas/content/whisper-tiny/` on the provider; the provider only needs the
+weights. Prepare resource `whisper-tiny`, its machine/account budgets and owner
+bootstrap scopes as described in
 [node administration](docs/admin.md#explicit-offline-initialization-and-recovery).
 Start a persistent HIP worker (use the matching `sha-REVISION-hip` tag):
 
@@ -139,6 +150,7 @@ save it as `invitation.json`. Bootstrap it with your passkey and the prepared
 scopes; the invitation pins its transport node:
 
 ```sh
+hellas --identity laptop.identity --software-root identity init
 hellas --identity laptop.identity --passkey owner.passkey admin bootstrap-remote \
   --invitation invitation.json --root-grant 01010101010101010101010101010101 \
   --administrator administrator.json --credential-scope application-scope.json \
@@ -147,15 +159,16 @@ hellas --passkey owner.passkey contact export --display-name me --out me.contact
 hellas --identity laptop.identity identity show-holder > me.holder
 hellas --identity laptop.identity --passkey owner.passkey admin \
   --profile operator/profile.json --node NODE_PIN share \
-  --contact me.contact --holder me.holder --resource klein \
+  --contact me.contact --holder me.holder --resource whisper-tiny \
   --limit requests:total:100 --max-job 15m --out me.access
 hellas --identity laptop.identity --passkey owner.passkey offer import-bundle me.access --name box
-hellas --identity laptop.identity --passkey owner.passkey image \
-  --provider ENROLLMENT_ID@NODE_ID --offer box.klein --model ./klein --prompt "a fox"
+hellas --identity laptop.identity --passkey owner.passkey transcribe \
+  --provider ENROLLMENT_ID@NODE_ID --offer box.whisper-tiny \
+  --model ./whisper-tiny --audio speech.wav --language en
 ```
 
 Use the worker's independently checked node pin for `NODE_PIN` and its printed
-provider address for `ENROLLMENT_ID@NODE_ID`. The config owns resource `klein`
+provider address for `ENROLLMENT_ID@NODE_ID`. The config owns resource `whisper-tiny`
 and its account; `share` creates the per-principal budget, allowance, execution
 grant and device credential. Your own work consumes the allowance too.
 
