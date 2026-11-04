@@ -387,11 +387,50 @@ hellas --identity laptop.identity --passkey me.passkey image \
 
 `run`, `image` and `transcribe` accept either `--offer NAME.POLICY` or
 `--payment AMOUNT`. `transact --job DIR --offer NAME.POLICY` uses the same
-lookup. None of these grant commands needs `--work-profile` or `--resource`.
+profile lookup. A single-policy offer selects its resource automatically. An
+imported allowance with multiple policies also accepts `--resource ID` to select
+an exact resource explicitly; `--work-profile` is unnecessary.
 The signed provider enrollment must match `--provider`; Apple providers also
 require the caller's independently approved `--trust-store` and `--trust-policy`.
 Repeated jobs reuse durable attempts by offer and job; `--attempt FILE` selects
 an explicit record. See [jobs](jobs.md) for recovery and results.
+
+### Renew an imported share
+
+Rerunning an unexpired share with the same `--expires` duration keeps its original
+expiry. After it expires, the same duration starts a new validity period. To
+renew earlier, choose a different duration that fits the administrator's issuance
+ceiling, and repeat the desired limits and job duration:
+
+```sh
+hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+  share --contact me.contact --holder me.holder --resource klein \
+  --limit requests:total:100 --max-job 15m --expires 60d --out me-renewed.access
+```
+
+The example renews the earlier `30d` share for `60d`; it requires an issuance
+ceiling that permits that duration. Keep the new bundle private and deliver it
+to the same recipient device. Each call issues a new credential while retaining
+the pool, allowance and grant identifiers and their used counters.
+
+On that device, import the renewed bundle under a new alias. An existing profile
+directory is never overwritten, including with `--replace`:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
+hellas --identity laptop.identity --passkey me.passkey transact --job ./saved-job \
+  --provider ENROLLMENT_ID@NODE_ID --offer box-renewed.klein \
+  --attempt ./renewed-attempt.json --output ./renewed-result
+```
+
+Use the new alias in subsequent commands, and delete the received bundle after
+import. The explicit new attempt above executes the saved job once with the new
+credential and consumes the existing allowance. Changing only the alias does not
+request new work: the default attempt for an identical provider, allowance and
+job still replays its retained result. Keep old profiles and attempt records until
+unresolved work has been recovered. When retiring the previous credential, the
+administrator can use `admin revoke-credential` with its old credential ID; the
+shared grant remains the same.
 
 `admin work` and `admin grant` remain the typed primitive commands for custom
 administration.
@@ -440,18 +479,12 @@ PKCS#8 `control.key.der` under the node state root. The grant configuration can
 select absolute `control_certificate` and `control_private_key` paths alongside
 `journal_root` and `control_socket`. The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-After explicit initialization, start the daemon with `--grant-config`. The file
-contains `max_job_millis`, optional listener/state paths, and the budget tree down
-to accounts plus the resources the node serves:
-
-```json
-{
-  "max_job_millis": 900000,
-  "machine": {"max_in_flight": 4, "limits": []},
-  "accounts": [{"account": "ACCOUNT_ID", "max_in_flight": 4, "limits": []}],
-  "resources": [{"resource": "RESOURCE_ID", "account": "ACCOUNT_ID", "revision": 1, "...": "..."}]
-}
-```
+After explicit initialization, start the daemon with `--grant-config`. Its file
+contains `max_job_millis`, optional listener/state paths, machine/account budgets
+and complete resource policies. Resource entries require the full invocation
+policy and pricing fields accepted by the strict grant-config loader. The
+[README walkthrough](../README.md#own-a-worker-and-share-access) describes the
+Whisper owner setup.
 
 Serving resources requires `machine`; every resource's account must be declared in
 `accounts`, and every declared account must be used. Limits use the same

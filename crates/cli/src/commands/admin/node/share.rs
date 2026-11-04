@@ -68,6 +68,7 @@ async fn find_grant<T>(
     client: &HostControlClientImpl<T>,
     authorization: GrantId,
     id: GrantId,
+    mut page: AuthorityInspection,
 ) -> Result<Option<Grant>>
 where
     T: StreamTransport + Send + Sync,
@@ -77,7 +78,6 @@ where
     // lets the normal Issue command enforce absence and the issuance ceiling.
     let mut after = None;
     loop {
-        let page = inspect(client, authorization, InspectionQuery::Grants { after }).await?;
         let InspectionRecords::Grants { records, next } = page.records else {
             anyhow::bail!("grant inspection required")
         };
@@ -90,6 +90,7 @@ where
             "grant inspection did not advance"
         );
         after = Some(next);
+        page = inspect(client, authorization, InspectionQuery::Grants { after }).await?;
     }
 }
 
@@ -187,17 +188,19 @@ where
         .into_iter()
         .find(|policy| policy.name == request.resource)
         .with_context(|| format!("the node serves no resource named {:?}", request.resource))?;
-    let authority = inspect(
+    // A restricted issuer's own administrative grant can be outside its
+    // issuance ceiling. Page metadata is visible without exposing that grant.
+    let grants = inspect(
         client,
         authorization,
-        InspectionQuery::Grant { id: authorization },
+        InspectionQuery::Grants { after: None },
     )
-    .await?
-    .authority;
+    .await?;
+    let authority = grants.authority;
     let pool = PoolId(share_id("pool", authority, subject, policy.resource));
     let allowance = GrantId(share_id("allowance", authority, subject, policy.resource));
     let grant = GrantId(share_id("grant", authority, subject, policy.resource));
-    let old_grant = find_grant(client, authorization, grant).await?;
+    let old_grant = find_grant(client, authorization, grant, grants).await?;
     let spec = grant_spec(
         authority,
         subject,
@@ -372,6 +375,7 @@ where
         anyhow::bail!("offer reply required")
     };
     ensure!(offers.len() == 1, "share needs one active offer");
+    let provider = hellas_sdk::client::ProviderAddress::of(&offers[0].offer().provider)?;
     let (prepared, credential) =
         Credential::prepare(spec.clone(), CredentialHolder::Node(holder), generation)?;
     let id = credential.id();
@@ -398,6 +402,7 @@ where
             "bundle_file": request.out, "credential_id": id.to_string(),
             "subject": subject.to_string(), "subject_fingerprint": subject.fingerprint(),
             "authority": authority.to_string(), "resource": policy.name,
+            "provider": provider.to_string(),
             "allowance": allowance.to_string(), "grant": grant.to_string(),
             "pool": pool.to_string(), "expires": spec.expires.0,
         })

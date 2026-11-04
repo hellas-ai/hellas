@@ -850,6 +850,245 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renewal() {
+    use hellas_auth::authority as auth;
+    let host = OfferHost::start().await;
+    let root = host.root();
+    let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
+        .unwrap()
+        .authority;
+    let administrator = Cli::new(root, "sharing-admin", AGENT_PASSKEY);
+    administrator
+        .run(&["--software-root", "identity", "init"])
+        .await;
+    let authorization = GrantId([0x31; 16]);
+    let now = auth::UnixMillis::now().unwrap();
+    let machine = hellas_authority::node::machine_resource(authority);
+    let scope = auth::GrantSpec {
+        authority,
+        subject: administrator.principal(),
+        permissions: [
+            (
+                hellas_authority::work_store::grant::WORK_ALLOWANCE_READ,
+                machine,
+            ),
+            (
+                hellas_authority::work_store::grant::WORK_BUDGET_CONFIGURE,
+                machine,
+            ),
+            (
+                hellas_authority::work_store::grant::WORK_ALLOWANCE_CONFIGURE,
+                machine,
+            ),
+            (
+                hellas_authority::work_store::grant::WORK_OFFER_EXPORT,
+                machine,
+            ),
+            (auth::GRANT_ISSUE, authority.resource()),
+            (auth::GRANT_ADMINISTER, authority.resource()),
+            (auth::CREDENTIAL_ISSUE, authority.resource()),
+        ]
+        .into_iter()
+        .map(|(operation, resource)| auth::Permission {
+            operation: auth::OperationId::new(operation).unwrap(),
+            resource,
+        })
+        .collect(),
+        not_before: now,
+        expires: auth::UnixMillis(now.0 + 600_000),
+        delegation_depth: 0,
+        issuance: Some(auth::IssuanceCeiling {
+            operations: [
+                auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE).unwrap(),
+            ]
+            .into(),
+            resources: auth::CeilingResources::Authority,
+            max_validity_ms: 600_000,
+            max_delegation_depth: 0,
+        }),
+    };
+    let command = request_file(
+        root,
+        &auth::GrantCommand::Issue {
+            authorization: host.root_grant,
+            id: authorization,
+            spec: scope.clone(),
+        },
+    );
+    host.provider
+        .run(&[
+            "admin",
+            "--profile",
+            string(&host.provider_profile),
+            "--control-socket",
+            string(&host.socket),
+            "grant",
+            string(&command),
+        ])
+        .await;
+    let scope_file = root.join("sharing-admin-scope.json");
+    std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
+    let credential_file = root.join("sharing-admin.credential");
+    host.provider
+        .run(&[
+            "admin",
+            "--profile",
+            string(&host.provider_profile),
+            "--control-socket",
+            string(&host.socket),
+            "issue-credential",
+            "--scope",
+            string(&scope_file),
+            "--holder",
+            string(&administrator.holder_file().await),
+            "--credential-out",
+            string(&credential_file),
+        ])
+        .await;
+    let secret = hellas_sdk::node_control::profile::read_credential(&credential_file).unwrap();
+    let administrator_profile = profile(
+        root,
+        "sharing-admin-control",
+        authority,
+        authorization,
+        &secret,
+    );
+    let query = request_file(root, &auth::InspectionQuery::Grant { id: authorization });
+    let own = administrator
+        .output(&[
+            "admin",
+            "--profile",
+            string(&administrator_profile),
+            "--control-socket",
+            string(&host.socket),
+            "inspect",
+            string(&query),
+        ])
+        .await;
+    assert!(
+        !own.status.success(),
+        "an execution-only ceiling must not expose the administrative assignment"
+    );
+    assert!(String::from_utf8_lossy(&own.stderr).contains("authorization failed"));
+    let query = request_file(root, &auth::InspectionQuery::Grants { after: None });
+    let visible: auth::AuthorityInspection = serde_json::from_str(
+        &administrator
+            .run(&[
+                "admin",
+                "--profile",
+                string(&administrator_profile),
+                "--control-socket",
+                string(&host.socket),
+                "inspect",
+                string(&query),
+            ])
+            .await,
+    )
+    .unwrap();
+    assert_eq!(visible.authority, authority);
+    let auth::InspectionRecords::Grants { records, .. } = visible.records else {
+        panic!()
+    };
+    assert!(!records.iter().any(|grant| grant.id() == authorization));
+
+    let contact = root.join("contact");
+    let holder = host.client.holder_file().await;
+    let share = async |out: &Path, expires: &str| {
+        let output = administrator
+            .run(&[
+                "admin",
+                "--profile",
+                string(&administrator_profile),
+                "--control-socket",
+                string(&host.socket),
+                "share",
+                "--contact",
+                string(&contact),
+                "--holder",
+                string(&holder),
+                "--resource",
+                "glm",
+                "--limit",
+                "requests:total:100",
+                "--max-job",
+                "5s",
+                "--expires",
+                expires,
+                "--out",
+                string(out),
+            ])
+            .await;
+        serde_json::from_str::<Value>(&output).unwrap()
+    };
+    let first_file = root.join("restricted.access");
+    let first = share(&first_file, "5m").await;
+    let first_import: Value = serde_json::from_str(
+        &host
+            .client
+            .run(&[
+                "offer",
+                "import-bundle",
+                string(&first_file),
+                "--name",
+                "restricted",
+            ])
+            .await,
+    )
+    .unwrap();
+    assert_eq!(first_import["offers"][0]["name"], "restricted.glm");
+    let renewed_file = root.join("restricted-renewed.access");
+    let renewed = share(&renewed_file, "6m").await;
+    for field in ["pool", "allowance", "grant"] {
+        assert_eq!(first[field], renewed[field]);
+    }
+    assert!(renewed["expires"].as_u64().unwrap() > first["expires"].as_u64().unwrap());
+    assert_ne!(first["credential_id"], renewed["credential_id"]);
+    let same_alias = host
+        .client
+        .output(&[
+            "offer",
+            "import-bundle",
+            string(&renewed_file),
+            "--name",
+            "restricted",
+        ])
+        .await;
+    assert!(
+        !same_alias.status.success(),
+        "renewal must not overwrite the existing profile"
+    );
+    let imported: Value = serde_json::from_str(
+        &host
+            .client
+            .run(&[
+                "offer",
+                "import-bundle",
+                string(&renewed_file),
+                "--name",
+                "restricted-renewed",
+            ])
+            .await,
+    )
+    .unwrap();
+    assert_eq!(imported["offers"][0]["name"], "restricted-renewed.glm");
+    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
+        panic!()
+    };
+    let installed = hellas_sdk::node_control::profile::ClientProfile::load_bound(
+        Path::new(imported["work_profile"].as_str().unwrap()),
+        &host.client.principal(),
+        &holder,
+    )
+    .unwrap();
+    assert_eq!(
+        installed.credential.id().to_string(),
+        renewed["credential_id"]
+    );
+    assert_eq!(installed.authorization.to_string(), renewed["grant"]);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     use hellas_auth::authority as auth;
     let mut policy = http_invocation_policy();
@@ -1169,9 +1408,13 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     .unwrap();
     let job_dir = root.join("grant-job");
     job.save(&job_dir).unwrap();
-    let provider = hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
-        .unwrap()
-        .to_string();
+    let provider = shared["provider"].as_str().unwrap().to_owned();
+    assert_eq!(
+        provider,
+        hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
+            .unwrap()
+            .to_string()
+    );
     let attempt = root.join("grant-attempt.json");
     let result_dir = root.join("grant-result");
     let args = [
