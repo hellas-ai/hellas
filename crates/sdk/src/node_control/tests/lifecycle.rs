@@ -649,6 +649,75 @@ async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
 }
 
 #[tokio::test]
+async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access() {
+    let world = crate::test_support::Host::builder().build().await;
+    let remote = world.remote().await;
+    let options = world.responses_options(remote.addresses()).await;
+    let access = options.serve.server.access.clone();
+    let factory = options.into_factory(SecretKey::from_bytes(&[3; 32]));
+    let loads = Arc::new(AtomicUsize::new(0));
+    let loader: host::GatewayAccessLoader = {
+        let loads = loads.clone();
+        Arc::new(move || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            let access = access.clone();
+            Box::pin(async move { Ok(access) })
+        })
+    };
+    let (tls, client_tls) = tls_configs();
+    let socket = world.root.path().join("deferred-control.sock");
+    let host = HostHandle::start_with_deferred_gateway(
+        HostOptions {
+            transport: None,
+            start_provider: false,
+            control: Some((
+                world.world.service.node(),
+                crate::ProviderControl {
+                    socket: socket.clone(),
+                    tls,
+                    remote: RemoteControlAdmission::default(),
+                },
+            )),
+            provider: None,
+            gateway: None,
+        },
+        factory,
+        loader,
+    )
+    .await
+    .unwrap();
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    let client = connect_local(
+        socket,
+        client_tls,
+        "localhost".try_into().unwrap(),
+        authority(),
+        world.world.secret(ROOT),
+        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
+    )
+    .await
+    .unwrap()
+    .0;
+    for enabled in [true, false, true, false] {
+        let result = client
+            .set_gateway_state(gateway_state(enabled))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.gateway.unwrap().state,
+            if enabled {
+                RuntimeState::Running
+            } else {
+                RuntimeState::Stopped
+            } as i32
+        );
+    }
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    host.shutdown().await.unwrap();
+    remote.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_provider_start_reports_its_error() {
     let f = fixture().await;
     let factory = host::ProviderFactory {
