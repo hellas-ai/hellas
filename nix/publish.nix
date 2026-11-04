@@ -58,8 +58,9 @@ pkgs.writeShellApplication {
       floating=1
     fi
     if [ -z "$revision" ]; then
-      echo "no revision has both a green CLI and GPU channel" >&2
-      exit 1
+      # A scheduled run with nothing eligible has nothing to do.
+      echo "no revision has both a green CLI and GPU channel yet"
+      exit 0
     fi
     cli_eval=$(grep "^$revision " <<< "$cli" | head -1 | cut -d' ' -f2)
     gpu_eval=$(grep "^$revision " <<< "$gpu" | head -1 | cut -d' ' -f2)
