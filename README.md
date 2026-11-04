@@ -104,6 +104,135 @@ the verified read-only descriptor and detects path/inode replacement; it does
 not defend against a separate local process that already holds a writable
 descriptor to the same inode and mutates it concurrently.
 
+## Own a worker and share access
+
+Use a CLI and worker from the same release. Download the portable CLI archive
+and `SHA256SUMS` from the [release page](https://github.com/hellas-ai/hellas/releases).
+For x86_64 Linux, set `RELEASE` to the selected tag and `REVISION` to its full
+commit SHA, then verify before unpacking:
+
+```sh
+archive="hellas-cli-x86_64-linux-musl-${REVISION}.tar.gz"
+curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/${archive}"
+curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$archive"
+export PATH="$PWD/bin:$PATH"
+hellas --version
+```
+
+This walkthrough requires a release containing `identity init --passkey-out`,
+`serve --audio-model`, and `admin share`. The earlier
+`v0.1.0-fbb697b1e42e` release does not contain these interfaces; use matching
+CLI and worker artifacts from the final reviewed commit.
+
+Download and convert multilingual Whisper tiny, then download the sample audio:
+
+```sh
+mkdir whisper-tiny-original
+base=https://huggingface.co/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af
+curl -fL --output-dir whisper-tiny-original --remote-name-all \
+  "$base/config.json" "$base/generation_config.json" \
+  "$base/tokenizer.json" "$base/model.safetensors"
+hellas convert-whisper --checkpoint ./whisper-tiny-original --output ./whisper-tiny
+curl -fL https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav -o speech.wav
+printf '%s  speech.wav\n' 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e | sha256sum -c -
+```
+
+Start a worker with the converted model. `--audio-model` pins its program and
+weights, creates its machine/account budgets, and serves one job at a time; no
+resource JSON is required. The resource is named after the directory,
+`whisper-tiny`. Here is the CUDA container command for an NVIDIA CDI host:
+
+```sh
+mkdir -m 700 worker
+docker run -d --name hellas-gpu --network host --device nvidia.com/gpu=all \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/worker:/state" -v "$PWD/whisper-tiny:/models/whisper-tiny:ro" \
+  "ghcr.io/hellas-ai/hellas:sha-${REVISION}-cuda" \
+  --identity /state/worker.identity --software-root \
+  --await-owner /state/node --audio-model /models/whisper-tiny \
+  --store-dir /state/store --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
+```
+
+For Strix Halo, use the matching `-hip` image, replace the NVIDIA device option
+with `--device /dev/kfd --device /dev/dri`, and add the host's render/video groups
+with Docker `--group-add`. Allow spare GPU memory; do not load a second model
+beside a memory-constrained distributed service. MI300X model execution and fresh
+Runpod inference are outside this initial walkthrough.
+
+The worker writes a private `worker/node/invitation.json` when ready. Create your
+client identity and owner key, then pair with that invitation from the machine
+you control:
+
+```sh
+hellas --software-root identity init --passkey-out owner.passkey
+hellas --passkey owner.passkey admin bootstrap-remote \
+  --invitation worker/node/invitation.json --profile-out operator
+```
+
+Bootstrap creates the owner administration scopes and saves the pinned node and
+credential in `operator/profile.json`. The owner grant lasts one year. Custom
+scopes remain available through `--administrator` and `--credential-scope`.
+The owner key stays on the client, outside the worker mount.
+
+Give your principal and device a one-request share, import it, and transcribe:
+
+```sh
+hellas --passkey owner.passkey contact export --display-name me --out me.contact
+hellas identity show-holder > me.holder
+hellas --passkey owner.passkey admin --profile operator/profile.json share \
+  --contact me.contact --holder me.holder --resource whisper-tiny \
+  --limit requests:total:1 --max-job 15m --expires 1h --out me.access
+hellas --passkey owner.passkey offer import-bundle me.access --name box
+hellas --passkey owner.passkey transcribe --offer box.whisper-tiny \
+  --model ./whisper-tiny --audio speech.wav --language en --output my-result
+```
+
+`--offer` supplies the provider and device-bound profile. The output includes a
+signed transcript and the transcription should begin “And so my fellow Americans”.
+
+For a second principal, the recipient creates their own key/device and exports
+only their contact and holder. To exercise this locally with separate credentials:
+
+```sh
+hellas --identity guest.identity --software-root identity init --passkey-out guest.passkey
+hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
+hellas --identity guest.identity identity show-holder > guest.holder
+hellas --passkey owner.passkey admin --profile operator/profile.json share \
+  --contact guest.contact --holder guest.holder --resource whisper-tiny \
+  --limit requests:total:1 --max-job 15m --expires 1h --out guest.access
+hellas --identity guest.identity --passkey guest.passkey offer import-bundle guest.access --name box
+hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+  --model ./whisper-tiny --audio speech.wav --language en --output guest-result
+```
+
+In a remote handoff, return only the private access bundle to the recipient;
+they keep their key and identity. Another device of the same principal shares
+its existing counters. See [renewal](docs/admin.md) before replacing a credential.
+
+A different request must now fail the guest's one-request quota:
+
+```sh
+hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+  --model ./whisper-tiny --audio speech.wav --language en --max-tokens 255
+```
+
+Stop the worker and repeat the original request. This uses the retained signed
+result and consumes no additional request:
+
+```sh
+docker stop hellas-gpu
+hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+  --model ./whisper-tiny --audio speech.wav --language en --output guest-replay
+cmp guest-result/transcript.cbor guest-replay/transcript.cbor
+```
+
+For paid jobs, follow the [paid quickstart](#quickstart-sell-and-buy-one-job).
+Grant execution does not prove paid settlement; the final release also needs a
+paid job and confirmed settlement using its matching artifacts.
+
+
 ## Sealed Fetch
 
 Fetch route names are operator-defined routing labels. The sealed destination

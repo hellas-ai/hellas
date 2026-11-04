@@ -340,7 +340,7 @@ async fn start_provider(
             root: Arc::new(SoftwareRoot),
             state_directory: root.join("provider-state"),
             grants: Some(hellas_sdk::GrantProviderOptions {
-                policies: vec![],
+                configuration: Default::default(),
                 max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
             }),
             routes,

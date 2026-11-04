@@ -1,5 +1,5 @@
-//! `serve --paid-work-config FILE`: the selected owner approves exactly the
-//! file's paid terms at startup and delegates the stake its offers bond.
+//! `serve --paid-work-config FILE`: use the exact owner-approved paid terms.
+//! An optional owner passkey also bootstraps approval and delegates stake.
 use super::*;
 use anyhow::ensure;
 use hellas_auth::{Digest, authority::*};
@@ -51,7 +51,7 @@ struct FetchFile {
 pub struct PaidWork {
     pub chain: WorkConfig,
     root: PathBuf,
-    owner: SoftPasskey,
+    owner: Option<SoftPasskey>,
     policy: PaidPolicy,
 }
 
@@ -79,6 +79,23 @@ fn publish(path: &Path, bytes: &[u8]) -> CliResult<()> {
 }
 
 impl PaidWorkFile {
+    fn read(path: &Path) -> CliResult<Self> {
+        let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        toml::from_str(std::str::from_utf8(&bytes).context("paid-work config must be UTF-8")?)
+            .with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    fn checked_policy(self, path: &Path, fetch_config: Option<&Path>) -> CliResult<PaidPolicy> {
+        let fetch_contract = self
+            .fetch
+            .as_ref()
+            .map(|fetch| paid_fetch_contract(fetch_config, &fetch.route))
+            .transpose()?;
+        self.policy(fetch_contract)
+            .with_context(|| format!("invalid paid terms in {}", path.display()))
+    }
+
     fn policy(self, fetch_contract: Option<hellas_rpc::FetchContract>) -> CliResult<PaidPolicy> {
         let capacity = self
             .payment
@@ -122,6 +139,16 @@ impl PaidWorkFile {
 }
 
 impl PaidWork {
+    pub fn approval(
+        path: &Path,
+        fetch_config: Option<&Path>,
+        expected_revision: Revision,
+    ) -> CliResult<WorkControlCommand> {
+        Ok(WorkControlCommand::SetPaidPolicy {
+            expected_revision,
+            policy: Box::new(PaidWorkFile::read(path)?.checked_policy(path, fetch_config)?),
+        })
+    }
     /// Read and check the whole file before anything binds.
     ///
     /// `fetch_config` is the same `--fetch-config` this node will serve: the
@@ -130,26 +157,15 @@ impl PaidWork {
     pub fn load(
         path: &Path,
         root: PathBuf,
-        owner: SoftPasskey,
+        owner: Option<SoftPasskey>,
         fetch_config: Option<&Path>,
     ) -> CliResult<Self> {
-        let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let file: PaidWorkFile =
-            toml::from_str(std::str::from_utf8(&bytes).context("paid-work config must be UTF-8")?)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
+        let file = PaidWorkFile::read(path)?;
         let chain = match &file.chain_config {
             Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
             None => hellas_sdk::client_chain::devnet(&root)?,
         };
-        let fetch_contract = file
-            .fetch
-            .as_ref()
-            .map(|fetch| paid_fetch_contract(fetch_config, &fetch.route))
-            .transpose()?;
-        let policy = file
-            .policy(fetch_contract)
-            .with_context(|| format!("invalid paid terms in {}", path.display()))?;
+        let policy = file.checked_policy(path, fetch_config)?;
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
             chain,
@@ -259,6 +275,9 @@ impl PaidWork {
         chain: &hellas_sdk::FullNode,
         key: &Secp256k1Signer,
     ) -> CliResult<()> {
+        let Some(owner) = &self.owner else {
+            return Ok(());
+        };
         let cap = self.policy.offers.max_stake_per_client;
         let path = self.root.join("delegation.json");
         if !path.try_exists()? {
@@ -278,7 +297,7 @@ impl PaidWork {
                         for (id, value) in listing.coins {
                             if value > 0 && value <= cap
                                 && let Some(coin) = client.get_coin(listing.snapshot.payload, id).await?
-                                && coin.owner.into_kernel() == self.owner.party_key()
+                                && coin.owner.into_kernel() == owner.party_key()
                                 && coin.delegate == Some(key.party_key().into())
                             { return Ok::<_, anyhow::Error>(true); }
                         }
@@ -302,142 +321,153 @@ impl PaidWork {
         let now = UnixMillis::now()?;
         let network = hellas_authority::model::grant::grant_network();
         let bootstrap_path = self.root.join("bootstrap.json");
-        let store =
-            match NodeStore::open(&config.journal_root, network, Some(enrollment.clone()), now)
-                .await
-            {
-                Ok(store) => store,
-                Err(NodeStoreError::Uninitialized) => {
-                    if !bootstrap_path.try_exists()? {
-                        let authority = AuthorityId(Digest::hash(&enrollment.canonical_bytes()));
-                        let subject = crate::commands::contributions::principal(&self.owner)?;
-                        let mut permissions: BTreeSet<_> = [
-                            GRANT_ISSUE,
-                            GRANT_REVOKE,
-                            GRANT_ADMINISTER,
-                            CREDENTIAL_ISSUE,
-                            CREDENTIAL_REVOKE,
-                        ]
-                        .into_iter()
-                        .map(|name| {
-                            Ok(Permission {
-                                operation: OperationId::new(name)?,
-                                resource: authority.resource(),
-                            })
-                        })
-                        .collect::<Result<_, hellas_auth::authority::AuthorityError>>()?;
-                        for op in hellas_authority::operations::OPERATIONS
-                            .iter()
-                            .filter(|op| {
-                                !matches!(op.scope, hellas_authority::operations::Scope::Allowance)
-                            })
-                        {
-                            permissions.insert(op.permission(authority, None)?);
-                        }
-                        let administrator = GrantSpec {
-                            authority,
-                            subject,
-                            issuance: Some(IssuanceCeiling {
-                                operations: permissions
-                                    .iter()
-                                    .map(|p| p.operation.clone())
-                                    .collect(),
-                                resources: CeilingResources::Authority,
-                                max_validity_ms: u64::MAX,
-                                max_delegation_depth: MAX_DELEGATION_DEPTH,
-                            }),
-                            permissions,
-                            not_before: now,
-                            expires: UnixMillis(u64::MAX),
-                            delegation_depth: 0,
-                        };
-                        let holder = NodeKey::from_public_key(producer.public_key())?;
-                        let root = GrantId([0; 16]);
-                        let approval = OwnerApproval {
-                            assertion: self
-                                .owner
-                                .assert(ownership_digest(
-                                    Ownership::Bootstrap { root, target: None },
-                                    &administrator,
-                                    &administrator,
-                                    holder,
-                                ))
-                                .await?,
-                            administrator: administrator.clone(),
-                            credential: administrator,
-                            holder,
-                        };
-                        let (approval, secret) = approval.prepare(None)?;
-                        let (certificate, private_key) = match (
-                            config.control_certificate.try_exists()?,
-                            config.control_private_key.try_exists()?,
-                        ) {
-                            (true, true) => {
-                                profile::server_identity(
-                                    &config.control_certificate,
-                                    &config.control_private_key,
-                                )?;
-                                (
-                                    hellas_private::read_bounded_regular_file(
-                                        &config.control_certificate,
-                                        64 * 1024,
-                                    )?,
-                                    hellas_private::read_bounded_regular_file(
-                                        &config.control_private_key,
-                                        64 * 1024,
-                                    )?,
-                                )
-                            }
-                            (false, false) => {
-                                let tls =
-                                    rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-                                (tls.cert.der().to_vec(), tls.signing_key.serialize_der())
-                            }
-                            _ => anyhow::bail!("paid control TLS configuration is incomplete"),
-                        };
-                        publish(
-                            &bootstrap_path,
-                            &serde_json::to_vec(&Bootstrap {
-                                approval,
-                                credential_id: secret.id(),
-                                credential_secret: *secret.expose_secret(),
-                                certificate,
-                                private_key,
-                            })?,
-                        )?;
-                    }
-                    let data: Bootstrap = serde_json::from_slice(
-                        &hellas_private::read_bounded_regular_file(&bootstrap_path, 64 * 1024)?,
+        let store = match NodeStore::open(
+            &config.journal_root,
+            network,
+            Some(enrollment.clone()),
+            now,
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(NodeStoreError::Uninitialized) => {
+                let owner = self.owner.as_ref().context(
+                        "paid startup without a passkey requires an initialized authority and an owner-approved paid policy",
                     )?;
-                    // Resume either file publication from the same prepared pair.
-                    for (path, bytes) in [
-                        (&config.control_certificate, &data.certificate),
-                        (&config.control_private_key, &data.private_key),
-                    ] {
-                        if path.try_exists()? {
-                            ensure!(
-                                hellas_private::read_bounded_regular_file(path, 64 * 1024)?
-                                    == *bytes,
-                                "paid control TLS differs from its saved initialization"
-                            );
-                        } else {
-                            publish(path, bytes)?;
-                        }
+                if !bootstrap_path.try_exists()? {
+                    let authority = AuthorityId(Digest::hash(&enrollment.canonical_bytes()));
+                    let subject = crate::commands::contributions::principal(owner)?;
+                    let mut permissions: BTreeSet<_> = [
+                        GRANT_ISSUE,
+                        GRANT_REVOKE,
+                        GRANT_ADMINISTER,
+                        CREDENTIAL_ISSUE,
+                        CREDENTIAL_REVOKE,
+                    ]
+                    .into_iter()
+                    .map(|name| {
+                        Ok(Permission {
+                            operation: OperationId::new(name)?,
+                            resource: authority.resource(),
+                        })
+                    })
+                    .collect::<Result<_, hellas_auth::authority::AuthorityError>>()?;
+                    for op in hellas_authority::operations::OPERATIONS
+                        .iter()
+                        .filter(|op| {
+                            !matches!(op.scope, hellas_authority::operations::Scope::Allowance)
+                        })
+                    {
+                        permissions.insert(op.permission(authority, None)?);
                     }
-                    NodeStore::bootstrap_prepared(
-                        &config.journal_root,
-                        network,
-                        GrantId([0; 16]),
-                        data.approval,
-                        Some(enrollment.clone()),
-                        now,
-                    )
-                    .await?
+                    let administrator = GrantSpec {
+                        authority,
+                        subject,
+                        issuance: Some(IssuanceCeiling {
+                            operations: permissions.iter().map(|p| p.operation.clone()).collect(),
+                            resources: CeilingResources::Authority,
+                            max_validity_ms: u64::MAX,
+                            max_delegation_depth: MAX_DELEGATION_DEPTH,
+                        }),
+                        permissions,
+                        not_before: now,
+                        expires: UnixMillis(u64::MAX),
+                        delegation_depth: 0,
+                    };
+                    let holder = NodeKey::from_public_key(producer.public_key())?;
+                    let root = GrantId([0; 16]);
+                    let approval = OwnerApproval {
+                        assertion: owner
+                            .assert(ownership_digest(
+                                Ownership::Bootstrap { root, target: None },
+                                &administrator,
+                                &administrator,
+                                holder,
+                            ))
+                            .await?,
+                        administrator: administrator.clone(),
+                        credential: administrator,
+                        holder,
+                    };
+                    let (approval, secret) = approval.prepare(None)?;
+                    let (certificate, private_key) = match (
+                        config.control_certificate.try_exists()?,
+                        config.control_private_key.try_exists()?,
+                    ) {
+                        (true, true) => {
+                            profile::server_identity(
+                                &config.control_certificate,
+                                &config.control_private_key,
+                            )?;
+                            (
+                                hellas_private::read_bounded_regular_file(
+                                    &config.control_certificate,
+                                    64 * 1024,
+                                )?,
+                                hellas_private::read_bounded_regular_file(
+                                    &config.control_private_key,
+                                    64 * 1024,
+                                )?,
+                            )
+                        }
+                        (false, false) => {
+                            let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+                            (tls.cert.der().to_vec(), tls.signing_key.serialize_der())
+                        }
+                        _ => anyhow::bail!("paid control TLS configuration is incomplete"),
+                    };
+                    publish(
+                        &bootstrap_path,
+                        &serde_json::to_vec(&Bootstrap {
+                            approval,
+                            credential_id: secret.id(),
+                            credential_secret: *secret.expose_secret(),
+                            certificate,
+                            private_key,
+                        })?,
+                    )?;
                 }
-                Err(error) => return Err(error.into()),
-            };
+                let data: Bootstrap = serde_json::from_slice(
+                    &hellas_private::read_bounded_regular_file(&bootstrap_path, 64 * 1024)?,
+                )?;
+                // Resume either file publication from the same prepared pair.
+                for (path, bytes) in [
+                    (&config.control_certificate, &data.certificate),
+                    (&config.control_private_key, &data.private_key),
+                ] {
+                    if path.try_exists()? {
+                        ensure!(
+                            hellas_private::read_bounded_regular_file(path, 64 * 1024)? == *bytes,
+                            "paid control TLS differs from its saved initialization"
+                        );
+                    } else {
+                        publish(path, bytes)?;
+                    }
+                }
+                NodeStore::bootstrap_prepared(
+                    &config.journal_root,
+                    network,
+                    GrantId([0; 16]),
+                    data.approval,
+                    Some(enrollment.clone()),
+                    now,
+                )
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(owner) = &self.owner else {
+            ensure!(
+                store
+                    .state()
+                    .paid_policy()
+                    .is_some_and(|current| current.policy == self.policy),
+                "paid terms differ from the owner-approved policy; approve the exact policy with the owner's admin profile before starting"
+            );
+            return Ok(None);
+        };
         let authority = store.state().authority();
-        let principal = crate::commands::contributions::principal(&self.owner)?;
+        let principal = crate::commands::contributions::principal(owner)?;
         ensure!(
             authority
                 .grant(authority.root_grant())
@@ -475,21 +505,26 @@ impl PaidWork {
         credential: Option<&CredentialSecret>,
     ) -> CliResult<PaidPolicy> {
         let node = admin.node();
-        ensure!(
-            node.owner().await? == crate::commands::contributions::principal(&self.owner)?,
-            "selected owner is not this provider's owner"
-        );
+        if let Some(owner) = &self.owner {
+            ensure!(
+                node.owner().await? == crate::commands::contributions::principal(owner)?,
+                "selected owner is not this provider's owner"
+            );
+        }
         let current = node.paid_policy().await?;
         if current
             .as_ref()
             .is_none_or(|current| current.policy != self.policy)
         {
+            let owner = self.owner.as_ref().context(
+                "paid terms differ from the owner-approved policy; approve the exact policy with the owner's admin profile before starting",
+            )?;
             let caller = node
                 .authenticate_session(
                     credential.context(
                         "this authority was not initialized by paid startup; approve its paid policy with the owner's admin profile",
                     )?,
-                    SessionKey::Passkey(&self.owner),
+                    SessionKey::Passkey(owner),
                 )
                 .await?;
             admin
@@ -516,6 +551,11 @@ impl PaidWork {
         key: &Secp256k1Signer,
         policy: &PaidPolicy,
     ) -> CliResult<()> {
+        if self.owner.is_none() {
+            // Fleet owners delegate stake from their own machine. The paid
+            // runner admits only live stake belonging to the authority owner.
+            return Ok(());
+        }
         let deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
         tokio::time::timeout_at(deadline, async {
             loop {
@@ -546,7 +586,11 @@ impl PaidWork {
     ) -> CliResult<()> {
         use hellas_chain::domain::{DecodeExt as _, Encode as _};
         let client = chain.view()?.client();
-        let owner = self.owner.party_key();
+        let signer = self
+            .owner
+            .as_ref()
+            .context("stake delegation requires an owner passkey")?;
+        let owner = signer.party_key();
         let path = self.root.join("delegation.json");
         let mut pins = Vec::from(hellas_chain::genesis_digest(&chain.config().genesis).as_ref());
         pins.extend_from_slice(chain.config().genesis_payload.as_ref());
@@ -594,12 +638,11 @@ impl PaidWork {
                 Some(policy.offers.max_stake_per_client),
             )
             .await?;
-            let assertion = self
-                .owner
+            let assertion = signer
                 .assert(Digest::from(*plan.payload_hash().as_bytes()))
                 .await?;
             let tx = Transaction::Kernel(
-                plan.authorize(kernel_auth(&self.owner.public_key()?, &assertion)?)?,
+                plan.authorize(kernel_auth(&signer.public_key()?, &assertion)?)?,
             );
             let receipt = Delegation {
                 genesis: genesis.clone(),

@@ -163,29 +163,54 @@ pub async fn execution_credential(
     credential
 }
 
+/// A test host's configuration: an unlimited 256-job machine, each policy's
+/// account unlimited at 256 jobs, and the policies themselves.
+pub fn configuration(
+    policies: Vec<crate::model::grant::records::GrantPolicy>,
+) -> crate::model::grant::configuration::NodeConfiguration {
+    configuration_with(unlimited(), policies)
+}
+fn unlimited() -> crate::model::grant::configuration::ConfiguredBudget {
+    crate::model::grant::configuration::ConfiguredBudget {
+        max_in_flight: std::num::NonZeroU16::new(256).unwrap(),
+        limits: vec![],
+    }
+}
+pub fn configuration_with(
+    machine: crate::model::grant::configuration::ConfiguredBudget,
+    policies: Vec<crate::model::grant::records::GrantPolicy>,
+) -> crate::model::grant::configuration::NodeConfiguration {
+    let accounts = policies
+        .iter()
+        .map(|policy| (policy.account, unlimited()))
+        .collect();
+    crate::model::grant::configuration::NodeConfiguration::new(Some(machine), accounts, policies)
+        .unwrap()
+}
+
 /// Test hosts keep the provisioned app credential and use the public checked API.
+/// The host configuration owns the machine, accounts and resources; changing it
+/// reconciles again, as a restart with an edited configuration does.
 pub struct WorkAdmin {
     root: auth::GrantId,
     pub service: crate::grant_service::WorkAdministration,
     pub caller: auth::AuthenticatedCaller,
+    grants: crate::grant_service::GrantService,
+    machine: crate::model::grant::configuration::ConfiguredBudget,
+    policies: Vec<crate::model::grant::records::GrantPolicy>,
 }
 impl WorkAdmin {
-    pub async fn resources(&self, policies: &[crate::model::grant::records::GrantPolicy]) {
-        use crate::model::grant::admin::*;
-        let WorkControlReply::Catalogue(configured) =
-            self.command(WorkControlCommand::Catalogue).await.unwrap()
-        else {
-            panic!("catalogue reply")
-        };
-        for policy in policies {
-            if !configured.contains(policy) {
-                self.command(WorkControlCommand::ConfigureResource {
-                    policy: policy.name.clone(),
-                })
-                .await
-                .unwrap();
-            }
-        }
+    fn configured(
+        grants: crate::grant_service::GrantService,
+        machine: &crate::model::grant::configuration::ConfiguredBudget,
+        policies: &[crate::model::grant::records::GrantPolicy],
+    ) -> crate::grant_service::WorkAdministration {
+        crate::grant_service::WorkAdministration::new(
+            grants,
+            configuration_with(machine.clone(), policies.to_vec()),
+            // Longer than one Work session, as deployed allowances may be.
+            std::num::NonZeroU64::new(20 * 60_000).unwrap(),
+        )
     }
     pub async fn budgets(
         &self,
@@ -195,7 +220,11 @@ impl WorkAdmin {
         concurrent: u16,
     ) {
         use crate::model::grant::admin::WorkControlCommand;
-        for definition in budgets(pool, subject, limits, concurrent) {
+        // The account belongs to the host configuration.
+        for definition in budgets(pool, subject, limits, concurrent)
+            .into_iter()
+            .filter(|definition| !matches!(definition.node, BudgetNode::Account(_)))
+        {
             match self
                 .command(WorkControlCommand::InspectBudget {
                     node: definition.node,
@@ -214,24 +243,22 @@ impl WorkAdmin {
             }
         }
     }
-    pub async fn capacity(&self, concurrent: u16, limits: Vec<crate::model::grant::budget::Limit>) {
-        self.service
-            .node()
-            .set_machine_capacity(
-                &self.caller,
-                self.root,
-                auth::Revision(0),
-                concurrent,
-                limits,
-            )
-            .await
-            .unwrap();
+    pub async fn capacity(
+        &mut self,
+        concurrent: u16,
+        limits: Vec<crate::model::grant::budget::Limit>,
+    ) {
+        self.machine = crate::model::grant::configuration::ConfiguredBudget {
+            max_in_flight: std::num::NonZeroU16::new(concurrent).unwrap(),
+            limits,
+        };
+        self.service = Self::configured(self.grants.clone(), &self.machine, &self.policies);
+        self.service.reconcile().await.unwrap();
     }
 
     pub async fn create(&self, definition: crate::model::grant::records::GrantDef) {
         use crate::model::grant::admin::*;
         assert_eq!(definition.revision, auth::Revision(1));
-        self.resources(&definition.policies).await;
         self.command(WorkControlCommand::Create {
             id: definition.id,
             terms: AllowanceTerms {
@@ -260,16 +287,16 @@ impl WorkAdmin {
             .authority()
             .root_grant();
         let caller = super::session(&node, secret).await;
+        let machine = unlimited();
+        let configured = Self::configured(service.clone(), &machine, &policies);
+        configured.reconcile().await.unwrap();
         Self {
             root,
-            service: crate::grant_service::WorkAdministration::new(
-                service,
-                policies,
-                // Longer than one Work session, as deployed allowances may be.
-                std::num::NonZeroU64::new(20 * 60_000).unwrap(),
-            )
-            .unwrap(),
+            service: configured,
             caller,
+            grants: service,
+            machine,
+            policies,
         }
     }
     pub async fn command(
@@ -357,7 +384,7 @@ pub async fn provision(
         std::sync::Arc::new(move || now),
     )
     .unwrap();
-    let admin = WorkAdmin::new(service.clone(), secret, definition.policies.clone()).await;
+    let mut admin = WorkAdmin::new(service.clone(), secret, definition.policies.clone()).await;
     admin.capacity(capacity.0, capacity.1).await;
     let BudgetNode::Subject { pool, subject } = definition.budget else {
         panic!("subject budget")

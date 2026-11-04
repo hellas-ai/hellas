@@ -350,10 +350,11 @@ impl Fixture {
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
         hellas_authority::grant_service::WorkAdministration::new(
             self.host.world.service.clone(),
-            self.host.allowance.policies.clone(),
+            hellas_authority::test_support::common_node::configuration(
+                self.host.allowance.policies.clone(),
+            ),
             self.host.allowance.max_job_millis,
         )
-        .unwrap()
         .execute(
             &self.host.world.administrator(ROOT).await,
             ids::ROOT_GRANT,
@@ -610,12 +611,6 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             vec![policy.clone()],
         )
         .await;
-        admin
-            .command(WorkControlCommand::ConfigureResource {
-                policy: policy.name,
-            })
-            .await
-            .unwrap();
         let grant = &fixture.host.allowance;
         admin
             .command(WorkControlCommand::Revise {
@@ -673,12 +668,6 @@ async fn renamed_policy_keeps_the_selected_resource() {
         vec![policy.clone()],
     )
     .await;
-    admin
-        .command(WorkControlCommand::ConfigureResource {
-            policy: policy.name.clone(),
-        })
-        .await
-        .unwrap();
     let grant = &fixture.host.allowance;
     admin
         .command(WorkControlCommand::Revise {
@@ -805,12 +794,6 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
         vec![renamed.clone(), replacement.clone()],
     )
     .await;
-    for policy in [renamed.name, replacement.name.clone()] {
-        admin
-            .command(WorkControlCommand::ConfigureResource { policy })
-            .await
-            .unwrap();
-    }
     let grant = &fixture.host.allowance;
     admin
         .command(WorkControlCommand::Revise {

@@ -27,9 +27,6 @@ pub enum WorkControlCommand {
         expected_revision: Revision,
         policy: Box<hellas_channel::model::paid_policy::PaidPolicy>,
     },
-    ConfigureResource {
-        policy: String,
-    },
     Catalogue,
     ConfigureBudget {
         definition: BudgetDef,

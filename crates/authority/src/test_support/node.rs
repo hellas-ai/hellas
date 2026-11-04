@@ -188,7 +188,7 @@ impl Node {
             self.clock.source(),
         )
         .unwrap();
-        let admin = common_node::WorkAdmin::new(service.clone(), &secret, policies).await;
+        let mut admin = common_node::WorkAdmin::new(service.clone(), &secret, policies).await;
         admin
             .capacity(self.capacity.concurrent, self.capacity.limits)
             .await;

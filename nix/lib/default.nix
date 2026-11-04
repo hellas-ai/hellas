@@ -47,9 +47,21 @@ in
       wrapProgram "$out/bin/nvcc" \
         --add-flags "-I$out/include -L$out/lib" \
         --set-default NVCC_CCBIN "${pkgs.cudaPackages.backendStdenv.cc}/bin/c++"
+      # CUDA splits its compiler headers into cuda_crt. Exercise the assembled
+      # prefix without a GPU so a missing component cannot reach a runtime image.
+      cat > cuda-smoke.cu <<'EOF'
+      #include <cuda_runtime.h>
+      #include <cuda_bf16.h>
+      extern "C" __global__ void smoke(__nv_bfloat16 *out) {
+        out[0] = __float2bfloat16(42.0f);
+      }
+      EOF
+      "$out/bin/nvcc" --std=c++17 --shared -Xcompiler=-fPIC -arch=sm_89 \
+        cuda-smoke.cu -o cuda-smoke.so
     '';
     paths = with pkgs.cudaPackages; [
       cuda_nvcc
+      cuda_crt
       cuda_cudart
       cccl
     ];

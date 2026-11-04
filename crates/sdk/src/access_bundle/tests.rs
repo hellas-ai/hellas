@@ -236,3 +236,42 @@ fn truncated_or_oversized_bundles_are_refused() {
         Err(AccessBundleError::TooLarge)
     ));
 }
+
+#[test]
+fn imported_access_resolves_dotted_bundle_and_policy_names_and_checks_holder() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bundle = bundle();
+    bundle.offers.truncate(1);
+    let mut offer = bundle.offers[0].offer().clone();
+    offer.grant.policies[0].name = "model.v1".into();
+    bundle.offers[0] = SignedOffer::sign(offer, &principal(2).1).unwrap();
+    let path = root.path().join("bundle");
+    bundle.save(&path).unwrap();
+    let store = crate::grant_store::GrantStore::new(root.path().join("store"));
+    store
+        .import_bundle(&path, "node.one", &bundle.subject, &bundle.holder, false)
+        .unwrap();
+    let (offer, profile) = store
+        .load_access("node.one.model.v1", &bundle.subject, &bundle.holder)
+        .unwrap();
+    assert_eq!(offer.encode().unwrap(), bundle.offers[0].encode().unwrap());
+    assert_eq!(profile.authorization, bundle.authorization);
+    assert_eq!(profile.credential.id(), bundle.credential.id());
+    assert!(
+        store
+            .load_access("node.one.model.v1", &bundle.subject, &node_key(8))
+            .is_err()
+    );
+    assert!(
+        store
+            .load_access("node.one.model.v1", &principal(8).0, &bundle.holder)
+            .is_err()
+    );
+    let plain = root.path().join("offer");
+    std::fs::write(&plain, offer.encode().unwrap()).unwrap();
+    store.import_offer(&plain, "plain", false).unwrap();
+    assert!(matches!(
+        store.load_access("plain", &bundle.subject, &bundle.holder),
+        Err(crate::grant_store::GrantStoreError::AccessAlias)
+    ));
+}

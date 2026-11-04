@@ -79,7 +79,7 @@ impl Harness {
                                 ),
                                 state_directory: forbidden_journal,
                                 grants: Some(crate::GrantProviderOptions {
-                                    policies: vec![],
+                                    configuration: Default::default(),
                                     max_job_millis: std::num::NonZeroU64::MIN,
                                 }),
                                 routes: crate::FetchRouteRegistry::new(),

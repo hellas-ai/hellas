@@ -28,7 +28,9 @@ delivery_credit_limit = 40
 [offers]
 max_stake_per_client = 12
 max_open_offers = 3
-bond_lifetime_blocks = 256
+# Covers the CLI's 300 admission + 3000 execution + 600 payment blocks,
+# with room for channel setup. These are finalized blocks, not seconds.
+bond_lifetime_blocks = 10000
 # Must exceed fixed_price * jobs_per_channel (200).
 omission_bond = 201
 redelegate_payout = true

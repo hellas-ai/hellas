@@ -1,6 +1,7 @@
 //! Checked node administration. Online commands always use an explicit app profile.
 use std::path::PathBuf;
 mod node;
+mod owner_scope;
 pub use node::{inspect_offline, run};
 
 #[derive(clap::Args)]
@@ -57,22 +58,22 @@ pub enum AdminCommand {
     },
     /// Read private node status using the profile's selected grant.
     Status,
+    /// Approve exact paid terms for a daemon whose owner key stays on this machine.
+    SetPaidPolicy {
+        #[arg(long)]
+        terms: PathBuf,
+        #[arg(long)]
+        expected_revision: u64,
+        /// The provider's Fetch routes, if its paid policy admits Fetch.
+        #[arg(long)]
+        fetch_config: Option<PathBuf>,
+    },
     /// Apply a typed upstream update; endpoint changes and key replacement/removal require --passkey.
     ConfigureProvider { command: PathBuf },
     /// Start or stop the provider through the normal host lifecycle.
     SetProviderState {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
-    },
-    /// Replace machine concurrency and budgets; revision zero initializes a provider.
-    SetCapacity {
-        #[arg(long)]
-        expected_revision: u64,
-        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
-        max_in_flight: u16,
-        /// JSON array of Work limits. Use [] explicitly for no budget limits.
-        #[arg(long)]
-        limits: PathBuf,
     },
     /// Bind the provider enrollment of an authority bootstrapped without one.
     BindProvider {
@@ -107,21 +108,31 @@ pub enum AdminCommand {
         #[arg(long)]
         offer_out: Option<PathBuf>,
     },
-    /// Share allowances with a contact: their offers and one new credential,
-    /// bound to the contact's device, as an access bundle.
-    ExportBundle {
-        /// An allowance whose offer the contact imports; repeat for each one.
-        #[arg(long = "allowance", required = true)]
-        allowances: Vec<String>,
-        /// The contact's Auth grant: work.execute on every shared allowance.
+    /// Give a contact's principal metered access to one configured resource,
+    /// as an access bundle bound to one of the contact's devices. Rerunning
+    /// with the same contact and resource revises that one share.
+    Share {
+        /// The verified contact card naming the principal; your own card shares
+        /// with yourself.
         #[arg(long)]
-        grant_id: String,
-        /// JSON GrantSpec bounding the contact's credential.
-        #[arg(long)]
-        credential_scope: PathBuf,
-        /// JSON CredentialHolder naming the contact device's node key.
+        contact: PathBuf,
+        /// JSON CredentialHolder naming the receiving device's node key, as
+        /// `hellas identity show-holder` prints it.
         #[arg(long)]
         holder: PathBuf,
+        /// The configured resource name, e.g. `klein`.
+        #[arg(long)]
+        resource: String,
+        /// A budget limit METER:WINDOW:AMOUNT, e.g. `requests:total:100`; repeat
+        /// for each. Without any, only concurrency bounds the share.
+        #[arg(long = "limit", value_parser = parse_limit)]
+        limits: Vec<hellas_authority::model::grant::budget::Limit>,
+        /// The longest one job may run, e.g. `15m`.
+        #[arg(long, value_parser = crate::commands::transact::duration)]
+        max_job: std::time::Duration,
+        /// How long the share's grant and credential stay valid, e.g. `30d`.
+        #[arg(long, default_value = "30d", value_parser = crate::commands::transact::duration)]
+        expires: std::time::Duration,
         /// Provider display name shown to the contact.
         #[arg(long)]
         label: Option<String>,
@@ -148,12 +159,14 @@ pub enum AdminCommand {
     BootstrapRemote {
         #[arg(long)]
         invitation: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = "00000000000000000000000000000000")]
         root_grant: String,
-        #[arg(long)]
-        administrator: PathBuf,
-        #[arg(long)]
-        credential_scope: PathBuf,
+        /// Custom administrator scope; otherwise grant the pairing owner full administration.
+        #[arg(long, requires = "credential_scope")]
+        administrator: Option<PathBuf>,
+        /// Custom device scope paired with --administrator.
+        #[arg(long, requires = "administrator")]
+        credential_scope: Option<PathBuf>,
         /// New private directory for the retained credential and remote profile.
         #[arg(long)]
         profile_out: PathBuf,
@@ -165,4 +178,98 @@ pub enum AdminCommand {
         #[command(flatten)]
         state: OfflineArgs,
     },
+}
+
+/// `METER:WINDOW:AMOUNT`, with kebab-case meter and window names.
+fn parse_limit(value: &str) -> Result<hellas_authority::model::grant::budget::Limit, String> {
+    use hellas_authority::model::grant::budget::{Limit, Meter, Window};
+    let [meter, window, amount] = value.split(':').collect::<Vec<_>>()[..] else {
+        return Err("a limit is METER:WINDOW:AMOUNT".into());
+    };
+    let meter = match meter {
+        "requests" => Meter::Requests,
+        "input-tokens" => Meter::InputTokens,
+        "output-tokens" => Meter::OutputTokens,
+        "device-millis" => Meter::DeviceMillis,
+        "usd-micros" => Meter::UsdMicros,
+        _ => {
+            return Err(
+                "meter is requests, input-tokens, output-tokens, device-millis or usd-micros"
+                    .into(),
+            );
+        }
+    };
+    let window = match window {
+        "hour" => Window::Hour,
+        "day" => Window::Day,
+        "week" => Window::Week,
+        "total" => Window::Total,
+        _ => return Err("window is hour, day, week or total".into()),
+    };
+    let amount = amount
+        .parse()
+        .map_err(|_| "amount is a non-negative integer")?;
+    Ok(Limit {
+        meter,
+        window,
+        amount,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    #[test]
+    fn share_requires_an_explicit_contact_and_holder_and_parses_limits() {
+        let base = [
+            "hellas",
+            "admin",
+            "share",
+            "--contact",
+            "me.contact",
+            "--holder",
+            "me.holder",
+            "--resource",
+            "model",
+            "--max-job",
+            "15m",
+            "--out",
+            "me.access",
+        ];
+        assert!(crate::Cli::try_parse_from(base).is_ok());
+        for missing in [3, 5] {
+            assert!(
+                crate::Cli::try_parse_from(
+                    base.iter()
+                        .enumerate()
+                        .filter_map(
+                            |(i, arg)| (!(missing..missing + 2).contains(&i)).then_some(*arg)
+                        )
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            crate::Cli::try_parse_from(base.into_iter().chain([
+                "--expires",
+                "30d",
+                "--limit",
+                "requests:total:100"
+            ]))
+            .is_ok()
+        );
+        for value in [
+            "requests:100",
+            "requests:total:-1",
+            "unknown:day:1",
+            "requests:month:1",
+            "requests:day:1:2",
+        ] {
+            assert!(super::parse_limit(value).is_err(), "{value}");
+        }
+        let limit = super::parse_limit("output-tokens:day:1000").unwrap();
+        assert_eq!(limit.amount, 1000);
+        assert!(crate::Cli::try_parse_from(["hellas", "admin", "export-bundle"]).is_err());
+    }
 }

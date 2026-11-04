@@ -3,7 +3,7 @@ use crate::commands::admin::{AdminArgs, AdminCommand, OfflineArgs};
 use crate::identity::LocalIdentity;
 use hellas_auth::{Digest, authority as auth};
 use hellas_authority::{
-    node::{HOST_STATUS, WORK_CAPACITY_CONFIGURE, host_resource, machine_resource},
+    node::{HOST_STATUS, host_resource},
     test_support::{WAIT, common_node, ids},
 };
 use hellas_rpc::Assurance;
@@ -105,10 +105,7 @@ impl Daemon {
         let scope = common_node::admin_spec(
             authority,
             owner,
-            &[
-                (HOST_STATUS, host_resource(authority)),
-                (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
-            ],
+            &[(HOST_STATUS, host_resource(authority))],
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
             &[],
@@ -399,46 +396,6 @@ async fn online_admin_requires_an_explicit_profile() {
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "--profile is required");
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn local_capacity_command_reaches_the_running_host() {
-    let mut daemon = Daemon::start().await;
-    let limits = daemon.root.path().join("machine-limits.json");
-    let budget = vec![hellas_authority::model::grant::budget::Limit {
-        meter: hellas_authority::model::grant::budget::Meter::Requests,
-        window: hellas_authority::model::grant::budget::Window::Total,
-        amount: 7,
-    }];
-    std::fs::write(&limits, serde_json::to_vec(&budget).unwrap()).unwrap();
-    let client = daemon.client().await;
-    let before = client.get_host_status(status_request()).await.unwrap();
-    assert!(before.machine.is_none());
-    run(
-        daemon.local(AdminCommand::SetCapacity {
-            limits,
-            expected_revision: 0,
-            max_in_flight: 3,
-        }),
-        &daemon.identity,
-    )
-    .await
-    .unwrap();
-    let machine = client
-        .get_host_status(status_request())
-        .await
-        .unwrap()
-        .machine
-        .unwrap();
-    assert_eq!(machine.max_in_flight, 3);
-    assert_eq!(
-        hellas_rpc::protocol::value::decode_dag_cbor::<
-            Vec<hellas_authority::model::grant::budget::Limit>,
-        >(&machine.limits)
-        .unwrap(),
-        budget
-    );
     daemon.stop().await;
 }
 

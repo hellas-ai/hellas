@@ -3,6 +3,7 @@
 #[macro_use]
 extern crate tracing;
 
+use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
@@ -135,7 +136,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum IdentityCommand {
     /// Create the local identity file if it does not exist
-    Init,
+    Init {
+        /// Create a fresh private software owner key alongside this device identity.
+        #[arg(long)]
+        passkey_out: Option<PathBuf>,
+    },
     /// Print the node ID (hex public key) derived from the identity file
     ShowNodeId,
     /// Print the ContentId of the canonical enrollment bundle
@@ -185,7 +190,7 @@ enum Commands {
     #[cfg(unix)]
     /// Create, list and destroy machines through a configured provider.
     Machines(machines::MachinesArgs),
-    /// Introduce the principal with a signed contact card, or save a friend's.
+    /// Introduce the principal with a signed contact card, or save a contact's.
     Contact {
         #[command(subcommand)]
         command: commands::contributions::ContactCommand,
@@ -216,8 +221,9 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid terms (TOML) the selected owner approves at startup. Paid
-        /// work is sold only with this file.
+        /// Paid terms (TOML). With an owner passkey, approve and fund them at
+        /// startup; without one, require the exact remotely approved policy
+        /// and stake already delegated by the owner.
         #[arg(
             long = "paid-work-config",
             value_name = "FILE",
@@ -229,6 +235,9 @@ enum Commands {
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
+        /// Serve a converted Whisper model with model-pinned grants and one concurrent job.
+        #[arg(long, requires = "await_owner", conflicts_with = "grant_config_file")]
+        audio_model: Option<PathBuf>,
         /// Wait for one owner pairing if uninitialized; use this directory for node state.
         #[arg(long, num_args = 0..=1, default_missing_value = ".")]
         await_owner: Option<PathBuf>,
@@ -585,13 +594,23 @@ async fn async_main() {
         check_config: true,
         fetch_config_file,
         grant_config_file,
+        audio_model,
+        await_owner,
         ..
     } = &cli.command
     {
-        let result = commands::serve::validate_provider_config(
-            fetch_config_file.as_deref(),
-            grant_config_file.as_deref(),
-        );
+        let result = if let Some(model) = audio_model {
+            commands::serve::audio_model::configure(
+                model,
+                await_owner.as_deref().unwrap_or(Path::new(".")),
+            )
+            .map(|_| ())
+        } else {
+            commands::serve::validate_provider_config(
+                fetch_config_file.as_deref(),
+                grant_config_file.as_deref(),
+            )
+        };
         tracer_provider.shutdown();
         if let Err(error) = result {
             eprintln!("error: {error:#}");
@@ -801,7 +820,7 @@ async fn async_main() {
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
         Commands::Serve {
-            native,
+            mut native,
             assurance,
             port,
             no_discovery,
@@ -809,6 +828,7 @@ async fn async_main() {
             work_config_file,
             chain_node,
             grant_config_file,
+            audio_model,
             await_owner,
             #[cfg(feature = "otel")]
                 metrics_port: _,
@@ -829,9 +849,7 @@ async fn async_main() {
                     commands::serve::paid::PaidWork::load(
                         path,
                         identity::provider_root(cli.identity.as_deref())?,
-                        owner.clone().ok_or_else(|| {
-                            anyhow::anyhow!("--paid-work-config requires --passkey, --faucet or --faucet-account")
-                        })?,
+                        owner.clone(),
                         fetch_config_file.as_deref(),
                     )
                 })
@@ -846,19 +864,45 @@ async fn async_main() {
                         let settlement_key = identity::settlement_signer(&local_identity)?;
                         let open_identity = local_identity.open_identity();
                         let grants = if let Some(path) = grant_config_file.as_deref() {
-                            anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
+                            anyhow::ensure!(
+                                assurance == hellas_rpc::Assurance::ProducerSigned,
+                                "grants require producer-signed assurance"
+                            );
                             let root = passkey
                                 .map(commands::contributions::principal)
                                 .transpose()?
                                 .map(|owner| commands::contributions::data_root(&owner))
                                 .transpose()?;
-                            let config = hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
+                            let config =
+                                hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
                             Some(config)
-                        } else { None };
+                        } else if let Some(model) = audio_model.as_deref() {
+                            anyhow::ensure!(
+                                assurance == hellas_rpc::Assurance::ProducerSigned,
+                                "grants require producer-signed assurance"
+                            );
+                            let root = std::path::absolute(
+                                await_owner
+                                    .as_ref()
+                                    .context("--audio-model requires --await-owner")?,
+                            )?;
+                            native
+                                .content_paths
+                                .push(model.join(hellas_client::model::whisper::WEIGHTS_FILE));
+                            Some(commands::serve::audio_model::configure(model, &root)?)
+                        } else {
+                            None
+                        };
 
                         let (grants, transport) = match await_owner.as_deref() {
                             Some(root) => {
-                                let (grants, transport) = commands::serve::bootstrap::prepare(root, &local_identity, port, grants).await?;
+                                let (grants, transport) = commands::serve::bootstrap::prepare(
+                                    root,
+                                    &local_identity,
+                                    port,
+                                    grants,
+                                )
+                                .await?;
                                 (Some(grants), transport)
                             }
                             None => (grants, None),
@@ -868,7 +912,11 @@ async fn async_main() {
                             (None, Some(root)) => {
                                 let path = std::path::absolute(root)?.join("fetch.json");
                                 if !path.try_exists()? {
-                                    hellas_private::write_atomically(&path, ".initializing", br#"{"revision":0,"routes":[]}"#)?;
+                                    hellas_private::write_atomically(
+                                        &path,
+                                        ".initializing",
+                                        br#"{"revision":0,"routes":[]}"#,
+                                    )?;
                                 }
                                 Some(path)
                             }
@@ -1244,7 +1292,11 @@ async fn async_main() {
             unreachable!("management commands handled before identity load")
         }
         Commands::Identity { command } => match command {
-            IdentityCommand::Init => Ok(()),
+            IdentityCommand::Init { passkey_out } => passkey_out
+                .as_deref()
+                .map(commands::identity::create_passkey)
+                .transpose()
+                .map(|_| ()),
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)

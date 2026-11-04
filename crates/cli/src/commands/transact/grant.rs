@@ -4,46 +4,85 @@ use hellas_auth::authority::{NodeKey, ResourceId, UnixMillis};
 use hellas_sdk::{
     execution::{ExecutionTarget, RetainedExecutionResult},
     grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer},
-    node_control::profile::ClientProfile,
 };
 
 #[derive(Debug, Default, Args)]
 pub(super) struct GrantArgs {
-    /// Imported allowance offer. Executes without funding or paying a channel.
-    #[arg(long, requires_all = ["work_profile", "resource", "attempt"], conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir"])]
+    /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
+    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
     pub offer: Option<String>,
-    /// Device-bound Work profile installed by `hellas offer import-bundle`.
-    #[arg(long, requires = "offer", value_name = "FILE")]
-    work_profile: Option<PathBuf>,
-    /// Exact resource ID admitted by the allowance.
-    #[arg(long, requires = "offer", value_name = "ID")]
-    resource: Option<hellas_auth::Digest>,
-    /// Durable attempt record. Reuse it to recover; a new path requests new work.
+    /// Select a resource ID in an imported allowance containing several policies.
+    #[arg(long, requires = "offer")]
+    resource: Option<ResourceId>,
+    /// Durable attempt record (default: under the client state, by offer and job).
     #[arg(long, requires = "offer", value_name = "FILE")]
     attempt: Option<PathBuf>,
 }
 
-pub(super) async fn run(
+pub(super) struct GrantResult {
+    pub attempt: ExecutionAttempt,
+    pub retained: RetainedExecutionResult,
+    resource: ResourceId,
+    provider_key: hellas_auth::PublicKey,
+    provider: hellas_sdk::client::ProviderAddress,
+}
+
+impl GrantResult {
+    pub fn save(&self, directory: &Path, job: &Job) -> anyhow::Result<()> {
+        hellas_private::create_dir_all_durable(directory)?;
+        write(
+            &directory.join("transcript.cbor"),
+            &self.retained.transcript,
+        )?;
+        write(
+            &directory.join("result.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "job": job.digest().to_string(), "provider": self.provider.to_string(),
+                "funding": "grant", "resource": self.resource.to_string(),
+                "work": self.attempt.inspect()?.work.context("completed grant has no work ID")?.to_string(),
+                "outcome": self.retained.output.outcome,
+            }))?,
+        )?;
+        save_invocation_outputs(directory, job, &self.retained.output, &self.provider_key)?;
+        Ok(())
+    }
+    pub fn ensure_succeeded(&self) -> anyhow::Result<()> {
+        if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) =
+            &self.retained.output.outcome
+        {
+            bail!("grant work failed: {reason:?}");
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn execute(
     grant: &GrantArgs,
     args: &ClientArgs,
     context: &Context,
     job: &Job,
-    output: Option<&Path>,
-) -> super::super::CliResult<()> {
-    ensure!(
-        args.provider.addresses.is_empty(),
-        "grant addresses come from the signed offer"
-    );
+) -> super::super::CliResult<GrantResult> {
     let principal = super::super::contributions::principal(&context.owner)?;
-    let offer = super::super::contributions::load_offer(
+    let holder = NodeKey::from_public_key(context.producer.public_key())?;
+    let store = hellas_sdk::grant_store::GrantStore::new(super::super::contributions::data_root(
         &principal,
+    )?);
+    let (offer, application) = store.load_access(
         grant.offer.as_deref().context("missing --offer")?,
+        &principal,
+        &holder,
     )?;
     let provider = hellas_sdk::client::ProviderAddress::of(&offer.offer().provider)?;
-    ensure!(
-        provider == args.provider.address,
-        "offer does not match --provider"
-    );
+    if let Some(expected) = &args.provider {
+        ensure!(
+            expected.addresses.is_empty(),
+            "grant addresses come from the signed offer"
+        );
+        ensure!(
+            provider == expected.address,
+            "offer does not match --provider"
+        );
+    }
     let trust = match (&args.trust_store, &args.trust_policy, job.assurance()) {
         (Some(directory), Some(id), assurance) => hellas_sdk::trust_policy::TrustPolicyStore::new(
             directory,
@@ -57,31 +96,23 @@ pub(super) async fn run(
         _ => bail!("Apple providers require --trust-store and --trust-policy"),
     };
     let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
-    let resource = ResourceId(grant.resource.context("missing --resource")?);
-    let policy = offer
-        .offer()
-        .grant
-        .policies
-        .iter()
-        .find(|policy| policy.resource == resource)
-        .context("offer does not admit --resource")?;
+    let policy = select_policy(&offer.offer().grant.policies, grant.resource)?;
+    let resource = policy.resource;
     job.input().admits(&policy.invocation_policy, false)?;
-    let holder = NodeKey::from_public_key(context.producer.public_key())?;
-    let application = Arc::new(ClientProfile::load_bound(
-        grant
-            .work_profile
-            .as_deref()
-            .context("missing --work-profile")?,
-        &principal,
-        &holder,
-    )?);
+    let application = Arc::new(application);
     let provider_key = hellas_auth::PublicKey::Secp256k1(
         hellas_authority::model::grant::records::grant_producer(&offer.offer().provider)?
             .to_bytes(),
     );
     let terms = ExecutionTerms::Grant { resource };
+    let default_attempt = args
+        .root(context)
+        .join("grant-attempts")
+        .join(provider.to_string())
+        .join(offer.offer().grant.id.to_string())
+        .join(format!("{}.json", job.digest()));
     let mut attempt = ExecutionAttempt::open(
-        grant.attempt.as_deref().context("missing --attempt")?,
+        grant.attempt.as_deref().unwrap_or(&default_attempt),
         job.input(),
         terms,
     )?;
@@ -135,32 +166,90 @@ pub(super) async fn run(
         closed?;
         result
     };
-    let work = attempt
+    Ok(GrantResult {
+        attempt,
+        retained,
+        resource,
+        provider_key,
+        provider,
+    })
+}
+
+pub(super) async fn run(
+    grant: &GrantArgs,
+    args: &ClientArgs,
+    context: &Context,
+    job: &Job,
+    output: Option<&Path>,
+) -> super::super::CliResult<()> {
+    let mut result = execute(grant, args, context, job).await?;
+    if let Some(directory) = output {
+        result.save(directory, job)?;
+    } else {
+        println!(
+            "output: {}",
+            serde_json::to_string(&result.retained.output)?
+        );
+    }
+    result.ensure_succeeded()?;
+    let work = result
+        .attempt
         .inspect()?
         .work
         .context("completed grant has no work ID")?;
-    if let Some(directory) = output {
-        hellas_private::create_dir_all_durable(directory)?;
-        write(&directory.join("transcript.cbor"), &retained.transcript)?;
-        write(
-            &directory.join("result.json"),
-            &serde_json::to_vec_pretty(&serde_json::json!({
-                "job": job.digest().to_string(), "provider": provider.to_string(),
-                "funding": "grant", "resource": resource.0.to_string(), "work": work.to_string(),
-                "outcome": retained.output.outcome,
-            }))?,
-        )?;
-        save_invocation_outputs(directory, job, &retained.output, &provider_key)?;
-    } else {
-        println!("output: {}", serde_json::to_string(&retained.output)?);
-    }
-    if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) =
-        retained.output.outcome
-    {
-        bail!("grant work {work} failed: {reason:?}");
-    }
-    println!("grant work {work} completed on {provider}");
+    println!("grant work {work} completed on {}", result.provider);
     std::io::stdout().lock().flush()?;
-    attempt.reported()?;
+    result.attempt.reported()?;
     Ok(())
+}
+
+fn select_policy(
+    policies: &[hellas_authority::model::grant::records::GrantPolicy],
+    resource: Option<ResourceId>,
+) -> anyhow::Result<&hellas_authority::model::grant::records::GrantPolicy> {
+    match resource {
+        Some(id) => policies
+            .iter()
+            .find(|policy| policy.resource == id)
+            .context("selected --resource is absent from the offer"),
+        None => {
+            ensure!(
+                policies.len() == 1,
+                "offer must contain one policy unless --resource selects an explicit resource ID"
+            );
+            Ok(&policies[0])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiple_policy_offers_require_and_honor_explicit_resource_selection() {
+        let first = hellas_authority::test_support::policy();
+        let mut second = first.clone();
+        second.resource = ResourceId(hellas_auth::Digest::hash(b"second resource"));
+        let policies = [first, second];
+        assert!(select_policy(&policies, None).is_err());
+        assert_eq!(
+            select_policy(&policies, Some(policies[1].resource))
+                .unwrap()
+                .resource,
+            policies[1].resource
+        );
+        assert!(
+            select_policy(
+                &policies,
+                Some(ResourceId(hellas_auth::Digest::hash(b"absent")))
+            )
+            .is_err()
+        );
+        assert!(select_policy(&[], None).is_err());
+        assert_eq!(
+            select_policy(&policies[..1], None).unwrap().resource,
+            policies[0].resource
+        );
+    }
 }

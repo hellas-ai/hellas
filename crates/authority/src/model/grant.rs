@@ -5,6 +5,7 @@ use hellas_kernel::NetworkId;
 use hellas_rpc::ContentId;
 pub mod admin;
 pub mod budget;
+pub mod configuration;
 pub mod pricing;
 pub mod records;
 pub mod resource;

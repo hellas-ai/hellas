@@ -355,7 +355,8 @@ fn decode(path: &Path, bytes: &[u8]) -> anyhow::Result<LocalIdentity> {
 fn persist(path: &Path, stored: &StoredIdentity) -> anyhow::Result<bool> {
     let dir = path
         .parent()
-        .context("identity path has no parent directory")?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     hellas_private::create_dir_all_durable(dir)
         .with_context(|| format!("failed to create identity directory {}", dir.display()))?;
     let mut temp = hellas_private::private_tempfile(dir, ".identity-", ".tmp")

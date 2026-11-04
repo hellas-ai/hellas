@@ -49,6 +49,16 @@ pub enum ChainCommand {
     },
     /// Reclaim selected coins without a delegate using the global owner passkey
     Sweep(OwnerCoinArgs),
+    /// Send coins to an owner, returning unused value as undelegated change
+    Send {
+        #[command(flatten)]
+        coins: OwnerCoinArgs,
+        /// Recipient owner key (base58)
+        #[arg(long)]
+        to: SettlementKey,
+        #[arg(long)]
+        amount: u64,
+    },
     /// Sign and submit a kernel edge Open transaction
     Open(OpenArgs),
     /// Sign and submit a kernel edge Close transaction
@@ -368,9 +378,14 @@ pub async fn run(command: ChainCommand, owner: Option<&hellas_kernel::SoftPasske
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
                 "delegate must be a valid secp256k1 node key"
             );
-            run_owner_coins(coins, Some(node.into_kernel()), split, owner).await
+            run_owner_coins(coins, Some(node.into_kernel()), split, None, owner).await
         }
-        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, None, owner).await,
+        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, None, None, owner).await,
+        ChainCommand::Send { coins, to, amount } => {
+            anyhow::ensure!(amount > 0, "amount must be positive");
+            hellas_sdk::coin_owner::OwnerReshape::validate_recipient(to.into_kernel())?;
+            run_owner_coins(coins, None, None, Some((to.into_kernel(), amount)), owner).await
+        }
         ChainCommand::Query {
             rpc,
             trust,
@@ -390,23 +405,37 @@ async fn run_owner_coins(
     args: OwnerCoinArgs,
     delegate: Option<hellas_kernel::Key>,
     split: Option<u64>,
+    payment: Option<(hellas_kernel::Key, u64)>,
     owner: Option<&hellas_kernel::SoftPasskey>,
 ) -> CliResult {
-    let owner =
-        owner.context("chain delegate/sweep requires --passkey, --faucet or --faucet-account")?;
+    let owner = owner
+        .context("chain delegate/sweep/send requires --passkey, --faucet or --faucet-account")?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
     let network = selected_network(&args.network, args.genesis.clone())?;
     let client =
         connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
-    let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
-        &client,
-        network,
-        hellas_kernel::Key::from_bytes(owner.public_key()?.to_compressed()),
-        selected.as_slice(),
-        delegate,
-        split,
-    )
-    .await?;
+    let key = hellas_kernel::Key::from_bytes(owner.public_key()?.to_compressed());
+    let plan = if let Some((recipient, amount)) = payment {
+        hellas_sdk::coin_owner::OwnerReshape::pay(
+            &client,
+            network,
+            key,
+            selected.as_slice(),
+            recipient,
+            amount,
+        )
+        .await?
+    } else {
+        hellas_sdk::coin_owner::OwnerReshape::prepare(
+            &client,
+            network,
+            key,
+            selected.as_slice(),
+            delegate,
+            split,
+        )
+        .await?
+    };
     let output_ids = plan.output_ids();
     let auth = kernel_auth(
         &owner.public_key()?,
@@ -1077,7 +1106,7 @@ mod tests {
         let node = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
         let key = SettlementKey::from(node.party_key()).to_string();
         let coin = "01".repeat(32);
-        for operation in ["delegate", "sweep"] {
+        for operation in ["delegate", "sweep", "send"] {
             let mut args = vec![
                 "hellas",
                 "--passkey",
@@ -1093,6 +1122,8 @@ mod tests {
             ];
             if operation == "delegate" {
                 args.extend(["--node", &key]);
+            } else if operation == "send" {
+                args.extend(["--to", &key, "--amount", "37"]);
             }
             assert!(crate::Cli::try_parse_from(&args).is_ok());
             args.extend(["--owner-key", "other.key"]);

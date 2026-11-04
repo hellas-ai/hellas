@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod audio_model;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
@@ -56,7 +57,7 @@ pub fn validate_grant_resources(
     config: &hellas_sdk::grant_config::GrantConfig,
     routes: &FetchRouteRegistry,
 ) -> CliResult<()> {
-    provider_resources(routes).validate(&config.resources)?;
+    provider_resources(routes).validate(config.configuration.resources())?;
     Ok(())
 }
 

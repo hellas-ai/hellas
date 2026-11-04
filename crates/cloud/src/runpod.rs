@@ -77,6 +77,7 @@ impl RunPod {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let allocation = method == Method::POST && path == "/pods";
         let token = self
             .credential
             .resolve()
@@ -92,7 +93,28 @@ impl RunPod {
         // Never retry allocation: a lost response can hide a billable machine.
         let mut response = request.send().await.map_err(Error::Request)?;
         if !response.status().is_success() {
-            return Err(Error::HttpStatus(response.status()));
+            let status = response.status();
+            // RunPod reports exhausted capacity as HTTP 500. Recognize only its
+            // exact public message; arbitrary error bodies can contain secrets.
+            if allocation && status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(Error::Request)? {
+                    if bytes.len().saturating_add(chunk.len()) > 4096 {
+                        return Err(Error::HttpStatus(status));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                if serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .is_some_and(|body| {
+                        body["error"].as_str()
+                            == Some("create pod: There are no instances currently available")
+                    })
+                {
+                    return Err(Error::CapacityUnavailable);
+                }
+            }
+            return Err(Error::HttpStatus(status));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(Error::Request)? {
@@ -505,6 +527,46 @@ mod tests {
             matches!(provider.create(&spec()).await, Err(Error::Allocated { id, .. }) if id == "pod1")
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_capacity_is_actionable_without_exposing_other_error_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential.json");
+        hellas_private::write_atomically(&path, ".tmp", br#"{"token":"key"}"#).unwrap();
+        for (body, capacity) in [
+            (json!({"error":"create pod: There are no instances currently available", "status":500, "detail":"private-detail"}).to_string(), true),
+            (json!({"error":"private-detail"}).to_string(), false),
+            ("private-detail".repeat(400), false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (headers, _) = receive(&mut socket);
+                assert!(headers.starts_with("GET /templates/template "));
+                respond(&mut socket, "200 OK", &template().to_string());
+                let (mut socket, _) = listener.accept().unwrap();
+                let (headers, _) = receive(&mut socket);
+                assert!(headers.starts_with("POST /pods "));
+                respond(&mut socket, "500 Internal Server Error", &body);
+            });
+            let provider = RunPod::new(source(&path), Config {
+                base_url: Some(format!("http://{address}")),
+                ..config()
+            }).unwrap();
+            let error = provider.create(&spec()).await.unwrap_err();
+            assert!(!error.to_string().contains("private-detail"));
+            let Error::CreationUnconfirmed { name, source } = error else {
+                panic!("allocation failure must retain reconciliation advice")
+            };
+            assert_eq!(name, "worker");
+            assert_eq!(matches!(*source, Error::CapacityUnavailable), capacity);
+            if !capacity {
+                assert!(matches!(*source, Error::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
+            }
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]

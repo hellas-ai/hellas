@@ -4181,7 +4181,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let provider = enrollment;
     let config = || ProviderGrants {
         config: crate::GrantProviderOptions {
-            policies: vec![],
+            configuration: Default::default(),
             max_job_millis: std::num::NonZeroU64::MIN,
         },
         authority: ProviderAuthority::Journal {
@@ -4234,19 +4234,22 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     .await;
     drop(store);
     let mut changed = config();
-    changed.config.policies = vec![GrantPolicy {
-        resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
-        account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
-        revision: hellas_auth::authority::Revision(1),
-        name: "evaluate".into(),
-        invocation_policy: work_policy(),
-        https: None,
-        pricing: hellas_authority::model::grant::pricing::Pricing {
+    changed.config.configuration =
+        hellas_authority::test_support::common_node::configuration(vec![GrantPolicy {
+            resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
+                b"test resource",
+            )),
+            account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             revision: hellas_auth::authority::Revision(1),
-            rates: None,
-        },
-        responses: None,
-    }];
+            name: "evaluate".into(),
+            invocation_policy: work_policy(),
+            https: None,
+            pricing: hellas_authority::model::grant::pricing::Pricing {
+                revision: hellas_auth::authority::Revision(1),
+                rates: None,
+            },
+            responses: None,
+        }]);
     for options in [config(), changed, config()] {
         let node = options
             .open(ProviderResources::ComputeAndFetch(&routes), &provider)
@@ -4268,10 +4271,9 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         .unwrap();
         let admin = hellas_authority::grant_service::WorkAdministration::new(
             service,
-            options.config.policies,
+            options.config.configuration,
             options.config.max_job_millis,
-        )
-        .unwrap();
+        );
         let hellas_authority::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
             .execute(
                 &caller,

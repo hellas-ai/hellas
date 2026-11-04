@@ -83,7 +83,7 @@ fn identity_init_has_an_explicit_dispatch_command() {
     assert!(matches!(
         cli.command,
         Commands::Identity {
-            command: IdentityCommand::Init,
+            command: IdentityCommand::Init { passkey_out: None },
         }
     ));
 }

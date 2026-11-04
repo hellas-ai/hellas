@@ -322,14 +322,9 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
         } else {
             changed.revision.0 += 1;
         }
+        // Configuring the changed resource reconciles it into the catalogue.
         let admin =
             common_node::WorkAdmin::new(service.clone(), &secret, vec![changed.clone()]).await;
-        admin
-            .command(WorkControlCommand::ConfigureResource {
-                policy: changed.name.clone(),
-            })
-            .await
-            .unwrap();
         if remove_from_allowance {
             use crate::model::grant::admin::AllowanceTerms;
             assert!(

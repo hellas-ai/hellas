@@ -5,6 +5,23 @@ only machine keys: an iroh transport key for QUIC and a secp256k1 node key. The
 CLI acts for the principal of a software passkey file given with `--passkey`
 (32 raw bytes or 64 hex digits); `--identity` names the node's own keys.
 
+For first setup, `hellas --software-root identity init --passkey-out owner.passkey`
+creates both the client device identity and a fresh private owner key. It never
+overwrites an existing key. Start a model worker with `serve --audio-model DIR
+--await-owner STATE`: the converted Whisper package supplies a model-pinned
+resource, a machine/account budget, and the indexed weights. The directory's
+basename is its resource name; one job may run at a time. Use `--grant-config`
+instead for custom resources or budgets.
+
+The worker writes a private `STATE/invitation.json`. Pair with
+`hellas --passkey owner.passkey admin bootstrap-remote --invitation FILE
+--profile-out operator`. Without custom scopes, the pairing owner receives
+one year of full node administration; `--administrator` and `--credential-scope`
+can supply narrower scopes together. The resulting profile retains the node
+pin from the authenticated invitation. Later `admin --profile operator/profile.json`
+commands need no `--node`; an explicit different node is rejected.
+See the [complete command sequence](../README.md#own-a-worker-and-share-access).
+
 Node administration requires a scoped application credential and explicit
 operation grants. A credential is issued to a principal and held by a device: it
 records the node key of the device that holds it. Each session proves the
@@ -26,23 +43,17 @@ passkey session; without it, the node key of `--identity` opens a daily session:
 
 ```sh
 hellas --identity node.identity admin --profile operator.json status
-hellas --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
 hellas --identity node.identity admin --profile operator.json work allowance.json
-hellas --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
+hellas --identity node.identity admin --profile operator.json work export.json --offer-out recipient.offer
 hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
-`status` requires `host.status` on this authority's host resource. `set-capacity`
-requires `work.capacity.configure` on its machine resource and the current machine
-revision returned by status. `--limits` supplies the complete budget configuration,
-for example `[{"meter":"Requests","window":"Day","amount":100}]`; an explicit `[]`
-removes budget limits. Changes preserve counters, reservations and outstanding work,
-so removing and restoring a limit cannot reset usage. Revision zero initializes a
-provider whose machine has not been configured. `status` includes the current limits.
+`status` requires `host.status` on this authority's host resource. It includes the
+machine budget the node's grant configuration applies (see below).
 `work` also accepts `SetPaidPolicy { expected_revision, policy }` to set the
 provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
@@ -122,20 +133,19 @@ table below is checked against the implementation by the Work tests.
 | `host.gateway.configure` | Host | Host |
 | `host.gateway.access` | Host | Host |
 | `gateway.invoke` | Host | Host |
-| `work.capacity.configure` | Work machine | Machine or provider |
 | `work.allowance.read` | Work machine | Provider |
 | `work.allowance.configure` | Work machine | Provider |
 | `work.budget.configure` | Work machine | Provider |
 | `work.offer.export` | Work machine | Provider |
 | `work.generation.reset` | Work machine | Provider |
-| `work.resource.configure` | Work machine | Provider |
 | `work.resource.repair` | Work machine | Provider |
 | `work.paid.configure` | Work machine | Provider |
 | `work.execute` | Selected allowance | Provider |
 <!-- operations:end -->
 
-Configure machine capacity first, then explicit account, pool and subject budgets
-with `ConfigureBudget`. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
+The node's grant configuration owns the machine and account budgets. Pool and
+subject budgets are configured with `ConfigureBudget`, which refuses the machine and
+accounts. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
 names a node, its parent, the new revision, limits and maximum concurrent jobs.
 An account is an Auth resource ID and has the machine as parent. A pool has a stable
 16-byte ID and an account parent. A subject node is the pair `(pool, principal)`;
@@ -144,13 +154,13 @@ levels are permitted. Parentage is immutable, and revisions start at one and inc
 by exactly one. Configuration returns the changed node and revision; `InspectBudget`
 requires the read permission and returns the current definition and accounting.
 
-Register each resource with `{"ConfigureResource":{"policy":"name"}}` after configuring
-its account budget. The command selects a validated policy from the host's resource
-file and commits it to the catalogue; startup does not register it. Every policy has
-an explicit `resource` ID, `account` ID and positive `revision`. Both IDs use Auth's
-32-byte ResourceId. A resource's account is immutable; policy revisions increase by
-exactly one. `Catalogue` returns the durable configuration through checked inspection.
-Configuration returns only the changed resource ID and revision.
+The grant configuration also declares the resources the node serves, and the node
+commits them to its catalogue when the provider starts. Every policy has an explicit
+`resource` ID, `account` ID and positive `revision`. Both IDs use Auth's 32-byte
+ResourceId. A resource's account is immutable; a changed policy must raise its
+`revision` by exactly one, or startup refuses it. A resource removed from the file
+stays in the catalogue, because allowances pin it. `Catalogue` returns the durable
+catalogue through checked inspection.
 
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result
@@ -311,39 +321,137 @@ secrets. `credential_claimed` is an unverified locator; only `verified=true` sup
 an actor validated by this node. A revoked credential or wrong session binding cannot
 attribute a request to that actor.
 
-## Access bundles
+## Share a resource
 
-An access bundle shares allowances with one contact device: one signed offer per
-allowance, the authority ID, the contact's Auth grant ID, the credential subject,
-the node key of the contact's device, the credential ID and secret, the expiry and
-an optional provider label of at most 64 bytes. It contains no provider trust; the
-contact still approves a trust policy with `hellas trust` before running work.
+`admin share` gives one principal metered access to one resource declared by the
+node's grant configuration. It uses a verified contact card as the subject and
+an explicit `CredentialHolder` for the receiving device. A principal can have
+many devices; a contact card never chooses one. Sharing with yourself follows
+the same metered path.
+
+On the receiving device, export its principal's contact card and device holder:
 
 ```sh
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
-hellas --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
+hellas --passkey me.passkey contact export --display-name me --out me.contact
+hellas --identity laptop.identity identity show-holder > me.holder
 ```
 
-`export-bundle` takes `--allowance` once per shared allowance, at most 16. The
-credential scope must grant `work.execute` on each of them; `--grant-id` names the
-contact's existing grant with those permissions, not an allowance ID. It exports
-each allowance's offer (`work.offer.export`), then prepares one credential bounded
-by the scope, held by the contact device named by `--holder`. It saves the bundle
-before submitting the verifier, exactly as `issue-credential` does. The bundle is canonical DAG-CBOR tagged
-`hellas.access-bundle.v2`. Its subject and holder carry their curve tags. It is
-written as a new private file that never replaces an existing one. A failed or
-unconfirmed issuance leaves that bundle pending; inspect its reported credential
-ID before sharing it. The secret is never printed.
+Give both files to the node administrator. The administrator selects the
+configured resource name; its account comes from the node's configuration:
 
-`offer import-bundle` accepts the received bundle file as it is; delete it after
-importing, since it holds the credential. It refuses a bundle whose subject is not
-the `--passkey` principal or whose holder is not this device's node key, and verifies
-each offer's provider signature. It saves each offer as `NAME.POLICY`, after the
-offer's first policy, as `offer import` does, and installs one remote-only Work
-profile (`profile.json` and a private `credential`) under `accesses/NAME` in the
-principal's data directory, refusing a non-empty directory. It prints each saved
-offer name with its grant ID, and the profile path; use that path as
-`--work-profile` together with `--offer NAME.POLICY`.
+```sh
+hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+  share --contact me.contact --holder me.holder --resource klein \
+  --limit requests:total:100 --max-job 15m --expires 1h --label "My node" --out me.access
+```
+
+The command derives one pool, allowance and Auth grant per
+(authority, principal, resource). It creates the pool under the resource's
+configured account, then a subject budget with the supplied limits and one job
+in flight. The allowance admits only that resource, including its configured
+upstream account when applicable. Its grant carries only `work.execute` on the
+allowance. The node's machine and account limits continue to apply.
+
+Repeat `--limit METER:WINDOW:AMOUNT` for different meter/window pairs. Meters are
+`requests`, `input-tokens`, `output-tokens`, `device-millis` and `usd-micros`;
+windows are `hour`, `day`, `week` and `total`. Duplicate pairs are refused.
+Omitting all limits bounds concurrency and job duration only. `--max-job` is
+required and cannot exceed the node's configured maximum. Durations accept
+`ms`, `s`, `m`, `h` and `d`; `--expires` defaults to `30d` and must fit the
+administrator's issuance ceiling.
+
+A rerun uses the same identifiers and changes only differing budget/allowance
+terms with checked revisions, preserving usage and reservations. It resumes after
+an interrupted creation. With the same validity duration, an unchanged live grant
+keeps its original expiry, so a second device's share does not invalidate the
+first. A changed duration or an expired grant starts a new validity period on the
+same grant. A revoked grant stays revoked. Concurrent edits fail their revision
+check; inspect and rerun. Each successful call issues a new credential for the
+explicit holder, so use a new output path.
+
+## Access bundles
+
+`share` exports one signed offer and one new device-bound credential into a
+private access bundle. It also carries the authority, grant and subject IDs,
+holder, expiry and optional provider label (at most 64 bytes). It contains no
+provider trust. The bundle is canonical DAG-CBOR tagged
+`hellas.access-bundle.v2`; the secret is never printed.
+
+The bundle is saved before the credential verifier is submitted, as with
+`issue-credential`. The output never replaces an existing file. Failed or
+unconfirmed issuance leaves that bundle pending: inspect its reported credential
+ID before distributing it or retrying issuance.
+
+On the receiving device:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey offer import-bundle me.access --name box
+```
+
+Import refuses a different principal or device and verifies the provider's offer
+signature. It installs offers as `NAME.POLICY` and a remote Work profile under
+`accesses/NAME` in the principal's data directory, refusing a non-empty profile
+directory. It prints the offer names, grant IDs and profile path. Delete the
+received bundle after importing, since it contains the credential secret.
+
+Use the imported offer directly; its signed policy selects the resource and
+its bundle alias locates the bound profile:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey image \
+  --offer box.klein --model ./klein --prompt "a fox"
+```
+
+`run`, `image` and `transcribe` accept either `--offer NAME.POLICY` or
+`--payment AMOUNT`. `transact --job DIR --offer NAME.POLICY` uses the same
+profile lookup. A single-policy offer selects its resource automatically. An
+imported allowance with multiple policies also accepts `--resource ID` to select
+an exact resource explicitly; `--work-profile` is unnecessary.
+The provider address comes from the verified signed offer. An explicit
+`--provider ENROLLMENT_ID@NODE_ID` must match that address. Apple providers also
+require the caller's independently approved `--trust-store` and `--trust-policy`.
+Repeated jobs reuse durable attempts by offer and job; `--attempt FILE` selects
+an explicit record. See [jobs](jobs.md) for recovery and results.
+
+### Renew an imported share
+
+Rerunning an unexpired share with the same `--expires` duration keeps its original
+expiry. After it expires, the same duration starts a new validity period. To
+renew earlier, choose a different duration that fits the administrator's issuance
+ceiling, and repeat the desired limits and job duration:
+
+```sh
+hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+  share --contact me.contact --holder me.holder --resource klein \
+  --limit requests:total:100 --max-job 15m --expires 2h --out me-renewed.access
+```
+
+The example renews the earlier `1h` share for `2h`; it requires an issuance
+ceiling that permits that duration. Keep the new bundle private and deliver it
+to the same recipient device. Each call issues a new credential while retaining
+the pool, allowance and grant identifiers and their used counters.
+
+On that device, import the renewed bundle under a new alias. An existing profile
+directory is never overwritten, including with `--replace`:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
+hellas --identity laptop.identity --passkey me.passkey transact --job ./saved-job \
+  --offer box-renewed.klein \
+  --attempt ./renewed-attempt.json --output ./renewed-result
+```
+
+Use the new alias in subsequent commands, and delete the received bundle after
+import. The explicit new attempt above executes the saved job once with the new
+credential and consumes the existing allowance. Changing only the alias does not
+request new work: the default attempt for an identical provider, allowance and
+job still replays its retained result. Keep old profiles and attempt records until
+unresolved work has been recovered. When retiring the previous credential, the
+administrator can use `admin revoke-credential` with its old credential ID; the
+shared grant remains the same.
+
+`admin work` and `admin grant` remain the typed primitive commands for custom
+administration.
 
 ## Explicit offline initialization and recovery
 
@@ -389,15 +497,22 @@ PKCS#8 `control.key.der` under the node state root. The grant configuration can
 select absolute `control_certificate` and `control_private_key` paths alongside
 `journal_root` and `control_socket`. The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-Resource configuration also cannot issue allowances or set budgets. After explicit
-initialization, start the daemon with `--grant-config` to mount its listeners and
-available resources. Use `set-capacity --expected-revision 0` to configure the first
-machine budget, configure account/pool/subject budgets, register each resource, then
-use `work` with `Create` to assign an allowance. Resource files contain `max_job_millis`, `resources` and optional listener/state paths;
-`machine_limits` and `max_in_flight` are not resource-file fields. Each resource also
-requires its explicit IDs and revision. Editing this file or restarting cannot change
-the durable catalogue or revise, revoke or renew an existing allowance. Such changes
-require their corresponding checked administration command.
+After explicit initialization, start the daemon with `--grant-config`. Its file
+contains `max_job_millis`, optional listener/state paths, machine/account budgets
+and complete resource policies. Resource entries require the full invocation
+policy and pricing fields accepted by the strict grant-config loader. The
+[README walkthrough](../README.md#own-a-worker-and-share-access) describes the
+Whisper owner setup.
+
+Serving resources requires `machine`; every resource's account must be declared in
+`accounts`, and every declared account must be used. Limits use the same
+`{"meter","window","amount"}` form as budgets. Whenever the provider starts with an
+initialized authority, including just after first pairing, the node applies this
+file: the machine first, then accounts, then resources, each committed only if it
+differs from the durable state. Budget changes preserve counters, reservations and
+outstanding work. The file never issues allowances, grants or credentials, and it
+cannot revise, revoke or renew an existing allowance; those remain checked
+administration commands, beginning with `work` and `Create`.
 
 The SDK Fetch provider follows the same sequence: initialize offline, start, then
 use its checked administration service. Its options describe available policies and

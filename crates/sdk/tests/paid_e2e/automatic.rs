@@ -399,10 +399,9 @@ impl Provider {
         .unwrap();
         let admin = hellas_authority::grant_service::WorkAdministration::new(
             grants.clone(),
-            composition_policies(),
+            hellas_authority::test_support::common_node::configuration(composition_policies()),
             std::num::NonZeroU64::new(5000).unwrap(),
-        )
-        .unwrap();
+        );
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(identity.transport_key())
             .alpns(vec![
@@ -2116,7 +2115,8 @@ fn grant_composition<'a>(
         let policies = composition_policies();
         let mut definition = definition(auth::GrantId([71; 16]), subject);
         definition.policies = policies.clone();
-        let admin = common_node::WorkAdmin::new(provider.grants.clone(), secret, policies).await;
+        let mut admin =
+            common_node::WorkAdmin::new(provider.grants.clone(), secret, policies).await;
         admin.capacity(4, vec![]).await;
         admin
             .budgets(

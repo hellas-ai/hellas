@@ -486,26 +486,6 @@ impl HostControlHandler for ControlSession {
             .map_err(node_error)?
     }
 
-    async fn set_machine_capacity(
-        &self,
-        request: SetMachineCapacityRequest,
-    ) -> Result<MachineCapacity, WireStatus> {
-        let caller = self.caller().await?;
-        let limits = decode_bounded(&request.limits, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
-        let result = self
-            .node
-            .set_machine_capacity(
-                caller,
-                grant_id(&request.authorization)?,
-                Revision(request.expected_revision),
-                u16::try_from(request.max_in_flight).map_err(|_| invalid())?,
-                limits,
-            )
-            .await
-            .map_err(node_error)?;
-        capacity(result)
-    }
-
     async fn grant_control(
         &self,
         request: GrantControlRequest,
@@ -776,13 +756,6 @@ impl ControlSession {
     }
 }
 
-fn capacity(value: hellas_authority::node::MachineCapacity) -> Result<MachineCapacity, WireStatus> {
-    Ok(MachineCapacity {
-        revision: value.revision.0,
-        max_in_flight: u32::from(value.max_in_flight.get()),
-        limits: canonical_dag_cbor(&value.limits).map_err(|_| unavailable())?,
-    })
-}
 fn grant_id(bytes: &[u8]) -> Result<GrantId, WireStatus> {
     GrantId::try_from(bytes).map_err(|_| invalid())
 }
@@ -818,6 +791,14 @@ fn denied() -> WireStatus {
 fn invalid() -> WireStatus {
     WireStatus::new(WireCode::InvalidArgument, "invalid node control request")
 }
+fn capacity(value: hellas_authority::node::MachineCapacity) -> Result<MachineCapacity, WireStatus> {
+    Ok(MachineCapacity {
+        revision: value.revision.0,
+        max_in_flight: u32::from(value.max_in_flight.get()),
+        limits: canonical_dag_cbor(&value.limits).map_err(|_| unavailable())?,
+    })
+}
+
 fn unavailable() -> WireStatus {
     WireStatus::new(WireCode::Unavailable, "node control is unavailable")
 }

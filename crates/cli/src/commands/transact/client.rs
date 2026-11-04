@@ -120,11 +120,12 @@ pub(super) async fn config(args: &ClientArgs, root: &Path) -> CliResult<WorkConf
 }
 
 pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()> {
+    let provider = args.paid_provider()?;
     let root = args.root(context);
     let config = config(args, &root).await?;
-    let journals = args.journals(&root);
+    let journals = args.journals(&root)?;
     if !journals.exists() {
-        println!("no open channels with {}", args.provider.address);
+        println!("no open channels with {}", provider.address);
         return Ok(());
     }
     let owner = hellas_auth::authority::PrincipalId::from_public_key(
@@ -133,7 +134,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
     let channels = retained_settlement_channels(
         &journals,
         config.chain.network,
-        args.provider.address,
+        provider.address,
         owner,
         context.settlement.party_key(),
     )
@@ -160,6 +161,6 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         );
         closed += 1;
     }
-    println!("settled {closed} channels with {}", args.provider.address);
+    println!("settled {closed} channels with {}", provider.address);
     Ok(())
 }
