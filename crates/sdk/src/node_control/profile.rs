@@ -134,10 +134,9 @@ pub fn server_tls(
 }
 
 fn read_private(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
-    hellas_private::read_private_bounded(
-        hellas_private::open_regular_file(path)?,
-        MAX_FILE as usize,
-    )
+    hellas_private::open_regular_file(path)
+        .and_then(|file| hellas_private::read_private_bounded(file, MAX_FILE as usize))
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
 /// A credential file is exactly its 16-byte ID followed by its 32-byte secret.
