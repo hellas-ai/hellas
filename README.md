@@ -341,7 +341,6 @@ streams a Docker archive to stdout:
 
 ```bash
 $(nix build .#docker --print-out-paths) | docker load
-nix run .#docker-push  # network image only
 ```
 
 GPU images include Catena and the corresponding runtime compiler:
@@ -362,8 +361,9 @@ docker run --rm --device /dev/kfd --device /dev/dri \
 ```
 
 Both GPU images default to `serve` with their matching backend. The host supplies
-the GPU driver and model content stays on runtime volumes. On x86_64 Linux,
-`nix run .#docker-push-all` publishes the network, CUDA, and HIP images.
+the GPU driver and model content stays on runtime volumes. Published images are
+the Hydra-built artifacts of a commit whose CLI and GPU releases both passed;
+see [checks and releases](docs/releases.md).
 
 A GPU asset owner uploads verified weights once and execution workers map them
 read-only. Worker replacement retains weights; asset pressure recreates the
