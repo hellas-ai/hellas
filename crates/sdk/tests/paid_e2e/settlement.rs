@@ -37,15 +37,6 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             assert_eq!(result.credited_cumulative, PRICE);
             session.shutdown().await;
             drop(session);
-            case.relays
-                .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let reads = case
-                .relays
-                .source
-                .attempts
-                .load(std::sync::atomic::Ordering::SeqCst);
             let discovered = hellas_sdk::paid_client::retained_settlement_channels(
                 &case.options.journal_root,
                 case.options.config.chain.network,
@@ -136,6 +127,20 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 .is_err()
             );
             case.provider.shutdown().await.unwrap();
+            // Use fresh RPC listeners so provider polling and queued requests from
+            // the execution phase cannot enter the settlement proof-read count.
+            case.relays.shutdown().await;
+            case.relays = remote::Relays::start(&case.devnet).await;
+            case.options.config.validators = case.relays.urls.clone();
+            case.relays
+                .source
+                .unavailable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let reads = case
+                .relays
+                .source
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
             case.relays
                 .source
                 .forged
