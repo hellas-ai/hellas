@@ -10,7 +10,7 @@ use hellas_sdk::{
 #[derive(Debug, Default, Args)]
 pub(super) struct GrantArgs {
     /// Imported allowance offer. Executes without funding or paying a channel.
-    #[arg(long, requires_all = ["work_profile", "resource", "attempt"], conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir"])]
+    #[arg(long, requires_all = ["work_profile", "resource", "attempt"], conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
     pub offer: Option<String>,
     /// Device-bound Work profile installed by `hellas offer import-bundle`.
     #[arg(long, requires = "offer", value_name = "FILE")]

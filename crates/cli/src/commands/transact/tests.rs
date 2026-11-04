@@ -34,6 +34,9 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
         &["--trust", "chain.json"],
         &["--address", "127.0.0.1:1"],
         &["--state-dir", "paid-state"],
+        &["--acceptance-blocks", "300"],
+        &["--terminal-blocks", "3000"],
+        &["--payment-blocks", "600"],
     ] {
         assert!(parse(extra).is_err(), "{extra:?}");
     }
@@ -46,6 +49,48 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
                 .filter_map(|(i, value)| (!(missing..missing + 2).contains(&i)).then_some(*value)),
         );
         assert!(crate::Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
+fn paid_deadline_options_reach_the_signed_job_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let identity_path = root.path().join("identity");
+    let identity = crate::identity::load_or_create(Some(&identity_path)).unwrap();
+    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
+    let owner = cli.owner.load().unwrap().unwrap();
+    let context = Context::new(&identity, Some(&owner), Some(&identity_path)).unwrap();
+    for (extra, expected) in [
+        (vec![], (300, 3000, 600)),
+        (
+            vec![
+                "--acceptance-blocks",
+                "444",
+                "--terminal-blocks",
+                "555",
+                "--payment-blocks",
+                "666",
+            ],
+            (444, 555, 666),
+        ),
+    ] {
+        let args = fetch_args(&extra).client;
+        let options = args
+            .options_with_config(
+                &context,
+                20,
+                Assurance::ProducerSigned,
+                hellas_sdk::client_chain::devnet(root.path()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                options.acceptance_blocks,
+                options.terminal_blocks,
+                options.payment_blocks
+            ),
+            expected
+        );
     }
 }
 

@@ -91,6 +91,15 @@ pub struct ClientArgs {
     /// Without it, wait until the job is done.
     #[arg(long, value_parser = duration)]
     timeout: Option<Duration>,
+    /// Finalized blocks allowed for paid-job admission and input upload.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    acceptance_blocks: u64,
+    /// Finalized blocks after admission allowed for execution and delivery.
+    #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u64).range(1..))]
+    terminal_blocks: u64,
+    /// Finalized blocks after execution allowed for payment.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    payment_blocks: u64,
     /// Wait for channel settlement after the job.
     #[arg(long)]
     settle: bool,
@@ -285,9 +294,9 @@ impl ClientArgs {
             assurance,
             apple_trust,
             expected_price: price,
-            acceptance_blocks: 16,
-            terminal_blocks: 64,
-            payment_blocks: 32,
+            acceptance_blocks: self.acceptance_blocks,
+            terminal_blocks: self.terminal_blocks,
+            payment_blocks: self.payment_blocks,
             timeout: self.timeout,
         })
     }
