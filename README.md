@@ -104,6 +104,69 @@ the verified read-only descriptor and detects path/inode replacement; it does
 not defend against a separate local process that already holds a writable
 descriptor to the same inode and mutates it concurrently.
 
+## Own a worker and share access
+
+Use a CLI and worker from the same release. Download the portable CLI archive
+and `SHA256SUMS` from the [release page](https://github.com/hellas-ai/hellas/releases).
+For x86_64 Linux, set `RELEASE` to the selected tag and `REVISION` to its full
+commit SHA, then verify before unpacking:
+
+```sh
+archive="hellas-cli-x86_64-linux-musl-${REVISION}.tar.gz"
+curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/${archive}"
+curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$archive"
+./bin/hellas --version
+```
+
+Stage 0 is your own worker. Prepare its resource configuration, machine/account
+budgets, model content and owner bootstrap scopes as described in
+[node administration](docs/admin.md#explicit-offline-initialization-and-recovery).
+Start a persistent HIP worker (use the matching `sha-REVISION-hip` tag):
+
+```sh
+docker run -d --name hellas-gpu --device /dev/kfd --device /dev/dri \
+  -v hellas-state:/var/lib/hellas -v "$PWD/provider:/provider:ro" \
+  -v /srv/hellas/content:/content:ro \
+  "ghcr.io/hellas-ai/hellas:sha-${REVISION}-hip" --software-root \
+  --content-root /content --grant-config /provider/resources.json \
+  --await-owner /var/lib/hellas/owner
+```
+
+Obtain the private invitation from the worker's authenticated console output and
+save it as `invitation.json`. Bootstrap it with your passkey and the prepared
+scopes; the invitation pins its transport node:
+
+```sh
+hellas --identity laptop.identity --passkey owner.passkey admin bootstrap-remote \
+  --invitation invitation.json --root-grant 01010101010101010101010101010101 \
+  --administrator administrator.json --credential-scope application-scope.json \
+  --profile-out operator
+hellas --passkey owner.passkey contact export --display-name me --out me.contact
+hellas --identity laptop.identity identity show-holder > me.holder
+hellas --identity laptop.identity --passkey owner.passkey admin \
+  --profile operator/profile.json --node NODE_PIN share \
+  --contact me.contact --holder me.holder --resource klein \
+  --limit requests:total:100 --max-job 15m --out me.access
+hellas --identity laptop.identity --passkey owner.passkey offer import-bundle me.access --name box
+hellas --identity laptop.identity --passkey owner.passkey image \
+  --provider ENROLLMENT_ID@NODE_ID --offer box.klein --model ./klein --prompt "a fox"
+```
+
+Use the worker's independently checked node pin for `NODE_PIN` and its printed
+provider address for `ENROLLMENT_ID@NODE_ID`. The config owns resource `klein`
+and its account; `share` creates the per-principal budget, allowance, execution
+grant and device credential. Your own work consumes the allowance too.
+
+Stage 1 shares the worker with another principal. They export their own contact
+card and holder. Run the same `admin share` with those files and send them the
+private access bundle. They import it on that device and use its `--offer`
+alias. Sharing another device of the same principal keeps the same counters.
+
+Stage 2 sells jobs for coins: use the [paid quickstart](#quickstart-sell-and-buy-one-job)
+with `--paid-work-config` on the provider and `--payment` on the caller.
+
 ## Sealed Fetch
 
 Fetch route names are operator-defined routing labels. The sealed destination
