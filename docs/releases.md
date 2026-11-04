@@ -56,8 +56,9 @@ selects a successful evaluation, rather than changing the source branch.
 | `hellas-consensus` | `releaseJobs.consensus` | Validator package; chain, settlement, validator VM and kernel model checks |
 
 All three also require lints and unit tests. CLI covers x86 and ARM Linux and
-ARM64 macOS; GPU and consensus cover x86 Linux. CUDA/HIP model compilation
-runs on Linux, while the remaining CLI checks run on each release platform.
+ARM64 macOS; GPU and consensus cover x86 Linux. CUDA/HIP model compilation and
+native cases that re-execute a Catena compile worker run on Linux, while the
+remaining CLI checks run on each release platform.
 The exact test selection lives in `nix/releases.nix`. Native Linux archives require
 their Nix runtime closure. The musl and Darwin archives run without Nix. Darwin packaging uses the macOS system libiconv and ad-hoc
 signs the executable; it is not Developer ID signed or notarized.

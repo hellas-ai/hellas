@@ -991,7 +991,9 @@ async fn async_main() {
                         client,
                         work_application()?,
                     )?,
-                    hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?,
+                    hellas_sdk::grant_client::GrantTransport::Remote(
+                        hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?,
+                    ),
                 ))
             } else if let Some(grant) = local_grant.as_deref() {
                 anyhow::ensure!(
@@ -1104,11 +1106,7 @@ async fn async_main() {
                 metrics::spawn_metrics_server(address, bundle).await?;
             }
             let gateway = if let Some(pool) = pool_options {
-                let transport =
-                    hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?;
-                let hellas_sdk::grant_client::GrantTransport::Remote(endpoint) = transport else {
-                    unreachable!()
-                };
+                let endpoint = hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
                 let transports = (0..pool.channels.len())
                     .map(|_| hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()))
                     .collect();

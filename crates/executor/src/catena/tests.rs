@@ -39,14 +39,22 @@ fn provider_requires_the_program_to_ship_its_stdlib() {
     let missing = vec![SOURCE.to_owned()];
     assert!(compile::compile_sources(&missing, dialect).is_err());
     assert!(compile::compile_sources(&complete, dialect).is_ok());
+}
+
+// The isolated compile child exists only on Linux (`process::isolate_child`).
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_compile_requires_the_program_to_ship_its_stdlib() {
+    let dialect = GpuDialect::Hip;
     let exe = std::env::current_exe().unwrap();
     let compile = |sources: &[String]| {
         compile::compile_cancellable(sources, &exe, &super::Cancellation::default(), dialect)
     };
-    assert!(compile(&missing).is_err());
-    assert!(compile(&complete).is_ok());
+    assert!(compile(&[SOURCE.to_owned()]).is_err());
+    assert!(compile(&complete_sources(SOURCE)).is_ok());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ephemeral_retention_does_not_disable_program_cache() {
     const CHILD: &str = "HELLAS_TEST_PROGRAM_CACHE_BY_DEFAULT";

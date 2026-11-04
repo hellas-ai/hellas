@@ -1715,6 +1715,7 @@ async fn provider_close_offline(
 
 /// Plan-v4 §6, CI variant: B, with no node, buys one run of a program A has
 /// never seen through an automatic offer, and pays for it exactly once.
+#[cfg(target_os = "linux")]
 #[test]
 fn unseen_program_pays_exactly_once() {
     run(automatic::exercise);

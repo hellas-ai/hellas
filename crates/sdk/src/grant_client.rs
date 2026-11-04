@@ -251,21 +251,20 @@ pub struct GrantSessionOptions {
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
 }
+/// A remote session connects through an endpoint it does not own: whoever
+/// binds the endpoint closes it, after the session has shut down.
 pub enum GrantTransport {
     Remote(Endpoint),
     Local(GrantService),
 }
-impl GrantTransport {
-    pub async fn remote(
-        key: iroh::SecretKey,
-    ) -> std::result::Result<Self, iroh::endpoint::BindError> {
-        Ok(Self::Remote(
-            Endpoint::builder(iroh::endpoint::presets::N0)
-                .secret_key(key)
-                .bind()
-                .await?,
-        ))
-    }
+/// Bind a client endpoint for `GrantTransport::Remote`.
+pub async fn bind_endpoint(
+    key: iroh::SecretKey,
+) -> std::result::Result<Endpoint, iroh::endpoint::BindError> {
+    Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(key)
+        .bind()
+        .await
 }
 
 enum SessionTransport {

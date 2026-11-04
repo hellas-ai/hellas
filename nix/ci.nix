@@ -67,6 +67,10 @@ let
     # Catena's libffi-sys configure step needs the ordinary stdenv shell and
     # POSIX utilities even though the Rust compiler itself does not.
     ++ pkgs.stdenv.initialPath
+    # On Darwin the clang driver runs dsymutil whenever one command compiles
+    # and links with -g, as build-script probes do. LLVM ships it, not the
+    # cc-wrapper.
+    ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.llvmPackages.llvm
     ++ workspaceNativeBuildInputs;
 
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
@@ -120,7 +124,11 @@ let
       HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
       export HELLAS_CLI_TEST_BINARY
       cargo test -p hellas-sdk --features integration-tests --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
-      cargo test -p hellas-sdk --features integration-tests --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
+      # The paid/grant composition case re-executes a Catena compile worker,
+      # whose process isolation is implemented only on Linux.
+      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+        cargo test -p hellas-sdk --features integration-tests --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
+      ''}
       cargo test -p hellas-cli --features otel,integration-tests --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
