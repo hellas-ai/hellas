@@ -1436,7 +1436,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         // Every read resolves at once against the committed block; none waits
         // for the cursor, and nothing is published below.
         let (coin, held, edge, snapshot) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 tokio::join!(
                     local.get_coin(floor.digest(), ids[0]),
                     local.get_coins_by_owner(owner),

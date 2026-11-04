@@ -82,7 +82,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
         let mut prefixes = 0;
         let prefix_seen = tokio::sync::Notify::new();
         let ready = fetch_ready();
-        let (delivery, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (delivery, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 fetch_result_stream(transport.clone(), &mut client, &ready, id, |event| {
                     assert!(!worker.is_finished());
@@ -412,7 +412,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     });
     let mut received = 0;
     let delivered = tokio::time::timeout(
-        std::time::Duration::from_secs(180),
+        std::time::Duration::from_secs(45),
         fetch_result_stream(transport.clone(), &mut client, &ready, id, |_| {
             received += 1;
             Ok(())
