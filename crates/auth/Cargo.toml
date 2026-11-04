@@ -32,3 +32,4 @@ zeroize = "1.9"
 [dev-dependencies]
 hellas-kernel = { workspace = true, features = ["webauthn"] }
 serde_ipld_dagcbor.workspace = true
+serde_json.workspace = true

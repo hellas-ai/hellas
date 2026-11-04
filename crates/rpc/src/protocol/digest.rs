@@ -81,16 +81,12 @@ mod tests {
         assert_eq!(decoded, digest);
         let array = serde_ipld_dagcbor::to_vec(&[7u8; 32]).unwrap();
         assert!(serde_ipld_dagcbor::from_slice::<Digest>(&array).is_err());
+        // Byte arrays are not a digest in any format; text is the printable form.
         for length in [31, 32, 33] {
             let sequence = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
                 std::iter::repeat_n(7u8, length),
             );
-            let decoded = Digest::deserialize(sequence);
-            if length == 32 {
-                assert_eq!(decoded.unwrap(), digest);
-            } else {
-                assert!(decoded.is_err());
-            }
+            assert!(Digest::deserialize(sequence).is_err());
         }
     }
 }
