@@ -55,7 +55,8 @@ and the CUDA backend, including driver-library setup. In RunPod's
 `dockerStartCmd`, pass only additional arguments, for example:
 
 ```json
-["--software-root", "--await-owner", "/var/lib/hellas/authority",
+["--identity", "/var/lib/hellas/worker.identity", "--software-root",
+ "--await-owner", "/var/lib/hellas/authority",
  "--grant-config", "/var/lib/hellas/resources.json",
  "--content-root", "/var/lib/hellas/content"]
 ```
@@ -66,6 +67,14 @@ Use the [node configuration and bootstrap procedure](admin.md#explicit-offline-i
 then issue/import access and run a job as in the
 [owner walkthrough](../README.md#own-a-worker-and-share-access). `admin share`
 requires a release containing that command on both client and worker.
+The state filesystem must preserve private files owned by the daemon user
+(mode `0600` on Unix). If startup reports `file must be private`, inspect the
+reported path's owner and permissions on the actual mounted filesystem; do not
+relax the check or advertise the worker as ready. RunPod's volume disk can be
+[network-backed](https://github.com/runpod/runpod-plugins-official/blob/main/plugins/runpod/skills/runpod-usage/reference/storage.md),
+so verify its semantics rather than assuming it behaves like the container disk.
+Keep the identity and journal together on persistent storage across restarts.
+
 Keep the owner passkey on the client. An unowned worker's invitation expires
 15 minutes after startup; obtain it promptly through the authenticated console.
 
