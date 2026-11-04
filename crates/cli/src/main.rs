@@ -216,8 +216,9 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid terms (TOML) the selected owner approves at startup. Paid
-        /// work is sold only with this file.
+        /// Paid terms (TOML). With an owner passkey, approve and fund them at
+        /// startup; without one, require the exact remotely approved policy
+        /// and stake already delegated by the owner.
         #[arg(
             long = "paid-work-config",
             value_name = "FILE",
@@ -829,9 +830,7 @@ async fn async_main() {
                     commands::serve::paid::PaidWork::load(
                         path,
                         identity::provider_root(cli.identity.as_deref())?,
-                        owner.clone().ok_or_else(|| {
-                            anyhow::anyhow!("--paid-work-config requires --passkey, --faucet or --faucet-account")
-                        })?,
+                        owner.clone(),
                         fetch_config_file.as_deref(),
                     )
                 })
@@ -846,19 +845,31 @@ async fn async_main() {
                         let settlement_key = identity::settlement_signer(&local_identity)?;
                         let open_identity = local_identity.open_identity();
                         let grants = if let Some(path) = grant_config_file.as_deref() {
-                            anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
+                            anyhow::ensure!(
+                                assurance == hellas_rpc::Assurance::ProducerSigned,
+                                "grants require producer-signed assurance"
+                            );
                             let root = passkey
                                 .map(commands::contributions::principal)
                                 .transpose()?
                                 .map(|owner| commands::contributions::data_root(&owner))
                                 .transpose()?;
-                            let config = hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
+                            let config =
+                                hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
                             Some(config)
-                        } else { None };
+                        } else {
+                            None
+                        };
 
                         let (grants, transport) = match await_owner.as_deref() {
                             Some(root) => {
-                                let (grants, transport) = commands::serve::bootstrap::prepare(root, &local_identity, port, grants).await?;
+                                let (grants, transport) = commands::serve::bootstrap::prepare(
+                                    root,
+                                    &local_identity,
+                                    port,
+                                    grants,
+                                )
+                                .await?;
                                 (Some(grants), transport)
                             }
                             None => (grants, None),
@@ -868,7 +879,11 @@ async fn async_main() {
                             (None, Some(root)) => {
                                 let path = std::path::absolute(root)?.join("fetch.json");
                                 if !path.try_exists()? {
-                                    hellas_private::write_atomically(&path, ".initializing", br#"{"revision":0,"routes":[]}"#)?;
+                                    hellas_private::write_atomically(
+                                        &path,
+                                        ".initializing",
+                                        br#"{"revision":0,"routes":[]}"#,
+                                    )?;
                                 }
                                 Some(path)
                             }

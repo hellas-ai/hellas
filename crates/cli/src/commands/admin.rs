@@ -57,6 +57,16 @@ pub enum AdminCommand {
     },
     /// Read private node status using the profile's selected grant.
     Status,
+    /// Approve exact paid terms for a daemon whose owner key stays on this machine.
+    SetPaidPolicy {
+        #[arg(long)]
+        terms: PathBuf,
+        #[arg(long)]
+        expected_revision: u64,
+        /// The provider's Fetch routes, if its paid policy admits Fetch.
+        #[arg(long)]
+        fetch_config: Option<PathBuf>,
+    },
     /// Apply a typed upstream update; endpoint changes and key replacement/removal require --passkey.
     ConfigureProvider { command: PathBuf },
     /// Start or stop the provider through the normal host lifecycle.

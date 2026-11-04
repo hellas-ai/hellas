@@ -1,6 +1,90 @@
 use super::*;
 use clap::Parser as _;
 
+#[tokio::test]
+async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
+    use std::sync::Arc;
+    struct NoBackend;
+    impl hellas_channel::work::WorkBackend for NoBackend {
+        fn try_admit(
+            &self,
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
+        {
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let mut paid = PaidWork::load(&example, root.path().join("provider"), None, None).unwrap();
+    let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);
+    assert!(
+        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+            .await
+            .is_err()
+    );
+    assert!(!paid.root.join("bootstrap.json").exists());
+
+    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
+    paid.owner = cli.owner.load().unwrap();
+    let credential = paid
+        .prepare(&config, &identity.enrollment, &identity.node_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = paid.owner.take();
+    assert!(
+        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+            .await
+            .is_err()
+    );
+    let store = NodeStore::open(
+        &config.journal_root,
+        hellas_authority::model::grant::grant_network(),
+        Some(identity.enrollment.clone()),
+        UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let service = hellas_authority::grant_service::GrantService::new(
+        store,
+        Arc::new(identity.node_key.clone()),
+        NoBackend,
+        vec![],
+        Arc::new(|| UnixMillis::now().unwrap()),
+    )
+    .unwrap();
+    let admin =
+        WorkAdministration::new(service, vec![], std::num::NonZeroU64::new(90_000).unwrap())
+            .unwrap();
+    // A daemon with only its node identity cannot install or alter paid terms.
+    assert!(paid.configure(&admin, Some(&credential)).await.is_err());
+    assert!(admin.node().paid_policy().await.unwrap().is_none());
+    paid.owner = owner;
+    paid.configure(&admin, Some(&credential)).await.unwrap();
+    paid.owner = None;
+    let approved = admin.node().paid_policy().await.unwrap().unwrap();
+    paid.configure(&admin, None).await.unwrap();
+    paid.policy.offers.max_open_offers += 1;
+    assert!(paid.configure(&admin, None).await.is_err());
+    assert_eq!(admin.node().paid_policy().await.unwrap().unwrap(), approved);
+    drop(admin);
+    assert!(
+        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+            .await
+            .is_err()
+    );
+    paid.policy.offers.max_open_offers -= 1;
+    assert!(
+        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 fn paid_compute_program_selection_survives_config_parsing() {
     let example = include_str!("../../../../../../docs/examples/faucet-provider.toml");
@@ -48,7 +132,7 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     let owner = cli.owner.load().unwrap().unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let paid = PaidWork::load(&example, root.path().join("provider"), owner, None).unwrap();
+    let paid = PaidWork::load(&example, root.path().join("provider"), Some(owner), None).unwrap();
     assert_eq!(paid.chain.chain.network.as_str(), "hellas-devnet-1");
     assert_eq!(paid.policy.payment_policy.fixed_price, 20);
     assert_eq!(paid.policy.expected_payment_values.value(), 401);
@@ -176,7 +260,7 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
     let paid = PaidWork::load(
         &terms_path,
         root.path().join("provider"),
-        owner,
+        Some(owner),
         Some(&fetch_path),
     )
     .unwrap();

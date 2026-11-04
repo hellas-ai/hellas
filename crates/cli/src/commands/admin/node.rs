@@ -426,6 +426,19 @@ where
             }
             println!("{}", serde_json::to_string(&reply)?);
         }
+        AdminCommand::SetPaidPolicy {
+            terms,
+            expected_revision,
+            fetch_config,
+        } => {
+            let value = crate::commands::serve::paid::PaidWork::approval(
+                &terms,
+                fetch_config.as_deref(),
+                Revision(expected_revision),
+            )?;
+            let reply = work(&client, authorization, &value).await?;
+            println!("{}", serde_json::to_string(&reply)?);
+        }
         _ => anyhow::bail!("this command requires its offline or management entrypoint"),
     }
     Ok(())
