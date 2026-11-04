@@ -268,6 +268,27 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         let found = coin(&client, swept).await;
         assert_eq!(found.owner.into_kernel(), owner);
         assert_eq!(found.delegate, None);
+        // A transfer must reject malformed recipients before asking for a signature.
+        let mut invalid_point = [0xff; 33];
+        invalid_point[0] = 2;
+        for bytes in [[0; 33], [0xff; 33], invalid_point] {
+            let invalid = hellas_kernel::Key::from_bytes(bytes);
+            assert!(
+                matches!(
+                    OwnerReshape::pay(&client, network, owner, &[swept], invalid, 37).await,
+                    Err(hellas_sdk::coin_owner::CoinOwnerError::Recipient)
+                ),
+                "invalid recipient accepted"
+            );
+        }
+        for recipient in [passkey.party_key(), native.party_key()] {
+            assert!(
+                OwnerReshape::pay(&client, network, owner, &[swept], recipient, 37)
+                    .await
+                    .is_ok(),
+                "supported recipient rejected"
+            );
+        }
         if owner == passkey.party_key() {
             assert!(
                 OwnerReshape::pay(&client, network, owner, &[swept], native.party_key(), 0)

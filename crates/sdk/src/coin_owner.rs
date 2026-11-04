@@ -26,6 +26,8 @@ pub enum CoinOwnerError {
     Split,
     #[error("payment must be positive and no greater than the selected balance")]
     Payment,
+    #[error("recipient must be a valid P-256 or secp256k1 public key")]
+    Recipient,
     #[error("selected coin values overflow")]
     ValueOverflow,
     #[error("chain network does not match the requested signing network")]
@@ -46,6 +48,20 @@ pub struct OwnerReshape {
 }
 
 impl OwnerReshape {
+    /// Reject destinations that cannot be controlled by either owner scheme.
+    pub fn validate_recipient(recipient: Key) -> Result<(), CoinOwnerError> {
+        if Secp256k1Verifier::is_valid_key(recipient)
+            || hellas_auth::authority::PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+                *recipient.as_bytes(),
+            ))
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(CoinOwnerError::Recipient)
+        }
+    }
+
     /// Pay a recipient from verified owner coins, returning undelegated change.
     pub async fn pay<C: LightClient>(
         chain: &C,
@@ -55,6 +71,7 @@ impl OwnerReshape {
         recipient: Key,
         amount: u64,
     ) -> Result<Self, CoinOwnerError> {
+        Self::validate_recipient(recipient)?;
         let mut plan = Self::prepare(chain, network, owner, selected, None, None).await?;
         let balance = plan.outputs.as_slice()[0].value();
         if amount == 0 || amount > balance {
@@ -345,6 +362,23 @@ impl OwnerReshape {
 mod tests {
     use super::*;
     use hellas_kernel::Secp256k1Signer;
+
+    #[test]
+    fn recipients_must_be_valid_points_on_a_supported_owner_curve() {
+        let native = Secp256k1Signer::from_secret_scalar([12; 32]).unwrap();
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([21; 32]).unwrap();
+        for key in [native.party_key(), passkey.party_key()] {
+            OwnerReshape::validate_recipient(key).unwrap();
+        }
+        let mut invalid_point = [0xff; 33];
+        invalid_point[0] = 2;
+        for bytes in [[0; 33], [0xff; 33], invalid_point] {
+            assert!(matches!(
+                OwnerReshape::validate_recipient(Key::from_bytes(bytes)),
+                Err(CoinOwnerError::Recipient)
+            ));
+        }
+    }
 
     #[test]
     fn delegate_cannot_authorize_owner_sweep_or_reuse_delegation_signature() {

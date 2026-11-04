@@ -383,6 +383,7 @@ pub async fn run(command: ChainCommand, owner: Option<&hellas_kernel::SoftPasske
         ChainCommand::Sweep(coins) => run_owner_coins(coins, None, None, None, owner).await,
         ChainCommand::Send { coins, to, amount } => {
             anyhow::ensure!(amount > 0, "amount must be positive");
+            hellas_sdk::coin_owner::OwnerReshape::validate_recipient(to.into_kernel())?;
             run_owner_coins(coins, None, None, Some((to.into_kernel(), amount)), owner).await
         }
         ChainCommand::Query {
