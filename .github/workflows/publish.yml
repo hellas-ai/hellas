@@ -1,0 +1,49 @@
+name: Publish
+
+# Publishes the newest revision whose Hydra CLI and GPU channels both
+# succeeded. The tool fetches the signed artifacts from the cache and never
+# rebuilds; reruns are idempotent, and existing tags must name the same content.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Exact commit to publish (default: newest green revision)"
+        required: false
+      dry_run:
+        description: Resolve and verify without publishing
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+        with:
+          extra-conf: |
+            extra-substituters = https://cache.hellas.ai
+            extra-trusted-public-keys = cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g=
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+          REVISION: ${{ inputs.revision }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [ -n "$REVISION" ]; then args+=(--revision "$REVISION"); fi
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          nix run --accept-flake-config .#publish -- "${args[@]}"
