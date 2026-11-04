@@ -58,6 +58,9 @@ pub fn isolate_child() -> io::Result<()> {
 }
 
 pub(crate) fn kill_group(pid: i32) {
+    #[cfg(not(unix))]
+    unreachable!("Catena process isolation cannot create child {pid} on this platform");
+    #[cfg(unix)]
     if pid > 1 {
         unsafe {
             libc::killpg(pid, libc::SIGKILL);

@@ -9,15 +9,18 @@ use catena_lang::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
-    fs, io,
+    collections::HashMap,
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::{collections::BTreeSet, fs, io};
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[cfg(target_os = "linux")]
 fn children() -> io::Result<BTreeSet<i32>> {
     let mut found = BTreeSet::new();
     for ent in fs::read_dir("/proc")? {
@@ -168,6 +171,7 @@ fn spawn_on(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn monitor_init(
     before: BTreeSet<i32>,
     cancel: Cancellation,
@@ -243,6 +247,7 @@ fn monitor_init(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_child(cancel: Cancellation, dialect: GpuDialect) -> Result<(SafeRuntime, i32)> {
     if cancel.is_cancelled() {
         return Err("SafeRuntime initialization cancelled".into());
@@ -512,4 +517,19 @@ impl Drop for Lease {
             state.workers[self.index].busy = false;
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_child(_cancel: Cancellation, _dialect: GpuDialect) -> Result<(SafeRuntime, i32)> {
+    Err("Catena process isolation requires Linux".into())
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+#[test]
+fn unsupported_runtime_does_not_launch_a_child() {
+    let result = spawn_child(Cancellation::default(), GpuDialect::Hip);
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "Catena process isolation requires Linux"
+    );
 }
