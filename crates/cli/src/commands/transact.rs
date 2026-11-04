@@ -455,6 +455,10 @@ async fn purchase_and_execute(
     context: &Context,
     job: &Job,
 ) -> super::CliResult<(ExecutionAttempt, PaidWorkResult)> {
+    ensure!(
+        job.price() > 0,
+        "paid execution requires a positive job payment; select --offer for grant work"
+    );
     let options = args.options(context, job.price(), job.assurance()).await?;
     let mut purchase = args.purchase(context, job, &options).await?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;

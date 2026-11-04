@@ -377,9 +377,21 @@ signature. It installs offers as `NAME.POLICY` and a remote Work profile under
 directory. It prints the offer names, grant IDs and profile path. Delete the
 received bundle after importing, since it contains the credential secret.
 
-Use the printed profile path as `--work-profile` with the imported offer,
-its exact `--resource` ID and a durable `--attempt` record when executing
-`transact --job DIR --offer NAME.POLICY`.
+Use the imported offer directly; its signed policy selects the resource and
+its bundle alias locates the bound profile:
+
+```sh
+hellas --identity laptop.identity --passkey me.passkey image \
+  --provider ENROLLMENT_ID@NODE_ID --offer box.klein --model ./klein --prompt "a fox"
+```
+
+`run`, `image` and `transcribe` accept either `--offer NAME.POLICY` or
+`--payment AMOUNT`. `transact --job DIR --offer NAME.POLICY` uses the same
+lookup. None of these grant commands needs `--work-profile` or `--resource`.
+The signed provider enrollment must match `--provider`; Apple providers also
+require the caller's independently approved `--trust-store` and `--trust-policy`.
+Repeated jobs reuse durable attempts by offer and job; `--attempt FILE` selects
+an explicit record. See [jobs](jobs.md) for recovery and results.
 
 `admin work` and `admin grant` remain the typed primitive commands for custom
 administration.

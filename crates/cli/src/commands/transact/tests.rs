@@ -4,7 +4,6 @@ use clap::Parser as _;
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let provider = provider();
-    let resource = hellas_auth::Digest::hash(b"resource").to_string();
     let base = [
         "hellas",
         "transact",
@@ -13,16 +12,7 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
         "--provider",
         &provider,
     ];
-    let grant = [
-        "--offer",
-        "shared.model",
-        "--work-profile",
-        "profile.json",
-        "--resource",
-        &resource,
-        "--attempt",
-        "attempt.json",
-    ];
+    let grant = ["--offer", "shared.model"];
     let parse = |extra: &[&str]| {
         crate::Cli::try_parse_from(base.iter().chain(grant.iter()).chain(extra.iter()).copied())
     };
@@ -40,15 +30,8 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     ] {
         assert!(parse(extra).is_err(), "{extra:?}");
     }
-    for missing in [0, 2, 4, 6] {
-        let mut args = base.to_vec();
-        args.extend(
-            grant
-                .iter()
-                .enumerate()
-                .filter_map(|(i, value)| (!(missing..missing + 2).contains(&i)).then_some(*value)),
-        );
-        assert!(crate::Cli::try_parse_from(args).is_err());
+    for old_flag in ["--work-profile", "--resource"] {
+        assert!(parse(&[old_flag, "value"]).is_err());
     }
 }
 
@@ -559,4 +542,27 @@ fn run_writes_one_call_job_that_transact_loads_unchanged() {
             ],
         }
     );
+}
+
+#[test]
+fn execution_helpers_choose_payment_or_an_imported_offer() {
+    let provider = provider();
+    for helper in [
+        vec!["run", "--source", "program.hex", "--entry", "main"],
+        vec!["image", "--model", "model", "--prompt", "fox"],
+        vec!["transcribe", "--model", "model", "--audio", "speech.wav"],
+    ] {
+        let mut base = vec!["hellas"];
+        base.extend(helper);
+        base.extend(["--provider", &provider]);
+        let parse = |flags: &[&str]| {
+            crate::Cli::try_parse_from(base.iter().copied().chain(flags.iter().copied()))
+        };
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--payment", "20"]).is_ok());
+        assert!(parse(&["--payment", "0"]).is_err());
+        assert!(parse(&["--offer", "box.model"]).is_ok());
+        assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
+        assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+    }
 }

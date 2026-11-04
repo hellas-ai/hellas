@@ -859,7 +859,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         });
-    let host = OfferHost::start_with_policy(None, None, None, policy).await;
+    let mut host = OfferHost::start_with_policy(None, None, None, policy).await;
     let root_path = host.root().to_path_buf();
     let root = root_path.as_path();
     let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
@@ -1172,10 +1172,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let provider = hellas_sdk::client::ProviderAddress::of(&host.provider_enrollment)
         .unwrap()
         .to_string();
-    let resource = host.signed_offer.offer().grant.policies[0]
-        .resource
-        .0
-        .to_string();
     let attempt = root.join("grant-attempt.json");
     let result_dir = root.join("grant-result");
     let args = [
@@ -1184,10 +1180,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         &provider,
         "--offer",
         "shared.glm",
-        "--work-profile",
-        imported["work_profile"].as_str().unwrap(),
-        "--resource",
-        &resource,
         "--attempt",
         string(&attempt),
         "--job",
@@ -1294,40 +1286,51 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     next_args[at + 1] = string(&next_attempt);
     host.client.run(&next_args).await;
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 3);
-    // A signed compilation failure is a failed command, including on replay.
-    let mut content = hellas_channel::content::EphemeralContent::default();
-    let source = content.insert(b"invalid Hex source".to_vec());
-    let environment = hellas_rpc::protocol::invocation::compute::Environment {
-        sources: vec![source],
-        assets: vec![],
-    };
-    content.insert(environment.canonical_bytes().unwrap());
-    let invalid_job = hellas_sdk::job::Job::compute(
-        20,
-        environment,
-        hellas_channel::test_support::channel::plan(),
-        vec![],
-        hellas_channel::content::InvocationContent::Ephemeral(content),
-    )
-    .unwrap();
+    // The run helper saves a zero-price job and uses the same grant path.
+    // A signed compilation failure remains a failed command on replay.
+    let invalid_source = root.join("invalid.hex");
+    std::fs::write(&invalid_source, b"invalid Hex source").unwrap();
     let invalid_dir = root.join("invalid-compute-job");
-    invalid_job.save(&invalid_dir).unwrap();
-    let failed_attempt = root.join("failed-compute-attempt.json");
-    let mut failed_args = args.to_vec();
-    for (flag, path) in [("--job", &invalid_dir), ("--attempt", &failed_attempt)] {
-        let at = failed_args.iter().position(|arg| *arg == flag).unwrap();
-        failed_args[at + 1] = string(path);
-    }
+    let failed_result = root.join("failed-compute-result");
+    let failed_args = [
+        "run",
+        "--source",
+        string(&invalid_source),
+        "--entry",
+        "main",
+        "--returns",
+        "u64",
+        "--provider",
+        &provider,
+        "--offer",
+        "shared.glm",
+        "--save-job",
+        string(&invalid_dir),
+        "--output",
+        string(&failed_result),
+    ];
     for _ in 0..2 {
         let failed = host.client.output(&failed_args).await;
         assert!(
             !failed.status.success(),
             "a failed computation returned success"
         );
-        assert!(String::from_utf8_lossy(&failed.stderr).contains("Compilation"));
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("Compilation"),
+            "{}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
         assert!(!String::from_utf8_lossy(&failed.stdout).contains("completed"));
     }
-    host.stop().await;
+    assert_eq!(hellas_sdk::job::Job::load(&invalid_dir).unwrap().price(), 0);
+    let retained = std::fs::read(failed_result.join("result.json")).unwrap();
+    let mut replay_command = host.client.command(&failed_args);
+    let retained_path = failed_result.join("result.json");
+    host.node.stop().await;
+    let replay = replay_command.output().await.unwrap();
+    assert!(!replay.status.success());
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("Compilation"));
+    assert_eq!(std::fs::read(retained_path).unwrap(), retained);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

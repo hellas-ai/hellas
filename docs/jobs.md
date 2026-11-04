@@ -1,23 +1,25 @@
 # Jobs
 
 To execute an existing job using an allowance, import its access bundle for
-the current principal and device, then select the exact resource:
+the current principal and device, then select its imported offer:
 
 ```sh
 hellas --passkey owner.key offer import-bundle access.bundle --name shared
 hellas --passkey owner.key transact --job ./job \
-  --provider ENROLLMENT_ID@NODE_ID --offer shared.model \
-  --work-profile /path/printed/by/import/profile.json --resource RESOURCE_ID \
-  --attempt ./attempt.json --output ./result
+  --provider ENROLLMENT_ID@NODE_ID --offer shared.model --output ./result
 ```
 
 Authenticate the provider enrollment and node ID independently before using
 them. The grant route checks that pin, the device-bound credential and the
 resource's invocation policy. It starts no chain client and spends no coins;
-the job folder's price is used only by paid execution. Reusing the attempt
-returns its retained result without executing again. An unresolved attempt
+the job folder's price is used only by paid execution and can be zero for a
+grant job. The offer's signed first policy selects the resource, and its
+`NAME.POLICY` alias locates the bound profile under `accesses/NAME`. Reusing
+the same offer and job returns its retained result without executing again. An unresolved attempt
 reports its recorded status instead of submitting new work. A new attempt
-path is an explicit request to execute again and consume the allowance.
+path (`--attempt FILE`) is an explicit request to execute again and consume the allowance.
+`run`, `image` and `transcribe` accept `--offer NAME.POLICY` as the exclusive
+alternative to `--payment`; they save a zero-price job and use this same route.
 Grant channel journals share the imported offers' data directory with the
 gateway (`HELLAS_GRANT_DATA_DIR`); `--state-dir` is for paid execution.
 Grant Compute uses ephemeral provider retention for job payloads. Compiled
