@@ -104,7 +104,7 @@ impl<'de> Deserialize<'de> for NodeKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AuthorityId(pub Digest);
 
 impl AuthorityId {
@@ -117,10 +117,10 @@ impl AuthorityId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceId(pub Digest);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GrantId(pub [u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -482,15 +482,15 @@ impl TryFrom<&[u8]> for PrincipalId {
 impl std::str::FromStr for PrincipalId {
     type Err = AuthorityError;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        Self::try_from(
-            crate::hex::parse::<33>(text)
-                .map_err(|_| AuthorityError::Invalid)?
-                .as_slice(),
-        )
+        Self::from_public_key(text.parse().map_err(|_| AuthorityError::Invalid)?)
     }
 }
 impl std::fmt::Display for PrincipalId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&::hex::encode(self.as_bytes()))
+        self.public_key().fmt(f)
     }
 }
+
+crate::printable_identifier!(AuthorityId, crate::Digest);
+crate::printable_identifier!(ResourceId, crate::Digest);
+crate::printable_identifier!(GrantId, [u8; 16]);

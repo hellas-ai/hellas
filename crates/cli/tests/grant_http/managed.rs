@@ -35,7 +35,10 @@ impl ManagedWorker {
         std::fs::write(&resources, json!({
             "journal_root":state.join("provider"),"control_socket":state.join("control.sock"),
             "control_certificate":state.join("control.cert.der"),"control_private_key":state.join("control.key.der"),
-            "max_job_millis":10000,"resources":[{
+            "max_job_millis":10000,
+            "machine":{"max_in_flight":2,"limits":[{"meter":"OutputTokens","window":"Total","amount":10}]},
+            "accounts":[{"account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],
+            "resources":[{
                 "resource":auth::ResourceId(hellas_auth::Digest::hash(b"test resource")),
                 "account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,
                 "pricing":{"revision":1,"rates":null},"name":"glm",
@@ -165,24 +168,6 @@ impl ManagedWorker {
         owner
             .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
-        let limits = root.join("limits.json");
-        std::fs::write(
-            &limits,
-            br#"[{"meter":"OutputTokens","window":"Total","amount":10}]"#,
-        )
-        .unwrap();
-        let args = run(vec![
-            "set-capacity".into(),
-            "--expected-revision".into(),
-            "0".into(),
-            "--max-in-flight".into(),
-            "2".into(),
-            "--limits".into(),
-            string(&limits).into(),
-        ]);
-        owner
-            .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
-            .await;
         let subject = owner.principal();
         let allowance = hellas_authority::model::grant::owner_grant_id(
             hellas_authority::model::grant::grant_network(),
@@ -200,17 +185,14 @@ impl ManagedWorker {
             1,
         )
         .into_iter()
+        // The grant config owns the account.
+        .filter(|definition| !matches!(definition.node, BudgetNode::Account(_)))
         .map(|definition| WorkControlCommand::ConfigureBudget { definition })
         .collect();
-        commands.extend([
-            WorkControlCommand::ConfigureResource {
-                policy: "glm".into(),
-            },
-            WorkControlCommand::Create {
-                id: allowance,
-                terms: terms(subject),
-            },
-        ]);
+        commands.extend([WorkControlCommand::Create {
+            id: allowance,
+            terms: terms(subject),
+        }]);
         for command in commands {
             let file = request_file(root, &command);
             let args = run(vec!["work".into(), string(&file).into()]);

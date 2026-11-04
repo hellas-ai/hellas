@@ -98,7 +98,7 @@ fn malformed_job_documents_and_missing_files_are_refused() {
         ("[payment]", "[payment]\nunknown = 1"),
         ("[application]", "[application]\nunknown = 1"),
         ("[fetch]", "[fetch]\nunknown = 1"),
-        ("price = 20", "price = 0"),
+        ("price = 20", "price = -1"),
         ("request.json", "missing.json"),
         ("request.json", "../request.json"),
         ("request.json", "/request.json"),
@@ -387,4 +387,16 @@ fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
         job.check_policy(&expected).is_err(),
         "uncached upload must fit before funding"
     );
+}
+
+#[test]
+fn grant_jobs_save_without_a_payment() {
+    let source = fetch();
+    let job = Job::from_input(0, source.input().clone()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    job.save(root.path()).unwrap();
+    let loaded = Job::load(root.path()).unwrap();
+    assert_eq!(loaded.price(), 0);
+    assert_eq!(loaded.digest(), job.digest());
+    assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 const TAG: &str = "hellas.contact-card.v1";
 pub const MAX_CONTACT_NAME_BYTES: usize = 64;
 
-/// A friend's passkey public key and display name, with their passkey's
+/// A contact's passkey public key and display name, with their passkey's
 /// assertion over both. Compare [`PrincipalId::fingerprint`] out of band.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactCard {

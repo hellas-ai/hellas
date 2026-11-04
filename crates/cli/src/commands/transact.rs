@@ -56,31 +56,35 @@ impl std::str::FromStr for Provider {
     }
 }
 
-fn duration(value: &str) -> Result<Duration, String> {
+pub(crate) fn duration(value: &str) -> Result<Duration, String> {
     let (digits, scale) = if let Some(value) = value.strip_suffix("ms") {
         (value, 1)
     } else if let Some(value) = value.strip_suffix('s') {
         (value, 1000)
     } else if let Some(value) = value.strip_suffix('m') {
         (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
+    } else if let Some(value) = value.strip_suffix('d') {
+        (value, 86_400_000)
     } else {
-        return Err("timeout needs a unit: ms, s or m".into());
+        return Err("duration needs a unit: ms, s, m, h or d".into());
     };
     let millis = digits
         .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(scale))
         .filter(|n| *n > 0)
-        .ok_or("timeout must be positive and bounded")?;
+        .ok_or("duration must be positive and bounded")?;
     Ok(Duration::from_millis(millis))
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
-    /// Provider address ENROLLMENT_ID@NODE_ID, as `hellas serve` prints it,
-    /// optionally followed by @IP:PORT.
+    /// Provider address ENROLLMENT_ID@NODE_ID, optionally followed by @IP:PORT.
+    /// Paid work requires it; --offer derives it from the signed offer.
     #[arg(long)]
-    provider: Provider,
+    provider: Option<Provider>,
     /// Additional direct UDP addresses for the provider.
     #[arg(long = "address", value_delimiter = ',')]
     addresses: Vec<SocketAddr>,
@@ -91,6 +95,15 @@ pub struct ClientArgs {
     /// Without it, wait until the job is done.
     #[arg(long, value_parser = duration)]
     timeout: Option<Duration>,
+    /// Finalized blocks allowed for paid-job admission and input upload.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    acceptance_blocks: u64,
+    /// Finalized blocks after admission allowed for execution and delivery.
+    #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u64).range(1..))]
+    terminal_blocks: u64,
+    /// Finalized blocks after execution allowed for payment.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    payment_blocks: u64,
     /// Wait for channel settlement after the job.
     #[arg(long)]
     settle: bool,
@@ -114,6 +127,7 @@ pub struct ClientArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TransactArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -128,6 +142,7 @@ pub struct TransactArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("paid_provider").required(true).arg("provider")))]
 pub struct FetchArgs {
     url: String,
     #[command(flatten)]
@@ -189,6 +204,12 @@ impl Context {
 }
 
 impl ClientArgs {
+    fn paid_provider(&self) -> super::CliResult<&Provider> {
+        self.provider
+            .as_ref()
+            .context("paid execution requires --provider")
+    }
+
     fn root(&self, context: &Context) -> PathBuf {
         self.state_dir
             .clone()
@@ -224,7 +245,7 @@ impl ClientArgs {
                 )
                 .to_string(),
             )
-            .join(self.provider.address.to_string())
+            .join(options.provider.to_string())
             .join(hex::encode(owner.principal().as_bytes()))
             .join(format!("{}.json", job.digest()));
         if let Some(attempt) = select_attempt(&path, job, self.buy_again)? {
@@ -236,9 +257,10 @@ impl ClientArgs {
     }
 
     /// One directory of channel journals per provider address.
-    fn journals(&self, root: &Path) -> PathBuf {
-        root.join("channels")
-            .join(self.provider.address.to_string())
+    fn journals(&self, root: &Path) -> super::CliResult<PathBuf> {
+        Ok(root
+            .join("channels")
+            .join(self.paid_provider()?.address.to_string()))
     }
 
     async fn options(
@@ -247,6 +269,7 @@ impl ClientArgs {
         price: u64,
         assurance: Assurance,
     ) -> super::CliResult<PaidWorkOptions> {
+        self.paid_provider()?;
         let root = self.root(context);
         let config = client::config(self, &root).await?;
         self.options_with_config(context, price, assurance, config)
@@ -259,6 +282,7 @@ impl ClientArgs {
         assurance: Assurance,
         config: hellas_sdk::work_config::WorkConfig,
     ) -> super::CliResult<PaidWorkOptions> {
+        let provider = self.paid_provider()?;
         let root = self.root(context);
         let apple_trust = match (&self.trust_store, &self.trust_policy, assurance) {
             (Some(directory), Some(id), _) => Some(
@@ -272,11 +296,10 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: self.journals(&root),
+            journal_root: self.journals(&root)?,
             config,
-            provider: self.provider.address,
-            provider_addrs: self
-                .provider
+            provider: provider.address,
+            provider_addrs: provider
                 .addresses
                 .iter()
                 .chain(&self.addresses)
@@ -285,9 +308,9 @@ impl ClientArgs {
             assurance,
             apple_trust,
             expected_price: price,
-            acceptance_blocks: 16,
-            terminal_blocks: 64,
-            payment_blocks: 32,
+            acceptance_blocks: self.acceptance_blocks,
+            terminal_blocks: self.terminal_blocks,
+            payment_blocks: self.payment_blocks,
             timeout: self.timeout,
         })
     }
@@ -442,6 +465,10 @@ async fn purchase_and_execute(
     context: &Context,
     job: &Job,
 ) -> super::CliResult<(ExecutionAttempt, PaidWorkResult)> {
+    ensure!(
+        job.price() > 0,
+        "paid execution requires a positive job payment; select --offer for grant work"
+    );
     let options = args.options(context, job.price(), job.assurance()).await?;
     let mut purchase = args.purchase(context, job, &options).await?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
@@ -466,7 +493,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         } else {
             println!("output: {}", serde_json::to_string(&hellas_channel::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
         }
-        println!("{}", wording(&args.client.provider, &job, &result));
+        println!("{}", wording(args.client.paid_provider()?, &job, &result));
         std::io::stdout().lock().flush()?;
         purchase.reported()?;
         Ok(())
@@ -555,7 +582,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 } else {
                     std::io::stdout().lock().write_all(&body)?;
                 }
-                eprintln!("{}", wording(&args.client.provider, &job, &result));
+                eprintln!("{}", wording(args.client.paid_provider()?, &job, &result));
                 std::io::stdout().lock().flush()?;
                 std::io::stderr().lock().flush()?;
                 purchase.reported()?;

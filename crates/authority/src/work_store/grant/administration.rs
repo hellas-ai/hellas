@@ -1,8 +1,5 @@
 use super::{NodeStore, NodeStoreError, state::Change};
-use crate::model::grant::{
-    budget::{BudgetDef, Limit},
-    records::{GrantDef, GrantPolicy},
-};
+use crate::model::grant::{budget::BudgetDef, records::GrantDef};
 use hellas_auth::authority::{AuthenticatedCaller, CallerRecord, GrantId as Authorization};
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
 use serde::{Deserialize, Serialize};
@@ -12,7 +9,6 @@ pub const WORK_ALLOWANCE_CONFIGURE: &str = "work.allowance.configure";
 pub const WORK_BUDGET_CONFIGURE: &str = "work.budget.configure";
 pub const WORK_OFFER_EXPORT: &str = "work.offer.export";
 pub const WORK_GENERATION_RESET: &str = "work.generation.reset";
-pub const WORK_RESOURCE_CONFIGURE: &str = "work.resource.configure";
 pub const WORK_RESOURCE_REPAIR: &str = "work.resource.repair";
 pub const WORK_PAID_POLICY_CONFIGURE: &str = "work.paid.configure";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,13 +18,7 @@ pub(crate) enum WorkMutation {
         policy_salt: [u8; 32],
         policy: Box<hellas_channel::model::paid_policy::PaidPolicy>,
     },
-    Capacity {
-        expected: Revision,
-        max_in_flight: u16,
-        limits: Vec<Limit>,
-    },
     Budget(BudgetDef),
-    Resource(Box<GrantPolicy>),
     Define(Box<GrantDef>),
     Generation {
         id: GrantId,
@@ -43,21 +33,10 @@ impl WorkMutation {
     pub(crate) fn operation(&self) -> &'static str {
         match self {
             Self::PaidPolicy { .. } => WORK_PAID_POLICY_CONFIGURE,
-            Self::Capacity { .. } => crate::node::WORK_CAPACITY_CONFIGURE,
-            Self::Resource(_) => WORK_RESOURCE_CONFIGURE,
             Self::Budget(_) => WORK_BUDGET_CONFIGURE,
             Self::Define(_) => WORK_ALLOWANCE_CONFIGURE,
             Self::Generation { .. } => WORK_GENERATION_RESET,
             Self::Repair { .. } => WORK_RESOURCE_REPAIR,
-        }
-    }
-
-    pub(crate) fn valid_capacity(&self) -> bool {
-        match self {
-            Self::Capacity { max_in_flight, .. } => {
-                (1..=super::store::MAX_OPEN_JOBS).contains(&usize::from(*max_in_flight))
-            }
-            _ => true,
         }
     }
 }
@@ -103,6 +82,48 @@ impl NodeStore {
         self.commit(now, Change::BindProvider(record), true).await
     }
 
+    /// Apply the node's own configuration: the machine budget, then accounts,
+    /// then resources. Each change commits separately, so an interrupted pass
+    /// resumes at the next start; an unchanged configuration commits nothing.
+    pub(crate) async fn reconcile(
+        &mut self,
+        configuration: &crate::model::grant::configuration::NodeConfiguration,
+        now: UnixMillis,
+    ) -> Result<(), NodeStoreError> {
+        self.check_authority()?;
+        if let Some(machine) = configuration.machine() {
+            let concurrent = machine.max_in_flight.get();
+            if usize::from(concurrent) > super::store::MAX_OPEN_JOBS {
+                return Err(hellas_auth::authority::AuthorityError::Invalid.into());
+            }
+            let current = self
+                .state()
+                .ledger
+                .node(crate::model::grant::budget::BudgetNode::Machine);
+            if current.is_none_or(|node| {
+                node.limits() != machine.limits.as_slice() || node.concurrent() != concurrent
+            }) {
+                let change = Change::Machine {
+                    limits: machine.limits.clone(),
+                    concurrent,
+                };
+                self.commit(now, change, true).await?;
+            }
+        }
+        for definition in
+            configuration.account_changes(|node| self.state().ledger.definition(node))?
+        {
+            self.commit(now, Change::Budget(definition), true).await?;
+        }
+        for policy in configuration.resources() {
+            if self.state().resource(policy.resource) != Some(policy) {
+                self.commit(now, Change::Resource(policy.clone()), true)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     // The entry point checks before inspecting command data; commit rechecks the
     // recorded mutation against the same operation table before appending it.
     pub(crate) async fn commit_work(
@@ -114,9 +135,6 @@ impl NodeStore {
     ) -> Result<(), NodeStoreError> {
         self.check_authority()?;
         let authority = self.state().authority();
-        if !mutation.valid_capacity() {
-            return Err(hellas_auth::authority::AuthorityError::Invalid.into());
-        }
         let record = WorkRecord {
             caller: authority.record_caller(caller, now)?,
             authorization,

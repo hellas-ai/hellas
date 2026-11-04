@@ -3,6 +3,7 @@ use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TranscribeArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -15,8 +16,10 @@ pub struct TranscribeArgs {
     language: Option<String>,
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    #[arg(long)]
-    payment: u64,
+    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    payment: Option<u64>,
+    #[command(flatten)]
+    grant: grant::GrantArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
@@ -34,7 +37,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         max_new_tokens: args.max_tokens,
     })?;
     let job = Job::compute(
-        args.payment,
+        args.payment.unwrap_or(0),
         rendered.environment,
         rendered.plan,
         rendered.inputs,
@@ -50,6 +53,16 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
     bounded(
         args.client.timeout,
         async {
+            if args.grant.offer.is_some() {
+                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
+                if let Some(directory) = &args.output { result.save(directory, &job)?; }
+                result.ensure_succeeded()?;
+                let ModelResponse::Transcription(transcription) = package.decode(&result.retained.output)? else { bail!("expected transcription") };
+                println!("{}", transcription.text);
+                std::io::stdout().lock().flush()?;
+                result.attempt.reported()?;
+                return Ok(());
+            }
             let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
             if let Some(directory) = &args.output {
                 save_outputs(directory, &job, &result)?;

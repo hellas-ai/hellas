@@ -15,6 +15,7 @@ use std::path::PathBuf;
 const BYTES_FORMAT: &str = "catena.bytes.v1";
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct RunArgs {
     #[command(flatten)]
     pub(super) client: ClientArgs,
@@ -34,8 +35,10 @@ pub struct RunArgs {
     #[arg(long = "returns", value_name = "KIND", value_parser = parse_returns)]
     returns: Vec<OutputKind>,
     /// Flat price the provider charges per job.
-    #[arg(long)]
-    payment: u64,
+    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    payment: Option<u64>,
+    #[command(flatten)]
+    grant: super::grant::GrantArgs,
     /// Job folder to write (default: under the client state, by job digest).
     #[arg(long, value_name = "DIR")]
     save_job: Option<PathBuf>,
@@ -135,7 +138,7 @@ impl RunArgs {
                 .collect(),
         };
         Ok(Job::compute(
-            self.payment,
+            self.payment.unwrap_or(0),
             environment,
             plan,
             inputs,
@@ -159,7 +162,7 @@ pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()>
             client: args.client,
             job: Some(directory),
             output: args.output,
-            grant: Default::default(),
+            grant: args.grant,
         },
         context,
     )

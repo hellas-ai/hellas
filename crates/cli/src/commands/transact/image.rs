@@ -3,6 +3,7 @@ use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct ImageArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -19,8 +20,10 @@ pub struct ImageArgs {
     height: usize,
     #[arg(long, default_value_t = 4)]
     steps: usize,
-    #[arg(long)]
-    payment: u64,
+    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    payment: Option<u64>,
+    #[command(flatten)]
+    grant: grant::GrantArgs,
     #[arg(short = 'o', long, default_value = "image.png", value_name = "PNG")]
     output: PathBuf,
 }
@@ -36,13 +39,24 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     let (package, job, directory) = prepare(
         &args.model,
         request,
-        args.payment,
+        args.payment.unwrap_or(0),
         &args.client.root(&context),
     )?;
     eprintln!("job: {}", directory.display());
     bounded(
         args.client.timeout,
         async {
+            if args.grant.offer.is_some() {
+                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
+                result.save(&directory.join("result"), &job)?;
+                result.ensure_succeeded()?;
+                let ModelResponse::Image(image) = package.decode(&result.retained.output)? else { bail!("expected image") };
+                std::fs::write(&args.output, image.png(args.width, args.height)?)?;
+                println!("{}", args.output.display());
+                std::io::stdout().lock().flush()?;
+                result.attempt.reported()?;
+                return Ok(());
+            }
             let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
             let ModelResponse::Image(image) = package.decode(&result.output)? else {
                 bail!("expected image");

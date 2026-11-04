@@ -277,8 +277,8 @@ impl JobInput {
 
 impl Job {
     pub fn from_input(price: u64, input: JobInput) -> Result<Self> {
-        if price == 0 || price > i64::MAX as u64 {
-            return Err(invalid("payment price must be a positive TOML integer"));
+        if price > i64::MAX as u64 {
+            return Err(invalid("payment price must be a non-negative TOML integer"));
         }
         let manifest = input.manifest()?;
         Ok(Self {

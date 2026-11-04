@@ -49,8 +49,20 @@ impl Window {
         self as usize
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolId(pub [u8; 16]);
+impl std::str::FromStr for PoolId {
+    type Err = hex::FromHexError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        hellas_auth::hex::parse::<16>(text).map(Self)
+    }
+}
+impl std::fmt::Display for PoolId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+hellas_auth::printable_identifier!(PoolId, [u8; 16]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BudgetNode {

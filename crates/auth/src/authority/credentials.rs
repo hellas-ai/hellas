@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroizing;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CredentialId(pub [u8; 16]);
 
 /// Client-owned material, deliberately neither serializable nor printable.
@@ -269,3 +269,5 @@ impl std::fmt::Display for CredentialId {
         f.write_str(&::hex::encode(self.0))
     }
 }
+
+crate::printable_identifier!(CredentialId, [u8; 16]);

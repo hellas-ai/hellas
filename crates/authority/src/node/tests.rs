@@ -179,21 +179,9 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
         .build()
         .unwrap()
         .block_on(async {
-            #[derive(Clone, Copy)]
-            enum Command {
-                Credential,
-                Capacity,
-            }
-            for command in [Command::Credential, Command::Capacity] {
+            {
                 let directory = tempfile::tempdir().unwrap();
                 let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-                node.store
-                    .lock()
-                    .await
-                    .unwrap()
-                    .configure_machine(vec![], 4, UnixMillis(10))
-                    .await
-                    .unwrap();
                 let caller = crate::test_support::session(&node, &secret).await;
                 let before = node.store.lock().await.unwrap().state().clone();
                 let (prepared, retained) =
@@ -201,23 +189,9 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                         .unwrap();
                 let (started, release) = node.store.lock().await.unwrap().pause_next_statement().await;
                 {
-                    let mut issue = Box::pin(async {
-                        if matches!(command, Command::Capacity) {
-                            node.set_machine_capacity(
-                                &caller,
-                                ids::ROOT_GRANT,
-                                Revision(1),
-                                2,
-                                vec![],
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
-                            node.issue_credential(&caller, ids::ROOT_GRANT, prepared.clone())
-                                .await
-                                .map(|_| ())
-                        }
-                    });
+                    let mut issue = Box::pin(
+                        node.issue_credential(&caller, ids::ROOT_GRANT, prepared.clone()),
+                    );
                     tokio::select! {
                         entered = started => entered.unwrap(),
                         result = &mut issue => panic!("administration completed before cancellation: {result:?}"),
@@ -245,11 +219,6 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                     node.status(&caller, ids::ROOT_GRANT).await,
                     NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
                 );
-                assert_err!(
-                    node.set_machine_capacity(&caller, ids::ROOT_GRANT, Revision(1), 3, vec![])
-                        .await,
-                    NodeStoreError::Journal(hellas_channel::work_store::journal::JournalError::Poisoned)
-                );
                 node.store.lock().await.unwrap().resume_statements(release).await;
                 drop(node);
                 let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11))
@@ -263,7 +232,6 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 // The caller retains its exact ID and secret even if cancellation
                 // races the append. Reconcile that record, never guess by scope.
                 if let Some(installed) = reopened.state().authority().credential(retained.id()) {
-                    assert!(matches!(command, Command::Credential));
                     assert_eq!(installed, &prepared);
                     crate::test_support::passkey_caller(
                         reopened.state().authority(),
@@ -271,17 +239,6 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                         UnixMillis(11),
                     );
                 }
-                assert!(
-                    [2, 4].contains(
-                        &reopened
-                            .state()
-                            .machine_capacity()
-                            .unwrap()
-                            .unwrap()
-                            .max_in_flight
-                            .get()
-                    )
-                );
             }
         });
 }
@@ -294,7 +251,7 @@ fn host_scope(actor: Actor) -> GrantSpec {
         (HOST_STATUS, host_resource(spec.authority)),
         (HOST_PROVIDER_BIND, host_resource(spec.authority)),
         (GATEWAY_INVOKE, host_resource(spec.authority)),
-        (WORK_CAPACITY_CONFIGURE, machine_resource(spec.authority)),
+        (HOST_PROVIDER_CONFIGURE, host_resource(spec.authority)),
     ] {
         let operation = OperationId::new(op).unwrap();
         spec.permissions.insert(Permission {
@@ -342,32 +299,6 @@ async fn application(
         .await
         .unwrap();
     (caller, secret)
-}
-
-#[tokio::test]
-async fn an_unmounted_machine_cannot_receive_capacity_commands() {
-    let directory = tempfile::tempdir().unwrap();
-    let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    let root = crate::test_support::session(&node, &secret).await;
-    let status = node.status(&root, ids::ROOT_GRANT).await.unwrap();
-    assert_eq!(status.provider, None);
-    assert_eq!(status.machine, None);
-    assert_err!(
-        node.set_machine_capacity(&root, ids::ROOT_GRANT, Revision(0), 1, vec![])
-            .await,
-        NodeStoreError::MissingMachine
-    );
-    assert_err!(
-        crate::test_support::credentials::issue_one(
-            &node,
-            &root,
-            ids::ROOT_GRANT,
-            host_scope(OPERATOR),
-            OPERATOR.holder()
-        )
-        .await,
-        NodeStoreError::Authority(AuthorityError::Denied)
-    );
 }
 
 #[tokio::test]
@@ -464,13 +395,6 @@ async fn an_execution_credential_cannot_bind_a_provider() {
 async fn host_reads_require_their_own_operation() {
     let directory = tempfile::tempdir().unwrap();
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    node.store
-        .lock()
-        .await
-        .unwrap()
-        .configure_machine(vec![], 4, UnixMillis(10))
-        .await
-        .unwrap();
     let root = crate::test_support::session(&node, &secret).await;
     let (reader, _) =
         application(&node, &root, ids::OPERATOR_GRANT, OPERATOR, &[HOST_STATUS]).await;
@@ -479,7 +403,7 @@ async fn host_reads_require_their_own_operation() {
         &root,
         ids::FRIEND_GRANT,
         FRIEND,
-        &[WORK_CAPACITY_CONFIGURE],
+        &[HOST_PROVIDER_CONFIGURE],
     )
     .await;
 
@@ -489,8 +413,13 @@ async fn host_reads_require_their_own_operation() {
         NodeStoreError::Authority(AuthorityError::Denied)
     );
     assert_err!(
-        node.set_machine_capacity(&reader, ids::OPERATOR_GRANT, Revision(1), 1, vec![])
-            .await,
+        node.host_action(
+            &reader,
+            ids::OPERATOR_GRANT,
+            HOST_PROVIDER_CONFIGURE,
+            |_| ()
+        )
+        .await,
         NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
@@ -522,87 +451,27 @@ async fn host_operations_require_their_named_resource() {
 }
 
 #[tokio::test]
-async fn a_provider_can_initialize_its_machine_capacity() {
-    use crate::model::grant::budget::*;
-    let directory = tempfile::tempdir().unwrap();
-    let mut admin = host_scope(ROOT);
-    admin
-        .issuance
-        .as_mut()
-        .unwrap()
-        .operations
-        .insert(OperationId::new(crate::grant_service::WORK_EXECUTE).unwrap());
-    let (store, secret) = NodeStore::bootstrap(
-        directory.path(),
-        common::network(),
-        ids::ROOT_GRANT,
-        common::common_node::approval(
-            Ownership::Bootstrap {
-                root: ids::ROOT_GRANT,
-                target: None,
-            },
-            admin,
-        ),
-        Some(common::provider_enrollment()),
-        UnixMillis(1000),
-    )
-    .await
-    .unwrap();
-    let limits = vec![Limit {
-        meter: Meter::Requests,
-        window: Window::Total,
-        amount: 4,
-    }];
-    let node = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1000)));
-    let root = crate::test_support::session(&node, &secret).await;
-    // A provider can grant the setting before its machine budget exists.
-    let (writer, _) = application(
-        &node,
-        &root,
-        ids::OPERATOR_GRANT,
-        OPERATOR,
-        &[WORK_CAPACITY_CONFIGURE],
-    )
-    .await;
-    let initial = node
-        .set_machine_capacity(&writer, ids::OPERATOR_GRANT, Revision(0), 4, limits.clone())
-        .await
-        .unwrap();
-    assert_eq!(initial.revision, Revision(1));
-    assert_eq!(initial.limits, limits);
-    node.store.lock().await.unwrap().rotate().await.unwrap();
-    drop(node);
-    let reopened = NodeStore::open(directory.path(), common::network(), None, UnixMillis(1000))
-        .await
-        .unwrap();
-    assert_eq!(reopened.state().machine_capacity().unwrap(), Some(initial));
-}
-
-#[tokio::test]
 async fn queued_setting_and_revocation_use_the_same_writer_order() {
     let directory = tempfile::tempdir().unwrap();
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    node.store
-        .lock()
-        .await
-        .unwrap()
-        .configure_machine(vec![], 4, UnixMillis(10))
-        .await
-        .unwrap();
     let root = crate::test_support::session(&node, &secret).await;
     let (writer, app_secret) = application(
         &node,
         &root,
         ids::OPERATOR_GRANT,
         OPERATOR,
-        &[WORK_CAPACITY_CONFIGURE],
+        &[HOST_PROVIDER_CONFIGURE],
     )
     .await;
     let held = node.store.lock().await.unwrap();
     let mut revoke =
         Box::pin(node.revoke_credential(&root, ids::ROOT_GRANT, app_secret.id(), Revision(1)));
-    let mut setting =
-        Box::pin(node.set_machine_capacity(&writer, ids::OPERATOR_GRANT, Revision(1), 1, vec![]));
+    let mut setting = Box::pin(node.host_action(
+        &writer,
+        ids::OPERATOR_GRANT,
+        HOST_PROVIDER_CONFIGURE,
+        |_| (),
+    ));
     assert!(futures::poll!(&mut revoke).is_pending());
     assert!(futures::poll!(&mut setting).is_pending());
     drop(held);
@@ -612,22 +481,12 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         changed,
         NodeStoreError::Authority(AuthorityError::Credential)
     );
-    assert_eq!(
-        node.status(&root, ids::ROOT_GRANT)
-            .await
-            .unwrap()
-            .machine
-            .unwrap()
-            .max_in_flight
-            .get(),
-        4
-    );
     let (writer, _) = application(
         &node,
         &root,
         ids::FRIEND_GRANT,
         FRIEND,
-        &[WORK_CAPACITY_CONFIGURE],
+        &[HOST_PROVIDER_CONFIGURE],
     )
     .await;
     let held = node.store.lock().await.unwrap();
@@ -639,7 +498,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         .unwrap()
         .revision();
     let mut setting =
-        Box::pin(node.set_machine_capacity(&writer, ids::FRIEND_GRANT, Revision(1), 1, vec![]));
+        Box::pin(node.host_action(&writer, ids::FRIEND_GRANT, HOST_PROVIDER_CONFIGURE, |_| ()));
     let mut revoke = Box::pin(node.grant(
         &root,
         GrantCommand::Revoke {
@@ -652,166 +511,13 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
     assert!(futures::poll!(&mut revoke).is_pending());
     drop(held);
     let (changed, revoked) = tokio::join!(setting, revoke);
-    assert_eq!(changed.unwrap().max_in_flight.get(), 1);
+    changed.unwrap();
     revoked.unwrap();
     assert_err!(
-        node.set_machine_capacity(&writer, ids::FRIEND_GRANT, Revision(2), 4, vec![])
+        node.host_action(&writer, ids::FRIEND_GRANT, HOST_PROVIDER_CONFIGURE, |_| ())
             .await,
         NodeStoreError::Authority(AuthorityError::Revoked)
     );
-}
-
-async fn capacity_world(path: &std::path::Path) -> common::TestService {
-    common::Node::bootstrap(path)
-        .with_grant(
-            ids::OPERATOR_GRANT,
-            common::Rights::new(common::authority(), OPERATOR)
-                .allow(
-                    WORK_CAPACITY_CONFIGURE,
-                    machine_resource(common::authority()),
-                )
-                .valid_until(UnixMillis(100_000))
-                .build(),
-        )
-        .build()
-        .await
-        .serve(common::common_node::NoBackend)
-}
-
-#[tokio::test]
-async fn machine_capacity_accepts_exactly_its_bounds() {
-    let directory = tempfile::tempdir().unwrap();
-    let world = capacity_world(directory.path()).await;
-    let node = world.service.node();
-    let caller = world.caller(OPERATOR).await;
-    let mut expected = world
-        .snapshot()
-        .await
-        .machine_capacity()
-        .unwrap()
-        .unwrap()
-        .revision;
-    for capacity in [0, 257, u16::MAX] {
-        assert_err!(
-            node.set_machine_capacity(&caller, ids::OPERATOR_GRANT, expected, capacity, vec![])
-                .await,
-            NodeStoreError::Authority(AuthorityError::Invalid)
-        );
-    }
-    for capacity in [1, 256] {
-        let changed = node
-            .set_machine_capacity(&caller, ids::OPERATOR_GRANT, expected, capacity, vec![])
-            .await
-            .unwrap();
-        assert_eq!(changed.max_in_flight.get(), capacity);
-        expected = changed.revision;
-    }
-    world.service.drain().await.unwrap();
-}
-
-#[tokio::test]
-async fn capacity_changes_require_the_current_revision() {
-    let directory = tempfile::tempdir().unwrap();
-    let world = capacity_world(directory.path()).await;
-    let node = world.service.node();
-    let caller = world.caller(OPERATOR).await;
-    let stale = world
-        .snapshot()
-        .await
-        .machine_capacity()
-        .unwrap()
-        .unwrap()
-        .revision;
-    let updated = node
-        .set_machine_capacity(&caller, ids::OPERATOR_GRANT, stale, 2, vec![])
-        .await
-        .unwrap();
-    assert_err!(
-        node.set_machine_capacity(&caller, ids::OPERATOR_GRANT, stale, 3, vec![])
-            .await,
-        NodeStoreError::Authority(AuthorityError::Revision)
-    );
-    assert_eq!(
-        world.snapshot().await.machine_capacity().unwrap(),
-        Some(updated)
-    );
-    world.service.drain().await.unwrap();
-}
-
-#[tokio::test]
-async fn checked_capacity_changes_reach_work_admission() {
-    use common::{actors::*, ids, within};
-    use hellas_rpc::pb::work::{GrantRefusalCode, accept_work_response::Outcome};
-    let directory = tempfile::tempdir().unwrap();
-    let finish = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend = common::backend::Backend {
-        slots: Arc::new(tokio::sync::Semaphore::new(2)),
-        finish: common::backend::Completion::Permits(finish.clone()),
-        signer: Arc::new(PROVIDER.node_key()),
-        ..common::backend::Backend::default()
-    };
-    let world = common::Node::bootstrap(directory.path())
-        .with_allowance(common::Allowance::responses(ids::ALLOWANCE, FRIEND))
-        .with_grant(
-            ids::FRIEND_GRANT,
-            common::Rights::new(common::authority(), FRIEND)
-                .allow(
-                    crate::grant_service::WORK_EXECUTE,
-                    crate::grant_service::allowance_resource(common::authority(), ids::ALLOWANCE),
-                )
-                .valid_until(UnixMillis(100_000))
-                .build(),
-        )
-        .build()
-        .await
-        .serve(backend.clone());
-    let node = world.service.node();
-    let root = world.caller(ROOT).await;
-    let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
-    let first = world.proposal(FRIEND, ids::ALLOWANCE, 1).await;
-    assert!(matches!(
-        crate::test_support::accept_grant(&work, &first.request(), &FRIEND.node_key())
-            .await
-            .outcome,
-        Some(Outcome::Accepted(_))
-    ));
-    within(backend.started.notified()).await;
-    let expected = world
-        .snapshot()
-        .await
-        .machine_capacity()
-        .unwrap()
-        .unwrap()
-        .revision;
-
-    let lowered = node
-        .set_machine_capacity(&root, ids::ROOT_GRANT, expected, 1, vec![])
-        .await
-        .unwrap();
-    let second = world.proposal(FRIEND, ids::ALLOWANCE, 2).await;
-    let response =
-        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key()).await;
-    let Some(Outcome::Refused(refused)) = response.outcome else {
-        panic!("capacity did not reach Work: {response:?}")
-    };
-    assert_eq!(
-        refused.grant.unwrap().code,
-        GrantRefusalCode::Concurrency as i32
-    );
-    node.set_machine_capacity(&root, ids::ROOT_GRANT, lowered.revision, 2, vec![])
-        .await
-        .unwrap();
-    assert!(matches!(
-        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key())
-            .await
-            .outcome,
-        Some(Outcome::Accepted(_))
-    ));
-    within(backend.started.notified()).await;
-
-    finish.add_permits(2);
-    within(world.service.drain()).await.unwrap();
-    assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -856,4 +562,133 @@ async fn session_checks_binding_before_calling_the_authenticator_and_propagates_
         Err(AuthorityError::Credential)
     ));
     assert_eq!(authenticator.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn configured_machine_changes_reach_work_admission() {
+    use crate::model::grant::configuration::ConfiguredBudget;
+    use common::{actors::*, ids, within};
+    use hellas_rpc::pb::work::{GrantRefusalCode, accept_work_response::Outcome};
+    let directory = tempfile::tempdir().unwrap();
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = common::backend::Backend {
+        slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        finish: common::backend::Completion::Permits(finish.clone()),
+        signer: Arc::new(PROVIDER.node_key()),
+        ..common::backend::Backend::default()
+    };
+    let allowance = common::Allowance::responses(ids::ALLOWANCE, FRIEND);
+    let policies = allowance.definition.policies.clone();
+    let world = common::Node::bootstrap(directory.path())
+        .with_allowance(allowance)
+        .with_grant(
+            ids::FRIEND_GRANT,
+            common::Rights::new(common::authority(), FRIEND)
+                .allow(
+                    crate::grant_service::WORK_EXECUTE,
+                    crate::grant_service::allowance_resource(common::authority(), ids::ALLOWANCE),
+                )
+                .valid_until(UnixMillis(100_000))
+                .build(),
+        )
+        .build()
+        .await
+        .serve(backend.clone());
+    // The host applies its own configuration; a restart with an edited one
+    // reconciles again.
+    let reconcile = async |max_in_flight| {
+        let machine = ConfiguredBudget {
+            max_in_flight: std::num::NonZeroU16::new(max_in_flight).unwrap(),
+            limits: vec![],
+        };
+        crate::grant_service::WorkAdministration::new(
+            world.service.clone(),
+            common::common_node::configuration_with(machine, policies.clone()),
+            std::num::NonZeroU64::new(20 * 60_000).unwrap(),
+        )
+        .reconcile()
+        .await
+        .unwrap();
+    };
+    let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
+    let first = world.proposal(FRIEND, ids::ALLOWANCE, 1).await;
+    assert!(matches!(
+        crate::test_support::accept_grant(&work, &first.request(), &FRIEND.node_key())
+            .await
+            .outcome,
+        Some(Outcome::Accepted(_))
+    ));
+    within(backend.started.notified()).await;
+
+    reconcile(1).await;
+    let second = world.proposal(FRIEND, ids::ALLOWANCE, 2).await;
+    let response =
+        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key()).await;
+    let Some(Outcome::Refused(refused)) = response.outcome else {
+        panic!("configured capacity did not reach Work: {response:?}")
+    };
+    assert_eq!(
+        refused.grant.unwrap().code,
+        GrantRefusalCode::Concurrency as i32
+    );
+    reconcile(2).await;
+    assert!(matches!(
+        crate::test_support::accept_grant(&work, &second.request(), &FRIEND.node_key())
+            .await
+            .outcome,
+        Some(Outcome::Accepted(_))
+    ));
+    within(backend.started.notified()).await;
+
+    finish.add_permits(2);
+    within(world.service.drain()).await.unwrap();
+    assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
+    use crate::model::grant::{admin::WorkControlCommand, budget::BudgetNode, records::GrantError};
+    let directory = tempfile::tempdir().unwrap();
+    let world = common::Node::bootstrap(directory.path())
+        .build()
+        .await
+        .serve(common::common_node::NoBackend);
+    let admin = crate::grant_service::WorkAdministration::new(
+        world.service.clone(),
+        common::common_node::configuration(vec![common::policy()]),
+        std::num::NonZeroU64::new(60_000).unwrap(),
+    );
+    admin.reconcile().await.unwrap();
+    let root = world.administrator(common::actors::ROOT).await;
+    let [account, pool, subject] = common::common_node::budgets(
+        common::common_node::POOL,
+        common::actors::FRIEND.principal(),
+        vec![],
+        1,
+    );
+    let mut machine = account.clone();
+    (machine.node, machine.parent) = (BudgetNode::Machine, BudgetNode::Machine);
+    for definition in [machine, account] {
+        assert_err!(
+            admin
+                .execute(
+                    &root,
+                    ids::ROOT_GRANT,
+                    WorkControlCommand::ConfigureBudget { definition }
+                )
+                .await,
+            NodeStoreError::Grant(GrantError::OutOfScope)
+        );
+    }
+    // Pools and subjects remain owner-administered.
+    for definition in [pool, subject] {
+        admin
+            .execute(
+                &root,
+                ids::ROOT_GRANT,
+                WorkControlCommand::ConfigureBudget { definition },
+            )
+            .await
+            .unwrap();
+    }
 }

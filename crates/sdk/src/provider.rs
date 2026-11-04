@@ -105,7 +105,7 @@ impl<R> FetchProviderOptions<R> {
         };
         if let Some(grants) = &options.grants {
             crate::grant_provider::ProviderResources::Fetch(&options.routes)
-                .validate(&grants.policies)?;
+                .validate(grants.configuration.resources())?;
         }
         let work_config = options
             .paid_work
@@ -189,7 +189,7 @@ impl ProviderGrants {
         resources: crate::grant_provider::ProviderResources<'_>,
         provider: &ProviderEnrollmentBundle,
     ) -> Result<hellas_authority::node::NodeCoordinator, ProviderError> {
-        resources.validate(&self.config.policies)?;
+        resources.validate(self.config.configuration.resources())?;
         match &self.authority {
             ProviderAuthority::Journal { root, .. } => {
                 Ok(hellas_authority::node::NodeCoordinator::new(
@@ -535,9 +535,11 @@ where
         .with_content_store(content.clone());
         let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
-            grants.config.policies,
+            grants.config.configuration,
             grants.config.max_job_millis,
-        )?;
+        );
+        // The node's own configuration is current before any work is admitted.
+        administration.reconcile().await?;
         let admin = match grants.authority {
             ProviderAuthority::Host(control) => Some(*control),
             ProviderAuthority::Journal { .. } => None,

@@ -8,6 +8,17 @@ journals. The gateway skips busy provider channels and serializes requests
 within each channel. Providers must already hold the GGUF named by the job (for
 example via `hellas store adopt`); the gateway never uploads the weights.
 
+The Qwen3 BF16 program's HIP kernels require a supported gfx11 target, including
+the Strix Halo gfx1151 used in the demo. A gfx1010 GPU can run a scalar smoke
+test but cannot compile this model's native packed BF16 operations. Check the
+model on the target GPU before offering paid inference.
+
+Strix Halo shares system memory with the GPU. An idle worker can retain model
+weights, and `--gpu-session-asset-bytes` bounds that cache, not all GPU or process
+memory. A systemd memory limit alone does not reserve headroom for another GPU
+service. Avoid retaining demo models alongside a GLM deployment that can fill
+the machine; stop the completed demo worker to release its GPU allocations.
+
 Whisper uses the same Compute work source. Convert a downloaded multilingual
 80-mel Whisper checkpoint once on the client (the checkpoint directory contains
 `config.json`, `generation_config.json`, `tokenizer.json`, and `model.safetensors`):
@@ -87,9 +98,43 @@ already-delegated coin fits it; use the explicit owner `chain delegate --split`
 path to reshape unused stake first. The saved `admin.json` profile beside the
 provider identity works with the passkey administration commands.
 
-An owner can also set the policy with `hellas admin work
-policy-command.json`, using a `SetPaidPolicy` command with `expected_revision`
-and `policy`. A stale revision or a daily node-key session cannot change it.
+For an existing fleet daemon, keep the owner key on the administration machine.
+Approve the same TOML file remotely with its owner profile:
+
+```sh
+hellas --identity laptop.identity --passkey owner.key admin \
+  --profile node-admin.json --node NODE_ID --address HOST:31145 \
+  set-paid-policy --terms paid.toml --expected-revision 0
+```
+
+Then start the initialized daemon with `serve --grant-config node.json
+--paid-work-config paid.toml`, without a passkey or `--faucet`. It checks the
+stored policy matches exactly and cannot approve changed terms itself. Use the
+current policy revision for subsequent approvals. A stale revision or a node-key
+session cannot change paid terms.
+
+Stake must belong to the authority owner and be delegated to the daemon's
+settlement key. From the owner's machine, use `chain delegate --coin COIN_ID
+--node SETTLEMENT_KEY --split 12` with `--passkey owner.key`, the independently
+pinned `--trust` document and `--rpc` endpoint. Use the stake value configured in
+`offers.max_stake_per_client`; the example uses 12. `chain send --coin COIN_ID
+--to OWNER_KEY --amount 1000` can fund the owner from a public
+`--faucet-account N`. It returns any change to the sender without delegation.
+These commands print submission status and resulting coin IDs; submission is
+not finalization. Check finalized coin state before relying on the funding.
+
+The first paid daemon startup synchronizes authenticated devnet state before
+serving requests. This can take several minutes. Retain its `--chain-store-dir`
+across restarts; the CLI reports the wait. A buyer's `--faucet` chooses a public
+devnet account and records that choice beside its identity. Use a dedicated
+identity and retain its wallet/channel state through settlement.
+
+Paid CLI jobs default to 300 admission blocks, 3000 execution/delivery blocks,
+and 600 payment blocks. Override these with `--acceptance-blocks`,
+`--terminal-blocks`, and `--payment-blocks`; they count finalized blocks, not
+seconds. The gateway pool exposes the same fields and defaults. The provider's
+bond lifetime must cover all three windows plus channel setup. `--timeout`
+separately limits the caller's wall-clock wait; it does not extend signed deadlines.
 
 Execution limits are A's: a job over the upload limit is refused before it
 runs, and a job that exceeds `execution_timeout_ms` is killed with its worker
@@ -122,9 +167,9 @@ The pool selects providers and expected prices. It obtains each policy with
       "payment": 20
     }
   ],
-  "acceptance_blocks": 16,
-  "terminal_blocks": 64,
-  "payment_blocks": 32,
+  "acceptance_blocks": 300,
+  "terminal_blocks": 3000,
+  "payment_blocks": 600,
   "timeout_secs": 300,
   "max_pending_requests": 64
 }

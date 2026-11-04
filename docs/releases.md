@@ -56,8 +56,9 @@ selects a successful evaluation, rather than changing the source branch.
 | `hellas-consensus` | `releaseJobs.consensus` | Validator package; chain, settlement, validator VM and kernel model checks |
 
 All three also require lints and unit tests. CLI covers x86 and ARM Linux and
-ARM64 macOS; GPU and consensus cover x86 Linux. CUDA/HIP model compilation
-runs on Linux, while the remaining CLI checks run on each release platform.
+ARM64 macOS; GPU and consensus cover x86 Linux. CUDA/HIP model compilation and
+native cases that re-execute a Catena compile worker run on Linux, while the
+remaining CLI checks run on each release platform.
 The exact test selection lives in `nix/releases.nix`. Native Linux archives require
 their Nix runtime closure. The musl and Darwin archives run without Nix. Darwin packaging uses the macOS system libiconv and ad-hoc
 signs the executable; it is not Developer ID signed or notarized.
@@ -70,13 +71,13 @@ This is the same derivation built by Hydra and the macOS GitHub job. It requires
 a native Darwin builder, which Nix/Hydra schedules through their configured
 build machines; no SSH packaging or publication script is needed.
 
-Docker is an artifact format: the network image follows the CLI release,
-while CUDA/HIP images follow the GPU release. A push to `master` or `devnet`
-does not publish any of them. There is no parallel GitHub release workflow.
+Docker is an artifact format: the network image is a CLI artifact and the
+CUDA/HIP images are GPU artifacts. A push to `master` or `devnet` does not
+publish any of them; publication only copies artifacts Hydra already built.
 
-Hardware comparisons requiring a GPU or private model checkpoints are an
-explicit prerequisite to GPU promotion. Building an image and running CPU
-tests does not establish that a model executed correctly on hardware.
+Published GPU images are CI-built, not hardware-qualified. Building an image
+and running CPU tests does not establish that a model executed correctly on
+hardware.
 
 ## Build and promote a release
 
@@ -87,26 +88,25 @@ tests does not establish that a model executed correctly on hardware.
 2. Select a successful component evaluation at the full commit SHA intended for
    release. Its `channel` job must have succeeded: each platform's `release` job
    depends on all its checks and artifacts and rejects Hydra's failed-test
-   marker. Release JSON records the source SHA and artifact store paths; archive
-   outputs include SHA256 checksums. A standalone CI artifact is useful for
-   testing but does not replace the complete component release gate.
-3. Record the evaluation/build ID, full SHA, artifact checksums and any required
-   GPU hardware results. Keep that build in Hydra so garbage collection cannot
-   remove its artifacts. Never resolve a moving branch or latest-successful
-   channel again during publication.
-4. Publish the existing verified artifacts without rebuilding. An immutable
-   release tag names that exact source commit; attach the matching archives and
-   checksums. Copy a selected container archive to a commit-specific registry tag
-   and record its image digest. Refuse a tag or asset that already names different
-   content. Components may publish different successful commits independently.
-5. Update deployment pins to the published commit or image digest through infra.
+   marker. Each artifact output holds its archive and a `SHA256SUMS` file; the
+   evaluation's builds record the artifact store paths. A standalone CI
+   artifact is useful for testing but does not replace the complete component
+   release gate.
+3. Publish with `nix run .#publish`. The `Publish` workflow runs it every 30
+   minutes and on demand (`workflow_dispatch`, optionally with an exact
+   revision or a dry run). It selects the newest commit whose CLI and GPU
+   channels both succeeded, fetches that evaluation's artifacts from
+   `cache.hellas.ai` with signature checks and verifies each `SHA256SUMS`; it
+   never rebuilds. Images go to `ghcr.io/hellas-ai/hellas:sha-<commit>-<backend>`
+   (`network`, `hip`, `cuda`), then the floating `network`, `latest`, `hip` and
+   `cuda` tags. The GitHub release `v<version>-<commit12>` targets that commit
+   with the musl, Darwin and RPC WASM archives, one combined `SHA256SUMS`, and
+   the image digests. An existing commit tag or release must name the same
+   content, so reruns are idempotent and a mismatch fails. The pinned skopeo
+   keeps layer digests stable, so the registry only receives changed layers.
+4. Update deployment pins to the published commit or image digest through infra.
    Building, publishing and deploying are separate actions; a new successful
    build does not change a running deployment.
-
-The repository currently builds Hydra artifacts and CI artifacts; automated
-GitHub Release/registry publication is a separate implementation task. Any
-publisher must consume a selected successful evaluation under the contract
-above, not start another build from `master`.
 
 Hydra's Channels tab exposes a Nix channel for each jobset. Its expression
 pins that successful source revision and exposes the component's artifacts.

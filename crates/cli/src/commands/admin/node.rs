@@ -15,17 +15,15 @@ use hellas_authority::model::grant::records::{decode_enrollment, grant_transport
 use hellas_rpc::{
     pb::host::{
         BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
-        IssueCredentialRequest, RevokeCredentialRequest, SetMachineCapacityRequest,
-        WorkControlRequest,
+        IssueCredentialRequest, RevokeCredentialRequest, WorkControlRequest,
     },
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
 };
-use hellas_sdk::{
-    access_bundle::{AccessBundle, MAX_BUNDLE_OFFERS, MAX_LABEL_BYTES},
-    node_control::{self, profile},
-};
+use hellas_sdk::node_control::{self, profile};
+mod share;
 use hellas_wire::{ServiceMarker, StreamTransport};
+use share::{ShareRequest, share};
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -95,8 +93,9 @@ pub async fn run(
         _ => {}
     }
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
-    let profile =
-        profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
+    let profile_path = args.profile.as_deref().context("--profile is required")?;
+    let pinned_node = profile::ClientProfile::remote_node(profile_path)?;
+    let profile = profile::ClientProfile::load(profile_path)?;
     let remote = args
         .node_enrollment
         .map(|target| -> Result<iroh::EndpointId> {
@@ -110,6 +109,17 @@ pub async fn run(
             Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
         })
         .transpose()?;
+    ensure!(
+        remote
+            .zip(pinned_node)
+            .is_none_or(|(requested, pinned)| requested == pinned),
+        "--node differs from the profile's paired node"
+    );
+    let remote = remote.or(pinned_node);
+    ensure!(
+        remote.is_none() || args.control_socket.is_none(),
+        "a remote profile cannot use --control-socket"
+    );
     if let Some(node) = remote {
         // The application identity is proved inside the authenticated session.
         // A stable endpoint key permits explicit remote ingress admission; use
@@ -229,25 +239,6 @@ where
                 .await?;
             print_status(status)?;
         }
-        AdminCommand::SetCapacity {
-            expected_revision,
-            max_in_flight,
-            limits,
-        } => {
-            let limits: Vec<hellas_authority::model::grant::budget::Limit> = read(&limits)?;
-            let result = client
-                .set_machine_capacity(SetMachineCapacityRequest {
-                    authorization: authorization.0.to_vec(),
-                    expected_revision,
-                    max_in_flight: u32::from(max_in_flight),
-                    limits: canonical_dag_cbor(&limits)?,
-                })
-                .await?;
-            println!(
-                "{}",
-                serde_json::json!({"revision": result.revision, "max_in_flight": result.max_in_flight})
-            );
-        }
         AdminCommand::BindProvider { enrollment } => {
             let response = client
                 .bind_provider(BindProviderRequest {
@@ -299,92 +290,32 @@ where
                 })
             );
         }
-        AdminCommand::ExportBundle {
-            allowances,
-            grant_id,
-            credential_scope,
+        AdminCommand::Share {
+            contact,
             holder,
+            resource,
+            limits,
+            max_job,
+            expires,
             label,
             out,
         } => {
-            ensure!(!out.try_exists()?, "bundle output already exists");
-            ensure!(
-                label
-                    .as_ref()
-                    .is_none_or(|label| label.len() <= MAX_LABEL_BYTES),
-                "label exceeds {MAX_LABEL_BYTES} bytes"
-            );
-            ensure!(
-                allowances.len() <= MAX_BUNDLE_OFFERS,
-                "a bundle shares at most {MAX_BUNDLE_OFFERS} allowances"
-            );
-            let grant: GrantId = grant_id
-                .parse()
-                .context("grant ID must be 16 bytes of hex")?;
-            let scope: GrantSpec = read(&credential_scope)?;
-            let CredentialHolder::Node(holder) = read(&holder)? else {
-                anyhow::bail!("a contact's credential is held by the contact's device");
-            };
-            let mut offers = Vec::with_capacity(allowances.len());
-            for allowance in &allowances {
-                let allowance: GrantId = allowance
-                    .parse()
-                    .context("allowance must be 16 bytes of hex")?;
-                ensure!(
-                    scope.permissions.iter().any(|p| {
-                        p.operation.as_str() == hellas_authority::grant_service::WORK_EXECUTE
-                            && p.resource
-                                == hellas_authority::grant_service::allowance_resource(
-                                    scope.authority,
-                                    allowance,
-                                )
-                    }),
-                    "the credential scope must grant work.execute on allowance {allowance}"
-                );
-                let request = WorkControlCommand::Offers {
-                    id: Some(allowance),
-                };
-                let WorkControlReply::Offers(found) =
-                    work(&client, authorization, &request).await?
-                else {
-                    anyhow::bail!("offer reply required")
-                };
-                let Ok([offer]) = <[_; 1]>::try_from(found) else {
-                    anyhow::bail!("allowance {allowance} needs one active offer")
-                };
-                offers.push(offer);
-            }
-            let (prepared, credential) =
-                Credential::prepare(scope.clone(), CredentialHolder::Node(holder), generation)?;
-            let id = hex::encode(credential.id().0);
-            let bundle = AccessBundle {
-                offers,
-                authority: scope.authority,
-                authorization: grant,
-                subject: scope.subject,
-                holder,
-                credential,
-                expires: scope.expires,
+            let request = ShareRequest {
+                contact: hellas_authority::model::grant::records::decode_contact_card(
+                    &hellas_private::read_bounded_regular_file(
+                        &contact,
+                        hellas_authority::model::grant::records::MAX_CONTACT_CARD_BYTES,
+                    )?,
+                )?,
+                holder: read(&holder)?,
+                resource,
+                limits,
+                max_job,
+                expires,
                 label,
+                out,
             };
-            bundle.save(&out)?;
-            issue(&client, authorization, &prepared).await.with_context(|| format!(
-                "bundle credential {id} is retained at {} pending confirmation; inspect Credential {{ id }} before sharing it or retrying issuance",
-                out.display(),
-            ))?;
-            for offer in &bundle.offers {
-                offer_fingerprints(offer)?;
-            }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "credential_id": id, "revision": 1, "bundle_file": out,
-                    "subject": hex::encode(scope.subject.as_bytes()),
-                    "subject_fingerprint": scope.subject.fingerprint(),
-                    "authority": hex::encode(scope.authority.0.as_bytes()),
-                    "allowances": allowances,
-                })
-            );
+            share(&client, authorization, generation, request).await?;
         }
         AdminCommand::RevokeCredential {
             credential_id,
@@ -424,6 +355,19 @@ where
                 offer_fingerprints(offer)?;
                 hellas_private::write_atomically(&path, ".writing", &offer.encode()?)?;
             }
+            println!("{}", serde_json::to_string(&reply)?);
+        }
+        AdminCommand::SetPaidPolicy {
+            terms,
+            expected_revision,
+            fetch_config,
+        } => {
+            let value = crate::commands::serve::paid::PaidWork::approval(
+                &terms,
+                fetch_config.as_deref(),
+                Revision(expected_revision),
+            )?;
+            let reply = work(&client, authorization, &value).await?;
             println!("{}", serde_json::to_string(&reply)?);
         }
         _ => anyhow::bail!("this command requires its offline or management entrypoint"),
@@ -641,8 +585,14 @@ async fn bootstrap_remote(
     };
     let invitation: node_control::bootstrap::Invitation = read(&invitation)?;
     let root: GrantId = root_grant.parse()?;
-    let administrator: GrantSpec = read(&administrator)?;
-    let scope: GrantSpec = read(&credential_scope)?;
+    let (administrator, scope) = match (administrator, credential_scope) {
+        (Some(administrator), Some(scope)) => (read(&administrator)?, read(&scope)?),
+        (None, None) => {
+            let scope = super::owner_scope::administrator(passkey.public_key()?)?;
+            (scope.clone(), scope)
+        }
+        _ => anyhow::bail!("custom administrator and credential scope must be supplied together"),
+    };
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
@@ -657,6 +607,7 @@ async fn bootstrap_remote(
     .await?;
     let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
     let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
+    profile::pin_remote(&profile, invitation.node)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
         .bind()

@@ -218,30 +218,33 @@ impl ResellerBuilder {
                 fetch_queue_capacity: 2,
                 paid_work: None,
                 grants: Some(GrantProviderOptions {
-                    policies: vec![
-                        crate::responses_policy(
-                            hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                                b"test resource",
-                            )),
-                            hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                                b"test account",
-                            )),
-                            hellas_auth::authority::Revision(1),
-                            "openai",
-                            "responses",
-                            responses_resource(),
-                            pricing(),
-                            NonZeroU64::new(60_000).unwrap(),
-                        )
-                        .unwrap(),
-                    ],
+                    configuration: hellas_authority::test_support::common_node::configuration(
+                        vec![
+                            crate::responses_policy(
+                                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
+                                    b"test resource",
+                                )),
+                                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
+                                    b"test account",
+                                )),
+                                hellas_auth::authority::Revision(1),
+                                "openai",
+                                "responses",
+                                responses_resource(),
+                                pricing(),
+                                NonZeroU64::new(60_000).unwrap(),
+                            )
+                            .unwrap(),
+                        ],
+                    ),
                     max_job_millis: NonZeroU64::new(60_000).unwrap(),
                 }),
             }
         };
         let clock = TestClock::new(hellas_auth::authority::UnixMillis::now().unwrap_or_default());
         let mut allowance = Allowance::responses(ALLOWANCE, FRIEND);
-        allowance.definition.policies = options().grants.unwrap().policies;
+        allowance.definition.policies =
+            options().grants.unwrap().configuration.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
         let world = Node::bootstrap(&root.path().join("provider/grants"))
             .with_network(hellas_authority::model::grant::grant_network())
@@ -496,6 +499,8 @@ impl OpenAiFixture {
             bearer_token: "fixture".into(),
             resource: ResourceId(hellas_auth::Digest::hash(b"test resource")),
             account: ResourceId(hellas_auth::Digest::hash(b"test account")),
+            machine: unlimited(),
+            account_budget: unlimited(),
             policy_revision: Revision(1),
             pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
@@ -724,5 +729,12 @@ impl ControlledGateway {
         );
         drop(self.control);
         self.host.shutdown().await
+    }
+}
+
+fn unlimited() -> hellas_authority::model::grant::configuration::ConfiguredBudget {
+    hellas_authority::model::grant::configuration::ConfiguredBudget {
+        max_in_flight: std::num::NonZeroU16::new(256).unwrap(),
+        limits: vec![],
     }
 }

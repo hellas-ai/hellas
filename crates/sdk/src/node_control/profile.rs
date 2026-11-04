@@ -26,6 +26,8 @@ struct ProfileFile {
     credential: PathBuf,
     local: Option<LocalTrust>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_node: Option<iroh::EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     subject: Option<PrincipalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     holder: Option<NodeKey>,
@@ -48,6 +50,13 @@ pub struct ClientProfile {
 }
 
 impl ClientProfile {
+    /// The transport pin established by an explicit owner pairing.
+    pub fn remote_node(path: &Path) -> io::Result<Option<iroh::EndpointId>> {
+        let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
+            .map_err(|_| invalid("invalid control profile"))?;
+        Ok(profile.remote_node)
+    }
+
     pub fn load(path: &Path) -> io::Result<Self> {
         let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
             .map_err(|_| invalid("invalid control profile"))?;
@@ -75,6 +84,21 @@ impl ClientProfile {
             local: profile.local.map(|trust| trust.load(parent)).transpose()?,
         })
     }
+}
+
+/// Retain the independently trusted pairing target beside its new credential.
+pub fn pin_remote(path: &Path, node: iroh::EndpointId) -> io::Result<()> {
+    let mut profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
+        .map_err(|_| invalid("invalid control profile"))?;
+    if profile.local.is_some() || profile.remote_node.is_some_and(|existing| existing != node) {
+        return Err(invalid("profile already pins a different server"));
+    }
+    profile.remote_node = Some(node);
+    hellas_private::write_atomically(
+        path,
+        ".pinning",
+        &serde_json::to_vec(&profile).map_err(io::Error::other)?,
+    )
 }
 
 impl LocalTrust {
@@ -134,10 +158,9 @@ pub fn server_tls(
 }
 
 fn read_private(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
-    hellas_private::read_private_bounded(
-        hellas_private::open_regular_file(path)?,
-        MAX_FILE as usize,
-    )
+    hellas_private::open_regular_file(path)
+        .and_then(|file| hellas_private::read_private_bounded(file, MAX_FILE as usize))
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
 /// A credential file is exactly its 16-byte ID followed by its 32-byte secret.
@@ -232,6 +255,7 @@ fn install_remote_inner(
         authorization,
         credential: "credential".into(),
         local: None,
+        remote_node: None,
         subject: binding.map(|binding| binding.0),
         holder: binding.map(|binding| binding.1),
     })
@@ -325,5 +349,34 @@ impl GatewayProfile {
             access,
             control,
         })
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_pin_is_retained_and_cannot_be_silently_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let profile = ProfileFile {
+            authority: AuthorityId(hellas_auth::Digest::hash(b"paired authority")),
+            authorization: GrantId([1; 16]),
+            credential: "credential".into(),
+            local: None,
+            remote_node: None,
+            subject: None,
+            holder: None,
+        };
+        hellas_private::write_atomically(&path, ".writing", &serde_json::to_vec(&profile).unwrap())
+            .unwrap();
+        let first = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        assert_eq!(ClientProfile::remote_node(&path).unwrap(), None);
+        pin_remote(&path, first).unwrap();
+        assert_eq!(ClientProfile::remote_node(&path).unwrap(), Some(first));
+        assert!(pin_remote(&path, second).is_err());
+        assert_eq!(ClientProfile::remote_node(&path).unwrap(), Some(first));
     }
 }

@@ -53,6 +53,13 @@ pub async fn prepare(
     )
     .await?;
     let invitation = bootstrap::Invitation::create(&endpoint, now)?;
+    let invitation_path = root.join("invitation.json");
+    hellas_private::write_atomically(
+        &invitation_path,
+        ".pairing",
+        &serde_json::to_vec(&invitation)?,
+    )?;
+    eprintln!("Private pairing invitation: {}", invitation_path.display());
     // Pairing exists only for this process. A restart cannot reset the attempt
     // counter for an old secret: it generates an independent invitation instead.
     eprintln!("Obtain this pairing document through the authenticated machine console:");

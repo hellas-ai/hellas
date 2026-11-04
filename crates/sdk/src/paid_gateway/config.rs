@@ -142,13 +142,13 @@ struct PoolFile {
     max_pending_requests: usize,
 }
 const fn acceptance_blocks() -> u64 {
-    16
+    300
 }
 const fn terminal_blocks() -> u64 {
-    64
+    3000
 }
 const fn payment_blocks() -> u64 {
-    32
+    600
 }
 const fn timeout_secs() -> u64 {
     300

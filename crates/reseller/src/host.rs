@@ -32,6 +32,9 @@ pub struct OpenAiProviderOptions<R> {
     pub bearer_token: String,
     pub resource: hellas_auth::authority::ResourceId,
     pub account: hellas_auth::authority::ResourceId,
+    /// The machine and account budgets this host configures for its resource.
+    pub machine: hellas_authority::model::grant::configuration::ConfiguredBudget,
+    pub account_budget: hellas_authority::model::grant::configuration::ConfiguredBudget,
     pub policy_revision: hellas_auth::authority::Revision,
     pub responses: hellas_authority::model::grant::responses::ResponsesResource,
     pub pricing: hellas_authority::model::grant::pricing::Pricing,
@@ -74,7 +77,11 @@ where
         state_directory: options.state_directory.clone(),
         routes,
         grants: Some(GrantProviderOptions {
-            policies: vec![policy],
+            configuration: hellas_authority::model::grant::configuration::NodeConfiguration::new(
+                Some(options.machine.clone()),
+                [(options.account, options.account_budget.clone())].into(),
+                vec![policy],
+            )?,
             max_job_millis: options.max_job_millis,
         }),
         fetch_max_in_flight: options.fetch_max_in_flight,

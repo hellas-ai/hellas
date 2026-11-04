@@ -12,7 +12,6 @@ pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
 pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
 pub const HOST_GATEWAY_ACCESS: &str = "host.gateway.access";
 pub use hellas_auth::authority::GATEWAY_INVOKE;
-pub const WORK_CAPACITY_CONFIGURE: &str = "work.capacity.configure";
 
 pub fn host_resource(authority: AuthorityId) -> ResourceId {
     ResourceId(hash_tuple(
@@ -172,52 +171,6 @@ impl NodeCoordinator {
                 machine: state.machine_capacity()?,
             }))
         })
-        .await
-    }
-
-    /// Replaces machine concurrency and budgets, preserving counters and held work.
-    /// Revision zero explicitly initializes an unconfigured provider machine.
-    /// The expected revision makes lost replies reconcilable without blind retries.
-    pub async fn set_machine_capacity(
-        &self,
-        caller: &AuthenticatedCaller,
-        authorization: GrantId,
-        expected: Revision,
-        max_in_flight: u16,
-        limits: Vec<Limit>,
-    ) -> Result<MachineCapacity, NodeStoreError> {
-        let _changed = ChangeNotification(self.changed.clone());
-        self.checked(
-            caller,
-            authorization,
-            WORK_CAPACITY_CONFIGURE,
-            async |store, now| {
-                let authority = store.state().authority();
-                authority.authorize_caller(
-                    caller,
-                    authorization,
-                    &Operation::named(WORK_CAPACITY_CONFIGURE)?
-                        .permission(authority.authority(), None)?,
-                    now,
-                )?;
-                store
-                    .commit_work(
-                        caller,
-                        authorization,
-                        crate::work_store::grant::WorkMutation::Capacity {
-                            expected,
-                            max_in_flight,
-                            limits,
-                        },
-                        now,
-                    )
-                    .await?;
-                store
-                    .state()
-                    .machine_capacity()?
-                    .ok_or(NodeStoreError::MissingMachine)
-            },
-        )
         .await
     }
 }

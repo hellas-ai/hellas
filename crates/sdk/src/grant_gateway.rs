@@ -683,8 +683,8 @@ impl GrantServeOptions {
             let (mut options, key) = (self.clone(), key.clone());
             options.serve.server.access = access;
             Box::pin(async move {
-                let transport = GrantTransport::remote(key).await?;
-                Ok(options.start(transport).await?)
+                let endpoint = crate::grant_client::bind_endpoint(key).await?;
+                Ok(options.start(GrantTransport::Remote(endpoint)).await?)
             })
         })
     }

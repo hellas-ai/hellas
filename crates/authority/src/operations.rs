@@ -31,17 +31,11 @@ pub const OPERATIONS: &[Operation] = &[
     Operation::new(node::HOST_GATEWAY_CONFIGURE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_GATEWAY_ACCESS, Scope::Host, Mount::Host),
     Operation::new(node::GATEWAY_INVOKE, Scope::Host, Mount::Host),
-    Operation::new(
-        node::WORK_CAPACITY_CONFIGURE,
-        Scope::Machine,
-        Mount::Machine,
-    ),
     Operation::new(grant::WORK_ALLOWANCE_READ, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_ALLOWANCE_CONFIGURE, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_BUDGET_CONFIGURE, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_OFFER_EXPORT, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_GENERATION_RESET, Scope::Machine, Mount::Work),
-    Operation::new(grant::WORK_RESOURCE_CONFIGURE, Scope::Machine, Mount::Work),
     Operation::new(grant::WORK_RESOURCE_REPAIR, Scope::Machine, Mount::Work),
     Operation::new(
         grant::WORK_PAID_POLICY_CONFIGURE,

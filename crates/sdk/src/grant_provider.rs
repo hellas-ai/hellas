@@ -1,6 +1,6 @@
 //! Validate available resources and open explicitly initialized provider authority.
 use crate::{FetchRoute, FetchRouteRegistry};
-use std::{collections::BTreeSet, num::NonZeroU64};
+use std::num::NonZeroU64;
 use {
     hellas_authority::model::grant::records::GrantError,
     hellas_authority::model::grant::records::GrantPolicy,
@@ -26,19 +26,10 @@ pub enum ProviderResources<'a> {
 }
 impl ProviderResources<'_> {
     pub fn validate(&self, policies: &[GrantPolicy]) -> Result<(), GrantProviderError> {
-        if policies.len() > 16 {
-            return Err(GrantError::Limits.into());
-        }
-        let mut names = BTreeSet::new();
-        let mut ids = BTreeSet::new();
         let routes = match self {
             Self::Fetch(routes) | Self::ComputeAndFetch(routes) => routes,
         };
         for resource in policies {
-            resource.validate()?;
-            if !names.insert(&resource.name) || !ids.insert(resource.resource) {
-                return Err(GrantError::Malformed.into());
-            }
             for admission in &resource.invocation_policy.admissions {
                 match admission {
                     Admission::Compute { .. } => {
@@ -74,6 +65,6 @@ impl ProviderResources<'_> {
 /// Available resources for checked administration, never startup permission grants.
 #[derive(Clone)]
 pub struct GrantProviderOptions {
-    pub policies: Vec<GrantPolicy>,
+    pub configuration: hellas_authority::model::grant::configuration::NodeConfiguration,
     pub max_job_millis: NonZeroU64,
 }

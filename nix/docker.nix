@@ -120,14 +120,7 @@ let
     };
   };
 
-  push = pkgs.writeShellApplication {
-    name = "docker-push";
-    runtimeInputs = [ pkgs.skopeo ];
-    text = ''
-      ${image} | skopeo copy docker-archive:/dev/stdin "docker://${imageRepository}:${backend}" "$@"
-    '';
-  };
 in
 {
-  inherit image push;
+  inherit image;
 }

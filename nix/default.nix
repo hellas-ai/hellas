@@ -328,28 +328,10 @@ let
         docker-hip = dockerHip.image;
       };
 
-      apps = {
-        "docker-push" = {
-          type = "app";
-          program = "${docker.push}/bin/docker-push";
-          meta.description = "Push the Hellas network-node Docker image";
-        };
-      }
-      // lib.optionalAttrs isX86_64Linux {
-        "docker-push-all" = {
-          type = "app";
-          program = "${
-            pkgs.writeShellApplication {
-              name = "hellas-docker-push-all";
-              text = ''
-                ${docker.push}/bin/docker-push "$@"
-                ${dockerCuda.push}/bin/docker-push "$@"
-                ${dockerHip.push}/bin/docker-push "$@"
-              '';
-            }
-          }/bin/hellas-docker-push-all";
-          meta.description = "Push the Hellas network, CUDA, and HIP Docker images";
-        };
+      apps.publish = {
+        type = "app";
+        program = "${import ./publish.nix { inherit pkgs; }}/bin/hellas-publish";
+        meta.description = "Publish verified Hydra artifacts to ghcr.io and GitHub Releases";
       };
 
       devShells = lib.optionalAttrs isX86_64Linux {
@@ -478,20 +460,26 @@ let
 
   };
 
-  hydraUnit = nativePkg.mkHellasPackage {
-    pname = "hellas-check-unit";
-    buildType = "debug";
-    dontBuild = true;
-    doCheck = true;
-    cargoTestFlags = [
-      "--locked"
-      "--workspace"
-    ];
-    installPhase = ''
-      mkdir -p "$out"
-      touch "$out/passed"
-    '';
-  };
+  hydraUnit = nativePkg.mkHellasPackage (
+    {
+      pname = "hellas-check-unit";
+      buildType = "debug";
+      dontBuild = true;
+      doCheck = true;
+      cargoTestFlags = [
+        "--locked"
+        "--workspace"
+      ];
+      installPhase = ''
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
+    }
+    // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      cargoTestJobs = 1;
+      RUST_TEST_THREADS = "1";
+    }
+  );
 
 in
 {

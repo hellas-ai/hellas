@@ -1,8 +1,12 @@
-//! Local resource configuration shares exactly the paid InvocationPolicy parser.
-//! Grants and their counters remain runtime state in the provider journal.
+//! A node's own configuration: its listeners, the budget tree down to accounts,
+//! and the resources it serves, sharing exactly the paid InvocationPolicy parser.
+//! Pools, subjects, allowances, grants and their counters remain runtime state
+//! in the provider journal.
 use crate::resource_config::ResourceConfigError;
 use hellas_auth::authority::{ResourceId, Revision};
 use hellas_authority::model::grant::{
+    budget::Limit,
+    configuration::{ConfiguredBudget, NodeConfiguration},
     records::{GrantError, GrantPolicy},
     resource::HttpsResource,
     responses::ResponsesResource,
@@ -40,6 +44,13 @@ struct ResourceFile {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AccountFile {
+    account: ResourceId,
+    max_in_flight: std::num::NonZeroU16,
+    limits: Vec<Limit>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     journal_root: Option<PathBuf>,
     control_socket: Option<PathBuf>,
@@ -50,6 +61,9 @@ struct ConfigFile {
     #[serde(default)]
     remote_control: bool,
     max_job_millis: NonZeroU64,
+    machine: Option<ConfiguredBudget>,
+    #[serde(default)]
+    accounts: Vec<AccountFile>,
     resources: Vec<ResourceFile>,
 }
 pub struct GrantConfig {
@@ -59,10 +73,10 @@ pub struct GrantConfig {
     pub control_private_key: PathBuf,
     pub remote_control: crate::node_control::RemoteControlAdmission,
     pub max_job_millis: NonZeroU64,
-    pub resources: Vec<GrantPolicy>,
+    pub configuration: NodeConfiguration,
 }
 impl GrantConfig {
-    /// Listener and resource configuration never supplies permissions or budgets.
+    /// Serves no resources and configures no budgets; never supplies permissions.
     pub fn unconfigured(root: &Path) -> Self {
         Self {
             journal_root: root.join("provider"),
@@ -71,7 +85,7 @@ impl GrantConfig {
             control_private_key: root.join("control.key.der"),
             remote_control: Default::default(),
             max_job_millis: NonZeroU64::MIN.saturating_add(1_799_999), // 30 minutes
-            resources: vec![],
+            configuration: NodeConfiguration::default(),
         }
     }
 
@@ -110,35 +124,34 @@ impl GrantConfig {
             || !control_socket.is_absolute()
             || !control_certificate.is_absolute()
             || !control_private_key.is_absolute()
-            || file.resources.len() > 16
         {
             return Err(GrantError::Limits.into());
         }
         let resources = file
             .resources
             .into_iter()
-            .map(|p| {
-                let policy = GrantPolicy {
-                    resource: p.resource,
-                    account: p.account,
-                    revision: p.revision,
-                    name: p.name,
-                    invocation_policy: p.invocation_policy,
-                    https: p.https,
-                    responses: p.responses,
-                    pricing: p.pricing,
-                };
-                policy.validate()?;
-                Ok(policy)
+            .map(|p| GrantPolicy {
+                resource: p.resource,
+                account: p.account,
+                revision: p.revision,
+                name: p.name,
+                invocation_policy: p.invocation_policy,
+                https: p.https,
+                responses: p.responses,
+                pricing: p.pricing,
             })
-            .collect::<Result<Vec<_>, GrantConfigError>>()?;
-        let mut names = std::collections::BTreeSet::new();
-        let mut ids = std::collections::BTreeSet::new();
-        for resource in &resources {
-            if !names.insert(&resource.name) || !ids.insert(resource.resource) {
+            .collect();
+        let mut accounts = std::collections::BTreeMap::new();
+        for account in file.accounts {
+            let budget = ConfiguredBudget {
+                max_in_flight: account.max_in_flight,
+                limits: account.limits,
+            };
+            if accounts.insert(account.account, budget).is_some() {
                 return Err(GrantError::Malformed.into());
             }
         }
+        let configuration = NodeConfiguration::new(file.machine, accounts, resources)?;
         Ok(Self {
             journal_root,
             control_socket,
@@ -146,7 +159,7 @@ impl GrantConfig {
             control_private_key,
             remote_control,
             max_job_millis: file.max_job_millis,
-            resources,
+            configuration,
         })
     }
 }
@@ -270,15 +283,50 @@ mod tests {
             usd_micros: 3,
             units: NonZeroU64::new(4).unwrap(),
         }]);
-        let config = json!({"max_job_millis":10000,"resources":[{
+        let account = json!({"account":expected.account,"max_in_flight":4,"limits":[]});
+        let config = json!({"max_job_millis":10000,
+        "machine":{"max_in_flight":8,"limits":[]},"accounts":[account],
+        "resources":[{
             "resource":expected.resource,"account":expected.account,"revision":expected.revision,
             "name":expected.name,"responses":expected.responses,"pricing":expected.pricing,
             "invocation_policy":expected.invocation_policy
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let parsed = GrantConfig::load(&path, Some(directory.path())).unwrap();
-        assert_eq!(parsed.resources, vec![expected]);
+        assert_eq!(parsed.configuration.resources(), [expected.clone()]);
+        assert_eq!(
+            parsed.configuration.machine().unwrap().max_in_flight.get(),
+            8
+        );
         assert!(!parsed.journal_root.exists());
+        // The configuration owns the budget tree above pools, completely: a
+        // resource needs a machine and a declared account, and every declared
+        // account is used exactly once.
+        let load = |value: &serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            GrantConfig::load(&path, Some(directory.path()))
+        };
+        let other = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"other account"));
+        for (field, value) in [
+            ("machine", serde_json::Value::Null),
+            ("accounts", json!([])),
+            (
+                "accounts",
+                json!([account, {"account":other,"max_in_flight":1,"limits":[]}]),
+            ),
+        ] {
+            let mut invalid = config.clone();
+            invalid[field] = value;
+            assert_err!(load(&invalid), GrantConfigError::Grant(GrantError::Limits));
+        }
+        let mut duplicated = config.clone();
+        duplicated["accounts"] = json!([account, account]);
+        assert_err!(
+            load(&duplicated),
+            GrantConfigError::Grant(GrantError::Malformed)
+        );
+        let unconfigured = load(&json!({"max_job_millis":10000,"resources":[]})).unwrap();
+        assert_eq!(unconfigured.configuration, NodeConfiguration::default());
         let mut missing = config.clone();
         missing["resources"][0]
             .as_object_mut()
