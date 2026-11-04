@@ -96,7 +96,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         )
         .unwrap();
-        let admin =
+        let mut admin =
             crate::test_node::WorkAdmin::new(grants.clone(), &secret, grant.policies.clone()).await;
         admin.capacity(2, vec![]).await;
         admin

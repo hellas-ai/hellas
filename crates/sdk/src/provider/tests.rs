@@ -76,7 +76,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                     crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap(),
                 ),
                 grants: Some(crate::GrantProviderOptions {
-                    policies: vec![],
+                    configuration: Default::default(),
                     max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
                 }),
             }
@@ -309,7 +309,9 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
         crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0;
     let mut options = ProviderGrants {
         config: crate::GrantProviderOptions {
-            policies: vec![hellas_authority::test_support::policy()],
+            configuration: hellas_authority::test_support::common_node::configuration(vec![
+                hellas_authority::test_support::policy(),
+            ]),
             max_job_millis: std::num::NonZeroU64::MIN,
         },
         authority: ProviderAuthority::Journal {
@@ -326,7 +328,7 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
         ))
     ));
     assert!(!root.path().join("provider").exists());
-    options.config.policies.clear();
+    options.config.configuration = Default::default();
     assert!(matches!(
         options
             .open(ProviderResources::Fetch(&routes), &provider)

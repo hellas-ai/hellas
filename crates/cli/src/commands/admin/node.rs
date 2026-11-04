@@ -15,8 +15,7 @@ use hellas_authority::model::grant::records::{decode_enrollment, grant_transport
 use hellas_rpc::{
     pb::host::{
         BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
-        IssueCredentialRequest, RevokeCredentialRequest, SetMachineCapacityRequest,
-        WorkControlRequest,
+        IssueCredentialRequest, RevokeCredentialRequest, WorkControlRequest,
     },
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
@@ -228,25 +227,6 @@ where
                 })
                 .await?;
             print_status(status)?;
-        }
-        AdminCommand::SetCapacity {
-            expected_revision,
-            max_in_flight,
-            limits,
-        } => {
-            let limits: Vec<hellas_authority::model::grant::budget::Limit> = read(&limits)?;
-            let result = client
-                .set_machine_capacity(SetMachineCapacityRequest {
-                    authorization: authorization.0.to_vec(),
-                    expected_revision,
-                    max_in_flight: u32::from(max_in_flight),
-                    limits: canonical_dag_cbor(&limits)?,
-                })
-                .await?;
-            println!(
-                "{}",
-                serde_json::json!({"revision": result.revision, "max_in_flight": result.max_in_flight})
-            );
         }
         AdminCommand::BindProvider { enrollment } => {
             let response = client

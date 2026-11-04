@@ -360,7 +360,7 @@ impl State {
                 self.provider = Some(record.provider.clone());
             }
             Change::Work(record) => {
-                if record.caller.at() != now || !record.mutation.valid_capacity() {
+                if record.caller.at() != now {
                     return Err(NodeStoreError::Malformed);
                 }
                 self.authority.authorize_recorded(
@@ -401,31 +401,11 @@ impl State {
                                 policy: policy.as_ref().clone(),
                             });
                     }
-                    super::WorkMutation::Capacity {
-                        expected,
-                        max_in_flight,
-                        limits,
-                    } => {
-                        if *expected != self.machine_revision {
-                            return Err(hellas_auth::authority::AuthorityError::Revision.into());
-                        }
-                        if self.provider.is_none()
-                            && self.ledger.node(BudgetNode::Machine).is_none()
-                        {
-                            return Err(NodeStoreError::MissingMachine);
-                        }
-                        self.apply_change(
-                            &Change::Machine {
-                                limits: limits.clone(),
-                                concurrent: *max_in_flight,
-                            },
-                            now,
-                        )?;
-                    }
-                    super::WorkMutation::Resource(policy) => {
-                        self.apply_change(&Change::Resource(policy.as_ref().clone()), now)?;
-                    }
                     super::WorkMutation::Budget(def) => {
+                        // The host configuration owns the machine and accounts.
+                        if !matches!(def.node, BudgetNode::Pool(_) | BudgetNode::Subject { .. }) {
+                            return Err(NodeStoreError::Malformed);
+                        }
                         self.apply_change(&Change::Budget(def.clone()), now)?;
                     }
                     super::WorkMutation::Define(def) => {
@@ -1062,21 +1042,6 @@ impl State {
                 || record.caller.before().0 == 0
                 || record.caller.before() > state.authority.revision()
                 || record.caller.at() > s.ledger.high_water()
-                || !record.mutation.valid_capacity()
-                || match &record.mutation {
-                    super::WorkMutation::Capacity {
-                        expected,
-                        max_in_flight,
-                        limits,
-                    } => {
-                        (expected.0 == 0 && state.provider.is_none())
-                            || *expected >= s.machine_revision
-                            || Ledger::default()
-                                .configure_machine(limits.clone(), *max_in_flight)
-                                .is_err()
-                    }
-                    _ => false,
-                }
         }) {
             return Err(NodeStoreError::Malformed);
         }

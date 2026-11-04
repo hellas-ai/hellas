@@ -156,7 +156,7 @@ impl OfferHost {
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
         }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
+        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
         let mut node = provider.spawn(
             &[
@@ -178,24 +178,6 @@ impl OfferHost {
         let metrics = node
             .wait_for("prometheus metrics server listening on ")
             .await;
-        let limits = root.join("machine-limits.json");
-        std::fs::write(&limits, b"[]").unwrap();
-        provider
-            .run(&[
-                "admin",
-                "--profile",
-                string(&provider_profile),
-                "--control-socket",
-                string(&socket),
-                "set-capacity",
-                "--expected-revision",
-                "0",
-                "--max-in-flight",
-                "2",
-                "--limits",
-                string(&limits),
-            ])
-            .await;
         let offer = root.join("offer");
         let id = GrantId([9; 16]);
         for definition in common_node::budgets(
@@ -207,7 +189,11 @@ impl OfferHost {
                 amount: 20,
             }],
             1,
-        ) {
+        )
+        .into_iter()
+        // The grant config owns the account.
+        .filter(|definition| !matches!(definition.node, BudgetNode::Account(_)))
+        {
             admin(
                 &provider,
                 &provider_profile,
@@ -216,16 +202,6 @@ impl OfferHost {
             )
             .await;
         }
-
-        admin(
-            &provider,
-            &provider_profile,
-            &socket,
-            WorkControlCommand::ConfigureResource {
-                policy: "glm".into(),
-            },
-        )
-        .await;
         admin(
             &provider,
             &provider_profile,

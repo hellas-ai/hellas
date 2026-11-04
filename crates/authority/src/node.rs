@@ -9,8 +9,8 @@ use std::sync::Arc;
 mod host;
 pub use host::{
     GATEWAY_INVOKE, HOST_GATEWAY_ACCESS, HOST_GATEWAY_CONFIGURE, HOST_PROVIDER_BIND,
-    HOST_PROVIDER_CONFIGURE, HOST_STATUS, MachineCapacity, NodeStatus, WORK_CAPACITY_CONFIGURE,
-    host_resource, machine_resource,
+    HOST_PROVIDER_CONFIGURE, HOST_STATUS, MachineCapacity, NodeStatus, host_resource,
+    machine_resource,
 };
 
 /// The key a client proves an authority session with.

@@ -18,6 +18,7 @@ use {
 use crate::test_support::*;
 mod budgets;
 mod catalogue;
+mod configuration;
 mod paid_policy;
 mod pricing;
 mod reservations;

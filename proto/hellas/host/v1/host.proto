@@ -12,7 +12,6 @@ service HostControl {
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
-  rpc SetMachineCapacity(SetMachineCapacityRequest) returns (MachineCapacity);
   rpc ConfigureProvider(ConfigureProviderRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
@@ -23,14 +22,6 @@ service HostControl {
 }
 
 message GetHostStatusRequest { bytes authorization = 1; }
-
-message SetMachineCapacityRequest {
-  bytes authorization = 1;
-  uint64 expected_revision = 2;
-  uint32 max_in_flight = 3;
-  // Canonical DAG-CBOR array of Work Limit values. An encoded empty array clears limits.
-  bytes limits = 4;
-}
 
 message MachineCapacity {
   uint64 revision = 1;

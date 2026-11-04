@@ -750,7 +750,7 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
         .map_err(ProviderError::from)?;
         let grants = crate::ProviderGrants {
             config: crate::GrantProviderOptions {
-                policies: config.resources,
+                configuration: config.configuration,
                 max_job_millis: config.max_job_millis,
             },
             authority: crate::ProviderAuthority::Journal {

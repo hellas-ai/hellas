@@ -1,23 +1,22 @@
 //! Checked Work administration; user and role administration belongs to Auth.
-use hellas_rpc::protocol::value::all_distinct;
-
 use super::{GrantService, NodeStore, NodeStoreError};
 use crate::model::grant::{admin::*, records::*, *};
 use crate::operations::Operation;
 use crate::work_store::grant::{
     WORK_ALLOWANCE_CONFIGURE, WORK_ALLOWANCE_READ, WORK_BUDGET_CONFIGURE, WORK_GENERATION_RESET,
-    WORK_OFFER_EXPORT, WORK_RESOURCE_CONFIGURE, WORK_RESOURCE_REPAIR, WorkMutation,
+    WORK_OFFER_EXPORT, WORK_RESOURCE_REPAIR, WorkMutation,
 };
 use hellas_auth::authority::{AuthenticatedCaller, GrantId as Authorization};
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
 use std::{num::NonZeroU64, sync::Arc};
 
-/// One Work administration service assembled with the host's validated resources.
-/// Its caller supplies operations, never a replacement resource catalogue or writer.
+/// One Work administration service assembled with the host's validated
+/// configuration. Callers supply operations, never a replacement catalogue,
+/// budget tree or writer.
 #[derive(Clone)]
 pub struct WorkAdministration {
     service: GrantService,
-    resources: Arc<Vec<GrantPolicy>>,
+    configuration: Arc<configuration::NodeConfiguration>,
     max_job_millis: NonZeroU64,
 }
 enum ChangeReply {
@@ -29,23 +28,29 @@ enum ChangeReply {
 impl WorkAdministration {
     pub fn new(
         service: GrantService,
-        resources: Vec<GrantPolicy>,
+        configuration: configuration::NodeConfiguration,
         max_job_millis: NonZeroU64,
-    ) -> Result<Self, NodeStoreError> {
-        if resources.len() > MAX_WORK_POLICIES
-            || !all_distinct(resources.iter().map(|p| &p.name))
-            || !all_distinct(resources.iter().map(|p| p.resource))
-        {
-            return Err(GrantError::Limits.into());
-        }
-        for policy in &resources {
-            policy.validate()?;
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             service,
-            resources: Arc::new(resources),
+            configuration: Arc::new(configuration),
             max_job_millis,
-        })
+        }
+    }
+
+    /// Apply the host's configuration to an initialized authority. The host is
+    /// its own operator here: no caller, audited as host configuration.
+    pub async fn reconcile(&self) -> Result<(), NodeStoreError> {
+        let mut decision = crate::audit::Decision::new("host.configuration", None, None);
+        let configuration = self.configuration.clone();
+        let result = self
+            .service
+            .administer(async |store, now| {
+                decision.observe(store.state().authority(), None, now);
+                store.reconcile(&configuration, now).await
+            })
+            .await;
+        decision.finish(result)
     }
     pub fn node(&self) -> crate::node::NodeCoordinator {
         self.service.node()
@@ -73,7 +78,6 @@ impl WorkAdministration {
             WorkControlCommand::NewGeneration { .. } => WORK_GENERATION_RESET,
             WorkControlCommand::RepairResource { .. } => WORK_RESOURCE_REPAIR,
             WorkControlCommand::ConfigureBudget { .. } => WORK_BUDGET_CONFIGURE,
-            WorkControlCommand::ConfigureResource { .. } => WORK_RESOURCE_CONFIGURE,
         };
         let mut decision =
             crate::audit::Decision::new(operation, Some(authorization), Some(caller.credential()));
@@ -110,25 +114,19 @@ impl WorkAdministration {
                             }),
                         )
                     }
-                    WorkControlCommand::ConfigureResource { policy } => {
-                        let definition = self.resource(&policy)?.clone();
-                        let resource = definition.resource;
-                        let revision = definition.revision;
-                        let mutation = WorkMutation::Resource(Box::new(definition));
-                        (
-                            mutation,
-                            ChangeReply::Ready(WorkControlReply::ResourceChanged {
-                                resource,
-                                revision,
-                            }),
-                        )
-                    }
                     WorkControlCommand::Catalogue => {
                         return Ok(WorkControlReply::Catalogue(
                             store.state().catalogue().cloned().collect(),
                         ));
                     }
                     WorkControlCommand::ConfigureBudget { definition } => {
+                        // The host configuration owns the machine and accounts.
+                        if !matches!(
+                            definition.node,
+                            budget::BudgetNode::Pool(_) | budget::BudgetNode::Subject { .. }
+                        ) {
+                            return Err(GrantError::OutOfScope.into());
+                        }
                         let node = definition.node;
                         let revision = definition.revision;
                         let mutation = WorkMutation::Budget(definition);
@@ -246,12 +244,6 @@ impl WorkAdministration {
         decision.finish(result)
     }
 
-    fn resource(&self, name: &str) -> Result<&GrantPolicy, GrantError> {
-        self.resources
-            .iter()
-            .find(|p| p.name == name)
-            .ok_or(GrantError::OutOfScope)
-    }
     fn resource_status(
         &self,
         store: &NodeStore,

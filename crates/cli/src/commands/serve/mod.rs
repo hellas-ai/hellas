@@ -56,7 +56,7 @@ pub fn validate_grant_resources(
     config: &hellas_sdk::grant_config::GrantConfig,
     routes: &FetchRouteRegistry,
 ) -> CliResult<()> {
-    provider_resources(routes).validate(&config.resources)?;
+    provider_resources(routes).validate(config.configuration.resources())?;
     Ok(())
 }
 

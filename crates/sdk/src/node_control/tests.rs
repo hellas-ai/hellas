@@ -7,9 +7,8 @@ mod lifecycle;
 mod local;
 mod remote;
 mod sessions;
-use hellas_authority::model::grant::budget::{Limit, Meter, Window};
 use hellas_authority::{
-    node::{HOST_STATUS, WORK_CAPACITY_CONFIGURE, host_resource, machine_resource},
+    node::{HOST_STATUS, host_resource},
     work_store::grant::NodeStore,
 };
 use hellas_rpc::authentication::{decode_challenge, encode_response};
@@ -55,7 +54,6 @@ fn scope(actor: Actor) -> GrantSpec {
                 hellas_authority::node::GATEWAY_INVOKE,
                 host_resource(authority),
             ),
-            (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
         ],
         (UnixMillis(1000), UnixMillis(1_000_000)),
         (1_000_000, 8),

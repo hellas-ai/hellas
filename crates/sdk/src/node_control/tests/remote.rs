@@ -82,27 +82,6 @@ async fn remote_status_matches_the_native_writer() {
 }
 
 #[tokio::test]
-async fn omitted_capacity_limits_are_invalid_rpc_input() {
-    let remote = Remote::new().await;
-    let machine = remote.native_status().await.machine.unwrap();
-    assert_eq!(
-        remote
-            .client
-            .set_machine_capacity(SetMachineCapacityRequest {
-                authorization: ROOT_GRANT.0.to_vec(),
-                expected_revision: machine.revision.0,
-                max_in_flight: 2,
-                limits: vec![],
-            })
-            .await
-            .unwrap_err()
-            .code(),
-        WireCode::InvalidArgument
-    );
-    remote.shutdown().await;
-}
-
-#[tokio::test]
 async fn credential_frames_are_bounded_before_decoding() {
     let remote = Remote::new().await;
     for credential in [vec![], vec![0; MAX_COMMAND_BYTES + 1]] {

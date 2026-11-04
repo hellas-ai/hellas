@@ -99,31 +99,6 @@ async fn local_control_matches_remote_authority_decisions() {
             .await
             .unwrap()
     );
-    let limits = vec![Limit {
-        meter: Meter::InputTokens,
-        window: Window::Hour,
-        amount: 500,
-    }];
-    local
-        .set_machine_capacity(SetMachineCapacityRequest {
-            limits: canonical_dag_cbor(&limits).unwrap(),
-            authorization: ROOT_GRANT.0.to_vec(),
-            expected_revision: 1,
-            max_in_flight: 3,
-        })
-        .await
-        .unwrap();
-    let remote_machine = remote
-        .get_host_status(read_request(ROOT_GRANT))
-        .await
-        .unwrap()
-        .machine
-        .unwrap();
-    assert_eq!(remote_machine.max_in_flight, 3);
-    assert_eq!(
-        decode_dag_cbor::<Vec<Limit>>(&remote_machine.limits).unwrap(),
-        limits
-    );
     let mut spec = scope(OPERATOR);
     spec.issuance = None;
     spec.permissions

@@ -74,16 +74,6 @@ pub enum AdminCommand {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Replace machine concurrency and budgets; revision zero initializes a provider.
-    SetCapacity {
-        #[arg(long)]
-        expected_revision: u64,
-        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
-        max_in_flight: u16,
-        /// JSON array of Work limits. Use [] explicitly for no budget limits.
-        #[arg(long)]
-        limits: PathBuf,
-    },
     /// Bind the provider enrollment of an authority bootstrapped without one.
     BindProvider {
         /// Canonical provider enrollment bytes.

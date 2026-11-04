@@ -26,7 +26,6 @@ passkey session; without it, the node key of `--identity` opens a daily session:
 
 ```sh
 hellas --identity node.identity admin --profile operator.json status
-hellas --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
 hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
@@ -36,13 +35,8 @@ hellas --identity node.identity admin --profile operator.json work export.json -
 hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
-`status` requires `host.status` on this authority's host resource. `set-capacity`
-requires `work.capacity.configure` on its machine resource and the current machine
-revision returned by status. `--limits` supplies the complete budget configuration,
-for example `[{"meter":"Requests","window":"Day","amount":100}]`; an explicit `[]`
-removes budget limits. Changes preserve counters, reservations and outstanding work,
-so removing and restoring a limit cannot reset usage. Revision zero initializes a
-provider whose machine has not been configured. `status` includes the current limits.
+`status` requires `host.status` on this authority's host resource. It includes the
+machine budget the node's grant configuration applies (see below).
 `work` also accepts `SetPaidPolicy { expected_revision, policy }` to set the
 provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
@@ -122,20 +116,19 @@ table below is checked against the implementation by the Work tests.
 | `host.gateway.configure` | Host | Host |
 | `host.gateway.access` | Host | Host |
 | `gateway.invoke` | Host | Host |
-| `work.capacity.configure` | Work machine | Machine or provider |
 | `work.allowance.read` | Work machine | Provider |
 | `work.allowance.configure` | Work machine | Provider |
 | `work.budget.configure` | Work machine | Provider |
 | `work.offer.export` | Work machine | Provider |
 | `work.generation.reset` | Work machine | Provider |
-| `work.resource.configure` | Work machine | Provider |
 | `work.resource.repair` | Work machine | Provider |
 | `work.paid.configure` | Work machine | Provider |
 | `work.execute` | Selected allowance | Provider |
 <!-- operations:end -->
 
-Configure machine capacity first, then explicit account, pool and subject budgets
-with `ConfigureBudget`. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
+The node's grant configuration owns the machine and account budgets. Pool and
+subject budgets are configured with `ConfigureBudget`, which refuses the machine and
+accounts. Its [BudgetDef](../crates/authority/src/model/grant/budget.rs)
 names a node, its parent, the new revision, limits and maximum concurrent jobs.
 An account is an Auth resource ID and has the machine as parent. A pool has a stable
 16-byte ID and an account parent. A subject node is the pair `(pool, principal)`;
@@ -144,13 +137,13 @@ levels are permitted. Parentage is immutable, and revisions start at one and inc
 by exactly one. Configuration returns the changed node and revision; `InspectBudget`
 requires the read permission and returns the current definition and accounting.
 
-Register each resource with `{"ConfigureResource":{"policy":"name"}}` after configuring
-its account budget. The command selects a validated policy from the host's resource
-file and commits it to the catalogue; startup does not register it. Every policy has
-an explicit `resource` ID, `account` ID and positive `revision`. Both IDs use Auth's
-32-byte ResourceId. A resource's account is immutable; policy revisions increase by
-exactly one. `Catalogue` returns the durable configuration through checked inspection.
-Configuration returns only the changed resource ID and revision.
+The grant configuration also declares the resources the node serves, and the node
+commits them to its catalogue when the provider starts. Every policy has an explicit
+`resource` ID, `account` ID and positive `revision`. Both IDs use Auth's 32-byte
+ResourceId. A resource's account is immutable; a changed policy must raise its
+`revision` by exactly one, or startup refuses it. A resource removed from the file
+stays in the catalogue, because allowances pin it. `Catalogue` returns the durable
+catalogue through checked inspection.
 
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result
@@ -389,15 +382,28 @@ PKCS#8 `control.key.der` under the node state root. The grant configuration can
 select absolute `control_certificate` and `control_private_key` paths alongside
 `journal_root` and `control_socket`. The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-Resource configuration also cannot issue allowances or set budgets. After explicit
-initialization, start the daemon with `--grant-config` to mount its listeners and
-available resources. Use `set-capacity --expected-revision 0` to configure the first
-machine budget, configure account/pool/subject budgets, register each resource, then
-use `work` with `Create` to assign an allowance. Resource files contain `max_job_millis`, `resources` and optional listener/state paths;
-`machine_limits` and `max_in_flight` are not resource-file fields. Each resource also
-requires its explicit IDs and revision. Editing this file or restarting cannot change
-the durable catalogue or revise, revoke or renew an existing allowance. Such changes
-require their corresponding checked administration command.
+After explicit initialization, start the daemon with `--grant-config`. The file
+contains `max_job_millis`, optional listener/state paths, and the budget tree down
+to accounts plus the resources the node serves:
+
+```json
+{
+  "max_job_millis": 900000,
+  "machine": {"max_in_flight": 4, "limits": []},
+  "accounts": [{"account": "ACCOUNT_ID", "max_in_flight": 4, "limits": []}],
+  "resources": [{"resource": "RESOURCE_ID", "account": "ACCOUNT_ID", "revision": 1, "...": "..."}]
+}
+```
+
+Serving resources requires `machine`; every resource's account must be declared in
+`accounts`, and every declared account must be used. Limits use the same
+`{"meter","window","amount"}` form as budgets. Whenever the provider starts with an
+initialized authority, including just after first pairing, the node applies this
+file: the machine first, then accounts, then resources, each committed only if it
+differs from the durable state. Budget changes preserve counters, reservations and
+outstanding work. The file never issues allowances, grants or credentials, and it
+cannot revise, revoke or renew an existing allowance; those remain checked
+administration commands, beginning with `work` and `Create`.
 
 The SDK Fetch provider follows the same sequence: initialize offline, start, then
 use its checked administration service. Its options describe available policies and

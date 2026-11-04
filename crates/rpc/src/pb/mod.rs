@@ -196,8 +196,8 @@ mod id_pins {
             BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl,
             IssueCredential, RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
         };
-        // Typed provider configuration changes the HostControl service descriptor.
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x5169_5ede);
+        // Machine capacity left the service: the node's configuration owns it.
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xd18c_677a);
         assert_eq!(<ConfigureProvider as MethodMarker>::METHOD_ID, 0x689e_9aaa);
         assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xd9b2_bce2);
         assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0x6c32_7cb7);
