@@ -67,6 +67,10 @@ let
     # Catena's libffi-sys configure step needs the ordinary stdenv shell and
     # POSIX utilities even though the Rust compiler itself does not.
     ++ pkgs.stdenv.initialPath
+    # On Darwin the clang driver runs dsymutil whenever one command compiles
+    # and links with -g, as build-script probes do. LLVM ships it, not the
+    # cc-wrapper.
+    ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.llvmPackages.llvm
     ++ workspaceNativeBuildInputs;
 
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
