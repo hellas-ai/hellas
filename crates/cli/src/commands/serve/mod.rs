@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod audio_model;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;

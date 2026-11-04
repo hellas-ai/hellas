@@ -1,6 +1,7 @@
 //! Checked node administration. Online commands always use an explicit app profile.
 use std::path::PathBuf;
 mod node;
+mod owner_scope;
 pub use node::{inspect_offline, run};
 
 #[derive(clap::Args)]
@@ -158,12 +159,14 @@ pub enum AdminCommand {
     BootstrapRemote {
         #[arg(long)]
         invitation: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = "00000000000000000000000000000000")]
         root_grant: String,
-        #[arg(long)]
-        administrator: PathBuf,
-        #[arg(long)]
-        credential_scope: PathBuf,
+        /// Custom administrator scope; otherwise grant the pairing owner full administration.
+        #[arg(long, requires = "credential_scope")]
+        administrator: Option<PathBuf>,
+        /// Custom device scope paired with --administrator.
+        #[arg(long, requires = "administrator")]
+        credential_scope: Option<PathBuf>,
         /// New private directory for the retained credential and remote profile.
         #[arg(long)]
         profile_out: PathBuf,

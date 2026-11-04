@@ -93,8 +93,9 @@ pub async fn run(
         _ => {}
     }
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
-    let profile =
-        profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
+    let profile_path = args.profile.as_deref().context("--profile is required")?;
+    let pinned_node = profile::ClientProfile::remote_node(profile_path)?;
+    let profile = profile::ClientProfile::load(profile_path)?;
     let remote = args
         .node_enrollment
         .map(|target| -> Result<iroh::EndpointId> {
@@ -108,6 +109,17 @@ pub async fn run(
             Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
         })
         .transpose()?;
+    ensure!(
+        remote
+            .zip(pinned_node)
+            .is_none_or(|(requested, pinned)| requested == pinned),
+        "--node differs from the profile's paired node"
+    );
+    let remote = remote.or(pinned_node);
+    ensure!(
+        remote.is_none() || args.control_socket.is_none(),
+        "a remote profile cannot use --control-socket"
+    );
     if let Some(node) = remote {
         // The application identity is proved inside the authenticated session.
         // A stable endpoint key permits explicit remote ingress admission; use
@@ -573,8 +585,14 @@ async fn bootstrap_remote(
     };
     let invitation: node_control::bootstrap::Invitation = read(&invitation)?;
     let root: GrantId = root_grant.parse()?;
-    let administrator: GrantSpec = read(&administrator)?;
-    let scope: GrantSpec = read(&credential_scope)?;
+    let (administrator, scope) = match (administrator, credential_scope) {
+        (Some(administrator), Some(scope)) => (read(&administrator)?, read(&scope)?),
+        (None, None) => {
+            let scope = super::owner_scope::administrator(passkey.public_key()?)?;
+            (scope.clone(), scope)
+        }
+        _ => anyhow::bail!("custom administrator and credential scope must be supplied together"),
+    };
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
@@ -589,6 +607,7 @@ async fn bootstrap_remote(
     .await?;
     let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
     let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
+    profile::pin_remote(&profile, invitation.node)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
         .bind()
