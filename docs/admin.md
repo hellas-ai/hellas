@@ -5,6 +5,23 @@ only machine keys: an iroh transport key for QUIC and a secp256k1 node key. The
 CLI acts for the principal of a software passkey file given with `--passkey`
 (32 raw bytes or 64 hex digits); `--identity` names the node's own keys.
 
+For first setup, `hellas --software-root identity init --passkey-out owner.passkey`
+creates both the client device identity and a fresh private owner key. It never
+overwrites an existing key. Start a model worker with `serve --audio-model DIR
+--await-owner STATE`: the converted Whisper package supplies a model-pinned
+resource, a machine/account budget, and the indexed weights. The directory's
+basename is its resource name; one job may run at a time. Use `--grant-config`
+instead for custom resources or budgets.
+
+The worker writes a private `STATE/invitation.json`. Pair with
+`hellas --passkey owner.passkey admin bootstrap-remote --invitation FILE
+--profile-out operator`. Without custom scopes, the pairing owner receives
+one year of full node administration; `--administrator` and `--credential-scope`
+can supply narrower scopes together. The resulting profile retains the node
+pin from the authenticated invitation. Later `admin --profile operator/profile.json`
+commands need no `--node`; an explicit different node is rejected.
+See the [complete command sequence](../README.md#own-a-worker-and-share-access).
+
 Node administration requires a scoped application credential and explicit
 operation grants. A credential is issued to a principal and held by a device: it
 records the node key of the device that holds it. Each session proves the

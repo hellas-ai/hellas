@@ -197,7 +197,7 @@ only their contact and holder. To exercise this locally with separate credential
 
 ```sh
 hellas --identity guest.identity --software-root identity init --passkey-out guest.passkey
-hellas --identity guest.identity --passkey guest.passkey contact export --display-name guest --out guest.contact
+hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
 hellas --identity guest.identity identity show-holder > guest.holder
 hellas --passkey owner.passkey admin --profile operator/profile.json share \
   --contact guest.contact --holder guest.holder --resource whisper-tiny \
