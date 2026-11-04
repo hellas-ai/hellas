@@ -515,9 +515,12 @@ mod tests {
                 first.await.unwrap()
             );
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), provider.started.notified())
-            .await
-            .expect("first Fetch reached the provider");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.started.notified(),
+        )
+        .await
+        .expect("first Fetch reached the provider");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         for revoked in [true, false] {
             let dispatched = Arc::new(AtomicBool::new(false));
