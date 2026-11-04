@@ -43,15 +43,25 @@ succeed. `latest` is an alias for **network**, which cannot execute GPU jobs.
 The old `ghcr.io/hellas-ai/node:*` images and their `--execute-policy` /
 `--download-policy` flags are not this CLI.
 
+RunPod also lists AMD MI300X (`AMD Instinct MI300X OAM` in the machine spec).
+AMD workers need the `hip` image and access to `/dev/kfd` and their `/dev/dri`
+render devices. Image/backend selection alone does not establish model support:
+MI300X is `gfx942`, while the pinned Catena packed BF16 dot implementation
+requires `gfx11`. The Qwen BF16 path uses that operation. Before renting, compile
+the intended kernels for the actual target using the image's compiler; a passing
+Strix (`gfx1151`) test does not establish MI300X compatibility. A scalar HIP
+kernel can compile for `gfx942` even when the model's BF16 kernel cannot.
+
 Floating tags help discover a release; `machines create` requires an immutable
 `ghcr.io/hellas-ai/hellas@sha256:...` in both the template and machine spec.
-Take the CUDA digest from the selected [release](https://github.com/hellas-ai/hellas/releases),
-and use that release's CLI. The immutable tag is `sha-FULL_COMMIT_SHA-cuda`.
+Take the matching backend's digest from the selected [release](https://github.com/hellas-ai/hellas/releases),
+and use that release's CLI. The immutable tags are `sha-FULL_COMMIT_SHA-cuda`
+and `sha-FULL_COMMIT_SHA-hip`.
 Updating a tag or template does not upgrade an already running Pod. Review the
 new release's state compatibility before replacing a persistent worker.
 
 Preserve the image's Docker entrypoint: it already selects `serve`, port 31145,
-and the CUDA backend, including driver-library setup. In RunPod's
+and its matching backend, including CUDA driver-library setup where needed. In RunPod's
 `dockerStartCmd`, pass only additional arguments, for example:
 
 ```json
