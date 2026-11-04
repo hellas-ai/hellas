@@ -3,6 +3,7 @@ use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TranscribeArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -54,7 +55,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         async {
             if args.grant.offer.is_some() {
                 let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                if let Some(directory) = &args.output { result.save(directory, &job, args.client.provider.address)?; }
+                if let Some(directory) = &args.output { result.save(directory, &job)?; }
                 result.ensure_succeeded()?;
                 let ModelResponse::Transcription(transcription) = package.decode(&result.retained.output)? else { bail!("expected transcription") };
                 println!("{}", transcription.text);

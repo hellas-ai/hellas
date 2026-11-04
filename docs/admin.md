@@ -325,7 +325,7 @@ configured resource name; its account comes from the node's configuration:
 ```sh
 hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
   share --contact me.contact --holder me.holder --resource klein \
-  --limit requests:total:100 --max-job 15m --expires 30d --label "My node" --out me.access
+  --limit requests:total:100 --max-job 15m --expires 1h --label "My node" --out me.access
 ```
 
 The command derives one pool, allowance and Auth grant per
@@ -382,7 +382,7 @@ its bundle alias locates the bound profile:
 
 ```sh
 hellas --identity laptop.identity --passkey me.passkey image \
-  --provider ENROLLMENT_ID@NODE_ID --offer box.klein --model ./klein --prompt "a fox"
+  --offer box.klein --model ./klein --prompt "a fox"
 ```
 
 `run`, `image` and `transcribe` accept either `--offer NAME.POLICY` or
@@ -390,7 +390,8 @@ hellas --identity laptop.identity --passkey me.passkey image \
 profile lookup. A single-policy offer selects its resource automatically. An
 imported allowance with multiple policies also accepts `--resource ID` to select
 an exact resource explicitly; `--work-profile` is unnecessary.
-The signed provider enrollment must match `--provider`; Apple providers also
+The provider address comes from the verified signed offer. An explicit
+`--provider ENROLLMENT_ID@NODE_ID` must match that address. Apple providers also
 require the caller's independently approved `--trust-store` and `--trust-policy`.
 Repeated jobs reuse durable attempts by offer and job; `--attempt FILE` selects
 an explicit record. See [jobs](jobs.md) for recovery and results.
@@ -405,10 +406,10 @@ ceiling, and repeat the desired limits and job duration:
 ```sh
 hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
   share --contact me.contact --holder me.holder --resource klein \
-  --limit requests:total:100 --max-job 15m --expires 60d --out me-renewed.access
+  --limit requests:total:100 --max-job 15m --expires 2h --out me-renewed.access
 ```
 
-The example renews the earlier `30d` share for `60d`; it requires an issuance
+The example renews the earlier `1h` share for `2h`; it requires an issuance
 ceiling that permits that duration. Keep the new bundle private and deliver it
 to the same recipient device. Each call issues a new credential while retaining
 the pool, allowance and grant identifiers and their used counters.
@@ -419,7 +420,7 @@ directory is never overwritten, including with `--replace`:
 ```sh
 hellas --identity laptop.identity --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
 hellas --identity laptop.identity --passkey me.passkey transact --job ./saved-job \
-  --provider ENROLLMENT_ID@NODE_ID --offer box-renewed.klein \
+  --offer box-renewed.klein \
   --attempt ./renewed-attempt.json --output ./renewed-result
 ```
 

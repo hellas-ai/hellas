@@ -1419,8 +1419,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let result_dir = root.join("grant-result");
     let args = [
         "transact",
-        "--provider",
-        &provider,
         "--offer",
         "shared.glm",
         "--attempt",
@@ -1438,8 +1436,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     }
     .to_string();
     let mut refused = args.to_vec();
-    let at = refused.iter().position(|arg| *arg == "--provider").unwrap();
-    refused[at + 1] = &wrong_provider;
+    refused.extend(["--provider", &wrong_provider]);
     assert!(!host.client.output(&refused).await.status.success());
     assert!(!attempt.exists());
     assert!(!other_device.output(&args).await.status.success());
@@ -1450,6 +1447,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             serde_json::from_slice(&std::fs::read(result_dir.join("result.json")).unwrap())
                 .unwrap();
         assert_eq!(metadata["funding"], "grant");
+        assert_eq!(metadata["provider"], provider);
         assert!(metadata.get("paid").is_none());
         let response: Value =
             serde_json::from_slice(&std::fs::read(result_dir.join("output-0000")).unwrap())
@@ -1543,8 +1541,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "main",
         "--returns",
         "u64",
-        "--provider",
-        &provider,
         "--offer",
         "shared.glm",
         "--save-job",

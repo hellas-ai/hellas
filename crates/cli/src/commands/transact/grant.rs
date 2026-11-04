@@ -11,6 +11,9 @@ pub(super) struct GrantArgs {
     /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
     #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
     pub offer: Option<String>,
+    /// Select a resource ID in an imported allowance containing several policies.
+    #[arg(long, requires = "offer")]
+    resource: Option<ResourceId>,
     /// Durable attempt record (default: under the client state, by offer and job).
     #[arg(long, requires = "offer", value_name = "FILE")]
     attempt: Option<PathBuf>,
@@ -21,15 +24,11 @@ pub(super) struct GrantResult {
     pub retained: RetainedExecutionResult,
     resource: ResourceId,
     provider_key: hellas_auth::PublicKey,
+    provider: hellas_sdk::client::ProviderAddress,
 }
 
 impl GrantResult {
-    pub fn save(
-        &self,
-        directory: &Path,
-        job: &Job,
-        provider: hellas_sdk::client::ProviderAddress,
-    ) -> anyhow::Result<()> {
+    pub fn save(&self, directory: &Path, job: &Job) -> anyhow::Result<()> {
         hellas_private::create_dir_all_durable(directory)?;
         write(
             &directory.join("transcript.cbor"),
@@ -38,7 +37,7 @@ impl GrantResult {
         write(
             &directory.join("result.json"),
             &serde_json::to_vec_pretty(&serde_json::json!({
-                "job": job.digest().to_string(), "provider": provider.to_string(),
+                "job": job.digest().to_string(), "provider": self.provider.to_string(),
                 "funding": "grant", "resource": self.resource.0.to_string(),
                 "work": self.attempt.inspect()?.work.context("completed grant has no work ID")?.to_string(),
                 "outcome": self.retained.output.outcome,
@@ -63,10 +62,6 @@ pub(super) async fn execute(
     context: &Context,
     job: &Job,
 ) -> super::super::CliResult<GrantResult> {
-    ensure!(
-        args.provider.addresses.is_empty(),
-        "grant addresses come from the signed offer"
-    );
     let principal = super::super::contributions::principal(&context.owner)?;
     let holder = NodeKey::from_public_key(context.producer.public_key())?;
     let store = hellas_sdk::grant_store::GrantStore::new(super::super::contributions::data_root(
@@ -78,10 +73,16 @@ pub(super) async fn execute(
         &holder,
     )?;
     let provider = hellas_sdk::client::ProviderAddress::of(&offer.offer().provider)?;
-    ensure!(
-        provider == args.provider.address,
-        "offer does not match --provider"
-    );
+    if let Some(expected) = &args.provider {
+        ensure!(
+            expected.addresses.is_empty(),
+            "grant addresses come from the signed offer"
+        );
+        ensure!(
+            provider == expected.address,
+            "offer does not match --provider"
+        );
+    }
     let trust = match (&args.trust_store, &args.trust_policy, job.assurance()) {
         (Some(directory), Some(id), assurance) => hellas_sdk::trust_policy::TrustPolicyStore::new(
             directory,
@@ -95,12 +96,7 @@ pub(super) async fn execute(
         _ => bail!("Apple providers require --trust-store and --trust-policy"),
     };
     let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
-    let policy = offer
-        .offer()
-        .grant
-        .policies
-        .first()
-        .context("offer has no policy")?;
+    let policy = select_policy(&offer.offer().grant.policies, grant.resource)?;
     let resource = policy.resource;
     job.input().admits(&policy.invocation_policy, false)?;
     let application = Arc::new(application);
@@ -175,6 +171,7 @@ pub(super) async fn execute(
         retained,
         resource,
         provider_key,
+        provider,
     })
 }
 
@@ -187,7 +184,7 @@ pub(super) async fn run(
 ) -> super::super::CliResult<()> {
     let mut result = execute(grant, args, context, job).await?;
     if let Some(directory) = output {
-        result.save(directory, job, args.provider.address)?;
+        result.save(directory, job)?;
     } else {
         println!(
             "output: {}",
@@ -200,8 +197,59 @@ pub(super) async fn run(
         .inspect()?
         .work
         .context("completed grant has no work ID")?;
-    println!("grant work {work} completed on {}", args.provider.address);
+    println!("grant work {work} completed on {}", result.provider);
     std::io::stdout().lock().flush()?;
     result.attempt.reported()?;
     Ok(())
+}
+
+fn select_policy(
+    policies: &[hellas_authority::model::grant::records::GrantPolicy],
+    resource: Option<ResourceId>,
+) -> anyhow::Result<&hellas_authority::model::grant::records::GrantPolicy> {
+    match resource {
+        Some(id) => policies
+            .iter()
+            .find(|policy| policy.resource == id)
+            .context("selected --resource is absent from the offer"),
+        None => {
+            ensure!(
+                policies.len() == 1,
+                "offer must contain one policy unless --resource selects an explicit resource ID"
+            );
+            Ok(&policies[0])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiple_policy_offers_require_and_honor_explicit_resource_selection() {
+        let first = hellas_authority::test_support::policy();
+        let mut second = first.clone();
+        second.resource = ResourceId(hellas_auth::Digest::hash(b"second resource"));
+        let policies = [first, second];
+        assert!(select_policy(&policies, None).is_err());
+        assert_eq!(
+            select_policy(&policies, Some(policies[1].resource))
+                .unwrap()
+                .resource,
+            policies[1].resource
+        );
+        assert!(
+            select_policy(
+                &policies,
+                Some(ResourceId(hellas_auth::Digest::hash(b"absent")))
+            )
+            .is_err()
+        );
+        assert!(select_policy(&[], None).is_err());
+        assert_eq!(
+            select_policy(&policies[..1], None).unwrap().resource,
+            policies[0].resource
+        );
+    }
 }

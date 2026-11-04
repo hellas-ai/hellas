@@ -3,15 +3,7 @@ use clap::Parser as _;
 
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
-    let provider = provider();
-    let base = [
-        "hellas",
-        "transact",
-        "--job",
-        "job",
-        "--provider",
-        &provider,
-    ];
+    let base = ["hellas", "transact", "--job", "job"];
     let grant = ["--offer", "shared.model"];
     let parse = |extra: &[&str]| {
         crate::Cli::try_parse_from(base.iter().chain(grant.iter()).chain(extra.iter()).copied())
@@ -30,9 +22,11 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     ] {
         assert!(parse(extra).is_err(), "{extra:?}");
     }
-    for old_flag in ["--work-profile", "--resource"] {
-        assert!(parse(&[old_flag, "value"]).is_err());
-    }
+    assert!(parse(&["--work-profile", "profile.json"]).is_err());
+    let resource = hellas_auth::Digest::hash(b"selected resource").to_string();
+    assert!(parse(&["--resource", &resource]).is_ok());
+    let provider = provider();
+    assert!(parse(&["--provider", &provider]).is_ok());
 }
 
 #[test]
@@ -440,7 +434,7 @@ fn output_claims_only_provider_signature_and_job_binding() {
         input: hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([5; 32])),
         settled_provider_payout: None,
     };
-    let output = wording(&args.client.provider, &job, &result);
+    let output = wording(args.client.paid_provider().unwrap(), &job, &result);
     assert_eq!(
         output.lines().nth(1),
         Some(
@@ -554,15 +548,38 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
     ] {
         let mut base = vec!["hellas"];
         base.extend(helper);
-        base.extend(["--provider", &provider]);
         let parse = |flags: &[&str]| {
             crate::Cli::try_parse_from(base.iter().copied().chain(flags.iter().copied()))
         };
         assert!(parse(&[]).is_err());
-        assert!(parse(&["--payment", "20"]).is_ok());
-        assert!(parse(&["--payment", "0"]).is_err());
+        assert!(parse(&["--payment", "20"]).is_err());
+        assert!(parse(&["--payment", "20", "--provider", &provider]).is_ok());
+        assert!(parse(&["--payment", "0", "--provider", &provider]).is_err());
         assert!(parse(&["--offer", "box.model"]).is_ok());
+        assert!(parse(&["--offer", "box.model", "--provider", &provider]).is_ok());
         assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
         assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+    }
+}
+
+#[test]
+fn paid_commands_require_a_provider_before_opening_chain_state() {
+    for args in [
+        vec!["hellas", "transact", "--job", "job"],
+        vec!["hellas", "transact", "--settle"],
+        vec![
+            "hellas",
+            "fetch",
+            "https://example.test",
+            "--contract",
+            "http",
+            "--payment",
+            "20",
+        ],
+    ] {
+        let error = crate::Cli::try_parse_from(args)
+            .err()
+            .expect("missing paid provider");
+        assert!(error.to_string().contains("--provider"), "{error}");
     }
 }

@@ -81,10 +81,10 @@ pub(crate) fn duration(value: &str) -> Result<Duration, String> {
 
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
-    /// Provider address ENROLLMENT_ID@NODE_ID, as `hellas serve` prints it,
-    /// optionally followed by @IP:PORT.
+    /// Provider address ENROLLMENT_ID@NODE_ID, optionally followed by @IP:PORT.
+    /// Paid work requires it; --offer derives it from the signed offer.
     #[arg(long)]
-    provider: Provider,
+    provider: Option<Provider>,
     /// Additional direct UDP addresses for the provider.
     #[arg(long = "address", value_delimiter = ',')]
     addresses: Vec<SocketAddr>,
@@ -127,6 +127,7 @@ pub struct ClientArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TransactArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -141,6 +142,7 @@ pub struct TransactArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("paid_provider").required(true).arg("provider")))]
 pub struct FetchArgs {
     url: String,
     #[command(flatten)]
@@ -202,6 +204,12 @@ impl Context {
 }
 
 impl ClientArgs {
+    fn paid_provider(&self) -> super::CliResult<&Provider> {
+        self.provider
+            .as_ref()
+            .context("paid execution requires --provider")
+    }
+
     fn root(&self, context: &Context) -> PathBuf {
         self.state_dir
             .clone()
@@ -237,7 +245,7 @@ impl ClientArgs {
                 )
                 .to_string(),
             )
-            .join(self.provider.address.to_string())
+            .join(options.provider.to_string())
             .join(hex::encode(owner.principal().as_bytes()))
             .join(format!("{}.json", job.digest()));
         if let Some(attempt) = select_attempt(&path, job, self.buy_again)? {
@@ -249,9 +257,10 @@ impl ClientArgs {
     }
 
     /// One directory of channel journals per provider address.
-    fn journals(&self, root: &Path) -> PathBuf {
-        root.join("channels")
-            .join(self.provider.address.to_string())
+    fn journals(&self, root: &Path) -> super::CliResult<PathBuf> {
+        Ok(root
+            .join("channels")
+            .join(self.paid_provider()?.address.to_string()))
     }
 
     async fn options(
@@ -260,6 +269,7 @@ impl ClientArgs {
         price: u64,
         assurance: Assurance,
     ) -> super::CliResult<PaidWorkOptions> {
+        self.paid_provider()?;
         let root = self.root(context);
         let config = client::config(self, &root).await?;
         self.options_with_config(context, price, assurance, config)
@@ -272,6 +282,7 @@ impl ClientArgs {
         assurance: Assurance,
         config: hellas_sdk::work_config::WorkConfig,
     ) -> super::CliResult<PaidWorkOptions> {
+        let provider = self.paid_provider()?;
         let root = self.root(context);
         let apple_trust = match (&self.trust_store, &self.trust_policy, assurance) {
             (Some(directory), Some(id), _) => Some(
@@ -285,11 +296,10 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: self.journals(&root),
+            journal_root: self.journals(&root)?,
             config,
-            provider: self.provider.address,
-            provider_addrs: self
-                .provider
+            provider: provider.address,
+            provider_addrs: provider
                 .addresses
                 .iter()
                 .chain(&self.addresses)
@@ -483,7 +493,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         } else {
             println!("output: {}", serde_json::to_string(&hellas_channel::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
         }
-        println!("{}", wording(&args.client.provider, &job, &result));
+        println!("{}", wording(args.client.paid_provider()?, &job, &result));
         std::io::stdout().lock().flush()?;
         purchase.reported()?;
         Ok(())
@@ -572,7 +582,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 } else {
                     std::io::stdout().lock().write_all(&body)?;
                 }
-                eprintln!("{}", wording(&args.client.provider, &job, &result));
+                eprintln!("{}", wording(args.client.paid_provider()?, &job, &result));
                 std::io::stdout().lock().flush()?;
                 std::io::stderr().lock().flush()?;
                 purchase.reported()?;

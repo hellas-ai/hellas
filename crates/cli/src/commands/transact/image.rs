@@ -3,6 +3,7 @@ use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct ImageArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -47,7 +48,7 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         async {
             if args.grant.offer.is_some() {
                 let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                result.save(&directory.join("result"), &job, args.client.provider.address)?;
+                result.save(&directory.join("result"), &job)?;
                 result.ensure_succeeded()?;
                 let ModelResponse::Image(image) = package.decode(&result.retained.output)? else { bail!("expected image") };
                 std::fs::write(&args.output, image.png(args.width, args.height)?)?;

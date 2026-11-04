@@ -15,6 +15,7 @@ use std::path::PathBuf;
 const BYTES_FORMAT: &str = "catena.bytes.v1";
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct RunArgs {
     #[command(flatten)]
     pub(super) client: ClientArgs,
