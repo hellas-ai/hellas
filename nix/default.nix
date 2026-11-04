@@ -478,20 +478,26 @@ let
 
   };
 
-  hydraUnit = nativePkg.mkHellasPackage {
-    pname = "hellas-check-unit";
-    buildType = "debug";
-    dontBuild = true;
-    doCheck = true;
-    cargoTestFlags = [
-      "--locked"
-      "--workspace"
-    ];
-    installPhase = ''
-      mkdir -p "$out"
-      touch "$out/passed"
-    '';
-  };
+  hydraUnit = nativePkg.mkHellasPackage (
+    {
+      pname = "hellas-check-unit";
+      buildType = "debug";
+      dontBuild = true;
+      doCheck = true;
+      cargoTestFlags = [
+        "--locked"
+        "--workspace"
+      ];
+      installPhase = ''
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
+    }
+    // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      cargoTestJobs = 1;
+      RUST_TEST_THREADS = "1";
+    }
+  );
 
 in
 {

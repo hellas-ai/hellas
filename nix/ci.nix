@@ -47,6 +47,9 @@ let
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
       export CARGO_NET_OFFLINE=${lib.boolToString offline}
       export SQLX_OFFLINE=true
+      ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+        export RUST_TEST_THREADS=1
+      ''}
       ${cmd}
     '' ([ pkgs.coreutils ] ++ inputs);
 
