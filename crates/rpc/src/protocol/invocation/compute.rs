@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ContentRef;
 
-pub const EVALUATOR: &str = "hellas/catena-721edd0a567d";
+pub const EVALUATOR: &str = "hellas/catena-cef40b1ea587";
 pub const MAX_ENVIRONMENT_BYTES: usize = 1 << 20;
 // Every reference contains at least its 32-byte content identifier.
 pub const MAX_ENVIRONMENT_REFERENCES: usize = MAX_ENVIRONMENT_BYTES / 32;
