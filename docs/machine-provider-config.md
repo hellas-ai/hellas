@@ -26,12 +26,79 @@ can still correspond to an allocated, billable resource.
 
 The ordinary image does not enable bootstrap by default. Its entrypoint is
 `serve --port 31145`; configure the provider template's additional arguments as
-`--await-owner /var/lib/hellas/authority` to opt in. Preserve the persistent mount
-and publish UDP port 31145. The console's direct addresses are those visible to
-the container; where NAT changes them, use the provider's authenticated public
-UDP mapping in the invitation. Production uses the normal N0 relay configuration;
-relay-disabled endpoints are test fixtures, not an image guarantee. The public
-transport pin must remain the console-provided pin when addresses are adjusted.
+`--await-owner /var/lib/hellas/authority` to opt in. Preserve the persistent mount.
+
+RunPod does not expose inbound UDP ([port documentation](https://docs.runpod.io/pods/configuration/expose-ports)).
+Do not request `31145/udp` or substitute a TCP mapping into a QUIC invitation.
+Hellas uses the normal N0 address lookup and relay configuration, so keep outbound
+relay connectivity available. The console's addresses are container-local hints;
+the independently verified node pin remains authoritative. Test bootstrap and an
+actual job from outside the Pod before considering the deployment usable.
+
+## Images and template updates
+
+For NVIDIA Pods, use `ghcr.io/hellas-ai/hellas:cuda`. The publisher advances
+`cuda`, `hip`, and `network` only after the matching CLI and GPU Hydra builds
+succeed. `latest` is an alias for **network**, which cannot execute GPU jobs.
+The old `ghcr.io/hellas-ai/node:*` images and their `--execute-policy` /
+`--download-policy` flags are not this CLI.
+
+Floating tags help discover a release; `machines create` requires an immutable
+`ghcr.io/hellas-ai/hellas@sha256:...` in both the template and machine spec.
+Take the CUDA digest from the selected [release](https://github.com/hellas-ai/hellas/releases),
+and use that release's CLI. The immutable tag is `sha-FULL_COMMIT_SHA-cuda`.
+Updating a tag or template does not upgrade an already running Pod. Review the
+new release's state compatibility before replacing a persistent worker.
+
+Preserve the image's Docker entrypoint: it already selects `serve`, port 31145,
+and the CUDA backend, including driver-library setup. In RunPod's
+`dockerStartCmd`, pass only additional arguments, for example:
+
+```json
+["--software-root", "--await-owner", "/var/lib/hellas/authority",
+ "--grant-config", "/var/lib/hellas/resources.json",
+ "--content-root", "/var/lib/hellas/content"]
+```
+
+Prepare `resources.json` and the weights on the persistent volume before using
+that command; a template does not create an allowance or download models.
+Use the [node configuration and bootstrap procedure](admin.md#explicit-offline-initialization-and-recovery),
+then issue/import access and run a job as in the
+[owner walkthrough](../README.md#own-a-worker-and-share-access). `admin share`
+requires a release containing that command on both client and worker.
+Keep the owner passkey on the client. An unowned worker's invitation expires
+15 minutes after startup; obtain it promptly through the authenticated console.
+
+## Provision through the CLI
+
+With `credential-source.json` and `machine-provider.json` prepared as above,
+write a machine spec (replace the digest and accelerator with your selection):
+
+```json
+{
+  "name": "hellas-demo",
+  "image": "ghcr.io/hellas-ai/hellas@sha256:CUDA_MANIFEST_DIGEST",
+  "accelerator": "NVIDIA L4",
+  "accelerator_count": 1,
+  "interruptible": false
+}
+```
+
+```sh
+hellas machines --credential-source credential-source.json \
+  --provider-config machine-provider.json list
+hellas machines --credential-source credential-source.json \
+  --provider-config machine-provider.json create --spec machine.json
+# After closing paid channels and retaining any needed results:
+hellas machines --credential-source credential-source.json \
+  --provider-config machine-provider.json destroy POD_ID
+```
+
+Creation allocates a billable GPU Pod; it does not wait for the image to pull,
+bootstrap its owner, or verify inference. Retain the returned Pod ID for cleanup.
+The CLI currently creates, lists and destroys Pods; template editing remains a
+RunPod console/API operation. Review the template before allocating, and use
+`list` to reconcile an uncertain creation result rather than blindly retrying.
 
 An OS store reference uses the same credential source:
 `{"secret_store":{"backend":"native","service":"hellas-gate","key":"provider-token"}}`.
