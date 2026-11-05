@@ -123,17 +123,15 @@ pkgs.writeShellApplication {
     staged=$(mktemp -d --tmpdir="''${RUNNER_TEMP:-$PWD}" hellas-publish.XXXXXX)
     trap 'rm -rf "$staged"' EXIT
     sums=$staged/SHA256SUMS
-    for job in x86_64-linux.artifacts.static-x86_64 x86_64-linux.artifacts.static-aarch64 aarch64-darwin.artifacts.native x86_64-linux.artifacts.wasm; do
+    for job in x86_64-linux.artifacts.portable-x86_64 x86_64-linux.artifacts.portable-aarch64 aarch64-darwin.artifacts.portable-aarch64 x86_64-linux.artifacts.wasm; do
       path=$(fetch "$job")
       cat "$path/SHA256SUMS" >> "$sums"
       assets+=("$path"/*.tar.gz)
       case "$job" in
-        *.static-x86_64) platform=x86_64-linux ;;
-        *.static-aarch64) platform=aarch64-linux ;;
-        *.native) platform=aarch64-darwin ;;
+        *.portable-*) ;;
         *) continue ;;
       esac
-      archive="hellas-$platform.tar.gz"
+      archive=$(basename "$path"/*.tar.gz "-$revision.tar.gz").tar.gz
       cp "$path"/*.tar.gz "$staged/$archive"
       (cd "$staged" && sha256sum "$archive" > "$archive.sha256")
       cat "$staged/$archive.sha256" >> "$sums"

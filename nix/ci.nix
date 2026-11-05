@@ -387,8 +387,8 @@ let
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";
-    static-x86_64 = "cross-x86_64-linux-musl-cli";
-    static-aarch64 = "cross-aarch64-linux-musl-cli";
+    portable-x86_64 = "cross-x86_64-linux-musl-cli";
+    portable-aarch64 = "cross-aarch64-linux-musl-cli";
     hellas-rpc-wasm = "hellas-rpc-wasm";
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

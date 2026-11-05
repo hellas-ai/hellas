@@ -106,7 +106,7 @@ descriptor to the same inode and mutates it concurrently.
 
 ## Install
 
-Static CLI binaries for [Linux](https://hydra.hellas.ai/job/hellas/hellas-cli/x86_64-linux.artifacts.static-x86_64) and [macOS](https://hydra.hellas.ai/job/hellas/hellas-cli/aarch64-darwin.artifacts.native) are built as our [Hydra channel](https://hydra.hellas.ai/jobset/hellas/hellas-cli) advances. Install like so:
+Portable CLI binaries for [Linux](https://hydra.hellas.ai/job/hellas/hellas-cli/x86_64-linux.artifacts.portable-x86_64) and [macOS](https://hydra.hellas.ai/job/hellas/hellas-cli/aarch64-darwin.artifacts.portable-aarch64) are built as our [Hydra channel](https://hydra.hellas.ai/jobset/hellas/hellas-cli) advances. Install like so:
 
 ```sh
 curl -fsSL https://github.com/hellas-ai/hellas/releases/latest/download/install.sh | sh

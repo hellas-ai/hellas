@@ -6,7 +6,7 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) platform=aarch64-darwin ;;
   *) echo 'Unsupported platform' >&2; exit 1 ;;
 esac
-archive="hellas-$platform.tar.gz"
+archive="hellas-$platform-portable.tar.gz"
 base=https://github.com/hellas-ai/hellas/releases/latest/download
 directory=${HELLAS_INSTALL_DIR:-"$HOME/.local/bin"}
 temporary=$(mktemp -d)
