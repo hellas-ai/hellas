@@ -116,6 +116,9 @@ pub(super) fn usage(
         };
         return UsageObservation::incomplete(Some(status));
     };
+    if response.upstream_peer().is_err() {
+        return UsageObservation::BackendFault;
+    }
     let (events, _) = response.output_event_payloads();
     let mut decoder = UsageDecoder::new(Mode::Strict(resource.accounting), None, None);
     let mut head = false;
@@ -156,6 +159,8 @@ pub(super) fn usage(
                 };
                 decoder.push(&bytes);
             }
+            Ok(OutputEvent::Provenance(provenance))
+                if provenance.upstream.is_some() && provenance.call_commitment.is_none() => {}
             _ => return UsageObservation::BackendFault,
         }
     }
@@ -179,6 +184,7 @@ fn failed_status(output: &InvocationOutput) -> Option<u16> {
     }
     let mut remaining = artifact.bytes.as_bytes();
     let mut status = None;
+    let mut peer_seen = false;
     while !remaining.is_empty() {
         let header = remaining.get(..4)?;
         let len = u32::from_be_bytes(header.try_into().ok()?) as usize;
@@ -195,6 +201,21 @@ fn failed_status(output: &InvocationOutput) -> Option<u16> {
             })) if status.is_none() => status = Some(head_status),
             OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { .. }))
                 if status.is_some() => {}
+            OutputEvent::Provenance(provenance)
+                if !peer_seen
+                    && status.is_none()
+                    && provenance.call_commitment.is_none()
+                    && provenance.upstream.is_some() =>
+            {
+                let peer = provenance.upstream?;
+                hellas_rpc::upstream::UpstreamPolicy {
+                    host: peer.host,
+                    spki_sha256: vec![peer.spki_sha256],
+                }
+                .validate()
+                .ok()?;
+                peer_seen = true;
+            }
             _ => return None,
         }
     }
@@ -223,6 +244,7 @@ mod tests {
             "openai",
             "responses",
             b"{}",
+            None,
             contract.manifest_id(),
             Assurance::ProducerSigned,
             &key,
@@ -312,6 +334,7 @@ mod tests {
             "openai",
             "responses",
             &serde_json::to_vec(&request).unwrap(),
+            None,
             contract.manifest_id(),
             Assurance::ProducerSigned,
             &hellas_channel::test_support::principal(1).1,
@@ -347,7 +370,19 @@ mod tests {
             }),
         ))
         .unwrap();
-        let mut framed = (head.len() as u32).to_be_bytes().to_vec();
+        let peer = hellas_rpc::fetch::encode_fetch_event_payload(&OutputEvent::Provenance(
+            hellas_rpc::output::Provenance {
+                call_commitment: None,
+                upstream: Some(hellas_rpc::upstream::UpstreamPeer {
+                    host: "glm.test".into(),
+                    spki_sha256: "ab".repeat(32),
+                }),
+            },
+        ))
+        .unwrap();
+        let mut framed = (peer.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&peer);
+        framed.extend_from_slice(&(head.len() as u32).to_be_bytes());
         framed.extend_from_slice(&head);
         let mut stream = OutputStream::new(&input.request, key, 65_536).unwrap();
         stream

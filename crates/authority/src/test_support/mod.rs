@@ -310,6 +310,7 @@ pub fn proposal_for(
         "openai",
         "responses",
         &body,
+        None,
         environment.manifest_id(),
         Assurance::ProducerSigned,
         &key,

@@ -228,6 +228,7 @@ fn other_contract_job() -> hellas_sdk::job::Job {
         "openai".into(),
         "responses".into(),
         BODY.to_vec(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap()
@@ -884,6 +885,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         "openai",
         "responses",
         BODY,
+        None,
         test_responses_contract().manifest_id(),
         Assurance::ProducerSigned,
         &client_producer,
@@ -1295,6 +1297,7 @@ async fn paid_finish(case: PaidScenario) {
         "openai".into(),
         "responses".into(),
         BODY.to_vec(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap();

@@ -78,6 +78,7 @@ fn request(body: &[u8]) -> PreparedFetchRequest {
         "codex",
         "responses",
         JsonBytes::new(body.to_vec()),
+        None,
         hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([7; 32])),
     );
     PreparedFetchRequest::new(&call, call.body.clone())
@@ -104,18 +105,20 @@ async fn forwards_streaming_request_with_codex_token() {
     );
     let access_token = non_expiring_token();
     auth.save(&crate::codex_auth::CodexAuthState::new(
-        crate::codex_auth::test_tokens_with_account_id(
-            &access_token,
-            "refresh",
-            "acct-1",
-        ),
+        crate::codex_auth::test_tokens_with_account_id(&access_token, "refresh", "acct-1"),
         None,
     ))
     .unwrap();
-    let provider = CodexResponsesFetchProvider::with_store(
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert("ChatGPT-Account-ID", HeaderValue::from_static("acct-1"));
+    headers.insert("Originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+    let (endpoint, client) = hellas_providers::test_support::https_forward(
         Url::parse(&format!("http://{addr}/codex/responses")).unwrap(),
-        auth,
+        headers,
     );
+    let mut provider = CodexResponsesFetchProvider::with_store(endpoint, auth);
+    provider.client = client;
 
     let body = br#"{"model":"gpt-5.5-codex","input":"hello","stream":true}"#;
     let mut stream = provider.run(request(body)).await.unwrap().stream;

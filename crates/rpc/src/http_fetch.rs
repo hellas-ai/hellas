@@ -232,6 +232,9 @@ impl HttpFetchResponse {
         output: &crate::fetch::FetchOutput,
     ) -> Result<Self, HttpRequestError> {
         use crate::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+        output
+            .upstream_peer()
+            .map_err(|_| HttpRequestError("upstream TLS peer evidence"))?;
         let (events, terminal) = output.output_event_payloads();
         let mut response = None;
         for payload in events {
@@ -267,6 +270,8 @@ impl HttpFetchResponse {
                     }
                     response.body.extend_from_slice(&bytes);
                 }
+                OutputEvent::Provenance(provenance)
+                    if provenance.upstream.is_some() && provenance.call_commitment.is_none() => {}
                 _ => return Err(HttpRequestError("unexpected or duplicate response event")),
             }
         }

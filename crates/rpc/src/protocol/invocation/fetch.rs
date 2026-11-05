@@ -336,6 +336,18 @@ pub fn validate_input(
     {
         return Err(error("Fetch signed route is not admitted"));
     }
+    if let Some(policy) = &input.upstream
+        && let FetchEgress::FixedHttps(endpoint) = parameters.contract.egress()
+    {
+        let url =
+            url::Url::parse(endpoint).map_err(|_| error("invalid contract HTTPS endpoint"))?;
+        policy
+            .permits_host(
+                url.host_str()
+                    .ok_or_else(|| error("missing contract hostname"))?,
+            )
+            .map_err(error)?;
+    }
     if parameters.contract.schema() == FetchSchema::HttpV1 {
         let request = crate::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
             .map_err(|e| error(e.to_string()))?;
@@ -356,7 +368,20 @@ pub fn validate_input(
         let request = crate::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
             .map_err(|e| error(e.to_string()))?;
         let url = request.parsed_url().map_err(|e| error(e.to_string()))?;
-        if (*require_spki_pin && request.tls.spki_sha256.is_empty())
+        if let Some(policy) = &input.upstream {
+            policy
+                .permits_host(
+                    url.host_str()
+                        .ok_or_else(|| error("missing HTTP hostname"))?,
+                )
+                .map_err(error)?;
+        }
+        if (*require_spki_pin
+            && request.tls.spki_sha256.is_empty()
+            && input
+                .upstream
+                .as_ref()
+                .is_none_or(|policy| policy.spki_sha256.is_empty()))
             || (!allowed_hosts.is_empty()
                 && !allowed_hosts
                     .iter()
@@ -523,6 +548,20 @@ pub fn validate_output(
         }
     ) {
         return Err(error("cancelled Fetch is not a successful result"));
+    }
+    let input_artifact = &prepared.input.artifacts[0];
+    let input_events: Vec<crate::InputEventEnvelope> =
+        crate::protocol::value::decode_canonical_dag_cbor(input_artifact.bytes.as_bytes())?;
+    let input =
+        crate::fetch::verify_input_events(&input_events).map_err(|e| error(e.to_string()))?;
+    let peer = response.upstream_peer().map_err(|e| error(e.to_string()))?;
+    if let Some(policy) = &input.upstream {
+        policy
+            .verify_peer(
+                peer.as_ref()
+                    .ok_or_else(|| error("signed response has no upstream peer"))?,
+            )
+            .map_err(error)?;
     }
     if admission.contract.schema() == crate::FetchSchema::HttpV1 {
         let input_artifact = &prepared.input.artifacts[0];

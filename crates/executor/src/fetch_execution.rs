@@ -149,6 +149,7 @@ pub(crate) fn project_fetch(
                 return Ok(Some((item, state)));
             }
             if let Some(request) = state.request.take() {
+                let upstream_policy = request.upstream.clone();
                 let response = state
                     .provider
                     .run(request)
@@ -159,6 +160,28 @@ pub(crate) fn project_fetch(
                     .begin(response.head)
                     .map_err(|error| state.projection_failure(error))?
                     .into();
+                if let Some(policy) = upstream_policy {
+                    let peer = response.peer.as_ref().ok_or_else(|| {
+                        state.failure(FetchProviderError::failed("upstream peer evidence missing"))
+                    })?;
+                    policy
+                        .verify_peer(peer)
+                        .map_err(|message| state.failure(FetchProviderError::failed(message)))?;
+                }
+                if let Some(peer) = response.peer {
+                    let payload = hellas_rpc::fetch::encode_fetch_event_payload(
+                        &hellas_rpc::output::OutputEvent::Provenance(
+                            hellas_rpc::output::Provenance {
+                                call_commitment: None,
+                                upstream: Some(peer),
+                            },
+                        ),
+                    )
+                    .map_err(|error| {
+                        state.failure(FetchProviderError::failed(error.to_string()))
+                    })?;
+                    state.pending.push_front(ProjectedFetch::Event(payload));
+                }
                 state.response = Some(response.stream);
                 continue;
             }
@@ -267,6 +290,7 @@ mod tests {
                 "http",
                 "fetch",
                 JsonBytes(b"{}".to_vec()),
+                None,
                 InputCommitment::from_digest(Digest::from_bytes([5; 32])),
             ),
             JsonBytes(b"{}".to_vec()),
@@ -347,6 +371,7 @@ mod tests {
             self.started.notify_one();
             Box::pin(async {
                 Ok(FetchProviderResponse {
+                    peer: None,
                     head: Default::default(),
                     stream: Box::pin(TrackedBody {
                         dropped: self.dropped.clone(),
@@ -449,6 +474,7 @@ mod tests {
                 "http",
                 "fetch",
                 b"{}",
+                None,
                 contract.manifest_id(),
                 Assurance::ProducerSigned,
                 &caller,

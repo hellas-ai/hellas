@@ -9,8 +9,8 @@ use crate::{
 use hellas_auth::{ProducerSigningKey, PublicKey};
 use k256::elliptic_curve::Generate as _;
 
-const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
-const INPUT_EVENT_KINDS: [&str; 8] = [
+const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v4";
+const INPUT_EVENT_KINDS: [&str; 9] = [
     "assurance",
     "execution.environment",
     "request.nonce",
@@ -18,6 +18,7 @@ const INPUT_EVENT_KINDS: [&str; 8] = [
     "method",
     "request.retain",
     "request.body",
+    "request.upstream",
     "input.end",
 ];
 
@@ -53,6 +54,7 @@ pub struct FetchInput {
     pub method: String,
     pub body: JsonBytes,
     pub retention: Retention,
+    pub upstream: Option<crate::upstream::UpstreamPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,30 @@ impl FetchOutput {
         }
     }
 
+    /// Actual TLS peer signed into the response, distinct from a requested pin.
+    pub fn upstream_peer(
+        &self,
+    ) -> Result<Option<crate::upstream::UpstreamPeer>, FetchPayloadError> {
+        let mut peer = None;
+        for (index, payload) in self.event_payloads.iter().enumerate() {
+            if let OutputEvent::Provenance(provenance) = decode_fetch_event_payload(payload)?
+                && let Some(observed) = provenance.upstream
+            {
+                if index != 0 || peer.is_some() || provenance.call_commitment.is_some() {
+                    return Err(FetchPayloadError::Upstream);
+                }
+                crate::upstream::UpstreamPolicy {
+                    host: observed.host.clone(),
+                    spki_sha256: vec![observed.spki_sha256.clone()],
+                }
+                .validate()
+                .map_err(|_| FetchPayloadError::Upstream)?;
+                peer = Some(observed);
+            }
+        }
+        Ok(peer)
+    }
+
     pub fn output_event_payloads(&self) -> (&[Vec<u8>], &[u8]) {
         (&self.event_payloads, &self.terminal_payload)
     }
@@ -88,6 +114,7 @@ pub fn build_input_events(
     service: &str,
     method: &str,
     payload: &[u8],
+    upstream: Option<&crate::upstream::UpstreamPolicy>,
     execution_environment: ContentId,
     assurance: Assurance,
     key: &ProducerSigningKey,
@@ -96,6 +123,7 @@ pub fn build_input_events(
         service,
         method,
         payload,
+        upstream,
         execution_environment,
         assurance,
         key,
@@ -103,10 +131,12 @@ pub fn build_input_events(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_input_events_with_retention(
     service: &str,
     method: &str,
     payload: &[u8],
+    upstream: Option<&crate::upstream::UpstreamPolicy>,
     execution_environment: ContentId,
     assurance: Assurance,
     key: &ProducerSigningKey,
@@ -116,6 +146,7 @@ pub fn build_input_events_with_retention(
         service,
         method,
         payload,
+        upstream,
         execution_environment,
         assurance,
         key,
@@ -131,6 +162,7 @@ pub fn build_input_events_with_nonce(
     service: &str,
     method: &str,
     payload: &[u8],
+    upstream: Option<&crate::upstream::UpstreamPolicy>,
     execution_environment: ContentId,
     assurance: Assurance,
     key: &ProducerSigningKey,
@@ -155,6 +187,15 @@ pub fn build_input_events_with_nonce(
     builder.push("method", method.as_bytes().to_vec())?;
     builder.push("request.retain", vec![u8::from(retention.should_retain())])?;
     builder.push("request.body", payload.to_vec())?;
+    if let Some(policy) = upstream {
+        policy
+            .validate()
+            .map_err(|_| FetchProtocolError::InvalidUpstream)?;
+    }
+    builder.push(
+        "request.upstream",
+        canonical_dag_cbor(&upstream).map_err(|_| FetchProtocolError::InvalidUpstream)?,
+    )?;
     builder.push("input.end", Vec::new())?;
     let (events, _) = builder.finish()?;
     Ok(events)
@@ -164,7 +205,7 @@ pub fn verify_input_events(
     events: &[InputEventEnvelope],
 ) -> Result<FetchInput, FetchProtocolError> {
     // Shape and byte bounds are deliberately checked before signature
-    // verification. The Fetch input language has exactly eight events, so an
+    // verification. The Fetch input language has exactly nine events, so an
     // adversarial peer must never be able to buy an unbounded signature loop
     // by appending otherwise well-formed envelopes.
     let parts = input_parts(events)?;
@@ -182,6 +223,7 @@ pub fn verify_input_events(
         method: parts.method.to_string(),
         body: JsonBytes::new(parts.body.to_vec()),
         retention: parts.retention,
+        upstream: parts.upstream,
     })
 }
 
@@ -218,6 +260,7 @@ struct FetchInputParts<'a> {
     method: &'a str,
     body: &'a [u8],
     retention: Retention,
+    upstream: Option<crate::upstream::UpstreamPolicy>,
 }
 
 trait FetchInputPayload {
@@ -237,7 +280,7 @@ impl FetchInputPayload for PbInputEventEnvelope {
 }
 
 fn input_parts(events: &[InputEventEnvelope]) -> Result<FetchInputParts<'_>, FetchProtocolError> {
-    if events.len() != 8 {
+    if events.len() != 9 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
         });
@@ -251,13 +294,13 @@ fn input_parts(events: &[InputEventEnvelope]) -> Result<FetchInputParts<'_>, Fet
 fn input_payload_parts<T: FetchInputPayload>(
     events: &[T],
 ) -> Result<FetchInputParts<'_>, FetchProtocolError> {
-    if events.len() != 8 {
+    if events.len() != 9 {
         return Err(FetchProtocolError::WrongInputEventCount {
             actual: events.len(),
         });
     }
     let payload = |index: usize| events[index].fetch_payload();
-    if !payload(7).is_empty() {
+    if !payload(8).is_empty() {
         return Err(FetchProtocolError::NonEmptyInputEnd);
     }
     let execution_environment =
@@ -301,6 +344,17 @@ fn input_payload_parts<T: FetchInputPayload>(
     let assurance = Assurance::from_byte(*assurance)
         .map_err(|_| FetchProtocolError::UnknownAssurance(*assurance))?;
     validate_request_body_limit(payload(6))?;
+    if payload(7).len() > 2048 {
+        return Err(FetchProtocolError::InvalidUpstream);
+    }
+    let upstream: Option<crate::upstream::UpstreamPolicy> =
+        crate::protocol::value::decode_canonical_dag_cbor(payload(7))
+            .map_err(|_| FetchProtocolError::InvalidUpstream)?;
+    if let Some(policy) = &upstream {
+        policy
+            .validate()
+            .map_err(|_| FetchProtocolError::InvalidUpstream)?;
+    }
     Ok(FetchInputParts {
         assurance,
         execution_environment,
@@ -308,6 +362,7 @@ fn input_payload_parts<T: FetchInputPayload>(
         method,
         body: payload(6),
         retention,
+        upstream,
     })
 }
 
@@ -380,6 +435,8 @@ fn validate_request_body_limit(payload: &[u8]) -> Result<(), FetchProtocolError>
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchProtocolError {
+    #[error("invalid caller-signed upstream TLS policy")]
+    InvalidUpstream,
     #[error("fetch service must not be empty")]
     EmptyService,
     #[error("fetch method must not be empty")]
@@ -388,7 +445,7 @@ pub enum FetchProtocolError {
         "fetch {field} contains {actual} bytes, over the {MAX_FETCH_ROUTE_COMPONENT_BYTES}-byte limit"
     )]
     RouteComponentLimit { field: &'static str, actual: usize },
-    #[error("fetch input transcript must contain exactly 8 events, got {actual}")]
+    #[error("fetch input transcript must contain exactly 9 events, got {actual}")]
     WrongInputEventCount { actual: usize },
     #[error("fetch assurance must be exactly one byte, got {actual}")]
     WrongAssuranceLength { actual: usize },
@@ -457,7 +514,7 @@ use crate::output::{
 use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
 use crate::{DagCborEncodeError, canonical_dag_cbor};
 
-const EVENT_CODEC: &str = "hellas.fetch.output.event.v3";
+const EVENT_CODEC: &str = "hellas.fetch.output.event.v4";
 const TERMINAL_CODEC: &str = "hellas.fetch.output.terminal.v2";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -686,6 +743,8 @@ impl TryFrom<FetchEventPayload> for OutputEvent {
 
 #[derive(Debug, Error)]
 pub enum FetchPayloadError {
+    #[error("invalid or duplicate upstream TLS peer evidence")]
+    Upstream,
     #[error("fetch payload encode failed: {0}")]
     Encode(#[from] DagCborEncodeError),
     #[error("fetch payload decode failed: {0}")]
@@ -832,7 +891,7 @@ mod payload_tests {
             channel: TextChannel::Output,
         };
         let actual = hex(&encode_fetch_event_payload(&event).unwrap());
-        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7633a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
+        let expected = "82781c68656c6c61732e66657463682e6f75747075742e6576656e742e7634a1695465787444656c7461a36564656c746162686965696e64657800676368616e6e656c664f7574707574";
         assert_eq!(actual, expected);
     }
 }

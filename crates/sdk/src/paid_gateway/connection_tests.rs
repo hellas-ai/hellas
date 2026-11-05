@@ -180,6 +180,7 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 method: "responses".into(),
                 request: crate::test_support::BODY.to_vec(),
                 assurance: hellas_rpc::Assurance::ProducerSigned,
+                upstream: None,
             };
             let request = pool.request(WorkRequest::Compute(input)).unwrap();
             let pool = Arc::new(pool);

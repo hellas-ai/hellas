@@ -113,6 +113,7 @@ impl Case {
                     "openai",
                     "responses",
                     &serde_json::to_vec(&http).unwrap(),
+                    None,
                     contract.manifest_id(),
                     Assurance::ProducerSigned,
                     &signer.node_key(),

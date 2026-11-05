@@ -80,6 +80,7 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
         "http".into(),
         "request".into(),
         serde_json::to_vec(&request).unwrap(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap();
@@ -299,6 +300,7 @@ fn helper_and_hand_written_folder_produce_identical_signed_input() {
         "http".into(),
         "request".into(),
         serde_json::to_vec(&request).unwrap(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap();
@@ -411,6 +413,7 @@ fn output_claims_only_provider_signature_and_job_binding() {
         "http".into(),
         "request".into(),
         serde_json::to_vec(&args.request().unwrap()).unwrap(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap();

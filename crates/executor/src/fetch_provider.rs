@@ -32,6 +32,7 @@ impl FetchProviderResponseHead {
 }
 
 pub struct FetchProviderResponse {
+    pub peer: Option<hellas_rpc::upstream::UpstreamPeer>,
     pub head: FetchProviderResponseHead,
     pub stream: FetchProviderStream,
 }
@@ -53,6 +54,7 @@ pub struct FetchCall {
     pub service: String,
     pub method: String,
     pub body: JsonBytes,
+    pub upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
     /// Commitment over the complete caller-signed input transcript.
     pub input_commitment: InputCommitment,
 }
@@ -62,12 +64,14 @@ impl FetchCall {
         service: impl Into<String>,
         method: impl Into<String>,
         body: JsonBytes,
+        upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
         input_commitment: InputCommitment,
     ) -> Self {
         Self {
             service: service.into(),
             method: method.into(),
             body,
+            upstream,
             input_commitment,
         }
     }
@@ -81,6 +85,7 @@ pub struct PreparedFetchRequest {
     pub service: String,
     pub method: String,
     pub body: JsonBytes,
+    pub upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
     input_commitment: InputCommitment,
 }
 
@@ -91,6 +96,7 @@ impl PreparedFetchRequest {
             service: call.service.clone(),
             method: call.method.clone(),
             body,
+            upstream: call.upstream.clone(),
             input_commitment: call.input_commitment,
         }
     }
@@ -205,6 +211,7 @@ impl FetchProvider for MockFetchProvider {
                 ))
             })?;
             Ok(FetchProviderResponse {
+                peer: None,
                 head: FetchProviderResponseHead::default(),
                 stream: Box::pin(stream::iter(chunks.into_iter().map(Ok))) as FetchProviderStream,
             })
@@ -264,6 +271,7 @@ mod tests {
                 "codex",
                 "responses",
                 JsonBytes::new(br#"{"input":"hello"}"#.to_vec()),
+                None,
                 InputCommitment::from_digest(Digest::from_bytes([byte; 32])),
             )
         };

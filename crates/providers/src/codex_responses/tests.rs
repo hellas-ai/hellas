@@ -9,6 +9,7 @@ fn call(value: JsonValue) -> FetchCall {
         "codex",
         "responses",
         JsonBytes::new(serde_json::to_vec(&value).unwrap()),
+        None,
         InputCommitment::from_digest(Digest::from_bytes([9; 32])),
     )
 }

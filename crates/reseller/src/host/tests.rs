@@ -33,13 +33,16 @@ struct TlsResponses {
 }
 impl FetchProvider for TlsResponses {
     fn execution_environment(&self) -> hellas_rpc::ContentId {
-        hellas_providers::responses_contract().unwrap().manifest_id()
+        hellas_providers::responses_contract()
+            .unwrap()
+            .manifest_id()
     }
     fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
         Box::pin(async move {
             hellas_providers::execute_responses_request(
                 &self.client,
                 self.url.clone(),
+                request.upstream.as_ref(),
                 "fixture-secret",
                 request.body.as_bytes().to_vec(),
                 &request.idempotency_key(),
@@ -97,6 +100,7 @@ async fn tls_fixture(mode: UpstreamMode) -> TlsFixture {
     .parse()
     .unwrap();
     let client = reqwest::Client::builder()
+        .tls_info(true)
         .add_root_certificate(reqwest::Certificate::from_der(ca.as_ref().der()).unwrap())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(WAIT * 6)

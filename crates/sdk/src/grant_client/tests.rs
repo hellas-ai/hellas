@@ -165,6 +165,7 @@ impl Fixture {
             "openai",
             "responses",
             br#"{"model":"fixture","input":"sdk-private-input","max_output_tokens":8}"#,
+            None,
             contract.manifest_id(),
             Assurance::ProducerSigned,
             &principal(1).1,
@@ -275,6 +276,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             request: br#"{"model":"fixture","input":"sdk-private-input","max_output_tokens":8}"#
                 .to_vec(),
             assurance: Assurance::ProducerSigned,
+            upstream: None,
         };
         let terms = crate::execution::ExecutionTerms::Grant {
             resource: a.resource_id,

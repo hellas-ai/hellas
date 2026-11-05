@@ -364,6 +364,7 @@ impl ExecutorHandle {
             request.service,
             request.method,
             request.body,
+            request.upstream,
             request.input_commitment,
         );
         let session = entry

@@ -149,3 +149,5 @@ pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
 /// Default bound on Fetch executions waiting behind active provider streams.
 #[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
+
+pub mod upstream;

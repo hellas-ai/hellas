@@ -25,3 +25,5 @@ mod openai_responses_projector;
 pub use openai::{OpenAiConfigError, OpenAiResponsesFetchProvider};
 pub use openai_contract::{OPENAI_RESPONSES_ENDPOINT, responses_contract};
 pub use openai_responses_projector::OpenAiResponsesAdaptorFactory;
+
+mod upstream;

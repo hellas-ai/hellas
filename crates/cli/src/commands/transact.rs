@@ -171,6 +171,9 @@ pub struct FetchArgs {
     /// SHA-256 of the leaf certificate's DER SPKI; repeat for several pins.
     #[arg(long = "spki-sha256")]
     spki_sha256: Vec<String>,
+    /// Provider-owned credential alias; the secret never leaves the provider.
+    #[arg(long)]
+    credential: Option<String>,
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
     #[arg(long, value_name = "DIR")]
@@ -418,6 +421,21 @@ async fn execute(
             "the original attempt was paid but its output is unavailable; use --buy-again for a new attempt"
         );
     }
+    if let JobInput::Fetch {
+        upstream: Some(policy),
+        ..
+    } = job.input()
+    {
+        eprintln!(
+            "Required upstream TLS policy: host={} allowed SPKI-SHA256={}",
+            policy.host,
+            if policy.spki_sha256.is_empty() {
+                "no additional SPKI constraint".into()
+            } else {
+                policy.spki_sha256.join(",")
+            }
+        );
+    }
     let owner = args.owner(context)?;
     let mut session = purchase
         .open_paid_session(
@@ -442,6 +460,12 @@ async fn execute(
     let result: super::CliResult<PaidWorkResult> = async {
         match result {
             Ok(ExecutionResult::Paid(mut result)) => {
+                if matches!(job.input(), JobInput::Fetch { .. }) {
+                    let response = hellas_rpc::protocol::invocation::fetch::decode_output(&result.output, &result.provider_key)?;
+                    if let Some(peer) = response.upstream_peer()? {
+                        eprintln!("Provider-signed upstream TLS peer: host={} SPKI-SHA256={} (observed after TLS)", peer.host, peer.spki_sha256);
+                    }
+                }
                 if args.settle {
                     result.settled_provider_payout = Some(session.settle().await?);
                 }
@@ -556,6 +580,10 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     service,
                     method,
                     serde_json::to_vec(&request)?,
+                    Some(hellas_rpc::upstream::UpstreamPolicy {
+                        host: request.parsed_url()?.host_str().context("missing HTTPS host")?.into(),
+                        spki_sha256: args.spki_sha256.clone(),
+                    }),
                     args.assurance(),
                 )?;
                 let directory = args.save_job.clone().unwrap_or_else(|| {
@@ -671,7 +699,7 @@ impl FetchArgs {
                 roots,
                 spki_sha256: self.spki_sha256.clone(),
             },
-            credential: None,
+            credential: self.credential.clone(),
             max_response_bytes: self
                 .max_response_bytes
                 .unwrap_or(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES),

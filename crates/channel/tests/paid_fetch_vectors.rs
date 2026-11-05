@@ -187,6 +187,13 @@ fn signed_input(
         )
         .unwrap();
     builder.push("request.body", body.to_vec()).unwrap();
+    builder
+        .push(
+            "request.upstream",
+            hellas_rpc::canonical_dag_cbor(&Option::<hellas_rpc::upstream::UpstreamPolicy>::None)
+                .unwrap(),
+        )
+        .unwrap();
     builder.push("input.end", Vec::new()).unwrap();
     builder.finish().unwrap().0
 }
@@ -342,13 +349,13 @@ fn golden_fetch_invocation_digests_are_pinned() {
     ];
     let expected = [
         "ee04b6bee03ee2e0a874b44f0061da24f31cab970afc2a0aeee2ec889d3e5e7d",
-        "3e6ce25bf54e270b3b4a27710fdd524fe170a1afd6378577bfb14a4d3531fe86",
-        "49de467ef4334be374b748326d015ed07fb439b7b8f16df04f8b9a3a41100198",
-        "060368615e68c89ca8fd87b604ec09eee7c5bc79de7a5da90082b153a027f71c",
-        "bccf5d4dd97b81660d9c0296f4039922ae875fa067a21b0e6940b5fccc679297",
-        "413bc901a9367bc949f5d53dfbe151e10aa0d9b7da9d748436496b576bc4c368",
-        "6e223dd82ad6548d1fa38373aaec2b6dc9baf3e856b1910f17e8c776ddcec1f0",
-        "96fd9d2c35f6117d49e7af395150c689506841e93229c6c811b99b0c5a1d1a29",
+        "b9e657bc0e97ad039de2751b61cda88218d31b5cb07c02170bb3c99209b64be5",
+        "b11b1f54c2a4c76b1668b570394326e1c1baab64920a7673d2c16fbf788c00f3",
+        "898524755417b2124de2c8263f8befb47f72d351e2f1bb15981bf4c2988b45c0",
+        "c71790479f0d0e71389444f33a2a943eaa8733b36726a40499a1ae9592f10afb",
+        "e605ab09848c4d0c5f9328e538fdc4521bdebb2a889b52bcf5099a21496c0aa9",
+        "3963dc09e3631151fa950ffab6bb8b7c7a35fec9a199d62b9fb663c9bab2d403",
+        "535622cf68eed81d060f377f0d46694ade1cf4acb7841d6c32294d27383b84ac",
     ];
     assert_eq!(
         values.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
@@ -512,6 +519,7 @@ fn request_caller_assurance_route_contract_and_retention_are_checked() {
         SERVICE,
         METHOD,
         REQUEST_BODY,
+        None,
         environment().manifest_id(),
         Assurance::ProducerSigned,
         &caller_key(),
@@ -684,6 +692,7 @@ fn the_real_input_constructor_passes_the_whole_pipeline() {
         SERVICE,
         METHOD,
         REQUEST_BODY,
+        None,
         environment().manifest_id(),
         Assurance::ProducerSigned,
         &caller_key(),

@@ -150,7 +150,7 @@ impl CodexAuthStore {
             return Err(CodexAuthError::RefreshBlocked);
         }
         if access_token_expiring(&state.tokens.access_token, REFRESH_SKEW_SECONDS) {
-            let client = responses_http_client(Default::default())?;
+            let client = responses_http_client(Default::default(), None)?;
             let refreshed = refresh_tokens(&client, self.token_url.clone(), &state.tokens).await;
             match refreshed {
                 Ok(tokens) => {
@@ -313,7 +313,7 @@ struct CodexAuthClient {
 impl CodexAuthClient {
     fn new(issuer: Url, token_url: Url) -> Result<Self, CodexAuthError> {
         Ok(Self {
-            http: responses_http_client(Default::default())?,
+            http: responses_http_client(Default::default(), None)?,
             issuer,
             token_url,
         })

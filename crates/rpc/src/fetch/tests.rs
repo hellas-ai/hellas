@@ -37,6 +37,12 @@ fn unchecked_input_events(body: Vec<u8>) -> Vec<InputEventEnvelope> {
     builder.push("method", b"responses".to_vec()).unwrap();
     builder.push("request.retain", vec![1]).unwrap();
     builder.push("request.body", body).unwrap();
+    builder
+        .push(
+            "request.upstream",
+            canonical_dag_cbor(&Option::<crate::upstream::UpstreamPolicy>::None).unwrap(),
+        )
+        .unwrap();
     builder.push("input.end", Vec::new()).unwrap();
     builder.finish().unwrap().0
 }
@@ -59,6 +65,12 @@ fn raw_input_events(service: Vec<u8>, method: Vec<u8>) -> Vec<InputEventEnvelope
     builder.push("method", method).unwrap();
     builder.push("request.retain", vec![1]).unwrap();
     builder.push("request.body", br#"{}"#.to_vec()).unwrap();
+    builder
+        .push(
+            "request.upstream",
+            canonical_dag_cbor(&Option::<crate::upstream::UpstreamPolicy>::None).unwrap(),
+        )
+        .unwrap();
     builder.push("input.end", Vec::new()).unwrap();
     builder.finish().unwrap().0
 }
@@ -70,6 +82,7 @@ fn input_events_round_trip_through_shape_verifier() {
         "openai",
         "responses",
         br#"{"model":"gpt"}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -92,18 +105,19 @@ fn input_count_is_rejected_before_chain_verification() {
         "openai",
         "responses",
         br#"{}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &key(1),
     )
     .unwrap();
     // The appended envelope has a valid signature in isolation but cannot
-    // be a valid continuation of the finished eight-event transcript.
+    // be a valid continuation of the finished nine-event transcript.
     events.push(events[0].clone());
 
     assert!(matches!(
         verify_input_events(&events),
-        Err(FetchProtocolError::WrongInputEventCount { actual: 9 })
+        Err(FetchProtocolError::WrongInputEventCount { actual: 10 })
     ));
 }
 
@@ -113,6 +127,7 @@ fn protobuf_shape_is_bounded_before_domain_conversion() {
         "openai",
         "responses",
         br#"{}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &key(1),
@@ -141,6 +156,7 @@ fn request_body_limit_accepts_the_exact_boundary() {
         "openai",
         "responses",
         &body,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -166,6 +182,7 @@ fn request_body_limit_rejects_build_and_authenticated_verify_oversize() {
             "openai",
             "responses",
             &body,
+        None,
             environment(),
             TEST_ASSURANCE,
             &caller,
@@ -189,6 +206,7 @@ fn ephemeral_retention_round_trips_in_signed_input() {
         "openai",
         "responses",
         br#"{"store":false}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -223,12 +241,18 @@ fn input_retention_commitment_vector_is_pinned() {
     builder
         .push("request.body", br#"{"input":"private"}"#.to_vec())
         .unwrap();
+    builder
+        .push(
+            "request.upstream",
+            canonical_dag_cbor(&Option::<crate::upstream::UpstreamPolicy>::None).unwrap(),
+        )
+        .unwrap();
     builder.push("input.end", Vec::new()).unwrap();
     let (_events, commitment) = builder.finish().unwrap();
 
     assert_eq!(
         commitment.digest().to_string(),
-        "88391071758ee944f6f1da90c88a4e37216fe2e4764b70c2fce74e4a28181fba"
+        "5a773ec26b595967b4d0dbfe980ef3ad5bb1b517bc770ecf3cb9235f02489344"
     );
 }
 
@@ -239,6 +263,7 @@ fn identical_requests_get_fresh_commitments() {
         "openai",
         "responses",
         br#"{}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -248,6 +273,7 @@ fn identical_requests_get_fresh_commitments() {
         "openai",
         "responses",
         br#"{}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -277,6 +303,7 @@ fn input_builder_bounds_each_route_component() {
         &maximum,
         &maximum,
         br#"{}"#,
+        None,
         environment(),
         TEST_ASSURANCE,
         &caller,
@@ -289,6 +316,7 @@ fn input_builder_bounds_each_route_component() {
             &overlong,
             "responses",
             br#"{}"#,
+        None,
             environment(),
             TEST_ASSURANCE,
             &caller,
@@ -304,6 +332,7 @@ fn input_builder_bounds_each_route_component() {
             "openai",
             &overlong,
             br#"{}"#,
+        None,
             environment(),
             TEST_ASSURANCE,
             &caller,
@@ -351,6 +380,12 @@ fn input_rejects_wrong_canonicalization() {
     builder.push("method", b"responses".to_vec()).unwrap();
     builder.push("request.retain", vec![1]).unwrap();
     builder.push("request.body", br#"{}"#.to_vec()).unwrap();
+    builder
+        .push(
+            "request.upstream",
+            canonical_dag_cbor(&Option::<crate::upstream::UpstreamPolicy>::None).unwrap(),
+        )
+        .unwrap();
     builder.push("input.end", Vec::new()).unwrap();
     let (events, _) = builder.finish().unwrap();
 
@@ -358,4 +393,49 @@ fn input_rejects_wrong_canonicalization() {
         verify_input_events(&events).unwrap_err(),
         FetchProtocolError::InputCanonicalizationMismatch { index: 0 }
     ));
+}
+
+#[test]
+fn upstream_policy_is_signed_and_old_input_shape_is_rejected() {
+    let policy = crate::upstream::UpstreamPolicy {
+        host: "api.example".into(),
+        spki_sha256: vec!["ab".repeat(32)],
+    };
+    let events = build_input_events(
+        "openai",
+        "responses",
+        b"{}",
+        Some(&policy),
+        environment(),
+        TEST_ASSURANCE,
+        &key(1),
+    )
+    .unwrap();
+    assert_eq!(verify_input_events(&events).unwrap().upstream, Some(policy));
+    let mut omitted = events.clone();
+    omitted.remove(7);
+    assert!(matches!(
+        verify_input_events(&omitted),
+        Err(FetchProtocolError::WrongInputEventCount { actual: 8 })
+    ));
+    let other_policy = crate::upstream::UpstreamPolicy {
+        host: "evil.example".into(),
+        spki_sha256: vec![],
+    };
+    let other = build_input_events(
+        "openai",
+        "responses",
+        b"{}",
+        Some(&other_policy),
+        environment(),
+        TEST_ASSURANCE,
+        &key(1),
+    )
+    .unwrap();
+    let mut substituted = events;
+    substituted[7] = other[7].clone();
+    assert!(
+        verify_input_events(&substituted).is_err(),
+        "a valid envelope from another policy must not splice into this request"
+    );
 }

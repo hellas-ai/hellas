@@ -312,6 +312,7 @@ impl PaidFixture {
             "openai",
             "responses",
             BODY,
+            None,
             test_responses_contract().manifest_id(),
             Assurance::ProducerSigned,
             &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(),

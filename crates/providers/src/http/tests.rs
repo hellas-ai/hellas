@@ -223,6 +223,7 @@ fn prepared(request: &HttpFetchRequest) -> PreparedFetchRequest {
         "http",
         "request",
         JsonBytes::new(serde_json::to_vec(request).unwrap()),
+        None,
         InputCommitment::from_digest(Digest::from_bytes([1; 32])),
     );
     HttpFetchAdaptorFactory::new()
@@ -436,6 +437,7 @@ async fn signed_heads_keep_representation_length_only_for_head_and_not_modified(
         "http",
         "request",
         JsonBytes::new(serde_json::to_vec(&head_request).unwrap()),
+        None,
         InputCommitment::from_digest(Digest::from_bytes([1; 32])),
     );
     let session = HttpFetchAdaptorFactory::new()
@@ -604,6 +606,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         "http",
         "request",
         &serde_json::to_vec(&request).unwrap(),
+        None,
         hellas_rpc::FetchContract::http().unwrap().manifest_id(),
         Assurance::ProducerSigned,
         &buyer,
@@ -615,6 +618,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         &input.service,
         &input.method,
         input.body.clone(),
+        None,
         input.input_commitment,
     );
     let session = HttpFetchAdaptorFactory::new()
@@ -692,4 +696,55 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn signed_upstream_policy_reports_actual_peer_and_rejects_substitution_before_http() {
+    use hellas_rpc::upstream::UpstreamPolicy;
+    let (valid, calls, _, task) = server(200, b"ok".to_vec(), None).await;
+    let configured = provider();
+    let policy = UpstreamPolicy {
+        host: "localhost".into(),
+        spki_sha256: valid.tls.spki_sha256.clone(),
+    };
+    let mut request = prepared(&valid);
+    request.upstream = Some(policy.clone());
+    let response = configured.run(request).await.unwrap();
+    let peer = response
+        .peer
+        .as_ref()
+        .expect("actual TLS certificate evidence");
+    assert_eq!(peer.host, "localhost");
+    assert_eq!(peer.spki_sha256, policy.spki_sha256[0]);
+    policy.verify_peer(peer).unwrap();
+    assert_eq!(collect(response).await, b"ok");
+    // Remove the old HTTP-specific pin to exercise the common policy verifier.
+    let mut no_nested_pin = valid.clone();
+    no_nested_pin.tls.spki_sha256.clear();
+    for denied in [
+        UpstreamPolicy {
+            host: "localhost".into(),
+            spki_sha256: vec!["00".repeat(32)],
+        },
+        UpstreamPolicy {
+            host: "another-api.example".into(),
+            spki_sha256: policy.spki_sha256.clone(),
+        },
+    ] {
+        let mut request = prepared(&no_nested_pin);
+        request.upstream = Some(denied);
+        assert!(configured.run(request).await.is_err());
+    }
+    // A different local DNS/address target still needs the named TLS identity.
+    let mut redirected = valid.clone();
+    redirected.url = redirected.url.replace("localhost", "127.0.0.1");
+    let mut request = prepared(&redirected);
+    request.upstream = Some(policy);
+    assert!(configured.run(request).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "denied policies disclose zero HTTP bytes even with a warm connection"
+    );
+    task.abort();
 }

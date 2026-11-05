@@ -286,4 +286,5 @@ pub struct Usage {
 pub struct Provenance {
     /// Lowercase hex commitment string ready for provider wire JSON.
     pub call_commitment: Option<String>,
+    pub upstream: Option<crate::upstream::UpstreamPeer>,
 }

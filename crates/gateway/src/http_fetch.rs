@@ -423,7 +423,16 @@ async fn open(
         body: payload,
     })?;
     let accepted = super::accepted(&mut stream).await;
-    match stream.next().await.transpose()? {
+    let first = stream.next().await.transpose()?;
+    let first = match first {
+        Some(WorkEvent::Output(OutputEvent::Provenance(provenance)))
+            if provenance.upstream.is_some() && provenance.call_commitment.is_none() =>
+        {
+            stream.next().await.transpose()?
+        }
+        first => first,
+    };
+    match first {
         Some(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
             HttpResponseEvent::Head { status, headers },
         )))) if (200..=599).contains(&status) => {

@@ -62,7 +62,7 @@ impl OpenAiResponsesFetchProvider {
         let endpoint =
             Url::parse(OPENAI_RESPONSES_ENDPOINT).map_err(|_| OpenAiConfigError::Endpoint)?;
         Self::with_client(
-            responses_http_client(Default::default())?,
+            responses_http_client(Default::default(), None)?,
             endpoint,
             bearer_token,
         )
@@ -70,7 +70,7 @@ impl OpenAiResponsesFetchProvider {
 
     pub fn with_secret(secret: crate::HttpSecret) -> Result<Self, OpenAiConfigError> {
         Ok(Self {
-            client: responses_http_client(Default::default())?,
+            client: responses_http_client(Default::default(), None)?,
             endpoint: Url::parse(OPENAI_RESPONSES_ENDPOINT)
                 .map_err(|_| OpenAiConfigError::Endpoint)?,
             bearer_token: secret,
@@ -95,9 +95,16 @@ impl OpenAiResponsesFetchProvider {
         &self,
         request: PreparedFetchRequest,
     ) -> Result<FetchProviderResponse, FetchProviderError> {
+        crate::upstream::require_host(request.upstream.as_ref(), &self.endpoint)?;
+        let client = if request.upstream.is_some() {
+            responses_http_client(Default::default(), request.upstream.as_ref())?
+        } else {
+            self.client.clone()
+        };
         execute_responses_request(
-            &self.client,
+            &client,
             self.endpoint.clone(),
+            request.upstream.as_ref(),
             &self.bearer_token.resolve().await?,
             request.body.as_bytes().to_vec(),
             &request.idempotency_key(),
@@ -182,12 +189,11 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
     }
 
     fn provider(addr: std::net::SocketAddr) -> OpenAiResponsesFetchProvider {
-        OpenAiResponsesFetchProvider::with_client(
-            reqwest::Client::new(),
+        let (endpoint, client) = crate::test_support::https_forward(
             Url::parse(&format!("http://{addr}/v1/responses")).unwrap(),
-            "test-key".to_string(),
-        )
-        .unwrap()
+            Default::default(),
+        );
+        OpenAiResponsesFetchProvider::with_client(client, endpoint, "test-key".to_string()).unwrap()
     }
 
     fn test_commitment() -> InputCommitment {
@@ -199,6 +205,7 @@ data: {"type":"response.completed","response":{"id":"resp_up","object":"response
             "openai",
             "responses",
             JsonBytes::new(body.to_vec()),
+            None,
             test_commitment(),
         );
         PreparedFetchRequest::new(&call, call.body.clone())

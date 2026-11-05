@@ -406,6 +406,7 @@ fn fetch_events(
         "openai",
         "responses",
         br#"{"input":"private request"}"#,
+        None,
         test_responses_contract().manifest_id(),
         assurance,
         &ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),

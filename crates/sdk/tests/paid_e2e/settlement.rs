@@ -257,6 +257,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 "openai".into(),
                 "responses".into(),
                 BODY.to_vec(),
+                None,
                 Assurance::ProducerSigned,
             )
             .unwrap();

@@ -286,6 +286,7 @@ mod tests {
                 })),
                 Ok(OutputEvent::Provenance(hellas_rpc::output::Provenance {
                     call_commitment: Some("signed".to_string()),
+                    upstream: None,
                 })),
             ])
             .map(|event| event.map(BackendEvent::from))

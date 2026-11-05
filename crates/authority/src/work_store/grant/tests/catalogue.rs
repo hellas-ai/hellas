@@ -57,7 +57,8 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         (br#"{"model":"fixture","model":"other","input":"private","max_output_tokens":8}"#, TemplateError::Malformed),
     ] {
         let events = hellas_rpc::fetch::build_input_events_with_retention(
-            "openai", "responses", body, test_responses_contract().manifest_id(),
+            "openai", "responses", body,
+        None, test_responses_contract().manifest_id(),
             Assurance::ProducerSigned, &principal(1).1, Retention::Ephemeral,
         ).unwrap();
         let input = hellas_rpc::protocol::invocation::fetch::prepare(&events, &test_responses_contract(), valid_input.request.runner_public_key,

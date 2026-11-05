@@ -1735,6 +1735,7 @@ mod tests {
             "codex",
             "responses",
             JsonBytes::new(body),
+            None,
             InputCommitment::from_digest(Digest::from_bytes([7; 32])),
         )
     }

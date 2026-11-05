@@ -276,7 +276,8 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let client = ClientService::new(ClientEndpoint::recover(fixture.store(Role::Client).await, signer(1)).unwrap());
         client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
         let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
-        let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
+        let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(),
+                    None, Assurance::ProducerSigned).unwrap();
         // The acceptance is reported once, before any output, and names the
         // work and the provider whose transcript the result carries.
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -334,6 +335,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 "openai",
                 "responses",
                 crate::test_support::BODY,
+        None,
                 admission.contract.manifest_id(),
                 Assurance::ProducerSigned,
                 &principal(1).1,

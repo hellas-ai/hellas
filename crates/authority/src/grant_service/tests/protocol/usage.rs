@@ -169,6 +169,7 @@ async fn metered_https_health_requests_do_not_quarantine_generation() {
                 "openai",
                 "responses",
                 &serde_json::to_vec(&request).unwrap(),
+                None,
                 contract.manifest_id(),
                 Assurance::ProducerSigned,
                 &FRIEND.node_key(),

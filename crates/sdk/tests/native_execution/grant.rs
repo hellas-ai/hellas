@@ -255,6 +255,7 @@ async fn local_grant_session_executes_without_http() {
         method: "responses".into(),
         request: br#"{"model":"fixture","input":"fixture","max_output_tokens":8}"#.to_vec(),
         assurance: Assurance::ProducerSigned,
+        upstream: None,
     };
     let terms = hellas_sdk::execution::ExecutionTerms::Grant {
         resource: grant.policies[0].resource,
@@ -578,6 +579,7 @@ fn attempt_identity_and_exclusive_lock_are_enforced() {
         method: "responses".into(),
         request: br#"{"model":"fixture","input":"one"}"#.to_vec(),
         assurance: Assurance::ProducerSigned,
+        upstream: None,
     };
     let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"resource"));
     let terms = ExecutionTerms::Grant { resource };

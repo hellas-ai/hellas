@@ -18,15 +18,21 @@ const FETCH_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// HTTP client for the compiled Responses egress contract. Its roots are bundled;
 /// operator proxy, CA and key-log configuration cannot change the private route.
-pub fn responses_http_client(headers: HeaderMap) -> Result<reqwest::Client, FetchProviderError> {
+pub fn responses_http_client(
+    headers: HeaderMap,
+    upstream: Option<&hellas_rpc::upstream::UpstreamPolicy>,
+) -> Result<reqwest::Client, FetchProviderError> {
     let tls = crate::http::tls::config(&hellas_rpc::http_fetch::HttpTls {
         roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
-        spki_sha256: Vec::new(),
+        spki_sha256: upstream
+            .map(|policy| policy.spki_sha256.clone())
+            .unwrap_or_default(),
     })
     .map_err(FetchProviderError::failed)?;
     reqwest::Client::builder()
         .default_headers(headers)
         .no_proxy()
+        .tls_info(true)
         .retry(reqwest::retry::never())
         .tls_backend_preconfigured(tls)
         .connect_timeout(Duration::from_secs(10))
@@ -39,6 +45,7 @@ pub fn responses_http_client(headers: HeaderMap) -> Result<reqwest::Client, Fetc
 pub async fn execute_responses_request(
     client: &reqwest::Client,
     endpoint: Url,
+    upstream_policy: Option<&hellas_rpc::upstream::UpstreamPolicy>,
     bearer_token: &str,
     body: Vec<u8>,
     // Derived from the input transcript commitment, so a re-issued call for
@@ -47,6 +54,7 @@ pub async fn execute_responses_request(
     idempotency_key: &str,
     label: &str,
 ) -> Result<FetchProviderResponse, FetchProviderError> {
+    crate::upstream::require_host(upstream_policy, &endpoint)?;
     let mut telemetry = telemetry::Request::new(&endpoint);
     let request = client
         .post(endpoint)
@@ -94,12 +102,14 @@ pub async fn execute_responses_request(
         )));
     }
 
+    let peer = crate::upstream::observed_peer(&upstream)?;
     let head = FetchProviderResponseHead {
         effective_model: effective_model_from_headers(upstream.headers())
             .inspect_err(|_| telemetry.fail("invalid_response_headers"))?,
         http: None,
     };
     Ok(FetchProviderResponse {
+        peer: Some(peer),
         head,
         stream: Box::pin(telemetry.stream(stream_response(upstream, label.to_string()))),
     })

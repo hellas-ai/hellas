@@ -12,6 +12,7 @@ fn job() -> hellas_sdk::job::Job {
         "openai".into(),
         "responses".into(),
         BODY.to_vec(),
+        None,
         Assurance::ProducerSigned,
     )
     .unwrap()
@@ -344,6 +345,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                 "openai".into(),
                 "responses".into(),
                 br#"{"input":"different"}"#.to_vec(),
+                None,
                 Assurance::ProducerSigned,
             )
             .unwrap();
@@ -721,6 +723,7 @@ fn reused_nonce_scenario(
                 "openai".into(),
                 "responses".into(),
                 br#"{"model":"fixture","input":"abandoned","max_output_tokens":8}"#.to_vec(),
+                None,
                 Assurance::ProducerSigned,
             )
             .unwrap()

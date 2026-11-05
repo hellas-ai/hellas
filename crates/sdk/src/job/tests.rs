@@ -3,6 +3,7 @@ use super::*;
 fn fetch() -> Job {
     Job::fetch(20, FetchContract::http().unwrap(), "http".into(), "request".into(),
         br#"{"url":"https://example.test/path","method":"GET","tls":{"roots":{"mode":"web_pki"}},"max_response_bytes":4096}"#.to_vec(),
+                    None,
         Assurance::ProducerSigned).unwrap()
 }
 

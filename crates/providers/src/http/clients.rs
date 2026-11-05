@@ -43,6 +43,7 @@ impl Clients {
         // but the insertion check below shares one pool before either sends.
         let client = Client::builder()
             .no_proxy()
+            .tls_info(true)
             .no_gzip()
             .no_brotli()
             .no_deflate()

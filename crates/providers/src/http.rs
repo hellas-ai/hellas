@@ -200,11 +200,25 @@ impl HttpFetchProvider {
         &self,
         prepared: PreparedFetchRequest,
     ) -> Result<FetchProviderResponse, FetchProviderError> {
-        let request = HttpFetchRequest::decode(prepared.body.as_bytes())
+        let mut request = HttpFetchRequest::decode(prepared.body.as_bytes())
             .map_err(|_| fault("invalid HTTPS request"))?;
         let url = request
             .parsed_url()
             .map_err(|_| fault("invalid HTTPS URL"))?;
+        crate::upstream::require_host(prepared.upstream.as_ref(), &url)?;
+        if let Some(policy) = &prepared.upstream {
+            if request.tls.spki_sha256.is_empty() {
+                request.tls.spki_sha256 = policy.spki_sha256.clone();
+            } else if !policy.spki_sha256.is_empty() {
+                request
+                    .tls
+                    .spki_sha256
+                    .retain(|pin| policy.spki_sha256.contains(pin));
+                if request.tls.spki_sha256.is_empty() {
+                    return Err(fault("conflicting signed upstream SPKI constraints"));
+                }
+            }
+        }
         let host = url.host_str().ok_or_else(|| fault("missing HTTPS host"))?;
         if !self.policy.allowed_hosts.is_empty()
             && !self
@@ -315,6 +329,7 @@ impl HttpFetchProvider {
             status: response.status().as_u16(),
             headers,
         };
+        let peer = crate::upstream::observed_peer(&response)?;
         let limit = request.max_response_bytes as usize;
         let stream = async_stream::try_stream! {
             let mut upstream = response.bytes_stream();
@@ -338,6 +353,7 @@ impl HttpFetchProvider {
             }
         };
         Ok(FetchProviderResponse {
+            peer: Some(peer),
             head: FetchProviderResponseHead {
                 effective_model: None,
                 http: Some(head),

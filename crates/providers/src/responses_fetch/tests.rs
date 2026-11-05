@@ -94,9 +94,11 @@ async fn test_endpoint(app: Router, path: &str) -> Url {
 }
 
 async fn execute_test_request(endpoint: Url) -> Result<FetchProviderResponse, FetchProviderError> {
+    let (endpoint, client) = crate::test_support::https_forward(endpoint, Default::default());
     execute_responses_request(
-        &responses_http_client(Default::default()).unwrap(),
+        &client,
         endpoint,
+        None,
         "secret",
         br#"{"model":"m","input":"hi","stream":true}"#.to_vec(),
         "idempotency",
@@ -207,7 +209,7 @@ async fn stalled_sse_body_hits_the_idle_deadline() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let response = responses_http_client(Default::default())
+    let response = responses_http_client(Default::default(), None)
         .unwrap()
         .post(format!("http://{addr}/stalled"))
         .send()

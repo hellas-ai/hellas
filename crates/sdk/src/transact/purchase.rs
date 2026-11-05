@@ -919,7 +919,8 @@ mod tests {
     }
 
     fn job() -> Job {
-        Job::fetch(20, hellas_rpc::FetchContract::http().unwrap(), "http".into(), "request".into(), br#"{"url":"https://example.test/private-input-sentinel","method":"GET","tls":{"roots":{"mode":"web_pki"}},"max_response_bytes":4096}"#.to_vec(), hellas_rpc::Assurance::ProducerSigned).unwrap()
+        Job::fetch(20, hellas_rpc::FetchContract::http().unwrap(), "http".into(), "request".into(), br#"{"url":"https://example.test/private-input-sentinel","method":"GET","tls":{"roots":{"mode":"web_pki"}},"max_response_bytes":4096}"#.to_vec(),
+                    None, hellas_rpc::Assurance::ProducerSigned).unwrap()
     }
     #[test]
     fn paid_but_unreported_marker_refuses_a_charge_and_retains_no_payload() {

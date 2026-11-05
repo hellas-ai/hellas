@@ -141,6 +141,7 @@ fn render_stream_events_carry_provenance_in_chunks() {
             &mut state,
             OutputEvent::Provenance(hellas_rpc::output::Provenance {
                 call_commitment: Some("aa".repeat(32)),
+                upstream: None,
             }),
         )
         .unwrap();
@@ -167,6 +168,7 @@ fn render_stream_events_carry_provenance_in_chunks() {
             &mut state,
             OutputEvent::Provenance(hellas_rpc::output::Provenance {
                 call_commitment: Some("aa".repeat(32)),
+                upstream: None,
             }),
         )
         .unwrap();

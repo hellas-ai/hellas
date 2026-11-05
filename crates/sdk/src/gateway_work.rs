@@ -449,6 +449,7 @@ impl WorkRequest {
                 method: request.method.clone(),
                 request: body,
                 assurance,
+                upstream: None,
             };
             match input.admits(policy, retain) {
                 Ok(()) if admitted.is_some() => {

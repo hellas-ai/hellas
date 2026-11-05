@@ -52,6 +52,7 @@ pub enum JobInput {
         method: String,
         request: Vec<u8>,
         assurance: Assurance,
+        upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
     },
     Compute {
         environment: compute::Environment,
@@ -90,6 +91,7 @@ struct FetchFiles {
     method: String,
     request: String,
     assurance: String,
+    upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,12 +126,14 @@ impl JobInput {
                 method,
                 request,
                 assurance,
+                upstream,
             } => hellas_rpc::canonical_dag_cbor(&(
                 "fetch",
                 serde_bytes::Bytes::new(&contract.canonical_bytes()),
                 service,
                 method,
                 assurance.to_byte(),
+                upstream,
                 serde_bytes::Bytes::new(request),
             )),
             Self::Compute {
@@ -216,11 +220,13 @@ impl JobInput {
                 method,
                 request,
                 assurance,
+                upstream,
             } => {
                 let events = hellas_rpc::fetch::build_input_events_with_nonce(
                     service,
                     method,
                     request,
+                    upstream.as_ref(),
                     contract.manifest_id(),
                     *assurance,
                     key,
@@ -293,6 +299,7 @@ impl Job {
         service: String,
         method: String,
         request: Vec<u8>,
+        upstream: Option<hellas_rpc::upstream::UpstreamPolicy>,
         assurance: Assurance,
     ) -> Result<Self> {
         Self::from_input(
@@ -303,6 +310,7 @@ impl Job {
                 method,
                 request,
                 assurance,
+                upstream,
             },
         )
     }
@@ -362,6 +370,7 @@ impl Job {
                 method,
                 request,
                 assurance,
+                upstream,
             } => hellas_rpc::canonical_dag_cbor(&(
                 FORMAT,
                 self.price,
@@ -370,6 +379,7 @@ impl Job {
                 service,
                 method,
                 assurance.to_byte(),
+                upstream,
                 serde_bytes::Bytes::new(request),
             )),
             JobInput::Compute {
@@ -434,6 +444,7 @@ impl Job {
                         &fetch.request,
                         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
                     )?,
+                    fetch.upstream,
                     assurance,
                 )?
             }
@@ -515,6 +526,7 @@ impl Job {
                 method,
                 request,
                 assurance,
+                upstream,
             } => {
                 write("contract.json", &serde_json::to_vec_pretty(contract)?)?;
                 write("request.json", request)?;
@@ -523,6 +535,7 @@ impl Job {
                     service: service.clone(),
                     method: method.clone(),
                     request: "request.json".into(),
+                    upstream: upstream.clone(),
                     assurance: match assurance {
                         Assurance::ProducerSigned => "producer-signed",
                         Assurance::AppleAppAttest => "apple-app-attest",

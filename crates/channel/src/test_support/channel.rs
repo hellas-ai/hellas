@@ -1025,6 +1025,7 @@ pub fn fetch_bundle(nonce: u8) -> PreparedInvocation {
         "http",
         "fetch",
         &body,
+        None,
         contract.manifest_id(),
         Assurance::ProducerSigned,
         &caller,

@@ -9,7 +9,7 @@ use axum::{
 };
 use futures::StreamExt;
 use hellas_executor::{FetchProviderError, FetchProviderResponse};
-use hellas_providers::{execute_responses_request, responses_http_client};
+use hellas_providers::execute_responses_request;
 use reqwest::Url;
 
 async fn test_endpoint(app: Router, path: &str) -> Url {
@@ -20,9 +20,12 @@ async fn test_endpoint(app: Router, path: &str) -> Url {
 }
 
 async fn execute_test_request(endpoint: Url) -> Result<FetchProviderResponse, FetchProviderError> {
+    let (endpoint, client) =
+        hellas_providers::test_support::https_forward(endpoint, Default::default());
     execute_responses_request(
-        &responses_http_client(Default::default()).unwrap(),
+        &client,
         endpoint,
+        None,
         "secret",
         br#"{"model":"m","input":"hi","stream":true}"#.to_vec(),
         "idempotency",

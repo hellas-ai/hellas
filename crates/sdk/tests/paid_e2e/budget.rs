@@ -65,6 +65,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 "openai".into(),
                 "responses".into(),
                 BODY.to_vec(),
+                None,
                 Assurance::ProducerSigned,
             )
             .unwrap();
