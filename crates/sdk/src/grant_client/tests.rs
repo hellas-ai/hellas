@@ -631,26 +631,38 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
             let transport = IrohTransport::new(connection);
             let inbound = transport.accept().await.unwrap().unwrap();
             assert_eq!(inbound.method_id, Open::METHOD_ID);
-            hellas_rpc::call::dispatch_unary_with_context::<IrohTransport, Open, _, _, _>(
-                inbound,
-                move |_, _| async move {
-                    if missing {
-                        Err(hellas_wire::WireStatus::new(
-                            hellas_wire::WireCode::Unimplemented,
-                            "Open unavailable",
-                        ))
-                    } else {
-                        Ok(hellas_rpc::pb::execute::OpenResponse {
-                            provider_genesis: crate::grant_client::tests::provider_enrollment(3)
-                                .canonical_bytes(),
-                            proof: None,
-                        })
-                    }
-                },
-            )
-            .await
-            .unwrap();
+            let response = hellas_rpc::call::dispatch_unary_with_context::<
+                IrohTransport,
+                Open,
+                _,
+                _,
+                _,
+            >(inbound, move |_, _| async move {
+                if missing {
+                    Err(hellas_wire::WireStatus::new(
+                        hellas_wire::WireCode::Unimplemented,
+                        "Open unavailable",
+                    ))
+                } else {
+                    Ok(hellas_rpc::pb::execute::OpenResponse {
+                        provider_genesis: crate::grant_client::tests::provider_enrollment(3)
+                            .canonical_bytes(),
+                        proof: None,
+                    })
+                }
+            })
+            .await;
             client_finished.await.unwrap();
+            // The client has asserted the exact Open refusal before signaling.
+            // Dropping that refused connection may beat the final QUIC ACK on
+            // the server, even though the client received the whole response.
+            // Only that known close race is benign; retain all other failures.
+            assert!(
+                response.is_ok()
+                    || matches!(&response, Err(hellas_wire::TransportError::Io(message))
+                        if message == "close: connection lost"),
+                "unexpected Open response failure: {response:?}",
+            );
             tokio::time::pause();
             if let Ok(Ok(_)) = tokio::time::timeout(WAIT, transport.connection().accept_bi()).await
             {
@@ -674,9 +686,9 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
         } else {
             assert_err!(result, GrantClientError::Client(hellas_client::ClientError::Protocol(message)) if message.starts_with("provider genesis pin mismatch"));
         }
-        finished.send(()).unwrap();
         assert!(!path.exists());
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        finished.send(()).unwrap();
         server.await.unwrap();
         client.close().await;
         provider.close().await;
