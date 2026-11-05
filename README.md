@@ -104,27 +104,15 @@ the verified read-only descriptor and detects path/inode replacement; it does
 not defend against a separate local process that already holds a writable
 descriptor to the same inode and mutates it concurrently.
 
-## Own a worker and share access
+## Install
 
-Use a CLI and worker from the same release. Download the portable CLI archive
-and `SHA256SUMS` from the [release page](https://github.com/hellas-ai/hellas/releases).
-For x86_64 Linux, set `RELEASE` to the selected tag and `REVISION` to its full
-commit SHA, then verify before unpacking:
+Portable CLI binaries for [Linux](https://hydra.hellas.ai/job/hellas/hellas-cli/x86_64-linux.artifacts.portable-x86_64) and [macOS](https://hydra.hellas.ai/job/hellas/hellas-cli/aarch64-darwin.artifacts.portable-aarch64) are built as our [Hydra channel](https://hydra.hellas.ai/jobset/hellas/hellas-cli) advances. Install like so:
 
 ```sh
-archive="hellas-cli-x86_64-linux-musl-${REVISION}.tar.gz"
-curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/${archive}"
-curl -fLO "https://github.com/hellas-ai/hellas/releases/download/${RELEASE}/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf "$archive"
-export PATH="$PWD/bin:$PATH"
-hellas --version
+curl -fsSL https://github.com/hellas-ai/hellas/releases/latest/download/install.sh | sh
 ```
 
-This walkthrough requires a release containing `identity init --passkey-out`,
-`serve --audio-model`, and `admin share`. The earlier
-`v0.1.0-fbb697b1e42e` release does not contain these interfaces; use matching
-CLI and worker artifacts from the final reviewed commit.
+## Own a worker and share access
 
 Download and convert multilingual Whisper tiny, then download the sample audio:
 
@@ -458,8 +446,7 @@ nix run .#check-kernel-model-verify
 
 `nix run .#check` runs the PR lints and unit tests. CLI, GPU execution and
 consensus have independent Hydra release jobsets for their heavier tests and
-artifacts. See [checks and releases](docs/releases.md) for promotion and
-deployment through infra. `devnet` tracks chain rollout; it does not trigger
+artifacts. `devnet` tracks chain rollout; it does not trigger
 CLI or GPU releases.
 
 ## Docker
@@ -491,8 +478,7 @@ docker run --rm --device /dev/kfd --device /dev/dri \
 
 Both GPU images default to `serve` with their matching backend. The host supplies
 the GPU driver and model content stays on runtime volumes. Published images are
-the Hydra-built artifacts of a commit whose CLI and GPU releases both passed;
-see [checks and releases](docs/releases.md).
+the Hydra-built artifacts of a commit whose CLI and GPU releases both passed.
 
 A GPU asset owner uploads verified weights once and execution workers map them
 read-only. Worker replacement retains weights; asset pressure recreates the

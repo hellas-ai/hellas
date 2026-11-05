@@ -96,12 +96,12 @@ jobs:
       - name: Build the Hydra release artifact
         run: >-
           nix build --accept-flake-config
-          .#releaseJobs.cli.aarch64-darwin.artifacts.native
+          .#releaseJobs.cli.aarch64-darwin.artifacts.portable-aarch64
       - name: Verify the downloadable CLI
         run: |
           mkdir unpacked
           (cd result && shasum -a 256 -c SHA256SUMS)
-          tar -xzf result/hellas-cli-aarch64-darwin-*.tar.gz -C unpacked
+          tar -xzf result/hellas-aarch64-darwin-portable-*.tar.gz -C unpacked
           test "$(lipo -archs unpacked/bin/hellas)" = arm64
           codesign --verify --strict unpacked/bin/hellas
           otool -L unpacked/bin/hellas
@@ -113,7 +113,7 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin unpacked/bin/hellas --help
       - uses: actions/upload-artifact@v4
         with:
-          name: hellas-cli-aarch64-darwin
+          name: hellas-aarch64-darwin-portable
           path: |
             result/*.tar.gz
             result/SHA256SUMS
