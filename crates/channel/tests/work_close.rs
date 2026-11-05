@@ -4059,14 +4059,36 @@ async fn client_replays_contest_history_and_waits_for_finalized_close() {
 #[tokio::test]
 async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
     use hellas_channel::model::work::PaidChannel;
-    struct DelayedHistory {
+    struct Pause {
+        height: std::sync::atomic::AtomicU64,
+        submission: std::sync::atomic::AtomicBool,
+        reached: tokio::sync::Notify,
+    }
+    struct PausedSink<'a> {
+        mempool: Mempool,
+        pause: &'a Pause,
+    }
+    impl hellas_channel::work_close::TxSink for PausedSink<'_> {
+        async fn submit(
+            &self,
+            tx: hellas_kernel::Tx,
+        ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+            if self.pause.submission.swap(false, Ordering::SeqCst) {
+                self.pause.reached.notify_one();
+                std::future::pending::<()>().await;
+            }
+            hellas_channel::work_close::TxSink::submit(&self.mempool, tx).await
+        }
+    }
+    struct DelayedHistory<'a> {
+        pause: &'a Pause,
         start: PaymentCloseStart,
         inclusion: u64,
         deadline: u64,
         latest: u64,
         reads: std::sync::Mutex<Vec<u64>>,
     }
-    impl FinalizedBlocks for DelayedHistory {
+    impl FinalizedBlocks for DelayedHistory<'_> {
         async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
             Ok(Some(self.latest))
         }
@@ -4076,7 +4098,10 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
                 "the already-read quiet tail is not fetched"
             );
             self.reads.lock().unwrap().push(height);
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            if height == self.pause.height.load(Ordering::SeqCst) {
+                self.pause.reached.notify_one();
+                std::future::pending::<()>().await;
+            }
             Ok(Some(block(
                 height,
                 if height == self.inclusion {
@@ -4137,14 +4162,23 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
     }
     store.rotate().await.unwrap();
     drop(store);
+    let pause = Pause {
+        height: std::sync::atomic::AtomicU64::new(0),
+        submission: std::sync::atomic::AtomicBool::new(true),
+        reached: tokio::sync::Notify::new(),
+    };
     let source = DelayedHistory {
+        pause: &pause,
         start,
         inclusion,
         deadline,
         latest,
         reads: Default::default(),
     };
-    let sink = Mempool::default();
+    let sink = PausedSink {
+        mempool: Mempool::default(),
+        pause: &pause,
+    };
     let mut previous = inclusion - 1;
     let mut completed = false;
     let mut interruptions = 0;
@@ -4166,18 +4200,32 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
         store.rotate().await.unwrap();
         let mut endpoint = ClientEndpoint::recover(store, client()).unwrap();
         source.reads.lock().unwrap().clear();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            endpoint.advance_close(&source, &sink),
-        )
-        .await;
+        // Cancel only after 64 blocks have been verified and committed, or
+        // immediately before submission once the entire history is durable.
+        pause.height.store(previous + 65, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                result = endpoint.advance_close(&source, &sink) => Some(result),
+                () = pause.reached.notified() => None,
+            }
+        })
+        .await
+        .expect("close recovery reaches a controlled cancellation point or completes");
         let queried = source.reads.lock().unwrap().clone();
-        assert_eq!(
-            queried.first().copied(),
-            Some(previous + 1),
-            "retry begins after durable progress"
-        );
-        if let Ok(result) = result {
+        if previous < deadline {
+            assert_eq!(
+                queried.first().copied(),
+                Some(previous + 1),
+                "retry begins after durable progress"
+            );
+        } else {
+            assert!(
+                queried.is_empty(),
+                "fully durable history needs no reads after cancelled submission"
+            );
+        }
+        if let Some(result) = result {
+            assert_eq!(previous, deadline, "retry retains the complete history");
             assert!(
                 matches!(result.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
             );
@@ -4185,7 +4233,7 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
             break;
         }
         assert!(
-            sink.taken().is_empty(),
+            sink.mempool.taken().is_empty(),
             "partial history cannot authorize a payout"
         );
         interruptions += 1;
@@ -4196,7 +4244,7 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
         "bounded retries eventually reconstruct all 4097 blocks"
     );
     assert!(interruptions > 1);
-    assert_eq!(sink.taken().len(), 1);
+    assert_eq!(sink.mempool.taken().len(), 1);
 }
 
 #[tokio::test]
