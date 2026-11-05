@@ -55,7 +55,7 @@ pub enum ModelResponse {
 }
 
 impl ModelPackage {
-    /// A Qwen3 GGUF, or a converted Whisper or Flux package directory.
+    /// A Qwen GGUF, or a converted Whisper or Flux package directory.
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             family: if path.join("model_index.json").is_file() {
