@@ -83,28 +83,48 @@ impl OfferConnection {
         // before the provider's local finalized view catches up. Reuse the
         // exact signed request; this cannot create another funding signature
         // or a work proposal.
-        let mut needs_funding = false;
-        let response = tokio::time::timeout(timeout, async {
+        retry_offer(timeout, args.config.poll, funding.is_some(), || {
+            hellas_rpc::call::unary::<_, hellas_rpc::services::work_setup::RequestOffer>(
+                &self.transport,
+                request.clone(),
+                Metadata::new(),
+            )
+        })
+        .await
+    }
+}
+
+async fn retry_offer<F, R>(
+    timeout: Duration,
+    poll: Duration,
+    funded: bool,
+    mut request: F,
+) -> Result<Outcome>
+where
+    F: FnMut() -> R,
+    R: Future<Output = Result<hellas_rpc::pb::work::RequestOfferResponse, hellas_wire::WireStatus>>,
+{
+    let mut needs_funding = false;
+    let mut unavailable = None;
+    let response = tokio::time::timeout(timeout, async {
             loop {
-                let response = hellas_rpc::call::unary::<
-                    _,
-                    hellas_rpc::services::work_setup::RequestOffer,
-                >(&self.transport, request.clone(), Metadata::new())
-                .await;
+                let response = request().await;
                 match response {
                     // A block may advance between the provider's coherent proof
                     // reads. Retrying this signed request reuses its retained offer.
                     Err(status) if status.code() == hellas_wire::WireCode::Unavailable => {
+                        tracing::debug!(%status, "provider offer temporarily unavailable");
+                        unavailable = Some(status);
                         needs_funding = false;
-                        tokio::time::sleep(args.config.poll).await;
+                        tokio::time::sleep(poll).await;
                     }
                     Ok(response)
-                        if funding.is_some()
+                        if funded
                             && matches!(response.outcome.as_ref(), Some(Outcome::Refused(refused))
                                 if refused.code == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32) =>
                     {
                         needs_funding = true;
-                        tokio::time::sleep(args.config.poll).await;
+                        tokio::time::sleep(poll).await;
                     }
                     response => {
                         return response.map_err(|status| {
@@ -118,14 +138,15 @@ impl OfferConnection {
         .map_err(|_| {
             if needs_funding {
                 PaidClientError::OfferRefused(hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32)
+            } else if let Some(source) = unavailable {
+                PaidClientError::OfferUnavailable { source }
             } else {
                 PaidClientError::Timeout { stage: "offer availability" }
             }
         })??;
-        response
-            .outcome
-            .ok_or(PaidClientError::MissingState("offer response"))
-    }
+    response
+        .outcome
+        .ok_or(PaidClientError::MissingState("offer response"))
 }
 
 fn check_quote(args: &PaidWorkOptions, quote: Quote) -> Result<PaidQuote> {
@@ -372,5 +393,93 @@ impl RetainedSetups {
             retained = Some((store, offer));
         }
         Ok(retained)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use hellas_rpc::pb::work::{OfferRefusalCode, OfferRefused, RequestOfferResponse};
+    use hellas_wire::{WireCode, WireStatus};
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_deadline_preserves_the_last_provider_cause() {
+        let mut calls = 0;
+        let error = retry_offer(
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            false,
+            || {
+                calls += 1;
+                std::future::ready(Err(WireStatus::new(
+                    WireCode::Unavailable,
+                    if calls == 1 {
+                        "initializing"
+                    } else {
+                        "chain node is catching up"
+                    },
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(calls >= 2);
+        let PaidClientError::OfferUnavailable { source } = error else {
+            panic!("{error}")
+        };
+        assert_eq!(source.code(), WireCode::Unavailable);
+        assert!(source.to_string().contains("chain node is catching up"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_funding_refusal_supersedes_an_earlier_unavailable_error() {
+        let mut calls = 0;
+        let error = retry_offer(Duration::from_secs(3), Duration::from_secs(1), true, || {
+            calls += 1;
+            std::future::ready(if calls == 1 {
+                Err(WireStatus::new(WireCode::Unavailable, "initializing"))
+            } else {
+                Ok(RequestOfferResponse {
+                    outcome: Some(Outcome::Refused(OfferRefused {
+                        code: OfferRefusalCode::NeedsFunding as i32,
+                        required: 401,
+                    })),
+                })
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, PaidClientError::OfferRefused(code) if code == OfferRefusalCode::NeedsFunding as i32)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_returns_a_response_when_the_provider_becomes_available() {
+        let mut calls = 0;
+        let response = retry_offer(
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            false,
+            || {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Err(WireStatus::new(WireCode::Unavailable, "initializing"))
+                } else {
+                    Ok(RequestOfferResponse {
+                        outcome: Some(Outcome::Refused(OfferRefused {
+                            code: OfferRefusalCode::NoStakeAvailable as i32,
+                            required: 0,
+                        })),
+                    })
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(
+            matches!(response, Outcome::Refused(refused) if refused.code == OfferRefusalCode::NoStakeAvailable as i32)
+        );
     }
 }
