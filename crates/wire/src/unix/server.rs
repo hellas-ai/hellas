@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::TransportContext;
@@ -27,11 +27,11 @@ pub async fn connect(path: impl AsRef<Path>) -> io::Result<MuxTransport> {
 }
 
 /// Dropping this handle closes the listener/connections and unlinks only the
-/// socket it created. Existing paths are never overwritten, including stale
-/// sockets left by a crashed process.
+/// socket it created. Stale sockets are recovered under a per-path lock.
 pub struct LocalControlServer {
     task: ListenerTask,
     _socket: SocketPath,
+    _lock: std::fs::File,
 }
 
 struct SocketPath {
@@ -60,6 +60,57 @@ impl LocalControlServer {
                 "control socket parent must be owned by this user with mode 0700",
             ));
         }
+        // Serialize bind/recovery across cooperating hosts. Keep this lock file
+        // after exit: unlinking a locked inode permits a competing lock inode.
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(PathBuf::from(lock_name))?;
+        let lock_meta = lock.metadata()?;
+        if !lock_meta.is_file() || lock_meta.uid() != uid || lock_meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid control socket lock",
+            ));
+        }
+        lock.try_lock()
+            .map_err(|error| io::Error::new(io::ErrorKind::AddrInUse, error))?;
+        if let Ok(before) = std::fs::symlink_metadata(path) {
+            if !before.file_type().is_socket() || before.uid() != uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "control path is not an owned socket",
+                ));
+            }
+            let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+            probe.set_nonblocking(true)?;
+            let address = socket2::SockAddr::unix(path)?;
+            match probe.connect(&address) {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "control socket is in use",
+                    ));
+                }
+            }
+            let after = std::fs::symlink_metadata(path)?;
+            if before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || !after.file_type().is_socket()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "control socket changed during recovery",
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
         let listener = UnixListener::bind(path)?;
         let metadata = std::fs::symlink_metadata(path)?;
         let socket = SocketPath {
@@ -86,6 +137,7 @@ impl LocalControlServer {
                 task,
             },
             _socket: socket,
+            _lock: lock,
         })
     }
 

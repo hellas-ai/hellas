@@ -189,6 +189,27 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
             .bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
     assert_eq!(std::fs::read(&socket).unwrap(), b"existing file");
     std::fs::remove_file(&socket).unwrap();
+    // Simulate an unclean process exit: the kernel listener closes but the
+    // filesystem entry remains. Recovery must keep the existing safety checks.
+    let abandoned = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    hellas_channel::test_support::assert_err!(f.service.bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
+    assert!(
+        socket.exists(),
+        "live uncooperative listener must not be unlinked"
+    );
+    drop(abandoned);
+    let recovered = f
+        .service
+        .bind_local(&socket, server_config.clone())
+        .unwrap();
+    recovered.shutdown().await.unwrap();
+    assert!(!socket.exists());
+    let target = parent.join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, &socket).unwrap();
+    hellas_channel::test_support::assert_err!(f.service.bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    std::fs::remove_file(&socket).unwrap();
 
     let listener = f
         .service

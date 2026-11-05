@@ -108,7 +108,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-721edd0a567d"
+evaluator = "hellas/catena-6e6ee62fc00e"
 adaptor = "compute-0.0.1"
 
 [payment]

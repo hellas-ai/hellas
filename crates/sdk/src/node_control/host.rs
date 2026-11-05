@@ -36,7 +36,7 @@ pub trait PreparedProviderConfiguration: Send {
     fn rollback(&mut self) -> Result<(), ProviderErrorBox>;
 }
 
-/// Starts the gateway with the access the host validated at startup.
+/// Starts the gateway with access validated by the host.
 pub type GatewayFactory = Arc<
     dyn Fn(
             hellas_gateway::GatewayAccess,
@@ -46,6 +46,20 @@ pub type GatewayFactory = Arc<
         > + Send
         + Sync,
 >;
+
+/// Read already-provisioned listener access when explicitly starting a gateway.
+/// This callback must not create grants or credentials. The host validates the
+/// result and its authority writer before handing it to the gateway factory.
+pub type GatewayAccessLoader = Arc<
+    dyn Fn() -> BoxFuture<'static, Result<hellas_gateway::GatewayAccess, ProviderErrorBox>>
+        + Send
+        + Sync,
+>;
+
+struct GatewayConfiguration {
+    factory: GatewayFactory,
+    loader: Option<GatewayAccessLoader>,
+}
 
 /// The provider identity is the authority's binding, read from the store.
 pub struct HostOptions {
@@ -90,6 +104,34 @@ impl HostHandle {
     /// An authority without a provider binding still serves control; provider
     /// start is refused until the binding exists.
     pub async fn start(options: HostOptions) -> Result<Self, HostError> {
+        Self::start_inner(options, None).await
+    }
+
+    /// Mount a stopped gateway whose listener credential will be provisioned
+    /// separately, through the normal owner-authorized control operations.
+    /// Startup never invokes `loader`; first enable loads and validates access.
+    pub async fn start_with_deferred_gateway(
+        options: HostOptions,
+        factory: GatewayFactory,
+        loader: GatewayAccessLoader,
+    ) -> Result<Self, HostError> {
+        if options.gateway.is_some() || options.control.is_none() {
+            return Err(HostError::Composition);
+        }
+        Self::start_inner(
+            options,
+            Some(GatewayConfiguration {
+                factory,
+                loader: Some(loader),
+            }),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        options: HostOptions,
+        deferred: Option<GatewayConfiguration>,
+    ) -> Result<Self, HostError> {
         if let Some((access, _)) = &options.gateway {
             if !options
                 .control
@@ -119,7 +161,7 @@ impl HostHandle {
             transport: transport.clone(),
             state,
             has_provider: options.provider.is_some(),
-            has_gateway: options.gateway.is_some(),
+            has_gateway: options.gateway.is_some() || deferred.is_some(),
             endpoint: watch::channel(None).0,
         };
         let (control, listener) = if let Some((node, config)) = options.control {
@@ -156,7 +198,13 @@ impl HostHandle {
             stopped,
             control,
             options.provider,
-            options.gateway.map(|(_, factory)| factory),
+            options
+                .gateway
+                .map(|(_, factory)| GatewayConfiguration {
+                    factory,
+                    loader: None,
+                })
+                .or(deferred),
         ));
         let host = Self {
             runtime,
@@ -464,7 +512,7 @@ impl Runtime {
         command: &Command,
         control: &Option<NodeControl>,
         provider: &Option<ProviderFactory>,
-        gateway: &Option<GatewayFactory>,
+        gateway: &Option<GatewayConfiguration>,
         stopped: &watch::Receiver<bool>,
     ) -> Result<(), WireStatus> {
         if !command.enabled {
@@ -578,8 +626,28 @@ impl Runtime {
                     state.gateway_state = RuntimeState::Starting;
                     state.access.clone()
                 })?;
-                match factory(access.ok_or_else(unsupported)?).await {
-                    Ok(handle) => self.with(|state| {
+                let started: Result<_, ProviderErrorBox> = async {
+                    let access = match access {
+                        Some(access) => access,
+                        None => (factory.loader.as_ref().ok_or(HostError::Composition)?)().await?,
+                    };
+                    if !control
+                        .as_ref()
+                        .is_some_and(|control| access.shares_writer(&control.node))
+                    {
+                        return Err(HostError::Composition.into());
+                    }
+                    access.validate().await?;
+                    if *stopped.borrow() {
+                        return Err(std::io::Error::other("host is shutting down").into());
+                    }
+                    let handle = (factory.factory)(access.clone()).await?;
+                    Ok((access, handle))
+                }
+                .await;
+                match started {
+                    Ok((access, handle)) => self.with(|state| {
+                        state.access = Some(access);
                         state.gateway = Some(handle);
                         state.gateway_state = RuntimeState::Running;
                     }),
@@ -603,7 +671,7 @@ async fn run(
     mut stopped: watch::Receiver<bool>,
     control: Option<NodeControl>,
     provider: Option<ProviderFactory>,
-    gateway: Option<GatewayFactory>,
+    gateway: Option<GatewayConfiguration>,
 ) -> Result<(), HostError> {
     loop {
         let command = tokio::select! {

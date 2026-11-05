@@ -2,21 +2,27 @@ use bincode::Options;
 use catena_lang::{
     codegen::{CodegenKind, GpuDialect},
     report::CompileReport,
-    runtime::{ModuleCache, RuntimeModule},
+    runtime::RuntimeModule,
 };
 use hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES;
-use std::{
-    io::{Read, Write},
-    path::Path,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{io::Read, path::Path};
 
-use super::process::{Cancellation, Watchdog, isolate_child};
+use super::process::{Cancellation, isolate_child};
+#[cfg(target_os = "linux")]
+use {
+    super::process::Watchdog,
+    catena_lang::runtime::ModuleCache,
+    std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::Duration,
+    },
+};
 
 // Decision 23's killable compile child, specified in plan-v4 §§2.2/2.5.
 // Decision 41 removes its deadline but retains explicit cancellation.
 const COMPILE_ENV: &str = "HELLAS_CATENA_COMPILE";
+#[cfg(target_os = "linux")]
 const MAX_MODULE_BYTES: u64 = 256 << 20;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -70,6 +76,7 @@ pub fn compile(
     compile_cancellable(sources, executable, &Cancellation::default(), dialect)
 }
 
+#[cfg(target_os = "linux")]
 pub fn compile_cancellable(
     sources: &[String],
     executable: &Path,
@@ -152,6 +159,7 @@ pub fn compile_cancellable(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn compile_child(
     sources: &[String],
     executable: &Path,
@@ -219,4 +227,21 @@ fn compile_child(
         .with_limit(MAX_MODULE_BYTES)
         .reject_trailing_bytes()
         .deserialize(&bytes)?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn compile_cancellable(
+    _sources: &[String],
+    _executable: &Path,
+    _cancel: &Cancellation,
+    _dialect: GpuDialect,
+) -> Result<RuntimeModule> {
+    Err("Catena process isolation requires Linux".into())
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+#[test]
+fn unsupported_compile_does_not_launch_a_child() {
+    let error = compile(&[], Path::new("must-not-be-launched"), GpuDialect::Hip).unwrap_err();
+    assert_eq!(error.to_string(), "Catena process isolation requires Linux");
 }
