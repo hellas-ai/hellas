@@ -557,6 +557,36 @@ async fn async_main() {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+    #[cfg(not(feature = "heavy"))]
+    if let Commands::Serve {
+        audio_model,
+        fetch_config_file,
+        grant_config_file,
+        work_config_file,
+        ..
+    } = &cli.command
+    {
+        let result = (|| -> commands::CliResult<()> {
+            anyhow::ensure!(
+                audio_model.is_none(),
+                "Compute serving requires the heavy CLI"
+            );
+            if fetch_config_file.is_some() || grant_config_file.is_some() {
+                commands::serve::validate_provider_config(
+                    fetch_config_file.as_deref(),
+                    grant_config_file.as_deref(),
+                )?;
+            }
+            if let Some(path) = work_config_file {
+                commands::serve::paid::PaidWork::validate_capabilities(path)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+    }
     if matches!(&cli.command, Commands::Serve { .. })
         && let Err(err) = platform_hardening::harden_provider_process()
     {

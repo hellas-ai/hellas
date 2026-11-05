@@ -1,6 +1,28 @@
 use std::process::Command;
 
-#[cfg(feature = "heavy")]
+#[cfg(not(feature = "heavy"))]
+#[test]
+fn light_provider_rejects_compute_before_initializing_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/examples/faucet-provider.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
+        .current_dir(directory.path())
+        .env("HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path().join("data"))
+        .args([
+            "serve",
+            "--software-root",
+            "--paid-work-config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("heavy CLI"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn local_tasks_do_not_initialize_an_identity_or_wallet() {
     for task in ["transcribe", "image", "text"] {
@@ -19,7 +41,12 @@ fn local_tasks_do_not_initialize_an_identity_or_wallet() {
             .unwrap();
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("No such file or directory"), "{error}");
+        let expected = if cfg!(feature = "heavy") {
+            "No such file or directory"
+        } else {
+            "local execution needs the heavy hellas build"
+        };
+        assert!(error.contains(expected), "{error}");
         assert_eq!(
             std::fs::read_dir(directory.path()).unwrap().count(),
             0,

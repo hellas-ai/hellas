@@ -79,6 +79,15 @@ fn publish(path: &Path, bytes: &[u8]) -> CliResult<()> {
 }
 
 impl PaidWorkFile {
+    fn validate_capabilities(&self) -> CliResult<()> {
+        #[cfg(not(feature = "heavy"))]
+        ensure!(
+            self.compute.is_none(),
+            "Compute serving requires the heavy CLI"
+        );
+        Ok(())
+    }
+
     fn read(path: &Path) -> CliResult<Self> {
         let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -139,6 +148,11 @@ impl PaidWorkFile {
 }
 
 impl PaidWork {
+    #[cfg(not(feature = "heavy"))]
+    pub fn validate_capabilities(path: &Path) -> CliResult<()> {
+        PaidWorkFile::read(path)?.validate_capabilities()
+    }
+
     pub fn approval(
         path: &Path,
         fetch_config: Option<&Path>,
@@ -161,8 +175,7 @@ impl PaidWork {
         fetch_config: Option<&Path>,
     ) -> CliResult<Self> {
         let file = PaidWorkFile::read(path)?;
-        #[cfg(not(feature = "heavy"))]
-        ensure!(file.compute.is_none(), "Compute serving requires the heavy CLI");
+        file.validate_capabilities()?;
         let chain = match &file.chain_config {
             Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
             None => hellas_sdk::client_chain::devnet(&root)?,

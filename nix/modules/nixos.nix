@@ -152,7 +152,10 @@ in
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = (hellas.normalCliPackage pkgs).override { otel = cfg.otel.enable; };
+      package = (hellas.normalCliPackage pkgs).override {
+        otel = cfg.otel.enable;
+        heavy = providerGpuConfigured || gatewayGpuConfigured;
+      };
       inherit (cfg) otel;
       packageDescription = ''
         The hellas CLI used to run the serve daemon. Local Catena execution is

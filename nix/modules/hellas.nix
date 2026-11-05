@@ -1,7 +1,7 @@
 { self }:
 rec {
   # The ordinary CLI omits OTEL. Modules opt in through the package override.
-  # It carries the network, chain, gateway and local Catena execution surfaces.
+  # GPU services additionally select the heavy execution feature.
   normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
   catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
 

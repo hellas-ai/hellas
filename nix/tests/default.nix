@@ -22,6 +22,9 @@
     pkgs
     lib
     ;
-  package = package.override { otel = true; };
+  package = package.override {
+    otel = true;
+    heavy = true;
+  };
   validatorPackage = validatorPackage.override { otel = true; };
 })
