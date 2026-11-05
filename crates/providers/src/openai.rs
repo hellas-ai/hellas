@@ -5,7 +5,7 @@ use hellas_executor::{
 };
 use reqwest::Url;
 
-use hellas_providers::{execute_responses_request, responses_http_client};
+use crate::{execute_responses_request, responses_http_client};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiConfigError {
@@ -29,7 +29,7 @@ pub enum OpenAiConfigError {
 pub struct OpenAiResponsesFetchProvider {
     client: reqwest::Client,
     endpoint: Url,
-    bearer_token: String,
+    bearer_token: crate::HttpSecret,
     environment: hellas_rpc::ContentId,
 }
 
@@ -68,6 +68,16 @@ impl OpenAiResponsesFetchProvider {
         )
     }
 
+    pub fn with_secret(secret: crate::HttpSecret) -> Result<Self, OpenAiConfigError> {
+        Ok(Self {
+            client: responses_http_client(Default::default())?,
+            endpoint: Url::parse(OPENAI_RESPONSES_ENDPOINT)
+                .map_err(|_| OpenAiConfigError::Endpoint)?,
+            bearer_token: secret,
+            environment: crate::responses_contract()?.manifest_id(),
+        })
+    }
+
     fn with_client(
         client: reqwest::Client,
         endpoint: Url,
@@ -77,7 +87,7 @@ impl OpenAiResponsesFetchProvider {
             environment: crate::responses_contract()?.manifest_id(),
             client,
             endpoint,
-            bearer_token,
+            bearer_token: crate::HttpSecret::Value(bearer_token),
         })
     }
 
@@ -88,7 +98,7 @@ impl OpenAiResponsesFetchProvider {
         execute_responses_request(
             &self.client,
             self.endpoint.clone(),
-            &self.bearer_token,
+            &self.bearer_token.resolve().await?,
             request.body.as_bytes().to_vec(),
             &request.idempotency_key(),
             "OpenAI Responses",

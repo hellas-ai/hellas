@@ -386,10 +386,10 @@ let
   };
   defaultIdentityProvider = evalProvider { };
   storePathWorkConfig = evalProvider {
-    workConfigFile = "${builtins.storeDir}/work.toml";
+    configFile = "${builtins.storeDir}/work.toml";
   };
   storePathFetchConfig = evalProvider {
-    fetchConfigFile = "${builtins.storeDir}/fetch.json";
+    configFile = "${builtins.storeDir}/fetch.json";
   };
   storePathProviderEnvironmentFile = evalProvider {
     environmentFile = "${builtins.storeDir}/provider.env";
@@ -448,16 +448,16 @@ let
     gpuBackend = "hip";
   };
   cudaProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.toml";
+    configFile = "/run/hellas/serve.json";
     gpuBackend = "cuda";
   };
   hipProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.toml";
+    configFile = "/run/hellas/serve.json";
     gpuBackend = "hip";
   };
   grantOnlyHipProvider = evalProvider {
     contentRoots = [ "/srv/hellas/grant-content" ];
-    grantConfigFile = "/run/hellas/grant.json";
+    configFile = "/run/hellas/serve.json";
     gpuBackend = "hip";
   };
   maxGpuSessionAssetBytes = evalProvider {
@@ -532,7 +532,7 @@ let
   homeManagerDarwinServe = evalDarwinServe {
     identityPath = "/Users/hellas/Library/Application Support/Hellas/identity";
     environmentFile = "/Users/hellas/.config/hellas/provider.env";
-    fetchConfigFile = "/Users/hellas/.config/hellas/fetch.json";
+    configFile = "/Users/hellas/.config/hellas/fetch.json";
     assurance = "apple-app-attest";
   };
   homeManagerDarwinService = homeManagerDarwinServe.config.launchd.agents.hellas;
@@ -545,10 +545,10 @@ let
     content = [ "${builtins.storeDir}/model.hex" ];
   };
   homeManagerDarwinStoreWorkConfig = evalDarwinServe {
-    workConfigFile = "${builtins.storeDir}/work.toml";
+    configFile = "${builtins.storeDir}/work.toml";
   };
   homeManagerDarwinStoreFetchConfig = evalDarwinServe {
-    fetchConfigFile = "${builtins.storeDir}/fetch.json";
+    configFile = "${builtins.storeDir}/fetch.json";
   };
   homeManagerDarwinStoreEnvironmentFile = evalDarwinServe {
     environmentFile = "${builtins.storeDir}/provider.env";
@@ -619,13 +619,12 @@ let
           contentIndex = "/srv/hellas-index/content-index.bin";
           gpuSessionAssetBytes = 1073741824;
           memoryMaxBytes = 2147483648;
-          workConfigFile = "/run/hellas/work.toml";
+          configFile = "/run/hellas/serve.json";
           passkey = "/run/hellas/owner.passkey";
           otel.enable = true;
           metricsPort = 9400;
           metricsAddress = "0.0.0.0";
           queueSize = 0;
-          fetchConfigFile = "/run/hellas/fetch.json";
           environmentFile = "/run/hellas/provider.env";
           gateway = {
             enable = true;
@@ -705,8 +704,8 @@ in
       "/var/lib/hellas/.hellas/identity-v3"
       "/srv/hellas/content"
       "/srv/hellas-index/content-index.bin"
-      "/run/hellas/work.toml"
-      "/run/hellas/fetch.json"
+      "/run/hellas/serve.json"
+      "/run/hellas/serve.json"
       "/run/hellas/provider.env"
     ];
     assert
@@ -721,10 +720,10 @@ in
       ];
     assert !(managedContentProviderService.serviceConfig ? ReadWritePaths);
     assert service.serviceConfig.EnvironmentFile == "/run/hellas/provider.env";
-    assert lib.hasInfix "--paid-work-config /run/hellas/work.toml" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--config /run/hellas/serve.json" service.serviceConfig.ExecStart;
     assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--config /run/hellas/serve.json" service.serviceConfig.ExecStart;
     assert
       !(metricsFeatureAssertion (evalProvider {
         metricsPort = 9400;
@@ -879,7 +878,7 @@ in
       hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
-    assert lib.hasInfix "--grant-config /run/hellas/grant.json"
+    assert lib.hasInfix "--config /run/hellas/serve.json"
       grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert grantOnlyHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert grantOnlyHipProvider.config.systemd.services.hellas.path != [ ];
@@ -891,14 +890,14 @@ in
     assert lib.elem "/dev/kfd rw"
       grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
     assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
-    assert lib.elem "/run/hellas/grant.json"
+    assert lib.elem "/run/hellas/serve.json"
       grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--await-owner /var/lib/hellas/await-owner"
       awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert
       !(lib.hasInfix "--paid-work-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
     assert
-      !(lib.hasInfix "--grant-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+      !(lib.hasInfix "--config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
     assert awaitOwnerHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert awaitOwnerHipProvider.config.systemd.services.hellas.path != [ ];
     assert
@@ -959,10 +958,10 @@ in
         "/Users/hellas/Library/Application Support/Hellas/identity"
         "--port"
         "31145"
+        "--config"
+        "/Users/hellas/.config/hellas/fetch.json"
         "--assurance"
         "apple-app-attest"
-        "--fetch-config"
-        "/Users/hellas/.config/hellas/fetch.json"
       ];
     assert !(homeManagerDarwinService.config ? EnvironmentFile);
     assert homeManagerDarwinService.config.EnvironmentVariables == { HOME = "/Users/hellas"; };

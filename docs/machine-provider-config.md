@@ -67,11 +67,11 @@ and its matching backend, including CUDA driver-library setup where needed. In R
 ```json
 ["--identity", "/var/lib/hellas/worker.identity", "--software-root",
  "--await-owner", "/var/lib/hellas/authority",
- "--grant-config", "/var/lib/hellas/resources.json",
+ "--config", "/var/lib/hellas/serve.json",
  "--content-root", "/var/lib/hellas/content"]
 ```
 
-Prepare `resources.json` and the weights on the persistent volume before using
+Prepare the SDK v1 `serve.json` (with its `grants` object) and the weights on the persistent volume before using
 that command; a template does not create an allowance or download models.
 Use the [node configuration and bootstrap procedure](admin.md#explicit-offline-initialization-and-recovery),
 then issue/import access and run a job as in the

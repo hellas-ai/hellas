@@ -1,15 +1,14 @@
-//! `serve --paid-work-config FILE`: use the exact owner-approved paid terms.
+//! `serve --config FILE`: use the exact owner-approved paid terms.
 //! An optional owner passkey also bootstraps approval and delegates stake.
 use super::*;
 use anyhow::ensure;
 use hellas_auth::{Digest, authority::*};
 use hellas_chain::{LightClient as _, domain::Transaction};
-use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
-use hellas_rpc::protocol::invocation::{
-    Admission, ComputePrograms, InvocationPolicy, Limits,
-    fetch::{FetchAdmission, FetchLimits},
-};
+use hellas_kernel::{CoinId, SoftPasskey};
+use hellas_rpc::protocol::invocation::Admission;
 use hellas_sdk::node_control::profile;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 use {
@@ -20,34 +19,9 @@ use {
     hellas_authority::work_store::grant::NodeStoreError,
     hellas_authority::work_store::grant::OwnerApproval,
     hellas_authority::work_store::grant::PreparedBootstrap, hellas_channel::model::paid_policy::*,
-    hellas_channel::model::work::*,
 };
 
 /// The provider's paid terms. Every value is the operator's; nothing defaults.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PaidWorkFile {
-    /// JSON chain configuration for a custom network; omit for the shipped devnet.
-    chain_config: Option<PathBuf>,
-    jobs_per_channel: u64,
-    min_omit_response_blocks: u64,
-    payment: JobPaymentPolicyV2,
-    channel: PaidChannelPolicyV1,
-    offers: OfferPolicy,
-    limits: Limits,
-    /// Explicitly admit any Compute program or only selected manifests.
-    compute: Option<ComputePrograms>,
-    /// Admit caller-signed HTTPS Fetch under these bounds.
-    fetch: Option<FetchFile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FetchFile {
-    route: hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-    limits: FetchLimits,
-}
-
 pub struct PaidWork {
     pub chain: WorkConfig,
     root: PathBuf,
@@ -78,94 +52,33 @@ fn publish(path: &Path, bytes: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-impl PaidWorkFile {
-    fn read(path: &Path) -> CliResult<Self> {
-        let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(std::str::from_utf8(&bytes).context("paid-work config must be UTF-8")?)
-            .with_context(|| format!("failed to parse {}", path.display()))
-    }
-
-    fn checked_policy(self, path: &Path, fetch_config: Option<&Path>) -> CliResult<PaidPolicy> {
-        let fetch_contract = self
-            .fetch
-            .as_ref()
-            .map(|fetch| paid_fetch_contract(fetch_config, &fetch.route))
-            .transpose()?;
-        self.policy(fetch_contract)
-            .with_context(|| format!("invalid paid terms in {}", path.display()))
-    }
-
-    fn policy(self, fetch_contract: Option<hellas_rpc::FetchContract>) -> CliResult<PaidPolicy> {
-        let capacity = self
-            .payment
-            .fixed_price
-            .checked_mul(self.jobs_per_channel)
-            .context("paid channel capacity overflow")?;
-        let value = capacity
-            .checked_add(self.offers.omission_bond)
-            .context("paid funding overflow")?;
-        let mut admissions = Vec::new();
-        if let Some(programs) = self.compute {
-            admissions.push(Admission::Compute {
-                evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
-                programs,
-            });
-        }
-        if let Some(fetch) = self.fetch {
-            admissions.push(Admission::Fetch {
-                admission: FetchAdmission {
-                    contract: fetch_contract.context("paid Fetch terms have no route contract")?,
-                    route: fetch.route,
-                    limits: fetch.limits,
-                },
-            });
-        }
-        let policy = PaidPolicy {
-            channel_policy: self.channel,
-            invocation_policy: InvocationPolicy {
-                admissions,
-                limits: self.limits,
-            },
-            payment_policy: self.payment,
-            expected_payment_values: EdgeValues::new(value, 0, Fees::ZERO),
-            min_omit_response_blocks: self.min_omit_response_blocks,
-            jobs_per_channel: self.jobs_per_channel,
-            offers: self.offers,
-        };
-        policy.check()?;
-        Ok(policy)
-    }
-}
-
 impl PaidWork {
-    pub fn approval(
-        path: &Path,
-        fetch_config: Option<&Path>,
-        expected_revision: Revision,
-    ) -> CliResult<WorkControlCommand> {
+    pub fn approval(path: &Path, expected_revision: Revision) -> CliResult<WorkControlCommand> {
+        let config = hellas_sdk::serve_config::ServeConfig::load(path)?;
+        let terms = config
+            .paid
+            .as_ref()
+            .context("host config does not enable paid work")?;
         Ok(WorkControlCommand::SetPaidPolicy {
             expected_revision,
-            policy: Box::new(PaidWorkFile::read(path)?.checked_policy(path, fetch_config)?),
+            policy: Box::new(terms.policy()?),
         })
     }
-    /// Read and check the whole file before anything binds.
-    ///
-    /// `fetch_config` is the same `--fetch-config` this node will serve: the
-    /// paid Fetch admission's contract is the route's actual sealed contract,
-    /// not an assumed one.
-    pub fn load(
-        path: &Path,
+    pub fn from_config(
+        config: &hellas_sdk::serve_config::ServeConfig,
         root: PathBuf,
         owner: Option<SoftPasskey>,
-        fetch_config: Option<&Path>,
     ) -> CliResult<Self> {
-        let file = PaidWorkFile::read(path)?;
-        let chain = match &file.chain_config {
-            Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
+        config.validate()?;
+        let terms = config
+            .paid
+            .as_ref()
+            .context("host config does not enable paid work")?;
+        let chain = match &terms.chain {
+            Some(chain) => chain.clone().into_config()?,
             None => hellas_sdk::client_chain::devnet(&root)?,
         };
-        let policy = file.checked_policy(path, fetch_config)?;
+        let policy = terms.policy()?;
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
             chain,

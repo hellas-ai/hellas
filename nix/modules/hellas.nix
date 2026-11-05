@@ -195,14 +195,12 @@ rec {
     "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
-    "--paid-work-config"
-    "--grant-config"
+    "--config"
     "--await-owner"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
     "--graffiti"
-    "--fetch-config"
     "--fetch-max-in-flight"
     "--fetch-queue-size"
   ];
@@ -444,26 +442,11 @@ rec {
           separately to bound host RAM. Null uses the CLI default.
         '';
       };
-      workConfigFile = mkOption {
+      configFile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        example = "/var/lib/hellas/paid-work.toml";
-        description = ''
-          Runtime TOML paid terms passed as --paid-work-config. The owner
-          selected by passkey approves exactly these terms at startup; paid
-          work is sold only with this file. Keep it outside the Nix store.
-        '';
-      };
-      grantConfigFile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/var/lib/hellas/grant.json";
-        description = ''
-          Runtime JSON grant resources and listener configuration passed as
-          --grant-config. Native Compute runs through grants without paid
-          work, so this file enables the same content and GPU service setup as
-          workConfigFile. Keep it outside the Nix store.
-        '';
+        example = "/var/lib/hellas/serve.json";
+        description = "Versioned SDK JSON v1 host configuration for upstreams, grants, paid terms and listeners; passed as --config. Contains secret references only.";
       };
       awaitOwner = mkOption {
         type = types.nullOr runtimePath;
@@ -479,18 +462,7 @@ rec {
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the provider's owner, passed as --passkey; required by workConfigFile unless extraArgs selects a faucet account.";
-      };
-      fetchConfigFile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/run/secrets/hellas-fetch.json";
-        description = ''
-          Runtime JSON file containing sealed Fetch destinations, credential
-          references and capabilities. Passed as
-          --fetch-config without copying its contents into the Nix store.
-          Null disables Fetch serving.
-        '';
+        description = "Private software passkey of the provider's owner, passed as --passkey; required to approve configured paid terms unless extraArgs selects a faucet account.";
       };
       fetchMaxInFlight = mkOption {
         type = types.nullOr types.ints.positive;
@@ -757,8 +729,7 @@ rec {
     ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
-    ++ optArg "--paid-work-config" serve.workConfigFile
-    ++ optArg "--grant-config" serve.grantConfigFile
+    ++ optArg "--config" serve.configFile
     ++ optArg "--await-owner" serve.awaitOwner
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
@@ -772,7 +743,6 @@ rec {
       serve.assurance
     ]
     ++ optArg "--graffiti" serve.graffiti
-    ++ optArg "--fetch-config" serve.fetchConfigFile
     ++ optArg "--fetch-max-in-flight" serve.fetchMaxInFlight
     ++ optArg "--fetch-queue-size" serve.fetchQueueSize
     ++ serve.extraArgs;

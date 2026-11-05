@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "revision": 0,
+  "routes": [
+    {
+      "service": "http",
+      "method": "request",
+      "destination": {
+        "type": "http",
+        "config": {}
+      }
+    }
+  ],
+  "paid": {
+    "jobs_per_channel": 10,
+    "min_omit_response_blocks": 16,
+    "payment": {
+      "fixed_price": 20,
+      "dispatch_margin_blocks": 4,
+      "delivery_margin_blocks": 2,
+      "oracle_grace_blocks": 6
+    },
+    "channel": {
+      "compute_credit_limit": 40,
+      "delivery_credit_limit": 40
+    },
+    "offers": {
+      "max_stake_per_client": 12,
+      "max_open_offers": 3,
+      "bond_lifetime_blocks": 10000,
+      "omission_bond": 201,
+      "redelegate_payout": true
+    },
+    "invocation_policy": {
+      "admissions": [
+        {
+          "kind": "compute",
+          "evaluator": "hellas/catena-6e6ee62fc00e",
+          "programs": {
+            "mode": "any"
+          }
+        },
+        {
+          "kind": "fetch",
+          "admission": {
+            "contract": {
+              "adaptor": "http-0.0.1",
+              "schema": "http_v1",
+              "driver": "https-request-roots-and-spki-no-redirect-0.0.1",
+              "egress": "request_https"
+            },
+            "route": {
+              "OpenFetch": {
+                "require_spki_pin": true,
+                "allowed_hosts": []
+              }
+            },
+            "limits": {
+              "max_request_body_bytes": 65536,
+              "max_output_events": 1024,
+              "max_spool_bytes": 4194304,
+              "max_encoded_result_frame": 1048576,
+              "max_encoded_prepared_input": 1048576
+            }
+          }
+        }
+      ],
+      "limits": {
+        "max_upload_bytes": 4194304,
+        "max_output_bytes": 1048576,
+        "max_steps": 64,
+        "execution_timeout_ms": 90000
+      }
+    }
+  }
+}

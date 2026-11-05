@@ -334,15 +334,14 @@ fn identity_show_holder_accepts_global_identity_path() {
 }
 
 #[test]
-fn serve_accepts_work_config() {
-    let cli =
-        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
+fn serve_accepts_one_host_config() {
+    let cli = Cli::try_parse_from(["hellas", "serve", "--config", "/tmp/serve.json"]).unwrap();
     match cli.command {
         Commands::Serve {
-            work_config_file, ..
+            fetch_config_file, ..
         } => assert_eq!(
-            work_config_file.as_deref(),
-            Some(std::path::Path::new("/tmp/work.toml"))
+            fetch_config_file.as_deref(),
+            Some(std::path::Path::new("/tmp/serve.json"))
         ),
         _ => panic!("expected serve command"),
     }
@@ -360,8 +359,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid =
-        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
+    let paid = Cli::try_parse_from(["hellas", "serve", "--config", "/tmp/serve.json"]).unwrap();
 
     let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("an identity file that is not one is not a key to settle with");
@@ -382,7 +380,7 @@ fn serve_accepts_fetch_config() {
         "3",
         "--fetch-queue-size",
         "0",
-        "--fetch-config",
+        "--config",
         "/tmp/fetch-config.json",
     ])
     .unwrap();
@@ -660,4 +658,11 @@ fn grant_pool_gateway_flags_enforce_source_exclusivity() {
         );
     }
     assert!(parse_gateway(&["--check-config"]).is_err());
+}
+
+#[test]
+fn serve_rejects_removed_split_configuration_flags() {
+    for flag in ["--fetch-config", "--grant-config", "--paid-work-config"] {
+        assert!(Cli::try_parse_from(["hellas", "serve", flag, "/tmp/old"]).is_err());
+    }
 }

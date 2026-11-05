@@ -146,18 +146,22 @@ impl OfferHost {
         let client_profile = profile(root, "reader", authority, reader_grant, &client_secret);
         let socket = root.join("control.sock");
         let fetch = root.join("fetch.json");
-        let resources = root.join("resources.json");
         let (control_certificate, control_private_key) = control_tls(root);
         let secret = root.join("account.json");
         hellas_private::write_atomically(&secret, ".new", br#"{"access_token":"fixture-key"}"#)
             .unwrap();
-        std::fs::write(&fetch,json!({"routes":[{"service":"http","method":"request","destination":{"type":"http","config":{
+        let routes = json!({"routes":[{"service":"http","method":"request","destination":{"type":"http","config":{
             "allowed_hosts":["localhost"],"allow_private_addresses":true,
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
-        }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
-            "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
+        }}}]});
+        let grants = json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
+            "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]});
+        std::fs::write(
+            &fetch,
+            json!({"version":1,"routes":routes["routes"],"grants":grants}).to_string(),
+        )
+        .unwrap();
         let mut node = provider.spawn(
             &[
                 "serve",
@@ -166,10 +170,8 @@ impl OfferHost {
                 #[cfg(feature = "otel")]
                 "0",
                 "--no-discovery",
-                "--fetch-config",
+                "--config",
                 string(&fetch),
-                "--grant-config",
-                string(&resources),
             ],
             "provider.log",
         );
@@ -1403,6 +1405,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "http".into(),
         "request".into(),
         serde_json::to_vec(&request).unwrap(),
+        None,
         hellas_rpc::Assurance::ProducerSigned,
     )
     .unwrap();

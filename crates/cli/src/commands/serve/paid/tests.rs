@@ -1,5 +1,12 @@
 use super::*;
 use clap::Parser as _;
+use hellas_sdk::serve_config::{Destination, Route, ServeConfig};
+fn example() -> ServeConfig {
+    ServeConfig::from_bytes(include_bytes!(
+        "../../../../../../docs/examples/faucet-provider.json"
+    ))
+    .unwrap()
+}
 
 #[tokio::test]
 async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
@@ -16,9 +23,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     }
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
-    let example =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let mut paid = PaidWork::load(&example, root.path().join("provider"), None, None).unwrap();
+    let mut paid = PaidWork::from_config(&example(), root.path().join("provider"), None).unwrap();
     let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);
     assert!(
         paid.prepare(&config, &identity.enrollment, &identity.node_key)
@@ -89,23 +94,16 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
 
 #[test]
 fn paid_compute_program_selection_survives_config_parsing() {
-    let example = include_str!("../../../../../../docs/examples/faucet-provider.toml");
     let environment = hellas_rpc::protocol::invocation::compute::Environment {
         sources: vec![hellas_rpc::ContentRef::for_bytes(b"approved program")],
         assets: vec![],
     };
     let manifest = environment.manifest().unwrap();
-    let selected = example.replace(
-        "mode = \"any\"",
-        &format!(
-            "mode = \"only\"\nmanifests = [\"{}\"]",
-            manifest.content_id()
-        ),
-    );
-    let file: PaidWorkFile = toml::from_str(&selected).unwrap();
-    let policy = file
-        .policy(Some(hellas_rpc::FetchContract::http().unwrap()))
-        .unwrap();
+    let mut selected = serde_json::to_value(example()).unwrap();
+    selected["paid"]["invocation_policy"]["admissions"][0]["programs"] =
+        serde_json::json!({"mode":"only","manifests":[manifest.content_id().to_string()]});
+    let config = ServeConfig::from_bytes(&serde_json::to_vec(&selected).unwrap()).unwrap();
+    let policy = config.paid.as_ref().unwrap().policy().unwrap();
     policy
         .invocation_policy
         .classify_manifest(&manifest)
@@ -115,15 +113,12 @@ fn paid_compute_program_selection_survives_config_parsing() {
         hellas_rpc::ContentId::hash(b"other"),
     );
     assert!(policy.invocation_policy.classify_manifest(&other).is_err());
-    let empty = selected.replace(&format!("\"{}\"", manifest.content_id()), "");
-    assert!(
-        toml::from_str::<PaidWorkFile>(&empty)
-            .unwrap()
-            .policy(Some(hellas_rpc::FetchContract::http().unwrap()))
-            .is_err()
-    );
-    let ambiguous = selected.replace("mode = \"only\"", "mode = \"any\"");
-    assert!(toml::from_str::<PaidWorkFile>(&ambiguous).is_err());
+    selected["paid"]["invocation_policy"]["admissions"][0]["programs"]["manifests"] =
+        serde_json::json!([]);
+    assert!(ServeConfig::from_bytes(&serde_json::to_vec(&selected).unwrap()).is_err());
+    selected["paid"]["invocation_policy"]["admissions"][0]["programs"]["mode"] =
+        serde_json::json!("any");
+    assert!(ServeConfig::from_bytes(&serde_json::to_vec(&selected).unwrap()).is_err());
 }
 
 #[tokio::test]
@@ -132,9 +127,8 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
     let owner = cli.owner.load().unwrap().unwrap();
-    let example =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let paid = PaidWork::load(&example, root.path().join("provider"), Some(owner), None).unwrap();
+    let paid =
+        PaidWork::from_config(&example(), root.path().join("provider"), Some(owner)).unwrap();
     assert_eq!(paid.chain.chain.network.as_str(), "hellas-devnet-1");
     assert_eq!(paid.policy.payment_policy.fixed_price, 20);
     assert_eq!(paid.policy.expected_payment_values.value(), 401);
@@ -182,12 +176,7 @@ fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
             max_new_tokens: 4,
         })
         .unwrap();
-    let example: toml::Value = toml::from_str(include_str!(
-        "../../../../../../docs/examples/faucet-provider.toml"
-    ))
-    .unwrap();
-    let limits: hellas_rpc::protocol::invocation::Limits =
-        example["limits"].clone().try_into().unwrap();
+    let limits = example().paid.unwrap().invocation_policy.limits;
     let inputs = job
         .inputs
         .iter()
@@ -229,83 +218,46 @@ fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
 
 #[test]
 fn paid_fetch_admission_derives_the_configured_route_contract() {
-    use hellas_executor::FetchAdaptorFactory as _;
     let root = tempfile::tempdir().unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli.owner.load().unwrap().unwrap();
-    let example =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let mut terms: toml::Value =
-        toml::from_str(&std::fs::read_to_string(&example).unwrap()).unwrap();
-    terms.as_table_mut().unwrap().remove("compute");
-    terms["fetch"]["route"] =
-        toml::from_str("[SealedRoute]\nservice = \"codex\"\nmethod = \"responses\"\n").unwrap();
-    let terms_path = root.path().join("paid.toml");
-    std::fs::write(&terms_path, toml::to_string(&terms).unwrap()).unwrap();
-    let fetch_path = root.path().join("fetch.json");
-    std::fs::write(
-        &fetch_path,
-        serde_json::json!({
-            "routes": [{
-                "service": "codex",
-                "method": "responses",
-                "destination": {
-                    "type": "codex-responses",
-                    "auth_path": "target/hellas-test-codex-auth.json"
-                }
-            }]
-        })
-        .to_string(),
-    )
-    .unwrap();
-
-    let paid = PaidWork::load(
-        &terms_path,
-        root.path().join("provider"),
-        Some(owner),
-        Some(&fetch_path),
-    )
-    .unwrap();
-    let admission = paid
-        .policy
+    let mut doc = example();
+    doc.paid
+        .as_mut()
+        .unwrap()
         .invocation_policy
         .admissions
-        .iter()
-        .find_map(|admission| match admission {
-            Admission::Fetch { admission } => Some(admission),
-            _ => None,
-        })
+        .retain(|a| matches!(a, Admission::Fetch { .. }));
+    doc.routes = vec![Route {
+        service: "codex".into(),
+        method: "responses".into(),
+        destination: Destination::CodexResponses {
+            auth_path: Some("target/hellas-test-codex-auth.json".into()),
+        },
+        capabilities: Default::default(),
+        credential_metadata: Default::default(),
+    }];
+    if let Admission::Fetch { admission } =
+        &mut doc.paid.as_mut().unwrap().invocation_policy.admissions[0]
+    {
+        admission.route = hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::sealed_route(
+            "codex",
+            "responses",
+        )
         .unwrap();
+        // The old HTTP contract cannot be passed off as a Codex contract.
+    }
+    assert!(doc.validate().is_err());
+    if let Admission::Fetch { admission } =
+        &mut doc.paid.as_mut().unwrap().invocation_policy.admissions[0]
+    {
+        admission.contract = hellas_providers::codex_responses_contract().unwrap();
+    }
+    doc.validate().unwrap();
+    let paid = PaidWork::from_config(&doc, root.path().join("provider"), None).unwrap();
+    let Admission::Fetch { admission } = &paid.policy.invocation_policy.admissions[0] else {
+        panic!("Fetch admission")
+    };
     assert_eq!(
         admission.contract,
         hellas_providers::codex_responses_contract().unwrap()
     );
-    assert_eq!(
-        admission.contract.manifest_id(),
-        hellas_providers::CodexResponsesAdaptorFactory::new()
-            .unwrap()
-            .execution_environment()
-    );
-
-    // An HTTP destination derives the generic contract instead.
-    let http_path = root.path().join("http.json");
-    std::fs::write(
-        &http_path,
-        serde_json::json!({
-            "routes": [{
-                "service": "http",
-                "method": "request",
-                "destination": {"type": "http", "config": {}}
-            }]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let http = paid_fetch_contract(
-        Some(&http_path),
-        &hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::sealed_route("http", "request")
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(http, hellas_rpc::FetchContract::http().unwrap());
 }

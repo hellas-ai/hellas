@@ -1,4 +1,4 @@
-use hellas_providers::stream::{project_events, push_sse};
+use crate::stream::{project_events, push_sse};
 
 use hellas_adaptors::{
     OutputEvent, SseDecoder, StopReason, TextChannel, ToolCallArgumentsDelta, ToolCallEnd,

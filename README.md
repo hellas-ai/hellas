@@ -42,13 +42,13 @@ Person A sells GPU compute on the devnet with a GPU build (`.#cli` or
 the `hip`/`cuda` image below):
 
 ```sh
-hellas --faucet serve --paid-work-config docs/examples/faucet-provider.toml
+hellas --faucet serve --config docs/examples/faucet-provider.json
 ```
 
 `--faucet` only selects a key from the devnet genesis faucet allocation. These
 are public development keys; the selected account is retained beside the
 identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
-work is sold only with `--paid-work-config FILE`: at startup the selected owner
+work is sold only with `--config FILE` and its explicit `paid` policy: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
 The example charges 20 per job, ten jobs per channel, and stops execution after
 90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
@@ -243,7 +243,7 @@ claim a different adaptor identity.
 A provider route file contains a `routes` array. Each route has `service`,
 `method`, `destination` and optional `capabilities` (model and output limits).
 The former `callers` field is rejected; the mounted Work channel authorizes jobs.
-Use `serve --fetch-config FILE --paid-work-config FILE` to sell it.
+Use `serve --config FILE` to sell it.
 See [paid Work](crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
 
@@ -399,7 +399,7 @@ The NixOS module provisions the matching toolchain and device access:
 ```nix
 services.hellas = {
   enable = true;
-  workConfigFile = "/srv/hellas/paid-work.toml"; # passed as --paid-work-config
+  configFile = "/srv/hellas/serve.json"; # SDK v1 JSON for routes, grants and paid terms
   passkey = "/srv/hellas/owner.passkey";
   gpuBackend = "cuda"; # or "hip" / "auto"
   contentRoots = [ "/srv/hellas/content" ];

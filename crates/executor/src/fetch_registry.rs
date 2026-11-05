@@ -32,6 +32,14 @@ pub struct FetchRouteEntry {
 }
 
 impl FetchRouteEntry {
+    /// Attach host accounting without changing the trusted adaptor binding.
+    pub fn map_provider(
+        self,
+        map: impl FnOnce(Arc<dyn FetchProvider>) -> Arc<dyn FetchProvider>,
+    ) -> Result<Self, FetchRouteBindingError> {
+        Self::new(map(self.provider), self.adaptor_factory, self.capabilities)
+    }
+
     /// Binds one provider-local credential source to a trusted adaptor.
     ///
     /// Credentials and capabilities remain local policy. The bound manifest

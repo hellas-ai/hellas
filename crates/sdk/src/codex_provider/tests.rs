@@ -103,8 +103,8 @@ async fn forwards_streaming_request_with_codex_token() {
         Url::parse("http://127.0.0.1/token").unwrap(),
     );
     let access_token = non_expiring_token();
-    auth.save(&crate::commands::codex_auth::CodexAuthState::new(
-        crate::commands::codex_auth::test_tokens_with_account_id(
+    auth.save(&crate::codex_auth::CodexAuthState::new(
+        crate::codex_auth::test_tokens_with_account_id(
             &access_token,
             "refresh",
             "acct-1",
@@ -172,13 +172,13 @@ async fn codex_requests_and_refresh_reject_operator_interception() {
             module_path!(),
             "::codex_requests_and_refresh_reject_operator_interception"
         )
-        .trim_start_matches("hellas::"),
+        .trim_start_matches("hellas_sdk::"),
         2,
         |url| async move {
             let dir = tempfile::tempdir().unwrap();
             let auth = CodexAuthStore::with_token_url(dir.path().join("auth.json"), url.clone());
-            auth.save(&crate::commands::codex_auth::CodexAuthState::new(
-                crate::commands::codex_auth::test_tokens_with_account_id(
+            auth.save(&crate::codex_auth::CodexAuthState::new(
+                crate::codex_auth::test_tokens_with_account_id(
                     &non_expiring_token(),
                     "PRIVATE_REFRESH_CANARY",
                     "PRIVATE_ACCOUNT_CANARY",
@@ -191,8 +191,8 @@ async fn codex_requests_and_refresh_reject_operator_interception() {
             let rejected = response.is_err();
             drop(response);
             // Force a separate refresh through the actual store/client path.
-            auth.save(&crate::commands::codex_auth::CodexAuthState::new(
-                crate::commands::codex_auth::test_tokens_with_account_id(
+            auth.save(&crate::codex_auth::CodexAuthState::new(
+                crate::codex_auth::test_tokens_with_account_id(
                     "expired",
                     "PRIVATE_REFRESH_CANARY",
                     "PRIVATE_ACCOUNT_CANARY",

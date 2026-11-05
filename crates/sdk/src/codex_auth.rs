@@ -21,7 +21,7 @@ const AUTH_FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(35);
 const REFRESH_SKEW_SECONDS: u64 = 120;
 const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
 
-pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
+pub async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
     let client = CodexAuthClient::new(
         Url::parse(ISSUER).expect("Codex auth issuer URL is valid"),
@@ -33,7 +33,7 @@ pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn status(auth_path: Option<&Path>) -> anyhow::Result<()> {
+pub fn status(auth_path: Option<&Path>) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
     match store.load() {
         Ok(state) => {
@@ -61,7 +61,7 @@ pub(crate) fn status(auth_path: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn import_codex_cli(
+pub fn import_codex_cli(
     auth_path: Option<&Path>,
     source_path: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -83,7 +83,7 @@ pub(crate) fn import_codex_cli(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CodexAuthStore {
+pub struct CodexAuthStore {
     path: PathBuf,
     token_url: Url,
     /// Prevent many callers in this process from occupying Tokio blocking
@@ -92,7 +92,7 @@ pub(crate) struct CodexAuthStore {
 }
 
 impl CodexAuthStore {
-    pub(crate) fn new(path: Option<&Path>) -> Result<Self, CodexAuthError> {
+    pub fn new(path: Option<&Path>) -> Result<Self, CodexAuthError> {
         let path = match path {
             Some(path) => path.to_path_buf(),
             None => default_auth_path()?,
@@ -105,7 +105,7 @@ impl CodexAuthStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_token_url(path: PathBuf, token_url: Url) -> Self {
+    pub fn with_token_url(path: PathBuf, token_url: Url) -> Self {
         Self {
             path,
             token_url,
@@ -113,15 +113,15 @@ impl CodexAuthStore {
         }
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn load(&self) -> Result<CodexAuthState, CodexAuthError> {
+    pub fn load(&self) -> Result<CodexAuthState, CodexAuthError> {
         self.load_unlocked()
     }
 
-    pub(crate) fn account_id(&self) -> Result<String, CodexAuthError> {
+    pub fn account_id(&self) -> Result<String, CodexAuthError> {
         self.load_unlocked()?
             .tokens
             .account_id
@@ -136,7 +136,7 @@ impl CodexAuthStore {
         }
     }
 
-    pub(crate) async fn access_token(&self) -> Result<String, CodexAuthError> {
+    pub async fn access_token(&self) -> Result<String, CodexAuthError> {
         if !self.path.exists() {
             return Err(CodexAuthError::Missing);
         }
@@ -173,7 +173,7 @@ impl CodexAuthStore {
         Ok(state.tokens.access_token)
     }
 
-    pub(crate) fn save(&self, state: &CodexAuthState) -> Result<(), CodexAuthError> {
+    pub fn save(&self, state: &CodexAuthState) -> Result<(), CodexAuthError> {
         let dir = self
             .path
             .parent()
@@ -192,7 +192,7 @@ impl CodexAuthStore {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CodexAuthState {
+pub struct CodexAuthState {
     version: u8,
     tokens: CodexTokens,
     last_refresh: Option<String>,
@@ -200,7 +200,7 @@ pub(crate) struct CodexAuthState {
 }
 
 impl CodexAuthState {
-    pub(crate) fn new(tokens: CodexTokens, last_refresh: Option<String>) -> Self {
+    pub fn new(tokens: CodexTokens, last_refresh: Option<String>) -> Self {
         Self {
             version: 1,
             tokens,
@@ -211,7 +211,7 @@ impl CodexAuthState {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CodexTokens {
+pub struct CodexTokens {
     access_token: String,
     refresh_token: String,
     #[serde(default, deserialize_with = "deserialize_optional_account_id")]
@@ -219,7 +219,7 @@ pub(crate) struct CodexTokens {
 }
 
 #[cfg(test)]
-pub(crate) fn test_tokens_with_account_id(
+pub fn test_tokens_with_account_id(
     access_token: &str,
     refresh_token: &str,
     account_id: &str,
@@ -238,7 +238,7 @@ struct BlockedRefreshToken {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CodexAuthError {
+pub enum CodexAuthError {
     #[error("no Codex credentials found; run `hellas codex-auth login`")]
     Missing,
     #[error("Codex auth refresh token is blocked; sign in again")]

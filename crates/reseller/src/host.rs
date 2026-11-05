@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiProviderError {
     #[error(transparent)]
-    Config(#[from] crate::OpenAiConfigError),
+    Config(#[from] hellas_providers::OpenAiConfigError),
     #[error(transparent)]
     Grant(#[from] hellas_authority::model::grant::records::GrantError),
     #[error(transparent)]
@@ -60,10 +60,10 @@ where
         options.pricing.clone(),
         options.max_job_millis,
     )?;
-    let upstream = Arc::new(crate::OpenAiResponsesFetchProvider::with_bearer(
+    let upstream = Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
         options.bearer_token.clone(),
     )?);
-    let adaptor = Arc::new(crate::OpenAiResponsesAdaptorFactory::new()?);
+    let adaptor = Arc::new(hellas_providers::OpenAiResponsesAdaptorFactory::new()?);
     let mut routes = FetchRouteRegistry::new();
     routes.register(
         FetchRoute::new(options.service.clone(), options.method.clone()),

@@ -33,7 +33,7 @@ struct TlsResponses {
 }
 impl FetchProvider for TlsResponses {
     fn execution_environment(&self) -> hellas_rpc::ContentId {
-        crate::responses_contract().unwrap().manifest_id()
+        hellas_providers::responses_contract().unwrap().manifest_id()
     }
     fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
         Box::pin(async move {
@@ -201,7 +201,7 @@ impl ResellerBuilder {
                     FetchRoute::new("openai", "responses"),
                     FetchRouteEntry::new(
                         upstream.provider.clone(),
-                        Arc::new(crate::OpenAiResponsesAdaptorFactory::new().unwrap()),
+                        Arc::new(hellas_providers::OpenAiResponsesAdaptorFactory::new().unwrap()),
                         FetchRoutePolicy::default(),
                     )
                     .unwrap(),
@@ -520,7 +520,7 @@ async fn openai_host_refuses_an_empty_upstream_key() {
     options.bearer_token.clear();
     hellas_auth::assert_err!(
         start_openai_provider(&options, None).await,
-        OpenAiProviderError::Config(crate::OpenAiConfigError::EmptyKey)
+        OpenAiProviderError::Config(hellas_providers::OpenAiConfigError::EmptyKey)
     );
 }
 #[tokio::test]

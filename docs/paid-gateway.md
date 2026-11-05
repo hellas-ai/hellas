@@ -77,19 +77,18 @@ see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
 account, so this path never falls back to a different provider or funding source.
 
 The provider keeps its paid policy in its node authority. A provider started
-with `serve --paid-work-config FILE` has its selected owner (`--passkey`,
+with `serve --config FILE` has its selected owner (`--passkey`,
 `--faucet` or `--faucet-account N`) approve exactly that file's terms at
 startup, unless the authority already holds them, and delegate the stake its
 offers bond. Paid work is sold only with this file; nothing has a built-in
-default. [`faucet-provider.toml`](examples/faucet-provider.toml) is a complete
+default. [`faucet-provider.json`](examples/faucet-provider.json) is a complete
 example: price, jobs per channel, channel credit, offer bounds, upload/output
-limits, maximum steps, the execution limit, `[compute]` with `mode = "any"` and an optional
-`[fetch]` section. To restrict Compute to reviewed programs, use
-`[compute]` with `mode = "only"` and a nonempty `manifests` list of exact
-program manifest content IDs. These bind the rendered code and asset hashes;
-request inputs and plans still vary within the configured limits. Omit
-`[compute]` to disable Compute. The same explicit `programs` selection applies
-to Compute admissions in owner-issued grant policies.
+limits, maximum steps and the execution limit, under `paid.invocation_policy`.
+Compute admissions select `programs.mode = "any"` or `"only"` with a nonempty
+`manifests` list of exact reviewed program content IDs. Fetch admissions name
+one contract and route. Omit an admission to disable that work. The same JSON
+file holds `routes`, `grants` and `paid`; the SDK validates it before startup.
+
 
 `--faucet` selects only the owner key from the public
 devnet faucet allocation; it never sets price or limits. Restarts with the same
@@ -99,16 +98,15 @@ path to reshape unused stake first. The saved `admin.json` profile beside the
 provider identity works with the passkey administration commands.
 
 For an existing fleet daemon, keep the owner key on the administration machine.
-Approve the same TOML file remotely with its owner profile:
+Approve the same v1 JSON host file remotely with its owner profile:
 
 ```sh
 hellas --identity laptop.identity --passkey owner.key admin \
   --profile node-admin.json --node NODE_ID --address HOST:31145 \
-  set-paid-policy --terms paid.toml --expected-revision 0
+  set-paid-policy --terms serve.json --expected-revision 0
 ```
 
-Then start the initialized daemon with `serve --grant-config node.json
---paid-work-config paid.toml`, without a passkey or `--faucet`. It checks the
+Then start the initialized daemon with `serve --config serve.json`, without a passkey or `--faucet`. It checks the
 stored policy matches exactly and cannot approve changed terms itself. Use the
 current policy revision for subsequent approvals. A stale revision or a node-key
 session cannot change paid terms.

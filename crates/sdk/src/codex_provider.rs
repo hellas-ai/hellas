@@ -8,7 +8,7 @@ use hellas_providers::{CODEX_RESPONSES_ENDPOINT, codex_responses_contract};
 use reqwest::Url;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 
-use crate::commands::codex_auth::CodexAuthStore;
+use crate::codex_auth::CodexAuthStore;
 
 use hellas_providers::{execute_responses_request, responses_http_client};
 

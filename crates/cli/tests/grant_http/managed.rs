@@ -31,8 +31,7 @@ impl ManagedWorker {
         assert!(exported.status.success());
         let provider = decode_enrollment(&exported.stdout).unwrap();
         let https = Https::start(None).await;
-        let resources = root.join("resources.json");
-        std::fs::write(&resources, json!({
+        let grants = json!({
             "journal_root":state.join("provider"),"control_socket":state.join("control.sock"),
             "control_certificate":state.join("control.cert.der"),"control_private_key":state.join("control.key.der"),
             "max_job_millis":10000,
@@ -47,12 +46,12 @@ impl ManagedWorker {
                     "credential":null,"tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},
                     "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}
             }]
-        }).to_string()).unwrap();
+        });
         // The installed policy must name an available route at startup. Remote
         // administration will enable private-address access before the first job.
         std::fs::write(
-            state.join("fetch.json"),
-            json!({"revision":0,"routes":[{
+            state.join("serve.json"),
+            json!({"version":1,"revision":0,"grants":grants,"routes":[{
                 "service":"http","method":"request","destination":{"type":"http",
                 "config":{"allowed_hosts":["localhost"],"allow_private_addresses":false}}
             }]})
@@ -64,8 +63,8 @@ impl ManagedWorker {
                 "serve",
                 "--await-owner",
                 string(&state),
-                "--grant-config",
-                string(&resources),
+                "--config",
+                string(&state.join("serve.json")),
                 "--port",
                 "0",
                 "--no-discovery",
@@ -375,7 +374,7 @@ async fn normal_host_reconnects_through_its_original_enrollment() {
 async fn failed_configuration_restores_the_route_and_requires_explicit_restart() {
     let mut worker = ManagedWorker::start().await;
     worker.fetch().await;
-    let path = worker.root.path().join("worker/fetch.json");
+    let path = worker.root.path().join("worker/serve.json");
     let original = std::fs::read(&path).unwrap();
     let command = request_file(
         worker.root.path(),
@@ -424,7 +423,7 @@ async fn failed_configuration_restores_the_route_and_requires_explicit_restart()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejected_configuration_keeps_running_and_valid_configuration_keeps_stopped() {
     let mut worker = ManagedWorker::start().await;
-    let path = worker.root.path().join("worker/fetch.json");
+    let path = worker.root.path().join("worker/serve.json");
     let original = std::fs::read(&path).unwrap();
     let endpoint = || {
         UpstreamChange::SetEndpoint(UpstreamEndpoint {

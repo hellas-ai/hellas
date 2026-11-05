@@ -10,7 +10,7 @@ creates both the client device identity and a fresh private owner key. It never
 overwrites an existing key. Start a model worker with `serve --audio-model DIR
 --await-owner STATE`: the converted Whisper package supplies a model-pinned
 resource, a machine/account budget, and the indexed weights. The directory's
-basename is its resource name; one job may run at a time. Use `--grant-config`
+basename is its resource name; one job may run at a time. Use `--config`
 instead for custom resources or budgets.
 
 The worker writes a private `STATE/invitation.json`. Pair with
@@ -59,7 +59,7 @@ provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
 resource. The node generates the policy salt and retains the original terms
 with each signed offer; changing the standing policy does not alter open channels.
-`serve --paid-work-config FILE` approves a file's policy this way at startup; see
+`serve --config FILE` approves a file's policy this way at startup; see
 the [paid gateway guide](paid-gateway.md). The provider runs each Catena job in a
 separate worker process. That isolation is crash/timeout containment, not a
 sandbox, and there is no memory metering. Requesters pay only for a result
@@ -497,10 +497,11 @@ PKCS#8 `control.key.der` under the node state root. The grant configuration can
 select absolute `control_certificate` and `control_private_key` paths alongside
 `journal_root` and `control_socket`. The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-After explicit initialization, start the daemon with `--grant-config`. Its file
-contains `max_job_millis`, optional listener/state paths, machine/account budgets
+After explicit initialization, start the daemon with `--config`. Its file
+is a versioned JSON document with `version: 1`; its `grants` object contains
+`max_job_millis`, optional listener/state paths, machine/account budgets
 and complete resource policies. Resource entries require the full invocation
-policy and pricing fields accepted by the strict grant-config loader. The
+policy and pricing fields under `grants` in the SDK v1 host configuration. The
 [README walkthrough](../README.md#own-a-worker-and-share-access) describes the
 Whisper owner setup.
 

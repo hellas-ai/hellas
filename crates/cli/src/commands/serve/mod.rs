@@ -1,25 +1,20 @@
 use crate::commands::CliResult;
-use anyhow::{Context, bail};
+use anyhow::Context;
 use hellas_auth::ProducerSigningKey;
-use hellas_executor::{
-    ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
-};
+use hellas_executor::{ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
 use iroh::SecretKey;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod audio_model;
 pub mod bootstrap;
-mod codex_provider;
 mod configuration;
 pub mod paid;
 pub mod work_config;
 
-pub use work_config::{WorkConfig, load_work_config};
+pub use work_config::WorkConfig;
 
 pub struct ServeOptions {
     pub transport: Option<iroh::Endpoint>,
@@ -67,22 +62,12 @@ fn provider_resources(
     hellas_sdk::grant_provider::ProviderResources::ComputeAndFetch(routes)
 }
 
-pub fn validate_provider_config(
-    fetch: Option<&std::path::Path>,
-    grant: Option<&std::path::Path>,
-) -> CliResult<()> {
-    anyhow::ensure!(
-        fetch.is_some() || grant.is_some(),
-        "--check-config requires --fetch-config or --grant-config"
-    );
-    let routes = fetch
-        .map(load_fetch_config)
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(path) = grant {
-        let config =
-            hellas_sdk::grant_config::GrantConfig::load(path, Some(&std::env::current_dir()?))?;
-        validate_grant_resources(&config, &routes)?;
+pub fn validate_provider_config(path: Option<&std::path::Path>) -> CliResult<()> {
+    let path = path.context("--check-config requires --config")?;
+    let config = hellas_sdk::serve_config::ServeConfig::load(path)?;
+    let routes = config.routes()?;
+    if let Some(grants) = config.grants(Some(&std::env::current_dir()?))? {
+        validate_grant_resources(&grants, &routes)?;
     }
     Ok(())
 }
@@ -92,7 +77,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         // The config file is the single source of fetch truth: routes,
         // capabilities, cross-validated at load. No file
         // means this node serves no Fetch routes. Work authorizes every execution.
-        Some(path) => load_fetch_config(path)?,
+        Some(path) => hellas_sdk::serve_config::ServeConfig::load(path)?.routes()?,
         None => FetchRouteRegistry::default(),
     };
     let mut executor = ExecutorSpawnConfig::new(
@@ -228,168 +213,6 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::i
     }
     #[cfg(not(unix))]
     Ok(tokio::signal::ctrl_c())
-}
-
-fn read_fetch_config(path: &std::path::Path) -> CliResult<FetchConfigFile> {
-    let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-/// The Fetch contract a paid admission must name for `route`.
-///
-/// The executor compares an admission's contract manifest with the manifest of
-/// the route entry it dispatches to, so the admission is derived from the
-/// destination that route is configured with. `OpenFetch` is defined only over
-/// the generic HTTP contract; a sealed route is either defined by the served
-/// `--fetch-config` or is the built-in `http/request` route registered when no
-/// file is supplied.
-fn paid_fetch_contract(
-    fetch_config: Option<&std::path::Path>,
-    route: &hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-) -> CliResult<hellas_rpc::FetchContract> {
-    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
-    match route {
-        FetchRoutePolicy::OpenFetch { .. } => Ok(hellas_rpc::FetchContract::http()?),
-        FetchRoutePolicy::SealedRoute { service, method } => {
-            let Some(path) = fetch_config else {
-                anyhow::ensure!(
-                    service == "http" && method == "request",
-                    "paid Fetch admits sealed route {service}/{method}, but no --fetch-config defines it"
-                );
-                return Ok(hellas_rpc::FetchContract::http()?);
-            };
-            let file = read_fetch_config(path)?;
-            let configured = file
-                .routes
-                .iter()
-                .find(|configured| configured.service == *service && configured.method == *method)
-                .with_context(|| {
-                    format!(
-                        "paid Fetch admits sealed route {service}/{method}, but {} does not define it",
-                        path.display()
-                    )
-                })?;
-            configured.destination.contract()
-        }
-    }
-}
-
-fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
-    let file = read_fetch_config(path)?;
-
-    let mut registry = FetchRouteRegistry::new();
-    for route in file.routes {
-        if route.service.trim().is_empty() || route.method.trim().is_empty() {
-            bail!("fetch config route service and method must be non-empty");
-        }
-        let entry = route
-            .destination
-            .into_entry(route.capabilities.into_policy()?)?;
-        info!(
-            service = %route.service,
-            method = %route.method,
-            execution_environment = %entry.execution_environment(),
-            "loaded sealed Fetch route",
-        );
-        registry
-            .register(FetchRoute::new(route.service, route.method), entry)
-            .map_err(|err| anyhow::anyhow!("invalid fetch config: {err}"))?;
-    }
-
-    Ok(registry)
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FetchConfigFile {
-    #[serde(default)]
-    revision: u64,
-    #[serde(default)]
-    routes: Vec<FetchConfigRoute>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FetchConfigRoute {
-    service: String,
-    method: String,
-    /// One sealed, compiled destination plus provider-local credentials. This
-    /// one selection constructs both the HTTP driver and the projector whose
-    /// manifest is quoted; a URL or separate identity cannot be supplied.
-    destination: FetchDestination,
-    #[serde(default)]
-    capabilities: FetchPolicyLimits,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-enum FetchDestination {
-    /// Caller-signed HTTPS URL and TLS settings with operator-owned account aliases.
-    Http {
-        config: hellas_providers::HttpProviderConfig,
-    },
-    /// Official Codex Responses, authenticated by the local Codex OAuth store.
-    CodexResponses {
-        #[serde(default)]
-        auth_path: Option<PathBuf>,
-    },
-}
-
-impl FetchDestination {
-    /// The sealed contract this destination's trusted adaptor implements.
-    fn contract(&self) -> CliResult<hellas_rpc::FetchContract> {
-        match self {
-            Self::Http { .. } => Ok(hellas_rpc::FetchContract::http()?),
-            Self::CodexResponses { .. } => Ok(hellas_providers::codex_responses_contract()?),
-        }
-    }
-
-    fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
-        let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
-            Self::Http { config } => return Ok(config.into_entry(capabilities)?),
-            Self::CodexResponses { auth_path } => Arc::new(
-                codex_provider::CodexResponsesFetchProvider::new(auth_path.as_deref())?,
-            ),
-        };
-        let adaptor_factory = Arc::new(hellas_providers::CodexResponsesAdaptorFactory::new()?);
-        Ok(FetchRouteEntry::new(
-            provider,
-            adaptor_factory,
-            capabilities,
-        )?)
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FetchPolicyLimits {
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default, alias = "max_output_units")]
-    max_output_tokens: Option<u64>,
-}
-
-impl FetchPolicyLimits {
-    fn into_policy(self) -> CliResult<FetchRoutePolicy> {
-        let allowed_models = if self.models.is_empty() {
-            None
-        } else {
-            let mut models = BTreeSet::new();
-            for model in self.models {
-                let model = model.trim();
-                if model.is_empty() {
-                    bail!("fetch config model names must be non-empty");
-                }
-                models.insert(model.to_string());
-            }
-            Some(models)
-        };
-        Ok(FetchRoutePolicy {
-            allowed_models,
-            max_output_units: self.max_output_tokens,
-        })
-    }
 }
 
 fn print_qr(data: &str) {

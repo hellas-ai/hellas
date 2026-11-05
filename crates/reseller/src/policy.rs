@@ -18,7 +18,7 @@ pub fn responses_policy(
 ) -> Result<GrantPolicy, GrantError> {
     let route =
         FetchRoutePolicy::sealed_route(service, method).map_err(|_| GrantError::Malformed)?;
-    let contract = crate::responses_contract().map_err(|_| GrantError::Malformed)?;
+    let contract = hellas_providers::responses_contract().map_err(|_| GrantError::Malformed)?;
     let policy = GrantPolicy {
         resource,
         account,

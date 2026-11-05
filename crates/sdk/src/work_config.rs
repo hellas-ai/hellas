@@ -10,7 +10,7 @@ type Result<T> = std::result::Result<T, WorkConfigError>;
 use crate::resource_config::{parse_digest, parse_hex};
 use hellas_auth::Digest;
 use hellas_kernel::NetworkId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Number of distinct validator RPC URLs required by this deployment.
 pub const VALIDATOR_COUNT: usize = 6;
@@ -154,16 +154,16 @@ pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WorkConfigFile {
-    chain: ChainFile,
-    validators: Vec<String>,
-    journal: JournalFile,
+pub struct WorkConfigFile {
+    pub chain: ChainFile,
+    pub validators: Vec<String>,
+    pub journal: JournalFile,
     /// How often the watcher asks the chain for the next block.
-    poll_ms: u64,
+    pub poll_ms: u64,
     #[serde(default = "default_observation_age_ms")]
-    max_observation_age_ms: u64,
+    pub max_observation_age_ms: u64,
 }
 
 pub(crate) fn chain_genesis(
@@ -199,7 +199,7 @@ fn default_observation_age_ms() -> u64 {
 }
 
 impl WorkConfigFile {
-    fn into_config(self) -> Result<WorkConfig> {
+    pub fn into_config(self) -> Result<WorkConfig> {
         let Some(network) = NetworkId::new(self.chain.network_id.trim()) else {
             return Err(WorkConfigError::Invalid {
                 field: "chain.network_id",
@@ -267,20 +267,20 @@ fn parse_validators(entries: Vec<String>) -> Result<Vec<String>> {
     Ok(validators)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ChainFile {
-    network_id: String,
-    genesis_payload_digest: String,
-    threshold_identity: String,
+pub struct ChainFile {
+    pub network_id: String,
+    pub genesis_payload_digest: String,
+    pub threshold_identity: String,
     #[serde(default)]
-    genesis: Option<hellas_chain::genesis::Genesis>,
+    pub genesis: Option<hellas_chain::genesis::Genesis>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct JournalFile {
-    root: PathBuf,
+pub struct JournalFile {
+    pub root: PathBuf,
 }
 
 /// Packs typed funding coins without imposing a provider/client funding policy.

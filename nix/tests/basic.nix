@@ -29,7 +29,7 @@
         ${package}/bin/hellas serve --help | grep -F -- "--content-index <FILE>"
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-programs"
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-asset-bytes"
-        ${package}/bin/hellas serve --help | grep -F -- "--paid-work-config"
+        ${package}/bin/hellas serve --help | grep -F -- "--config"
         ! ${package}/bin/hellas serve --help | grep -F -- "--gfx"
         ${package}/bin/hellas identity --help | grep -F -- "show-enrollment-id"
 

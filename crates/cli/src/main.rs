@@ -221,22 +221,10 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid terms (TOML). With an owner passkey, approve and fund them at
-        /// startup; without one, require the exact remotely approved policy
-        /// and stake already delegated by the owner.
-        #[arg(
-            long = "paid-work-config",
-            value_name = "FILE",
-            conflicts_with = "await_owner"
-        )]
-        work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
-        /// Resources and listeners for an explicitly initialized authority store.
-        #[arg(long = "grant-config")]
-        grant_config_file: Option<PathBuf>,
         /// Serve a converted Whisper model with model-pinned grants and one concurrent job.
-        #[arg(long, requires = "await_owner", conflicts_with = "grant_config_file")]
+        #[arg(long, requires = "await_owner", conflicts_with = "fetch_config_file")]
         audio_model: Option<PathBuf>,
         /// Wait for one owner pairing if uninitialized; use this directory for node state.
         #[arg(long, num_args = 0..=1, default_missing_value = ".")]
@@ -255,7 +243,7 @@ enum Commands {
         /// Fetch configuration file: sealed upstream destinations and
         /// credentials and route capabilities. No file
         /// means this node serves no Fetch routes.
-        #[arg(long = "fetch-config")]
+        #[arg(long = "config")]
         fetch_config_file: Option<PathBuf>,
         /// Validate Fetch and grant resources without starting a node.
         #[arg(long)]
@@ -593,7 +581,6 @@ async fn async_main() {
     if let Commands::Serve {
         check_config: true,
         fetch_config_file,
-        grant_config_file,
         audio_model,
         await_owner,
         ..
@@ -606,10 +593,7 @@ async fn async_main() {
             )
             .map(|_| ())
         } else {
-            commands::serve::validate_provider_config(
-                fetch_config_file.as_deref(),
-                grant_config_file.as_deref(),
-            )
+            commands::serve::validate_provider_config(fetch_config_file.as_deref())
         };
         tracer_provider.shutdown();
         if let Err(error) = result {
@@ -651,16 +635,17 @@ async fn async_main() {
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {
             CodexAuthCommand::Login { auth_path } => {
-                commands::codex_auth::login(auth_path.as_deref()).await
+                hellas_sdk::codex_auth::login(auth_path.as_deref()).await
             }
             CodexAuthCommand::Import {
                 auth_path,
                 source_path,
-            } => {
-                commands::codex_auth::import_codex_cli(auth_path.as_deref(), source_path.as_deref())
-            }
+            } => hellas_sdk::codex_auth::import_codex_cli(
+                auth_path.as_deref(),
+                source_path.as_deref(),
+            ),
             CodexAuthCommand::Status { auth_path } => {
-                commands::codex_auth::status(auth_path.as_deref())
+                hellas_sdk::codex_auth::status(auth_path.as_deref())
             }
         };
         tracer_provider.shutdown();
@@ -825,9 +810,7 @@ async fn async_main() {
             port,
             no_discovery,
             queue_size,
-            work_config_file,
             chain_node,
-            grant_config_file,
             audio_model,
             await_owner,
             #[cfg(feature = "otel")]
@@ -843,27 +826,36 @@ async fn async_main() {
             // Loaded before anything binds: a work configuration that
             // will not load is a node that would advertise two paid
             // ALPNs and then have nothing to mount behind them.
-            match work_config_file
-                .as_deref()
-                .map(|path| {
-                    commands::serve::paid::PaidWork::load(
-                        path,
-                        identity::provider_root(cli.identity.as_deref())?,
-                        owner.clone(),
-                        fetch_config_file.as_deref(),
-                    )
-                })
-                .transpose()
-            {
+            let setup = (|| -> anyhow::Result<_> {
+                let config = fetch_config_file
+                    .as_deref()
+                    .map(hellas_sdk::serve_config::ServeConfig::load)
+                    .transpose()?;
+                let paid = config
+                    .as_ref()
+                    .filter(|c| c.paid.is_some())
+                    .map(|c| {
+                        commands::serve::paid::PaidWork::from_config(
+                            c,
+                            identity::provider_root(cli.identity.as_deref())?,
+                            owner.clone(),
+                        )
+                    })
+                    .transpose()?;
+                Ok((config, paid))
+            })();
+            match setup {
                 Err(error) => Err(error),
-                Ok(paid) => {
+                Ok((configuration, paid)) => {
                     async {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
                         let settlement_key = identity::settlement_signer(&local_identity)?;
                         let open_identity = local_identity.open_identity();
-                        let grants = if let Some(path) = grant_config_file.as_deref() {
+                        let grants = if let Some(config) =
+                            configuration.as_ref().filter(|c| c.grants.is_some())
+                        {
                             anyhow::ensure!(
                                 assurance == hellas_rpc::Assurance::ProducerSigned,
                                 "grants require producer-signed assurance"
@@ -873,8 +865,9 @@ async fn async_main() {
                                 .transpose()?
                                 .map(|owner| commands::contributions::data_root(&owner))
                                 .transpose()?;
-                            let config =
-                                hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
+                            let config = config
+                                .grants(root.as_deref())?
+                                .context("grant configuration is missing")?;
                             Some(config)
                         } else if let Some(model) = audio_model.as_deref() {
                             anyhow::ensure!(
@@ -910,12 +903,12 @@ async fn async_main() {
                         let fetch_config_file = match (fetch_config_file, await_owner.as_deref()) {
                             (Some(path), _) => Some(path),
                             (None, Some(root)) => {
-                                let path = std::path::absolute(root)?.join("fetch.json");
+                                let path = std::path::absolute(root)?.join("serve.json");
                                 if !path.try_exists()? {
                                     hellas_private::write_atomically(
                                         &path,
                                         ".initializing",
-                                        br#"{"revision":0,"routes":[]}"#,
+                                        br#"{"version":1,"revision":0,"routes":[]}"#,
                                     )?;
                                 }
                                 Some(path)
@@ -924,7 +917,7 @@ async fn async_main() {
                         };
                         commands::serve::run(commands::serve::ServeOptions {
                             transport,
-                            port,
+                            port: configuration.as_ref().and_then(|c| c.port).or(port),
                             discovery: !no_discovery,
                             queue_size,
                             native,

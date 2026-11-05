@@ -48,6 +48,17 @@ pub struct SecretStore {
     backend: Backend,
 }
 impl SecretStore {
+    /// Public source metadata for serializing a reference, never its secret.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+    pub fn file_directory(&self) -> Option<&std::path::Path> {
+        match &self.backend {
+            Backend::Native => None,
+            Backend::HeadlessFiles(path) => Some(path),
+        }
+    }
+
     pub fn native(service: impl Into<String>) -> Result<Self, SecretError> {
         let service = service.into();
         validate_name(&service)?;

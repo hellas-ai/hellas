@@ -11,7 +11,7 @@ use hellas_authority::model::grant::{
     resource::HttpsResource,
     responses::ResponsesResource,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -30,41 +30,41 @@ pub enum GrantConfigError {
     #[error("grant config must name {0} when no default data root applies")]
     MissingPath(&'static str),
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ResourceFile {
-    resource: ResourceId,
-    account: ResourceId,
-    revision: Revision,
-    name: String,
-    invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
-    https: Option<HttpsResource>,
-    responses: Option<ResponsesResource>,
-    pricing: hellas_authority::model::grant::pricing::Pricing,
+pub struct ResourceFile {
+    pub resource: ResourceId,
+    pub account: ResourceId,
+    pub revision: Revision,
+    pub name: String,
+    pub invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
+    pub https: Option<HttpsResource>,
+    pub responses: Option<ResponsesResource>,
+    pub pricing: hellas_authority::model::grant::pricing::Pricing,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AccountFile {
-    account: ResourceId,
-    max_in_flight: std::num::NonZeroU16,
-    limits: Vec<Limit>,
+pub struct AccountFile {
+    pub account: ResourceId,
+    pub max_in_flight: std::num::NonZeroU16,
+    pub limits: Vec<Limit>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ConfigFile {
-    journal_root: Option<PathBuf>,
-    control_socket: Option<PathBuf>,
-    control_certificate: Option<PathBuf>,
-    control_private_key: Option<PathBuf>,
+pub struct GrantSettings {
+    pub journal_root: Option<PathBuf>,
+    pub control_socket: Option<PathBuf>,
+    pub control_certificate: Option<PathBuf>,
+    pub control_private_key: Option<PathBuf>,
     #[serde(default)]
-    remote_control_peers: Vec<iroh::EndpointId>,
+    pub remote_control_peers: Vec<iroh::EndpointId>,
     #[serde(default)]
-    remote_control: bool,
-    max_job_millis: NonZeroU64,
-    machine: Option<ConfiguredBudget>,
+    pub remote_control: bool,
+    pub max_job_millis: NonZeroU64,
+    pub machine: Option<ConfiguredBudget>,
     #[serde(default)]
-    accounts: Vec<AccountFile>,
-    resources: Vec<ResourceFile>,
+    pub accounts: Vec<AccountFile>,
+    pub resources: Vec<ResourceFile>,
 }
 pub struct GrantConfig {
     pub journal_root: PathBuf,
@@ -91,9 +91,10 @@ impl GrantConfig {
 
     /// Unnamed paths default under `default_root`; without one, the config
     /// must name every path.
-    pub fn load(path: &Path, default_root: Option<&Path>) -> Result<Self, GrantConfigError> {
-        let bytes = hellas_private::read_bounded_regular_file(path, 1 << 20)?;
-        let file: ConfigFile = serde_json::from_slice(&bytes)?;
+    pub fn from_settings(
+        file: GrantSettings,
+        default_root: Option<&Path>,
+    ) -> Result<Self, GrantConfigError> {
         let remote_control = if file.remote_control && file.remote_control_peers.is_empty() {
             crate::node_control::RemoteControlAdmission::credential_gated()
         } else {
@@ -192,7 +193,7 @@ mod tests {
     #[test]
     fn configuration_cannot_install_authority_or_budgets() {
         let baseline = json!({"max_job_millis":10000,"resources":[]});
-        serde_json::from_value::<ConfigFile>(baseline.clone()).unwrap();
+        serde_json::from_value::<GrantSettings>(baseline.clone()).unwrap();
         for field in [
             "grants",
             "allowances",
@@ -202,7 +203,7 @@ mod tests {
         ] {
             let mut config = baseline.clone();
             config[field] = json!([]);
-            let error = serde_json::from_value::<ConfigFile>(config).unwrap_err();
+            let error = serde_json::from_value::<GrantSettings>(config).unwrap_err();
             assert_eq!(error.classify(), serde_json::error::Category::Data);
             assert!(
                 error
@@ -222,7 +223,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let config = GrantConfig::load(&path, Some(directory.path())).unwrap();
+        let config = serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+            .map_err(GrantConfigError::Json)
+            .and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path())))
+            .unwrap();
         assert!(config.remote_control.enabled());
     }
 
@@ -236,12 +240,17 @@ mod tests {
             "control_certificate":named("control.cert.der")});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert_err!(
-            GrantConfig::load(&path, None),
+            serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+                .map_err(GrantConfigError::Json)
+                .and_then(|settings| GrantConfig::from_settings(settings, None)),
             GrantConfigError::MissingPath("control_private_key")
         );
         config["control_private_key"] = json!(named("control.key.der"));
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let config = GrantConfig::load(&path, None).unwrap();
+        let config = serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+            .map_err(GrantConfigError::Json)
+            .and_then(|settings| GrantConfig::from_settings(settings, None))
+            .unwrap();
         assert_eq!(config.control_private_key, named("control.key.der"));
     }
 
@@ -252,7 +261,9 @@ mod tests {
         let mut config = json!({"max_job_millis":10000,"resources":[]});
         let load = |value: &serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            GrantConfig::load(&path, Some(directory.path()))
+            serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+                .map_err(GrantConfigError::Json)
+                .and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path())))
         };
         assert!(!load(&config).unwrap().remote_control.enabled());
         let peer = iroh::SecretKey::from_bytes(&[1; 32]).public().to_string();
@@ -292,7 +303,10 @@ mod tests {
             "invocation_policy":expected.invocation_policy
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let parsed = GrantConfig::load(&path, Some(directory.path())).unwrap();
+        let parsed = serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+            .map_err(GrantConfigError::Json)
+            .and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path())))
+            .unwrap();
         assert_eq!(parsed.configuration.resources(), [expected.clone()]);
         assert_eq!(
             parsed.configuration.machine().unwrap().max_in_flight.get(),
@@ -304,7 +318,9 @@ mod tests {
         // account is used exactly once.
         let load = |value: &serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            GrantConfig::load(&path, Some(directory.path()))
+            serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+                .map_err(GrantConfigError::Json)
+                .and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path())))
         };
         let other = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"other account"));
         for (field, value) in [
@@ -333,7 +349,7 @@ mod tests {
             .unwrap()
             .remove("pricing");
         std::fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
-        assert_err!(GrantConfig::load(&path, Some(directory.path())), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+        assert_err!(serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap()).map_err(GrantConfigError::Json).and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path()))), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
         for invalid in [
             json!(null),
             json!({"revision":0,"rates":[]}),
@@ -345,10 +361,15 @@ mod tests {
             changed["resources"][0]["pricing"] = invalid;
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
             if malformed_json {
-                assert_err!(GrantConfig::load(&path, Some(directory.path())), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+                assert_err!(serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap()).map_err(GrantConfigError::Json).and_then(|settings| GrantConfig::from_settings(settings, Some(directory.path()))), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
             } else {
                 assert_err!(
-                    GrantConfig::load(&path, Some(directory.path())),
+                    serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+                        .map_err(GrantConfigError::Json)
+                        .and_then(|settings| GrantConfig::from_settings(
+                            settings,
+                            Some(directory.path())
+                        )),
                     GrantConfigError::Grant(GrantError::Limits)
                 );
             }
@@ -365,7 +386,12 @@ mod tests {
             changed["resources"][0]["pricing"]["rates"] = json!(null);
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
             assert_err!(
-                GrantConfig::load(&path, Some(directory.path())),
+                serde_json::from_slice::<GrantSettings>(&std::fs::read(&path).unwrap())
+                    .map_err(GrantConfigError::Json)
+                    .and_then(|settings| GrantConfig::from_settings(
+                        settings,
+                        Some(directory.path())
+                    )),
                 GrantConfigError::Grant(GrantError::Malformed)
             );
         }

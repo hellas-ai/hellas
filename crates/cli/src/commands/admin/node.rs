@@ -360,11 +360,9 @@ where
         AdminCommand::SetPaidPolicy {
             terms,
             expected_revision,
-            fetch_config,
         } => {
             let value = crate::commands::serve::paid::PaidWork::approval(
                 &terms,
-                fetch_config.as_deref(),
                 Revision(expected_revision),
             )?;
             let reply = work(&client, authorization, &value).await?;

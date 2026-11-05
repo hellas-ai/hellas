@@ -1,6 +1,7 @@
 //! In-process configuration on the normal host's serialized provider lifecycle.
 use super::*;
 use hellas_sdk::node_control::{configuration::*, host::*};
+use hellas_sdk::serve_config::{Destination, Route, ServeConfig};
 use std::path::Path;
 
 pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync + 'static>(
@@ -37,7 +38,7 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
             Box::pin(async move {
                 let metadata = match &path {
                     Some(path) => {
-                        provider.executor.fetch_routes = load_fetch_config(path)?;
+                        provider.executor.fetch_routes = ServeConfig::load(path)?.routes()?;
                         Some(metadata(&read(path)?))
                     }
                     None => None,
@@ -62,19 +63,17 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
     })
     .await?)
 }
-fn read(path: &Path) -> CliResult<FetchConfigFile> {
-    Ok(serde_json::from_slice(
-        &hellas_private::read_bounded_regular_file(path, 64 * 1024)?,
-    )?)
+fn read(path: &Path) -> CliResult<ServeConfig> {
+    ServeConfig::load(path)
 }
-fn metadata(config: &FetchConfigFile) -> ProviderMetadata {
+fn metadata(config: &ServeConfig) -> ProviderMetadata {
     ProviderMetadata {
         revision: config.revision,
         endpoints: config
             .routes
             .iter()
             .filter_map(|route| {
-                let FetchDestination::Http { config } = &route.destination else {
+                let Destination::Http { config } = &route.destination else {
                     return None;
                 };
                 Some(EndpointMetadata {
@@ -157,7 +156,7 @@ impl Drop for StagedConfiguration {
     }
 }
 fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<Vec<u8>> {
-    let mut file: FetchConfigFile = serde_json::from_slice(old)?;
+    let mut file = ServeConfig::from_bytes(old)?;
     anyhow::ensure!(
         file.revision == update.expected_revision,
         "stale provider configuration revision"
@@ -180,20 +179,21 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
                 .iter_mut()
                 .find(|route| route.service == endpoint.service && route.method == endpoint.method)
             {
-                let FetchDestination::Http { config } = &mut route.destination else {
+                let Destination::Http { config } = &mut route.destination else {
                     anyhow::bail!("route is not HTTP")
                 };
                 config.allowed_hosts = replacement.allowed_hosts;
                 config.allow_private_addresses = replacement.allow_private_addresses;
             } else {
                 anyhow::ensure!(file.routes.len() < 16, "too many upstream routes");
-                file.routes.push(FetchConfigRoute {
+                file.routes.push(Route {
                     service: endpoint.service,
                     method: endpoint.method,
-                    destination: FetchDestination::Http {
+                    destination: Destination::Http {
                         config: replacement,
                     },
                     capabilities: Default::default(),
+                    credential_metadata: Default::default(),
                 });
             }
         }
@@ -295,6 +295,7 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
             .clone()
             .into_entry(route.capabilities.clone().into_policy()?)?;
     }
+    file.validate()?;
     file.revision = file
         .revision
         .checked_add(1)
@@ -307,7 +308,7 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
     Ok(bytes)
 }
 fn http<'a>(
-    file: &'a mut FetchConfigFile,
+    file: &'a mut ServeConfig,
     service: &str,
     method: &str,
 ) -> CliResult<&'a mut hellas_providers::HttpProviderConfig> {
@@ -317,7 +318,7 @@ fn http<'a>(
         .find(|route| route.service == service && route.method == method)
         .context("unknown endpoint")?;
     match &mut route.destination {
-        FetchDestination::Http { config } => Ok(config),
+        Destination::Http { config } => Ok(config),
         _ => anyhow::bail!("route is not HTTP"),
     }
 }
@@ -330,7 +331,7 @@ fn clean_unused_keys(path: &Path) -> CliResult<()> {
         .routes
         .iter()
         .flat_map(|route| match &route.destination {
-            FetchDestination::Http { config } => config
+            Destination::Http { config } => config
                 .credentials
                 .values()
                 .filter_map(|key| key.source.secret_file.as_ref())
@@ -415,7 +416,8 @@ mod tests {
     fn key_updates_are_add_only_or_replace_only_and_status_contains_no_secret() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fetch.json");
-        hellas_private::write_atomically(&path, ".writing", br#"{"routes":[]}"#).unwrap();
+        hellas_private::write_atomically(&path, ".writing", br#"{"version":1,"routes":[]}"#)
+            .unwrap();
         apply(
             &path,
             ProviderUpdate {
@@ -505,7 +507,8 @@ mod tests {
         let a = directory.path().join("a.json");
         let b = directory.path().join("b.json");
         for path in [&a, &b] {
-            hellas_private::write_atomically(path, ".writing", br#"{"routes":[]}"#).unwrap();
+            hellas_private::write_atomically(path, ".writing", br#"{"version":1,"routes":[]}"#)
+                .unwrap();
             apply(
                 path,
                 ProviderUpdate {
@@ -552,14 +555,20 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&a).unwrap();
-        load_fetch_config(&b).unwrap();
+        hellas_sdk::serve_config::ServeConfig::load(&a)
+            .unwrap()
+            .routes()
+            .unwrap();
+        hellas_sdk::serve_config::ServeConfig::load(&b)
+            .unwrap()
+            .routes()
+            .unwrap();
     }
     #[test]
     fn staged_replacement_retains_old_keys_until_commit_succeeds_or_rolls_back() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fetch.json");
-        std::fs::write(&path, br#"{"routes":[]}"#).unwrap();
+        std::fs::write(&path, br#"{"version":1,"routes":[]}"#).unwrap();
         apply(
             &path,
             ProviderUpdate {
@@ -613,7 +622,10 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&path).unwrap();
+        hellas_sdk::serve_config::ServeConfig::load(&path)
+            .unwrap()
+            .routes()
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -624,7 +636,7 @@ mod tests {
         let protected = outside.path().join(".upstream-key-protected.json");
         std::fs::write(&protected, "retained").unwrap();
         let path = directory.path().join("fetch.json");
-        std::fs::write(&path, br#"{"routes":[]}"#).unwrap();
+        std::fs::write(&path, br#"{"version":1,"routes":[]}"#).unwrap();
         std::os::unix::fs::symlink(outside.path(), key_directory(&path).unwrap()).unwrap();
         assert!(clean_unused_keys(&path).is_err());
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "retained");
