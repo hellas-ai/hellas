@@ -37,15 +37,6 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             assert_eq!(result.credited_cumulative, PRICE);
             session.shutdown().await;
             drop(session);
-            case.relays
-                .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let reads = case
-                .relays
-                .source
-                .attempts
-                .load(std::sync::atomic::Ordering::SeqCst);
             let discovered = hellas_sdk::paid_client::retained_settlement_channels(
                 &case.options.journal_root,
                 case.options.config.chain.network,
@@ -136,6 +127,15 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 .is_err()
             );
             case.provider.shutdown().await.unwrap();
+            // Use fresh RPC listeners so provider polling and queued requests from
+            // the execution phase cannot enter the settlement proof-read count.
+            case.relays.shutdown().await;
+            case.relays = remote::Relays::start(&case.devnet).await;
+            case.options.config.validators = case.relays.urls.clone();
+            case.relays
+                .source
+                .unavailable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             case.relays
                 .source
                 .forged
@@ -178,7 +178,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     .source
                     .attempts
                     .load(std::sync::atomic::Ordering::SeqCst),
-                reads
+                0
             );
             assert_eq!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
@@ -462,15 +462,14 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .is_err()
             );
             case.provider.shutdown().await.unwrap();
+            // Drain execution-phase RPCs before counting settlement proof reads.
+            case.relays.shutdown().await;
+            case.relays = remote::Relays::start(&case.devnet).await;
+            case.options.config.validators = case.relays.urls.clone();
             case.relays
                 .source
                 .unavailable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let proof_reads = case
-                .relays
-                .source
-                .attempts
-                .load(std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
                     Duration::from_secs(1),
@@ -517,7 +516,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                     .source
                     .attempts
                     .load(std::sync::atomic::Ordering::SeqCst),
-                proof_reads,
+                0,
                 "close and restart require no live object witness"
             );
             let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
@@ -788,15 +787,14 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             let trust_path = root.join("cli-trust.json");
             std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
             case.provider.shutdown().await.unwrap();
+            // Drain execution-phase RPCs before counting settlement proof reads.
+            case.relays.shutdown().await;
+            case.relays = remote::Relays::start(&case.devnet).await;
+            case.options.config.validators = case.relays.urls.clone();
             case.relays
                 .source
                 .unavailable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let reads = case
-                .relays
-                .source
-                .attempts
-                .load(std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
                     Duration::from_secs(1),
@@ -879,7 +877,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                     .source
                     .attempts
                     .load(std::sync::atomic::Ordering::SeqCst),
-                reads
+                0
             );
             // A different owner must not close this channel, even when the
             // journal is present and the provider cannot be contacted.
@@ -975,15 +973,14 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
             session.shutdown().await;
             drop(session);
             case.provider.shutdown().await.unwrap();
+            // Drain execution-phase RPCs before counting settlement proof reads.
+            case.relays.shutdown().await;
+            case.relays = remote::Relays::start(&case.devnet).await;
+            case.options.config.validators = case.relays.urls.clone();
             case.relays
                 .source
                 .unavailable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let reads = case
-                .relays
-                .source
-                .attempts
-                .load(std::sync::atomic::Ordering::SeqCst);
 
             // A client-signed understatement is answered by the certificate actually
             // earned above. Both moves pass through the real consensus kernel.
@@ -1066,7 +1063,7 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                     .source
                     .attempts
                     .load(std::sync::atomic::Ordering::SeqCst),
-                reads
+                0
             );
             assert_eq!(
                 hellas_sdk::paid_client::finalized_channel_settlement(

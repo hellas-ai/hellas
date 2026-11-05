@@ -333,6 +333,8 @@ mod tests {
         }
     }
     struct TrackedProvider {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
         dropped: Arc<AtomicBool>,
         polls: Arc<AtomicUsize>,
     }
@@ -341,6 +343,8 @@ mod tests {
             hellas_channel::test_support::test_responses_contract().manifest_id()
         }
         fn run(&self, _: PreparedFetchRequest) -> FetchProviderFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
             Box::pin(async {
                 Ok(FetchProviderResponse {
                     head: Default::default(),
@@ -354,6 +358,8 @@ mod tests {
     }
     fn tracked() -> Arc<TrackedProvider> {
         Arc::new(TrackedProvider {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
             dropped: Arc::new(AtomicBool::new(false)),
             polls: Arc::new(AtomicUsize::new(0)),
         })
@@ -509,7 +515,13 @@ mod tests {
                 first.await.unwrap()
             );
         }
-        let polls = provider.polls.load(Ordering::SeqCst);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.started.notified(),
+        )
+        .await
+        .expect("first Fetch reached the provider");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         for revoked in [true, false] {
             let dispatched = Arc::new(AtomicBool::new(false));
             let observed = dispatched.clone();
@@ -542,8 +554,8 @@ mod tests {
             assert!(second.await.is_err());
             assert!(!dispatched.load(Ordering::SeqCst));
             assert_eq!(
-                provider.polls.load(Ordering::SeqCst),
-                polls,
+                provider.calls.load(Ordering::SeqCst),
+                1,
                 "queued grant invoked the provider"
             );
         }
