@@ -79,10 +79,16 @@ let
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
-    actions = mk "check-actions" "actionlint .github/workflows/*.yml" [
-      pkgs.actionlint
-      pkgs.shellcheck
-    ];
+    actions =
+      mk "check-actions"
+        ''
+          actionlint .github/workflows/*.yml
+          shellcheck --shell=sh install.sh
+        ''
+        [
+          pkgs.actionlint
+          pkgs.shellcheck
+        ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
     regressions = mkCargo "check-regressions" ''
       cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api -- --test-threads=1

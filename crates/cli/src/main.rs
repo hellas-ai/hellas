@@ -110,7 +110,7 @@ impl RemoteTrustArgs {
 
 #[derive(Parser)]
 #[command(name = "hellas")]
-#[command(version)]
+#[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
     /// Path to the versioned local identity for commands that use one

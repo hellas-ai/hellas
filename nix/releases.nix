@@ -84,6 +84,12 @@ let
         native = archive "cli-${system}" (if darwin then portableDarwin else nativePackages.cli);
       }
       // lib.optionalAttrs x86 {
+        installer = pkgs.runCommand "hellas-installer-${revision}" { } ''
+          mkdir -p "$out"
+          cp ${../install.sh} "$out/install.sh"
+          cd "$out"
+          sha256sum install.sh > SHA256SUMS
+        '';
         static-x86_64 = archive "cli-x86_64-linux-musl" crossPackages.cross-x86_64-linux-musl-cli;
         static-aarch64 = archive "cli-aarch64-linux-musl" crossPackages.cross-aarch64-linux-musl-cli;
         network-image = image "network";

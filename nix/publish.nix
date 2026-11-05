@@ -127,7 +127,21 @@ pkgs.writeShellApplication {
       path=$(fetch "$job")
       cat "$path/SHA256SUMS" >> "$sums"
       assets+=("$path"/*.tar.gz)
+      case "$job" in
+        *.static-x86_64) platform=x86_64-linux ;;
+        *.static-aarch64) platform=aarch64-linux ;;
+        *.native) platform=aarch64-darwin ;;
+        *) continue ;;
+      esac
+      archive="hellas-$platform.tar.gz"
+      cp "$path"/*.tar.gz "$staged/$archive"
+      (cd "$staged" && sha256sum "$archive" > "$archive.sha256")
+      cat "$staged/$archive.sha256" >> "$sums"
+      assets+=("$staged/$archive" "$staged/$archive.sha256")
     done
+    installer=$(fetch x86_64-linux.artifacts.installer)
+    cat "$installer/SHA256SUMS" >> "$sums"
+    assets+=("$installer/install.sh")
     if existing=$(gh release download "$release" --repo "$repository" --pattern SHA256SUMS --output - 2> /dev/null); then
       if [ "$existing" != "$(cat "$sums")" ]; then
         echo "release $release already names different archives" >&2
