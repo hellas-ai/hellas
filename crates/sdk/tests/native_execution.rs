@@ -546,6 +546,41 @@ async fn holdings(devnet: &Devnet, owner: SettlementKey) -> Vec<(CoinId, u64)> {
         .collect()
 }
 
+// Drive real blocks until the provider's finalized state contains the expected
+// coins. Each read follows publication; scheduler speed does not set a retry count.
+async fn wait_for_holdings(
+    devnet: &mut Devnet,
+    owner: SettlementKey,
+    ready: impl Fn(&[(CoinId, u64)]) -> bool,
+) {
+    let node = devnet.full_node(0).clone();
+    sealing_while(devnet, Duration::from_millis(100), async {
+        let mut finalized = node.finalized();
+        let chain = node.wait_ready().await.unwrap().client();
+        loop {
+            finalized.borrow_and_update();
+            match chain.get_coins_by_owner(owner).await {
+                Ok(Some(listing)) => {
+                    let coins: Vec<_> = listing
+                        .coins
+                        .into_iter()
+                        .map(|(id, value)| (CoinId::from_bytes(id.0), value))
+                        .collect();
+                    if ready(&coins) {
+                        break;
+                    }
+                }
+                Ok(None)
+                | Err(hellas_chain::QueryError::StateUnavailable(_))
+                | Err(hellas_chain::QueryError::NotYetApplied) => {}
+                Err(error) => panic!("reading finalized holdings: {error}"),
+            }
+            finalized.changed().await.expect("provider remains running");
+        }
+    })
+    .await;
+}
+
 async fn client_reshapes(devnet: &Devnet) -> Vec<hellas_kernel::Reshape> {
     let mut found = Vec::new();
     let chain = devnet.validator_light_client(0);
@@ -1499,15 +1534,8 @@ async fn paid_finish(case: PaidScenario) {
     );
 
     eprintln!("H4 settlement complete; awaiting early stake reclaim");
-    let mut held = Vec::new();
-    for _ in 0..200 {
-        held = holdings(&devnet, PROVIDER_OWNER.key()).await;
-        if held.len() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        devnet.seal().await;
-    }
+    wait_for_holdings(&mut devnet, PROVIDER_OWNER.key(), |held| held.len() == 2).await;
+    let held = holdings(&devnet, PROVIDER_OWNER.key()).await;
     assert!(
         devnet.height() < bond_timeout,
         "payment closure releases stake before the horizon"
@@ -1652,20 +1680,25 @@ async fn provider_close_offline(
         "A can settle only B's certified cumulative while B is absent"
     );
     devnet.seal_through(pending.response_deadline()).await;
-    for _ in 0..32 {
-        devnet.seal().await;
-        if source
-            .work_channel_snapshot(query.clone())
-            .await
-            .unwrap()
-            .unwrap()
-            .payment()
-            .is_none()
-        {
-            break;
+    let node = devnet.full_node(0).clone();
+    sealing_while(devnet, Duration::from_millis(100), async {
+        let mut finalized = node.finalized();
+        loop {
+            finalized.borrow_and_update();
+            if source
+                .work_channel_snapshot(query.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .payment()
+                .is_none()
+            {
+                break;
+            }
+            finalized.changed().await.expect("provider remains running");
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
     assert!(
         source
             .work_channel_snapshot(query)

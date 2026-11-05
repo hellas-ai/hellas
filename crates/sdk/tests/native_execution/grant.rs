@@ -208,6 +208,7 @@ async fn local_grant_session_executes_without_http() {
         reply: Reply::text("fixture output", 1),
         ..Backend::default()
     };
+    let started = backend.started.clone();
     let clock = TestClock::default();
     let service = GrantService::new(
         store,
@@ -493,13 +494,9 @@ async fn local_grant_session_executes_without_http() {
             .await
             .is_err()
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while calls.load(Ordering::SeqCst) < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    while calls.load(Ordering::SeqCst) < 3 {
+        started.notified().await;
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     finish.release();
     session.shutdown().await.unwrap();

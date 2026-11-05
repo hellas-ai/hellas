@@ -12,6 +12,7 @@ pub(super) struct Source {
     pub local: hellas_chain::rpc::LocalLightClient,
     pub unavailable: Arc<AtomicBool>,
     pub tips_unavailable: Arc<AtomicBool>,
+    tip_refusals: Arc<tokio::sync::Semaphore>,
     pub listing_padding: Arc<AtomicBool>,
     pub attempts: Arc<AtomicUsize>,
     pub replay: Arc<AtomicU64>,
@@ -69,6 +70,7 @@ impl hellas_chain::LightClient for Source {
         query: FinalizedBlockQuery,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
         if self.tips_unavailable.load(Ordering::SeqCst) {
+            self.tip_refusals.add_permits(1);
             return Err(QueryError::Remote("injected RPC Unavailable".into()));
         }
         let height = self.replay.load(Ordering::SeqCst);
@@ -90,6 +92,7 @@ impl hellas_chain::LightClient for Source {
         query: FinalizedBlockQuery,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
         if self.tips_unavailable.load(Ordering::SeqCst) {
+            self.tip_refusals.add_permits(1);
             return Err(QueryError::Remote("injected RPC Unavailable".into()));
         }
         let height = self.replay.load(Ordering::SeqCst);
@@ -161,6 +164,7 @@ impl Relays {
             local: devnet.validator_light_client(0),
             unavailable: Arc::new(AtomicBool::new(false)),
             tips_unavailable: Arc::new(AtomicBool::new(false)),
+            tip_refusals: Arc::new(tokio::sync::Semaphore::new(0)),
             listing_padding: Arc::new(AtomicBool::new(false)),
             attempts: Arc::new(AtomicUsize::new(0)),
             replay: Arc::new(AtomicU64::new(replay)),
@@ -614,16 +618,16 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
             .is_ok()
     );
     drop(hanging);
-    config.validators = relays.urls.clone();
+    // One source makes two refusals evidence of a retry, rather than two
+    // concurrent source-selection requests. Observe requests, not elapsed time.
+    config.validators = vec![relays.urls[0].clone()];
     relays.source.tips_unavailable.store(true, Ordering::SeqCst);
     let connecting = hellas_sdk::client_chain::connect(&config, Duration::from_secs(2));
     tokio::pin!(connecting);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut connecting)
-            .await
-            .is_err(),
-        "RPC Unavailable waits on the same connection future"
-    );
+    tokio::select! {
+        result = &mut connecting => panic!("source selection ended before retrying unavailable tips: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+        permits = relays.source.tip_refusals.acquire_many(2) => permits.unwrap().forget(),
+    }
     relays
         .source
         .tips_unavailable

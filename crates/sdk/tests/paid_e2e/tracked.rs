@@ -18,28 +18,20 @@ fn job() -> hellas_sdk::job::Job {
 }
 
 // Establish fixture funding separately from the tracked attempts under test.
+// The SDK owns bounded funding retries on the original connection.
 async fn fund(case: &mut PaidScenario<()>) {
-    let mut session = sealing_while(&mut case.devnet, Duration::from_millis(100), async {
-        loop {
-            match PaidWorkSession::open(
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
-                SessionOpenMode::Any,
-                SessionFundingOptions::default(),
-            )
-            .await
-            {
-                Err(PaidClientError::OfferRefused(code))
-                    if code == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32 =>
-                {
-                    tokio::time::sleep(case.options.config.poll).await;
-                }
-                result => break result,
-            }
-        }
-    })
+    let mut session = sealing_while(
+        &mut case.devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
+        ),
+    )
     .await
     .unwrap();
     session.shutdown().await;

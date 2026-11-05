@@ -76,35 +76,19 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             })));
             let mut bond = None;
             for n in 0..10 {
-                let open = async {
-                    loop {
-                        let opened = PaidWorkSession::open(
-                            case.options.clone(),
-                            case.endpoint.clone(),
-                            client_settlement(),
-                            case.owner.clone(),
-                            SessionOpenMode::Job(&job),
-                            SessionFundingOptions {
-                                max_funding: Some(if n == 0 { 1000 } else { 0 }),
-                                approval: Some(budget.clone()),
-                            },
-                        )
-                        .await;
-                        // The client can verify funding before the provider's
-                        // full node applies that block. Resume the signed intent
-                        // on the next opening attempt; never reserve/sign twice.
-                        match opened {
-                            Err(hellas_sdk::paid_client::PaidClientError::OfferRefused(code))
-                                if code
-                                    == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding
-                                        as i32 =>
-                            {
-                                tokio::time::sleep(case.options.config.poll).await;
-                            }
-                            result => break result,
-                        }
-                    }
-                };
+                // The SDK retries funding visibility on the same connection;
+                // a failed session open must fail the test, not start another.
+                let open = PaidWorkSession::open(
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionOpenMode::Job(&job),
+                    SessionFundingOptions {
+                        max_funding: Some(if n == 0 { 1000 } else { 0 }),
+                        approval: Some(budget.clone()),
+                    },
+                );
                 // Only the first opening funds a channel. Reconnecting to it
                 // needs no blocks: sealing on a wall-clock timer here would
                 // age the bond according to the CI runner's network speed.
@@ -242,34 +226,47 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             // alone does not release budget: until verified returns are recorded,
             // a fresh quote must fail before signing.
             budget.0.lock().unwrap().reservation = [8; 16];
-            let refused = sealing_while(&mut case.devnet, Duration::from_millis(100), async {
+            // Observe reclamation through the provider's finalized view. Opening
+            // fresh QUIC connections every poll interval competes with admission
+            // limits and tests connection timing instead of the funding budget.
+            sealing_while(&mut case.devnet, Duration::from_millis(100), async {
+                let mut finalized = case.provider_node.finalized();
+                let chain = case.provider_node.wait_ready().await.unwrap().client();
                 loop {
-                    let opened = PaidWorkSession::open(
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionOpenMode::Job(&job),
-                        SessionFundingOptions {
-                            max_funding: Some(1000),
-                            approval: Some(budget.clone()),
-                        },
-                    )
-                    .await;
-                    // The provider must reclaim its old bond before offering a
-                    // replacement; that wait must not be mistaken for budget refusal.
-                    match opened {
-                        Err(hellas_sdk::paid_client::PaidClientError::OfferRefused(code))
-                            if code
-                                == hellas_rpc::pb::work::OfferRefusalCode::NoStakeAvailable
-                                    as i32 =>
+                    finalized.borrow_and_update();
+                    let snapshot = chain
+                        .work_channel_snapshot(hellas_chain::work_view::WorkChannelQuery {
+                            bond_edge: bond,
+                            payment_edge: Some(descriptor.channel().payment_edge()),
+                            funding: Default::default(),
+                        })
+                        .await;
+                    match snapshot {
+                        Ok(Some(snapshot))
+                            if snapshot.bond().is_none() && snapshot.payment().is_none() =>
                         {
-                            tokio::time::sleep(case.options.config.poll).await;
+                            break;
                         }
-                        result => break result,
+                        Ok(_)
+                        | Err(hellas_chain::QueryError::StateUnavailable(_))
+                        | Err(hellas_chain::QueryError::NotYetApplied) => {}
+                        Err(error) => panic!("reading provider reclamation state: {error}"),
                     }
+                    finalized.changed().await.expect("provider remains running");
                 }
             })
+            .await;
+            let refused = PaidWorkSession::open(
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionOpenMode::Job(&job),
+                SessionFundingOptions {
+                    max_funding: Some(1000),
+                    approval: Some(budget.clone()),
+                },
+            )
             .await
             .err()
             .expect("replacement channel exceeds the budget");
