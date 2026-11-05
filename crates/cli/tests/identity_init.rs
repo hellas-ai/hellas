@@ -1,5 +1,33 @@
 use std::process::Command;
 
+#[cfg(feature = "heavy")]
+#[test]
+fn local_tasks_do_not_initialize_an_identity_or_wallet() {
+    for task in ["transcribe", "image", "text"] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
+            .current_dir(directory.path())
+            .env("HOME", directory.path())
+            .env("XDG_DATA_HOME", directory.path().join("data"))
+            .args([task, "--local", "--model", "missing-model"])
+            .args(if task == "transcribe" {
+                ["--audio", "missing.wav"]
+            } else {
+                ["--prompt", "hello"]
+            })
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("No such file or directory"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "local preparation initialized identity state"
+        );
+    }
+}
+
 #[test]
 fn initialize_identity_and_owner_key_with_bare_filenames() {
     let directory = tempfile::tempdir().unwrap();

@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn model_tasks_select_one_execution_mode() {
+    for args in [
+        vec!["transcribe", "--model", "model", "--audio", "audio.wav"],
+        vec!["image", "--model", "model", "--prompt", "fox"],
+        vec!["text", "--model", "model.gguf", "--prompt", "hello"],
+    ] {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                std::iter::once("hellas")
+                    .chain(args.iter().copied())
+                    .chain(extra.iter().copied()),
+            )
+        };
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--offer", "friend.model"]).is_ok());
+        let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
+        assert!(parse(&["--provider", &provider, "--payment", "20"]).is_ok());
+        assert!(parse(&["--local"]).is_ok());
+        for extra in [
+            vec!["--local", "--offer", "friend.model"],
+            vec!["--local", "--provider", &provider, "--payment", "20"],
+            vec!["--local", "--faucet"],
+            vec!["--local", "--settle"],
+        ] {
+            assert!(parse(&extra).is_err(), "{args:?} {extra:?}");
+        }
+    }
+}
+
+#[test]
 fn image_cli_and_gateway_surfaces_are_available() {
     let convert = Cli::try_parse_from([
         "hellas",

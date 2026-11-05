@@ -73,7 +73,7 @@ impl ServeArgs {
     }
 }
 #[cfg(feature = "heavy")]
-fn parse_gpu_backend(value: &str) -> Result<GpuDialect, String> {
+pub(crate) fn parse_gpu_backend(value: &str) -> Result<GpuDialect, String> {
     match value {
         "hip" => Ok(GpuDialect::Hip),
         "cuda" => Ok(GpuDialect::Cuda),

@@ -401,6 +401,8 @@ enum Commands {
     },
     /// Generate one PNG with a client-rendered Flux job on a paid provider.
     Image(commands::transact::ImageArgs),
+    /// Continue text using a client-rendered model job.
+    Text(commands::transact::TextArgs),
     /// Inspect and fill the content store
     Store {
         /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
@@ -441,6 +443,9 @@ fn validate_identity_options(
     software_root: bool,
 ) -> Result<(), String> {
     let identity_free = match command {
+        Commands::Transcribe(args) if args.is_local() => Some("transcribe --local"),
+        Commands::Image(args) if args.is_local() => Some("image --local"),
+        Commands::Text(args) if args.is_local() => Some("text --local"),
         Commands::Admin(commands::admin::AdminArgs {
             command: commands::admin::AdminCommand::InspectOffline { .. },
             ..
@@ -620,6 +625,33 @@ async fn async_main() {
         return;
     }
 
+    // Local compute does not initialize an owner, wallet, or network identity.
+    let local_task = match &cli.command {
+        Commands::Transcribe(args) => args.is_local(),
+        Commands::Image(args) => args.is_local(),
+        Commands::Text(args) => args.is_local(),
+        _ => false,
+    };
+    if local_task {
+        #[cfg(feature = "heavy")]
+        let result = match cli.command {
+            Commands::Transcribe(args) => commands::transact::transcribe(args, None).await,
+            Commands::Image(args) => commands::transact::image(args, None).await,
+            Commands::Text(args) => commands::transact::text(args, None).await,
+            _ => unreachable!(),
+        };
+        #[cfg(not(feature = "heavy"))]
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+            "local execution needs the heavy hellas build"
+        ));
+        tracer_provider.shutdown();
+        if let Err(error) = result {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // A selected faucet account stays with this identity across restarts.
     let persistent_owner = matches!(
         &cli.command,
@@ -629,6 +661,7 @@ async fn async_main() {
             | Commands::Run(_)
             | Commands::Transcribe(_)
             | Commands::Image(_)
+            | Commands::Text(_)
             | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
@@ -1258,11 +1291,11 @@ async fn async_main() {
             async {
                 commands::transact::transcribe(
                     args,
-                    commands::transact::Context::new(
+                    Some(commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
-                    )?,
+                    )?),
                 )
                 .await
             }
@@ -1272,11 +1305,25 @@ async fn async_main() {
             async {
                 commands::transact::image(
                     args,
-                    commands::transact::Context::new(
+                    Some(commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
-                    )?,
+                    )?),
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Text(args) => {
+            async {
+                commands::transact::text(
+                    args,
+                    Some(commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        cli.identity.as_deref(),
+                    )?),
                 )
                 .await
             }

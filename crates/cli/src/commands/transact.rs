@@ -5,11 +5,9 @@ use hellas_auth::ProducerSigningKey;
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
 use hellas_sdk::{
-    execution::{
-        ExecutionAttempt, ExecutionResult, ExecutionSession, ExecutionTerms, PaidCompletion,
-    },
+    execution::{Completion, Evidence, ExecutionAttempt, ExecutionTerms, RemoteEvidence},
     job::{Job, JobInput},
-    paid_client::{PaidWorkOptions, bind_paid_endpoint, request_paid_quote, settle_channel},
+    paid_client::{PaidWorkOptions, bind_paid_endpoint, request_paid_quote},
     transact::PurchaseRecovery,
 };
 use std::{
@@ -23,11 +21,14 @@ use std::{
 mod client;
 mod grant;
 mod run;
+mod task;
 mod transcribe;
 pub use run::{RunArgs, run as run_program};
 pub use transcribe::{TranscribeArgs, transcribe};
 mod image;
 pub use image::{ImageArgs, image};
+mod text;
+pub use text::{TextArgs, text};
 #[cfg(test)]
 mod tests;
 
@@ -144,13 +145,15 @@ pub struct TransactArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("paid_provider").required(true).arg("provider")))]
+#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct FetchArgs {
     url: String,
     #[command(flatten)]
     client: ClientArgs,
-    #[arg(long)]
-    payment: u64,
+    #[command(flatten)]
+    grant: grant::GrantArgs,
+    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    payment: Option<u64>,
     #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
     assurance: String,
     #[arg(short = 'X', long, default_value = "GET")]
@@ -271,6 +274,10 @@ impl ClientArgs {
         price: u64,
         assurance: Assurance,
     ) -> super::CliResult<PaidWorkOptions> {
+        ensure!(
+            price > 0,
+            "paid execution requires a positive job payment; select --offer for grant work"
+        );
         self.paid_provider()?;
         let root = self.root(context);
         let config = client::config(self, &root).await?;
@@ -403,259 +410,119 @@ async fn bounded<T>(
     }
 }
 
-async fn execute(
-    args: &ClientArgs,
-    context: &Context,
-    job: &Job,
-    options: PaidWorkOptions,
-    endpoint: iroh::Endpoint,
-    purchase: &mut ExecutionAttempt,
-) -> super::CliResult<PaidCompletion> {
-    if let Some(result) = purchase.retained_paid_result()? {
-        purchase.bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
-            provider: options.provider,
-        })?;
-        return Ok(result);
-    }
-    let facts = purchase.inspect()?;
-    if matches!(facts.terminal, hellas_sdk::execution::Terminal::Rejected) {
-        bail!("this attempt is already terminal; use --buy-again for a new attempt");
-    }
-    let owner = args.owner(context)?;
-    let mut session = purchase
-        .open_paid_session(
-            job.input(),
-            options,
-            endpoint,
-            context.settlement.clone(),
-            owner,
-            Default::default(),
-        )
-        .await?;
-    let terms = ExecutionTerms::Paid { price: job.price() };
-    let result = ExecutionSession::Paid(&mut session)
-        .execute(
-            job.input().clone(),
-            terms,
-            &context.producer,
-            Default::default(),
-            Some(purchase),
-        )
-        .await;
-    let result: super::CliResult<PaidCompletion> = async {
-        match result {
-            Ok(ExecutionResult::Paid(_)) => purchase.retained_paid_result()?
-                .context("paid output was not retained"),
-            Ok(ExecutionResult::Grant(_)) => unreachable!("paid session returned grant result"),
-            Err(hellas_sdk::execution::ExecutionError::RecoveryRequired) => {
-                let facts = ExecutionSession::Paid(&mut session).recover(purchase).await?;
-                bail!("the existing purchase requires recovery (work {:?}, payment {:?}, result available: {}); use --buy-again for a new attempt", facts.work, facts.payment, facts.result_available)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-    .await;
-    session.shutdown().await;
-    result
-}
-
-async fn purchase_and_execute(
-    args: &ClientArgs,
-    context: &Context,
-    job: &Job,
-    deliver: impl FnOnce(&PaidCompletion) -> super::CliResult<()>,
-) -> super::CliResult<()> {
-    ensure!(
-        job.price() > 0,
-        "paid execution requires a positive job payment; select --offer for grant work"
-    );
-    let options = args.options(context, job.price(), job.assurance()).await?;
-    let mut purchase = args.purchase(context, job, &options).await?;
-    let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-    let result = execute(
-        args,
-        context,
-        job,
-        options.clone(),
-        endpoint.clone(),
-        &mut purchase,
-    )
-    .await;
-    endpoint.close().await;
-    deliver_paid(args, context, &options, &mut purchase, &result?, deliver).await
-}
-
-async fn deliver_then_settle(
-    deliver: impl FnOnce() -> super::CliResult<()>,
-    settle: impl std::future::Future<Output = super::CliResult<()>>,
-) -> super::CliResult<()> {
-    deliver()?;
-    settle.await
-}
-
-async fn deliver_paid(
-    args: &ClientArgs,
-    context: &Context,
-    options: &PaidWorkOptions,
-    purchase: &mut ExecutionAttempt,
-    result: &PaidCompletion,
-    deliver: impl FnOnce(&PaidCompletion) -> super::CliResult<()>,
-) -> super::CliResult<()> {
-    deliver_then_settle(
-        || {
-            deliver(result)?;
-            purchase.reported()?;
-            Ok(())
-        },
-        async {
-            if args.settle {
-                let receipt = settle_channel(
-                    options,
-                    result.bond_edge,
-                    args.owner(context)?.principal(),
-                    &context.settlement,
-                )
-                .await?;
-                ensure!(
-                    receipt.channel == result.channel_id,
-                    "settlement channel mismatch"
-                );
-                eprintln!(
-                    "settled channel {}: provider payout {}",
-                    receipt.channel, receipt.provider_payout
-                );
-            }
-            Ok(())
-        },
-    )
-    .await
-}
-
 pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
-    // Load every input before network activity or an owner approval.
     let job = args.job.as_deref().map(Job::load).transpose()?;
     bounded(args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
-        if args.grant.offer.is_some() {
-            return grant::run(&args.grant, &args.client, &context, &job, args.output.as_deref()).await;
-        }
-        purchase_and_execute(&args.client, &context, &job, |result| {
-        if let Some(directory) = &args.output { save_outputs(directory, &job, result)?; }
-        else if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1) {
+        let mut completion = task::remote(&args.client, &args.grant, &context, &job).await?;
+        if let Some(directory) = args.output {
+            save_outputs(&directory, &job, &completion)?;
+        } else if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1) {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
-            println!("output-0000 (base64): {}", STANDARD.encode(http_body(&job, result)?));
+            println!("output-0000 (base64): {}", STANDARD.encode(http_body(&job, &completion)?));
         } else {
-            println!("output: {}", serde_json::to_string(&hellas_channel::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
+            let output = match &completion.evidence {
+                Evidence::Remote(evidence) if matches!(evidence.terms, ExecutionTerms::Paid { .. }) =>
+                    serde_json::to_string(&hellas_channel::model::work::decode_transcript(&evidence.transcript, evidence.transcript.len())?)?,
+                _ => serde_json::to_string(&completion.output)?,
+            };
+            println!("output: {output}");
         }
-        println!("{}", wording(args.client.paid_provider()?, &job, result));
+        ensure_succeeded(&completion)?;
+        println!("{}", wording(&job, &completion.evidence));
         std::io::stdout().lock().flush()?;
+        task::deliver_and_settle(&mut completion).await?;
         Ok(())
-        }).await
     }, |timeout| format!("transaction exceeded {timeout:?}; use the same folder to recover its existing attempt")).await
 }
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
-    let mut request = args.request()?;
+    let request = args.request()?;
     let contract = args.contract()?;
-    ensure!(args.payment > 0, "--payment must be positive");
-    bounded(
-        args.client.timeout,
-        async {
-            let options = args
-                .client
-                .options(&context, args.payment, args.assurance())
-                .await?;
+    bounded(args.client.timeout, async {
+        let (job, executor) = if args.grant.offer.is_some() {
+            let options = args.grant.options(&args.client, &context, args.assurance())?;
+            let policy = &args.grant.policy(&options)?.invocation_policy;
+            let job = args.job(request, contract, policy, &context)?;
+            let executor = args.grant.executor(&args.client, &context, &job, options).await?;
+            (job, executor)
+        } else {
+            let options = args.client.options(&context, args.payment.unwrap(), args.assurance()).await?;
             let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-            let result = async {
-                let quote = request_paid_quote(
-                    &options,
-                    &endpoint,
-                    &context.settlement,
-                    args.client.owner(&context)?.principal(),
-                )
-                .await?;
-                let admission = quote
-                    .policy
-                    .invocation_policy
-                    .admissions
-                    .iter()
-                    .find_map(|a| match a {
-                        hellas_rpc::protocol::invocation::Admission::Fetch { admission }
-                            if admission.contract == contract =>
-                        {
-                            Some(admission)
-                        }
-                        _ => None,
-                    })
-                    .context("provider does not admit the named contract. Nothing was paid.")?;
-                let route = &admission.route;
-                let (service, method) = match route {
-                    hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch {
-                        ..
-                    } => ("http".into(), "request".into()),
-                    hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                        service,
-                        method,
-                    } => (service.clone(), method.clone()),
-                };
-                if args.max_response_bytes.is_none() {
-                    request.max_response_bytes =
-                        (quote.policy.invocation_policy.limits.max_output_bytes / 4 * 3)
-                            .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
-                            as u32;
-                }
-                let job = Job::fetch(
-                    args.payment,
-                    contract.clone(),
-                    service,
-                    method,
-                    serde_json::to_vec(&request)?,
-                    args.assurance(),
-                )?;
-                let directory = args.save_job.clone().unwrap_or_else(|| {
-                    args.client
-                        .root(&context)
-                        .join("jobs")
-                        .join(job.digest().to_string())
-                });
-                job.save(&directory)?;
-                eprintln!("job: {}", directory.display());
-                let mut purchase = args.client.purchase(&context, &job, &options).await?;
-                let result = execute(
-                    &args.client,
-                    &context,
-                    &job,
-                    options.clone(),
-                    endpoint.clone(),
-                    &mut purchase,
-                )
-                .await?;
-                deliver_paid(&args.client, &context, &options, &mut purchase, &result, |result| {
-                let body = http_body(&job, result)?;
-                if let Some(path) = &args.output {
-                    write(path, &body)?;
-                } else {
-                    std::io::stdout().lock().write_all(&body)?;
-                }
-                eprintln!("{}", wording(args.client.paid_provider()?, &job, result));
-                std::io::stdout().lock().flush()?;
-                std::io::stderr().lock().flush()?;
-                Ok(())
-                }).await
-            }
-            .await;
-            endpoint.close().await;
-            result
-        },
-        |timeout| {
-            format!("Fetch exceeded {timeout:?}; recover the existing attempt with transact --job and the saved folder")
-        },
-    )
-    .await
+            let quote = request_paid_quote(&options, &endpoint, &context.settlement,
+                args.client.owner(&context)?.principal()).await?;
+            let job = args.job(request, contract, &quote.policy.invocation_policy, &context)?;
+            let executor = args.client.executor(&context, &job, options, endpoint).await?;
+            (job, executor)
+        };
+        let mut completion = task::execute(executor, &job).await?;
+        let body = http_body(&job, &completion)?;
+        if let Some(path) = &args.output {
+            write(path, &body)?;
+        } else {
+            std::io::stdout().lock().write_all(&body)?;
+        }
+        eprintln!("{}", wording(&job, &completion.evidence));
+        std::io::stdout().lock().flush()?;
+        std::io::stderr().lock().flush()?;
+        task::deliver_and_settle(&mut completion).await?;
+        Ok(())
+    }, |timeout| format!("Fetch exceeded {timeout:?}; recover the existing attempt with transact --job and the saved folder")).await
 }
 
 impl FetchArgs {
+    fn job(
+        &self,
+        mut request: hellas_rpc::http_fetch::HttpFetchRequest,
+        contract: hellas_rpc::FetchContract,
+        policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
+        context: &Context,
+    ) -> super::CliResult<Job> {
+        let admission = policy
+            .admissions
+            .iter()
+            .find_map(|admission| match admission {
+                hellas_rpc::protocol::invocation::Admission::Fetch { admission }
+                    if admission.contract == contract =>
+                {
+                    Some(admission)
+                }
+                _ => None,
+            })
+            .context("provider does not admit the named contract. Nothing was paid.")?;
+        let (service, method) = match &admission.route {
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch { .. } => {
+                ("http".into(), "request".into())
+            }
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                service,
+                method,
+            } => (service.clone(), method.clone()),
+        };
+        if self.max_response_bytes.is_none() {
+            request.max_response_bytes = (policy.limits.max_output_bytes / 4 * 3)
+                .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
+                as u32;
+        }
+        let job = Job::fetch(
+            self.payment.unwrap_or(0),
+            contract,
+            service,
+            method,
+            serde_json::to_vec(&request)?,
+            self.assurance(),
+        )?;
+        let directory = self.save_job.clone().unwrap_or_else(|| {
+            self.client
+                .root(context)
+                .join("jobs")
+                .join(job.digest().to_string())
+        });
+        job.save(&directory)?;
+        eprintln!("job: {}", directory.display());
+        Ok(job)
+    }
+
     /// The named HTTPS contract; checked before any provider is contacted.
     fn contract(&self) -> super::CliResult<hellas_rpc::FetchContract> {
         let contract = match self.contract.as_str() {
@@ -737,8 +604,11 @@ impl FetchArgs {
     }
 }
 
-fn http_body(job: &Job, result: &PaidCompletion) -> super::CliResult<Vec<u8>> {
-    decode_http_body(job, &result.output, &result.provider_key)
+fn http_body(job: &Job, completion: &Completion) -> super::CliResult<Vec<u8>> {
+    let Evidence::Remote(evidence) = &completion.evidence else {
+        bail!("HTTPS Fetch requires remote evidence");
+    };
+    decode_http_body(job, &completion.output, &evidence.provider_key)
 }
 
 fn decode_http_body(
@@ -761,32 +631,44 @@ fn decode_http_body(
     Ok(hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &output)?.body)
 }
 
-fn save_outputs(directory: &Path, job: &Job, result: &PaidCompletion) -> super::CliResult<()> {
+fn save_outputs(directory: &Path, job: &Job, completion: &Completion) -> super::CliResult<()> {
     hellas_private::create_dir_all_durable(directory)?;
-    write(&directory.join("transcript.cbor"), &result.transcript)?;
+    let metadata = match &completion.evidence {
+        Evidence::Local => {
+            serde_json::json!({"job": job.digest().to_string(), "execution": "local", "outcome": completion.output.outcome})
+        }
+        Evidence::Remote(evidence) => {
+            let RemoteEvidence {
+                terms,
+                provider,
+                channel,
+                work,
+                transcript,
+                ..
+            } = evidence.as_ref();
+            write(&directory.join("transcript.cbor"), transcript)?;
+            match terms {
+                ExecutionTerms::Grant { resource } => serde_json::json!({
+                    "job": job.digest().to_string(), "provider": provider.to_string(),
+                    "funding": "grant", "resource": resource.to_string(),
+                    "work": work.to_string(), "outcome": completion.output.outcome,
+                }),
+                ExecutionTerms::Paid { price } => serde_json::json!({
+                    "job": job.digest().to_string(), "work": work.to_string(),
+                    "channel": channel.to_string(), "paid": price,
+                }),
+            }
+        }
+    };
     write(
         &directory.join("result.json"),
-        &serde_json::to_vec_pretty(
-            &serde_json::json!({"job": job.digest().to_string(), "work": result.work_id.to_string(), "channel": result.channel_id.to_string(), "paid": result.job_price}),
-        )?,
+        &serde_json::to_vec_pretty(&metadata)?,
     )?;
-    save_invocation_outputs(directory, job, &result.output, &result.provider_key)
-}
-
-fn save_invocation_outputs(
-    directory: &Path,
-    job: &Job,
-    output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
-    provider_key: &hellas_auth::PublicKey,
-) -> super::CliResult<()> {
     if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1)
     {
-        write(
-            &directory.join("output-0000"),
-            &decode_http_body(job, output, provider_key)?,
-        )?;
+        write(&directory.join("output-0000"), &http_body(job, completion)?)?;
     } else {
-        for (index, artifact) in output.artifacts.iter().enumerate() {
+        for (index, artifact) in completion.output.artifacts.iter().enumerate() {
             write(
                 &directory.join(format!("output-{index:04}")),
                 artifact.bytes.as_bytes(),
@@ -794,8 +676,17 @@ fn save_invocation_outputs(
         }
         write(
             &directory.join("output.json"),
-            &serde_json::to_vec_pretty(output)?,
+            &serde_json::to_vec_pretty(&completion.output)?,
         )?;
+    }
+    Ok(())
+}
+
+fn ensure_succeeded(completion: &Completion) -> super::CliResult<()> {
+    if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) =
+        &completion.output.outcome
+    {
+        bail!("work failed: {reason:?}");
     }
     Ok(())
 }
@@ -805,16 +696,34 @@ fn write(path: &Path, bytes: &[u8]) -> super::CliResult<()> {
     Ok(())
 }
 
-fn wording(provider: &Provider, job: &Job, result: &PaidCompletion) -> String {
-    format!(
-        "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} (`hellas transact --settle --provider {}` settles this provider's channels)",
-        provider.address,
-        job.digest(),
-        job.manifest().application().evaluator(),
-        job.manifest().application().adaptor(),
-        result.job_price,
-        result.work_id,
-        result.channel_id,
-        provider.address,
-    )
+fn wording(job: &Job, evidence: &Evidence) -> String {
+    let Evidence::Remote(evidence) = evidence else {
+        return "executed locally".into();
+    };
+    let RemoteEvidence {
+        terms,
+        provider,
+        channel,
+        work,
+        settled_provider_payout,
+        ..
+    } = evidence.as_ref();
+    match terms {
+        ExecutionTerms::Grant { .. } => format!("grant work {work} completed on {provider}"),
+        ExecutionTerms::Paid { price } => format!(
+            "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} ({})",
+            provider,
+            job.digest(),
+            job.manifest().application().evaluator(),
+            job.manifest().application().adaptor(),
+            price,
+            work,
+            channel,
+            if settled_provider_payout.is_some() {
+                "settled".into()
+            } else {
+                format!("open; `hellas transact --settle --provider {provider}` closes it")
+            }
+        ),
+    }
 }

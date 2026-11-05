@@ -1,32 +1,6 @@
 use super::*;
 use clap::Parser as _;
 
-#[tokio::test]
-async fn paid_output_is_flushed_before_a_failed_settlement() {
-    let directory = tempfile::tempdir().unwrap();
-    let output = directory.path().join("output");
-    let result = deliver_then_settle(
-        || {
-            let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
-            writer.write_all(b"paid result")?;
-            writer.flush()?;
-            Ok(())
-        },
-        async {
-            assert_eq!(std::fs::read(&output).unwrap(), b"paid result");
-            bail!("injected settlement failure")
-        },
-    )
-    .await;
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("injected settlement failure")
-    );
-    assert_eq!(std::fs::read(output).unwrap(), b"paid result");
-}
-
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let base = ["hellas", "transact", "--job", "job"];
@@ -440,22 +414,18 @@ fn output_claims_only_provider_signature_and_job_binding() {
         Assurance::ProducerSigned,
     )
     .unwrap();
-    let result = PaidCompletion {
-        bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
-        channel_id: hellas_auth::Digest::from_bytes([3; 32]),
-        transcript: vec![],
-        output: hellas_rpc::protocol::invocation::output::InvocationOutput {
-            outcome: hellas_rpc::protocol::invocation::output::Outcome::Succeeded,
-            artifacts: vec![],
-            metadata: hellas_rpc::JsonBytes(vec![]),
-        },
-        work_id: hellas_auth::Digest::from_bytes([4; 32]),
-        job_price: 20,
+    let evidence = Evidence::Remote(Box::new(RemoteEvidence {
+        terms: ExecutionTerms::Paid { price: 20 },
+        provider: args.client.paid_provider().unwrap().address,
         provider_key: ProducerSigningKey::from_secret_bytes([8; 32])
             .unwrap()
             .public_key(),
-    };
-    let output = wording(args.client.paid_provider().unwrap(), &job, &result);
+        channel: hellas_auth::Digest::from_bytes([3; 32]),
+        work: hellas_auth::Digest::from_bytes([4; 32]),
+        transcript: vec![],
+        settled_provider_payout: None,
+    }));
+    let output = wording(&job, &evidence);
     assert_eq!(
         output.lines().nth(1),
         Some(
@@ -602,5 +572,33 @@ fn paid_commands_require_a_provider_before_opening_chain_state() {
             .err()
             .expect("missing paid provider");
         assert!(error.to_string().contains("--provider"), "{error}");
+    }
+}
+
+#[test]
+fn fetch_share_selects_grant_execution_and_refuses_payment_options() {
+    let base = [
+        "hellas",
+        "fetch",
+        "https://example.test",
+        "--contract",
+        "http",
+        "--offer",
+        "shared.api",
+    ];
+    let parse =
+        |extra: &[&str]| crate::Cli::try_parse_from(base.into_iter().chain(extra.iter().copied()));
+    let crate::Commands::Fetch(args) = parse(&[]).unwrap().command else {
+        unreachable!()
+    };
+    assert!(args.payment.is_none());
+    assert_eq!(args.grant.offer.as_deref(), Some("shared.api"));
+    for extra in [
+        &["--payment", "20"][..],
+        &["--settle"],
+        &["--buy-again"],
+        &["--address", "127.0.0.1:1"],
+    ] {
+        assert!(parse(extra).is_err(), "{extra:?}");
     }
 }

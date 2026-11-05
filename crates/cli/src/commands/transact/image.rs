@@ -1,12 +1,10 @@
 use super::*;
-use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct ImageArgs {
     #[command(flatten)]
-    client: ClientArgs,
+    task: task::TaskArgs,
     /// Converted Flux2 Klein package directory.
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
@@ -20,15 +18,17 @@ pub struct ImageArgs {
     height: usize,
     #[arg(long, default_value_t = 4)]
     steps: usize,
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
-    #[command(flatten)]
-    grant: grant::GrantArgs,
     #[arg(short = 'o', long, default_value = "image.png", value_name = "PNG")]
     output: PathBuf,
 }
 
-pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult<()> {
+impl ImageArgs {
+    pub fn is_local(&self) -> bool {
+        self.task.is_local()
+    }
+}
+
+pub async fn image(args: ImageArgs, context: Option<Context>) -> super::super::CliResult<()> {
     let request = ImageRequest {
         prompt: &args.prompt,
         seed: args.seed,
@@ -36,105 +36,69 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         height: args.height,
         steps: args.steps,
     };
-    let (package, job, directory) = prepare(
-        &args.model,
-        request,
-        args.payment.unwrap_or(0),
-        &args.client.root(&context),
-    )?;
-    eprintln!("job: {}", directory.display());
-    bounded(
-        args.client.timeout,
-        async {
-            if args.grant.offer.is_some() {
-                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                result.save(&directory.join("result"), &job)?;
-                result.ensure_succeeded()?;
-                let ModelResponse::Image(image) = package.decode(&result.retained.output)? else { bail!("expected image") };
-                std::fs::write(&args.output, image.png(args.width, args.height)?)?;
-                println!("{}", args.output.display());
-                std::io::stdout().lock().flush()?;
-                result.attempt.reported()?;
-                return Ok(());
-            }
-            purchase_and_execute(&args.client, &context, &job, |result| {
-            let ModelResponse::Image(image) = package.decode(&result.output)? else {
-                bail!("expected image");
-            };
-            let png = image.png(args.width, args.height)?;
-            std::fs::write(&args.output, png)?;
-            save_outputs(&directory.join("result"), &job, result)?;
-            println!("{}", args.output.display());
-            std::io::stdout().lock().flush()?;
-            Ok(())
-            }).await
-        },
-        |timeout| {
-            format!("image generation exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
-        },
-    )
-    .await
-}
-
-fn prepare(
-    model: &Path,
-    request: ImageRequest<'_>,
-    payment: u64,
-    root: &Path,
-) -> anyhow::Result<(ModelPackage, Job, PathBuf)> {
     request.validate()?;
-    let package = ModelPackage::open(model)?;
+    let package = ModelPackage::open(&args.model)?;
     let rendered = package.render_job(&ModelRequest::Image(request))?;
-    let job = Job::compute(
-        payment,
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        InvocationContent::Ephemeral(rendered.content),
-    )?;
-    let directory = root.join("jobs").join(job.digest().to_string());
-    job.save(&directory)?;
-    Ok((package, job, directory))
+    let job = args.task.job(rendered, &args.model)?;
+    let mut completion = args.task.execute(&job, context.as_ref()).await?;
+    let ModelResponse::Image(image) = package.decode(&completion.output)? else {
+        bail!("expected image")
+    };
+    std::fs::write(&args.output, image.png(args.width, args.height)?)?;
+    println!("{}", args.output.display());
+    std::io::stdout().lock().flush()?;
+    task::deliver_and_settle(&mut completion).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
+
     #[test]
-    fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
+    fn image_targets_preserve_the_same_canonical_input() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
-        let root = tempfile::tempdir().unwrap();
-        let (_, job, directory) = prepare(
-            &model,
-            ImageRequest {
-                prompt: "a red fox",
-                seed: 42,
-                width: 16,
-                height: 16,
-                steps: 1,
-            },
-            20,
-            root.path(),
-        )
-        .unwrap();
-        let loaded = Job::load(&directory).unwrap();
-        assert_eq!(loaded.digest(), job.digest());
-        let JobInput::Compute {
-            environment,
-            plan,
-            content,
-            ..
-        } = loaded.input()
-        else {
-            panic!()
-        };
-        assert_eq!(plan.calls.len(), 3);
-        assert_eq!(environment.sources.len(), 1);
-        assert!(content.read(environment.sources[0]).is_ok());
-        assert_eq!(environment.assets.len(), 3);
-        assert!(environment.assets.iter().all(|asset| matches!(
-            content.read(asset.object),
-            Err(hellas_channel::content::ContentError::Missing)
-        )));
+        let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
+        let mut targets = vec![
+            vec!["--offer", "friend.image"],
+            vec!["--provider", &provider, "--payment", "20"],
+        ];
+        if cfg!(feature = "heavy") {
+            targets.push(vec!["--local"]);
+        }
+        let mut digest = None;
+        for target in targets {
+            let crate::Commands::Image(args) = crate::Cli::try_parse_from(
+                [
+                    "hellas",
+                    "image",
+                    "--model",
+                    model.to_str().unwrap(),
+                    "--prompt",
+                    "fox",
+                ]
+                .into_iter()
+                .chain(target),
+            )
+            .unwrap()
+            .command
+            else {
+                unreachable!()
+            };
+            let package = ModelPackage::open(&model).unwrap();
+            let rendered = package
+                .render_job(&ModelRequest::Image(ImageRequest {
+                    prompt: "fox",
+                    seed: 42,
+                    width: 16,
+                    height: 16,
+                    steps: 1,
+                }))
+                .unwrap();
+            let job = args.task.job(rendered, &model).unwrap();
+            let actual = job.input().tracking_digest();
+            assert_eq!(*digest.get_or_insert(actual), actual);
+        }
     }
 }

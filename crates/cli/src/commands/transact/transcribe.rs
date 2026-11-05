@@ -1,12 +1,10 @@
 use super::*;
-use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TranscribeArgs {
     #[command(flatten)]
-    client: ClientArgs,
+    task: task::TaskArgs,
     /// Converted Whisper client package directory.
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
@@ -16,15 +14,20 @@ pub struct TranscribeArgs {
     language: Option<String>,
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
-    #[command(flatten)]
-    grant: grant::GrantArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
 
-pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
+impl TranscribeArgs {
+    pub fn is_local(&self) -> bool {
+        self.task.is_local()
+    }
+}
+
+pub async fn transcribe(
+    args: TranscribeArgs,
+    context: Option<Context>,
+) -> super::super::CliResult<()> {
     let package = ModelPackage::open(&args.model)?;
     let samples = wav::decode(&super::super::read_bounded_regular_file(
         &args.audio,
@@ -36,56 +39,24 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         language: args.language.as_deref(),
         max_new_tokens: args.max_tokens,
     })?;
-    let job = Job::compute(
-        args.payment.unwrap_or(0),
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        InvocationContent::Ephemeral(rendered.content),
-    )?;
-    let directory = args
-        .client
-        .root(&context)
-        .join("jobs")
-        .join(job.digest().to_string());
-    job.save(&directory)?;
-    eprintln!("job: {}", directory.display());
-    bounded(
-        args.client.timeout,
-        async {
-            if args.grant.offer.is_some() {
-                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                if let Some(directory) = &args.output { result.save(directory, &job)?; }
-                result.ensure_succeeded()?;
-                let ModelResponse::Transcription(transcription) = package.decode(&result.retained.output)? else { bail!("expected transcription") };
-                println!("{}", transcription.text);
-                std::io::stdout().lock().flush()?;
-                result.attempt.reported()?;
-                return Ok(());
-            }
-            purchase_and_execute(&args.client, &context, &job, |result| {
-            if let Some(directory) = &args.output {
-                save_outputs(directory, &job, result)?;
-            }
-            let ModelResponse::Transcription(transcription) = package.decode(&result.output)?
-            else {
-                bail!("expected transcription");
-            };
-            println!("{}", transcription.text);
-            std::io::stdout().lock().flush()?;
-            Ok(())
-            }).await
-        },
-        |timeout| {
-            format!("transcription exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
-        },
-    )
-    .await
+    let job = args.task.job(rendered, &args.model)?;
+    let mut completion = args.task.execute(&job, context.as_ref()).await?;
+    if let Some(directory) = &args.output {
+        save_outputs(directory, &job, &completion)?;
+    }
+    let ModelResponse::Transcription(transcription) = package.decode(&completion.output)? else {
+        bail!("expected transcription")
+    };
+    println!("{}", transcription.text);
+    std::io::stdout().lock().flush()?;
+    task::deliver_and_settle(&mut completion).await?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "heavy"))]
 mod tests {
     use super::*;
+    use hellas_channel::content::InvocationContent;
     #[test]
     fn whisper_plan_validates_against_the_compiled_bundle() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
