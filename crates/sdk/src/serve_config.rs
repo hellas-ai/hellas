@@ -164,33 +164,36 @@ impl Destination {
     }
 
     pub fn into_entry(self, capabilities: FetchRoutePolicy) -> anyhow::Result<FetchRouteEntry> {
-        let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
-            Self::Http { config } => return Ok(config.into_entry(capabilities)?),
+        match self {
+            Self::Http { config } => Ok(config.into_entry(capabilities)?),
             Self::OpenAiResponses {
                 credential,
                 mut credentials,
-            } => {
-                return Ok(FetchRouteEntry::new(
-                    Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_secret(
-                        credentials
-                            .remove(&credential)
-                            .context("unknown OpenAI credential alias")?
-                            .into_secret()?,
+            } => Ok(FetchRouteEntry::new(
+                Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_secret(
+                    credentials
+                        .remove(&credential)
+                        .context("unknown OpenAI credential alias")?
+                        .into_secret()?,
+                )?),
+                Arc::new(hellas_providers::OpenAiResponsesAdaptorFactory::new()?),
+                capabilities,
+            )?),
+            Self::CodexResponses { auth_path } => {
+                let cap: u32 = capabilities
+                    .max_output_units
+                    .context("Codex route requires capabilities.max_output_tokens")?
+                    .try_into()
+                    .context("Codex output cap exceeds u32")?;
+                Ok(FetchRouteEntry::new(
+                    Arc::new(crate::codex_provider::CodexResponsesFetchProvider::new(
+                        auth_path.as_deref(),
                     )?),
-                    Arc::new(hellas_providers::OpenAiResponsesAdaptorFactory::new()?),
+                    Arc::new(hellas_providers::CodexResponsesAdaptorFactory::new(cap)?),
                     capabilities,
-                )?);
+                )?)
             }
-            Self::CodexResponses { auth_path } => Arc::new(
-                crate::codex_provider::CodexResponsesFetchProvider::new(auth_path.as_deref())?,
-            ),
-        };
-        let adaptor_factory = Arc::new(hellas_providers::CodexResponsesAdaptorFactory::new()?);
-        Ok(FetchRouteEntry::new(
-            provider,
-            adaptor_factory,
-            capabilities,
-        )?)
+        }
     }
 }
 

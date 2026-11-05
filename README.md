@@ -19,7 +19,7 @@ intentionally have different trust boundaries:
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
 | `hellas/catena-6e6ee62fc00e`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
-| `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
+| `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.3` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
 remote request, so structuring and destructuring are inside that application's
@@ -240,12 +240,22 @@ selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
 and response projector as one unit. A configuration cannot supply a URL or
 claim a different adaptor identity.
 
-A provider route file contains a `routes` array. Each route has `service`,
+The SDK host file has `version: 1` and a `routes` array, plus optional `grants`
+and `paid` policies. Each route has `service`,
 `method`, `destination` and optional `capabilities` (model and output limits).
 The former `callers` field is rejected; the mounted Work channel authorizes jobs.
 Use `serve --config FILE` to sell it.
 See [paid Work](crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
+
+Codex routes use `destination.type = "codex-responses"` and an `auth_path`
+pointing directly to the Codex CLI's native `auth.json`. `capabilities.max_output_tokens`
+is mandatory. The sealed driver sends that cap as `max_output_tokens`; a caller
+may request a smaller cap. Hellas reads credentials without refreshing, importing
+or rewriting them. Use the external Codex CLI to sign in and refresh; expired
+credentials fail closed. Without an explicit path, the reader uses
+`$CODEX_HOME/auth.json`, or `$HOME/.codex/auth.json`. Personal sharing stays off
+until accounts, quotas and agent reserve are explicitly approved.
 
 ## HTTP gateway
 

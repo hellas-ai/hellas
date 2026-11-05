@@ -36,18 +36,28 @@ pub const CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/code
 pub fn codex_responses_contract()
 -> Result<hellas_rpc::FetchContract, hellas_rpc::protocol::value::CanonicalDecodeError> {
     hellas_rpc::FetchContract::new(
-        "codex-responses-0.0.2",
+        "codex-responses-0.0.3",
         hellas_rpc::FetchSchema::ResponsesItemsV1,
-        "codex-responses-driver-0.0.2",
+        "codex-responses-driver-0.0.3",
         hellas_rpc::FetchEgress::FixedHttps(CODEX_RESPONSES_ENDPOINT.into()),
     )
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct CodexResponsesAdaptorFactory(hellas_rpc::ContentId);
+pub struct CodexResponsesAdaptorFactory(hellas_rpc::ContentId, u32);
 impl CodexResponsesAdaptorFactory {
-    pub fn new() -> Result<Self, hellas_rpc::protocol::value::CanonicalDecodeError> {
-        Ok(Self(codex_responses_contract()?.manifest_id()))
+    pub fn new(
+        max_output_tokens: u32,
+    ) -> Result<Self, hellas_rpc::protocol::value::CanonicalDecodeError> {
+        if max_output_tokens == 0 {
+            return Err(hellas_rpc::protocol::value::CanonicalDecodeError::new(
+                "Codex route requires a positive output cap",
+            ));
+        }
+        Ok(Self(
+            codex_responses_contract()?.manifest_id(),
+            max_output_tokens,
+        ))
     }
 }
 impl hellas_executor::FetchAdaptorFactory for CodexResponsesAdaptorFactory {
@@ -55,21 +65,20 @@ impl hellas_executor::FetchAdaptorFactory for CodexResponsesAdaptorFactory {
         self.0
     }
     fn create(&self, request: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError> {
-        create_session(request)
+        create_session(request, self.1)
     }
 }
 
 pub(super) fn create_session(
     request: &FetchCall,
+    max_output_tokens: u32,
 ) -> Result<FetchAdaptorSession, FetchAdaptorError> {
-    let prepared = prepare_request(request)?;
+    let prepared = prepare_request(request, max_output_tokens)?;
     let request_view = FetchRequestView {
         service: request.service.clone(),
         method: request.method.clone(),
         model: Some(prepared.model.clone()),
-        // The current Codex request contract has no max_output_tokens field.
-        // Signed Fetch event/byte limits remain independently mandatory.
-        max_output_units: None,
+        max_output_units: Some(u64::from(prepared.max_output_tokens)),
     };
     Ok(FetchAdaptorSession {
         request_view,
@@ -81,10 +90,14 @@ pub(super) fn create_session(
 struct PreparedCodexRequest {
     body: JsonBytes,
     model: String,
+    max_output_tokens: u32,
     contract: ProjectionContract,
 }
 
-fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAdaptorError> {
+fn prepare_request(
+    request: &FetchCall,
+    route_cap: u32,
+) -> Result<PreparedCodexRequest, FetchAdaptorError> {
     let body = request.body.as_bytes();
     if body.len() > MAX_FETCH_REQUEST_BODY_BYTES {
         return Err(failed("signed Codex request exceeds the byte limit"));
@@ -92,6 +105,13 @@ fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAda
 
     let mut trusted: CodexRequest =
         serde_json::from_slice(body).map_err(|_| failed("invalid sealed Codex request"))?;
+    let max_output_tokens = trusted.max_output_tokens.unwrap_or(route_cap);
+    if max_output_tokens == 0 || max_output_tokens > route_cap {
+        return Err(failed(
+            "Codex max_output_tokens exceeds the route output cap",
+        ));
+    }
+    trusted.max_output_tokens = Some(max_output_tokens);
     let contract = trusted.validate_and_rebuild()?;
     let model = trusted.model.clone();
     let rebuilt =
@@ -102,6 +122,7 @@ fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAda
     Ok(PreparedCodexRequest {
         body: JsonBytes::new(rebuilt),
         model,
+        max_output_tokens,
         contract,
     })
 }
@@ -110,6 +131,8 @@ fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAda
 #[serde(deny_unknown_fields)]
 struct CodexRequest {
     model: String,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     instructions: String,
     input: Vec<CodexInputItem>,
@@ -268,6 +291,9 @@ impl CodexRequest {
         }
         self.tools = rebuilt_tools;
         let contract = ProjectionContract {
+            max_output_tokens: self
+                .max_output_tokens
+                .ok_or_else(|| failed("Codex output cap missing"))?,
             functions,
             customs,
             deferred_functions,
@@ -871,6 +897,7 @@ enum ReasoningKind {
 }
 
 struct ProjectionContract {
+    max_output_tokens: u32,
     functions: BTreeSet<String>,
     customs: BTreeSet<String>,
     deferred_functions: BTreeSet<String>,
@@ -2088,6 +2115,11 @@ impl CodexProjector {
         let (mut completed, lifecycle_model) = payload
             .response
             .into_completed(self.response_id.as_deref())?;
+        if completed.usage.output_tokens > u64::from(self.contract.max_output_tokens) {
+            return Err(failed(
+                "Codex response exceeded the enforced max_output_tokens",
+            ));
+        }
         self.observe_server_model(lifecycle_model)?;
         completed.server_model = self.server_model.clone();
         let usage = Usage {

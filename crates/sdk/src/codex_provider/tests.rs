@@ -99,16 +99,8 @@ async fn forwards_streaming_request_with_codex_token() {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let auth = CodexAuthStore::with_token_url(
-        dir.path().join("codex-auth.json"),
-        Url::parse("http://127.0.0.1/token").unwrap(),
-    );
     let access_token = non_expiring_token();
-    auth.save(&crate::codex_auth::CodexAuthState::new(
-        crate::codex_auth::test_tokens_with_account_id(&access_token, "refresh", "acct-1"),
-        None,
-    ))
-    .unwrap();
+    let auth = native_store(dir.path(), &access_token, "acct-1");
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert("ChatGPT-Account-ID", HeaderValue::from_static("acct-1"));
@@ -120,8 +112,22 @@ async fn forwards_streaming_request_with_codex_token() {
     let mut provider = CodexResponsesFetchProvider::with_store(endpoint, auth);
     provider.client = client;
 
-    let body = br#"{"model":"gpt-5.5-codex","input":"hello","stream":true}"#;
-    let mut stream = provider.run(request(body)).await.unwrap().stream;
+    let body = br#"{"model":"gpt-5.5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}"#;
+    let call = hellas_executor::FetchCall::new(
+        "codex",
+        "responses",
+        JsonBytes::new(body.to_vec()),
+        None,
+        hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([7; 32])),
+    );
+    use hellas_executor::FetchAdaptorFactory as _;
+    let prepared = hellas_providers::CodexResponsesAdaptorFactory::new(8)
+        .unwrap()
+        .create(&call)
+        .unwrap()
+        .provider_request;
+    let expected_body = prepared.body.clone();
+    let mut stream = provider.run(prepared).await.unwrap().stream;
     let mut output = Vec::new();
     while let Some(event) = stream.next().await {
         output.push(event.unwrap());
@@ -133,7 +139,11 @@ async fn forwards_streaming_request_with_codex_token() {
     assert_eq!(accept.as_deref(), Some("text/event-stream"));
     assert_eq!(account_id.as_deref(), Some("acct-1"));
     assert_eq!(originator.as_deref(), Some(CODEX_ORIGINATOR));
-    assert_eq!(forwarded_body.as_ref(), body);
+    assert_eq!(forwarded_body.as_ref(), expected_body.as_bytes());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&forwarded_body).unwrap()["max_output_tokens"],
+        8
+    );
     let joined = String::from_utf8(output.concat()).unwrap();
     assert!(joined.contains("event: response.created"));
     assert!(joined.contains(r#""id":"resp_codex_up""#));
@@ -169,43 +179,37 @@ fn non_expiring_token() -> String {
 use hellas_providers::test_support as interception;
 
 #[tokio::test]
-async fn codex_requests_and_refresh_reject_operator_interception() {
+async fn codex_requests_reject_operator_interception_without_refresh() {
     interception::rejects_operator_interception(
         concat!(
             module_path!(),
-            "::codex_requests_and_refresh_reject_operator_interception"
+            "::codex_requests_reject_operator_interception_without_refresh"
         )
         .trim_start_matches("hellas_sdk::"),
-        2,
+        1,
         |url| async move {
             let dir = tempfile::tempdir().unwrap();
-            let auth = CodexAuthStore::with_token_url(dir.path().join("auth.json"), url.clone());
-            auth.save(&crate::codex_auth::CodexAuthState::new(
-                crate::codex_auth::test_tokens_with_account_id(
-                    &non_expiring_token(),
-                    "PRIVATE_REFRESH_CANARY",
-                    "PRIVATE_ACCOUNT_CANARY",
-                ),
-                None,
-            ))
-            .unwrap();
+            let auth = native_store(dir.path(), &non_expiring_token(), "PRIVATE_ACCOUNT_CANARY");
             let provider = CodexResponsesFetchProvider::with_store(url, auth.clone());
             let response = provider.run(request(b"PRIVATE_PROMPT_CANARY")).await;
             let rejected = response.is_err();
             drop(response);
-            // Force a separate refresh through the actual store/client path.
-            auth.save(&crate::codex_auth::CodexAuthState::new(
-                crate::codex_auth::test_tokens_with_account_id(
-                    "expired",
-                    "PRIVATE_REFRESH_CANARY",
-                    "PRIVATE_ACCOUNT_CANARY",
-                ),
-                None,
-            ))
-            .unwrap();
-            let refreshed = auth.access_token().await;
-            rejected && refreshed.is_err()
+            let before = std::fs::read(dir.path().join("auth.json")).unwrap();
+            native_store(dir.path(), "expired", "PRIVATE_ACCOUNT_CANARY");
+            let expired_before = std::fs::read(dir.path().join("auth.json")).unwrap();
+            let expired = auth.credentials().await;
+            rejected
+                && expired.is_err()
+                && std::fs::read(dir.path().join("auth.json")).unwrap() == expired_before
+                && before != expired_before
         },
     )
     .await;
+}
+
+fn native_store(directory: &std::path::Path, token: &str, account: &str) -> CodexAuthStore {
+    let path = directory.join("auth.json");
+    let value = serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":token,"account_id":account,"refresh_token":"DO_NOT_REFRESH"}});
+    hellas_private::write_atomically(&path, "json", &serde_json::to_vec(&value).unwrap()).unwrap();
+    CodexAuthStore::new(Some(&path)).unwrap()
 }

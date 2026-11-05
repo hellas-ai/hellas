@@ -181,8 +181,8 @@ HTTP retries. Adapter 0.0.3 also removes input-derived error diagnostics. Its ne
 manifest requires explicit caller approval and a new resource revision; approvals of
 older adapter or driver versions do not carry forward.
 
-The current Codex contract uses adapter `codex-responses-0.0.2`, schema
-`responses_items_v1`, driver `codex-responses-driver-0.0.2` and fixed HTTPS egress
+The current Codex contract uses adapter `codex-responses-0.0.3`, schema
+`responses_items_v1`, driver `codex-responses-driver-0.0.3` and fixed HTTPS egress
 `https://chatgpt.com/backend-api/codex/responses`. Its manifest ID is
 `a4e12aa2a03d6649a5f3864272c203baaa902c386327336a15c7058ba1f2dfa6`.
 Its request and authentication clients share the same proxy/CA/redirect policy;

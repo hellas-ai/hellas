@@ -26,12 +26,7 @@ fn authenticated_codex_route(
     capabilities: serde_json::Value,
 ) -> serde_json::Value {
     let auth_path = dir.path().join("codex-auth.json");
-    let auth = hellas_sdk::codex_auth::CodexAuthStore::new(Some(&auth_path)).unwrap();
-    auth.save(&hellas_sdk::codex_auth::CodexAuthState::new(
-        serde_json::from_value::<hellas_sdk::codex_auth::CodexTokens>(serde_json::json!({"access_token":"test-access","refresh_token":"test-refresh","account_id":"test-account"})).unwrap(),
-        None,
-    ))
-    .unwrap();
+    hellas_private::write_atomically(&auth_path, "json", &serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"unused","account_id":"test-account"}})).unwrap()).unwrap();
     let mut route = codex_route(capabilities);
     route["destination"]["auth_path"] = serde_json::json!(auth_path);
     route

@@ -4,6 +4,10 @@ use hellas_rpc::InputCommitment;
 use hellas_rpc::fetch::{decode_fetch_event_payload, decode_fetch_terminal_payload};
 use serde_json::json;
 
+fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAdaptorError> {
+    super::prepare_request(request, 1024)
+}
+
 fn call(value: JsonValue) -> FetchCall {
     FetchCall::new(
         "codex",
@@ -847,7 +851,7 @@ fn upstream_and_decoder_errors_exclude_private_content() {
         (unknown_field, "malformed Codex SSE event"),
     ];
     for (event, reason) in events {
-        let mut session = create_session(&call(request(Vec::new()))).unwrap();
+        let mut session = create_session(&call(request(Vec::new())), 1024).unwrap();
         let error = session
             .projector
             .project(&sse(&[
@@ -866,7 +870,7 @@ fn upstream_and_decoder_errors_exclude_private_content() {
     }
     let mut input = request(Vec::new());
     input[canary] = json!(true);
-    let error = match create_session(&call(input)) {
+    let error = match create_session(&call(input), 1024) {
         Ok(_) => panic!("unknown request field accepted"),
         Err(error) => error,
     };
@@ -874,4 +878,23 @@ fn upstream_and_decoder_errors_exclude_private_content() {
         !error.to_string().contains(canary),
         "request data entered a Fetch error: {error}"
     );
+}
+
+#[test]
+fn route_cap_is_sent_upstream_and_caller_can_only_narrow_it() {
+    let value = json!({"model":"codex","input":[]});
+    let prepared = super::prepare_request(&call(value.clone()), 256).unwrap();
+    let rebuilt: JsonValue = serde_json::from_slice(prepared.body.as_bytes()).unwrap();
+    assert_eq!(rebuilt["max_output_tokens"], 256);
+    assert_eq!(prepared.contract.max_output_tokens, 256);
+    let mut narrower = value.clone();
+    narrower["max_output_tokens"] = json!(32);
+    let session = create_session(&call(narrower), 256).unwrap();
+    assert_eq!(session.request_view.max_output_units, Some(32));
+    for cap in [0, 257, -1] {
+        let mut denied = value.clone();
+        denied["max_output_tokens"] = json!(cap);
+        assert!(super::prepare_request(&call(denied), 256).is_err());
+    }
+    assert!(CodexResponsesAdaptorFactory::new(0).is_err());
 }

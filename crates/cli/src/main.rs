@@ -155,31 +155,6 @@ enum IdentityCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum CodexAuthCommand {
-    /// Sign in to Codex with device-code OAuth and store credentials locally
-    Login {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
-    },
-    /// Import credentials from an existing Codex CLI auth file
-    Import {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
-        /// Source auth file (default: $HOME/.codex/auth.json)
-        #[arg(long = "from")]
-        source_path: Option<PathBuf>,
-    },
-    /// Show whether local Codex credentials are configured
-    Status {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
-    },
-}
-
 // Parsed once at startup and immediately destructured; boxing the large
 // variants would buy nothing.
 #[allow(clippy::large_enum_variant)]
@@ -407,11 +382,6 @@ enum Commands {
         #[command(subcommand)]
         command: IdentityCommand,
     },
-    /// Manage Codex OAuth credentials
-    CodexAuth {
-        #[command(subcommand)]
-        command: CodexAuthCommand,
-    },
     /// Discover peers and log network events
     Monitor {
         /// Stop monitoring after N seconds (default: run until Ctrl+C)
@@ -445,7 +415,6 @@ fn validate_identity_options(
             check_config: true, ..
         } => Some("serve --check-config"),
         Commands::Chain { .. } => Some("chain"),
-        Commands::CodexAuth { .. } => Some("codex-auth"),
         _ => None,
     };
     if let Some(name) = identity_free
@@ -631,30 +600,6 @@ async fn async_main() {
     let passkey = owner
         .as_ref()
         .map(|key| key as &dyn hellas_authority::authenticator::Authenticator);
-
-    if let Commands::CodexAuth { command } = &cli.command {
-        let result = match command {
-            CodexAuthCommand::Login { auth_path } => {
-                hellas_sdk::codex_auth::login(auth_path.as_deref()).await
-            }
-            CodexAuthCommand::Import {
-                auth_path,
-                source_path,
-            } => hellas_sdk::codex_auth::import_codex_cli(
-                auth_path.as_deref(),
-                source_path.as_deref(),
-            ),
-            CodexAuthCommand::Status { auth_path } => {
-                hellas_sdk::codex_auth::status(auth_path.as_deref())
-            }
-        };
-        tracer_provider.shutdown();
-        if let Err(err) = result {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
 
     // Chain commands carry their own authentication material and transport.
     // Running them must not create an unrelated provider identity as a side
@@ -1301,7 +1246,6 @@ async fn async_main() {
                 commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())
             }
         },
-        Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
         Commands::Monitor {
             timeout_secs,
             no_interrogate,

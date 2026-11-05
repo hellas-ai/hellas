@@ -411,60 +411,6 @@ fn serve_rejects_zero_fetch_concurrency() {
 }
 
 #[test]
-fn codex_auth_status_accepts_auth_path() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "codex-auth",
-        "status",
-        "--auth-path",
-        "/tmp/codex-auth.json",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::CodexAuth {
-            command: CodexAuthCommand::Status { auth_path },
-        } => assert_eq!(
-            auth_path.as_deref(),
-            Some(std::path::Path::new("/tmp/codex-auth.json"))
-        ),
-        _ => panic!("expected codex-auth status command"),
-    }
-}
-
-#[test]
-fn codex_auth_import_accepts_paths() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "codex-auth",
-        "import",
-        "--auth-path",
-        "/tmp/hellas-codex-auth.json",
-        "--from",
-        "/tmp/codex-auth.json",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::CodexAuth {
-            command:
-                CodexAuthCommand::Import {
-                    auth_path,
-                    source_path,
-                },
-        } => {
-            assert_eq!(
-                auth_path.as_deref(),
-                Some(std::path::Path::new("/tmp/hellas-codex-auth.json"))
-            );
-            assert_eq!(
-                source_path.as_deref(),
-                Some(std::path::Path::new("/tmp/codex-auth.json"))
-            );
-        }
-        _ => panic!("expected codex-auth import command"),
-    }
-}
-
-#[test]
 fn retired_commands_are_not_exposed() {
     for command in ["llm", "fetch", "artifact", "output-cache"] {
         assert!(Cli::try_parse_from(["hellas", command]).is_err());
@@ -664,5 +610,12 @@ fn grant_pool_gateway_flags_enforce_source_exclusivity() {
 fn serve_rejects_removed_split_configuration_flags() {
     for flag in ["--fetch-config", "--grant-config", "--paid-work-config"] {
         assert!(Cli::try_parse_from(["hellas", "serve", flag, "/tmp/old"]).is_err());
+    }
+}
+
+#[test]
+fn codex_login_and_import_belong_only_to_the_external_codex_cli() {
+    for command in ["login", "import", "status"] {
+        assert!(Cli::try_parse_from(["hellas", "codex-auth", command]).is_err());
     }
 }

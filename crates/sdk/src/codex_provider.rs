@@ -18,6 +18,7 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub struct CodexResponsesFetchProvider {
     client: reqwest::Client,
     auth: CodexAuthStore,
+    account_id: String,
     endpoint: Url,
     environment: hellas_rpc::ContentId,
 }
@@ -29,6 +30,7 @@ impl CodexResponsesFetchProvider {
         Ok(Self {
             environment: codex_responses_contract()?.manifest_id(),
             client: codex_http_client(&account_id, None)?,
+            account_id,
             auth,
             endpoint: Url::parse(CODEX_RESPONSES_ENDPOINT)?,
         })
@@ -36,7 +38,9 @@ impl CodexResponsesFetchProvider {
 
     #[cfg(test)]
     fn with_store(endpoint: Url, auth: CodexAuthStore) -> Self {
+        let account_id = auth.account_id().expect("test account id");
         Self {
+            account_id,
             environment: codex_responses_contract().unwrap().manifest_id(),
             client: codex_http_client(&auth.account_id().expect("test account id"), None)
                 .expect("Codex HTTP client"),
@@ -59,25 +63,24 @@ impl CodexResponsesFetchProvider {
                 .map_err(FetchProviderError::failed)?;
         }
         let client = if request.upstream.is_some() {
-            let account = self
-                .auth
-                .account_id()
-                .map_err(|_| FetchProviderError::failed("Codex account unavailable"))?;
-            codex_http_client(&account, request.upstream.as_ref())
+            codex_http_client(&self.account_id, request.upstream.as_ref())
                 .map_err(|_| FetchProviderError::failed("Codex TLS policy invalid"))?
         } else {
             self.client.clone()
         };
-        let access_token = self
-            .auth
-            .access_token()
-            .await
-            .map_err(|_| FetchProviderError::failed("Codex authentication failed"))?;
+        let credentials = self.auth.credentials().await.map_err(|error| {
+            FetchProviderError::failed(format!("Codex authentication failed: {error}"))
+        })?;
+        if credentials.account_id != self.account_id {
+            return Err(FetchProviderError::failed(
+                "Codex account changed; restart the provider with the intended account",
+            ));
+        }
         execute_responses_request(
             &client,
             self.endpoint.clone(),
             request.upstream.as_ref(),
-            &access_token,
+            &credentials.access_token,
             request.body.as_bytes().to_vec(),
             &request.idempotency_key(),
             "Codex Responses",
