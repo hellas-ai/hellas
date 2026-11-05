@@ -9,7 +9,7 @@ use hellas_kernel::{EdgeValues, Fees};
 use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -22,6 +22,8 @@ pub struct ServeConfig {
     pub revision: u64,
     #[serde(default)]
     pub routes: Vec<Route>,
+    #[serde(default)]
+    pub upstream_accounts: BTreeMap<String, hellas_providers::account::AccountConfig>,
     pub grants: Option<crate::grant_config::GrantSettings>,
     pub paid: Option<PaidTerms>,
     pub port: Option<u16>,
@@ -32,6 +34,7 @@ impl ServeConfig {
             version: 1,
             revision: 0,
             routes: Vec::new(),
+            upstream_accounts: BTreeMap::new(),
             grants: None,
             paid: None,
             port: None,
@@ -52,6 +55,7 @@ impl ServeConfig {
             "unsupported host configuration version {}",
             self.version
         );
+        hellas_providers::account::validate_accounts(&self.upstream_accounts)?;
         let mut names = BTreeSet::new();
         for route in &self.routes {
             ensure!(
@@ -63,6 +67,7 @@ impl ServeConfig {
                 "duplicate Fetch route"
             );
             route.capabilities.clone().into_policy()?;
+            route.validate_accounts(&self.upstream_accounts)?;
         }
         if let Some(paid) = &self.paid {
             paid.policy()?;
@@ -91,14 +96,18 @@ impl ServeConfig {
     }
     pub fn routes(&self) -> anyhow::Result<FetchRouteRegistry> {
         self.validate()?;
+        let accounts = hellas_providers::account::AccountRegistry::new(&self.upstream_accounts)?;
         let mut routes = FetchRouteRegistry::new();
         for route in &self.routes {
             routes.register(
                 FetchRoute::new(&route.service, &route.method),
-                route
-                    .destination
-                    .clone()
-                    .into_entry(route.capabilities.clone().into_policy()?)?,
+                route.bind_accounts(
+                    route
+                        .destination
+                        .clone()
+                        .into_entry(route.capabilities.clone().into_policy()?)?,
+                    &accounts,
+                )?,
             )?;
         }
         Ok(routes)
@@ -129,10 +138,123 @@ pub struct Route {
     /// one selection constructs both the HTTP driver and the projector whose
     /// manifest is quoted; a URL or separate identity cannot be supplied.
     pub destination: Destination,
+    /// Sealed drivers use this canonical account; HTTP credentials use aliases below.
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub credential_accounts: BTreeMap<String, String>,
     #[serde(default)]
     pub capabilities: RouteLimits,
     #[serde(default)]
     pub credential_metadata: std::collections::BTreeMap<String, CredentialMetadata>,
+}
+
+impl Route {
+    fn validate_accounts(
+        &self,
+        accounts: &BTreeMap<String, hellas_providers::account::AccountConfig>,
+    ) -> anyhow::Result<()> {
+        let lookup = |name: &str| {
+            accounts
+                .get(name)
+                .context("route refers to an undeclared upstream account")
+        };
+        let bound = match &self.destination {
+            Destination::Http { config } => {
+                ensure!(
+                    self.account.is_none(),
+                    "HTTP accounts use credential aliases"
+                );
+                ensure!(
+                    config
+                        .credentials
+                        .keys()
+                        .all(|k| self.credential_accounts.contains_key(k)),
+                    "every HTTP credential requires an account binding"
+                );
+                None
+            }
+            Destination::OpenAiResponses {
+                credential,
+                credentials,
+            } => {
+                ensure!(
+                    self.account.is_none(),
+                    "OpenAI accounts use credential aliases"
+                );
+                ensure!(
+                    credentials
+                        .keys()
+                        .all(|k| self.credential_accounts.contains_key(k)),
+                    "every OpenAI credential requires an account binding"
+                );
+                Some(
+                    self.credential_accounts
+                        .get(credential)
+                        .context("selected credential requires an account binding")?
+                        .as_str(),
+                )
+            }
+            Destination::CodexResponses { .. } => {
+                ensure!(
+                    self.credential_accounts.is_empty(),
+                    "Codex uses a single account binding"
+                );
+                Some(
+                    self.account
+                        .as_deref()
+                        .context("Codex requires an upstream account")?,
+                )
+            }
+        };
+        for name in self.credential_accounts.values() {
+            lookup(name)?;
+        }
+        if let Some(bound) = bound {
+            let account = lookup(bound)?;
+            ensure!(
+                account.accounting
+                    == hellas_authority::model::http_usage::AccountingProfile::OpenaiResponses,
+                "Responses account requires the existing Responses meter"
+            );
+            ensure!(
+                self.capabilities
+                    .max_output_tokens
+                    .is_some_and(|cap| cap <= u64::from(account.max_output_tokens)),
+                "route output cap must fit the upstream account cap"
+            );
+        }
+        Ok(())
+    }
+    /// Apply after any host instrumentation/fixture substitution, so there is
+    /// no funding-specific or test-specific route around account admission.
+    pub fn bind_accounts(
+        &self,
+        entry: FetchRouteEntry,
+        accounts: &hellas_providers::account::AccountRegistry,
+    ) -> anyhow::Result<FetchRouteEntry> {
+        let http = matches!(self.destination, Destination::Http { .. });
+        let account = match &self.destination {
+            Destination::OpenAiResponses { credential, .. } => {
+                self.credential_accounts.get(credential).map(String::as_str)
+            }
+            _ => self.account.as_deref(),
+        };
+        let mut error = None;
+        let entry = entry.map_provider(|driver| {
+            match accounts.bind(driver.clone(), account, &self.credential_accounts, http) {
+                Ok(provider) => provider,
+                Err(e) => {
+                    error = Some(e);
+                    driver
+                }
+            }
+        })?;
+        if let Some(error) = error {
+            return Err(error.into());
+        }
+        Ok(entry)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -301,7 +423,11 @@ mod tests {
     #[test]
     fn one_document_retains_grants_and_secret_references() {
         let bytes=br#"{"version":1,"revision":7,"routes":[{"service":"deepseek","method":"request","destination":{"type":"http","config":{"allowed_hosts":["api.deepseek.com"],"credentials":{"main":{"allowed_origins":["https://api.deepseek.com"],"allowed_paths":["/chat/completions"],"allowed_methods":["POST"],"header_name":"authorization","secret_env":"DEEPSEEK_API_KEY","prefix":"Bearer "}}}}}],"grants":{"max_job_millis":10000,"resources":[]}}"#;
-        let config = ServeConfig::from_bytes(bytes).unwrap();
+        assert!(ServeConfig::from_bytes(bytes).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        value["upstream_accounts"] = serde_json::json!({"personal": account()});
+        value["routes"][0]["credential_accounts"] = serde_json::json!({"main":"personal"});
+        let config = ServeConfig::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(config.revision, 7);
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(serialized.contains("DEEPSEEK_API_KEY"));
@@ -311,5 +437,29 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+    fn account() -> serde_json::Value {
+        serde_json::json!({"ledger":"/tmp/hellas-account-test/budget.sqlite", "window_seconds":86400,
+            "max_requests":10, "max_tokens":10000, "max_concurrency":1,
+            "max_request_bytes":65536, "max_output_tokens":256, "accounting":"openai-responses",
+            "quota":{"url":"http://127.0.0.1:9184/metrics", "provider":"openai-personal",
+                "upstream":"openai", "account":"personal", "max_age_seconds":600,
+                "reserve":{"type":"remaining-ratio", "minimum":0.2, "scope":"all", "windows":["seven_day"]}}})
+    }
+    #[test]
+    fn sealed_credentials_require_explicit_account_and_matching_cap() {
+        let mut value = serde_json::json!({"version":1,"upstream_accounts":{"personal":account()},
+            "routes":[{"service":"codex","method":"responses","destination":{"type":"codex-responses"},
+                "account":"personal","capabilities":{"max_output_tokens":128}}]});
+        let check =
+            |v: &serde_json::Value| ServeConfig::from_bytes(&serde_json::to_vec(v).unwrap());
+        assert!(check(&value).is_ok());
+        value["routes"][0]["account"] = serde_json::json!("missing");
+        assert!(check(&value).is_err());
+        value["routes"][0]["account"] = serde_json::Value::Null;
+        assert!(check(&value).is_err());
+        value["routes"][0]["account"] = serde_json::json!("personal");
+        value["routes"][0]["capabilities"]["max_output_tokens"] = serde_json::json!(257);
+        assert!(check(&value).is_err());
     }
 }

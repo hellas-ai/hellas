@@ -598,8 +598,11 @@ pub(super) fn resource_charge(
             input.input.parameters.as_bytes(),
         )
         .map_err(|_| GrantError::Malformed)?;
-        if parameters.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
-            && let Some(resource) = &policy.responses
+        if matches!(
+            parameters.contract.schema(),
+            hellas_rpc::FetchSchema::StatelessResponsesV1
+                | hellas_rpc::FetchSchema::ResponsesItemsV1
+        ) && let Some(resource) = &policy.responses
         {
             charge.set(
                 Meter::OutputTokens,

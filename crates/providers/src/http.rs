@@ -417,10 +417,23 @@ impl FetchAdaptorFactory for HttpFetchAdaptorFactory {
         self.0
     }
     fn create(&self, call: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError> {
-        HttpFetchRequest::decode(call.body.as_bytes())
+        let request = HttpFetchRequest::decode(call.body.as_bytes())
             .map_err(|_| FetchAdaptorError::failed("invalid HTTPS request"))?;
+        let mut request_view = FetchRequestView::from_call(call);
+        if let Ok(body) = request.body()
+            && let Ok(value) = hellas_authority::model::http_usage::unique_json(&body)
+        {
+            request_view.model = hellas_authority::model::http_usage::request_model(&value)
+                .map_err(FetchAdaptorError::failed)?
+                .map(str::to_owned);
+            request_view.max_output_units =
+                ["max_output_tokens", "max_completion_tokens", "max_tokens"]
+                    .iter()
+                    .filter_map(|key| value.get(key).and_then(serde_json::Value::as_u64))
+                    .max();
+        }
         Ok(FetchAdaptorSession {
-            request_view: FetchRequestView::from_call(call),
+            request_view,
             provider_request: PreparedFetchRequest::new(call, call.body.clone()),
             projector: Box::new(HttpProjector { started: false }),
         })

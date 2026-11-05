@@ -192,6 +192,8 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
                     destination: Destination::Http {
                         config: replacement,
                     },
+                    account: None,
+                    credential_accounts: Default::default(),
                     capabilities: Default::default(),
                     credential_metadata: Default::default(),
                 });
@@ -391,6 +393,17 @@ mod tests {
         Ok(())
     }
 
+    fn configured_account() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"version":1,"routes":[{
+            "service":"api","method":"fetch","destination":{"type":"http","config":{}},
+            "credential_accounts":{"account":"personal"}}],"upstream_accounts":{"personal":{
+                "ledger":"/tmp/hellas-cli-config-budget.sqlite","window_seconds":60,"max_requests":1,
+                "max_tokens":8,"max_concurrency":1,"max_request_bytes":65536,"max_output_tokens":8,
+                "accounting":"openai-responses","quota":{"url":"http://127.0.0.1:9184/metrics",
+                    "provider":"openai-personal","upstream":"openai","account":"personal","max_age_seconds":600,
+                    "reserve":{"type":"remaining-ratio","minimum":0.2,"scope":"all","windows":["seven_day"]}}
+            }}})).unwrap()
+    }
     fn endpoint() -> UpstreamChange {
         UpstreamChange::SetEndpoint(UpstreamEndpoint {
             service: "api".into(),
@@ -416,8 +429,7 @@ mod tests {
     fn key_updates_are_add_only_or_replace_only_and_status_contains_no_secret() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fetch.json");
-        hellas_private::write_atomically(&path, ".writing", br#"{"version":1,"routes":[]}"#)
-            .unwrap();
+        hellas_private::write_atomically(&path, ".writing", &configured_account()).unwrap();
         apply(
             &path,
             ProviderUpdate {
@@ -507,8 +519,7 @@ mod tests {
         let a = directory.path().join("a.json");
         let b = directory.path().join("b.json");
         for path in [&a, &b] {
-            hellas_private::write_atomically(path, ".writing", br#"{"version":1,"routes":[]}"#)
-                .unwrap();
+            hellas_private::write_atomically(path, ".writing", &configured_account()).unwrap();
             apply(
                 path,
                 ProviderUpdate {
@@ -568,7 +579,7 @@ mod tests {
     fn staged_replacement_retains_old_keys_until_commit_succeeds_or_rolls_back() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fetch.json");
-        std::fs::write(&path, br#"{"version":1,"routes":[]}"#).unwrap();
+        std::fs::write(&path, configured_account()).unwrap();
         apply(
             &path,
             ProviderUpdate {
@@ -636,7 +647,7 @@ mod tests {
         let protected = outside.path().join(".upstream-key-protected.json");
         std::fs::write(&protected, "retained").unwrap();
         let path = directory.path().join("fetch.json");
-        std::fs::write(&path, br#"{"version":1,"routes":[]}"#).unwrap();
+        std::fs::write(&path, configured_account()).unwrap();
         std::os::unix::fs::symlink(outside.path(), key_directory(&path).unwrap()).unwrap();
         assert!(clean_unused_keys(&path).is_err());
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "retained");

@@ -819,12 +819,14 @@ impl State {
                     hellas_rpc::protocol::invocation::Admission::Compute { .. } => false,
                     hellas_rpc::protocol::invocation::Admission::Fetch { admission } => {
                         admission.contract.manifest_id() == auth.environment_commitment
-                            && (admission.contract.schema()
-                                == hellas_rpc::FetchSchema::StatelessResponsesV1
-                                || policy.https.as_ref().is_some_and(|r| {
-                                    r.accounting
-                                        != crate::model::grant::resource::AccountingProfile::None
-                                }))
+                            && (matches!(
+                                admission.contract.schema(),
+                                hellas_rpc::FetchSchema::StatelessResponsesV1
+                                    | hellas_rpc::FetchSchema::ResponsesItemsV1
+                            ) || policy.https.as_ref().is_some_and(|r| {
+                                r.accounting
+                                    != crate::model::grant::resource::AccountingProfile::None
+                            }))
                     }
                 });
         let provider_key = grant_producer(self.provider()?)?;

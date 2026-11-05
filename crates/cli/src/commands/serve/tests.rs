@@ -29,7 +29,17 @@ fn authenticated_codex_route(
     hellas_private::write_atomically(&auth_path, "json", &serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"unused","account_id":"test-account"}})).unwrap()).unwrap();
     let mut route = codex_route(capabilities);
     route["destination"]["auth_path"] = serde_json::json!(auth_path);
+    route["account"] = serde_json::json!("personal");
     route
+}
+
+fn test_account() -> serde_json::Value {
+    serde_json::json!({"ledger":"/tmp/hellas-config-test/budget.sqlite","window_seconds":60,
+        "max_requests":1,"max_tokens":4096,"max_concurrency":1,"max_request_bytes":65536,
+        "max_output_tokens":4096,"accounting":"openai-responses",
+        "quota":{"url":"http://127.0.0.1:9184/metrics","provider":"openai-personal",
+            "upstream":"openai","account":"personal","max_age_seconds":600,
+            "reserve":{"type":"remaining-ratio","minimum":0.2,"scope":"all","windows":["seven_day"]}}})
 }
 
 #[test]
@@ -38,7 +48,7 @@ fn load_fetch_config_parses_route_capabilities() {
     let path = write_config(
         &dir,
         serde_json::json!({
-            "version":1,
+            "version":1,"upstream_accounts":{"personal":test_account()},
             "routes": [authenticated_codex_route(&dir, serde_json::json!({
                 "models": ["gpt-5.5-codex"],
                 "max_output_tokens": 4096
@@ -73,8 +83,8 @@ fn load_fetch_config_rejects_duplicate_route() {
         serde_json::json!({
             "version":1,
             "routes": [
-                authenticated_codex_route(&dir, serde_json::json!({})),
-                authenticated_codex_route(&dir, serde_json::json!({})),
+                serde_json::json!({"service":"http","method":"request","destination":{"type":"http","config":{}}}),
+                serde_json::json!({"service":"http","method":"request","destination":{"type":"http","config":{}}}),
             ],
         }),
     );

@@ -1,6 +1,7 @@
 //! Audited sealed-Fetch upstream drivers and projectors shared by native
 //! hosts and the Hellas CLI.
 
+pub mod account;
 mod codex_responses;
 mod http;
 mod responses_fetch;

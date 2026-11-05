@@ -1,4 +1,4 @@
-//! Resource limits for the compiled stateless Responses request schema.
+//! One resource/meter for stateless Responses and Codex ResponsesItemsV1.
 //! These checks constrain signed requests; they never rewrite provider input.
 //! The adapter still owns complete request decoding and transport preparation.
 use super::resource::TemplateError;

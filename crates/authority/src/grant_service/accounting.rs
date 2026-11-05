@@ -45,7 +45,10 @@ pub(super) fn usage(
     if policy.responses.is_none() && policy.https.is_none() {
         return UsageObservation::Observed(charge);
     }
-    if parameters.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1 {
+    if matches!(
+        parameters.contract.schema(),
+        hellas_rpc::FetchSchema::StatelessResponsesV1 | hellas_rpc::FetchSchema::ResponsesItemsV1
+    ) {
         let Ok(response) = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider)
         else {
             return UsageObservation::BackendFault;
@@ -239,7 +242,12 @@ mod tests {
     }
     fn metered(policy: &GrantPolicy, output: &InvocationOutput) -> Usage {
         let key = hellas_channel::test_support::principal(1).1;
-        let contract = hellas_channel::test_support::test_responses_contract();
+        let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+            &policy.invocation_policy.admissions[0]
+        else {
+            panic!("Fetch policy")
+        };
+        let contract = admission.contract.clone();
         let events = hellas_rpc::fetch::build_input_events_with_retention(
             "openai",
             "responses",
@@ -270,6 +278,46 @@ mod tests {
         .journal_fields()
         .0
         .map_or(Usage::Unknown, Usage::Observed)
+    }
+
+    #[test]
+    fn codex_uses_the_same_responses_resource_and_output_meter() {
+        let mut policy = crate::test_support::policy();
+        let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+            &mut policy.invocation_policy.admissions[0]
+        else {
+            panic!("Fetch policy")
+        };
+        admission.contract = hellas_rpc::FetchContract::new(
+            "codex-responses-0.0.3",
+            hellas_rpc::FetchSchema::ResponsesItemsV1,
+            "codex-responses-driver-0.0.3",
+            hellas_rpc::FetchEgress::FixedHttps(
+                "https://chatgpt.com/backend-api/codex/responses".into(),
+            ),
+        )
+        .unwrap();
+        policy.validate().unwrap();
+        let events = transcript(Some(hellas_rpc::output::Usage {
+            input_tokens: Some(5),
+            output_tokens: Some(2),
+            total_tokens: Some(7),
+        }));
+        assert_eq!(
+            metered(&policy, &events),
+            Usage::Observed(Charge([1, 0, 2, 0, 0]))
+        );
+        assert_eq!(
+            policy
+                .responses
+                .as_ref()
+                .unwrap()
+                .matches(br#"{"model":"fixture","input":[],"max_output_tokens":8}"#)
+                .unwrap(),
+            8
+        );
+        policy.responses = None;
+        assert!(policy.validate().is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use hellas_channel::test_support::actors::{FRIEND, ROOT};
 
 struct OfferHost {
     directory: tempfile::TempDir,
+    _quota: Quota,
     https: Https,
     provider: Cli,
     client: Cli,
@@ -146,11 +147,12 @@ impl OfferHost {
         let client_profile = profile(root, "reader", authority, reader_grant, &client_secret);
         let socket = root.join("control.sock");
         let fetch = root.join("fetch.json");
+        let quota = Quota::start().await;
         let (control_certificate, control_private_key) = control_tls(root);
         let secret = root.join("account.json");
         hellas_private::write_atomically(&secret, ".new", br#"{"access_token":"fixture-key"}"#)
             .unwrap();
-        let routes = json!({"routes":[{"service":"http","method":"request","destination":{"type":"http","config":{
+        let routes = json!({"routes":[{"service":"http","method":"request","credential_accounts":{"glm-account":"fixture"},"destination":{"type":"http","config":{
             "allowed_hosts":["localhost"],"allow_private_addresses":true,
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
@@ -159,7 +161,13 @@ impl OfferHost {
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]});
         std::fs::write(
             &fetch,
-            json!({"version":1,"routes":routes["routes"],"grants":grants}).to_string(),
+            json!({"version":1,"routes":routes["routes"],"grants":grants,"upstream_accounts":{"fixture":{
+                "ledger":root.join("account-budget.sqlite"),"window_seconds":86400,"max_requests":1024,
+                "max_tokens":8192,"max_concurrency":8,"max_request_bytes":65536,"max_output_tokens":8,
+                "accounting":"openai-chat","quota":{"url":quota.url,"provider":"fixture","upstream":"openai",
+                    "account":"personal","max_age_seconds":600,"reserve":{"type":"remaining-ratio",
+                        "minimum":0.2,"scope":"all","windows":["seven_day"]}}
+            }}}).to_string(),
         )
         .unwrap();
         let mut node = provider.spawn(
@@ -254,6 +262,7 @@ impl OfferHost {
         );
         OfferHost {
             directory,
+            _quota: quota,
             https,
             provider,
             client,
@@ -1671,4 +1680,26 @@ async fn pool_gateway_opens_two_independent_providers() {
     gateway.stop().await;
     second.stop().await;
     first.stop().await;
+}
+
+struct Quota {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for Quota {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl Quota {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/metrics",axum::routing::get(|| async {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            format!("llm_account_info{{provider=\"fixture\",upstream=\"openai\",account=\"personal\"}} 1\nllm_quota_data_fresh{{provider=\"fixture\"}} 1\nllm_quota_last_success_timestamp_seconds{{provider=\"fixture\"}} {now}\nllm_quota_utilization_ratio{{provider=\"fixture\",scope=\"all\",window=\"seven_day\"}} 0\n")
+        }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { url, task }
+    }
 }

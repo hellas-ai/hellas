@@ -232,9 +232,21 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
         destination: Destination::CodexResponses {
             auth_path: Some("target/hellas-test-codex-auth.json".into()),
         },
-        capabilities: Default::default(),
+        account: Some("personal".into()),
+        credential_accounts: Default::default(),
+        capabilities: hellas_sdk::serve_config::RouteLimits {
+            models: vec![],
+            max_output_tokens: Some(8),
+        },
         credential_metadata: Default::default(),
     }];
+    doc.upstream_accounts.insert("personal".into(), serde_json::from_value(serde_json::json!({
+        "ledger":"/tmp/hellas-paid-config-test.sqlite", "window_seconds":60,"max_requests":1,
+        "max_tokens":8,"max_concurrency":1,"max_request_bytes":65536,"max_output_tokens":8,
+        "accounting":"openai-responses", "quota":{"url":"http://127.0.0.1:9184/metrics",
+            "provider":"openai-personal","upstream":"openai","account":"personal","max_age_seconds":600,
+            "reserve":{"type":"remaining-ratio","minimum":0.2,"scope":"all","windows":["seven_day"]}}
+    })).unwrap());
     if let Admission::Fetch { admission } =
         &mut doc.paid.as_mut().unwrap().invocation_policy.admissions[0]
     {

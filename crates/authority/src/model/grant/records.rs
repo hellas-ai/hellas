@@ -135,9 +135,13 @@ impl GrantPolicy {
                 _ => None,
             })
             .collect();
-        let responses = fetch
-            .iter()
-            .any(|a| a.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1);
+        let responses = fetch.iter().any(|a| {
+            matches!(
+                a.contract.schema(),
+                hellas_rpc::FetchSchema::StatelessResponsesV1
+                    | hellas_rpc::FetchSchema::ResponsesItemsV1
+            )
+        });
         let https = fetch
             .iter()
             .any(|a| a.contract.schema() == hellas_rpc::FetchSchema::HttpV1);
@@ -207,8 +211,11 @@ impl GrantDef {
             let account_backed = policy.invocation_policy.admissions.iter().any(|a| match a {
                 Admission::Compute { .. } => false,
                 Admission::Fetch { admission } => {
-                    admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
-                        || policy.https.as_ref().is_none_or(|r| r.credential.is_some())
+                    matches!(
+                        admission.contract.schema(),
+                        hellas_rpc::FetchSchema::StatelessResponsesV1
+                            | hellas_rpc::FetchSchema::ResponsesItemsV1
+                    ) || policy.https.as_ref().is_none_or(|r| r.credential.is_some())
                 }
             });
             if !self.allow_account_backed && account_backed {
