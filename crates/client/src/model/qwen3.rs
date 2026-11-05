@@ -1,4 +1,4 @@
-//! Qwen3 text generation as a client-rendered Compute job.
+//! Dense Qwen3 and Qwen3.5 text generation as a client-rendered Compute job.
 //!
 //! The provider runs only the opaque program: catena-models renders the Hex
 //! from the GGUF configuration, this package maps its weight order onto byte
@@ -34,8 +34,11 @@ impl Qwen3 {
         let header = gguf::read_header(&mut File::open(path)?)?;
         let config = read_gguf_model_config(path)?;
         ensure!(
-            config.architecture == ModelArchitecture::Qwen3Dense,
-            "text package requires dense Qwen3"
+            matches!(
+                config.architecture,
+                ModelArchitecture::Qwen3Dense | ModelArchitecture::Qwen35Dense
+            ),
+            "text package requires dense Qwen3 or Qwen3.5"
         );
         let tensors: BTreeMap<_, _> = header
             .tensors
