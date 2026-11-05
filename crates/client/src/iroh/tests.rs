@@ -499,6 +499,75 @@ fn live_apple_open_advances_counter_and_rejects_lower_replay() {
 }
 
 #[test]
+fn readable_apple_verification_is_emitted_only_after_all_checks() {
+    // Other parallel tests exercise this same tracing callsite without a
+    // subscriber. Isolate capture so their callsite-interest cache updates
+    // cannot suppress this thread's event.
+    const CHILD: &str = "HELLAS_TEST_APPLE_REPORT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "iroh::tests::readable_apple_verification_is_emitted_only_after_all_checks",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = Capture(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let counters = Arc::new(TestCounterStore::default());
+        let (trust, response, _) = apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
+        assert!(
+            verify_open_response(&trust, &[5; 32], &[7; 32], ALPN, ENROLLED_PEER, response)
+                .is_err()
+        );
+        assert!(output.lock().unwrap().is_empty());
+        let (trust, response, _) = apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
+        verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).unwrap();
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("App Attest verified"), "captured: {text}");
+        assert!(text.contains("TESTTEAM.example.app"));
+        assert!(text.contains("apple_root_chain=\"ok\""));
+        assert!(text.contains(&format!("cdhash={}", "08".repeat(32))));
+        assert!(text.contains(&format!("nonce={}", "06".repeat(32))));
+        assert!(text.contains("counter=2"));
+        output.lock().unwrap().clear();
+        let (trust, replay, _) = apple_open_response(&[5; 32], &[6; 32], 1, counters);
+        assert!(
+            verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, replay).is_err()
+        );
+        assert!(output.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
 fn paid_services_app_attest_binds_the_exact_connection_and_service() {
     for alpn in [
         hellas_rpc::services::work::Work::ALPN,

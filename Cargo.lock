@@ -3000,6 +3000,7 @@ dependencies = [
  "hellas-rpc",
  "hex",
  "p256",
+ "rcgen",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
@@ -3263,6 +3264,7 @@ dependencies = [
  "tokenizers 0.23.2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

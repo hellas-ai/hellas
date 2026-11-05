@@ -61,6 +61,67 @@ pub fn apple_client_data_hash(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension,
+        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    };
+
+    #[test]
+    fn generated_chain_requires_selected_root_time_and_attestation_eku() {
+        fn ca_params(name: &str) -> CertificateParams {
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            params
+        }
+        let root =
+            CertifiedIssuer::self_signed(ca_params("test root"), KeyPair::generate().unwrap())
+                .unwrap();
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("test intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[2, 5, 29, 37],
+                APP_ATTEST_EKU_DER.to_vec(),
+            ));
+        let leaf = params.signed_by(&key, &intermediate).unwrap();
+        let chain = vec![
+            ByteBuf::from(leaf.der().to_vec()),
+            ByteBuf::from(intermediate.der().to_vec()),
+        ];
+        assert!(verify_chain(&chain, root.der(), AnchorTime(1_790_996_283)).is_ok());
+        assert!(
+            verify_chain(
+                &chain,
+                apple_app_attest_root_ca(),
+                AnchorTime(1_790_996_283)
+            )
+            .is_err()
+        );
+        assert!(verify_chain(&chain, root.der(), AnchorTime(0)).is_err());
+        let mut wrong_usage = CertificateParams::default();
+        wrong_usage
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let leaf = wrong_usage.signed_by(&key, &intermediate).unwrap();
+        let chain = vec![ByteBuf::from(leaf.der().to_vec()), chain[1].clone()];
+        assert!(verify_chain(&chain, root.der(), AnchorTime(1_790_996_283)).is_err());
+    }
+}
+
 pub struct AppleCredential {
     pub attestation: Vec<u8>,
     pub client_data_hash: [u8; 32],

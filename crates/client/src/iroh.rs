@@ -444,7 +444,26 @@ fn verify_open_response(
                         "provider App Attest open assertion counter advancement failed",
                         source,
                     )
-                })
+                })?;
+            // Emit only after enrollment, live binding, allowlist and replay
+            // checks all succeed, before the caller discloses request data.
+            let hex = |bytes: &[u8]| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            };
+            tracing::info!(
+                target: "hellas_attestation",
+                apple_root_chain = "ok",
+                app_id = %apple.app_id,
+                cdhash = %hex(&claims.cd_hash),
+                nonce = %hex(nonce),
+                counter = claims.counter,
+                enrollment = %actual_genesis,
+                "App Attest verified"
+            );
+            Ok(())
         }
     }?;
     Ok(producer_key)

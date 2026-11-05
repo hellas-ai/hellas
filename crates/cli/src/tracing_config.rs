@@ -89,6 +89,7 @@ fn base_env_filter() -> EnvFilter {
 fn with_default_directives(filter: EnvFilter) -> EnvFilter {
     filter
         .add_directive("hellas_request=info".parse().unwrap())
+        .add_directive("hellas_attestation=info".parse().unwrap())
         .add_directive("noq::connection=error".parse().unwrap())
         .add_directive("noq_proto::connection=error".parse().unwrap())
         .add_directive("netlink_packet_route=error".parse().unwrap())

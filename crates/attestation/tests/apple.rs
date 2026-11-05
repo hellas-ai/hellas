@@ -371,3 +371,144 @@ fn repeated_verification_does_not_advance_counter_state() {
     assert_eq!(first, second);
     assert_eq!(second.counter, 2);
 }
+
+#[test]
+fn real_capture_rejects_changed_challenges_key_id_chain_and_time() {
+    let fixture = fixture();
+    let mut credential = fixture_credential(&fixture);
+    credential.client_data_hash[0] ^= 1;
+    assert!(
+        register_apple(
+            &credential,
+            apple_app_id_hash(APP_ID),
+            apple_app_attest_root_ca(),
+            AnchorTime(FIXTURE_VALIDATION_TIME),
+        )
+        .is_err()
+    );
+    let credential = fixture_credential(&fixture);
+    assert!(
+        register_apple(
+            &credential,
+            apple_app_id_hash(APP_ID),
+            apple_app_attest_root_ca(),
+            AnchorTime(0),
+        )
+        .is_err()
+    );
+    let mut wrong_root = apple_app_attest_root_ca().to_vec();
+    wrong_root[0] ^= 1;
+    assert!(
+        register_apple(
+            &credential,
+            apple_app_id_hash(APP_ID),
+            &wrong_root,
+            AnchorTime(FIXTURE_VALIDATION_TIME),
+        )
+        .is_err()
+    );
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![REAL_CD_HASH],
+    };
+    let assertion = decode_base64(fixture.assertion_object_base64);
+    let mut challenge = decode_hex_32(fixture.assertion_client_data_hash_hex);
+    challenge[0] ^= 1;
+    let real_key = registered_fixture(&fixture);
+    assert!(verify_apple_assertion(&assertion, &challenge, &real_key, &policy).is_err());
+    let wrong_key = registered(&signing_key());
+    assert!(
+        verify_apple_assertion(
+            &assertion,
+            &decode_hex_32(fixture.assertion_client_data_hash_hex),
+            &wrong_key,
+            &policy,
+        )
+        .is_err()
+    );
+
+    let mut object: BTreeMap<String, ciborium::Value> =
+        ciborium::from_reader(credential.attestation.as_slice()).unwrap();
+    // RP hash, flags, counter, AAGUID, credential-id length, credential ID.
+    object.get_mut("authData").unwrap().as_bytes_mut().unwrap()[55] ^= 1;
+    let mut attestation = Vec::new();
+    ciborium::into_writer(&object, &mut attestation).unwrap();
+    assert!(
+        register_apple(
+            &AppleCredential {
+                attestation,
+                client_data_hash: credential.client_data_hash
+            },
+            apple_app_id_hash(APP_ID),
+            apple_app_attest_root_ca(),
+            AnchorTime(FIXTURE_VALIDATION_TIME),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn deterministic_attester_exercises_real_verifier_and_replay_protection() {
+    use hellas_attestation::{AssertionCounterStore, Attester, Binding, verify_apple};
+    use hellas_rpc::{APPLE_APP_ATTEST, EventCommitment, pb::execute::AssuranceEvidence};
+    use std::{
+        cell::Cell,
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    // This fake exists only in the test binary. It replaces the hardware
+    // assertion call, never any verifier or production trust anchor.
+    struct FakeAttester(SigningKey);
+    impl Attester for FakeAttester {
+        async fn attest(&self, binding: Binding) -> Result<AssuranceEvidence, AttestationError> {
+            Ok(AssuranceEvidence {
+                codec: APPLE_APP_ATTEST.into(),
+                credential: registered(&self.0).id.as_bytes().to_vec(),
+                proof: assertion(
+                    &self.0,
+                    apple_app_id_hash(APP_ID),
+                    [1; 32],
+                    1,
+                    binding.as_bytes(),
+                ),
+            })
+        }
+    }
+    struct Counter(Cell<u32>);
+    impl AssertionCounterStore for Counter {
+        fn advance(&self, _: &[u8; 33], next: u32) -> Result<(), AttestationError> {
+            if next <= self.0.get() {
+                return Err(AttestationError::Counter);
+            }
+            self.0.set(next);
+            Ok(())
+        }
+    }
+    let fake = FakeAttester(signing_key());
+    let binding = Binding::new("fixture", EventCommitment::from_canonical_bytes(&[3; 32]));
+    let mut future = pin!(fake.attest(binding));
+    let Poll::Ready(Ok(evidence)) = future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("deterministic attester must be immediately ready");
+    };
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![[1; 32]],
+    };
+    let credential = registered(&fake.0);
+    let counters = Counter(Cell::new(0));
+    assert!(verify_apple(&evidence, binding, &credential, &policy, &counters).is_ok());
+    assert_eq!(
+        verify_apple(&evidence, binding, &credential, &policy, &counters),
+        Err(AttestationError::Counter)
+    );
+    let changed = Binding::new(
+        "other-service",
+        EventCommitment::from_canonical_bytes(&[3; 32]),
+    );
+    assert!(verify_apple(&evidence, changed, &credential, &policy, &counters).is_err());
+}
