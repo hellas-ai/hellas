@@ -83,7 +83,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy"))]
 mod tests {
     use super::*;
     #[test]

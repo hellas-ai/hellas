@@ -9,6 +9,7 @@
 
 // The executor re-executes this binary as its Catena compile child.
 #[ctor::ctor(unsafe)]
+#[cfg(feature = "local")]
 fn catena_child() {
     if hellas_executor::child_main().unwrap() {
         std::process::exit(0);
@@ -16,6 +17,7 @@ fn catena_child() {
 }
 
 #[path = "paid_e2e/automatic.rs"]
+#[cfg(feature = "local")]
 mod automatic;
 #[path = "paid_e2e/budget.rs"]
 mod budget;
@@ -1741,13 +1743,14 @@ async fn provider_close_offline(
 
 /// Plan-v4 §6, CI variant: B, with no node, buys one run of a program A has
 /// never seen through an automatic offer, and pays for it exactly once.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "local"))]
 #[test]
 fn unseen_program_pays_exactly_once() {
     run(automatic::exercise);
 }
 
 #[test]
+#[cfg(feature = "local")]
 #[ignore = "requires the CLI executable supplied by the CLI integration gate"]
 fn cli_paid_and_grant_two_provider_composition() {
     assert!(std::env::var_os("HELLAS_CLI_TEST_BINARY").is_some());

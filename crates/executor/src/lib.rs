@@ -1,5 +1,6 @@
 mod error;
 pub use error::ExecutorError;
+#[cfg(feature = "compute")]
 pub mod catena;
 mod executor;
 mod fetch_execution;
@@ -10,12 +11,13 @@ mod fetch_registry;
 #[cfg(feature = "otel")]
 mod metrics;
 
+#[cfg(feature = "compute")]
 pub use catena::child_main;
+#[cfg(feature = "compute")]
 pub use catena_lang::codegen::GpuDialect;
-pub use executor::{
-    DEFAULT_GPU_SESSION_ASSET_BYTES, DEFAULT_GPU_SESSION_PROGRAMS, Executor, ExecutorHandle,
-    ExecutorSpawnConfig, GpuConfig,
-};
+#[cfg(feature = "compute")]
+pub use executor::{DEFAULT_GPU_SESSION_ASSET_BYTES, DEFAULT_GPU_SESSION_PROGRAMS, GpuConfig};
+pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};
 pub use fetch_policy::{FetchAccessError, FetchRoute, FetchRoutePolicy};
 pub use fetch_projection::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchProjector, FetchRequestView,

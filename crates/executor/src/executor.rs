@@ -1,15 +1,17 @@
 #[cfg(feature = "otel")]
 use crate::ExecutorMetrics;
-use crate::{ExecutorError, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch, catena};
+#[cfg(feature = "compute")]
+use crate::catena;
+use crate::{ExecutorError, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch};
 use futures_util::StreamExt;
 use hellas_auth::ProducerSigningKey;
+#[cfg(feature = "compute")]
+use hellas_channel::work::admission::{CancelOnFailure, Cancellation};
 use hellas_channel::{
     content::InvocationContent,
     work::{
         Admitted, BackendFault, PaidProgress, WorkBackend,
-        admission::{
-            AdmissionError, CancelOnFailure, Cancellation, CapacityDomain, RunningWork, WorkPermit,
-        },
+        admission::{AdmissionError, CapacityDomain, RunningWork, WorkPermit},
     },
 };
 use hellas_rpc::{
@@ -25,14 +27,18 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+#[cfg(feature = "compute")]
 pub const DEFAULT_GPU_SESSION_PROGRAMS: usize = 8;
+#[cfg(feature = "compute")]
 pub const DEFAULT_GPU_SESSION_ASSET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+#[cfg(feature = "compute")]
 #[derive(Clone, Copy, Debug)]
 pub struct GpuConfig {
     pub backend: crate::GpuDialect,
     pub session_programs: usize,
     pub session_asset_bytes: u64,
 }
+#[cfg(feature = "compute")]
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
@@ -53,6 +59,7 @@ pub struct ExecutorSpawnConfig {
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
     pub content_store: hellas_store::ContentStore,
+    #[cfg(feature = "compute")]
     pub gpu_config: GpuConfig,
 }
 impl ExecutorSpawnConfig {
@@ -71,20 +78,25 @@ impl ExecutorSpawnConfig {
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
             content_store: hellas_store::ContentStore::new(),
+            #[cfg(feature = "compute")]
             gpu_config: GpuConfig::default(),
         }
     }
     pub fn supports_compute(&self) -> bool {
-        true
+        cfg!(feature = "compute")
     }
 }
 pub struct Executor {
     config: ExecutorSpawnConfig,
     fetch_capacity: Arc<Semaphore>,
+    #[cfg(feature = "compute")]
     gpu_capacity: Arc<Semaphore>,
     fetch_active: Arc<Semaphore>,
+    #[cfg(feature = "compute")]
     gpu_active: Arc<Semaphore>,
+    #[cfg(feature = "compute")]
     pool: catena::pool::Pool,
+    #[cfg(feature = "compute")]
     assets: catena::assets::Assets,
 }
 #[derive(Clone)]
@@ -114,15 +126,20 @@ impl Executor {
                 })?;
             Ok(Arc::new(Semaphore::new(total)))
         };
+        #[cfg(feature = "compute")]
         let pool = catena::pool::Pool::new(1, config.gpu_config.session_programs)
             .map_err(|e| ExecutorError::Execution(e.to_string()))?;
         Ok(ExecutorHandle {
             inner: Arc::new(Self {
                 fetch_capacity: capacity(config.fetch_max_in_flight, config.fetch_queue_capacity)?,
+                #[cfg(feature = "compute")]
                 gpu_capacity: capacity(1, config.queue_capacity)?,
                 fetch_active: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
+                #[cfg(feature = "compute")]
                 gpu_active: Arc::new(Semaphore::new(1)),
+                #[cfg(feature = "compute")]
                 pool,
+                #[cfg(feature = "compute")]
                 assets: catena::assets::Assets::new(
                     config.gpu_config.session_asset_bytes,
                     config.gpu_config.backend,
@@ -136,6 +153,7 @@ impl ExecutorHandle {
     fn capacity(&self, domain: CapacityDomain) -> Result<Arc<Semaphore>, BackendFault> {
         match domain {
             CapacityDomain::Fetch => Ok(self.inner.fetch_capacity.clone()),
+            #[cfg(feature = "compute")]
             CapacityDomain::Gpu if self.inner.pool.available() => {
                 Ok(self.inner.gpu_capacity.clone())
             }
@@ -187,7 +205,10 @@ impl ExecutorHandle {
             )));
         }
         let active = match domain {
+            #[cfg(feature = "compute")]
             CapacityDomain::Gpu => self.inner.gpu_active.clone(),
+            #[cfg(not(feature = "compute"))]
+            CapacityDomain::Gpu => return Err(AdmissionError::Unsupported(domain).into()),
             CapacityDomain::Fetch => self.inner.fetch_active.clone(),
         };
         let expires = admission.deadline();
@@ -205,6 +226,7 @@ impl ExecutorHandle {
         let running = Arc::new(admission.dispatch().await?);
         running.check_active()?;
         match domain {
+            #[cfg(feature = "compute")]
             CapacityDomain::Gpu => {
                 let cancel = catena::Cancellation::default();
                 let signal = cancel.clone();
@@ -292,6 +314,8 @@ impl ExecutorHandle {
                     .map_err(BackendFault::caused_by)?
                     .map_err(|e| BackendFault::caused_by(ExecutorError::Execution(e.to_string())))
             }
+            #[cfg(not(feature = "compute"))]
+            CapacityDomain::Gpu => Err(AdmissionError::Unsupported(domain).into()),
             CapacityDomain::Fetch => {
                 let _active = active;
                 self.run_fetch(prepared, limits, content, running, progress)

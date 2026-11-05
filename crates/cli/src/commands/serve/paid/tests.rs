@@ -1,7 +1,22 @@
 use super::*;
 use clap::Parser as _;
 
+#[cfg(not(feature = "heavy"))]
+#[test]
+fn light_provider_refuses_compute_before_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("provider");
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let error = PaidWork::load(&example, state.clone(), None, None)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("heavy CLI"));
+    assert!(!state.exists());
+}
+
 #[tokio::test]
+#[cfg(feature = "heavy")]
 async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     use std::sync::Arc;
     struct NoBackend;
@@ -127,6 +142,7 @@ fn paid_compute_program_selection_survives_config_parsing() {
 }
 
 #[tokio::test]
+#[cfg(feature = "heavy")]
 async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
@@ -170,6 +186,7 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
 }
 
 #[test]
+#[cfg(feature = "heavy")]
 fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
     use hellas_channel::content::{EphemeralContent, InvocationContent};
     use hellas_client::model::{ModelPackage, ModelRequest};

@@ -191,17 +191,18 @@ let
           ;
       };
     in
-    {
+    rec {
       cli = lib.makeOverridable (
         {
           otel ? false,
+          heavy ? false,
         }:
         pkgSpec.mkHellasPackage {
           buildNoDefaultFeatures = true;
-          # Client, gateway and daemon share one native composition.
-          buildFeatures = lib.optional otel "otel";
+          buildFeatures = lib.optional otel "otel" ++ lib.optional heavy "heavy";
         }
       ) { };
+      cli-heavy = cli.override { heavy = true; };
       cli-validator = lib.makeOverridable (
         {
           otel ? false,
@@ -294,13 +295,13 @@ let
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
-        inherit (nativePackages) cli;
+        cli = nativePackages.cli-heavy;
         backend = "cuda";
         revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
-        inherit (nativePackages) cli;
+        cli = nativePackages.cli-heavy;
         backend = "hip";
         revision = self.rev or self.dirtyRev or "unknown";
       };
@@ -412,7 +413,7 @@ let
       cargoBuildType = "debug";
       buildPhase = ''
         runHook preBuild
-        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --offline -- -D warnings
+        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api,hellas-cli/heavy --offline -- -D warnings
         runHook postBuild
       '';
       doCheck = false;

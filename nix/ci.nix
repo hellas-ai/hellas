@@ -91,7 +91,7 @@ let
         ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
     regressions = mkCargo "check-regressions" ''
-      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api -- --test-threads=1
+      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api,hellas-cli/heavy -- --test-threads=1
     '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
@@ -101,7 +101,7 @@ let
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy =
       mkCargo "check-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames"
+        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api,hellas-cli/heavy -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames"
         (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.
@@ -111,6 +111,7 @@ let
         (
           [
             "integration-tests"
+            "heavy"
             "indexer"
             "otel"
           ]
@@ -128,15 +129,15 @@ let
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
     cli = mkCargo "check-cli" ''
-      cargo test -p hellas-cli --features integration-tests
-      cargo build -p hellas-cli --bin hellas
+      cargo test -p hellas-cli --features integration-tests,heavy
+      cargo build -p hellas-cli --features heavy --bin hellas
       HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
       export HELLAS_CLI_TEST_BINARY
-      cargo test -p hellas-sdk --features integration-tests --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
+      cargo test -p hellas-sdk --features integration-tests,local --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
       # The paid/grant composition case re-executes a Catena compile worker,
       # whose process isolation is implemented only on Linux.
       ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-        cargo test -p hellas-sdk --features integration-tests --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
+        cargo test -p hellas-sdk --features integration-tests,local --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
       ''}
       cargo test -p hellas-cli --features otel,integration-tests --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
@@ -154,7 +155,9 @@ let
     kernel = mkCargo "check-kernel" "cargo test -p hellas-kernel --all-features" (
       cargoEnv rustToolchain
     );
-    executor = mkCargo "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    executor = mkCargo "check-executor" "cargo test -p hellas-executor --features compute" (
+      cargoEnv rustToolchain
+    );
     # Money-only consumers keep node authority, attestation and compression out
     # of their production dependency graph. Grant-aware dev fixtures are separate.
     channel-dependencies = mkCargo "check-channel-dependencies" ''
@@ -213,8 +216,8 @@ let
       # These native cases each start a six-validator devnet. Serializing the
       # test harness avoids cross-test resource starvation; the cases retain
       # their own concurrent-client and cancellation assertions.
-      RUST_TEST_THREADS=1 cargo test -p hellas-sdk --features integration-tests
-      cargo clippy -p hellas-sdk --features integration-tests --all-targets -- -D warnings
+      RUST_TEST_THREADS=1 cargo test -p hellas-sdk --features integration-tests,local
+      cargo clippy -p hellas-sdk --features integration-tests,local --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
@@ -368,7 +371,7 @@ let
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
     clippy =
       mkCargo "fix-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --fix --allow-dirty --allow-staged"
+        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api,hellas-cli/heavy --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };

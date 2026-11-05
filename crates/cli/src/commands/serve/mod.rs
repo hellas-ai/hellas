@@ -64,7 +64,14 @@ pub fn validate_grant_resources(
 fn provider_resources(
     routes: &FetchRouteRegistry,
 ) -> hellas_sdk::grant_provider::ProviderResources<'_> {
-    hellas_sdk::grant_provider::ProviderResources::ComputeAndFetch(routes)
+    #[cfg(feature = "heavy")]
+    {
+        hellas_sdk::grant_provider::ProviderResources::ComputeAndFetch(routes)
+    }
+    #[cfg(not(feature = "heavy"))]
+    {
+        hellas_sdk::grant_provider::ProviderResources::Fetch(routes)
+    }
 }
 
 pub fn validate_provider_config(

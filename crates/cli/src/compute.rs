@@ -1,8 +1,12 @@
 //! Provider content indexing and GPU session configuration.
-use crate::{commands::CliResult, parsers::*};
+use crate::commands::CliResult;
+#[cfg(feature = "heavy")]
+use crate::parsers::*;
 use anyhow::Context as _;
 use clap::Args;
-use hellas_executor::{ExecutorSpawnConfig, GpuConfig, GpuDialect};
+use hellas_executor::ExecutorSpawnConfig;
+#[cfg(feature = "heavy")]
+use hellas_executor::{GpuConfig, GpuDialect};
 use hellas_store::ContentStore;
 use std::path::{Path, PathBuf};
 
@@ -25,22 +29,28 @@ pub(crate) struct ServeArgs {
     #[arg(long, conflicts_with = "content_roots")]
     pub(crate) require_content_index: bool,
     /// GPU runtime: auto, hip, or cuda.
+    #[cfg(feature = "heavy")]
     #[arg(long = "gpu-backend", default_value = "auto", value_parser = parse_gpu_backend)]
     pub(crate) gpu_backend: GpuDialect,
     /// Maximum programs retained in a GPU worker session.
+    #[cfg(feature = "heavy")]
     #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = parse_positive_usize)]
     pub(crate) gpu_session_programs: usize,
     /// Maximum static asset bytes retained across GPU jobs.
+    #[cfg(feature = "heavy")]
     #[arg(long = "gpu-session-asset-bytes", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_ASSET_BYTES, value_parser = parse_positive_u64)]
     pub(crate) gpu_session_asset_bytes: u64,
 }
 impl ServeArgs {
     pub(crate) fn configure(self, executor: &mut ExecutorSpawnConfig) -> CliResult<()> {
-        executor.gpu_config = GpuConfig {
-            backend: self.gpu_backend,
-            session_programs: self.gpu_session_programs,
-            session_asset_bytes: self.gpu_session_asset_bytes,
-        };
+        #[cfg(feature = "heavy")]
+        {
+            executor.gpu_config = GpuConfig {
+                backend: self.gpu_backend,
+                session_programs: self.gpu_session_programs,
+                session_asset_bytes: self.gpu_session_asset_bytes,
+            };
+        }
         let index = self
             .content_index
             .or_else(|| {
@@ -62,6 +72,7 @@ impl ServeArgs {
         Ok(())
     }
 }
+#[cfg(feature = "heavy")]
 fn parse_gpu_backend(value: &str) -> Result<GpuDialect, String> {
     match value {
         "hip" => Ok(GpuDialect::Hip),

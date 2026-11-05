@@ -161,6 +161,8 @@ impl PaidWork {
         fetch_config: Option<&Path>,
     ) -> CliResult<Self> {
         let file = PaidWorkFile::read(path)?;
+        #[cfg(not(feature = "heavy"))]
+        ensure!(file.compute.is_none(), "Compute serving requires the heavy CLI");
         let chain = match &file.chain_config {
             Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
             None => hellas_sdk::client_chain::devnet(&root)?,

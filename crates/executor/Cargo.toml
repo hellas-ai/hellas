@@ -8,6 +8,8 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
+default = []
+compute = ["dep:catena-lang", "dep:libloading", "dep:metacat"]
 otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [target.'cfg(unix)'.dependencies]
@@ -16,7 +18,7 @@ libc = "0.2"
 [dependencies]
 async-trait = "0.1"
 bincode = "1.3"
-catena-lang.workspace = true
+catena-lang = { workspace = true, optional = true }
 futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-auth.workspace = true
@@ -26,8 +28,8 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["execute", "fetch", "work"] }
 hellas-store.workspace = true
 hellas-wire = { workspace = true }
-libloading = "0.9"
-metacat = "0.3"
+libloading = { version = "0.9", optional = true }
+metacat = { version = "0.3", optional = true }
 opentelemetry = { workspace = true, optional = true }
 rand = { workspace = true }
 serde = { workspace = true }

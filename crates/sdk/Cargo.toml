@@ -8,6 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
+local = ["hellas-executor/compute"]
 # Opt in to tests that start local nodes or exercise complete host processes.
 integration-tests = []
 

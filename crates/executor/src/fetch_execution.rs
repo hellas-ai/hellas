@@ -576,7 +576,7 @@ mod tests {
             hellas_rpc::JsonBytes(compute_policy.canonical_bytes().unwrap());
         let published = Arc::new(AtomicUsize::new(0));
         let observed = published.clone();
-        let events = executor
+        let result = executor
             .execute_stream(
                 Admitted::new(
                     compute.clone(),
@@ -590,20 +590,38 @@ mod tests {
                     Ok(())
                 }),
             )
-            .await
-            .unwrap();
-        let output = compute
-            .verify_output(
-                &compute_policy,
-                &caller.public_key(),
-                &key.public_key(),
-                &events,
-            )
-            .unwrap()
-            .output;
-        assert_eq!(output.outcome, Outcome::Failed(FailureReason::Compilation));
-        assert_eq!(events.len(), 1);
-        assert_eq!(published.load(Ordering::SeqCst), 1);
+            .await;
+        #[cfg(feature = "compute")]
+        {
+            let events = result.unwrap();
+            let output = compute
+                .verify_output(
+                    &compute_policy,
+                    &caller.public_key(),
+                    &key.public_key(),
+                    &events,
+                )
+                .unwrap()
+                .output;
+            assert_eq!(output.outcome, Outcome::Failed(FailureReason::Compilation));
+            assert_eq!(events.len(), 1);
+            assert_eq!(published.load(Ordering::SeqCst), 1);
+        }
+        #[cfg(not(feature = "compute"))]
+        {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                std::error::Error::source(&error)
+                    .and_then(|cause| cause
+                        .downcast_ref::<hellas_channel::work::admission::AdmissionError>()),
+                Some(
+                    hellas_channel::work::admission::AdmissionError::Unsupported(
+                        CapacityDomain::Gpu
+                    )
+                )
+            ));
+            assert_eq!(published.load(Ordering::SeqCst), 0);
+        }
 
         // Each admitted bound must leave a terminal before any prefix escapes.
         for (events_cap, frame_cap, spool_cap, bytes) in [

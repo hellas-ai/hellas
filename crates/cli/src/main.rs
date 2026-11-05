@@ -510,6 +510,7 @@ fn main() {
     // must run before Tokio creates worker threads and before clap, tracing,
     // or any stdout-producing command so the child speaks only Catena's worker
     // protocol on stdout.
+    #[cfg(feature = "heavy")]
     match hellas_executor::child_main() {
         Ok(true) => return,
         Ok(false) => {}
