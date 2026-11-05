@@ -45,18 +45,18 @@ catena-lang = { git = "https://github.com/hellas-ai/catena-lang.git", branch = "
 catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "1fc1c9a40412ffd04bfe6dc51544e58c57fa21cb" }
 cc = "1"
 ciborium = "0.2"
-commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-broadcast = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-codec = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae", default-features = false }
-commonware-consensus = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-cryptography = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae", default-features = false }
-commonware-glue = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-p2p = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-parallel = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-resolver = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-runtime = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-storage = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
-commonware-utils = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
+commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-broadcast = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-codec = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1", default-features = false }
+commonware-consensus = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-cryptography = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1", default-features = false }
+commonware-glue = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-p2p = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-parallel = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-resolver = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-runtime = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-storage = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
+commonware-utils = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }
 dirs = "7"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3"

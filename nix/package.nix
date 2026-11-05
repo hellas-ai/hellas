@@ -75,7 +75,7 @@ let
       outputHashes = {
         "catena-lang-0.1.0" = "sha256-TYbZKh/t4oeqGY3oC4MuW8DzflrBRMrrcumTCT8afxw=";
         "catena-models-0.1.0" = "sha256-d8g7RhFsCxylUlcxzf81kzIoTbmVDAfC5AdhUw17c50=";
-        "commonware-actor-2026.7.0" = "sha256-xbYZBCOHXinf8gdcHCqP161xLZuDy0IflQAg9TCeBtQ=";
+        "commonware-actor-2026.7.0" = "sha256-Z1mtElU3fYKzHW0BTALtb6Bm3xasEJuH/dKlZXEDt+8=";
       };
     };
     inherit stdenv;
@@ -108,6 +108,8 @@ let
           ' bootstrap-test-build.json)
           # Bound test execution only; invoking Cargo again can trigger rebuilds.
           timeout 120 "$bootstrapTestBinary" "$bootstrapTest" --exact
+          startupTest=node_control::bootstrap::tests::provider_runtime_dials_tls_relay_with_default_stack
+          env -u RUST_MIN_STACK "$bootstrapTestBinary" "$startupTest" --exact
         '';
     checkInputs = with pkgs; [ cargo-outdated ];
     separateDebugInfo = true;
