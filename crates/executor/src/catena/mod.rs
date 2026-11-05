@@ -2,6 +2,7 @@
 pub mod assets;
 pub mod compile;
 pub mod driver;
+pub mod local;
 pub mod pool;
 pub(crate) mod process;
 pub mod program;

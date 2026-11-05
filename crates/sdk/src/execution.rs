@@ -10,6 +10,11 @@ use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+mod executor;
+#[cfg(feature = "local")]
+pub use executor::LocalExecutor;
+pub use executor::{Completion, Evidence, Executor, GrantExecutor, PaidExecutor, RemoteEvidence};
+
 /// Format tag of a persisted grant attempt record.
 const GRANT_ATTEMPT_FORMAT: &str = "hellas.grant-attempt.v1";
 /// Format tag of a persisted completion receipt.
@@ -29,11 +34,15 @@ pub struct ExecutionTarget {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
+    #[error("local execution failed: {0}")]
+    Local(String),
     #[error("attempt identity or funding mode does not match")]
     Identity,
     #[error("the original attempt is unresolved; recover it without proposing new work")]
     RecoveryRequired,
-    #[error("paid output is unavailable; recover the original attempt or explicitly buy again")]
+    #[error(
+        "retained output is unavailable; recover the original attempt or explicitly execute again"
+    )]
     ResultUnavailable,
     #[error(transparent)]
     Purchase(#[from] crate::transact::PurchaseError),
@@ -577,6 +586,8 @@ struct CompletionReceipt {
     finished: bool,
     retained: bool,
     reported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_provider_payout: Option<u64>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -681,6 +692,7 @@ impl ExecutionAttempt {
             finished,
             retained: true,
             reported: false,
+            settled_provider_payout: None,
         };
         let path = self.sidecar(".receipt")?;
         hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;

@@ -112,6 +112,98 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
     });
 }
 
+#[test]
+fn executor_replays_paid_output_and_interrupted_settlement_without_rebuying() {
+    run(|runtime| {
+        Box::pin(async move {
+            use hellas_sdk::execution::{Evidence, Executor, PaidExecutor};
+            let mut case = paid_fixture(runtime).await;
+            fund(&mut case).await;
+            let job = job();
+            let terms = ExecutionTerms::Paid { price: PRICE };
+            let path = case.root.path().join("replay");
+            let execute = || {
+                Executor::Paid(PaidExecutor {
+                    options: case.options.clone(),
+                    endpoint: case.endpoint.clone(),
+                    settlement_key: client_settlement(),
+                    owner: case.owner.clone(),
+                    signer: ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap(),
+                    attempt: ExecutionAttempt::open(&path, job.input(), terms).unwrap(),
+                    settle: true,
+                })
+                .execute(job.input().clone(), Default::default())
+            };
+            let mut first = sealing_while(&mut case.devnet, Duration::from_millis(100), execute())
+                .await
+                .unwrap();
+            assert!(case.endpoint.is_closed(), "executor owns endpoint cleanup");
+            let output = first.output.content_id().unwrap();
+            let Evidence::Remote(evidence) = &first.evidence else {
+                unreachable!()
+            };
+            assert_eq!(evidence.provider, case.options.provider);
+            let identity = (evidence.provider, evidence.provider_key, evidence.channel);
+            assert!(evidence.settled_provider_payout.is_none());
+            sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                first.deliver_and_settle(),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(&first.evidence,
+                Evidence::Remote(evidence) if evidence.settled_provider_payout == Some(PRICE)));
+
+            drop(first);
+            let approvals = case.approvals.0.lock().unwrap().len();
+
+            // Settlement reached finality, but the process died before recording it
+            // in its delivery receipt. Reconcile the already-closed original channel.
+            let sidecar = case.root.path().join(".hellas-execution");
+            let prefix = hex::encode(Digest::hash(b"replay").as_bytes());
+            let receipt_path = sidecar.join(format!("{prefix}.receipt"));
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+            receipt
+                .as_object_mut()
+                .unwrap()
+                .remove("settled_provider_payout");
+            std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let mut recovered = execute().await.unwrap();
+            recovered.deliver_and_settle().await.unwrap();
+            assert_eq!(recovered.output.content_id().unwrap(), output);
+            assert!(matches!(&recovered.evidence,
+                Evidence::Remote(evidence) if evidence.settled_provider_payout == Some(PRICE)));
+
+            drop(recovered);
+
+            case.endpoint.close().await;
+            let mut replayed = execute().await.unwrap();
+            assert_eq!(replayed.output.content_id().unwrap(), output);
+            let Evidence::Remote(evidence) = &replayed.evidence else {
+                unreachable!()
+            };
+            assert_eq!(
+                (evidence.provider, evidence.provider_key, evidence.channel),
+                identity
+            );
+            replayed.deliver_and_settle().await.unwrap();
+            replayed.deliver_and_settle().await.unwrap();
+            drop(replayed);
+            std::fs::remove_file(sidecar.join(format!("{prefix}.result"))).unwrap();
+            assert!(matches!(
+                execute().await,
+                Err(ExecutionError::ResultUnavailable)
+            ));
+            assert_eq!(case.approvals.0.lock().unwrap().len(), approvals);
+            case.provider.shutdown().await.unwrap();
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
 // Establish fixture funding separately from the tracked attempts under test.
 // The SDK owns bounded funding retries on the original connection.
 async fn fund(case: &mut PaidScenario<()>) {

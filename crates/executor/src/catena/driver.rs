@@ -34,6 +34,43 @@ pub struct Completed {
     cancel: super::Cancellation,
 }
 
+impl Completed {
+    /// The unsigned evaluator result, shared by local and signed remote execution.
+    pub fn output(
+        &self,
+        plan: &Plan,
+    ) -> Result<hellas_rpc::protocol::invocation::output::InvocationOutput> {
+        use hellas_rpc::protocol::invocation::{
+            Artifact,
+            output::{InvocationOutput, Outcome},
+        };
+        let mut artifacts: Vec<_> = plan
+            .outputs
+            .iter()
+            .map(|d| Artifact::new(&d.slot, d.kind.format(), self.outputs[&d.slot].clone()))
+            .collect();
+        if plan.step.is_some() {
+            artifacts.push(Artifact::new(
+                "emitted",
+                "catena.u64le.v1",
+                self.emitted.iter().flat_map(|n| n.to_le_bytes()).collect(),
+            ));
+        }
+        artifacts.sort_by(|a, b| a.name.cmp(&b.name));
+        let output = InvocationOutput {
+            outcome: Outcome::Succeeded,
+            artifacts,
+            metadata: hellas_rpc::JsonBytes(hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                steps: self.emitted.len() as u64,
+                stop: self.stop.clone(),
+            })?),
+        };
+        validate_output(plan, &output)?;
+        output.content_id()?;
+        Ok(output)
+    }
+}
+
 /// `emit` publishes each step before its stop rule is evaluated.
 #[allow(clippy::too_many_arguments)]
 pub fn execute(
@@ -322,10 +359,7 @@ pub(crate) fn execute_signed_in(
     let (plan, inputs) = program.input(prepared)?;
     let plan = &plan;
     let request = &prepared.request;
-    use hellas_rpc::protocol::invocation::{
-        Artifact,
-        output::{FailureReason, InvocationOutput, Outcome, OutputError, OutputStream},
-    };
+    use hellas_rpc::protocol::invocation::output::{FailureReason, OutputError, OutputStream};
     if request.retain != (content.retention() == hellas_rpc::Retention::Retain) {
         return Err("compute content retention differs from the signed request".into());
     }
@@ -382,39 +416,16 @@ pub(crate) fn execute_signed_in(
             return Ok((output, events));
         }
     };
+    let output = match completed.output(plan) {
+        Ok(output) => output,
+        Err(_) => {
+            let (output, events) = stream.fail(FailureReason::Execution)?;
+            publish(events.last().unwrap().clone())?;
+            return Ok((output, events));
+        }
+    };
     let deadline = completed.deadline;
     let cancel = completed.cancel;
-    let metadata = RunMetadata {
-        steps: completed.emitted.len() as u64,
-        stop: completed.stop,
-    };
-    let mut artifacts: Vec<_> = plan
-        .outputs
-        .iter()
-        .map(|d| Artifact::new(&d.slot, d.kind.format(), completed.outputs[&d.slot].clone()))
-        .collect();
-    if plan.step.is_some() {
-        artifacts.push(Artifact::new(
-            "emitted",
-            "catena.u64le.v1",
-            completed
-                .emitted
-                .into_iter()
-                .flat_map(u64::to_le_bytes)
-                .collect(),
-        ));
-    }
-    artifacts.sort_by(|a, b| a.name.cmp(&b.name));
-    let output = InvocationOutput {
-        outcome: Outcome::Succeeded,
-        artifacts,
-        metadata: hellas_rpc::JsonBytes(hellas_rpc::canonical_dag_cbor(&metadata)?),
-    };
-    if validate_output(plan, &output).is_err() {
-        let (output, events) = stream.fail(FailureReason::Execution)?;
-        publish(events.last().unwrap().clone())?;
-        return Ok((output, events));
-    }
     let maximum_payload_bytes = stream.maximum_payload_bytes();
     let (output, mut events) = stream.finish_or_fail(output, 64 << 10)?;
     let mut published = offset as usize / 8;

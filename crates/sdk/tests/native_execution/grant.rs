@@ -123,36 +123,28 @@ async fn granted_compute_executes_through_the_native_facade() {
     let terms = hellas_sdk::execution::ExecutionTerms::Grant {
         resource: grant.policies[0].resource,
     };
-    let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(
+    let attempt = hellas_sdk::execution::ExecutionAttempt::open(
         &root.path().join("compute-attempt"),
         &input,
         terms,
     )
     .unwrap();
-    let mut session = attempt
-        .open_grant_session(options, GrantTransport::Local(service))
-        .await
-        .unwrap();
-    let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-        .execute(
-            input,
-            terms,
-            &principal(1).1,
-            Default::default(),
-            Some(&mut attempt),
-        )
-        .await
-        .unwrap();
-    let hellas_sdk::execution::ExecutionResult::Grant(result) = result else {
-        panic!("grant result")
-    };
+    let mut result = hellas_sdk::execution::Executor::Grant(hellas_sdk::execution::GrantExecutor {
+        options,
+        transport: GrantTransport::Local(service),
+        resource: grant.policies[0].resource,
+        attempt,
+    })
+    .execute(input, Default::default())
+    .await
+    .unwrap();
     assert_eq!(result.output.artifacts[0].bytes.as_bytes(), &[0]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        attempt.inspect().unwrap().terminal,
-        hellas_sdk::execution::Terminal::Verified
-    );
-    session.shutdown().await.unwrap();
+    assert!(matches!(
+        result.evidence,
+        hellas_sdk::execution::Evidence::Remote(_)
+    ));
+    result.deliver_and_settle().await.unwrap();
 }
 
 #[tokio::test]
@@ -332,6 +324,32 @@ async fn local_grant_session_executes_without_http() {
     let reopened = hellas_sdk::execution::ExecutionAttempt::open(&path, &input, terms).unwrap();
     assert!(reopened.inspect().unwrap().reported);
     assert!(reopened.retained_result().unwrap().is_some());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(reopened);
+    let unavailable =
+        hellas_sdk::grant_client::bind_endpoint(iroh::SecretKey::from_bytes(&[0x39; 32]))
+            .await
+            .unwrap();
+    unavailable.close().await;
+    let mut replayed =
+        hellas_sdk::execution::Executor::Grant(hellas_sdk::execution::GrantExecutor {
+            options: options.clone(),
+            transport: GrantTransport::Remote(unavailable),
+            resource: grant.policies[0].resource,
+            attempt: hellas_sdk::execution::ExecutionAttempt::open_existing(&path, &input, terms)
+                .unwrap(),
+        })
+        .execute(input.clone(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.output.content_id().unwrap(),
+        result.output.content_id().unwrap()
+    );
+    replayed.deliver_and_settle().await.unwrap();
+    drop(replayed);
+    let reopened =
+        hellas_sdk::execution::ExecutionAttempt::open_existing(&path, &input, terms).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // Simulate losing the process after attempt intent was persisted, but
     // before the corresponding proposal was appended to the grant journal.
