@@ -13,6 +13,14 @@ fn object(reference: &pb::ContentRef) -> Result<hellas_rpc::ContentRef, WireStat
         reference.bytes,
     ))
 }
+fn current_scope(
+    shared: &std::sync::Mutex<hellas_store::content::Scope>,
+) -> Result<hellas_store::content::Scope, WireStatus> {
+    shared
+        .lock()
+        .map(|scope| scope.clone())
+        .map_err(|_| status("content scope lock"))
+}
 fn identity(job: &JobContent) -> (JobId, u64) {
     match &job.scope().kind {
         ScopeKind::Work {
@@ -320,13 +328,22 @@ impl GrantWork {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
+                    let (closure,local,bound) = {
+                        let store = work.service.node.writer().await.map_err(status)?;
+                        work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
+                        let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
+                        if identity(&job).1 != reservation { Err(status("content scope changed"))?; }
+                        let local = LocalStore::Job(job.clone());
+                        let bytes = match root { Some(root) => hellas_channel::content::read(&local, job.scope(), root, hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64).await.map_err(status)?, None => bytes::Bytes::new() };
+                        let closure = hellas_channel::job::content_closure(&policy, &manifest, &bytes, authorization.input_content).map_err(status)?;
+                        let bound = current_scope(&shared)?;
+                        (closure,local,bound)
+                    };
+                    local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
                     let mut store = work.service.node.writer().await.map_err(status)?;
                     work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
-                    let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
-                    if identity(&job).1 != reservation { Err(status("content scope changed"))?; }
-                    let local = LocalStore::Job(job.clone());
-                    let bytes = match root { Some(root) => hellas_channel::content::read(&local, job.scope(), root, hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64).await.map_err(status)?, None => bytes::Bytes::new() };
-                    let closure = hellas_channel::job::content_closure(&policy, &manifest, &bytes, authorization.input_content).map_err(status)?;
+                    let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_|status("content scope ended"))?;
+                    if identity(&job).1 != reservation {Err(status("content scope changed"))?;}
                     let job = job.widen(closure, policy.limits.max_upload_bytes).await.map_err(status)?;
                     work.service.set_pending_content(authorization.channel_id, job.clone()).map_err(status)?;
                     let (scope, _) = work.content_work_locked(&mut store, job.scope().clone(), authorization, connection.clone()).map_err(status)?;

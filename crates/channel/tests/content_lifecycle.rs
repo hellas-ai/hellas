@@ -1090,3 +1090,44 @@ async fn recovering_many_retained_jobs_loads_bodies_only_when_each_job_is_used()
         );
     }
 }
+
+#[tokio::test]
+async fn paid_root_completion_consults_the_policy_with_the_full_missing_reference_and_live_scope() {
+    use std::sync::{Arc, Mutex};
+    struct Recording(Arc<Mutex<Vec<(ContentRef, ScopeKind)>>>);
+    impl OnMiss for Recording {
+        fn decide(&self, miss: &Miss, _: &StoreStats) -> MissDecision {
+            self.0
+                .lock()
+                .unwrap()
+                .push((miss.object, miss.scope.kind.clone()));
+            MissDecision::Refuse
+        }
+    }
+    let (_root, service, node, frames) = pending_upload_fixture().await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    node.set_on_miss(Arc::new(Recording(observed.clone())))
+        .unwrap();
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    hellas_channel::test_support::drive_upload(
+        service
+            .upload_stream(
+                Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+                hellas_wire::TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                connection.clone(),
+            )
+            .await,
+    )
+    .await
+    .unwrap();
+    let expected = fixture::authorization().input_content;
+    let work = work_id(fixture::ready().channel(), &fixture::authorization());
+    assert!(observed.lock().unwrap().iter().any(|(object,scope)| {
+        *object==expected && matches!(scope,ScopeKind::Work{job,reservation,..} if job.id==work && *reservation!=0)
+    }));
+    connection.cancel();
+    wait_for_pending_cleanup(&node).await;
+}

@@ -42,11 +42,13 @@ async fn publish(
     stages: BTreeMap<ContentId, Staged>,
     target: Target,
     pin: PinTarget,
+    requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
     let object = target.object();
     store
         .effect(scope, move |store| {
             store.require_ready()?;
+            store.check_acquisition(&pin, &requester)?;
             store.publish_acquired(
                 stages
                     .into_values()
@@ -54,6 +56,7 @@ async fn publish(
                     .collect(),
                 target,
                 pin,
+                requester,
             )
         })
         .await?;
@@ -65,6 +68,7 @@ pub(crate) async fn memory(
     source: Source,
     expect: Option<ContentRef>,
     pin: PinTarget,
+    requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
     PinName::new(pin.name.as_str().to_owned())?;
     match source {
@@ -104,6 +108,7 @@ pub(crate) async fn memory(
                 BTreeMap::from([(stage.object.id(), stage)]),
                 target,
                 pin,
+                requester,
             )
             .await
         }
@@ -183,7 +188,7 @@ pub(crate) async fn memory(
                     }
                 }
             }
-            publish(store, scope, stages, root, pin).await
+            publish(store, scope, stages, root, pin, requester).await
         }
         Source::HfXet { repo, commit, path } => {
             repo.validate().map_err(hf_error)?;
@@ -200,7 +205,7 @@ pub(crate) async fn memory(
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            publish(store, scope, stages, root, pin).await
+            publish(store, scope, stages, root, pin, requester).await
         }
     }
 }
@@ -412,7 +417,7 @@ impl Core {
             name: PinName::new(format!("hf/{id}@{sha}"))?,
             policy: PinPolicy::Owner,
         };
-        let object = publish(self, scope, stages, root, pin).await?.object;
+        let object = publish(self, scope, stages, root, pin, None).await?.object;
         Ok((sha, object))
     }
 }

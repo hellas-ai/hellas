@@ -46,11 +46,15 @@ struct Work {
     charge: Arc<Reservation>,
     staged: BTreeMap<ContentId, Arc<Stored>>,
 }
+type AcquiredOwner = (std::sync::Weak<Mutex<State>>, ReservationId);
+type AcquiredOwners = BTreeMap<PinName, AcquiredOwner>;
 pub(crate) struct State {
     #[cfg(test)]
     tree_reads: std::sync::atomic::AtomicU64,
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
     pub(crate) pins: BTreeMap<PinName, PinValue>,
+    acquired: AcquiredOwners,
+    pub(crate) on_miss: Arc<dyn OnMiss>,
     work: BTreeMap<ReservationId, Work>,
     active: BTreeSet<(ReservationId, ContentId)>,
     pub(crate) generation: u64,
@@ -75,6 +79,8 @@ impl Core {
                 tree_reads: std::sync::atomic::AtomicU64::new(0),
                 objects: BTreeMap::new(),
                 pins: BTreeMap::new(),
+                acquired: BTreeMap::new(),
+                on_miss: Arc::new(Refuse),
                 work: BTreeMap::new(),
                 active: BTreeSet::new(),
                 generation: 0,
@@ -89,7 +95,17 @@ impl Core {
         objects: Vec<(ContentRef, super::storage::Data, Vec<Chunk>)>,
         target: Target,
         pin: PinTarget,
+        requester: Option<(Core, Scope)>,
     ) -> Result<()> {
+        let owner = requester
+            .map(|(core, scope)| {
+                let ScopeKind::Work { reservation, .. } = scope.kind else {
+                    return Err(Error::Denied);
+                };
+                Ok((Arc::downgrade(&core.state), reservation))
+            })
+            .transpose()?;
+        let name = pin.name.clone();
         let mut state = self
             .state
             .lock()
@@ -99,6 +115,9 @@ impl Core {
             .map(|(object, data, chunks)| (object.id(), Arc::new(Stored::new(data, chunks))))
             .collect();
         state.publish(objects, target, pin)?;
+        if let Some(owner) = owner {
+            state.acquired.insert(name, owner);
+        }
         self.changed.notify_waiters();
         Ok(())
     }
@@ -272,6 +291,9 @@ impl Core {
             }
             disk.discard_job(work.job)?;
         }
+        if self.disk.is_some() {
+            state.unpin_acquired(&(Arc::downgrade(&self.state), *reservation))?;
+        }
         self.changed.notify_waiters();
         Ok(())
     }
@@ -425,7 +447,7 @@ impl Core {
             .transpose()
     }
 }
-fn canonical_closure(closure: Closure) -> Result<Closure> {
+pub(super) fn canonical_closure(closure: Closure) -> Result<Closure> {
     let mut objects = BTreeMap::new();
     for object in closure {
         if objects
@@ -548,6 +570,21 @@ impl State {
                 .filter(|(name, pin)| readable(scope, name, pin))
                 .map(|(_, pin)| pin.target),
         )
+    }
+    fn unpin_acquired(&mut self, owner: &AcquiredOwner) -> Result<()> {
+        let names = self
+            .acquired
+            .iter()
+            .filter(|(_, current)| current.0.ptr_eq(&owner.0) && current.1 == owner.1)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in names {
+            self.acquired.remove(&name);
+            if self.pins.contains_key(&name) {
+                self.change_pin(name, None)?;
+            }
+        }
+        Ok(())
     }
     fn present(&self, scope: &Scope, object: ContentRef) -> Result<bool> {
         Ok(self.readable_refs(scope)?.contains(&object)
@@ -1105,6 +1142,7 @@ impl Core {
                     state.generation,
                     state.events.clone(),
                     state.event_bytes,
+                    state.acquired.clone(),
                 )
             };
             let rollback = PinCommit {
@@ -1155,6 +1193,7 @@ type PinSnapshot = (
     u64,
     VecDeque<(PinEvent, Option<PinValue>, usize)>,
     usize,
+    AcquiredOwners,
 );
 struct PinCommit {
     core: Core,
@@ -1163,12 +1202,13 @@ struct PinCommit {
 }
 impl Drop for PinCommit {
     fn drop(&mut self) {
-        if let Some((pins, generation, events, event_bytes)) = self.before.take() {
+        if let Some((pins, generation, events, event_bytes, acquired)) = self.before.take() {
             let mut state = self.core.state.lock().unwrap();
             state.pins = pins;
             state.generation = generation;
             state.events = events;
             state.event_bytes = event_bytes;
+            state.acquired = acquired;
         }
     }
 }
@@ -1210,27 +1250,7 @@ impl ContentStore for Core {
         expect: Option<ContentRef>,
         pin: PinTarget,
     ) -> Result<Acquisition> {
-        if !matches!(s.kind, ScopeKind::Owner) {
-            return Err(Error::Denied);
-        }
-        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
-            return Err(Error::Denied);
-        }
-        loop {
-            self.access(s, |core| core.require_ready()).await?;
-            let result = super::acquire::memory(self, s, source.clone(), expect, pin.clone()).await;
-            if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
-                return result;
-            }
-            if self
-                .access(s, |core| core.collect_sync(&Scope::Owner, true))
-                .await?
-                .objects
-                == 0
-            {
-                return result;
-            }
-        }
+        self.acquire_scoped(s, source, expect, pin, None).await
     }
     async fn set_pin(
         &self,
@@ -1283,6 +1303,146 @@ impl Core {
 }
 
 impl Core {
+    pub(crate) fn check_acquisition(
+        &self,
+        pin: &PinTarget,
+        requester: &Option<(Core, Scope)>,
+    ) -> Result<()> {
+        if let Some((requester, scope)) = requester {
+            requester.check(scope)?;
+            if self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?
+                .pins
+                .get(&pin.name)
+                .is_some_and(|value| value.policy != PinPolicy::Jobs)
+            {
+                return Err(Error::Denied);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn acquire_scoped(
+        &self,
+        s: &Scope,
+        source: Source,
+        expect: Option<ContentRef>,
+        pin: PinTarget,
+        requester: Option<(Core, Scope)>,
+    ) -> Result<Acquisition> {
+        if !matches!(s.kind, ScopeKind::Owner) {
+            return Err(Error::Denied);
+        }
+        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
+            return Err(Error::Denied);
+        }
+        loop {
+            let (checking_pin, checking_requester) = (pin.clone(), requester.clone());
+            self.access(s, move |core| {
+                core.require_ready()?;
+                core.check_acquisition(&checking_pin, &checking_requester)
+            })
+            .await?;
+            let result = super::acquire::memory(
+                self,
+                s,
+                source.clone(),
+                expect,
+                pin.clone(),
+                requester.clone(),
+            )
+            .await;
+            if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
+                return result;
+            }
+            if self
+                .access(s, |core| core.collect_sync(&Scope::Owner, true))
+                .await?
+                .objects
+                == 0
+            {
+                return result;
+            }
+        }
+    }
+
+    pub(crate) fn missing_refs(
+        &self,
+        scope: &Scope,
+        closure: &[ContentRef],
+    ) -> Result<Vec<ContentRef>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?;
+        state.check(scope)?;
+        let ScopeKind::Work {
+            closure: admitted,
+            reservation,
+            ..
+        } = &scope.kind
+        else {
+            return Err(Error::Denied);
+        };
+        if admitted.iter().any(|object| !closure.contains(object)) {
+            return Err(Error::Denied);
+        }
+        let held = state.held(scope, closure)?;
+        let lower = self.held_lower(scope, closure)?;
+        let work = state.work.get(reservation).ok_or(Error::Denied)?;
+        Ok(closure
+            .iter()
+            .filter(|object| {
+                !work.staged.contains_key(&object.id())
+                    && !held.contains(&object.id())
+                    && !lower.contains(&object.id())
+            })
+            .copied()
+            .collect())
+    }
+
+    pub(crate) fn clear_acquired(&self, owner: AcquiredOwner) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?
+            .unpin_acquired(&owner)
+    }
+    pub(crate) fn clear_orphan_acquired(&self) -> Result<()> {
+        if self.disk.as_ref().is_none_or(|disk| disk.ready()) {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?;
+        let live = state
+            .work
+            .iter()
+            .map(|(reservation, work)| (work.job.id.to_string(), *reservation))
+            .collect::<BTreeMap<_, _>>();
+        let names = state
+            .pins
+            .keys()
+            .filter_map(|name| {
+                let parts = name.as_str().split('/').collect::<Vec<_>>();
+                (parts.len() == 4 && parts[0] == "work" && parts[2] == "acquired")
+                    .then(|| (name.clone(), live.get(parts[1]).copied()))
+            })
+            .collect::<Vec<_>>();
+        for (name, reservation) in names {
+            if let Some(reservation) = reservation {
+                state
+                    .acquired
+                    .insert(name, (Arc::downgrade(&self.state), reservation));
+            } else {
+                state.change_pin(name.clone(), None)?;
+                state.acquired.remove(&name);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
         let recovering = !self.disk.as_ref().ok_or(Error::Denied)?.ready();
         let remaining = total.checked_sub(consumed).ok_or(Error::Capacity)?;

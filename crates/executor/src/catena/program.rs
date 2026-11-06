@@ -4,7 +4,7 @@ use hellas_rpc::{
     ContentId, ContentRef,
     protocol::invocation::{Limits, PreparedInvocation, compute::*},
 };
-use hellas_store::content::{LocalStore, Scope, VerifiedReader};
+use hellas_store::content::{LocalStore, Scope, ScopeKind, VerifiedReader};
 use std::{collections::BTreeMap, path::Path};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -36,7 +36,25 @@ impl BoundProgram {
         {
             return Err("unsupported compute evaluator".into());
         }
-        let root = hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?;
+        let root = if let ScopeKind::Work { closure, .. } = &content.1.kind {
+            let object = closure
+                .iter()
+                .find(|object| object.id() == manifest.root())
+                .copied()
+                .ok_or("missing compute root reference")?;
+            if object.bytes() > MAX_ENVIRONMENT_BYTES as u64 {
+                return Err("compute root exceeds byte limit".into());
+            }
+            content
+                .0
+                .preflight(&content.1, object)
+                .await?
+                .ok_or("missing compute root")?
+                .read_all(object, &content.0.ram_pool())
+                .await?
+        } else {
+            hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
+        };
         let environment = Environment::from_canonical_bytes(&root)?;
         if environment.manifest()?.content_id() != manifest.content_id() {
             return Err("compute environment identity mismatch".into());
@@ -51,16 +69,20 @@ impl BoundProgram {
         validate::preflight(&environment, &inputs, &plan, limits)?;
         let mut sources = Vec::new();
         for object in &environment.sources {
-            let bytes =
-                hellas_channel::content::read(&content.0, &content.1, *object, MAX_SOURCE_BYTES)
-                    .await?;
+            let bytes = content
+                .0
+                .preflight(&content.1, *object)
+                .await?
+                .ok_or("missing compute source")?
+                .read_all(*object, &content.0.ram_pool())
+                .await?;
             sources.push(std::str::from_utf8(&bytes)?.to_owned());
         }
         let mut readers = BTreeMap::new();
         for asset in &environment.assets {
             let reader = content
                 .0
-                .open_verified(&content.1, asset.object, None)
+                .preflight(&content.1, asset.object)
                 .await?
                 .ok_or("missing compute asset")?;
             readers.insert(asset.object.id(), reader);

@@ -17,6 +17,12 @@ fn path(name: &str) -> Path {
     Path::new(PinName::new(name.into()).unwrap(), String::new()).unwrap()
 }
 pub(crate) fn https(body: &'static [u8]) -> (url::Url, ureq::Agent, std::thread::JoinHandle<()>) {
+    https_with(body, || {})
+}
+pub(crate) fn https_with(
+    body: &'static [u8],
+    on_request: impl FnOnce() + Send + 'static,
+) -> (url::Url, ureq::Agent, std::thread::JoinHandle<()>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = certified.cert.der().clone();
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -64,6 +70,7 @@ pub(crate) fn https(body: &'static [u8]) -> (url::Url, ureq::Agent, std::thread:
                 }
             }
         }
+        on_request();
         write!(
             tls,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -366,9 +373,16 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());
-    publish(&store.core, &Scope::Owner, stages, root, pin("resolved"))
-        .await
-        .unwrap();
+    publish(
+        &store.core,
+        &Scope::Owner,
+        stages,
+        root,
+        pin("resolved"),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(pool.held(), root.object().bytes() + 2);
     assert!(
         store

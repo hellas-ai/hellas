@@ -433,3 +433,72 @@ async fn owner_content_authority_does_not_require_a_provider_service() {
     assert_eq!(pins.pins.len(), 1);
     assert_eq!(pins.pins[0].1.target.object(), object);
 }
+
+#[tokio::test]
+async fn grant_root_completion_consults_the_policy_with_full_reference_and_requesting_scope() {
+    use common::{actors::*, ids};
+    use hellas_store::content::{Miss, MissDecision, OnMiss, ScopeKind, StoreStats};
+    struct Recording(Arc<std::sync::Mutex<Vec<(hellas_rpc::ContentRef, ScopeKind)>>>);
+    impl OnMiss for Recording {
+        fn decide(&self, miss: &Miss, _: &StoreStats) -> MissDecision {
+            self.0
+                .lock()
+                .unwrap()
+                .push((miss.object, miss.scope.kind.clone()));
+            MissDecision::Refuse
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let compute = common::compute::Compute;
+    let node = common::Node::bootstrap(root.path())
+        .with_allowance(compute.allowance(ids::ALLOWANCE, FRIEND))
+        .with_grant(
+            ids::FRIEND_GRANT,
+            common::Rights::new(common::authority(), FRIEND)
+                .allow(
+                    hellas_authority::grant_service::WORK_EXECUTE,
+                    hellas_authority::grant_service::allowance_resource(
+                        common::authority(),
+                        ids::ALLOWANCE,
+                    ),
+                )
+                .valid_until(hellas_auth::authority::UnixMillis(100_000))
+                .build(),
+        )
+        .build()
+        .await;
+    let proposal = compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1);
+    let content = node.content.clone();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    content
+        .set_on_miss(Arc::new(Recording(observed.clone())))
+        .unwrap();
+    let world = node.serve(Backend::default());
+    let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
+    let (_, frames) = common::grant_upload_requests(
+        &proposal.request(),
+        &FRIEND.node_key(),
+        common::network(),
+        [7; 32],
+    );
+    let connection = Cancellation::new();
+    drive_upload(
+        work.upload_stream(
+            Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+            context(),
+            connection.clone(),
+        )
+        .await,
+    )
+    .await
+    .unwrap();
+    assert!(observed.lock().unwrap().iter().any(|(object,scope)| *object==proposal.authorization.input_content && matches!(scope,ScopeKind::Work {job,reservation,..} if job.id==proposal.work() && *reservation!=0)));
+    connection.cancel();
+    common::within(async {
+        while content.ram_pool().held() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    world.service.drain().await.unwrap();
+}

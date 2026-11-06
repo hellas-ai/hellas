@@ -24,6 +24,12 @@ fn object(reference: &pb::ContentRef) -> Result<ContentRef, WireStatus> {
     ))
 }
 
+fn current_scope(shared: &std::sync::Mutex<Scope>) -> Result<Scope, WireStatus> {
+    shared
+        .lock()
+        .map(|scope| scope.clone())
+        .map_err(|_| status(Error::Denied))
+}
 fn set_scope(shared: &std::sync::Mutex<Scope>, scope: Scope) -> Result<(), WireStatus> {
     *shared.lock().map_err(|_| status(Error::Denied))? = scope;
     Ok(())
@@ -552,10 +558,19 @@ impl WorkService {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
+                    let (closure, local, bound) = {
+                        let endpoint = host.endpoint().await.map_err(status)?;
+                        endpoint.check_content_authority(&authorization).map_err(status)?;
+                        let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
+                        let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
+                        let (local, _) = endpoint.close.store.invocation_content(id).map_err(status)?;
+                        let bound = current_scope(&shared)?;
+                        (closure,local,bound)
+                    };
+                    local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
                     let mut endpoint = host.endpoint().await.map_err(status)?;
                     endpoint.check_content_authority(&authorization).map_err(status)?;
-                    let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
-                    let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
+                    if !endpoint.close.store.has_content_scope(id,reservation) {Err(status(Error::Denied))?;}
                     let (_, scope) = endpoint.close.store.widen_content(id, closure, policy.limits.max_upload_bytes).await.map_err(status)?;
                     if authorization.retention == hellas_rpc::Retention::Retain { endpoint.close.store.reserve_retained(id, facts.max_spool_bytes).await.map_err(status)?; }
                     set_scope(&shared, host.bound_content_scope(scope, authorization, Some(connection.clone())))?;

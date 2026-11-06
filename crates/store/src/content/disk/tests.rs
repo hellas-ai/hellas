@@ -256,6 +256,7 @@ async fn invalid_acquired_tree_drops_private_files_and_cannot_fill_an_existing_p
                 vec![(object, data, chunks)],
                 Target::Tree(object),
                 pin("bad"),
+                None,
             )
         })
         .await;
@@ -684,4 +685,81 @@ async fn an_opener_cannot_adopt_the_temporary_root_scope_while_its_pin_is_commit
         Err(error) => panic!("unexpected admission error: {error}"),
     }
     assert!(store.core.live_jobs().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn acquired_pin_deletion_can_retry_after_sql_failure_even_when_work_has_ended() {
+    for ephemeral in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = open(root.path()).await;
+        let object = ContentRef::for_bytes(b"weights");
+        let (url, http, serving) = super::super::acquire::tests::https(b"weights");
+        store.core.http = http;
+        store
+            .set_on_miss(Arc::new(AllowList(BTreeMap::from([(
+                object.id(),
+                (
+                    object.bytes(),
+                    Source::Https {
+                        url,
+                        sha256: None,
+                        bytes: object.bytes(),
+                    },
+                ),
+            )]))))
+            .unwrap();
+        let (local, scope) = if ephemeral {
+            let work = JobContent::new(&store, recovery_job(), vec![], 0)
+                .await
+                .unwrap();
+            let scope = work.scope().clone();
+            (LocalStore::Job(work), scope)
+        } else {
+            let scope = store.open_work(recovery_job(), vec![], 0).await.unwrap();
+            (LocalStore::Disk(store.clone()), scope)
+        };
+        local.acquire_missing(&scope, vec![object]).await.unwrap();
+        serving.join().unwrap();
+        let disk = store.core.disk.as_ref().unwrap();
+        sqlx::raw_sql("CREATE TRIGGER reject_delete BEFORE DELETE ON pins BEGIN SELECT RAISE(ABORT,'injected'); END;").execute(&disk.db).await.unwrap();
+        let end = async {
+            match &local {
+                LocalStore::Job(work) => work.end().await,
+                LocalStore::Disk(node) => node.end_work(&scope).await,
+                _ => unreachable!(),
+            }
+        };
+        assert!(end.await.is_err());
+        assert_eq!(
+            store
+                .pins(&Scope::Owner, "work/", Cursor::default())
+                .await
+                .unwrap()
+                .pins
+                .len(),
+            1
+        );
+        sqlx::raw_sql("DROP TRIGGER reject_delete")
+            .execute(&disk.db)
+            .await
+            .unwrap();
+        match &local {
+            LocalStore::Job(work) => work.end().await.unwrap(),
+            LocalStore::Disk(node) => node.end_work(&scope).await.unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(
+            store
+                .pins(&Scope::Owner, "work/", Cursor::default())
+                .await
+                .unwrap()
+                .pins
+                .is_empty()
+        );
+        assert_eq!(
+            store.collect(&Scope::Owner).await.unwrap().bytes,
+            object.bytes()
+        );
+        assert_eq!(store.stats().unwrap().outstanding, 0);
+    }
 }

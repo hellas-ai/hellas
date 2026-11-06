@@ -589,6 +589,11 @@ impl DiskStore {
     /// The host calls this only after every channel has restored retained roots
     /// and outstanding output reservations. Admission and collection share it.
     pub async fn finish_recovery(&self) -> Result<()> {
+        if !self.core.disk.as_ref().unwrap().ready() {
+            self.core
+                .effect(&Scope::Owner, |core| core.clear_orphan_acquired())
+                .await?;
+        }
         let disk = self.core.disk.as_ref().unwrap().clone();
         let gate = self.core.gate.clone().lock_owned().await;
         let live = self.core.live_jobs()?;
@@ -637,6 +642,15 @@ impl DiskStore {
     }
     pub fn stats(&self) -> Result<StoreStats> {
         self.core.disk.as_ref().unwrap().quota.stats()
+    }
+    /// Both closure completion and local executor preflight consult this policy.
+    pub fn set_on_miss(&self, policy: Arc<dyn OnMiss>) -> Result<()> {
+        self.core
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?
+            .on_miss = policy;
+        Ok(())
     }
     pub fn with_peers(mut self, peers: hellas_wire::iroh::Pool) -> Self {
         self.core.peers = Some(peers);
