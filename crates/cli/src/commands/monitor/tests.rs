@@ -161,3 +161,19 @@ fn error_records_escape_peer_controlled_messages() {
         }
     }
 }
+
+#[tokio::test]
+async fn unavailable_mdns_completes_readiness_without_stopping_other_discovery() {
+    assert_eq!(
+        discovery_readiness(Err("multicast unavailable".into())).await,
+        Some("multicast unavailable".into())
+    );
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    drop(sender);
+    assert_eq!(
+        discovery_readiness(Ok(receiver)).await,
+        Some("mDNS discovery stopped before subscribing".into())
+    );
+    let (_, subscribed) = tokio::sync::watch::channel(true);
+    assert_eq!(discovery_readiness(Ok(subscribed)).await, None);
+}
