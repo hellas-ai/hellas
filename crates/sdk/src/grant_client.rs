@@ -503,11 +503,19 @@ impl Link {
             };
             if let Err(error) = transferred {
                 // A lost acceptance ACK can outlive its ephemeral upload scope.
-                // Recover the durable co-signature before reporting transfer failure.
+                // Recover the durable co-signature or a current policy refusal.
+                // Missing upload content is Malformed; preserve the transfer error
+                // in that case so an interrupted upload stays resumable.
                 let response = self.accept_existing(request.clone()).await?;
                 if matches!(
-                    response.outcome,
+                    &response.outcome,
                     Some(accept_work_response::Outcome::Accepted(_))
+                ) || matches!(
+                    &response.outcome,
+                    Some(accept_work_response::Outcome::Refused(refusal))
+                        if refusal.grant.as_ref()
+                            .and_then(|grant| GrantRefusalCode::try_from(grant.code).ok())
+                            .is_some_and(|code| code != GrantRefusalCode::Malformed)
                 ) {
                     return Ok(response);
                 }

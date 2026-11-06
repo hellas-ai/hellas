@@ -47,6 +47,8 @@ pub enum PaidProviderError {
     Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error("provider setup has no durable offer or its signing identity differs")]
     InvalidOffer,
+    #[error("channel journal has no recovered setup binding: {}", path.display())]
+    UnmatchedChannel { path: PathBuf },
     #[error("paid-work observer task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error(transparent)]
@@ -67,6 +69,8 @@ pub enum PaidProviderError {
     Endpoint(#[from] hellas_channel::work::EndpointError),
     #[error(transparent)]
     Setup(#[from] hellas_channel::model::setup::WorkSetupError),
+    #[error(transparent)]
+    SetupDrive(#[from] SetupDriveError),
     #[error(transparent)]
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]
@@ -699,6 +703,7 @@ enum Driven {
 /// Live acceptance and recovery use the same journaled running marker.
 struct DrivenChannel {
     service: WorkService,
+    origin: hellas_channel::work_store::SetupOrigin,
     descriptor: Option<WorkChannelDescriptor>,
     max_observation_age: Duration,
     driver: Option<AcceptedWorkDriver>,
@@ -706,6 +711,35 @@ struct DrivenChannel {
 }
 
 impl DrivenChannel {
+    async fn observe_origin<S: FinalizedBlocks + ?Sized>(
+        &self,
+        source: &S,
+    ) -> Result<(), PaidProviderError> {
+        if self
+            .service
+            .with_state(|state| state.origin_observed())
+            .await?
+        {
+            return Ok(());
+        }
+        let mut driver = self.service.drive()?;
+        let block = source.block_at(self.origin.height).await?.ok_or(
+            SetupDriveError::OriginUnreadable {
+                height: self.origin.height,
+            },
+        )?;
+        use hellas_channel::work_close::CloseChannel as _;
+        let mut store = driver.store().await?;
+        hellas_channel::work_open::observe_origin(
+            &mut store,
+            self.origin,
+            &block,
+            &Secp256k1Verifier::new(),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn refresh<S>(
         &self,
         source: &S,
@@ -715,6 +749,13 @@ impl DrivenChannel {
     where
         S: FinalizedBlocks + FinalizedWorkView + Sync,
     {
+        if !self
+            .service
+            .with_state(|state| state.origin_observed())
+            .await?
+        {
+            return Err(hellas_channel::work::EndpointError::NotAdmitting.into());
+        }
         let descriptor = self
             .descriptor
             .as_ref()
@@ -826,12 +867,29 @@ impl SetupClock {
             match step {
                 Ok(SetupAdvance { progress, mounted }) => {
                     if let Some(store) = mounted {
+                        let origin = match progress {
+                            SetupProgress::Complete(origin)
+                            | SetupProgress::CloseOnly { origin, .. } => origin,
+                            _ => {
+                                warn!(bond, "mounted channel has no verified setup origin");
+                                return false;
+                            }
+                        };
+
                         if let Some(peer) = self.route_peer
                             && let Err(error) = setup_mount.clear(peer, self.bond_edge)
                         {
                             warn!(%error, "setup could not be unmounted");
                         }
-                        self.take_mount(store, signer, &policy, work_mount).await;
+                        if let Err(error) = self
+                            .take_mount(store, signer, &policy, work_mount, origin)
+                            .await
+                        {
+                            warn!(bond, %error, "the mounted channel could not be bound");
+                            if !matches!(self.driven, Driven::Channel(_)) {
+                                self.driven = Driven::Done;
+                            }
+                        }
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -849,6 +907,12 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(channel) = &self.driven {
+            if let Err(error) = channel.observe_origin(source).await {
+                let _ = channel.service.suspend().await;
+                warn!(bond, %error, "the opening block is not yet verified");
+                return false;
+            }
+
             let started = hellas_channel::work::ObservationTime::now();
             let snapshot = match advance_paid_work_clock(&channel.service, source).await {
                 Ok(progress) => {
@@ -885,7 +949,8 @@ impl SetupClock {
         signer: &Secp256k1Signer,
         policy: &ProviderChannelPolicy,
         mount: &MountedWork,
-    ) {
+        origin: hellas_channel::work_store::SetupOrigin,
+    ) -> Result<(), PaidProviderError> {
         let bond = hex::encode(self.bond_edge.to_bytes());
         // Rebuild the descriptor from the retained policy and signed payment terms.
         let descriptor = {
@@ -898,42 +963,21 @@ impl SetupClock {
                 }
             }
         };
-        match CloseEndpoint::new(store, signer.clone()) {
-            Ok(close) => {
-                let service = WorkService::close_only(close);
-                if let Err(error) = service.require_observer().await {
-                    warn!(bond, %error, "channel observer could not be installed");
-                    self.driven = Driven::Done;
-                    return;
-                }
-                match self.route_peer {
-                    Some(peer) => match mount.mount(peer, &service).await {
-                        Ok(()) => {
-                            info!(bond, "this node now answers Work from its mounted channel")
-                        }
-                        Err(error) => {
-                            warn!(bond, %error, "channel is driven but could not be mounted")
-                        }
-                    },
-                    None => warn!(bond, "channel is driven without a peer route"),
-                }
-                self.driven = Driven::Channel(Box::new(DrivenChannel {
-                    node: mount.node.clone(),
-                    service,
-                    descriptor,
-                    max_observation_age: self.max_observation_age,
-                    driver: mount.driver.clone(),
-                }));
-            }
-            // The journal and the key are not both the provider's view
-            // of one channel. Nothing this runner can do about it, and
-            // dropping the mount is what stops it being reopened every
-            // tick.
-            Err(error) => {
-                warn!(bond, %error, "the mounted channel is not this node's to close");
-                self.driven = Driven::Done;
-            }
+        let service = WorkService::close_only(CloseEndpoint::new(store, signer.clone())?);
+        service.require_observer().await?;
+        self.driven = Driven::Channel(Box::new(DrivenChannel {
+            node: mount.node.clone(),
+            service: service.clone(),
+            origin,
+            descriptor,
+            max_observation_age: self.max_observation_age,
+            driver: mount.driver.clone(),
+        }));
+        match self.route_peer {
+            Some(peer) => mount.mount(peer, &service).await?,
+            None => warn!(bond, "channel is driven without a peer route"),
         }
+        Ok(())
     }
 }
 
@@ -964,8 +1008,8 @@ impl WorkRunner {
 
 impl WorkRunner {
     /// Discovers provider journals and mounts configured routes. Unrouted journals
-    /// are still driven through close. Unreadable journals are logged; failure to
-    /// enumerate the root is returned to the caller.
+    /// are still driven through close. Unreadable or unbound journals fail
+    /// startup before content recovery can permit collection.
     pub async fn discover(
         config: WorkRunnerConfig,
         work_mount: MountedWork,
@@ -980,6 +1024,30 @@ impl WorkRunner {
             })?;
         if !found.unidentified.is_empty() {
             return Err(PaidProviderError::InvalidOffer);
+        }
+        // Every initialized channel must be claimed before the global disk
+        // recovery barrier can permit collection or new reservations.
+        use hellas_channel::work_store::journal::{Journal, JournalKind};
+        let mut unmatched = BTreeMap::new();
+        for stem in Journal::stems(&config.journal_root)
+            .map_err(hellas_channel::work_store::WorkStoreError::from)?
+        {
+            if !stem.starts_with("channel-") {
+                continue;
+            }
+            let (identity, replay) = Journal::inspect(&config.journal_root, &stem)
+                .await
+                .map_err(hellas_channel::work_store::WorkStoreError::from)?;
+            if identity.kind != JournalKind::Channel
+                || stem != format!("channel-{}", hex::encode(identity.key))
+            {
+                return Err(PaidProviderError::UnmatchedChannel {
+                    path: Journal::path(&config.journal_root, &stem),
+                });
+            }
+            if replay.checkpoint.is_some() || !replay.records.is_empty() {
+                unmatched.insert(identity.key, Journal::path(&config.journal_root, &stem));
+            }
         }
         let mut clocks = Vec::new();
         let mut registry = BTreeMap::new();
@@ -996,11 +1064,43 @@ impl WorkRunner {
                 &Secp256k1Verifier::new(),
             )
             .await?;
-            let clock = Self::adopt_setup(&config, store, &setup_mount)?;
+            let recovered = match (
+                store.state().origin(),
+                store.state().close_descriptor(),
+                &setup_mount.3,
+            ) {
+                (Some(origin), Some(descriptor), Some(content)) => ChannelStore::recover(
+                    &config.journal_root,
+                    descriptor.channel().clone(),
+                    Role::Provider,
+                    content.clone(),
+                    &Secp256k1Verifier::new(),
+                )
+                .await?
+                .map(|store| (store, origin)),
+                _ => None,
+            };
+            let mut clock = Self::adopt_setup(&config, store, &setup_mount)?;
             if let Driven::Setup { service, .. } = &clock.driven {
                 registry.insert(setup.bond_edge, service.clone());
             }
+            if let Some((store, origin)) = recovered {
+                unmatched.remove(&ChannelStore::journal_key(store.state().channel()));
+                let policy = match &clock.driven {
+                    Driven::Setup { policy, .. } => policy.clone(),
+                    _ => unreachable!(),
+                };
+                clock
+                    .take_mount(store, &config.settlement_key, &policy, &work_mount, origin)
+                    .await?;
+                if let Some(peer) = clock.route_peer {
+                    setup_mount.clear(peer, clock.bond_edge)?;
+                }
+            }
             clocks.push(clock);
+        }
+        if let Some((_, path)) = unmatched.into_iter().next() {
+            return Err(PaidProviderError::UnmatchedChannel { path });
         }
         let (sender, adopt) = tokio::sync::mpsc::channel(16);
         Ok(Self {
@@ -1238,54 +1338,7 @@ impl NodeWorkRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{PaidFixture, signer};
-    use hellas_channel::model::work::{PaidJobAuthorizationV2, work_id};
-
-    /// One acceptance over the wire the way a provider's request path
-    /// performs it: the prepared input is uploaded first, then the
-    /// signed proposal is answered.
-    async fn accept_uploaded(
-        fixture: &PaidFixture,
-        service: &WorkService,
-        client: &hellas_channel::work::ClientEndpoint,
-        request: &hellas_rpc::pb::work::AcceptWorkRequest,
-    ) -> hellas_rpc::pb::work::AcceptWorkResponse {
-        let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
-        let id = work_id(fixture.ready.channel(), &authorization);
-        let bytes = client
-            .state()
-            .job_by_id(id)
-            .unwrap()
-            .prepared_input()
-            .to_vec();
-        let (wire, uploads) = hellas_channel::test_support::channel::input_uploads(
-            fixture.ready.channel(),
-            request,
-            &bytes,
-        );
-        let context = hellas_wire::TransportContext {
-            open_exporter: Some([7; 32]),
-            ..Default::default()
-        };
-        for mut upload in uploads {
-            upload.chunk_signature = signer(1)
-                .sign(hellas_channel::model::work::signing_hash(
-                    hellas_rpc::protocol::content_upload::chunk_digest(
-                        authorization.channel_id,
-                        id,
-                        authorization.input_content,
-                        upload.offset,
-                        &upload.chunk,
-                        &[7; 32],
-                    ),
-                ))
-                .as_bytes()
-                .to_vec();
-            let response = service.upload(&upload, &context).await.unwrap();
-            assert!(response.refused.is_none(), "{response:?}");
-        }
-        service.accept(&wire).await
-    }
+    use crate::test_support::{PaidFixture, accept_uploaded};
 
     /// Every durable acceptance is dispatched after a restart, not only
     /// a lone one. The running gate is the duplicate-execution barrier;
@@ -1297,7 +1350,13 @@ mod tests {
         let mut client = fixture.client().await;
         let mut accepted = Vec::new();
         for _ in 0..2 {
-            let request = client.propose(&fixture.proposal()).await.unwrap();
+            let request = client
+                .propose(
+                    &fixture.proposal(),
+                    &hellas_channel::test_support::channel::program_content().await,
+                )
+                .await
+                .unwrap();
             let response = accept_uploaded(&fixture, &service, &client, &request).await;
             accepted.push(client.accepted(&response).await.unwrap());
         }
@@ -1325,6 +1384,12 @@ mod tests {
         );
         let channel = DrivenChannel {
             service,
+            origin: hellas_channel::work_store::SetupOrigin {
+                payment_edge: fixture.ready.channel().payment_edge(),
+                height: 1,
+                payload: [1; 32],
+                parent: [0; 32],
+            },
             descriptor: Some(fixture.descriptor.clone()),
             max_observation_age: fixture.config.max_observation_age,
             driver: Some(driver),

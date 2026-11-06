@@ -1687,6 +1687,80 @@ async fn a_provider_with_no_finalized_block_is_not_ready() {
 }
 
 #[tokio::test]
+async fn expired_upload_returns_the_typed_refusal_and_preserves_the_signed_proposal() {
+    use hellas_channel::work_close::CloseChannel as _;
+    use hellas_store::content::{ContentStore as _, Cursor, Scope};
+    let client_root = temp();
+    let provider_root = temp();
+    let late = at_height(
+        store(provider_root.path(), Role::Provider).await,
+        deadlines().acceptance + 1,
+    )
+    .await;
+    let service = WorkService::new(ProviderEndpoint::new(ready(), late, provider()).unwrap());
+    let (client_transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let mut endpoint = client_endpoint(client_root.path()).await;
+    let content = endpoint.store().await.unwrap().content_store();
+    let result = propose_work(
+        client_transport,
+        &mut endpoint,
+        &proposal(1),
+        &hellas_channel::test_support::channel::program_content().await,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ProposeError::Refused {
+            refusal: WorkRefusal::Expired,
+            ..
+        })
+    ));
+    assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+    let job = endpoint.state().jobs().next().unwrap();
+    let id = job.work_id();
+    assert_eq!(job.phase(), JobPhase::HalfSigned);
+    assert_eq!(job.authorization().retention, hellas_rpc::Retention::Retain);
+    let signed = endpoint.resume_proposal(id).await.unwrap();
+    let pins = content
+        .pins(&Scope::Owner, "channel/", Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        pins.pins.len(),
+        1,
+        "the signed proposal still protects its exact share"
+    );
+    assert!(
+        pins.pins[0]
+            .0
+            .as_str()
+            .ends_with(&format!("/proposal/{id}"))
+    );
+    // Clear the resumed exchange through the same real expired provider, then
+    // reopen the journal to prove the refusal was durable without abandonment.
+    let response = service.accept(&signed).await;
+    assert!(matches!(
+        endpoint.accepted(&response).await,
+        Err(ProposeError::Refused {
+            refusal: WorkRefusal::Expired,
+            ..
+        })
+    ));
+    content.close().await;
+    drop(endpoint);
+    let mut reopened = client_endpoint(client_root.path()).await;
+    assert_eq!(reopened.state().job_book().pending_proposal(), None);
+    assert_eq!(
+        reopened.state().job_by_id(id).unwrap().phase(),
+        JobPhase::HalfSigned
+    );
+    assert_eq!(reopened.resume_proposal(id).await.unwrap(), signed);
+    serving.abort();
+    let _ = serving.await;
+}
+
+#[tokio::test]
 async fn an_authorization_past_its_acceptance_deadline_expires() {
     let root = temp();
     let late = at_height(

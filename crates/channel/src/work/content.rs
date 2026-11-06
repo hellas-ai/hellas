@@ -222,7 +222,16 @@ where
     .await;
     if let Err(error) = transferred {
         let response = client.accept_work(request.clone()).await?;
-        if matches!(response.outcome, Some(Outcome::Accepted(_))) {
+        // Preserve a fresh authority answer. Missing upload bytes may
+        // also produce Invalid, so that ambiguous refusal keeps the transfer error.
+        if matches!(&response.outcome, Some(Outcome::Accepted(_)))
+            || matches!(
+                &response.outcome,
+                Some(Outcome::Refused(refusal))
+                    if WorkRefusal::from_code(refusal.code)
+                        .is_some_and(|code| code != WorkRefusal::Invalid)
+            )
+        {
             return endpoint.client().await?.accepted(&response).await;
         }
         return Err(error.into());

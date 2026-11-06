@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture, signer};
-use hellas_channel::model::work::PrivateRecord as _;
 use hellas_channel::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
+use hellas_channel::work_close::CloseChannel as _;
 use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::services::work::{Work, WorkServer};
@@ -88,46 +88,7 @@ async fn accept_uploaded_fetch(
     client: &hellas_channel::work::ClientEndpoint,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
-    let authorization =
-        hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
-            .unwrap();
-    let work = hellas_channel::model::work::work_id(fixture.ready.channel(), &authorization);
-    let bytes = client
-        .state()
-        .job_by_id(work)
-        .unwrap()
-        .prepared_input()
-        .to_vec();
-    let (wire, uploads) = hellas_channel::test_support::channel::input_uploads(
-        fixture.ready.channel(),
-        request,
-        &bytes,
-    );
-    let context = hellas_wire::TransportContext {
-        open_exporter: Some([7; 32]),
-        ..Default::default()
-    };
-    let a = hellas_channel::model::work::PaidJobAuthorizationV2::decode(&request.authorization)
-        .unwrap();
-    let id = hellas_channel::model::work::work_id(fixture.ready.channel(), &a);
-    for mut upload in uploads {
-        upload.chunk_signature = signer(1)
-            .sign(hellas_channel::model::work::signing_hash(
-                hellas_rpc::protocol::content_upload::chunk_digest(
-                    a.channel_id,
-                    id,
-                    a.input_content,
-                    upload.offset,
-                    &upload.chunk,
-                    &[7; 32],
-                ),
-            ))
-            .as_bytes()
-            .to_vec();
-        let response = provider.upload(&upload, &context).await.unwrap();
-        assert!(response.refused.is_none(), "{response:?}");
-    }
-    provider.accept(&wire).await
+    crate::test_support::accept_uploaded(fixture, provider, client, request).await
 }
 
 #[tokio::test]
@@ -136,10 +97,22 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         let fixture = PaidFixture::new();
         let provider = fixture.provider().await;
         let mut client = fixture.client().await;
-        let request = client.propose(&fixture.proposal()).await.unwrap();
+        let request = client
+            .propose(
+                &fixture.proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
         let lost = client.accepted(&response).await.unwrap();
-        let request = client.propose(&fixture.proposal()).await.unwrap();
+        let request = client
+            .propose(
+                &fixture.proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
         let delivered = client.accepted(&response).await.unwrap();
         assert_ne!(lost, delivered);
@@ -172,8 +145,9 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         client.verified(delivered).await.unwrap();
         // Crash after verified delivery, before creating any payment certificate.
         assert!(client.state().last_payment().is_none());
-        drop(client);
         assert_no_payloads(fixture.root.path());
+        client.store().await.unwrap().content_store().close().await;
+        drop(client);
 
         let server = Endpoint::builder(presets::Minimal)
             .alpns(vec![Work::ALPN.as_bytes().to_vec()])
@@ -233,6 +207,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                         .is_some()
                 );
             }
+            let content = store.content_store();
             let client = ClientService::new(ClientEndpoint::recover(store, signer(1)).unwrap());
             client
                 .observer()
@@ -248,6 +223,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 .unwrap();
             let mut session = PaidWorkSession {
                 args: PaidWorkOptions {
+                    content,
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),
                     provider: crate::test_support::address(server.id()),
@@ -276,7 +252,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 session
                     .run(
                         None,
-                        &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                        &hellas_channel::test_support::channel::program_content().await,
                         true,
                         None
                     )
@@ -292,9 +268,11 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     .unwrap(),
                 PRICE
             );
+            assert_no_payloads(fixture.root.path());
+            session.shutdown().await;
+            session.args.content.close().await;
             drop(session);
             endpoint.close().await;
-            assert_no_payloads(fixture.root.path());
         }
         assert_eq!(backend.0.load(Ordering::SeqCst), 1);
         server.close().await;

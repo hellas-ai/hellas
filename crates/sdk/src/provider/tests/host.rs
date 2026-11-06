@@ -167,10 +167,12 @@ impl Host {
                         )
                         .await
                     {
-                        super::super::serve_loop(
+                        let _ = super::super::serve_loop(
                             transport,
                             server,
                             tokio::sync::watch::channel(false).1,
+                            crate::provider::RPC_CONNECTION_IDLE_TIMEOUT,
+                            tokio::time::Instant::now() + crate::provider::MAX_LIFETIME,
                         )
                         .await;
                     }

@@ -40,13 +40,13 @@ fn runner() -> PublicKey {
         .public_key()
 }
 
-#[test]
-fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
+#[tokio::test]
+async fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
     let directory = tempfile::tempdir().unwrap();
     let job = fetch();
     let folder = directory.path().join("job");
-    job.save(&folder).unwrap();
-    let loaded = Job::load(&folder).unwrap();
+    job.save(&folder).await.unwrap();
+    let loaded = Job::load(&folder).await.unwrap();
     assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
     assert_eq!(loaded.digest(), job.digest());
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
@@ -88,11 +88,11 @@ fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
         "a new purchase changes the actual signed input"
     );
     assert_ne!(nonce, loaded.purchase_nonce(Digest::from_bytes([8; 32]), 1));
-    job.save(&folder).unwrap();
+    job.save(&folder).await.unwrap();
 }
 
-#[test]
-fn malformed_job_documents_and_missing_files_are_refused() {
+#[tokio::test]
+async fn malformed_job_documents_and_missing_files_are_refused() {
     for change in [
         ("hellas.job.v1", "hellas.job.v2"),
         ("[payment]", "[payment]\nunknown = 1"),
@@ -105,7 +105,7 @@ fn malformed_job_documents_and_missing_files_are_refused() {
         ("hellas/fetch-0.0.2", "foreign/fetch"),
     ] {
         let directory = tempfile::tempdir().unwrap();
-        fetch().save(directory.path()).unwrap();
+        fetch().save(directory.path()).await.unwrap();
         let path = directory.path().join("job.toml");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -115,19 +115,19 @@ fn malformed_job_documents_and_missing_files_are_refused() {
         );
         std::fs::write(path, text.replace(change.0, change.1)).unwrap();
         assert!(
-            Job::load(directory.path()).is_err(),
+            Job::load(directory.path()).await.is_err(),
             "accepted mutation {change:?}"
         );
     }
 }
 
 #[cfg(unix)]
-#[test]
-fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
+#[tokio::test]
+async fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
     use std::os::unix::fs::symlink;
     let directory = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    fetch().save(directory.path()).unwrap();
+    fetch().save(directory.path()).await.unwrap();
     let payload = std::fs::read(directory.path().join("request.json")).unwrap();
     std::fs::write(outside.path().join("request.json"), &payload).unwrap();
     std::fs::remove_file(directory.path().join("request.json")).unwrap();
@@ -136,7 +136,7 @@ fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
         directory.path().join("request.json"),
     )
     .unwrap();
-    assert!(Job::load(directory.path()).is_err());
+    assert!(Job::load(directory.path()).await.is_err());
     std::fs::remove_file(directory.path().join("request.json")).unwrap();
     symlink(outside.path(), directory.path().join("link")).unwrap();
     let path = directory.path().join("job.toml");
@@ -144,21 +144,19 @@ fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
         .unwrap()
         .replace("request.json", "link/request.json");
     std::fs::write(path, text).unwrap();
-    assert!(Job::load(directory.path()).is_err());
+    assert!(Job::load(directory.path()).await.is_err());
 }
 
-#[test]
-fn compute_folder_round_trip_binds_environment_plan_and_price() {
+#[tokio::test]
+async fn compute_folder_round_trip_binds_environment_plan_and_price() {
     use hellas_channel::test_support::channel::{environment, plan, work_policy};
-    let content = || {
-        let mut content = EphemeralContent::default();
-        content.insert(environment().canonical_bytes().unwrap());
-        InvocationContent::Ephemeral(content)
-    };
-    let job = Job::compute(20, environment(), plan(), vec![], content()).unwrap();
+    let content = || hellas_channel::test_support::channel::program_content();
+    let job = Job::compute(20, environment(), plan(), vec![], content().await)
+        .await
+        .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    job.save(directory.path()).unwrap();
-    let loaded = Job::load(directory.path()).unwrap();
+    job.save(directory.path()).await.unwrap();
+    let loaded = Job::load(directory.path()).await.unwrap();
     assert_eq!(job.canonical_bytes(), loaded.canonical_bytes());
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     let prepared = loaded
@@ -172,18 +170,25 @@ fn compute_folder_round_trip_binds_environment_plan_and_price() {
     assert_eq!(prepared.request.runner_public_key, runner());
     assert_ne!(
         job.digest(),
-        Job::compute(21, environment(), plan(), vec![], content())
+        Job::compute(21, environment(), plan(), vec![], content().await)
+            .await
             .unwrap()
             .digest()
     );
 }
 
-#[test]
-fn compute_folder_preserves_provider_held_assets_without_uploading_them() {
+#[tokio::test]
+async fn compute_folder_preserves_provider_held_assets_without_uploading_them() {
     use compute::{Environment, NamedAsset};
-    let mut content = EphemeralContent::default();
-    let source = content.insert(b"self-contained source".to_vec());
-    let local = content.insert(b"caller-owned asset".to_vec());
+    let content = MemoryStore::new(Reservations::ram(
+        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+    ));
+    let source = hellas_channel::content::upload_object(&content, b"self-contained source")
+        .await
+        .unwrap();
+    let local = hellas_channel::content::upload_object(&content, b"caller-owned asset")
+        .await
+        .unwrap();
     let external = hellas_rpc::ContentRef::for_bytes(b"provider-held weights");
     let environment = Environment {
         sources: vec![source],
@@ -198,47 +203,62 @@ fn compute_folder_preserves_provider_held_assets_without_uploading_them() {
             },
         ],
     };
-    content.insert(environment.canonical_bytes().unwrap());
+    hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
+        .await
+        .unwrap();
     let job = Job::compute(
         20,
         environment,
         hellas_channel::test_support::channel::plan(),
         vec![],
-        InvocationContent::Ephemeral(content),
+        (LocalStore::Memory(content), Scope::Owner),
     )
+    .await
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    job.save(directory.path()).unwrap();
-    let loaded = Job::load(directory.path()).unwrap();
+    job.save(directory.path()).await.unwrap();
+    let loaded = Job::load(directory.path()).await.unwrap();
     assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
     assert_eq!(loaded.digest(), job.digest());
     let JobInput::Compute { content, .. } = loaded.input() else {
         panic!()
     };
     assert_eq!(
-        content.read(source).unwrap().as_slice(),
+        hellas_channel::content::read(&content.0, &content.1, source, source.bytes())
+            .await
+            .unwrap()
+            .as_ref(),
         b"self-contained source"
     );
     assert_eq!(
-        content.read(local).unwrap().as_slice(),
+        hellas_channel::content::read(&content.0, &content.1, local, local.bytes())
+            .await
+            .unwrap()
+            .as_ref(),
         b"caller-owned asset"
     );
     assert!(matches!(
-        content.read(external),
-        Err(hellas_channel::content::ContentError::Missing)
+        hellas_channel::content::read(&content.0, &content.1, external, external.bytes()).await,
+        Err(hellas_store::content::Error::Missing)
     ));
 }
 
-#[test]
-fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
+#[tokio::test]
+async fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
     use compute::{Environment, NamedAsset};
     let source = hellas_rpc::ContentRef::for_bytes(b"required source");
     for missing_source in [true, false] {
-        let mut content = EphemeralContent::default();
+        let content = MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ));
         if !missing_source {
-            content.insert(b"required source".to_vec());
+            hellas_channel::content::upload_object(&content, b"required source")
+                .await
+                .unwrap();
         }
-        let asset = content.insert(b"present asset".to_vec());
+        let asset = hellas_channel::content::upload_object(&content, b"present asset")
+            .await
+            .unwrap();
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
@@ -249,40 +269,49 @@ fn compute_folder_requires_sources_and_rejects_invalid_available_assets() {
                 ),
             }],
         };
-        content.insert(environment.canonical_bytes().unwrap());
+        hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
+            .await
+            .unwrap();
         let job = Job::compute(
             20,
             environment,
             hellas_channel::test_support::channel::plan(),
             vec![],
-            InvocationContent::Ephemeral(content),
+            (LocalStore::Memory(content), Scope::Owner),
         )
+        .await
         .unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let error = job.save(directory.path()).unwrap_err();
+        let error = job.save(directory.path()).await.unwrap_err();
         if missing_source {
             assert!(matches!(
                 error,
-                JobError::Content(hellas_channel::content::ContentError::Missing)
+                JobError::Content(hellas_store::content::Error::Missing)
             ));
         } else {
             assert!(matches!(
                 error,
-                JobError::Content(hellas_channel::content::ContentError::Hash)
+                JobError::Content(hellas_store::content::Error::Invalid(_))
             ));
         }
     }
 }
 
-#[test]
-fn large_compute_plan_folders_round_trip_with_bounded_documents() {
-    let mut content = EphemeralContent::default();
-    let source = content.insert(b"complete program".to_vec());
+#[tokio::test]
+async fn large_compute_plan_folders_round_trip_with_bounded_documents() {
+    let content = MemoryStore::new(Reservations::ram(
+        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+    ));
+    let source = hellas_channel::content::upload_object(&content, b"complete program")
+        .await
+        .unwrap();
     let environment = compute::Environment {
         sources: vec![source],
         assets: vec![],
     };
-    content.insert(environment.canonical_bytes().unwrap());
+    hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
+        .await
+        .unwrap();
     let plan = compute::Plan {
         calls: vec![compute::Call {
             entry: "many-arguments".into(),
@@ -297,19 +326,20 @@ fn large_compute_plan_folders_round_trip_with_bounded_documents() {
         environment,
         plan,
         vec![],
-        InvocationContent::Ephemeral(content),
+        (LocalStore::Memory(content), Scope::Owner),
     )
+    .await
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    job.save(directory.path()).unwrap();
+    job.save(directory.path()).await.unwrap();
     let path = directory.path().join("job.toml");
     assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024);
     assert_eq!(
-        Job::load(directory.path()).unwrap().canonical_bytes(),
+        Job::load(directory.path()).await.unwrap().canonical_bytes(),
         job.canonical_bytes()
     );
     std::fs::write(path, vec![b' '; MAX_DOCUMENT_BYTES + 1]).unwrap();
-    assert!(Job::load(directory.path()).is_err());
+    assert!(Job::load(directory.path()).await.is_err());
     let mut oversized = job.input().clone();
     let JobInput::Compute { plan, .. } = &mut oversized else {
         panic!()
@@ -317,7 +347,7 @@ fn large_compute_plan_folders_round_trip_with_bounded_documents() {
     plan.calls[0].args = vec![compute::Arg::U64(0); MAX_DOCUMENT_BYTES / 16];
     let oversized = Job::from_input(20, oversized).unwrap();
     let directory = tempfile::tempdir().unwrap();
-    assert!(oversized.save(directory.path()).is_err());
+    assert!(oversized.save(directory.path()).await.is_err());
     assert!(!directory.path().join("job.toml").exists());
 }
 
@@ -335,13 +365,16 @@ fn directory_reads_stay_with_the_selected_inode_after_its_name_is_replaced() {
     assert_eq!(held.read(Path::new("input"), 32).unwrap(), b"selected");
 }
 
-#[test]
-fn typed_job_price_must_round_trip_through_toml() {
+#[tokio::test]
+async fn typed_job_price_must_round_trip_through_toml() {
     assert!(Job::from_input(u64::MAX, fetch().input().clone()).is_err());
     let job = Job::from_input(i64::MAX as u64, fetch().input().clone()).unwrap();
     let directory = tempfile::tempdir().unwrap();
-    job.save(directory.path()).unwrap();
-    assert_eq!(Job::load(directory.path()).unwrap().digest(), job.digest());
+    job.save(directory.path()).await.unwrap();
+    assert_eq!(
+        Job::load(directory.path()).await.unwrap().digest(),
+        job.digest()
+    );
 }
 
 #[test]
@@ -389,13 +422,13 @@ fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
     );
 }
 
-#[test]
-fn grant_jobs_save_without_a_payment() {
+#[tokio::test]
+async fn grant_jobs_save_without_a_payment() {
     let source = fetch();
     let job = Job::from_input(0, source.input().clone()).unwrap();
     let root = tempfile::tempdir().unwrap();
-    job.save(root.path()).unwrap();
-    let loaded = Job::load(root.path()).unwrap();
+    job.save(root.path()).await.unwrap();
+    let loaded = Job::load(root.path()).await.unwrap();
     assert_eq!(loaded.price(), 0);
     assert_eq!(loaded.digest(), job.digest());
     assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());

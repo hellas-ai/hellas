@@ -125,6 +125,7 @@ impl Fixture {
             backend,
             vec![],
             clock.source(),
+            hellas_authority::test_support::content_store(&root.path().join("provider")).await,
         )
         .unwrap();
         let application =
@@ -198,7 +199,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             Some(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -337,7 +338,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 .run(
                     "responses",
                     f.input(),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &hellas_channel::test_support::channel::program_content().await,
                     None,
                     None,
                     None,
@@ -464,7 +465,7 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             None,
             None,
             None,
@@ -497,7 +498,7 @@ async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
                 .run(
                     "responses",
                     f.input(),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &hellas_channel::test_support::channel::program_content().await,
                     None,
                     None,
                     None,
@@ -526,7 +527,7 @@ async fn recovered_metadata_is_bound_to_the_requested_job_channel_and_provider()
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             None,
             None,
             None,

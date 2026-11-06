@@ -68,6 +68,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 identity,
                 enrollment,
                 root: root.clone(),
+                content: hellas_channel::test_support::channel::content_store(&state).await,
                 state_directory: state,
                 routes,
                 fetch_max_in_flight: 1,
@@ -196,7 +197,13 @@ fn mux_pair() -> (MuxTransport, MuxTransport) {
 async fn quiescing_finishes_an_active_response_before_closing_the_session() {
     let (client, server) = mux_pair();
     let (stop, stopping) = tokio::sync::watch::channel(false);
-    let serving = tokio::spawn(serve_loop(Arc::new(server), SlowStream, stopping));
+    let serving = tokio::spawn(serve_loop(
+        Arc::new(server),
+        SlowStream,
+        stopping,
+        RPC_CONNECTION_IDLE_TIMEOUT,
+        Instant::now() + MAX_LIFETIME,
+    ));
     let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
         &client,
         StreamResultRequest::default(),
@@ -211,7 +218,7 @@ async fn quiescing_finishes_an_active_response_before_closing_the_session() {
     assert!(response.next().await.unwrap().is_ok());
     assert!(response.next().await.is_none());
     response.finish().unwrap();
-    serving.await.unwrap();
+    serving.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -221,6 +228,8 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
         Arc::new(server),
         SlowStream,
         tokio::sync::watch::channel(false).1,
+        crate::provider::RPC_CONNECTION_IDLE_TIMEOUT,
+        tokio::time::Instant::now() + crate::provider::MAX_LIFETIME,
     ));
     for _ in 0..2 {
         let started = Instant::now();
@@ -240,7 +249,7 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
         assert!(!serving.is_finished());
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
-    serving.await.unwrap();
+    serving.await.unwrap().unwrap_err();
 }
 
 // This test only negotiates ALPNs; no upstream implementation is needed.
@@ -271,16 +280,25 @@ impl hellas_executor::FetchAdaptorFactory for ProbeRoute {
 use hellas_channel::test_support::test_responses_contract;
 
 #[test]
-fn work_is_the_only_execution_protocol_advertised() {
-    assert_eq!(served_alpns(false, false, false), [Node::ALPN.as_bytes()]);
+fn work_and_content_are_advertised_with_the_configured_control_services() {
+    use hellas_rpc::services::content::Content;
+    assert_eq!(
+        served_alpns(false, false, false),
+        [Node::ALPN.as_bytes(), Content::ALPN.as_bytes()]
+    );
     assert_eq!(
         served_alpns(false, true, false),
-        [Node::ALPN.as_bytes(), Work::ALPN.as_bytes()]
+        [
+            Node::ALPN.as_bytes(),
+            Content::ALPN.as_bytes(),
+            Work::ALPN.as_bytes()
+        ]
     );
     assert_eq!(
         served_alpns(false, true, true),
         [
             Node::ALPN.as_bytes(),
+            Content::ALPN.as_bytes(),
             Work::ALPN.as_bytes(),
             hellas_rpc::services::host_control::HostControl::ALPN.as_bytes()
         ]
@@ -293,6 +311,7 @@ fn work_is_the_only_execution_protocol_advertised() {
         served_alpns(true, false, false),
         [
             Node::ALPN.as_bytes(),
+            Content::ALPN.as_bytes(),
             hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes(),
             WorkSetup::ALPN.as_bytes(),
             Work::ALPN.as_bytes()
@@ -345,6 +364,8 @@ async fn cheap_streams_cannot_extend_the_connection_lifetime() {
         Arc::new(server),
         SlowStream,
         tokio::sync::watch::channel(false).1,
+        crate::provider::RPC_CONNECTION_IDLE_TIMEOUT,
+        tokio::time::Instant::now() + crate::provider::MAX_LIFETIME,
     ));
     let started = Instant::now();
     let max_lifetime = Duration::from_secs(15 * 60);
@@ -369,7 +390,7 @@ async fn cheap_streams_cannot_extend_the_connection_lifetime() {
             "repeated streams must not renew a connection forever"
         );
     }
-    serving.await.unwrap();
+    serving.await.unwrap().unwrap_err();
     assert!(started.elapsed() >= max_lifetime);
 }
 
@@ -380,6 +401,8 @@ async fn a_connection_without_a_first_stream_is_reaped() {
         Arc::new(server),
         SlowStream,
         tokio::sync::watch::channel(false).1,
+        crate::provider::RPC_CONNECTION_IDLE_TIMEOUT,
+        tokio::time::Instant::now() + crate::provider::MAX_LIFETIME,
     ));
     tokio::task::yield_now().await;
     tokio::time::advance(RPC_CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
@@ -390,5 +413,5 @@ async fn a_connection_without_a_first_stream_is_reaped() {
         serving.is_finished(),
         "no-stream connections release their slot on idle timeout"
     );
-    serving.await.unwrap();
+    serving.await.unwrap().unwrap_err();
 }

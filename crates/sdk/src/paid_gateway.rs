@@ -681,10 +681,14 @@ mod tests {
     use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
     use iroh::Endpoint;
 
-    fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
+    fn pool_options(
+        fixture: &crate::test_support::PaidFixture,
+        content: &hellas_store::content::DiskStore,
+    ) -> PaidGatewayOptions {
         PaidGatewayOptions {
             max_pending_requests: 4,
             providers: vec![PaidWorkOptions {
+                content: content.clone(),
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),
                 provider: crate::test_support::address(
@@ -705,16 +709,20 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     mod network;
 
-    #[test]
-    fn invalid_pool_options_are_refused_without_starting_a_gateway() {
+    #[tokio::test]
+    async fn invalid_pool_options_are_refused_without_starting_a_gateway() {
         let fixture = crate::test_support::PaidFixture::new();
-        assert!(pool_options(&fixture).validate().is_ok());
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        assert!(pool_options(&fixture, &content).validate().is_ok());
 
-        let mut zero = pool_options(&fixture);
+        let mut zero = pool_options(&fixture, &content);
         zero.max_pending_requests = 0;
         assert!(matches!(zero.validate(), Err(PoolError::Invalid(_))));
 
-        let mut duplicate = pool_options(&fixture);
+        let mut duplicate = pool_options(&fixture, &content);
         let mut second = duplicate.providers[0].clone();
         second.journal_root = fixture.root.path().join("second");
         duplicate.providers.push(second);
@@ -723,7 +731,7 @@ mod tests {
             Err(PoolError::DuplicateProvider(_))
         ));
 
-        let mut shared = pool_options(&fixture);
+        let mut shared = pool_options(&fixture, &content);
         let mut other = shared.providers[0].clone();
         other.journal_root = fixture.root.path().join("other");
         other.provider =
@@ -736,7 +744,11 @@ mod tests {
         fixture: &crate::test_support::PaidFixture,
         policy: ProviderChannelPolicy,
     ) -> PaidPool {
-        let args = pool_options(fixture).providers.remove(0);
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        let args = pool_options(fixture, &content).providers.remove(0);
         PaidPool {
             funding: Default::default(),
             owner: Arc::new(
@@ -860,7 +872,11 @@ mod tests {
     #[tokio::test]
     async fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
         let fixture = crate::test_support::PaidFixture::new();
-        let options = pool_options(&fixture);
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        let options = pool_options(&fixture, &content);
         let provider = &options.providers[0];
         assert!(!has_retained_setup(provider).await.unwrap());
         std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
@@ -910,7 +926,11 @@ mod tests {
     #[tokio::test]
     async fn shared_pool_rejects_reused_journal_before_opening_or_writing() {
         let fixture = crate::test_support::PaidFixture::new();
-        let mut options = pool_options(&fixture);
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        let mut options = pool_options(&fixture, &content);
         let mut second = options.providers[0].clone();
         second.provider =
             crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());

@@ -88,6 +88,7 @@ impl NodeControl {
             content: self.content.clone(),
             session: Arc::new(session),
             binding,
+            failed: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -377,18 +378,23 @@ where
     <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
 {
     let (_quiesce, quiescing) = tokio::sync::watch::channel(false);
-    tokio::time::timeout_at(
-        deadline,
-        crate::provider::serve_loop(
-            Arc::new(transport),
-            server,
-            quiescing,
-            IDLE_TIMEOUT,
+    let mut failed = server.failed.subscribe();
+    tokio::select! {
+        biased;
+        failure = failed.wait_for(Option::is_some) => {
+            Err(failure.ok().and_then(|status| status.clone()).unwrap_or_else(denied))
+        }
+        result = tokio::time::timeout_at(
             deadline,
-        ),
-    )
-    .await
-    .map_err(|_| denied())?
+            crate::provider::serve_loop(
+                Arc::new(transport),
+                server,
+                quiescing,
+                IDLE_TIMEOUT,
+                deadline,
+            ),
+        ) => result.map_err(|_| denied())?,
+    }
 }
 
 fn checked_transport(connection: Connection) -> Result<IrohTransport, WireStatus> {
@@ -418,6 +424,7 @@ struct ControlSession {
     content: Option<hellas_store::content::DiskStore>,
     session: Arc<AuthenticatedSession>,
     binding: Digest,
+    failed: tokio::sync::watch::Sender<Option<WireStatus>>,
 }
 impl ControlSession {
     async fn caller(&self) -> Result<&AuthenticatedCaller, WireStatus> {

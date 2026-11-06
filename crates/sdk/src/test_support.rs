@@ -269,8 +269,10 @@ impl PaidFixture {
         } else {
             "provider"
         };
-        ChannelStore::open(
-            &self.root.path().join(name),
+        let root = self.root.path().join(name);
+        let content = hellas_channel::test_support::channel::content_store(&root).await;
+        let store = ChannelStore::open(
+            &root,
             self.ready.channel().clone(),
             work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
             role,
@@ -280,11 +282,13 @@ impl PaidFixture {
                 payload: [1; 32],
                 parent: [0; 32],
             },
-            hellas_store::ContentStore::new(),
+            content.clone(),
             &Secp256k1Verifier::new(),
         )
         .await
-        .unwrap()
+        .unwrap();
+        content.finish_recovery().await.unwrap();
+        store
     }
 
     pub async fn client(&self) -> ClientEndpoint {
@@ -394,3 +398,95 @@ fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
 }
 
 use hellas_channel::test_support::test_responses_contract;
+
+/// Exercise the actual generic upload path before reference-only acceptance.
+pub async fn accept_uploaded(
+    fixture: &PaidFixture,
+    service: &hellas_channel::work::WorkService,
+    client: &hellas_channel::work::ClientEndpoint,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    use hellas_channel::model::work::{
+        PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id,
+    };
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(fixture.ready.channel(), &authorization);
+    let bytes = client.state().job_by_id(id).unwrap().prepared_input();
+    let (wire, mut frames) = hellas_channel::test_support::channel::input_uploads(
+        fixture.ready.channel(),
+        request,
+        bytes,
+    );
+    if let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &mut frames[0].part {
+        let opening = open.work.as_mut().unwrap();
+        opening.binding_signature = signer(1)
+            .sign(signing_hash(hellas_channel::job::opening_digest(
+                opening, &[7; 32],
+            )))
+            .as_bytes()
+            .to_vec();
+    }
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let _stop = hellas_channel::work::admission::CancelOnFailure(vec![connection.clone()]);
+    upload_frames(frames, async |requests| {
+        service
+            .upload_stream(
+                requests,
+                hellas_wire::TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                connection.clone(),
+            )
+            .await
+    })
+    .await
+    .expect("fresh positive acceptance completes its content upload");
+    let response = service.accept(&wire).await;
+    connection.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while service.content_upload_count().unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    response
+}
+
+/// Drive one real generic stream, respecting complete-on-Open for cached objects.
+pub async fn upload_frames(
+    frames: Vec<hellas_rpc::pb::content::UploadRequest>,
+    open: impl AsyncFnOnce(
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<
+                            hellas_rpc::pb::content::UploadRequest,
+                            hellas_wire::WireStatus,
+                        >,
+                    > + Send,
+            >,
+        >,
+    ) -> Result<
+        hellas_rpc::call::ResponseStream<hellas_rpc::pb::content::UploadResponse>,
+        hellas_wire::WireStatus,
+    >,
+) -> Result<(), hellas_wire::WireStatus> {
+    use futures::StreamExt as _;
+    use hellas_rpc::pb::content::upload_request::Part;
+    let mut frames = frames.into_iter();
+    let (send, receive) = futures::channel::mpsc::unbounded();
+    send.unbounded_send(Ok(frames.next().unwrap())).unwrap();
+    let mut replies = open(Box::pin(receive)).await?;
+    loop {
+        let reply = replies.next().await.expect("one answer per sent frame")?;
+        match frames.find(|frame| !reply.complete || matches!(frame.part, Some(Part::Open(_)))) {
+            Some(frame) => send.unbounded_send(Ok(frame)).unwrap(),
+            None => {
+                drop(send);
+                return hellas_channel::test_support::drive_upload(Ok(replies)).await;
+            }
+        }
+    }
+}

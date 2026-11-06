@@ -10,11 +10,14 @@ use tokio::net::UdpSocket;
 
 const PROGRESS: Duration = Duration::from_secs(5);
 
-async fn provider() -> ProviderHandle {
+async fn provider() -> (tempfile::TempDir, ProviderHandle) {
+    let root = tempfile::tempdir().unwrap();
+    let content = hellas_authority::test_support::content_store(root.path()).await;
     let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
     let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
     let signer = Arc::new(signer);
-    start_fetch_provider(ProviderOptions {
+    let handle = start_fetch_provider(ProviderOptions {
+        content,
         executor: ExecutorSpawnConfig::new(
             signer.clone(),
             Assurance::ProducerSigned,
@@ -30,7 +33,8 @@ async fn provider() -> ProviderHandle {
         open_identity: Arc::new(ProviderOpen::<UnusedRoot>::new(signer, enrollment, None).unwrap()),
     })
     .await
-    .unwrap()
+    .unwrap();
+    (root, handle)
 }
 
 fn socket(provider: &ProviderHandle) -> SocketAddr {
@@ -138,7 +142,7 @@ impl PausedHandshake {
 
 #[tokio::test]
 async fn stalled_handshake_does_not_block_another_client() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let client = endpoint().await;
     let mut paused = PausedHandshake::new(&provider, Ipv4Addr::LOCALHOST).await;
     let slow = {
@@ -178,7 +182,7 @@ async fn stalled_handshake_does_not_block_another_client() {
 
 #[tokio::test]
 async fn completed_session_does_not_cancel_another_handshake() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let client = endpoint().await;
     let target = EndpointAddr::new(provider.node_id()).with_ip_addr(socket(&provider));
     let first = client
@@ -245,7 +249,7 @@ async fn connect(provider: &ProviderHandle, client: &Endpoint) -> Result<Connect
 async fn local_processes_are_not_held_to_the_per_ip_cap() {
     // Per-IP and per-subnet caps bound remote peers (see hellas_wire::admission
     // tests); several local tools reaching their own node share loopback.
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let mut local = Vec::new();
     for _ in 0..crate::transport_admission::PER_IP + 2 {
         let endpoint = endpoint().await;
@@ -263,7 +267,7 @@ async fn local_processes_are_not_held_to_the_per_ip_cap() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn held_connections_from_one_identity_are_capped_across_source_ips() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let key = iroh::SecretKey::from_bytes(&[77; 32]);
     let mut attackers = Vec::new();
     for host in 1..=4 {

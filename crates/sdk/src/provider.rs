@@ -886,6 +886,7 @@ where
             }
             Some(Err(_)) => {
                 debug!("provider transport ended");
+                result = Err(WireStatus::new(WireCode::Unavailable, "connection ended"));
                 break;
             }
             None => break,

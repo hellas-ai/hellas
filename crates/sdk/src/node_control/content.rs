@@ -28,7 +28,8 @@ where
 {
     type Error = TransportError;
     async fn dispatch(&self, mut inbound: Inbound<T::Stream>) -> Result<(), Self::Error> {
-        if self.caller().await.is_err() {
+        if let Err(status) = self.caller().await {
+            self.failed.send_replace(Some(status));
             use hellas_wire::Stream;
             inbound.stream.reset(WireCode::PermissionDenied);
             return Err(TransportError::Protocol(
