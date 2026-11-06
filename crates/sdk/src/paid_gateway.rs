@@ -158,6 +158,9 @@ async fn provider_policy<
 impl PaidGateway {
     /// Open a reusable pool. Funding, recovery, queueing and payment are shared
     /// by CLI and embedding applications. Call `drain` during host shutdown.
+    /// Configured provider roots must cover the full journal census of each
+    /// supplied unready content store. A host sharing that upper with other
+    /// roots must recover those first: opening this pool completes its barrier.
     pub async fn open(
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
@@ -166,6 +169,7 @@ impl PaidGateway {
         Self::open_with_funding(options, identity, owner, Default::default()).await
     }
 
+    /// Uses the same complete content-recovery census contract as `open`.
     pub async fn open_with_funding(
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
@@ -175,6 +179,22 @@ impl PaidGateway {
         options.validate()?;
         for provider in &options.providers {
             provider.config.clone().validate()?;
+        }
+        // Restore every configured root before any shared upper opens admission.
+        for provider in &options.providers {
+            crate::paid_client::recover_content(
+                &provider.journal_root,
+                provider.config.chain.network,
+                &provider.content,
+            )
+            .await?;
+        }
+        for provider in &options.providers {
+            provider
+                .content
+                .finish_recovery()
+                .await
+                .map_err(hellas_channel::work_store::WorkStoreError::from)?;
         }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;

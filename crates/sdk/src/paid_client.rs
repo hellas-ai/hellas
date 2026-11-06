@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
+mod content;
 mod error;
 mod funding;
 pub(crate) mod offer;
 mod settlement;
+pub use content::recover_content;
 pub use error::PaidClientError;
 pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
 pub use offer::{PaidQuote, request_paid_quote};

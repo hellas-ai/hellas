@@ -2536,6 +2536,48 @@ impl OfferFixture {
         }
     }
 
+    async fn write_completed_client_setup(self, root: &Path) {
+        let verifier = Secp256k1Verifier::new();
+        let mut store =
+            SetupStore::open(root, network(), self.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
+        let one = self.proposed();
+        let two = self.countersigned(one.clone());
+        let three = self.completed(two.clone());
+        let mut offer = recorded_offer(
+            one,
+            first_route_peer(),
+            self.payment_funding(),
+            provider_policy(),
+        );
+        if let SetupRecord::Offer { floor, .. } = &mut offer {
+            *floor = None;
+        }
+        for record in [
+            offer,
+            SetupRecord::ScanArmed {
+                height: FLOOR,
+                payload: payload_at(FLOOR),
+            },
+            SetupRecord::ArmedBundle {
+                bundle: two.encode(),
+                close_descriptor: Box::new(self.descriptor()),
+            },
+            SetupRecord::Bundle {
+                bundle: three.encode(),
+            },
+            SetupRecord::Complete {
+                payment_edge: self.payment_edge(),
+                origin_height: ORIGIN,
+                origin_payload: payload_at(ORIGIN),
+                origin_parent: payload_at(ORIGIN - 1),
+            },
+        ] {
+            store.commit(record, &verifier).await.unwrap();
+        }
+    }
+
     fn prepared_bundle(self) -> PreparedInvocation {
         hellas_channel::test_support::channel::bundle(self.client_seed)
     }
@@ -4899,6 +4941,180 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     assert!(matches!(
         recovered,
         Err(crate::paid_provider::PaidProviderError::UnmatchedChannel { .. })
+    ));
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    node.close().await;
+}
+
+#[tokio::test]
+async fn offline_client_roots_restore_all_half_signed_obligations_before_collection() {
+    use hellas_store::content::{
+        ContentStore as _, Cursor, DiskStore, IndexMode, Reservations, Scope,
+    };
+    let root = temp();
+    let paths = [
+        root.path().join("client-one"),
+        root.path().join("client-two"),
+    ];
+    let offers = [OfferFixture::first(), OfferFixture::second()];
+    let node = DiskStore::open(
+        root.path().join("shared-content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
+    node.finish_recovery().await.unwrap();
+    let verifier = Secp256k1Verifier::new();
+    for (offer, path) in offers.into_iter().zip(&paths) {
+        offer.write_completed_client_setup(path).await;
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
+        let origin = setup.state().origin().unwrap();
+        drop(setup);
+        let mut journal = ChannelStore::open(
+            path,
+            offer.descriptor().channel().clone(),
+            offer
+                .descriptor()
+                .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
+                .unwrap(),
+            Role::Client,
+            origin,
+            node.clone(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let authorization = offer.authorization();
+        assert_eq!(authorization.retention, hellas_rpc::Retention::Retain);
+        let input = offer.prepared_bundle().canonical_bytes().unwrap();
+        hellas_channel::test_support::channel::seed_content(
+            &mut journal,
+            authorization,
+            input.clone().into(),
+        )
+        .await;
+        let work = work_id(journal.state().channel(), &authorization);
+        journal
+            .commit(
+                ChannelRecord::JobProposed {
+                    authorization,
+                    client_signature: offer.client().sign(signing_hash(work)),
+                    prepared_input: input.into(),
+                    retained_tree: None,
+                },
+                &verifier,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.state().job_by_id(work).unwrap().phase(),
+            hellas_channel::work_store::JobPhase::HalfSigned
+        );
+    }
+    let before = node.stats().unwrap().outstanding;
+    assert!(before > 0);
+    node.close().await;
+    drop(node);
+    let node = DiskStore::open(
+        root.path().join("shared-content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
+    assert_eq!(node.stats().unwrap().outstanding, 0);
+    for (index, path) in paths.iter().enumerate() {
+        crate::paid_client::recover_content(path, network(), &node)
+            .await
+            .unwrap();
+        assert!(node.collect(&Scope::Owner).await.is_err());
+        assert_eq!(
+            node.stats().unwrap().outstanding,
+            before / 2 * (index as u64 + 1)
+        );
+    }
+    assert_eq!(
+        node.pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .len(),
+        2
+    );
+    node.finish_recovery().await.unwrap();
+    assert_eq!(node.collect(&Scope::Owner).await.unwrap().bytes, 0);
+    // Offline handles are gone. Canonical online reopening reuses reservations
+    // rather than doubling them; no chain source was contacted to reach this gate.
+    for (offer, path) in offers.into_iter().zip(&paths) {
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
+        let journal = ChannelStore::open_existing(
+            path,
+            offer.descriptor().channel().clone(),
+            offer
+                .descriptor()
+                .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
+                .unwrap(),
+            Role::Client,
+            setup.state().origin().unwrap(),
+            node.clone(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.stats().unwrap().outstanding, before);
+        drop(journal);
+        drop(setup);
+    }
+    node.close().await;
+    drop(node);
+    let orphan = OfferFixture {
+        client_seed: 0x25,
+        bond_coin: 0xa3,
+        payment_coin: 0xb3,
+    };
+    let node = DiskStore::open(
+        root.path().join("shared-content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
+    let journal = ChannelStore::open(
+        &paths[1],
+        orphan.descriptor().channel().clone(),
+        orphan.descriptor().expected_settlement().unwrap(),
+        Role::Client,
+        hellas_channel::work_store::SetupOrigin {
+            payment_edge: orphan.payment_edge(),
+            height: ORIGIN,
+            payload: payload_at(ORIGIN),
+            parent: payload_at(ORIGIN - 1),
+        },
+        node.clone(),
+        &verifier,
+    )
+    .await
+    .unwrap();
+    drop(journal);
+    crate::paid_client::recover_content(&paths[0], network(), &node)
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::paid_client::recover_content(&paths[1], network(), &node).await,
+        Err(crate::paid_client::PaidClientError::UnmatchedChannel { .. })
     ));
     assert!(node.collect(&Scope::Owner).await.is_err());
     node.close().await;
