@@ -207,7 +207,7 @@ impl ChannelRecord {
                     ChannelStateError::Malformed,
                     take_content,
                 )?,
-                prepared_input: cursor.rest().to_vec(),
+                prepared_input: bytes::Bytes::copy_from_slice(cursor.rest()),
             },
             tag::ACCEPTED => Self::JobAccepted {
                 work_id: digest(&mut cursor)?,
@@ -230,7 +230,7 @@ impl ChannelRecord {
                     ChannelStateError::Malformed,
                     take_content,
                 )?,
-                transcript: cursor.rest().to_vec(),
+                transcript: bytes::Bytes::copy_from_slice(cursor.rest()),
             },
             tag::PLAINTEXT => Self::PlaintextReleased {
                 work_id: digest(&mut cursor)?,
@@ -626,8 +626,14 @@ impl Channel<PaymentFunding> {
                 provider_signature,
                 phase,
                 result,
-                prepared_input: take_bytes(&mut cursor, ChannelStateError::Malformed)?.to_vec(),
-                transcript: take_bytes(&mut cursor, ChannelStateError::Malformed)?.to_vec(),
+                prepared_input: bytes::Bytes::copy_from_slice(take_bytes(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                )?),
+                transcript: bytes::Bytes::copy_from_slice(take_bytes(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                )?),
             };
             if jobs.insert(work_id, job).is_some() {
                 return Err(ChannelStateError::Malformed);

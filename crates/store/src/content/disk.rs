@@ -99,6 +99,19 @@ impl Disk {
         hellas_private::sync_directory(&root)?;
         let records = Arc::new(Records::default());
         let _ = records.load(&root.join("fastresume.bin"));
+        let cleanup = root.clone();
+        tokio::task::spawn_blocking(move || {
+            for entry in fs::read_dir(cleanup.join("staging"))? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+            hellas_private::sync_directory(&cleanup.join("staging"))?;
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
         let used = Self::owned_bytes(&root)?;
         Ok(Arc::new(Self {
             quota: Reservations::disk(root.clone(), capacity, used),
@@ -577,13 +590,14 @@ impl DiskStore {
     /// and outstanding output reservations. Admission and collection share it.
     pub async fn finish_recovery(&self) -> Result<()> {
         let disk = self.core.disk.as_ref().unwrap().clone();
-        if disk.ready() {
-            return Ok(());
-        }
         let gate = self.core.gate.clone().lock_owned().await;
         let live = self.core.live_jobs()?;
+        let core = self.core.clone();
         tokio::task::spawn_blocking(move || {
             let _gate = gate;
+            if disk.ready() {
+                return Ok(());
+            }
             // Root-level temporaries are incomplete. Keep only job directories
             // restored by the host; journaled roots are protected before this gate.
             for entry in fs::read_dir(disk.root.join("staging"))? {
@@ -600,11 +614,26 @@ impl DiskStore {
             }
             hellas_private::sync_directory(&disk.root.join("staging"))?;
             disk.quota.reconcile_used(Disk::owned_bytes(&disk.root)?);
-            disk.recovered.store(true, Ordering::Release);
-            Ok::<_, Error>(())
+            // All journal roots and obligations now exist. Keep admission behind
+            // this held gate while reclaiming only the cache needed to fit them.
+            let result = (|| {
+                while disk.quota.check().is_err() {
+                    if core.collect_unpinned(&Scope::Owner, true)?.objects == 0 {
+                        return Err(Error::Capacity);
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_ok() {
+                disk.recovered.store(true, Ordering::Release);
+            }
+            result
         })
         .await
         .map_err(|_| Error::Invalid("staging cleanup worker"))?
+    }
+    pub fn ram_pool(&self) -> Reservations {
+        self.core.pool.clone()
     }
     pub fn stats(&self) -> Result<StoreStats> {
         self.core.disk.as_ref().unwrap().quota.stats()
@@ -664,6 +693,18 @@ impl DiskStore {
             .effect(&Scope::Owner, move |core| core.end_work(&scope))
             .await
     }
+    /// Restore journal-derived output accounting before the host opens recovery.
+    /// `consumed` counts authoritative generated metadata already owned on disk.
+    pub async fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
+        let scope = scope.clone();
+        self.core
+            .access(&scope.clone(), move |core| {
+                core.restore_output(&scope, total, consumed)
+            })
+            .await
+    }
+    /// Set the job's total output allowance. A retry does not replenish bytes
+    /// already consumed by staged trees or a transcript.
     pub async fn reserve_output(&self, scope: &Scope, bytes: u64) -> Result<()> {
         let scope = scope.clone();
         self.core
@@ -859,5 +900,11 @@ impl DiskStore {
                 core.verified(&scope, object, None, true)
             })
             .await
+    }
+}
+
+impl std::fmt::Debug for DiskStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiskStore")
     }
 }

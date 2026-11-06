@@ -154,6 +154,7 @@ async fn concurrent_objects_are_refused_and_cancellation_owns_the_stream() {
 async fn a_work_opening_uses_one_upload_stream_for_multiple_objects() {
     let fixture = Fixture::new(BTreeMap::new(), Mode::Good);
     let store = remote(fixture.clone()).with_opening(hellas_rpc::pb::content::WorkOpening {
+        binding_signature: vec![],
         signed_opening: vec![1],
         manifest: vec![2],
         root: Some(support::reference(ContentRef::for_bytes(b"root"))),

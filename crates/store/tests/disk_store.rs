@@ -638,3 +638,52 @@ async fn implicit_job_reads_and_missing_use_full_pin_references_while_gc_marks_i
     scope.end().await.unwrap();
     node.close().await;
 }
+
+#[tokio::test]
+async fn a_retired_ram_upper_scope_cannot_read_the_replacement_upper_for_the_same_job() {
+    let root = tempfile::tempdir().unwrap();
+    let node = open(root.path().into(), vec![], IndexMode::Resume, None).await;
+    node.finish_recovery().await.unwrap();
+    let data = b"scope-owned input";
+    let object = ContentRef::for_bytes(data);
+    let first = JobContent::new(&node, job(), vec![object], object.bytes())
+        .await
+        .unwrap();
+    let old_scope = first.scope().clone();
+    fill(
+        first
+            .store()
+            .upload(&old_scope, object, None)
+            .await
+            .unwrap(),
+        data,
+    )
+    .await;
+    first.end().await.unwrap();
+    let replacement = JobContent::new(&node, job(), vec![object], object.bytes())
+        .await
+        .unwrap();
+    let scope = replacement.scope().clone();
+    fill(
+        replacement
+            .store()
+            .upload(&scope, object, None)
+            .await
+            .unwrap(),
+        data,
+    )
+    .await;
+    let local = LocalStore::Job(replacement.clone());
+    assert!(matches!(
+        local.open_verified(&old_scope, object, None).await,
+        Err(Error::Denied)
+    ));
+    assert!(
+        local
+            .open_verified(&scope, object, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    replacement.end().await.unwrap();
+}

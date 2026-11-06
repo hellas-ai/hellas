@@ -123,13 +123,13 @@ mod stream;
 use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
-mod upload;
+mod content;
+use content::content_refusal;
 use hellas_rpc::protocol::content::{decode_reference, encode_reference};
 use hellas_rpc::{ContentId, ContentRef};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use upload::content_refusal;
 
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
@@ -640,6 +640,11 @@ impl ProviderEndpoint {
     /// [`EndpointError::NotAdmitting`] when readiness is unavailable,
     /// and [`EndpointError::ObservationStale`]
     /// while awaiting fresh finalized progress.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fixture_store(&mut self) -> &mut ChannelStore {
+        &mut self.close.store
+    }
+
     fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
         let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
         if let Some(observation) = &self.observation {
@@ -762,18 +767,8 @@ impl ProviderEndpoint {
 
     async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
-        self.close.store.gc_uploads()?;
+        self.close.store.reconcile_content().await?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
-            if let Some(job) = self.state().job_by_id(work_id) {
-                let bytes = job.prepared_input().to_vec();
-                if !bytes.is_empty() {
-                    self.close
-                        .store
-                        .uploads
-                        .publish_accepted(work_id, &bytes, authorization.retention)
-                        .map_err(content_refusal)?;
-                }
-            }
             return Ok((work_id, retained));
         }
         let ready = self
@@ -807,12 +802,7 @@ impl ProviderEndpoint {
                 "input reference differs from the signed proposal",
             ));
         }
-        let prepared_input = self
-            .close
-            .store
-            .uploads
-            .read(work_id, reference, authorization.retention)
-            .map_err(content_refusal)?;
+        let prepared_input = self.close.store.read_content(work_id, reference).await?;
         let bundle = PreparedInvocation::from_canonical_bytes(
             &prepared_input,
             crate::content::MAX_CONTENT_BYTES,
@@ -823,21 +813,49 @@ impl ProviderEndpoint {
         let manifest = bundle
             .manifest()
             .map_err(|error| Refusal::invalid(error.to_string()))?;
-        let root = self
-            .close
-            .store
-            .uploads
-            .root(work_id, manifest.root(), authorization.retention)
-            .map_err(content_refusal)?;
+        let (store, scope) = self.close.store.invocation_content(work_id)?;
+        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+            bytes::Bytes::new()
+        } else {
+            let hellas_store::content::ScopeKind::Work { closure, .. } = &scope.kind else {
+                return Err(content_refusal(hellas_store::content::Error::Denied));
+            };
+            let root = *closure
+                .iter()
+                .find(|object| object.id() == manifest.root())
+                .ok_or_else(|| content_refusal(hellas_store::content::Error::Missing))?;
+            self.close.store.read_content(work_id, root).await?
+        };
         let objects =
             crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
-        let content = self
-            .close
-            .store
-            .uploads
-            .invocation_content(work_id, &objects, authorization.retention)
-            .map_err(content_refusal)?;
-
+        for object in &objects {
+            if self
+                .close
+                .store
+                .open_content_reader(work_id, *object)
+                .await?
+                .is_none()
+            {
+                return Err(content_refusal(hellas_store::content::Error::Missing));
+            }
+        }
+        if authorization.retention == hellas_rpc::Retention::Retain {
+            let facts =
+                crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
+            self.close
+                .store
+                .reserve_retained(work_id, facts.max_spool_bytes)
+                .await?;
+        }
+        if self
+            .state()
+            .job_by_id(work_id)
+            .is_some_and(|job| job.prepared_input().is_empty())
+        {
+            self.close
+                .store
+                .reattach_input(work_id, prepared_input.clone())?;
+        }
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
         self.close
@@ -854,7 +872,6 @@ impl ProviderEndpoint {
             )
             .await?;
 
-        self.close.store.remember_content(work_id, content);
         let signature = self.close.signer.sign(signing_hash(work_id));
         self.close
             .store
@@ -868,11 +885,12 @@ impl ProviderEndpoint {
                 &Secp256k1Verifier::new(),
             )
             .await?;
-        self.close
-            .store
-            .uploads
-            .publish_accepted(work_id, &prepared_input, authorization.retention)
-            .map_err(content_refusal)?;
+        if let hellas_store::content::LocalStore::Job(job) = &store {
+            job.store()
+                .accept_work(&scope)
+                .await
+                .map_err(content_refusal)?;
+        }
         Ok((work_id, signature))
     }
 
@@ -990,9 +1008,7 @@ impl ProviderEndpoint {
             bundle,
             facts.limits,
             facts.capacity_domain,
-            self.close
-                .store
-                .invocation_content(work_id, ready.invocation_policy())?,
+            self.close.store.invocation_content(work_id)?,
             WorkAdmission::payment(),
         )));
 
@@ -1092,7 +1108,7 @@ impl ProviderEndpoint {
                     work_id,
                     result,
                     provider_signature: signature,
-                    transcript: spool,
+                    transcript: spool.into(),
 
                     retained_tree: None,
                 },
@@ -2800,22 +2816,9 @@ impl WorkService {
             .endpoint()
             .await
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
-            .and_then(|mut endpoint| {
+            .and_then(|endpoint| {
                 let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
                 let retained = endpoint.prior_acceptance(&authorization, work_id)?;
-                if retained.is_some()
-                    && let Some(job) = endpoint.state().job_by_id(work_id)
-                {
-                    let bytes = job.prepared_input().to_vec();
-                    if !bytes.is_empty() {
-                        endpoint
-                            .close
-                            .store
-                            .uploads
-                            .publish_accepted(work_id, &bytes, authorization.retention)
-                            .map_err(content_refusal)?;
-                    }
-                }
                 Ok(retained.map(|signature| (work_id, signature)))
             });
         result.transpose().map(acceptance_response)
@@ -2845,7 +2848,16 @@ impl WorkService {
         work_id: Digest,
         ready: &ReadyChannel,
     ) -> Result<RunAdmission, RunError> {
-        let result = self.endpoint().await?.begin_run(work_id, ready).await;
+        let mut endpoint = self.endpoint().await?;
+        let mut result = endpoint.begin_run(work_id, ready).await;
+        if let Ok(RunAdmission::Invoke(input)) = &mut result {
+            let authorization = *endpoint
+                .state()
+                .job_by_id(work_id)
+                .ok_or(RunError::NoSuchJob)?
+                .authorization();
+            input.bind_scope(self.content_scope(input.content().1.clone(), authorization));
+        }
         self.changed.notify_waiters();
         result
     }
@@ -3004,17 +3016,6 @@ impl WorkHandler for WorkService {
         Ok(self.accept(&request).await)
     }
 
-    async fn upload_content(
-        &self,
-        request: hellas_rpc::pb::work::UploadContentRequest,
-        context: TransportContext,
-    ) -> Result<
-        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-        WireStatus,
-    > {
-        self.upload(&request, &context).await
-    }
-
     async fn stream_result(
         &self,
         request: StreamResultRequest,
@@ -3059,7 +3060,7 @@ pub struct JobProposal {
 #[derive(Debug, thiserror::Error)]
 pub enum ProposeError {
     #[error(transparent)]
-    Content(#[from] crate::content::ContentError),
+    Content(#[from] hellas_store::content::Error),
     /// The shared client endpoint is unavailable.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
@@ -3164,7 +3165,13 @@ impl ClientEndpoint {
     pub fn retained_content(
         &self,
         work_id: Digest,
-    ) -> Result<Option<crate::content::InvocationContent>, WorkStoreError> {
+    ) -> Result<
+        Option<(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        )>,
+        WorkStoreError,
+    > {
         self.store.recoverable_content(work_id)
     }
 
@@ -3191,6 +3198,10 @@ impl ClientEndpoint {
     pub async fn propose(
         &mut self,
         proposal: &JobProposal,
+        content: &(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
     ) -> Result<AcceptWorkRequest, ProposeError> {
         if let Some(observation) = &self.observation {
             observation.check()?;
@@ -3272,13 +3283,15 @@ impl ClientEndpoint {
             .map_err(PaidWorkError::from)?;
         let work_id = work_id(self.state().channel(), &authorization);
 
+        self.retain_proposal(work_id, &authorization, &proposal.prepared_input, content)
+            .await?;
         let signature = self.signer.sign(signing_hash(work_id));
         self.store
             .commit(
                 ChannelRecord::JobProposed {
                     authorization,
                     client_signature: signature,
-                    prepared_input: prepared_input.clone(),
+                    prepared_input: prepared_input.clone().into(),
 
                     retained_tree: None,
                 },
@@ -3508,7 +3521,7 @@ impl ClientEndpoint {
                     work_id,
                     result,
                     provider_signature: signature,
-                    transcript: delivered.transcript.clone(),
+                    transcript: delivered.transcript.clone().into(),
 
                     retained_tree: None,
                 },
@@ -3753,7 +3766,7 @@ pub async fn admit_payment<T>(
     work_id: Digest,
 ) -> Result<u64, PaymentError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
@@ -3778,15 +3791,18 @@ pub async fn propose_work<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     proposal: &JobProposal,
-    content: &crate::content::InvocationContent,
+    content: &(
+        hellas_store::content::LocalStore,
+        hellas_store::content::Scope,
+    ),
 ) -> Result<Digest, ProposeError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.client().await?.propose(proposal).await?;
-    upload::send_proposal(transport, endpoint, request, content).await
+    let request = endpoint.client().await?.propose(proposal, content).await?;
+    content::transfer_proposal(transport, endpoint, request, content).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3798,15 +3814,18 @@ pub async fn resume_work_proposal<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     work_id: Digest,
-    content: &crate::content::InvocationContent,
+    content: &(
+        hellas_store::content::LocalStore,
+        hellas_store::content::Scope,
+    ),
 ) -> Result<Digest, ProposeError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    upload::send_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

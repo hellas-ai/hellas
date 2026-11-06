@@ -28,7 +28,7 @@ pub use setup::{
 #[derive(Debug, thiserror::Error)]
 pub enum WorkStoreError {
     #[error(transparent)]
-    Content(#[from] crate::content::ContentError),
+    Content(#[from] hellas_store::content::Error),
     /// The file could not be opened, replayed, or appended to.
     #[error(transparent)]
     Journal(#[from] JournalError),

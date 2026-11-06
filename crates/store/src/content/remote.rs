@@ -151,6 +151,23 @@ where
         self.opening = Some(opening);
         self
     }
+    /// Transfer one verified local object through the common paged upload path.
+    /// A missing local source is harmless when the peer already holds the object.
+    pub async fn upload_reader(
+        &self,
+        scope: &Scope,
+        object: ContentRef,
+        pin: Option<PinTarget>,
+        reader: Option<VerifiedReader>,
+    ) -> Result<()> {
+        let mut upload = self.upload(scope, object, pin).await?;
+        if upload.complete() {
+            return Ok(());
+        }
+        upload
+            .copy_from(reader.ok_or(Error::Missing)?, &self.pool)
+            .await
+    }
     pub async fn finish_uploads(&self) -> Result<()> {
         let mut session = RemoteSession::begin(self.upload.clone(), false)?;
         session.finish_object().await

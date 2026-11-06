@@ -227,7 +227,7 @@ impl<F: Funding> JobBook<F> {
         id: Digest,
         result: F::Result,
         signature: F::Signature,
-        transcript: Vec<u8>,
+        transcript: bytes::Bytes,
     ) -> Result<Applied, ChannelStateError> {
         if self.indeterminate.contains(&id) {
             return Err(ChannelStateError::Indeterminate);

@@ -38,6 +38,7 @@ use funding::{Clock, ClockReading};
 pub use funding::{FinalizedHeight, Funding, PaymentFunding};
 
 mod codec;
+mod content;
 mod state;
 mod store;
 
@@ -417,7 +418,7 @@ pub enum ChannelRecord {
         client_signature: Sig,
         /// The canonical prepared-input bundle the authorization's
         /// `prepared_input_digest` commits to.
-        prepared_input: Vec<u8>,
+        prepared_input: bytes::Bytes,
         /// Locally staged retained tree, journaled before its pin is published.
         retained_tree: Option<ContentRef>,
     },
@@ -449,7 +450,7 @@ pub enum ChannelRecord {
         /// The provider's signature over its digest.
         provider_signature: Sig,
         /// The transcript the result was derived from.
-        transcript: Vec<u8>,
+        transcript: bytes::Bytes,
         /// Locally staged retained tree, journaled before its pin is published.
         retained_tree: Option<ContentRef>,
     },
@@ -608,12 +609,12 @@ const JOB_TAIL_BYTES: usize = 2 * (PaidJobResultV1::ENCODED_SIZE + Sig::LENGTH)
 pub struct JobState<F: Funding = PaymentFunding> {
     pub authorization: F::Authorization,
     pub work_id: Digest,
-    pub prepared_input: Vec<u8>,
+    pub prepared_input: bytes::Bytes,
     pub client_signature: F::Signature,
     pub provider_signature: Option<F::Signature>,
     pub phase: JobPhase,
     pub result: Option<(F::Result, F::Signature)>,
-    pub transcript: Vec<u8>,
+    pub transcript: bytes::Bytes,
 }
 
 impl<F: Funding> JobState<F> {

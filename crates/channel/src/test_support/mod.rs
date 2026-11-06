@@ -1,4 +1,4 @@
-use crate::model::grant::{ChannelClient, GrantJobAuthorizationV1, grant_work_id};
+use crate::model::grant::{ChannelClient, GrantJobAuthorizationV1};
 use crate::model::work::PrivateRecord as _;
 use hellas_auth::authority::PrincipalId;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
@@ -152,97 +152,136 @@ pub fn test_responses_contract() -> hellas_rpc::FetchContract {
     .unwrap()
 }
 
-/// Turns a fixture's locally held input body into signed upload RPCs and a
-/// reference-only acceptance. Provider handlers never receive the body inline.
+/// Encode real generic Content frames for a fixture's already signed opening.
+pub fn upload_frames(
+    wire: &hellas_rpc::pb::work::AcceptWorkRequest,
+    manifest: Vec<u8>,
+    root: Vec<u8>,
+    input: &[u8],
+    sign: impl FnOnce(&hellas_rpc::pb::content::WorkOpening) -> Vec<u8>,
+) -> Vec<hellas_rpc::pb::content::UploadRequest> {
+    use hellas_rpc::pb::content as pb;
+    use prost::Message;
+    let root_ref = (!root.is_empty()).then(|| ContentRef::for_bytes(&root));
+    let wire_ref = |object: ContentRef| pb::ContentRef {
+        id: object.id().as_bytes().to_vec(),
+        bytes: object.bytes(),
+    };
+    let mut opening = pb::WorkOpening {
+        signed_opening: wire.encode_to_vec(),
+        manifest,
+        root: root_ref.map(wire_ref),
+        binding_signature: vec![],
+    };
+    opening.binding_signature = sign(&opening);
+    let mut frames = Vec::new();
+    for bytes in root_ref.map(|_| root.as_slice()).into_iter().chain([input]) {
+        let reference = ContentRef::for_bytes(bytes);
+        frames.push(pb::UploadRequest {
+            part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
+                object: Some(wire_ref(reference)),
+                pin: None,
+                work: (frames.is_empty()).then(|| opening.clone()),
+            })),
+        });
+        let chunks = hellas_xet::chunk(bytes);
+        let mut cursor = hellas_store::content::Cursor::default();
+        loop {
+            let page = hellas_store::content::chunk_page(reference, &chunks, cursor).unwrap();
+            frames.push(pb::UploadRequest {
+                part: Some(pb::upload_request::Part::List(pb::ChunkList {
+                    chunks: page
+                        .chunks
+                        .iter()
+                        .map(|chunk| pb::Chunk {
+                            hash: chunk.hash.as_bytes().to_vec(),
+                            bytes: chunk.data_len,
+                        })
+                        .collect(),
+                    complete: page.next.is_none(),
+                })),
+            });
+            match page.next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        let mut offset = 0;
+        for chunk in chunks {
+            let end = offset + chunk.data_len as usize;
+            frames.push(pb::UploadRequest {
+                part: Some(pb::upload_request::Part::Chunk(bytes[offset..end].to_vec())),
+            });
+            offset = end;
+        }
+    }
+    frames
+}
+
 pub fn grant_upload_requests(
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
     signer: &ProducerSigningKey,
-    network: NetworkId,
+    _network: NetworkId,
     exporter: [u8; 32],
 ) -> (
     hellas_rpc::pb::work::AcceptWorkRequest,
-    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+    Vec<hellas_rpc::pb::content::UploadRequest>,
 ) {
-    use hellas_rpc::protocol::{
-        content::encode_reference,
-        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
-    };
     let mut wire = request.clone();
-    let Ok(a) = GrantJobAuthorizationV1::decode(&request.authorization) else {
-        return (wire, Vec::new());
-    };
-    if request.prepared_input.is_empty() {
-        return (wire, Vec::new());
+    if GrantJobAuthorizationV1::decode(&request.authorization).is_err() {
+        return (wire, vec![]);
     }
-    let reference = ContentRef::new(
-        ContentId::hash(&request.prepared_input),
-        request.prepared_input.len() as u64,
+    let Ok(input) = hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
+        &request.prepared_input,
+        crate::content::MAX_CONTENT_BYTES,
+    ) else {
+        return (wire, vec![]);
+    };
+    wire.prepared_input = hellas_rpc::protocol::content::encode_reference(ContentRef::for_bytes(
+        &request.prepared_input,
+    ));
+    let frames = upload_frames(
+        &wire,
+        input.manifest().unwrap().canonical_bytes(),
+        channel::program_root(&input),
+        &request.prepared_input,
+        |opening| {
+            signer
+                .sign_digest(crate::job::opening_digest(opening, &exporter))
+                .unwrap()
+                .bytes()
+                .to_vec()
+        },
     );
-    wire.prepared_input = encode_reference(reference);
-    let work = grant_work_id(network, &a);
-    let chunks = request
-        .prepared_input
-        .chunks(CONTENT_CHUNK_BYTES)
-        .enumerate()
-        .map(|(index, chunk)| {
-            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
-            let signature = signer
-                .sign_digest(chunk_digest(
-                    a.channel_id.0,
-                    work,
-                    reference,
-                    offset,
-                    chunk,
-                    &exporter,
-                ))
-                .unwrap();
-            hellas_rpc::pb::work::UploadContentRequest {
-                program_root:
-                    hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
-                        &request.prepared_input,
-                        crate::content::MAX_CONTENT_BYTES,
-                    )
-                    .ok()
-                    .map(|input| channel::program_root(&input))
-                    .unwrap_or_default(),
-                program_manifest:
-                    hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
-                        &request.prepared_input,
-                        crate::content::MAX_CONTENT_BYTES,
-                    )
-                    .ok()
-                    .map(|input| input.manifest().unwrap().canonical_bytes())
-                    .unwrap_or_default(),
-                route: wire.route.clone(),
-                authorization: wire.authorization.clone(),
-                client_signature: wire.client_signature.clone(),
-                content_id: reference.id().as_bytes().to_vec(),
-                total_bytes: reference.bytes(),
-                offset,
-                chunk: chunk.to_vec(),
-                chunk_signature: signature.bytes().to_vec(),
-            }
-        })
-        .collect();
-    (wire, chunks)
+    (wire, frames)
+}
+
+pub async fn drive_upload(
+    response: Result<
+        hellas_rpc::call::ResponseStream<hellas_rpc::pb::content::UploadResponse>,
+        hellas_wire::WireStatus,
+    >,
+) -> Result<(), hellas_wire::WireStatus> {
+    use futures::StreamExt;
+    let mut response = response?;
+    while let Some(progress) = response.next().await {
+        progress?;
+    }
+    Ok(())
 }
 
 pub fn upload_failure(
-    response: Result<hellas_rpc::pb::work::UploadContentResponse, hellas_wire::WireStatus>,
+    response: Result<(), hellas_wire::WireStatus>,
 ) -> Option<hellas_rpc::pb::work::AcceptWorkResponse> {
     use hellas_rpc::pb::work::{
         AcceptWorkResponse, WorkRefusalCode, WorkRefused, accept_work_response,
     };
-    let refusal = match response {
-        Ok(response) => response.refused?,
-        Err(error) => WorkRefused {
+    response.err().map(|error| AcceptWorkResponse {
+        outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
             code: WorkRefusalCode::Unavailable as i32,
             reason: error.to_string(),
             grant: None,
-        },
-    };
-    Some(AcceptWorkResponse {
-        outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+        })),
     })
 }
 pub mod backend;

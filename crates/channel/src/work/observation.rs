@@ -53,6 +53,14 @@ impl Observation {
         }
     }
 
+    pub(super) fn remaining(&self) -> Option<Duration> {
+        match self.freshness {
+            Freshness::Fresh(started, max_age) => {
+                Some(max_age.saturating_sub(started.elapsed().unwrap_or(max_age)))
+            }
+            _ => Some(Duration::ZERO),
+        }
+    }
     pub(super) fn check(&self) -> Result<(), EndpointError> {
         match self.freshness {
             Freshness::Fresh(started, max_age)

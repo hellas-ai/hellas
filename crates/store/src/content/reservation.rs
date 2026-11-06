@@ -11,6 +11,7 @@ pub struct Reservations(Arc<Mutex<Pool>>);
 struct Pool {
     limit: u64,
     held: u64,
+    next_id: u64,
     used: u64,
     disk: Option<PathBuf>,
 }
@@ -54,6 +55,7 @@ impl Reservations {
         Self(Arc::new(Mutex::new(Pool {
             limit,
             held: 0,
+            next_id: 0,
             used,
             disk,
         })))
@@ -75,6 +77,21 @@ impl Reservations {
             },
         })
     }
+    pub(crate) fn next_id(&self) -> Result<u64> {
+        let mut pool = self
+            .0
+            .lock()
+            .map_err(|_| Error::Invalid("reservation lock"))?;
+        pool.next_id = pool.next_id.checked_add(1).ok_or(Error::Capacity)?;
+        Ok(pool.next_id)
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| Error::Invalid("reservation lock"))?
+            .admit(0)
+            .map(drop)
+    }
     pub(crate) fn reconcile_used(&self, bytes: u64) {
         self.0.lock().unwrap().used = bytes;
     }
@@ -86,7 +103,9 @@ impl Reservations {
             .0
             .lock()
             .map_err(|_| Error::Invalid("reservation lock"))?;
-        pool.held = pool.admit(bytes)?;
+        if bytes != 0 {
+            pool.held = pool.admit(bytes)?;
+        }
         Ok(Arc::new(Reservation {
             pool: self.clone(),
             state: Mutex::new(Charge {
@@ -98,6 +117,22 @@ impl Reservations {
     }
 }
 impl Reservation {
+    pub(crate) fn restore(&self, bytes: u64) -> Result<()> {
+        let mut charge = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("reservation lock"))?;
+        let mut pool = self
+            .pool
+            .0
+            .lock()
+            .map_err(|_| Error::Invalid("reservation lock"))?;
+        let unwritten = charge.unwritten.checked_add(bytes).ok_or(Error::Capacity)?;
+        let held = pool.held.checked_add(bytes).ok_or(Error::Capacity)?;
+        charge.unwritten = unwritten;
+        pool.held = held;
+        Ok(())
+    }
     pub(crate) fn extend(&self, extra: u64) -> Result<()> {
         let mut charge = self
             .state
@@ -208,6 +243,7 @@ mod tests {
         let mut pool = Pool {
             limit: 100,
             held: 10,
+            next_id: 0,
             used: 80,
             disk: Some(PathBuf::new()),
         };

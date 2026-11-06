@@ -38,6 +38,7 @@ impl Stored {
 struct Work {
     input_reserved: u64,
     output_remaining: u64,
+    output_allowance: u64,
     upload_limit: u64,
     job: JobId,
     closure: Closure,
@@ -51,7 +52,6 @@ pub(crate) struct State {
     pub(crate) pins: BTreeMap<PinName, PinValue>,
     work: BTreeMap<ReservationId, Work>,
     active: BTreeSet<(ReservationId, ContentId)>,
-    next_reservation: u64,
     pub(crate) generation: u64,
     events: VecDeque<(PinEvent, Option<PinValue>, usize)>,
     event_bytes: usize,
@@ -76,7 +76,6 @@ impl Core {
                 pins: BTreeMap::new(),
                 work: BTreeMap::new(),
                 active: BTreeSet::new(),
-                next_reservation: 0,
                 generation: 0,
                 events: VecDeque::new(),
                 event_bytes: 0,
@@ -135,16 +134,13 @@ impl Core {
         let charge = self
             .data_pool()
             .reserve(missing.saturating_sub(held_input))?;
-        state.next_reservation = state
-            .next_reservation
-            .checked_add(1)
-            .ok_or(Error::Capacity)?;
-        let reservation = state.next_reservation;
+        let reservation = self.data_pool().next_id()?;
         state.work.insert(
             reservation,
             Work {
                 input_reserved: missing,
                 output_remaining: 0,
+                output_allowance: 0,
                 upload_limit: max_upload_bytes,
                 job,
                 closure: closure.clone(),
@@ -205,6 +201,25 @@ impl Core {
         }
         work.closure = closure;
         Ok(new_scope)
+    }
+    pub(crate) fn work_bytes(&self, scope: &Scope) -> Result<u64> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?;
+        state.check(scope)?;
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
+            return Err(Error::Denied);
+        };
+        state
+            .work
+            .get(reservation)
+            .ok_or(Error::Denied)?
+            .staged
+            .values()
+            .try_fold(0u64, |total, stored| {
+                total.checked_add(stored.data.len()).ok_or(Error::Capacity)
+            })
     }
     /// The host has atomically taken these bytes into live job RAM accounting.
     pub fn accept_work(&self, scope: &Scope) -> Result<()> {
@@ -274,12 +289,8 @@ impl Core {
                 if pin.is_none() {
                     return Err(Error::Invalid("owner upload requires pin"));
                 }
-                state.next_reservation = state
-                    .next_reservation
-                    .checked_add(1)
-                    .ok_or(Error::Capacity)?;
                 (
-                    state.next_reservation,
+                    self.data_pool().next_id()?,
                     self.data_pool().reserve(object.bytes())?,
                 )
             }
@@ -720,6 +731,7 @@ impl Core {
         object: ContentRef,
         pin: Option<PinTarget>,
     ) -> Result<UploadSession> {
+        self.require_ready()?;
         let local = {
             let mut state = self
                 .state
@@ -950,7 +962,20 @@ impl Core {
             },
         )))
     }
+    pub(crate) fn require_ready(&self) -> Result<()> {
+        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
+            return Err(Error::Denied);
+        }
+        if let Some(lower) = &self.lower {
+            lower.require_ready()?;
+        }
+        Ok(())
+    }
     pub(crate) fn collect_sync(&self, scope: &Scope, one: bool) -> Result<Collected> {
+        self.require_ready()?;
+        self.collect_unpinned(scope, one)
+    }
+    pub(crate) fn collect_unpinned(&self, scope: &Scope, one: bool) -> Result<Collected> {
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
@@ -969,9 +994,6 @@ impl Core {
             .into_iter()
             .map(|object| object.id())
             .collect();
-        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
-            return Err(Error::Denied);
-        }
         for work in state.work.values() {
             reached.extend(work.closure.iter().map(|object| object.id()));
             reached.extend(work.staged.keys().copied());
@@ -1190,7 +1212,7 @@ impl ContentStore for Core {
             return Err(Error::Denied);
         }
         loop {
-            self.access(s, |_| Ok(())).await?;
+            self.access(s, |core| core.require_ready()).await?;
             let result = super::acquire::memory(self, s, source.clone(), expect, pin.clone()).await;
             if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
                 return result;
@@ -1256,6 +1278,28 @@ impl Core {
 }
 
 impl Core {
+    pub(crate) fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
+        if self.disk.as_ref().is_none_or(|disk| disk.ready()) {
+            return Err(Error::Denied);
+        }
+        let remaining = total.checked_sub(consumed).ok_or(Error::Capacity)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?;
+        state.check(scope)?;
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
+            return Err(Error::Denied);
+        };
+        let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
+        if work.output_allowance != 0 {
+            return Err(Error::Conflict);
+        }
+        work.charge.restore(remaining)?;
+        work.output_allowance = total;
+        work.output_remaining = remaining;
+        Ok(())
+    }
     pub(crate) fn reserve_output(&self, scope: &Scope, bytes: u64) -> Result<()> {
         let mut state = self
             .state
@@ -1266,11 +1310,16 @@ impl Core {
             return Err(Error::Denied);
         };
         let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
+        let extra = bytes.saturating_sub(work.output_allowance);
+        if extra == 0 {
+            return Ok(());
+        }
         let remaining = work
             .output_remaining
-            .checked_add(bytes)
+            .checked_add(extra)
             .ok_or(Error::Capacity)?;
-        work.charge.extend(bytes)?;
+        work.charge.extend(extra)?;
+        work.output_allowance = work.output_allowance.max(bytes);
         work.output_remaining = remaining;
         Ok(())
     }

@@ -1,15 +1,15 @@
 //! One verified input and its funding-bound execution admission.
 use super::BackendFault;
 use super::admission::{AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
-use crate::content::InvocationContent;
 use hellas_rpc::Retention;
 use hellas_rpc::protocol::invocation::{Limits, PreparedInvocation};
+use hellas_store::content::{LocalStore, Scope};
 
 pub struct Admitted<I = PreparedInvocation, A = WorkAdmission> {
     input: I,
     limits: Limits,
     domain: CapacityDomain,
-    content: InvocationContent,
+    content: (LocalStore, Scope),
     admission: A,
 }
 
@@ -31,7 +31,7 @@ impl<I> Admitted<I> {
         input: I,
         limits: Limits,
         domain: CapacityDomain,
-        content: InvocationContent,
+        content: (LocalStore, Scope),
         admission: WorkAdmission,
     ) -> Self {
         Self {
@@ -69,12 +69,15 @@ impl<I, A> Admitted<I, A> {
         self.domain
     }
     pub const fn retention(&self) -> Retention {
-        self.content.retention()
+        self.content.0.retention()
     }
-    pub const fn content(&self) -> &InvocationContent {
+    pub(crate) fn bind_scope(&mut self, scope: Scope) {
+        self.content.1 = scope;
+    }
+    pub const fn content(&self) -> &(LocalStore, Scope) {
         &self.content
     }
-    pub fn into_parts_and_admission(self) -> (I, Limits, InvocationContent, A) {
+    pub fn into_parts_and_admission(self) -> (I, Limits, (LocalStore, Scope), A) {
         (self.input, self.limits, self.content, self.admission)
     }
 }

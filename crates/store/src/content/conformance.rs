@@ -138,20 +138,18 @@ async fn put(
     scope: &Scope,
     bytes: &[u8],
     pin: Option<PinTarget>,
+    pool: &Reservations,
 ) -> ContentRef {
     let object = ContentRef::for_bytes(bytes);
     let mut session = store.upload(scope, object, pin).await.unwrap();
     if !session.complete() {
         session
-            .declare(&hellas_xet::chunk(bytes), true)
+            .copy_from(
+                VerifiedReader::Memory(std::io::Cursor::new(Bytes::copy_from_slice(bytes))),
+                pool,
+            )
             .await
             .unwrap();
-        let mut offset = 0;
-        for chunk in hellas_xet::chunk(bytes) {
-            let end = offset + chunk.data_len as usize;
-            session.accept_chunk(&bytes[offset..end]).await.unwrap();
-            offset = end;
-        }
     }
     assert!(session.complete());
     object
@@ -194,6 +192,7 @@ async fn suite(mut case: Case) {
         &Scope::Owner,
         &data,
         Some(pin("owner", PinPolicy::Owner)),
+        &case.core().pool,
     )
     .await;
     assert!(
@@ -227,6 +226,7 @@ async fn suite(mut case: Case) {
         &Scope::Owner,
         b"",
         Some(pin("empty", PinPolicy::Public)),
+        &case.core().pool,
     )
     .await;
     assert_eq!(empty.bytes(), 0);
@@ -251,6 +251,7 @@ async fn suite(mut case: Case) {
         &Scope::Owner,
         &tree.bytes(),
         Some(pin("tree", PinPolicy::Public)),
+        &case.core().pool,
     )
     .await;
     let old = PinValue {
@@ -294,6 +295,7 @@ async fn suite(mut case: Case) {
             &Scope::Owner,
             &bytes,
             Some(pin(&key, PinPolicy::Owner)),
+            &case.core().pool,
         )
         .await;
         child = Target::Tree(object);
@@ -548,7 +550,14 @@ async fn suite(mut case: Case) {
         )
         .await;
     let private_client = case.client(private_scope.clone());
-    put(private_client.as_ref(), &private_scope, private_bytes, None).await;
+    put(
+        private_client.as_ref(),
+        &private_scope,
+        private_bytes,
+        None,
+        &case.core().pool,
+    )
+    .await;
     assert!(
         private_client
             .upload(&private_scope, private, None)
@@ -588,6 +597,7 @@ async fn suite(mut case: Case) {
         &Scope::Owner,
         b"public outside job policy",
         Some(pin("public-only", PinPolicy::Public)),
+        &case.core().pool,
     )
     .await;
     let local = case
@@ -794,6 +804,7 @@ async fn suite(mut case: Case) {
         &Scope::Owner,
         b"peer bytes",
         Some(pin("peer-source", PinPolicy::Public)),
+        &case.core().pool,
     )
     .await;
     let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)

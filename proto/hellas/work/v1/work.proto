@@ -20,7 +20,6 @@ service Work {
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
 
   // Exporter-bound signed chunks for the proposal's missing content objects.
-  rpc UploadContent(UploadContentRequest) returns (UploadContentResponse);
 
   // Private grant status and current Offer, bound to this connection. A stale
   // generation may discover the current one; it cannot authorize new work.
@@ -193,26 +192,7 @@ message AcceptWorkRequest {
   bytes prepared_input = 3;
 }
 
-message UploadContentRequest {
-  WorkRoute route = 1;
-  bytes authorization = 2;
-  bytes client_signature = 3;
-  bytes content_id = 4;
-  uint64 total_bytes = 5;
-  uint64 offset = 6;
-  bytes chunk = 7;
-  bytes chunk_signature = 8;
-  // Canonical manifest opening authorization.environment_commitment. Required
-  // before upload bytes can reach durable staging.
-  bytes program_manifest = 9;
-  // Hash opening of manifest.root, validated by the application before staging.
-  bytes program_root = 10;
-}
-message UploadContentResponse {
-  // A zero-byte probe returns the staged offset; total_bytes means have.
-  uint64 next_offset = 1;
-  WorkRefused refused = 2;
-}
+
 
 message AcceptWorkResponse {
   oneof outcome {

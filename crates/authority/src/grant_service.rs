@@ -46,7 +46,6 @@ mod access;
 mod cache;
 pub(crate) mod delivery;
 pub(crate) use access::Access;
-mod upload;
 pub use access::{GrantWork, WORK_EXECUTE, allowance_resource};
 pub(crate) use cache::ResultCache;
 pub(crate) use delivery::Delivery;
@@ -1186,16 +1185,7 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
     {
         Ok(self.accept(&request).await)
     }
-    async fn upload_content(
-        &self,
-        request: hellas_rpc::pb::work::UploadContentRequest,
-        context: TransportContext,
-    ) -> Result<
-        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-        WireStatus,
-    > {
-        self.upload(&request, &context).await
-    }
+
     async fn stream_result(
         &self,
         request: StreamResultRequest,

@@ -1,0 +1,503 @@
+use super::*;
+use futures::{Stream, StreamExt};
+use hellas_rpc::{call::ResponseStream, pb::content as pb, services::content::ContentHandler};
+use hellas_store::content::{
+    ContentService, ContentStore, Error, LocalStore, RemoteStore, Scope, ScopeKind, VerifiedReader,
+};
+
+pub(super) fn content_refusal(error: Error) -> Refusal {
+    let code = match error {
+        Error::Conflict => WorkRefusal::Conflict,
+        Error::Io(_) => WorkRefusal::Unavailable,
+        Error::Capacity => WorkRefusal::Declined,
+        _ => WorkRefusal::Invalid,
+    };
+    Refusal::new(code, error.to_string())
+}
+fn status(error: impl std::fmt::Display) -> WireStatus {
+    WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
+}
+fn object(reference: &pb::ContentRef) -> Result<ContentRef, WireStatus> {
+    Ok(ContentRef::new(
+        ContentId::from_slice(&reference.id).map_err(status)?,
+        reference.bytes,
+    ))
+}
+
+fn set_scope(shared: &std::sync::Mutex<Scope>, scope: Scope) -> Result<(), WireStatus> {
+    *shared.lock().map_err(|_| status(Error::Denied))? = scope;
+    Ok(())
+}
+impl ClientEndpoint {
+    pub(super) async fn retain_proposal(
+        &mut self,
+        work: Digest,
+        authorization: &PaidJobAuthorizationV2,
+        prepared: &PreparedInvocation,
+        source: &(LocalStore, Scope),
+    ) -> Result<(), ProposeError> {
+        if authorization.retention != hellas_rpc::Retention::Retain {
+            return Ok(());
+        }
+        let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+            prepared.application_policy.as_bytes(),
+        )
+        .map_err(PaidWorkError::from)?;
+        let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
+        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+            bytes::Bytes::new()
+        } else {
+            crate::content::root(&source.0, &source.1, manifest.root()).await?
+        };
+        let closure =
+            crate::job::content_closure(&policy, &manifest, &root, authorization.input_content)?;
+        let mut share = vec![authorization.input_content];
+        let mut readers = Vec::new();
+        for reference in closure {
+            if reference == authorization.input_content {
+                continue;
+            }
+            if let Some(reader) = source.0.open_verified(&source.1, reference, None).await? {
+                share.push(reference);
+                readers.push((reference, reader));
+            }
+        }
+        let (store, scope) = self
+            .store
+            .open_content(
+                work,
+                authorization.retention,
+                share,
+                policy.limits.max_upload_bytes,
+            )
+            .await?;
+        let facts =
+            crate::job::check_paid_input(self.state().channel(), authorization, &policy, prepared)?;
+        self.store
+            .reserve_retained(work, facts.max_spool_bytes)
+            .await?;
+        crate::content::upload_bytes(
+            &store,
+            &scope,
+            &prepared.canonical_bytes().map_err(PaidWorkError::from)?,
+            None,
+        )
+        .await?;
+        for (reference, reader) in readers {
+            let mut upload = store.upload(&scope, reference, None).await?;
+            if !upload.complete() {
+                upload
+                    .copy_from(reader, &self.store.content_store().ram_pool())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn transfer_proposal<T>(
+    transport: T,
+    endpoint: &mut impl ClientChannel,
+    request: AcceptWorkRequest,
+    source: &(LocalStore, Scope),
+) -> Result<Digest, ProposeError>
+where
+    T: StreamTransport + Clone + Send + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let exporter = transport
+        .context()
+        .open_exporter
+        .ok_or(ProposeError::Malformed("upload connection exporter"))?;
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization)?;
+    let (work, prepared, pool, retained) = {
+        let client = endpoint.client().await?;
+        let work = work_id(client.state().channel(), &authorization);
+        let job = client
+            .state()
+            .job_by_id(work)
+            .ok_or(ProposeError::NoOpenJob)?;
+        let prepared = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        (
+            work,
+            prepared,
+            client.store.content_store().ram_pool(),
+            client.store.recoverable_content(work)?,
+        )
+    };
+    let source = retained.as_ref().unwrap_or(source);
+    let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
+    let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+        prepared.application_policy.as_bytes(),
+    )
+    .map_err(PaidWorkError::from)?;
+    let root = if policy.content_closure(&manifest, &[]).is_ok() {
+        None
+    } else {
+        Some(crate::content::root(&source.0, &source.1, manifest.root()).await?)
+    };
+    let closure = crate::job::content_closure(
+        &policy,
+        &manifest,
+        root.as_deref().unwrap_or_default(),
+        authorization.input_content,
+    )?;
+    let mut opening = pb::WorkOpening {
+        signed_opening: request.encode_to_vec(),
+        manifest: manifest.canonical_bytes(),
+        root: root.as_ref().map(|bytes| {
+            let root = ContentRef::for_bytes(bytes);
+            pb::ContentRef {
+                id: root.id().as_bytes().to_vec(),
+                bytes: root.bytes(),
+            }
+        }),
+        binding_signature: vec![],
+    };
+    opening.binding_signature = endpoint
+        .client()
+        .await?
+        .signer
+        .sign(signing_hash(crate::job::opening_digest(
+            &opening, &exporter,
+        )))
+        .as_bytes()
+        .to_vec();
+    let client = WorkClientImpl::new(transport.clone());
+    // A prior acceptance needs no content transfer, including after restart or
+    // input expiry. The precheck does not create a new acceptance from missing bytes.
+    if retained.is_some() {
+        let response = client.accept_work(request.clone()).await?;
+        if matches!(response.outcome, Some(Outcome::Accepted(_))) {
+            return endpoint.client().await?.accepted(&response).await;
+        }
+    }
+    let remote = RemoteStore::new(transport, pool).with_opening(opening);
+    let remote_scope = Scope::work(
+        hellas_store::content::JobId {
+            channel: authorization.channel_id,
+            id: work,
+        },
+        closure.clone(),
+        0,
+    );
+    let first = root
+        .as_ref()
+        .map(|bytes| ContentRef::for_bytes(bytes))
+        .unwrap_or(authorization.input_content);
+    for reference in
+        std::iter::once(first).chain(closure.into_iter().filter(|reference| *reference != first))
+    {
+        let reader = if reference == authorization.input_content {
+            Some(VerifiedReader::Memory(std::io::Cursor::new(
+                prepared
+                    .canonical_bytes()
+                    .map_err(PaidWorkError::from)?
+                    .into(),
+            )))
+        } else {
+            source.0.open_verified(&source.1, reference, None).await?
+        };
+        remote
+            .upload_reader(&remote_scope, reference, None, reader)
+            .await?;
+    }
+    remote.finish_uploads().await?;
+    let response = client.accept_work(request).await?;
+    endpoint.client().await?.accepted(&response).await
+}
+
+impl ProviderEndpoint {
+    fn check_content_authority(&self, authorization: &PaidJobAuthorizationV2) -> Result<(), Error> {
+        let work = work_id(self.state().channel(), authorization);
+        if self.state().terminal_by_id(work).is_some() || self.state().close_settled().is_some() {
+            return Err(Error::Denied);
+        }
+        if let Some(observation) = &self.observation {
+            observation.check().map_err(|_| Error::Denied)?;
+        }
+        if let Some(job) = self
+            .state()
+            .job_by_id(work)
+            .filter(|job| job.provider_signature().is_some())
+        {
+            if job.authorization() != authorization
+                || job.result().is_some()
+                || self.state().cursor().0 > authorization.terminal_deadline
+            {
+                return Err(Error::Denied);
+            }
+        } else {
+            let ready = self.admitting().map_err(|_| Error::Denied)?;
+            crate::job::check_authorization(
+                ready.channel(),
+                authorization,
+                ready.invocation_policy(),
+                ready.payment_policy(),
+                self.state().cursor().0,
+            )
+            .map_err(|_| Error::Denied)?;
+        }
+        Ok(())
+    }
+}
+
+impl WorkService {
+    pub(super) fn content_scope(
+        &self,
+        scope: Scope,
+        authorization: PaidJobAuthorizationV2,
+    ) -> Scope {
+        self.bound_content_scope(scope, authorization, None)
+    }
+    fn bound_content_scope(
+        &self,
+        scope: Scope,
+        authorization: PaidJobAuthorizationV2,
+        connection: Option<admission::Cancellation>,
+    ) -> Scope {
+        let (channel, work, reservation) = match &scope.kind {
+            ScopeKind::Work {
+                job, reservation, ..
+            } => (job.channel, job.id, *reservation),
+            _ => return scope,
+        };
+        let endpoint = self.endpoint.clone();
+        let service = self.clone();
+        let check_connection = connection.clone();
+        scope.bind(move || {
+            let endpoint = endpoint.clone();
+            let connection = check_connection.clone();
+            async move {
+                let held = endpoint.lock_owned().await.map_err(|_| Error::Denied)?;
+                Ok(move || {
+                    if connection.as_ref().is_some_and(admission::Cancellation::is_cancelled) { return Err(Error::Denied); }
+                    if held.state().channel().id() != channel || work_id(held.state().channel(), &authorization) != work || !held.close.store.has_content_scope(work, reservation) { return Err(Error::Denied); }
+                    held.check_content_authority(&authorization)
+                })
+            }
+        }, async move {
+            let cancelled = async { match &connection { Some(connection) => connection.cancelled().await, None => std::future::pending().await } };
+            tokio::pin!(cancelled);
+            loop {
+                let changed = service.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let remaining = {
+                    let Ok(endpoint) = service.endpoint().await else { return; };
+                    let work = work_id(endpoint.state().channel(), &authorization);
+                    if !endpoint.close.store.has_content_scope(work, reservation) || endpoint.check_content_authority(&authorization).is_err() { return; }
+                    endpoint.observation.as_ref().and_then(Observation::remaining)
+                };
+                let expiry = async { match remaining { Some(remaining) => tokio::time::sleep(remaining).await, None => std::future::pending().await } };
+                tokio::select! { biased; _ = &mut cancelled => return, _ = changed => {}, _ = expiry => {} }
+            }
+        })
+    }
+    fn pending_content_cleanup(&self, scope: &Scope) -> admission::CancelOnFailure {
+        let ScopeKind::Work {
+            job, reservation, ..
+        } = &scope.kind
+        else {
+            unreachable!()
+        };
+        let (work, reservation) = (job.id, *reservation);
+        let host = self.clone();
+        admission::CancelOnFailure(vec![admission::Cancellation::with_cleanup(move || {
+            let host = host.clone();
+            tokio::spawn(async move {
+                host.discard_pending_content(work, reservation).await;
+            });
+        })])
+    }
+    async fn discard_pending_content(&self, work: Digest, reservation: u64) {
+        if let Ok(mut endpoint) = self.endpoint().await {
+            let _ = endpoint
+                .close
+                .store
+                .discard_unaccepted_content(work, reservation)
+                .await;
+        }
+        self.changed.notify_waiters();
+    }
+
+    pub async fn upload_stream(
+        &self,
+        mut requests: std::pin::Pin<
+            Box<dyn Stream<Item = Result<pb::UploadRequest, WireStatus>> + Send>,
+        >,
+        context: TransportContext,
+        connection: admission::Cancellation,
+    ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
+        let first = requests
+            .next()
+            .await
+            .ok_or_else(|| status(Error::Invalid("missing Work opening")))??;
+        let Some(pb::upload_request::Part::Open(open)) = &first.part else {
+            return Err(status(Error::Invalid("missing Work opening")));
+        };
+        let opening = open
+            .work
+            .as_ref()
+            .ok_or_else(|| status(Error::Denied))?
+            .clone();
+        let request =
+            AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(status)?;
+        let exporter = context.open_exporter.ok_or_else(|| status(Error::Denied))?;
+        let mut endpoint = self
+            .endpoint
+            .lock_owned()
+            .await
+            .map_err(|_| status(Error::Denied))?;
+        let host = self.clone();
+        let open = open.clone();
+        // Admission and map insertion outlive a cancelled RPC together; dropping
+        // the detached result then runs cleanup for the actual completed scope.
+        let (authorization, manifest, policy, facts, root, store, scope, fresh, cleanup) =
+            tokio::spawn(async move {
+                let (authorization, _, work) = endpoint
+                    .authenticate_proposal(&request)
+                    .map_err(|error| status(error.reason))?;
+                endpoint
+                    .check_content_authority(&authorization)
+                    .map_err(status)?;
+                let signature =
+                    signature(&opening.binding_signature).ok_or_else(|| status(Error::Denied))?;
+                if !Secp256k1Verifier::new().verify_sig(
+                    signature,
+                    endpoint.state().channel().client_key(),
+                    signing_hash(crate::job::opening_digest(&opening, &exporter)),
+                ) {
+                    return Err(status(Error::Denied));
+                }
+                let manifest = hellas_rpc::ProgramManifest::from_canonical_bytes(&opening.manifest)
+                    .map_err(status)?;
+                if manifest.content_id() != authorization.environment_commitment
+                    || decode_reference(&request.prepared_input)
+                        != Some(authorization.input_content)
+                {
+                    return Err(status(Error::Denied));
+                }
+                let policy = endpoint
+                    .admitting()
+                    .map_err(status)?
+                    .invocation_policy()
+                    .clone();
+                let facts = policy.classify_manifest(&manifest).map_err(status)?;
+                if facts.retention != authorization.retention
+                    || authorization.input_content.bytes()
+                        > u64::from(facts.max_encoded_prepared_input)
+                {
+                    return Err(status(Error::Denied));
+                }
+                let root = match &opening.root {
+                    Some(root) => {
+                        let root = object(root)?;
+                        if root.id() != manifest.root()
+                            || root.bytes() > crate::content::MAX_PROGRAM_ROOT_BYTES as u64
+                        {
+                            return Err(status(Error::Invalid("signed program root")));
+                        }
+                        Some(root)
+                    }
+                    None if policy.content_closure(&manifest, &[]).is_ok() => None,
+                    None => return Err(status(Error::Invalid("missing signed root reference"))),
+                };
+                let first_object = root.unwrap_or(authorization.input_content);
+                if open.pin.is_some()
+                    || object(open.object.as_ref().ok_or_else(|| status(Error::Denied))?)?
+                        != first_object
+                {
+                    return Err(status(Error::Denied));
+                }
+                if endpoint.close.store.other_pending_content(work) {
+                    return Err(status(Error::Conflict));
+                }
+                let fresh = !endpoint.close.store.has_content(work);
+                let (store, scope) = endpoint
+                    .close
+                    .store
+                    .open_content(
+                        work,
+                        authorization.retention,
+                        vec![first_object],
+                        policy.limits.max_upload_bytes,
+                    )
+                    .await
+                    .map_err(status)?;
+                let cleanup = host.pending_content_cleanup(&scope);
+                Ok::<_, WireStatus>((
+                    authorization,
+                    manifest,
+                    policy,
+                    facts,
+                    root,
+                    store,
+                    scope,
+                    fresh,
+                    cleanup,
+                ))
+            })
+            .await
+            .map_err(|_| status(Error::Denied))??;
+        let id = match scope.kind {
+            ScopeKind::Work { job, .. } => job.id,
+            _ => unreachable!(),
+        };
+        let reservation = match &scope.kind {
+            ScopeKind::Work { reservation, .. } => *reservation,
+            _ => unreachable!(),
+        };
+        let scope = self.bound_content_scope(scope, authorization, Some(connection.clone()));
+        if fresh {
+            let monitor = scope.clone();
+            let host = self.clone();
+            tokio::spawn(async move {
+                monitor.ended().await;
+                host.discard_pending_content(id, reservation).await;
+            });
+        }
+        let service = ContentService::new(Arc::new(store), scope);
+        let shared = service.scope.clone();
+        let requests = requests.map(|request| request.and_then(|request| {
+            if matches!(&request.part, Some(pb::upload_request::Part::Open(open)) if open.work.is_some()) {
+                Err(status(Error::Invalid("duplicate Work opening")))
+            } else { Ok(request) }
+        }));
+        let incoming = futures::stream::once(async move { Ok(first) }).chain(requests);
+        let mut replies = service.upload(Box::pin(incoming), context).await?;
+        let host = self.clone();
+        Ok(ResponseStream::new(async_stream::try_stream! {
+            let mut cleanup = cleanup;
+            let mut widened = false;
+            while let Some(reply) = replies.next().await {
+                let reply = reply?;
+                if !widened && reply.complete {
+                    let mut endpoint = host.endpoint().await.map_err(status)?;
+                    endpoint.check_content_authority(&authorization).map_err(status)?;
+                    let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
+                    let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
+                    let (_, scope) = endpoint.close.store.widen_content(id, closure, policy.limits.max_upload_bytes).await.map_err(status)?;
+                    if authorization.retention == hellas_rpc::Retention::Retain { endpoint.close.store.reserve_retained(id, facts.max_spool_bytes).await.map_err(status)?; }
+                    set_scope(&shared, host.bound_content_scope(scope, authorization, Some(connection.clone())))?;
+                    widened = true;
+                }
+                yield reply;
+            }
+            {
+                let endpoint = host.endpoint().await.map_err(status)?;
+                let (_, scope) = endpoint.close.store.invocation_content(id).map_err(status)?;
+                let ScopeKind::Work { closure, .. } = &scope.kind else { Err(status(Error::Denied))?; unreachable!() };
+                for object in closure {
+                    if endpoint.close.store.open_content_reader(id, *object).await.map_err(status)?.is_none() { Err(status(Error::Missing))?; }
+                }
+            }
+            cleanup.0.clear();
+        }))
+    }
+}

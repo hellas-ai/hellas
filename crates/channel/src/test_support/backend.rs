@@ -94,7 +94,10 @@ impl Reply {
 pub type ContentInspection = Arc<
     dyn Fn(
             &hellas_rpc::protocol::invocation::PreparedInvocation,
-            &crate::content::InvocationContent,
+            &(
+                hellas_store::content::LocalStore,
+                hellas_store::content::Scope,
+            ),
         ) + Send
         + Sync,
 >;

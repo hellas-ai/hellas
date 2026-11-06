@@ -355,23 +355,6 @@ impl WorkHandler for MountedWorkService {
         Ok(response)
     }
 
-    async fn upload_content(
-        &self,
-        request: hellas_rpc::pb::work::UploadContentRequest,
-        context: TransportContext,
-    ) -> Result<
-        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-        WireStatus,
-    > {
-        if !self.node.ready() {
-            return Err(WireStatus::new(
-                hellas_wire::WireCode::Unavailable,
-                "chain node is catching up",
-            ));
-        }
-        self.service.upload(&request, &context).await
-    }
-
     async fn stream_result(
         &self,
         request: StreamResultRequest,
@@ -626,19 +609,6 @@ impl WorkHandler for MountedWork {
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => wt(service.accept_work(request, context)).await,
             None => wt(UnmountedWork.accept_work(request, context)).await,
-        }
-    }
-    async fn upload_content(
-        &self,
-        request: hellas_rpc::pb::work::UploadContentRequest,
-        context: TransportContext,
-    ) -> Result<
-        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-        WireStatus,
-    > {
-        match self.handler(&context, request.route.as_ref())? {
-            Some(service) => wt(service.upload_content(request, context)).await,
-            None => wt(UnmountedWork.upload_content(request, context)).await,
         }
     }
 

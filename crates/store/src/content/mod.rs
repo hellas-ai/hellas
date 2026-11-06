@@ -189,7 +189,7 @@ impl Scope {
         }));
         self
     }
-    async fn ended(&self) {
+    pub async fn ended(&self) {
         match &self.live {
             Some(live) => live.ended.clone().await,
             None => std::future::pending().await,
@@ -317,13 +317,13 @@ macro_rules! impl_local_content {
         #[async_trait::async_trait]
         impl ContentStore for $backend {
             async fn stat(&self, s: &Scope, at: &Path) -> Result<Option<Stat>> {
-                self.core.stat(s, at).await
+                self.core().stat(s, at).await
             }
             async fn chunks(&self, s: &Scope, at: &Path, page: Cursor) -> Result<ChunkPage> {
-                self.core.chunks(s, at, page).await
+                self.core().chunks(s, at, page).await
             }
             async fn read(&self, s: &Scope, at: &Path, range: Range<u64>) -> Result<ByteStream> {
-                self.core.read(s, at, range).await
+                self.core().read(s, at, range).await
             }
             async fn upload(
                 &self,
@@ -331,7 +331,7 @@ macro_rules! impl_local_content {
                 object: ContentRef,
                 pin: Option<PinTarget>,
             ) -> Result<UploadSession> {
-                self.core.upload(s, object, pin).await
+                self.core().upload(s, object, pin).await
             }
             async fn acquire(
                 &self,
@@ -340,7 +340,7 @@ macro_rules! impl_local_content {
                 expect: Option<ContentRef>,
                 pin: PinTarget,
             ) -> Result<Acquisition> {
-                self.core.acquire(s, source, expect, pin).await
+                self.core().acquire(s, source, expect, pin).await
             }
             async fn set_pin(
                 &self,
@@ -349,20 +349,31 @@ macro_rules! impl_local_content {
                 expected: Option<&PinValue>,
                 new: Option<PinValue>,
             ) -> Result<()> {
-                self.core.set_pin(s, name, expected, new).await
+                self.core().set_pin(s, name, expected, new).await
             }
             async fn pins(&self, s: &Scope, prefix: &str, page: Cursor) -> Result<PinPage> {
-                self.core.pins(s, prefix, page).await
+                self.core().pins(s, prefix, page).await
             }
             async fn watch(&self, s: &Scope, prefix: &str, from: Cursor) -> Result<PinEvents> {
-                self.core.watch(s, prefix, from).await
+                self.core().watch(s, prefix, from).await
             }
             async fn collect(&self, s: &Scope) -> Result<Collected> {
-                self.core.collect(s).await
+                self.core().collect(s).await
             }
         }
     };
 }
+impl MemoryStore {
+    fn core(&self) -> &core::Core {
+        &self.core
+    }
+}
+impl DiskStore {
+    fn core(&self) -> &core::Core {
+        &self.core
+    }
+}
+impl_local_content!(LocalStore);
 impl_local_content!(MemoryStore);
 
 impl_local_content!(DiskStore);

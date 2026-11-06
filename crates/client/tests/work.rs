@@ -371,24 +371,7 @@ async fn model_job_restart(provider_held: bool) {
                 "the acceptance reply was lost",
             ))
         }
-        async fn upload_content(
-            &self,
-            request: hellas_rpc::pb::work::UploadContentRequest,
-            context: hellas_wire::TransportContext,
-        ) -> Result<
-            impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-            hellas_wire::WireStatus,
-        > {
-            if request.chunk.is_empty() {
-                *self
-                    .probes
-                    .lock()
-                    .unwrap()
-                    .entry(request.content_id.clone())
-                    .or_default() += 1;
-            }
-            self.service.upload_content(request, context).await
-        }
+
         async fn get_standing(
             &self,
             request: hellas_rpc::pb::work::GetStandingRequest,

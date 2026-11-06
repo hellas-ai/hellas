@@ -32,7 +32,7 @@ use hellas_rpc::protocol::invocation::{
     self, Admission, Artifact, InvocationInput, InvocationPolicy, InvocationRequest, Limits,
     PreparedInvocation, compute, output,
 };
-use hellas_rpc::{Assurance, ContentId, JsonBytes, OutputEventEnvelope, ProgramManifest};
+use hellas_rpc::{Assurance, JsonBytes, OutputEventEnvelope, ProgramManifest};
 
 pub const HORIZON: u64 = 500;
 pub const PRICE: u64 = 10;
@@ -303,101 +303,72 @@ pub fn fixture_uploads(
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> (
     hellas_rpc::pb::work::AcceptWorkRequest,
-    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+    Vec<hellas_rpc::pb::content::UploadRequest>,
 ) {
-    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _};
     use hellas_rpc::protocol::content::decode_reference;
-    let wire = request.clone();
-    let Ok(_) = PaidJobAuthorizationV2::decode(&request.authorization) else {
-        return (wire, Vec::new());
-    };
     let bytes = if let Some(reference) = decode_reference(&request.prepared_input) {
-        let Some(bytes) = (0..=u8::MAX).map(bundle_bytes).find(|bytes| {
-            ContentId::hash(bytes) == reference.id() && bytes.len() as u64 == reference.bytes()
-        }) else {
-            return (wire, Vec::new());
+        let Some(bytes) = (0..=u8::MAX)
+            .map(bundle_bytes)
+            .find(|bytes| hellas_rpc::ContentRef::for_bytes(bytes) == reference)
+        else {
+            return (request.clone(), vec![]);
         };
         bytes
     } else {
         request.prepared_input.clone()
     };
-    input_uploads(channel, &wire, &bytes)
+    input_uploads(channel, request, &bytes)
 }
 
 pub fn input_uploads(
-    channel: &crate::model::work::PaidChannel,
+    _channel: &crate::model::work::PaidChannel,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
     bytes: &[u8],
 ) -> (
     hellas_rpc::pb::work::AcceptWorkRequest,
-    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+    Vec<hellas_rpc::pb::content::UploadRequest>,
 ) {
-    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id};
-    use hellas_rpc::protocol::{
-        content::encode_reference,
-        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
-    };
     let mut wire = request.clone();
-    let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
-        return (wire, Vec::new());
+    let Ok(input) =
+        PreparedInvocation::from_canonical_bytes(bytes, crate::content::MAX_CONTENT_BYTES)
+    else {
+        return (wire, vec![]);
     };
-    let reference = hellas_rpc::ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
-    wire.prepared_input = encode_reference(reference);
-    let id = work_id(channel, &a);
-    let program_manifest =
-        PreparedInvocation::from_canonical_bytes(bytes, crate::content::MAX_CONTENT_BYTES)
-            .ok()
-            .map(|input| input.manifest().unwrap().canonical_bytes())
-            .unwrap_or_default();
-    let program_root =
-        PreparedInvocation::from_canonical_bytes(bytes, crate::content::MAX_CONTENT_BYTES)
-            .ok()
-            .map(|input| program_root(&input))
-            .unwrap_or_default();
-    let uploads = bytes
-        .chunks(CONTENT_CHUNK_BYTES)
-        .enumerate()
-        .map(|(index, bytes)| {
-            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
-            let sig = client().sign(signing_hash(chunk_digest(
-                a.channel_id,
-                id,
-                reference,
-                offset,
-                bytes,
-                &[7; 32],
-            )));
-            hellas_rpc::pb::work::UploadContentRequest {
-                program_root: program_root.clone(),
-                program_manifest: program_manifest.clone(),
-                route: wire.route.clone(),
-                authorization: wire.authorization.clone(),
-                client_signature: wire.client_signature.clone(),
-                content_id: reference.id().as_bytes().to_vec(),
-                total_bytes: reference.bytes(),
-                offset,
-                chunk: bytes.to_vec(),
-                chunk_signature: sig.as_bytes().to_vec(),
-            }
-        })
-        .collect();
-    (wire, uploads)
+    wire.prepared_input =
+        hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::for_bytes(bytes));
+    let frames = super::upload_frames(
+        &wire,
+        input.manifest().unwrap().canonical_bytes(),
+        program_root(&input),
+        bytes,
+        |opening| {
+            client()
+                .sign(signing_hash(crate::job::opening_digest(opening, &[7; 32])))
+                .as_bytes()
+                .to_vec()
+        },
+    );
+    (wire, frames)
 }
+
 pub async fn accept_uploaded(
     endpoint: &mut crate::work::ProviderEndpoint,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
-    let (wire, uploads) = fixture_uploads(endpoint.state().channel(), request);
-    for upload in uploads {
-        if let Some(refusal) = super::upload_failure(endpoint.upload_content(
-            &upload,
-            &hellas_wire::TransportContext {
-                open_exporter: Some([7; 32]),
-                ..Default::default()
-            },
-        )) {
-            return refusal;
-        }
+    let (wire, _) = fixture_uploads(endpoint.state().channel(), request);
+    let reference = hellas_rpc::protocol::content::decode_reference(&wire.prepared_input);
+    let bytes = reference.and_then(|reference| {
+        (0..=u8::MAX)
+            .map(bundle_bytes)
+            .find(|bytes| hellas_rpc::ContentRef::for_bytes(bytes) == reference)
+    });
+    if let Some(bytes) = bytes
+        && let Ok(authorization) =
+            <PaidJobAuthorizationV2 as crate::model::work::PrivateRecord>::decode(
+                &wire.authorization,
+            )
+    {
+        seed_content(endpoint.fixture_store(), authorization, bytes.into()).await;
     }
     endpoint.accept(&wire).await
 }
@@ -409,23 +380,84 @@ pub async fn accept_uploaded_service(
     let Ok(channel) = service.with_state(|state| state.channel().clone()).await else {
         return service.accept(request).await;
     };
-    let (wire, uploads) = fixture_uploads(&channel, request);
-    for upload in uploads {
-        if let Some(refusal) = super::upload_failure(
-            service
-                .upload(
-                    &upload,
-                    &hellas_wire::TransportContext {
-                        open_exporter: Some([7; 32]),
-                        ..Default::default()
-                    },
-                )
-                .await,
-        ) {
-            return refusal;
+    let (wire, frames) = fixture_uploads(&channel, request);
+    send_frames(service, &wire, frames).await
+}
+
+async fn send_frames(
+    service: &WorkService,
+    wire: &hellas_rpc::pb::work::AcceptWorkRequest,
+    frames: Vec<hellas_rpc::pb::content::UploadRequest>,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    if !frames.is_empty() {
+        let stream = service
+            .upload_stream(
+                Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+                hellas_wire::TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                crate::work::admission::Cancellation::new(),
+            )
+            .await;
+        if let Some(refused) = super::upload_failure(super::drive_upload(stream).await) {
+            return refused;
         }
     }
-    service.accept(&wire).await
+    service.accept(wire).await
+}
+
+pub async fn seed_content(
+    store: &mut ChannelStore,
+    authorization: PaidJobAuthorizationV2,
+    input: bytes::Bytes,
+) {
+    let Ok(prepared) =
+        PreparedInvocation::from_canonical_bytes(&input, crate::content::MAX_CONTENT_BYTES)
+    else {
+        return;
+    };
+    let root = program_root(&prepared);
+    let policy =
+        InvocationPolicy::from_canonical_bytes(prepared.application_policy.as_bytes()).unwrap();
+    let Ok(closure) = crate::job::content_closure(
+        &policy,
+        &prepared.manifest().unwrap(),
+        &root,
+        authorization.input_content,
+    ) else {
+        return;
+    };
+    let work = work_id(store.state().channel(), &authorization);
+    let Ok((content, scope)) = store
+        .open_content(
+            work,
+            authorization.retention,
+            closure,
+            policy.limits.max_upload_bytes,
+        )
+        .await
+    else {
+        return;
+    };
+    if authorization.retention == hellas_rpc::Retention::Retain {
+        let facts = policy
+            .classify_manifest(&prepared.manifest().unwrap())
+            .unwrap();
+        store
+            .reserve_retained(work, facts.max_spool_bytes)
+            .await
+            .unwrap();
+    }
+    for bytes in (!root.is_empty())
+        .then_some(root.as_slice())
+        .into_iter()
+        .chain([input.as_ref()])
+    {
+        crate::content::upload_bytes(&content, &scope, bytes, None)
+            .await
+            .unwrap();
+    }
 }
 
 pub async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
@@ -434,47 +466,8 @@ pub async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
         prepared_input,
         ..
     } = &record
-        && store.state().role() == Role::Provider
-        && let Ok(input) = PreparedInvocation::from_canonical_bytes(
-            prepared_input,
-            crate::content::MAX_CONTENT_BYTES,
-        )
     {
-        let root = program_root(&input);
-        if !root.is_empty() {
-            let policy =
-                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-                    .unwrap();
-            let objects = crate::job::content_closure(
-                &policy,
-                &input.manifest().unwrap(),
-                &root,
-                authorization.input_content,
-            )
-            .unwrap();
-            let work = work_id(store.state().channel(), authorization);
-            store
-                .uploads
-                .declare_closure(
-                    work,
-                    &objects,
-                    authorization.acceptance_deadline,
-                    authorization.retention,
-                    policy.limits.max_upload_bytes,
-                )
-                .unwrap();
-            store
-                .uploads
-                .stage_complete(
-                    work,
-                    hellas_rpc::ContentRef::for_bytes(&root),
-                    authorization.acceptance_deadline,
-                    authorization.retention,
-                    policy.limits.max_upload_bytes,
-                    &root,
-                )
-                .unwrap();
-        }
+        seed_content(store, *authorization, prepared_input.clone()).await;
     }
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
         panic!("the fixture record commits: {error}");
@@ -497,13 +490,22 @@ pub async fn store_at(
     role: Role,
     height: u64,
 ) -> ChannelStore {
+    let content = hellas_store::content::DiskStore::open(
+        root.join("content"),
+        vec![],
+        hellas_store::content::IndexMode::Resume,
+        None,
+        hellas_store::content::Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
     let mut store = match ChannelStore::open(
         root,
         ready.channel().clone(),
         settlement(),
         role,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -511,6 +513,7 @@ pub async fn store_at(
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
     };
+    content.finish_recovery().await.unwrap();
     advance(&mut store, height).await;
     store
 }
@@ -609,23 +612,8 @@ pub async fn accept_uploaded_client(
     let Some(job) = client.state().job_by_id(id) else {
         return service.accept(request).await;
     };
-    let (wire, uploads) = input_uploads(client.state().channel(), request, job.prepared_input());
-    for upload in uploads {
-        if let Some(refusal) = super::upload_failure(
-            service
-                .upload(
-                    &upload,
-                    &hellas_wire::TransportContext {
-                        open_exporter: Some([7; 32]),
-                        ..Default::default()
-                    },
-                )
-                .await,
-        ) {
-            return refusal;
-        }
-    }
-    service.accept(&wire).await
+    let (wire, frames) = input_uploads(client.state().channel(), request, job.prepared_input());
+    send_frames(service, &wire, frames).await
 }
 
 pub const NONCE: u8 = 1;
@@ -667,7 +655,7 @@ pub async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
             ChannelRecord::JobProposed {
                 authorization,
                 client_signature: client().sign(signing_hash(id)),
-                prepared_input: prepared_input.clone(),
+                prepared_input: prepared_input.clone().into(),
 
                 retained_tree: None,
             },
@@ -1077,37 +1065,21 @@ pub fn program_root(input: &PreparedInvocation) -> Vec<u8> {
         Vec::new()
     }
 }
-pub fn program_content() -> crate::content::InvocationContent {
-    let mut content = crate::content::EphemeralContent::default();
-    content.insert(environment().canonical_bytes().unwrap());
-    crate::content::InvocationContent::Ephemeral(content)
-}
-
-/// Retains one upload object exactly as a client's proposal upload does.
-///
-/// Fixtures that commit a proposal directly need this to leave the journal
-/// in the state a real send would: the closure is durable, so a restart can
-/// resume the proposal instead of reporting it unresolved.
-pub fn retain_proposal_content(store: &mut crate::work_store::ChannelStore, bytes: &[u8]) {
-    let work = store
-        .state()
-        .job_book()
-        .pending_proposal()
-        .expect("the fixture has a pending proposal");
-    let job = store
-        .state()
-        .job_by_id(work)
-        .expect("the pending proposal is an open job");
-    let deadline = job.authorization().terminal_deadline;
-    let reference = hellas_rpc::ContentRef::for_bytes(job.prepared_input());
-    if let Err(error) = store.retain_upload(bytes) {
-        panic!("the fixture upload retains its content: {error}");
-    }
-    if let Err(error) = store.retain_closure(
-        work,
-        &[reference, hellas_rpc::ContentRef::for_bytes(bytes)],
-        deadline,
-    ) {
-        panic!("the fixture upload records its closure: {error}");
-    }
+pub async fn program_content() -> (
+    hellas_store::content::LocalStore,
+    hellas_store::content::Scope,
+) {
+    use hellas_store::content::*;
+    let store = MemoryStore::new(Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES));
+    let bytes = environment().canonical_bytes().unwrap();
+    let object = hellas_rpc::ContentRef::for_bytes(&bytes);
+    crate::content::upload_bytes(
+        &store,
+        &Scope::Owner,
+        &bytes,
+        Some(crate::content::object_pin(object).unwrap()),
+    )
+    .await
+    .unwrap();
+    (LocalStore::Memory(store), Scope::Owner)
 }

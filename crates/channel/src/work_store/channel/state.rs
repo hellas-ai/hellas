@@ -2,12 +2,11 @@ use super::*;
 use hellas_kernel::PartyAuth;
 
 impl Channel<PaymentFunding> {
-    pub(super) fn restore_client_input(
+    pub(super) fn restore_input(
         &mut self,
         work_id: Digest,
-        input: Vec<u8>,
+        input: bytes::Bytes,
     ) -> Result<(), ChannelStateError> {
-        self.require_role("restoring caller input", Role::Client)?;
         let job = self.book.open_job(work_id, "restoring caller input")?;
         self.check_authorization(&job.authorization, &input, false)?;
         self.book
@@ -343,10 +342,10 @@ impl Channel<PaymentFunding> {
         Ok(())
     }
     fn record_root(&mut self, work: Digest, tree: Option<ContentRef>, applied: Applied) -> Applied {
-        if let Some(tree) = tree {
-            if self.funding.retained_roots.insert(work, tree) != Some(tree) {
-                return Applied::Changed;
-            }
+        if let Some(tree) = tree
+            && self.funding.retained_roots.insert(work, tree) != Some(tree)
+        {
+            return Applied::Changed;
         }
         applied
     }
@@ -1275,7 +1274,7 @@ impl Channel<PaymentFunding> {
         &mut self,
         authorization: &PaidJobAuthorizationV2,
         client_signature: Sig,
-        prepared_input: &[u8],
+        prepared_input: &bytes::Bytes,
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
@@ -1283,8 +1282,11 @@ impl Channel<PaymentFunding> {
         if let Some(job) = self.book.jobs.get(&work_id) {
             if job.authorization == *authorization
                 && job.client_signature == client_signature
-                && job.prepared_input == prepared_input
+                && (job.prepared_input == prepared_input || job.prepared_input.is_empty())
             {
+                if job.prepared_input.is_empty() && !metadata_only {
+                    self.check_authorization(authorization, prepared_input, false)?;
+                }
                 return Ok(Applied::Redundant);
             }
             return Err(ChannelStateError::WrongPhase {
@@ -1322,12 +1324,12 @@ impl Channel<PaymentFunding> {
             JobState {
                 authorization: *authorization,
                 work_id,
-                prepared_input: prepared_input.to_vec(),
+                prepared_input: prepared_input.clone(),
                 client_signature,
                 provider_signature: None,
                 phase: JobPhase::HalfSigned,
                 result: None,
-                transcript: Vec::new(),
+                transcript: bytes::Bytes::new(),
             },
             self.role,
         )
@@ -1403,7 +1405,7 @@ impl Channel<PaymentFunding> {
         work_id: Digest,
         result: &PaidJobResultV1,
         provider_signature: Sig,
-        transcript: &[u8],
+        transcript: &bytes::Bytes,
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
@@ -1423,7 +1425,7 @@ impl Channel<PaymentFunding> {
                     .jobs
                     .get_mut(&work_id)
                     .ok_or(ChannelStateError::Malformed)?
-                    .transcript = transcript.to_vec();
+                    .transcript = transcript.clone();
                 return Ok(Applied::Changed);
             }
             return Err(ChannelStateError::Conflict {
@@ -1485,7 +1487,7 @@ impl Channel<PaymentFunding> {
             });
         }
         self.book
-            .record_result(work_id, *result, provider_signature, transcript.to_vec())
+            .record_result(work_id, *result, provider_signature, transcript.clone())
     }
     /// Full verification precedes a new durable verification decision. Replay
     /// keeps the prior decision without requiring ephemeral bodies to survive.

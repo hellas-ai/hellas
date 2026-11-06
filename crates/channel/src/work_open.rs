@@ -667,7 +667,7 @@ fn mount<'a, V: SigVerifier>(
             settlement,
             store.role(),
             origin,
-            store.content_store(),
+            store.content_store()?,
             verifier,
         )
         .await?;

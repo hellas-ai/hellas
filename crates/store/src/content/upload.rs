@@ -1,7 +1,7 @@
 use hellas_rpc::ContentRef;
 use hellas_xet::{Chunk, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, file_hash};
 
-use super::{Error, PinTarget, ReservationId, Result, Scope, core::Core};
+use super::{Cursor, Error, PinTarget, ReservationId, Result, Scope, chunk_page, core::Core};
 use prost::Message;
 
 /// Declare-then-fill verification. Payload is accepted only after the complete
@@ -36,6 +36,7 @@ enum Destination {
 }
 pub struct UploadSession {
     destination: Destination,
+    copy_charge: Option<std::sync::Arc<super::reservation::Reservation>>,
     object: ContentRef,
     chunks: Vec<Chunk>,
     declared_bytes: u64,
@@ -49,6 +50,7 @@ impl UploadSession {
     pub fn new(object: ContentRef) -> Self {
         Self {
             destination: Destination::Verify,
+            copy_charge: None,
             object,
             chunks: Vec::new(),
             declared_bytes: 0,
@@ -79,6 +81,7 @@ impl UploadSession {
         self.published = false;
         self.previous = Vec::new();
         self.chunks = Vec::new();
+        self.copy_charge = None;
         self.destination = Destination::Verify;
     }
     pub(crate) fn local(object: ContentRef, destination: LocalSession) -> Self {
@@ -96,6 +99,78 @@ impl UploadSession {
         session.destination = Destination::Present;
         session.published = true;
         session
+    }
+    /// Hash a verified owned reader with bounded scratch, then send canonical
+    /// descriptor pages and chunks through this session's ordinary verifier.
+    pub async fn copy_from(
+        &mut self,
+        mut reader: super::VerifiedReader,
+        pool: &super::Reservations,
+    ) -> Result<()> {
+        use std::io::{Read, Seek};
+        let object = self.object;
+        if self.complete() {
+            return Ok(());
+        }
+        let descriptor_bytes = (object.bytes() / MIN_CHUNK_SIZE as u64 + 1)
+            .checked_mul(std::mem::size_of::<Chunk>() as u64)
+            .ok_or(Error::Capacity)?;
+        // Source descriptors, the verifier's list, and the current page coexist;
+        // the current read and previous CDC chunk each need one chunk of scratch.
+        let charge = pool.reserve(
+            descriptor_bytes
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_add((MAX_CHUNK_SIZE * 2) as u64))
+                .ok_or(Error::Capacity)?,
+        )?;
+        let (mut reader, chunks, mut charge) = tokio::task::spawn_blocking(move || {
+            let mut hash = hellas_xet::XetFileHasher::new();
+            let mut remaining = object.bytes();
+            let mut scratch = vec![0; MAX_CHUNK_SIZE];
+            while remaining != 0 {
+                let len = remaining.min(scratch.len() as u64) as usize;
+                reader.read_exact(&mut scratch[..len])?;
+                hash.update(&scratch[..len]);
+                remaining -= len as u64;
+            }
+            if reader.read(&mut [0])? != 0 {
+                return Err(Error::Invalid("upload source grew"));
+            }
+            let chunks = hash.finalize_chunks();
+            if hellas_xet::file_hash(&chunks) != object.id().digest() {
+                return Err(Error::Invalid("upload source changed"));
+            }
+            reader.rewind()?;
+            Ok((reader, chunks, charge))
+        })
+        .await
+        .map_err(|_| Error::Invalid("upload source worker"))??;
+        self.copy_charge = Some(charge.clone());
+        let mut cursor = Cursor::default();
+        loop {
+            let page = chunk_page(object, &chunks, cursor)?;
+            self.declare(&page.chunks, page.next.is_none()).await?;
+            match page.next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        for chunk in chunks {
+            let (returned, bytes, returned_charge) = tokio::task::spawn_blocking(move || {
+                let mut bytes = vec![0; chunk.data_len as usize];
+                reader.read_exact(&mut bytes)?;
+                Ok::<_, Error>((reader, bytes, charge))
+            })
+            .await
+            .map_err(|_| Error::Invalid("upload source worker"))??;
+            reader = returned;
+            charge = returned_charge;
+            self.accept_chunk(&bytes).await?;
+        }
+        if !self.complete() {
+            return Err(Error::Missing);
+        }
+        Ok(())
     }
     pub async fn declare(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
         let result = self.declare_checked(chunks, complete).await;

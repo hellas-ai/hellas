@@ -46,6 +46,7 @@ async fn publish(
     let object = target.object();
     store
         .effect(scope, move |store| {
+            store.require_ready()?;
             store.publish_acquired(
                 stages
                     .into_values()
@@ -364,7 +365,7 @@ impl Core {
         if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
             return Err(Error::Denied);
         }
-        self.access(scope, |_| Ok(())).await?;
+        self.access(scope, |core| core.require_ready()).await?;
         let core = self.clone();
         let resolving = repo.clone();
         let sha = tokio::task::spawn_blocking(move || {
@@ -398,7 +399,7 @@ impl Core {
         scope: &Scope,
         repo: crate::hf::Repo,
     ) -> Result<(String, ContentRef)> {
-        self.access(scope, |_| Ok(())).await?;
+        self.access(scope, |core| core.require_ready()).await?;
         let core = self.clone();
         let id = repo.id.clone();
         let sha = repo.revision.clone();

@@ -40,7 +40,13 @@ message ReadResponse { ContentRef object = 1; uint64 offset = 2; bytes data = 3;
 // authorization body. The funding host decodes its existing AcceptWorkRequest
 // envelope (route, authorization, client signature and prepared reference).
 // Generic content storage never interprets this application-owned envelope.
-message WorkOpening { bytes signed_opening = 1; bytes manifest = 2; ContentRef root = 3; }
+message WorkOpening {
+  bytes signed_opening = 1;
+  bytes manifest = 2;
+  ContentRef root = 3;
+  // One application signature binds this opening to the live connection.
+  bytes binding_signature = 4;
+}
 message UploadOpen { ContentRef object = 1; PinTarget pin = 2; WorkOpening work = 3; }
 message ChunkList { repeated Chunk chunks = 1; bool complete = 2; }
 message UploadRequest {
