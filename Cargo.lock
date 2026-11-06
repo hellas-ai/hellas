@@ -782,7 +782,7 @@ dependencies = [
 [[package]]
 name = "catena-models"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-models.git?rev=2c147f7#2c147f7e0c2ee2e006ea9b78513a32e70720f9d0"
+source = "git+https://github.com/hellas-ai/catena-models.git?rev=1fc1c9a40412ffd04bfe6dc51544e58c57fa21cb#1fc1c9a40412ffd04bfe6dc51544e58c57fa21cb"
 dependencies = [
  "anyhow",
  "catena-lang",
@@ -3242,6 +3242,7 @@ dependencies = [
  "hellas-store",
  "hellas-wire",
  "hex",
+ "hexpr",
  "hound",
  "iroh",
  "iroh-mdns-address-lookup",

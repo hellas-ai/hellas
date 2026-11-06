@@ -72,23 +72,29 @@ pkgs.writeShellApplication {
 
     builds=$(jq -s 'add' <(api "/eval/$cli_eval/builds") <(api "/eval/$gpu_eval/builds"))
     output() {
-      jq -er --arg job "$1" '[.[] | select(.job == $job and .buildstatus == 0)][0].buildoutputs.out.path' <<< "$builds"
+      jq -er --arg job "$1" '[.[] | select(.job == $job and .buildstatus == 0)][0].buildoutputs.out.path // error("missing successful artifact job: \($job)")' <<< "$builds"
     }
     version=$(jq -er '[.[] | select(.job == "x86_64-linux.validation")][0].nixname | ltrimstr("hellas-cli-validation-")' <<< "$builds")
+    image_jobs=(network:x86_64-linux.artifacts.network-image hip:x86_64-linux.artifacts.hip-image cuda:x86_64-linux.artifacts.cuda-image)
+    archive_jobs=(x86_64-linux.artifacts.portable-x86_64 x86_64-linux.artifacts.portable-aarch64 aarch64-darwin.artifacts.portable-aarch64 x86_64-linux.artifacts.wasm)
+    # Resolve the complete release before changing any published tags.
+    for job in "''${image_jobs[@]#*:}" "''${archive_jobs[@]}" x86_64-linux.artifacts.installer; do
+      output "$job" > /dev/null
+    done
 
     # Fetching from the cache checks its signature; each artifact then
     # checks its own archive against the SHA256SUMS built beside it.
     fetch() {
       local path
-      path=$(output "$1")
-      nix copy --from "$cache" --option trusted-public-keys "$cache_key" "$path" >&2
-      (cd "$path" && sha256sum --check --quiet SHA256SUMS) >&2
+      path=$(output "$1") || return
+      nix copy --from "$cache" --option trusted-public-keys "$cache_key" "$path" >&2 || return
+      (cd "$path" && sha256sum --check --quiet SHA256SUMS) >&2 || return
       echo "$path"
     }
 
     config_digest() { skopeo inspect --raw --config "$1" | sha256sum | cut -d' ' -f1; }
     digests=""
-    for backend in network:x86_64-linux.artifacts.network-image hip:x86_64-linux.artifacts.hip-image cuda:x86_64-linux.artifacts.cuda-image; do
+    for backend in "''${image_jobs[@]}"; do
       name=''${backend%%:*}
       path=$(fetch "''${backend#*:}")
       archive="docker-archive:$path/hellas-$name-$revision.tar.gz"
@@ -123,7 +129,7 @@ pkgs.writeShellApplication {
     staged=$(mktemp -d --tmpdir="''${RUNNER_TEMP:-$PWD}" hellas-publish.XXXXXX)
     trap 'rm -rf "$staged"' EXIT
     sums=$staged/SHA256SUMS
-    for job in x86_64-linux.artifacts.portable-x86_64 x86_64-linux.artifacts.portable-aarch64 aarch64-darwin.artifacts.portable-aarch64 x86_64-linux.artifacts.wasm; do
+    for job in "''${archive_jobs[@]}"; do
       path=$(fetch "$job")
       cat "$path/SHA256SUMS" >> "$sums"
       assets+=("$path"/*.tar.gz)
