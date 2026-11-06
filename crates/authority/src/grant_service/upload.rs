@@ -49,6 +49,10 @@ impl GrantWork {
                 let prior = store
                     .precheck_acceptance(&a, client, &signature, now)
                     .await?;
+                let now = self.service.node.observed_time(&store);
+                if prior.is_none() && now > a.acceptance_deadline_ms {
+                    return Err(refused(GrantRefusalCode::Expired));
+                }
                 let policy = store.state().policy_for(&a)?.invocation_policy.clone();
                 let preflight = (|| -> Result<_, WorkRefused> {
                     if request.program_manifest.len() > 4096 {

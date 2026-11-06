@@ -165,6 +165,8 @@ pub struct Journal {
     records: u64,
     bytes: u64,
     poisoned: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    test_path: PathBuf,
 }
 
 impl Drop for Journal {
@@ -315,6 +317,8 @@ impl Journal {
             records: records_len,
             bytes,
             poisoned: false,
+            #[cfg(any(test, feature = "test-support"))]
+            test_path: path,
         };
         Ok((
             journal,
@@ -491,6 +495,8 @@ impl Journal {
         self.poisoned = true;
         let insert = sqlx::query!("INSERT INTO record (payload) VALUES (?)", payload);
         insert.execute(connection).await?;
+        #[cfg(any(test, feature = "test-support"))]
+        test_support::after_append(&self.test_path, payload).await;
         if let Some(ms) = fsync.ms() {
             tracing::event!(
                 name: "fsync_tail_ms", target: TARGET, LEVEL,
@@ -579,4 +585,4 @@ mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod test_support;
+pub mod test_support;

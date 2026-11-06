@@ -770,3 +770,36 @@ async fn stalled_local_transport_setup_keeps_its_control_timeout() {
     assert_err!(result, GrantClientError::Timeout);
     drop(held);
 }
+
+#[tokio::test]
+async fn prepared_resource_gets_fresh_admission_standing() {
+    let f = Fixture::new().await;
+    let mut session = f.session().await;
+    let input = f.input();
+    // The resource was selected and prepared from the previous standing.
+    f.clock.set(UnixMillis(61_000));
+    session
+        .run_current(
+            f.grant.policies[0].resource,
+            input,
+            &InvocationContent::Ephemeral(Default::default()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    session.shutdown().await.unwrap();
+}
+
+/// Open while the journal holds its first durable acknowledgement.
+pub(crate) async fn delayed_open_keeps_response_arrival_clock(
+    arm: impl FnOnce(&std::path::Path) -> hellas_channel::work_store::journal::test_support::AppendHook,
+) {
+    let f = Fixture::new().await;
+    let _hook = arm(&f.options().journal_root);
+    let mut session = f.session().await;
+    assert!(session.now().0 >= session.standing_now.0 + 500);
+    session.shutdown().await.unwrap();
+}

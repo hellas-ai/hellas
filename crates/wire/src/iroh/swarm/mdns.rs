@@ -56,11 +56,20 @@ fn classify_user_data_alpn(user_data: Option<&str>, alpn: &[u8]) -> UserDataAlpn
 // Feed builder.
 // ---------------------------------------------------------------------------
 
-fn mdns_feed(mdns: Arc<MdnsAddressLookup>, alpn: Vec<u8>, priority: u8, trust: u8) -> PeerFeedSpec {
+fn mdns_feed(
+    mdns: Arc<MdnsAddressLookup>,
+    alpn: Vec<u8>,
+    priority: u8,
+    trust: u8,
+    ready: Option<tokio::sync::watch::Sender<bool>>,
+) -> PeerFeedSpec {
     let scope_alpn = alpn.clone();
     let peer_trust = trust;
     let stream = async_stream::try_stream! {
         let mut sub = mdns.subscribe().await;
+        // subscribe() enqueues registration on the actor's FIFO mailbox.
+        // Advertisements sent after readiness cannot overtake that registration.
+        if let Some(ready) = ready { ready.send_replace(true); }
         while let Some(event) = sub.next().await {
             if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
                 let endpoint_id = endpoint_info.endpoint_id;
@@ -101,6 +110,7 @@ pub struct MdnsBackend {
     mdns: Arc<MdnsAddressLookup>,
     priority: u8,
     trust: u8,
+    ready: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl MdnsBackend {
@@ -111,6 +121,7 @@ impl MdnsBackend {
             mdns: Arc::new(mdns),
             priority: 50,
             trust: 200,
+            ready: None,
         }
     }
 
@@ -121,7 +132,15 @@ impl MdnsBackend {
             mdns,
             priority: 50,
             trust: 200,
+            ready: None,
         }
+    }
+
+    /// Notify when the first discovery feed has subscribed to mDNS events.
+    #[must_use]
+    pub fn notify_subscribed(mut self, ready: tokio::sync::watch::Sender<bool>) -> Self {
+        self.ready = Some(ready);
+        self
     }
 
     /// Set the feed priority (lower = polled first). Default: 50.
@@ -150,6 +169,7 @@ impl Discovery for MdnsBackend {
             alpn.to_vec(),
             self.priority,
             self.trust,
+            self.ready.clone(),
         )]
     }
 }
@@ -175,6 +195,31 @@ pub fn encode_alpns(alpns: &[Vec<u8>]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_requires_polling_the_lazy_subscription_not_a_discovered_peer() {
+        let id = iroh::SecretKey::generate().public();
+        let mdns = MdnsAddressLookup::builder()
+            .advertise(false)
+            .service_name(format!("ready-{}", &id.to_string()[..12]))
+            .build(id)
+            .unwrap();
+        let (ready, mut subscribed) = tokio::sync::watch::channel(false);
+        let backend = MdnsBackend::new(mdns).notify_subscribed(ready);
+        let mut feed = backend.feeds(b"readiness-test").remove(0).stream;
+        assert!(!*subscribed.borrow());
+        let polling = tokio::spawn(async move { feed.next().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscribed.wait_for(|ready| *ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!polling.is_finished(), "readiness does not require a peer");
+        polling.abort();
+        let _ = polling.await;
+    }
 
     #[test]
     fn classify_user_data_alpn_distinguishes_missing_match_and_mismatch() {

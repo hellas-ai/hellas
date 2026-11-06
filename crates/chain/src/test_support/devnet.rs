@@ -206,6 +206,8 @@ const VALIDATOR_LABELS: [&str; VALIDATORS] = [
 /// Six validators on one genesis, and the proposer they do not have.
 pub struct Devnet {
     validators: Vec<Validator>,
+    runtime_guard: Option<Runtime>,
+    executor: tokio::runtime::Handle,
     fixture: ConsensusFixture,
     document: Genesis,
     consensus_info: ConsensusInfo,
@@ -215,7 +217,7 @@ pub struct Devnet {
     full_nodes: Vec<crate::node::FullNode>,
     rpc: tokio::task::JoinSet<()>,
     activity: Vec<tokio::sync::broadcast::Sender<crate::ConsensusActivity>>,
-    storage: tempfile::TempDir,
+    storage: Option<tempfile::TempDir>,
     head: HellasBlock,
     height: u64,
     /// Every transaction already in finalized history, by digest.
@@ -389,6 +391,8 @@ impl Devnet {
 
             let mut devnet = Self {
                 validators,
+                runtime_guard: Some(runtime.child("devnet_teardown")),
+                executor: tokio::runtime::Handle::current(),
                 fixture,
                 document,
                 consensus_info,
@@ -398,14 +402,14 @@ impl Devnet {
                 full_nodes: Vec::new(),
                 rpc,
                 activity,
-                storage,
+                storage: Some(storage),
                 head: genesis,
                 height: 0,
                 included: BTreeSet::new(),
             };
             for ordinal in 0..full_node_count {
                 let mut config = devnet.full_node_config(
-                    devnet.storage.path().join(format!("full-node-{ordinal}")),
+                    devnet.storage().join(format!("full-node-{ordinal}")),
                     ordinal,
                 );
                 config
@@ -416,6 +420,10 @@ impl Devnet {
             }
             devnet
         })
+    }
+
+    fn storage(&self) -> &Path {
+        self.storage.as_ref().expect("live devnet storage").path()
     }
 
     /// The genesis document every validator started from.
@@ -464,7 +472,7 @@ impl Devnet {
             self.owners.contains(owner),
             "a genesis owner of this devnet"
         );
-        owner_file(self.storage.path(), owner)
+        owner_file(self.storage(), owner)
     }
 
     /// Validator `validator`'s light-client WebSocket URL.
@@ -754,14 +762,52 @@ impl Devnet {
     /// Stops every full node and server, then every follower indexer
     /// before the commonware runtime that owns it is dropped.
     pub async fn shutdown(mut self) {
-        for node in self.full_nodes {
-            node.shutdown().await.unwrap();
+        stop(
+            std::mem::take(&mut self.full_nodes),
+            std::mem::take(&mut self.rpc),
+            std::mem::take(&mut self.validators),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn stop(
+    nodes: Vec<crate::node::FullNode>,
+    mut rpc: tokio::task::JoinSet<()>,
+    validators: Vec<Validator>,
+) -> Result<(), crate::node::Error> {
+    let mut result = Ok(());
+    for node in nodes {
+        if let Err(error) = node.shutdown().await {
+            result = Err(error);
         }
-        self.rpc.shutdown().await;
-        for validator in self.validators {
-            validator.task.abort();
-            let _ = validator.task.await;
-        }
+    }
+    rpc.shutdown().await;
+    for validator in validators {
+        validator.task.abort();
+        let _ = validator.task.await;
+    }
+    result
+}
+
+impl Drop for Devnet {
+    fn drop(&mut self) {
+        let validators = std::mem::take(&mut self.validators);
+        let Some(runtime) = self.runtime_guard.take() else {
+            return;
+        };
+        let nodes = std::mem::take(&mut self.full_nodes);
+        let rpc = std::mem::take(&mut self.rpc);
+        let storage = self.storage.take();
+        // Keep the runtime and its storage alive until all fixture tasks stop,
+        // including when a test unwinds before calling shutdown().
+        let cleanup = self.executor.spawn(stop(nodes, rpc, validators));
+        std::thread::spawn(move || {
+            let _ = futures::executor::block_on(cleanup);
+            drop(runtime);
+            drop(storage);
+        });
     }
 }
 
