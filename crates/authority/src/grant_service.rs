@@ -433,7 +433,7 @@ impl GrantService {
                 let now = self.node.observed_time(&store);
                 access.authorize(&store, a.grant_id, now)?;
                 let reference =
-                    hellas_rpc::protocol::content_upload::decode_reference(&request.prepared_input)
+                    hellas_rpc::protocol::content::decode_reference(&request.prepared_input)
                         .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
                 let prepared_input = self
                     .inner

@@ -306,7 +306,7 @@ pub fn fixture_uploads(
     Vec<hellas_rpc::pb::work::UploadContentRequest>,
 ) {
     use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _};
-    use hellas_rpc::protocol::content_upload::decode_reference;
+    use hellas_rpc::protocol::content::decode_reference;
     let wire = request.clone();
     let Ok(_) = PaidJobAuthorizationV2::decode(&request.authorization) else {
         return (wire, Vec::new());
@@ -333,8 +333,9 @@ pub fn input_uploads(
     Vec<hellas_rpc::pb::work::UploadContentRequest>,
 ) {
     use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id};
-    use hellas_rpc::protocol::content_upload::{
-        CONTENT_CHUNK_BYTES, chunk_digest, encode_reference,
+    use hellas_rpc::protocol::{
+        content::encode_reference,
+        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
     };
     let mut wire = request.clone();
     let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {

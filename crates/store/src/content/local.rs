@@ -1,10 +1,7 @@
 //! Executor-local verified handles; remote stores never enter this enum.
 use super::{core::Core, storage::Data, *};
-use hellas_rpc::{ContentId, ContentRef};
-use std::{
-    collections::BTreeMap,
-    io::{Cursor, Read, Seek},
-};
+use hellas_rpc::ContentRef;
+use std::io::{Cursor, Read, Seek};
 
 pub enum VerifiedReader {
     File(crate::VerifiedFile),
@@ -46,13 +43,12 @@ impl JobContent {
         job: JobId,
         closure: Closure,
         max_upload_bytes: u64,
-        bindings: BTreeMap<ContentId, Path>,
     ) -> Result<Self> {
         if !node.core.disk.as_ref().unwrap().ready() {
             return Err(Error::Denied);
         }
         let mut core = Core::new(node.core.pool.clone());
-        core.lower = Some((Box::new(node.core.clone()), bindings));
+        core.lower = Some(Box::new(node.core.clone()));
         let scope = core
             .clone()
             .access(&Scope::Owner, move |core| {
@@ -61,6 +57,16 @@ impl JobContent {
             .await?;
         Ok(Self {
             upper: MemoryStore { core },
+            scope,
+        })
+    }
+    pub async fn widen(&self, closure: Closure, max_upload_bytes: u64) -> Result<Self> {
+        let scope = self
+            .upper
+            .widen_work(&self.scope, closure, max_upload_bytes)
+            .await?;
+        Ok(Self {
+            upper: self.upper.clone(),
             scope,
         })
     }

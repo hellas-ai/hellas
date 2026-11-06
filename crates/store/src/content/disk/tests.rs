@@ -390,16 +390,9 @@ async fn jobs_wait_for_provider_pin_commit_and_ignore_failed_pending_policy() {
         channel: hellas_auth::Digest::from_bytes([1; 32]),
         id: hellas_auth::Digest::from_bytes([2; 32]),
     };
-    let bindings = BTreeMap::from([(object.id(), at("held"))]);
-    let job = JobContent::new(
-        &store,
-        job_id,
-        vec![object],
-        object.bytes(),
-        bindings.clone(),
-    )
-    .await
-    .unwrap();
+    let job = JobContent::new(&store, job_id, vec![object], object.bytes())
+        .await
+        .unwrap();
     let local = LocalStore::Job(job.clone());
     sqlx::raw_sql("CREATE TRIGGER reject_pin BEFORE INSERT ON pins BEGIN SELECT RAISE(ABORT,'injected'); END;").execute(&store.core.disk.as_ref().unwrap().db).await.unwrap();
     let tx = store.core.disk.as_ref().unwrap().db.begin().await.unwrap();
@@ -433,7 +426,6 @@ async fn jobs_wait_for_provider_pin_commit_and_ignore_failed_pending_policy() {
         },
         vec![object],
         0,
-        bindings,
     );
     tokio::pin!(admitting);
     assert!(admitting.as_mut().now_or_never().is_none());
@@ -480,7 +472,7 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
         LocalStore::Disk(store.clone())
             .open_verified(&scope, object, None)
             .await,
-        Err(Error::Denied)
+        Ok(None)
     ));
     // The owner removes the deliberately corrupt foreign destination; retry
     // must use the original verified staging rather than downloading again.

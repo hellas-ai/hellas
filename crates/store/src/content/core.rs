@@ -19,7 +19,7 @@ pub(crate) struct Core {
     pub(crate) hf_hub: Option<String>,
     pub(crate) disk: Option<Arc<super::disk::Disk>>,
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) lower: Option<(Box<Core>, BTreeMap<ContentId, Path>)>,
+    pub(crate) lower: Option<Box<Core>>,
 }
 pub(crate) struct Stored {
     last_read: std::sync::atomic::AtomicU64,
@@ -45,6 +45,8 @@ struct Work {
     staged: BTreeMap<ContentId, Arc<Stored>>,
 }
 pub(crate) struct State {
+    #[cfg(test)]
+    tree_reads: std::sync::atomic::AtomicU64,
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
     pub(crate) pins: BTreeMap<PinName, PinValue>,
     work: BTreeMap<ReservationId, Work>,
@@ -68,6 +70,8 @@ impl Core {
             hf_hub: None,
             changed: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(Mutex::new(State {
+                #[cfg(test)]
+                tree_reads: std::sync::atomic::AtomicU64::new(0),
                 objects: BTreeMap::new(),
                 pins: BTreeMap::new(),
                 work: BTreeMap::new(),
@@ -479,6 +483,9 @@ impl State {
             .check(target.object())
     }
     fn load(&self, target: Target) -> Result<Bytes> {
+        #[cfg(test)]
+        self.tree_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         checked_bytes(
             self.objects
                 .get(&target.object().id())
@@ -488,20 +495,25 @@ impl State {
     }
     /// ID-deduplicated traversal propagates the longest prefix of each shared
     /// subtree, so aliases cannot hide a path overflow or cause exponential walks.
-    fn walk(&self, root: Target) -> Result<BTreeSet<ContentId>> {
+    fn walk(&self, roots: impl IntoIterator<Item = Target>) -> Result<BTreeSet<ContentRef>> {
         let mut reached = BTreeSet::new();
         let mut longest = BTreeMap::new();
-        let mut pending = vec![(root, 0usize)];
+        let mut pending = roots
+            .into_iter()
+            .map(|root| (root, 0usize))
+            .collect::<Vec<_>>();
         while let Some((target, path_len)) = pending.pop() {
-            reached.insert(target.object().id());
+            reached.insert(target.object());
             if let Target::Tree(object) = target {
-                if longest
-                    .get(&object.id())
-                    .is_some_and(|old| *old >= path_len)
-                {
-                    continue;
+                if let Some((previous, length)) = longest.get(&object.id()) {
+                    if *previous != object {
+                        return Err(Error::Invalid("conflicting tree lengths"));
+                    }
+                    if *length >= path_len {
+                        continue;
+                    }
                 }
-                longest.insert(object.id(), path_len);
+                longest.insert(object.id(), (object, path_len));
                 for (name, child) in Tree::decode(&self.load(target)?)?.entries() {
                     let length = path_len + usize::from(path_len != 0) + name.len();
                     if length > MAX_PATH_BYTES {
@@ -513,17 +525,35 @@ impl State {
         }
         Ok(reached)
     }
+    fn readable_refs(&self, scope: &Scope) -> Result<BTreeSet<ContentRef>> {
+        self.walk(
+            self.pins
+                .iter()
+                .filter(|(name, pin)| readable(scope, name, pin))
+                .map(|(_, pin)| pin.target),
+        )
+    }
     fn present(&self, scope: &Scope, object: ContentRef) -> Result<bool> {
-        for (name, pin) in &self.pins {
-            if readable(scope, name, pin)
-                && self.walk(pin.target)?.contains(&object.id())
-                && let Some(stored) = self.objects.get(&object.id())
-                && available(stored, object)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(self.readable_refs(scope)?.contains(&object)
+            && self
+                .objects
+                .get(&object.id())
+                .map(|stored| available(stored, object))
+                .transpose()?
+                .unwrap_or(false))
+    }
+    fn held(&self, scope: &Scope, closure: &[ContentRef]) -> Result<BTreeSet<ContentId>> {
+        let reachable = self.readable_refs(scope)?;
+        Ok(closure
+            .iter()
+            .filter(|object| {
+                reachable.contains(object)
+                    && self.objects.get(&object.id()).is_some_and(|stored| {
+                        stored.data.len() == object.bytes() && stored.data.available()
+                    })
+            })
+            .map(|object| object.id())
+            .collect())
     }
     fn missing(
         &self,
@@ -531,12 +561,7 @@ impl State {
         closure: &[ContentRef],
         lower: &BTreeSet<ContentId>,
     ) -> Result<u64> {
-        let mut reachable = BTreeSet::new();
-        for (name, pin) in &self.pins {
-            if readable(scope, name, pin) {
-                reachable.extend(self.walk(pin.target)?);
-            }
-        }
+        let held = self.held(scope, closure)?;
         closure
             .iter()
             .filter(|object| {
@@ -548,12 +573,7 @@ impl State {
                 } else {
                     false
                 };
-                owned
-                    || (!lower.contains(&object.id())
-                        && (!reachable.contains(&object.id())
-                            || self.objects.get(&object.id()).is_none_or(|stored| {
-                                stored.data.len() != object.bytes() || !stored.data.available()
-                            })))
+                owned || (!lower.contains(&object.id()) && !held.contains(&object.id()))
             })
             .try_fold(0u64, |total, object| {
                 total.checked_add(object.bytes()).ok_or(Error::Capacity)
@@ -763,7 +783,7 @@ impl Core {
             return Err(Error::Conflict);
         }
         if let Some(value) = &new {
-            state.walk(value.target)?;
+            state.walk([value.target])?;
             state.check_object(value.target)?;
         }
         state.change_pin(name.clone(), new)?;
@@ -938,10 +958,17 @@ impl Core {
             .state
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
-        let mut reached = BTreeSet::new();
-        for pin in state.pins.values().filter(|pin| live(pin)) {
-            reached.extend(state.walk(pin.target)?);
-        }
+        let mut reached: BTreeSet<ContentId> = state
+            .walk(
+                state
+                    .pins
+                    .values()
+                    .filter(|pin| live(pin))
+                    .map(|pin| pin.target),
+            )?
+            .into_iter()
+            .map(|object| object.id())
+            .collect();
         if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
             return Err(Error::Denied);
         }
@@ -1022,7 +1049,7 @@ impl Core {
         };
         let gate = self.gate.clone().lock_owned().await;
         let lower = match &self.lower {
-            Some((lower, _)) => Some(lower.gate.clone().lock_owned().await),
+            Some(lower) => Some(lower.gate.clone().lock_owned().await),
             None => None,
         };
         if let Some(check) = &authority {
@@ -1254,26 +1281,14 @@ impl Core {
         state.missing(scope, closure, &self.held_lower(scope, closure)?)
     }
     fn held_lower(&self, scope: &Scope, closure: &[ContentRef]) -> Result<BTreeSet<ContentId>> {
-        let mut held = BTreeSet::new();
-        if let Some((lower, bindings)) = &self.lower {
-            let lower = lower
+        match &self.lower {
+            Some(lower) => lower
                 .state
                 .lock()
-                .map_err(|_| Error::Invalid("lower lock"))?;
-            for object in closure {
-                if let Some(at) = bindings.get(&object.id())
-                    && lower
-                        .resolve_path(scope, at)?
-                        .is_some_and(|target| target.object() == *object)
-                    && lower.objects.get(&object.id()).is_some_and(|stored| {
-                        stored.data.len() == object.bytes() && stored.data.available()
-                    })
-                {
-                    held.insert(object.id());
-                }
-            }
+                .map_err(|_| Error::Invalid("lower lock"))?
+                .held(scope, closure),
+            None => Ok(BTreeSet::new()),
         }
-        Ok(held)
     }
     pub(crate) fn verified(
         &self,
@@ -1287,49 +1302,49 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        if job_upper
-            && let ScopeKind::Work {
-                reservation,
-                closure,
-                ..
-            } = &scope.kind
+        if let ScopeKind::Work {
+            reservation,
+            closure,
+            ..
+        } = &scope.kind
         {
             if !closure.contains(&object) {
                 return Err(Error::Denied);
             }
-            if let Some(stored) = state
-                .work
-                .get(reservation)
-                .and_then(|work| work.staged.get(&object.id()))
+            if job_upper
+                && let Some(stored) = state
+                    .work
+                    .get(reservation)
+                    .and_then(|work| work.staged.get(&object.id()))
             {
                 let reader = super::local::reader(&stored.data, object)?;
                 state.touch(stored);
                 return Ok(Some(reader));
             }
         }
-        let at = at.ok_or(Error::Denied)?;
-        if state
-            .resolve(scope, at)?
-            .is_some_and(|target| target.object() == object)
-            && let Some(stored) = state.objects.get(&object.id())
-        {
+        let readable = match at {
+            Some(at) => state
+                .resolve(scope, at)?
+                .is_some_and(|target| target.object() == object),
+            None => state.present(scope, object)?,
+        };
+        if readable && let Some(stored) = state.objects.get(&object.id()) {
             let reader = super::local::reader(&stored.data, object)?;
             state.touch(stored);
             return Ok(Some(reader));
         }
-        if job_upper && let Some((lower, bindings)) = &self.lower {
-            if bindings.get(&object.id()) != Some(at) {
-                return Err(Error::Denied);
-            }
+        if job_upper && let Some(lower) = &self.lower {
             let lower = lower
                 .state
                 .lock()
                 .map_err(|_| Error::Invalid("lower lock"))?;
-            if lower
-                .resolve_path(scope, at)?
-                .is_some_and(|target| target.object() == object)
-                && let Some(stored) = lower.objects.get(&object.id())
-            {
+            let readable = match at {
+                Some(at) => lower
+                    .resolve_path(scope, at)?
+                    .is_some_and(|target| target.object() == object),
+                None => lower.present(scope, object)?,
+            };
+            if readable && let Some(stored) = lower.objects.get(&object.id()) {
                 let reader = super::local::reader(&stored.data, object)?;
                 lower.touch(stored);
                 return Ok(Some(reader));
@@ -1452,9 +1467,12 @@ impl State {
             }
             previous.push((id, self.objects.insert(id, stored)));
         }
-        let reached = match self.walk(target).and_then(|reached| {
+        let reached = match self.walk([target]).and_then(|reached| {
             self.check_object(target)?;
-            Ok(reached)
+            Ok(reached
+                .into_iter()
+                .map(|object| object.id())
+                .collect::<BTreeSet<_>>())
         }) {
             Ok(reached) => reached,
             Err(error) => {

@@ -137,8 +137,8 @@ fn no_closure_payloads_on_disk(root: &std::path::Path, objects: &[Vec<u8>]) {
 #[tokio::test]
 async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_files_or_database_rows()
  {
-    use hellas_rpc::protocol::content_upload::{chunk_digest, encode_reference};
     use hellas_rpc::protocol::invocation::compute::{Environment, NamedAsset};
+    use hellas_rpc::protocol::{content::encode_reference, content_upload::chunk_digest};
     let directory = tempfile::tempdir().unwrap();
     let (node, mut proposal) = compute_node(directory.path(), false).await;
     let source = b"grant-private-program-source-7321".to_vec();

@@ -75,7 +75,7 @@ impl PrivateRecord for GrantJobAuthorizationV1 {
         out.extend_from_slice(&self.resource_revision.0.to_be_bytes());
         out.extend_from_slice(&self.pricing_revision.0.to_be_bytes());
         out.extend_from_slice(self.work_policy_digest.as_bytes());
-        out.extend_from_slice(&hellas_rpc::protocol::content_upload::encode_reference(
+        out.extend_from_slice(&hellas_rpc::protocol::content::encode_reference(
             self.input_content,
         ));
         out.extend_from_slice(self.prepared_input_digest.as_bytes());

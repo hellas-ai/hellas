@@ -124,7 +124,7 @@ use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
 mod upload;
-use hellas_rpc::protocol::content_upload::{decode_reference, encode_reference};
+use hellas_rpc::protocol::content::{decode_reference, encode_reference};
 use hellas_rpc::{ContentId, ContentRef};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};

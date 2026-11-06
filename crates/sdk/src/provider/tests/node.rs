@@ -632,7 +632,10 @@ fn upload_messages(
 ) {
     use hellas_rpc::{
         ContentRef,
-        protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
+        protocol::{
+            content::encode_reference,
+            content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
+        },
     };
     let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     let key = [OfferFixture::first(), OfferFixture::second()]
@@ -4138,7 +4141,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     ));
     let mut unmounted_grant = first.signed_accept_request();
     unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
-    unmounted_grant.prepared_input = hellas_rpc::protocol::content_upload::encode_reference(
+    unmounted_grant.prepared_input = hellas_rpc::protocol::content::encode_reference(
         hellas_rpc::ContentRef::for_bytes(&unmounted_grant.prepared_input),
     );
     let response: WithTrailer<AcceptWorkResponse> = mounted

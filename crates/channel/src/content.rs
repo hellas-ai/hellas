@@ -9,10 +9,15 @@ use std::{
 use hellas_auth::Digest;
 use hellas_rpc::{
     ContentId, ContentRef, Retention,
-    protocol::content_upload::{CONTENT_CHUNK_BYTES, decode_reference, encode_reference},
+    protocol::{
+        content::{decode_reference, encode_reference},
+        content_upload::CONTENT_CHUNK_BYTES,
+    },
 };
 use hellas_store::ContentStore;
 
+mod tree;
+pub(crate) use tree::{job_tree, tree_reservation};
 mod view;
 pub use view::{EphemeralContent, InvocationContent};
 

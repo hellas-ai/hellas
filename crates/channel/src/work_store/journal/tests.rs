@@ -193,3 +193,48 @@ async fn a_rotation_leaves_no_deleted_record_on_disk() {
         );
     }
 }
+
+#[tokio::test]
+async fn pre_cutover_journals_are_refused_without_migration_or_legacy_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = Journal::path(directory.path(), "old");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql(include_str!("schema.sql"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO record(payload) VALUES (?)")
+        .bind(b"old private metadata".as_slice())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    assert!(matches!(
+        Journal::open_latest(directory.path(), "old", id()).await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    assert!(matches!(
+        Journal::open_existing(directory.path(), "old", id()).await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    assert!(matches!(
+        Journal::inspect(directory.path(), "old").await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let bytes: Vec<u8> = sqlx::query_scalar("SELECT payload FROM record")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"old private metadata");
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(version, 0);
+    connection.close().await.unwrap();
+}

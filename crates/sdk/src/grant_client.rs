@@ -19,7 +19,10 @@ use hellas_rpc::protocol::invocation::{
 };
 use hellas_rpc::{
     ContentId, ContentRef,
-    protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
+    protocol::{
+        content::encode_reference,
+        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
+    },
 };
 use hellas_rpc::{
     OutputEventEnvelope, ProviderEnrollmentBundle,

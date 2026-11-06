@@ -152,7 +152,7 @@ fn request(authorization: &PaidJobAuthorizationV2, signature: Sig, nonce: u8) ->
         )),
         authorization: authorization.encode(),
         client_signature: signature.as_bytes().to_vec(),
-        prepared_input: hellas_rpc::protocol::content_upload::encode_reference(
+        prepared_input: hellas_rpc::protocol::content::encode_reference(
             hellas_rpc::ContentRef::new(
                 ContentId::hash(&bundle_bytes(nonce)),
                 bundle_bytes(nonce).len() as u64,
@@ -992,7 +992,7 @@ async fn a_client_journals_its_signature_before_the_request_leaves() {
     );
     assert_eq!(job.authorization().encode(), request.authorization);
     assert_eq!(
-        hellas_rpc::protocol::content_upload::encode_reference(hellas_rpc::ContentRef::new(
+        hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::new(
             ContentId::hash(job.prepared_input()),
             job.prepared_input().len() as u64
         )),
@@ -1986,7 +1986,7 @@ async fn the_wire_carries_the_authorization_the_signature_covers() {
     );
     assert_eq!(
         request.prepared_input,
-        hellas_rpc::protocol::content_upload::encode_reference(hellas_rpc::ContentRef::new(
+        hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::new(
             ContentId::hash(&bundle_bytes(1)),
             bundle_bytes(1).len() as u64
         ))

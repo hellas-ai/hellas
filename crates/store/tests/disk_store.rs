@@ -2,7 +2,7 @@ use futures::StreamExt;
 use hellas_auth::Digest;
 use hellas_rpc::ContentRef;
 use hellas_store::content::*;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 fn name(s: &str) -> PinName {
     PinName::new(s.into()).unwrap()
 }
@@ -333,15 +333,9 @@ async fn job_memory_uses_declared_live_lower_pins_and_never_spills_its_own_bytes
     store.finish_recovery().await.unwrap();
     let held = put(&store, "held", b"weights").await;
     let own = ContentRef::for_bytes(b"ephemeral");
-    let job = JobContent::new(
-        &store,
-        job(),
-        vec![held, own],
-        own.bytes(),
-        BTreeMap::from([(held.id(), path("held"))]),
-    )
-    .await
-    .unwrap();
+    let job = JobContent::new(&store, job(), vec![held, own], own.bytes())
+        .await
+        .unwrap();
     let before = store.stats().unwrap().used;
     fill(
         job.store().upload(job.scope(), own, None).await.unwrap(),
@@ -517,4 +511,130 @@ async fn publication_keeps_the_lower_alternative_when_the_upper_is_later_collect
             .join(object.id().to_string())
             .exists()
     );
+}
+
+#[tokio::test]
+async fn root_only_memory_job_widens_and_resolves_live_held_pins_without_a_host_id_map() {
+    let root = tempfile::tempdir().unwrap();
+    let node = open(root.path().join("upper"), vec![], IndexMode::Resume, None).await;
+    node.finish_recovery().await.unwrap();
+    let held = put(&node, "held", b"provider weights").await;
+    let bytes = b"application-owned root";
+    let reference = ContentRef::for_bytes(bytes);
+    let job = JobContent::new(&node, job(), vec![reference], reference.bytes())
+        .await
+        .unwrap();
+    fill(
+        job.store()
+            .upload(job.scope(), reference, None)
+            .await
+            .unwrap(),
+        bytes,
+    )
+    .await;
+    let wide = job
+        .widen(vec![reference, held], reference.bytes())
+        .await
+        .unwrap();
+    assert!(
+        wide.store()
+            .upload(wide.scope(), held, None)
+            .await
+            .unwrap()
+            .complete()
+    );
+    assert!(job.store().stat(job.scope(), &path("held")).await.is_err());
+    let local = LocalStore::Job(wide.clone());
+    assert!(matches!(
+        local.open_verified(wide.scope(), held, None).await.unwrap(),
+        Some(VerifiedReader::File(_))
+    ));
+    unpin(&node, "held").await;
+    assert!(
+        local
+            .open_verified(wide.scope(), held, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    wide.end().await.unwrap();
+}
+
+#[tokio::test]
+async fn implicit_job_reads_and_missing_use_full_pin_references_while_gc_marks_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = open(
+        directory.path().join("upper"),
+        vec![],
+        IndexMode::Resume,
+        None,
+    )
+    .await;
+    node.finish_recovery().await.unwrap();
+    let object = put(&node, "leaf", b"correct bytes").await;
+    let wrong = ContentRef::new(object.id(), object.bytes() + 1);
+    let tree = Tree::new(vec![("leaf".into(), Target::Object(wrong))]).unwrap();
+    let root = put(&node, "tree", &tree.bytes()).await;
+    let value = PinValue {
+        target: Target::Object(root),
+        policy: PinPolicy::Jobs,
+        expires: None,
+    };
+    node.set_pin(
+        &Scope::Owner,
+        &name("tree"),
+        Some(&value),
+        Some(PinValue {
+            target: Target::Tree(root),
+            ..value.clone()
+        }),
+    )
+    .await
+    .unwrap();
+    unpin(&node, "leaf").await;
+    assert!(matches!(
+        JobContent::new(&node, job(), vec![object], 0).await,
+        Err(Error::Capacity)
+    ));
+    let scope = JobContent::new(&node, job(), vec![object], object.bytes())
+        .await
+        .unwrap();
+    let local = LocalStore::Job(scope.clone());
+    assert!(
+        local
+            .open_verified(scope.scope(), object, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let missing = scope
+        .store()
+        .upload(scope.scope(), object, None)
+        .await
+        .unwrap();
+    assert!(!missing.complete());
+    drop(missing);
+    // An invalid leaf length never licenses a read, but GC remains conservative.
+    assert_eq!(node.collect(&Scope::Owner).await.unwrap().objects, 0);
+    node.set_pin(
+        &Scope::Owner,
+        &name("correct"),
+        None,
+        Some(PinValue {
+            target: Target::Object(object),
+            policy: PinPolicy::Jobs,
+            expires: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        local
+            .open_verified(scope.scope(), object, None)
+            .await
+            .unwrap(),
+        Some(VerifiedReader::File(_))
+    ));
+    scope.end().await.unwrap();
+    node.close().await;
 }

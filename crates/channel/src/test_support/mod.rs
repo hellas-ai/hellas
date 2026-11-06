@@ -163,8 +163,9 @@ pub fn grant_upload_requests(
     hellas_rpc::pb::work::AcceptWorkRequest,
     Vec<hellas_rpc::pb::work::UploadContentRequest>,
 ) {
-    use hellas_rpc::protocol::content_upload::{
-        CONTENT_CHUNK_BYTES, chunk_digest, encode_reference,
+    use hellas_rpc::protocol::{
+        content::encode_reference,
+        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
     };
     let mut wire = request.clone();
     let Ok(a) = GrantJobAuthorizationV1::decode(&request.authorization) else {
