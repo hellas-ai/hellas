@@ -147,6 +147,7 @@ let
   };
 
   ci = import ./ci.nix {
+    inherit (nativePkg) clippyArgs;
     inherit
       bufLintCommand
       denyCommand
@@ -159,25 +160,19 @@ let
     extraChecks = kernel.checks;
   };
 
+  # Whole-tree lints (workflows, Nix files, TOML outside the crates) as
+  # derivations. Each runs the same ci.nix app that `nix run .#check-<name>`
+  # runs, so the two cannot drift apart.
   mkHydraSourceCheck =
-    {
-      name,
-      inputs,
-      command,
-    }:
-    pkgs.runCommand "hellas-${name}"
-      {
-        nativeBuildInputs = inputs;
-      }
-      ''
-        export HOME="$TMPDIR/home"
-        export XDG_CACHE_HOME="$TMPDIR/cache"
-        mkdir -p "$HOME" "$XDG_CACHE_HOME"
-        # Whole-tree lints: workflows, Nix files and TOML outside the crates.
-        cd ${self}
-        ${command}
-        touch "$out"
-      '';
+    check:
+    pkgs.runCommand "hellas-${check.name}" { } ''
+      export HOME="$TMPDIR/home"
+      export XDG_CACHE_HOME="$TMPDIR/cache"
+      mkdir -p "$HOME" "$XDG_CACHE_HOME"
+      cd ${self}
+      ${lib.getExe check}
+      touch "$out"
+    '';
 
   packagesFor =
     crossSystem:
@@ -391,69 +386,21 @@ let
         touch "$out"
       '';
 
-  hydraLints = {
-    actions = mkHydraSourceCheck {
-      name = "check-actions";
-      inputs = [
-        pkgs.actionlint
-        pkgs.shellcheck
-      ];
-      command = "actionlint -config-file /dev/null .github/workflows/*.yml";
+  hydraLints =
+    lib.genAttrs [
+      "actions"
+      "sort"
+      "fmt"
+      "taplo"
+      "buf"
+      "deadnix"
+      "statix"
+      "nixfmt"
+    ] (name: mkHydraSourceCheck ci.checks.${name})
+    // {
+      "no-catgrad-lock" = noCatgradLock;
+      inherit (nativePkg.craneChecks) clippy;
     };
-    "no-catgrad-lock" = noCatgradLock;
-
-    sort = mkHydraSourceCheck {
-      name = "check-sort";
-      inputs = [ pkgs.cargo-sort ];
-      # Taplo owns TOML layout; cargo-sort owns table/key ordering.
-      command = "cargo-sort --workspace --check --no-format";
-    };
-
-    fmt = mkHydraSourceCheck {
-      name = "check-fmt";
-      inputs = [ rustToolchain ];
-      command = "cargo fmt --all -- --check";
-    };
-
-    inherit (nativePkg.craneChecks) clippy;
-
-    taplo = mkHydraSourceCheck {
-      name = "check-taplo";
-      inputs = [ pkgs.taplo ];
-      command = "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'";
-    };
-
-    buf = mkHydraSourceCheck {
-      name = "check-buf";
-      inputs = [ pkgs.buf ];
-      command = bufLintCommand;
-    };
-
-    deadnix = mkHydraSourceCheck {
-      name = "check-deadnix";
-      inputs = [ pkgs.deadnix ];
-      command = ''
-        shopt -s globstar
-        deadnix --fail flake.nix nix/**/*.nix
-      '';
-    };
-
-    statix = mkHydraSourceCheck {
-      name = "check-statix";
-      inputs = [ pkgs.statix ];
-      command = "statix check .";
-    };
-
-    nixfmt = mkHydraSourceCheck {
-      name = "check-nixfmt";
-      inputs = [ pkgs.nixfmt ];
-      command = ''
-        shopt -s globstar
-        nixfmt --check flake.nix nix/**/*.nix
-      '';
-    };
-
-  };
 
   hydraUnit = nativePkg.craneChecks.unit;
 

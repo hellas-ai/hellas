@@ -149,6 +149,8 @@ let
 
   # Feature set that clippy and the regression suite build with.
   integrationFeatures = "integration-tests,hellas-chain/indexer-api";
+  # Shared with the `check-clippy` app in ci.nix.
+  clippyArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames";
 
   craneArgs = {
     pname = "hellas";
@@ -161,6 +163,10 @@ let
     # No --profile flag: `cargo test` keeps the test profile, `cargo check`
     # and `cargo clippy` the dev profile, matching plain cargo in a checkout.
     CARGO_PROFILE = "";
+    # Checks never read debug info; skipping it saves compile time and keeps
+    # the published dependency artifacts small.
+    CARGO_PROFILE_DEV_DEBUG = "0";
+    CARGO_PROFILE_TEST_DEBUG = "0";
     inherit (commonArgs)
       RUST_MIN_STACK
       SQLX_OFFLINE
@@ -189,7 +195,9 @@ let
       craneArgs
       // {
         cargoArtifacts = cargoDeps;
-        cargoClippyExtraArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings";
+        # Terminal check: nothing consumes its target directory.
+        doInstallCargoArtifacts = false;
+        cargoClippyExtraArgs = clippyArgs;
       }
     );
     unit = craneLib.cargoTest (
@@ -197,6 +205,8 @@ let
       // {
         pname = "hellas-unit";
         cargoArtifacts = cargoDeps;
+        # Terminal check: nothing consumes its target directory.
+        doInstallCargoArtifacts = false;
         cargoTestExtraArgs = "--workspace";
       }
       // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
@@ -208,6 +218,8 @@ let
       // {
         pname = "hellas-regressions";
         cargoArtifacts = cargoDeps;
+        # Terminal check: nothing consumes its target directory.
+        doInstallCargoArtifacts = false;
         cargoTestExtraArgs = "--workspace --features ${integrationFeatures} -- --test-threads=1";
       }
     );
@@ -229,5 +241,6 @@ in
     revEnv
     cargoDeps
     craneChecks
+    clippyArgs
     ;
 }

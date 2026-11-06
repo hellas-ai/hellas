@@ -29,8 +29,9 @@
       self,
       nixpkgs,
       rust-overlay,
-      crane,
       nix-strix-halo,
+      # crane is used through self.inputs in nix/package.nix.
+      ...
     }:
     let
       systems = [
