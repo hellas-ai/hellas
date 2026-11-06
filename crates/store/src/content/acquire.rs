@@ -114,8 +114,11 @@ pub(crate) async fn memory(
         }
         Source::Peer { node, at } => {
             let pool = store
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?
                 .peers
-                .as_ref()
+                .clone()
                 .ok_or(Error::Invalid("no peer connection pool"))?;
             let node =
                 iroh::EndpointId::from_bytes(&node).map_err(|_| Error::Invalid("peer identity"))?;

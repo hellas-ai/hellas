@@ -509,6 +509,9 @@ where
             (builder.bind().await?, None, true)
         }
     };
+    let content = content.with_peers(hellas_wire::iroh::Pool::for_service::<
+        hellas_rpc::services::content::Content,
+    >(endpoint.clone(), Default::default()));
     let discovery = config
         .discovery
         .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))

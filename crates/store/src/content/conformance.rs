@@ -848,7 +848,7 @@ async fn suite(mut case: Case) {
         hellas_wire::iroh::PoolOptions::default(),
     );
     pool.connection(server.addr()).await.unwrap();
-    case.core_mut().peers = Some(pool);
+    case.core_mut().state.lock().unwrap().peers = Some(pool);
     let client = case.client(Scope::Owner);
     let got = client
         .acquire(

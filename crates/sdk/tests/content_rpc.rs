@@ -271,9 +271,27 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
         bytes.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(bytes, b"tokenizer");
-    let recipient = common::content_store(&root.path().join("recipient"))
+    // Keep a clone made before host startup: startup must attach the pool to
+    // the shared store used by all consumers, including this existing handle.
+    let recipient = common::content_store(&root.path().join("recipient")).await;
+    let lookup = iroh::address_lookup::MemoryLookup::new();
+    lookup.add_endpoint_info(host.endpoint().unwrap().addr());
+    let recipient_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .address_lookup(lookup)
+        .bind()
         .await
-        .with_peers(pool.clone());
+        .unwrap();
+    let recipient_host = HostHandle::start(HostOptions {
+        content: recipient.clone(),
+        transport: Some(recipient_endpoint),
+        start_provider: false,
+        control: None,
+        provider: None,
+        gateway: None,
+    })
+    .await
+    .unwrap();
     let acquired = recipient
         .acquire(
             &Scope::Owner,
@@ -322,6 +340,7 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
     pool.shutdown();
     client.close().await;
     host.shutdown().await.unwrap();
+    recipient_host.shutdown().await.unwrap();
     recipient.close().await;
     store.close().await;
 }

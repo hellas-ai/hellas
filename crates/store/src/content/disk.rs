@@ -652,8 +652,8 @@ impl DiskStore {
             .on_miss = policy;
         Ok(())
     }
-    pub fn with_peers(mut self, peers: hellas_wire::iroh::Pool) -> Self {
-        self.core.peers = Some(peers);
+    pub fn with_peers(self, peers: hellas_wire::iroh::Pool) -> Self {
+        self.core.state.lock().expect("content state").peers = Some(peers);
         self
     }
 }

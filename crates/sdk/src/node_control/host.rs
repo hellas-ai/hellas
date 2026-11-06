@@ -145,6 +145,14 @@ impl HostHandle {
             }
             access.validate().await?;
         }
+        if let Some(endpoint) = &options.transport {
+            options
+                .content
+                .clone()
+                .with_peers(hellas_wire::iroh::Pool::for_service::<
+                    hellas_rpc::services::content::Content,
+                >(endpoint.clone(), Default::default()));
+        }
         let transport = options.transport;
         let state = Arc::new(Mutex::new(State {
             configuration: None,

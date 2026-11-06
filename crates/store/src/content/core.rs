@@ -13,7 +13,6 @@ pub(crate) struct Core {
     pub(crate) state: Arc<Mutex<State>>,
     pub(crate) pool: Reservations,
     pub(crate) changed: Arc<tokio::sync::Notify>,
-    pub(crate) peers: Option<hellas_wire::iroh::Pool>,
     pub(crate) http: ureq::Agent,
     #[cfg(test)]
     pub(crate) hf_hub: Option<String>,
@@ -49,6 +48,7 @@ struct Work {
 type AcquiredOwner = (std::sync::Weak<Mutex<State>>, ReservationId);
 type AcquiredOwners = BTreeMap<PinName, AcquiredOwner>;
 pub(crate) struct State {
+    pub(crate) peers: Option<hellas_wire::iroh::Pool>,
     #[cfg(test)]
     tree_reads: std::sync::atomic::AtomicU64,
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
@@ -69,12 +69,12 @@ impl Core {
             disk: None,
             gate: Arc::new(tokio::sync::Mutex::new(())),
             lower: None,
-            peers: None,
             http: ureq::Agent::new_with_defaults(),
             #[cfg(test)]
             hf_hub: None,
             changed: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(Mutex::new(State {
+                peers: None,
                 #[cfg(test)]
                 tree_reads: std::sync::atomic::AtomicU64::new(0),
                 objects: BTreeMap::new(),

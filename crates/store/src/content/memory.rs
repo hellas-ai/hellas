@@ -11,8 +11,8 @@ impl MemoryStore {
             core: Core::new(pool),
         }
     }
-    pub fn with_peers(mut self, peers: hellas_wire::iroh::Pool) -> Self {
-        self.core.peers = Some(peers);
+    pub fn with_peers(self, peers: hellas_wire::iroh::Pool) -> Self {
+        self.core.state.lock().expect("content state").peers = Some(peers);
         self
     }
     pub async fn open_work(
