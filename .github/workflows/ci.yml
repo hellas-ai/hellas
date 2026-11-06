@@ -22,11 +22,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # Temporary: measure disk headroom now that the cleanup step is gone.
-      - name: Start disk sampler
-        run: |
-          df -h /
-          (while true; do df --output=used -B1M / | tail -1; sleep 5; done) > "$RUNNER_TEMP/disk-used-mib" &
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: Lints
         run: >-
@@ -42,11 +37,6 @@ jobs:
           for check in cargo-sources deny channel-dependencies xet-no-alloc; do
             nix run --accept-flake-config ".#check-$check"
           done
-      - name: Disk usage
-        if: always()
-        run: |
-          df -h /
-          echo "peak used: $(sort -n "$RUNNER_TEMP/disk-used-mib" | tail -1) MiB"
 
   unit-tests:
     name: Unit tests
@@ -54,16 +44,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # Temporary: measure disk headroom now that the cleanup step is gone.
-      - name: Start disk sampler
-        run: |
-          df -h /
-          (while true; do df --output=used -B1M / | tail -1; sleep 5; done) > "$RUNNER_TEMP/disk-used-mib" &
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: Unit tests
         run: nix build --accept-flake-config --print-build-logs --no-link .#checks.x86_64-linux.unit
-      - name: Disk usage
-        if: always()
-        run: |
-          df -h /
-          echo "peak used: $(sort -n "$RUNNER_TEMP/disk-used-mib" | tail -1) MiB"
