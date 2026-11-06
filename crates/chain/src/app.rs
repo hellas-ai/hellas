@@ -397,99 +397,104 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
-        let (runtime, consensus_context) = context;
-        let mut ancestry = Box::pin(ancestry);
-        let parent = ancestry.next().await?;
-        let snapshot = input.as_ref()?.snapshot().await;
-        // A proposed block is not a commitment. Keep resident transactions
-        // until finality, but do not execute them twice in one ancestry.
-        let finalized_height = self.owner_index.cursor().height;
-        let resident_digests: BTreeSet<_> = snapshot.iter().map(|entry| entry.digest).collect();
-        let mut ancestor_transactions = BTreeSet::new();
-        let mut ancestor = Some(parent.clone());
-        if !snapshot.is_empty() {
-            while let Some(block) = ancestor {
-                if block.height().get() <= finalized_height {
-                    break;
+        // Box at the boundary into commonware's generic actor: the actor's
+        // poll frames grow with this future, and debug builds copy it per await.
+        Box::pin(async move {
+            let (runtime, consensus_context) = context;
+            let mut ancestry = Box::pin(ancestry);
+            let parent = ancestry.next().await?;
+            let snapshot = input.as_ref()?.snapshot().await;
+            // A proposed block is not a commitment. Keep resident transactions
+            // until finality, but do not execute them twice in one ancestry.
+            let finalized_height = self.owner_index.cursor().height;
+            let resident_digests: BTreeSet<_> = snapshot.iter().map(|entry| entry.digest).collect();
+            let mut ancestor_transactions = BTreeSet::new();
+            let mut ancestor = Some(parent.clone());
+            if !snapshot.is_empty() {
+                while let Some(block) = ancestor {
+                    if block.height().get() <= finalized_height {
+                        break;
+                    }
+                    ancestor_transactions.extend(
+                        block
+                            .txs()
+                            .iter()
+                            .map(|tx| Sha256::hash(&tx.encode()))
+                            .filter(|digest| resident_digests.contains(digest)),
+                    );
+                    if ancestor_transactions.len() == resident_digests.len() {
+                        break;
+                    }
+                    ancestor = ancestry.next().await;
                 }
-                ancestor_transactions.extend(
-                    block
-                        .txs()
-                        .iter()
-                        .map(|tx| Sha256::hash(&tx.encode()))
-                        .filter(|digest| resident_digests.contains(digest)),
-                );
-                if ancestor_transactions.len() == resident_digests.len() {
-                    break;
-                }
-                ancestor = ancestry.next().await;
             }
-        }
-        let pending: Vec<_> = snapshot
-            .into_iter()
-            .filter(|entry| !ancestor_transactions.contains(&entry.digest))
-            .collect();
-        let response_count = pending
-            .iter()
-            .take_while(|entry| response_slot(&entry.transaction).is_some())
-            .count();
-        let response_bytes = response_count.saturating_mul(RESPONSE_TRANSACTION_BYTES);
-        let general_count_budget = MAX_TXS_PER_BLOCK.saturating_sub(response_count);
-        let general_byte_budget = MAX_BLOCK_TX_BYTES.saturating_sub(response_bytes);
-        let (responses, general) = pending.split_at(response_count);
-        debug_assert!(responses.iter().all(|entry| {
-            crate::light_client::canonical_submission_size(&entry.transaction)
-                == RESPONSE_TRANSACTION_BYTES
-        }));
-        let mut candidates: Vec<_> = responses
-            .iter()
-            .map(|entry| entry.transaction.clone())
-            .collect();
-        let mut general_bytes = 0_usize;
-        for entry in general {
-            let next_bytes = general_bytes.saturating_add(entry.transaction.encode_size());
-            if candidates.len().saturating_sub(response_count) >= general_count_budget
-                || next_bytes > general_byte_budget
+            let pending: Vec<_> = snapshot
+                .into_iter()
+                .filter(|entry| !ancestor_transactions.contains(&entry.digest))
+                .collect();
+            let response_count = pending
+                .iter()
+                .take_while(|entry| response_slot(&entry.transaction).is_some())
+                .count();
+            let response_bytes = response_count.saturating_mul(RESPONSE_TRANSACTION_BYTES);
+            let general_count_budget = MAX_TXS_PER_BLOCK.saturating_sub(response_count);
+            let general_byte_budget = MAX_BLOCK_TX_BYTES.saturating_sub(response_bytes);
+            let (responses, general) = pending.split_at(response_count);
+            debug_assert!(responses.iter().all(|entry| {
+                crate::light_client::canonical_submission_size(&entry.transaction)
+                    == RESPONSE_TRANSACTION_BYTES
+            }));
+            let mut candidates: Vec<_> = responses
+                .iter()
+                .map(|entry| entry.transaction.clone())
+                .collect();
+            let mut general_bytes = 0_usize;
+            for entry in general {
+                let next_bytes = general_bytes.saturating_add(entry.transaction.encode_size());
+                if candidates.len().saturating_sub(response_count) >= general_count_budget
+                    || next_bytes > general_byte_budget
+                {
+                    break;
+                }
+                general_bytes = next_bytes;
+                candidates.push(entry.transaction.clone());
+            }
+            let block_height = Height::new(parent.height().get() + 1);
+            let block_parent = parent.digest();
+            let (batches, txs, _retained) = match execute_proposal(
+                kernel_context(self.network, block_height, block_parent),
+                self.verifier.as_ref(),
+                candidates,
+                &self.genesis_allocations,
+                MAX_TXS_PER_BLOCK,
+                MAX_BLOCK_TX_BYTES,
+                batches,
+            )
+            .await
             {
-                break;
-            }
-            general_bytes = next_bytes;
-            candidates.push(entry.transaction.clone());
-        }
-        let block_height = Height::new(parent.height().get() + 1);
-        let block_parent = parent.digest();
-        let (batches, txs, _retained) = match execute_proposal(
-            kernel_context(self.network, block_height, block_parent),
-            self.verifier.as_ref(),
-            candidates,
-            &self.genesis_allocations,
-            MAX_TXS_PER_BLOCK,
-            MAX_BLOCK_TX_BYTES,
-            batches,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                error!(?err, "proposal execution failed");
-                return None;
-            }
-        };
-        let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
-        let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
+                Ok(result) => result,
+                Err(err) => {
+                    error!(?err, "proposal execution failed");
+                    return None;
+                }
+            };
+            let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
+            let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
 
-        let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
-        let block = HellasBlock::new(
-            consensus_context,
-            block_parent,
-            block_height,
-            timestamp,
-            merkleized.root(),
-            crate::execution::store::sync_target(&merkleized),
-            txs,
-        )
-        .with_owner_root(owner_root);
-        Some(Proposed { block, merkleized })
+            let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
+            let block = HellasBlock::new(
+                consensus_context,
+                block_parent,
+                block_height,
+                timestamp,
+                merkleized.root(),
+                crate::execution::store::sync_target(&merkleized),
+                txs,
+            )
+            .with_owner_root(owner_root);
+            Some(Proposed { block, merkleized })
+        })
+        .await
     }
 
     async fn verify(
@@ -498,31 +503,36 @@ where
         ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        let (runtime, consensus_context) = context;
-        let mut ancestry = Box::pin(ancestry);
-        let block = ancestry.next().await?;
-        let parent = ancestry.next().await?;
-        if let Err(err) = block.validate(
-            &consensus_context,
-            Height::new(parent.height().get() + 1),
-            parent.digest(),
-            runtime.current().epoch_millis(),
-            parent.timestamp(),
-        ) {
-            warn!(%err, payload = ?block.digest(), "block validation failed");
-            return None;
-        }
+        // Box at the boundary into commonware's generic actor: the actor's
+        // poll frames grow with this future, and debug builds copy it per await.
+        Box::pin(async move {
+            let (runtime, consensus_context) = context;
+            let mut ancestry = Box::pin(ancestry);
+            let block = ancestry.next().await?;
+            let parent = ancestry.next().await?;
+            if let Err(err) = block.validate(
+                &consensus_context,
+                Height::new(parent.height().get() + 1),
+                parent.digest(),
+                runtime.current().epoch_millis(),
+                parent.timestamp(),
+            ) {
+                warn!(%err, payload = ?block.digest(), "block validation failed");
+                return None;
+            }
 
-        crate::execution::finalized::execute(
-            &block,
-            self.network,
-            &self.genesis_allocations,
-            self.verifier.as_ref(),
-            batches,
-        )
+            crate::execution::finalized::execute(
+                &block,
+                self.network,
+                &self.genesis_allocations,
+                self.verifier.as_ref(),
+                batches,
+            )
+            .await
+            .map_err(|error| warn!(%error, payload = ?block.digest(), "block execution failed"))
+            .ok()
+        })
         .await
-        .map_err(|error| warn!(%error, payload = ?block.digest(), "block execution failed"))
-        .ok()
     }
 
     async fn apply(
@@ -531,35 +541,40 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        #[cfg(feature = "indexer-api")]
-        if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
-            let (batches, changes) = crate::execution::execute_all_observed(
-                kernel_context(self.network, block.height(), block.parent()),
-                self.verifier.as_ref(),
-                block.txs(),
+        // Box at the boundary into commonware's generic actor: the actor's
+        // poll frames grow with this future, and debug builds copy it per await.
+        Box::pin(async move {
+            #[cfg(feature = "indexer-api")]
+            if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
+                let (batches, changes) = crate::execution::execute_all_observed(
+                    kernel_context(self.network, block.height(), block.parent()),
+                    self.verifier.as_ref(),
+                    block.txs(),
+                    &self.genesis_allocations,
+                    batches,
+                )
+                .await
+                .expect("certified block must execute");
+                let executed = crate::execution::finalized::check(block, batches)
+                    .await
+                    .expect("certified block must reproduce its roots");
+                index
+                    .prepare(block, changes)
+                    .await
+                    .expect("certified index intent must persist");
+                return executed;
+            }
+            crate::execution::finalized::execute(
+                block,
+                self.network,
                 &self.genesis_allocations,
+                self.verifier.as_ref(),
                 batches,
             )
             .await
-            .expect("certified block must execute");
-            let executed = crate::execution::finalized::check(block, batches)
-                .await
-                .expect("certified block must reproduce its roots");
-            index
-                .prepare(block, changes)
-                .await
-                .expect("certified index intent must persist");
-            return executed;
-        }
-        crate::execution::finalized::execute(
-            block,
-            self.network,
-            &self.genesis_allocations,
-            self.verifier.as_ref(),
-            batches,
-        )
+            .expect("certified block execution must reproduce its roots")
+        })
         .await
-        .expect("certified block execution must reproduce its roots")
     }
 
     async fn finalized(
@@ -568,113 +583,118 @@ where
         block: &Self::Block,
         databases: &Self::Databases,
     ) {
-        if databases.read().await.root() != block.state_root() {
-            return;
-        }
-        assert_eq!(
-            crate::execution::owner_tree::stored_root(&*databases.read().await)
-                .await
-                .expect("durable owner root"),
-            block.owner_root(),
-            "certified owner root differs from durable state"
-        );
-        self.finalized_height
-            .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
-        // Readers woken by publication must see this block's owner cursor.
-        self.owner_index.publish_cursor(block);
-        if let Some(publication) = &self.publication {
-            publication.finalized(block, databases).await;
-        }
-        let Some(mempool) = &self.mempool else {
-            return;
-        };
-        mempool
-            .remove(
-                &block
-                    .txs()
-                    .iter()
-                    .map(|tx| Sha256::hash(&tx.encode()))
-                    .collect(),
-            )
-            .await;
-        // Reconcile against committed state, never a speculative proposal.
-        // Each candidate gets its own disposable batch so one candidate's
-        // effects cannot invalidate another.
-        // Startup/state-sync notifications may trail the database checkpoint.
-        if self.owner_index.cursor().height == block.height().get()
-            && databases.read().await.root() == block.state_root()
-        {
-            let mut rejected = BTreeSet::new();
-            let candidates = mempool.snapshot().await;
-            // Admission caps how many transactions the pool holds, not how
-            // often each is re-examined. Reconciling the whole pool here
-            // would make every validator pay one full kernel execution per
-            // resident per block, and `submit_general` admits without
-            // semantic validation while `ObjectNotFound` is transient and so
-            // retained -- a peer can park `GENERAL_MEMPOOL_CAPACITY`
-            // never-includable transactions and have them re-verified
-            // forever. Examine a bounded window instead, starting at an
-            // offset derived from the height so the whole pool is still
-            // covered, just across several blocks rather than all at once.
-            // A retained resident accrues a strike so repeated failures
-            // bound its lifetime instead of letting it hold capacity
-            // forever.
-            let examined = candidates.len().min(RECONCILED_PER_BLOCK);
-            let start = if candidates.is_empty() {
-                0
-            } else {
-                usize::try_from(block.height().get() % candidates.len() as u64).unwrap_or(0)
+        // Box at the boundary into commonware's generic actor: the actor's
+        // poll frames grow with this future, and debug builds copy it per await.
+        Box::pin(async move {
+            if databases.read().await.root() != block.state_root() {
+                return;
+            }
+            assert_eq!(
+                crate::execution::owner_tree::stored_root(&*databases.read().await)
+                    .await
+                    .expect("durable owner root"),
+                block.owner_root(),
+                "certified owner root differs from durable state"
+            );
+            self.finalized_height
+                .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
+            // Readers woken by publication must see this block's owner cursor.
+            self.owner_index.publish_cursor(block);
+            if let Some(publication) = &self.publication {
+                publication.finalized(block, databases).await;
+            }
+            let Some(mempool) = &self.mempool else {
+                return;
             };
-            let mut executable = BTreeSet::new();
-            let mut transient = BTreeSet::new();
-            for offset in 0..examined {
-                let candidate = &candidates[(start + offset) % candidates.len()];
-                let outcome = execute_proposal(
-                    kernel_context(
-                        self.network,
-                        Height::new(block.height().get() + 1),
-                        block.digest(),
-                    ),
-                    self.verifier.as_ref(),
-                    vec![candidate.transaction.clone()],
-                    &self.genesis_allocations,
-                    MAX_TXS_PER_BLOCK,
-                    MAX_BLOCK_TX_BYTES,
-                    databases.new_batches().await,
+            mempool
+                .remove(
+                    &block
+                        .txs()
+                        .iter()
+                        .map(|tx| Sha256::hash(&tx.encode()))
+                        .collect(),
                 )
                 .await;
-                // `propose` treats this same error set as a skipped round
-                // (see `proposal execution failed` above). Pruning is an
-                // optimisation -- a transaction left in the pool is retried
-                // next block -- so a storage fault must not be more fatal
-                // here than it is there.
-                let (_, included, retained) = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        error!(?err, "finalized mempool validation failed");
-                        break;
-                    }
-                };
-                if !retained.is_empty() {
-                    transient.insert(candidate.digest);
-                } else if !included.is_empty() {
-                    executable.insert(candidate.digest);
+            // Reconcile against committed state, never a speculative proposal.
+            // Each candidate gets its own disposable batch so one candidate's
+            // effects cannot invalidate another.
+            // Startup/state-sync notifications may trail the database checkpoint.
+            if self.owner_index.cursor().height == block.height().get()
+                && databases.read().await.root() == block.state_root()
+            {
+                let mut rejected = BTreeSet::new();
+                let candidates = mempool.snapshot().await;
+                // Admission caps how many transactions the pool holds, not how
+                // often each is re-examined. Reconciling the whole pool here
+                // would make every validator pay one full kernel execution per
+                // resident per block, and `submit_general` admits without
+                // semantic validation while `ObjectNotFound` is transient and so
+                // retained -- a peer can park `GENERAL_MEMPOOL_CAPACITY`
+                // never-includable transactions and have them re-verified
+                // forever. Examine a bounded window instead, starting at an
+                // offset derived from the height so the whole pool is still
+                // covered, just across several blocks rather than all at once.
+                // A retained resident accrues a strike so repeated failures
+                // bound its lifetime instead of letting it hold capacity
+                // forever.
+                let examined = candidates.len().min(RECONCILED_PER_BLOCK);
+                let start = if candidates.is_empty() {
+                    0
                 } else {
-                    rejected.insert(candidate.digest);
+                    usize::try_from(block.height().get() % candidates.len() as u64).unwrap_or(0)
+                };
+                let mut executable = BTreeSet::new();
+                let mut transient = BTreeSet::new();
+                for offset in 0..examined {
+                    let candidate = &candidates[(start + offset) % candidates.len()];
+                    let outcome = execute_proposal(
+                        kernel_context(
+                            self.network,
+                            Height::new(block.height().get() + 1),
+                            block.digest(),
+                        ),
+                        self.verifier.as_ref(),
+                        vec![candidate.transaction.clone()],
+                        &self.genesis_allocations,
+                        MAX_TXS_PER_BLOCK,
+                        MAX_BLOCK_TX_BYTES,
+                        databases.new_batches().await,
+                    )
+                    .await;
+                    // `propose` treats this same error set as a skipped round
+                    // (see `proposal execution failed` above). Pruning is an
+                    // optimisation -- a transaction left in the pool is retried
+                    // next block -- so a storage fault must not be more fatal
+                    // here than it is there.
+                    let (_, included, retained) = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            error!(?err, "finalized mempool validation failed");
+                            break;
+                        }
+                    };
+                    if !retained.is_empty() {
+                        transient.insert(candidate.digest);
+                    } else if !included.is_empty() {
+                        executable.insert(candidate.digest);
+                    } else {
+                        rejected.insert(candidate.digest);
+                    }
                 }
+                mempool.clear_strikes(&executable).await;
+                mempool.strike(&transient).await;
+                mempool.evict_orphans().await;
+                mempool.remove(&rejected).await;
             }
-            mempool.clear_strikes(&executable).await;
-            mempool.strike(&transient).await;
-            mempool.evict_orphans().await;
-            mempool.remove(&rejected).await;
-        }
-        info!(
-            name: "app.finalized",
-            height = %block.height(),
-            view = %block.context().round.view(),
-            payload = ?block.digest(),
-            tx_count = block.txs().len(),
-        );
+            info!(
+                name: "app.finalized",
+                height = %block.height(),
+                view = %block.context().round.view(),
+                payload = ?block.digest(),
+                tx_count = block.txs().len(),
+            );
+        })
+        .await
     }
 }
 

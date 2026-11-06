@@ -331,7 +331,7 @@ impl LightClient for RemoteLightClient {
         &self,
         keys: Vec<crate::domain::ObjectId>,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        objects::read(self, keys, FinalizedBlockQuery::Latest).await
+        Box::pin(objects::read(self, keys, FinalizedBlockQuery::Latest)).await
     }
 
     async fn get_objects_at(
@@ -339,7 +339,7 @@ impl LightClient for RemoteLightClient {
         keys: Vec<ObjectId>,
         query: FinalizedBlockQuery,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        objects::read(self, keys, query).await
+        Box::pin(objects::read(self, keys, query)).await
     }
 
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
@@ -609,7 +609,7 @@ impl LightClient for RemoteLightClient {
         after: Option<ObjectId>,
     ) -> impl Future<Output = Result<Option<crate::light_client::CoinPage>, QueryError>> + Send
     {
-        self.verified_coin_page(owner, after, false)
+        Box::pin(self.verified_coin_page(owner, after, false))
     }
 
     fn get_coins_by_delegate(
@@ -631,7 +631,7 @@ impl LightClient for RemoteLightClient {
         after: Option<ObjectId>,
     ) -> impl Future<Output = Result<Option<crate::light_client::CoinPage>, QueryError>> + Send
     {
-        self.verified_coin_page(delegate, after, true)
+        Box::pin(self.verified_coin_page(delegate, after, true))
     }
 
     fn get_edges_by_owner(
