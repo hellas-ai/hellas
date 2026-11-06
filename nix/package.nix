@@ -143,9 +143,9 @@ let
   # Crane builds the workspace's external dependencies once (`cargoDeps`) and
   # hands the compiled target directory to each check, which then compiles
   # only Hellas crates. Hydra populates cache.hellas.ai with these outputs.
-  craneLib =
-    ((self.inputs.crane.mkLib pkgs).overrideToolchain (_: rustToolchain)).overrideScope
-      (_: _: { stdenvSelector = p: p.clangStdenv; });
+  craneLib = ((self.inputs.crane.mkLib pkgs).overrideToolchain (_: rustToolchain)).overrideScope (
+    _: _: { stdenvSelector = p: p.clangStdenv; }
+  );
 
   # Feature set that clippy and the regression suite build with.
   integrationFeatures = "integration-tests,hellas-chain/indexer-api";
