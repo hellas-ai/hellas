@@ -764,9 +764,9 @@ async fn compute_and_settle_inner(
     assert!(
         matches!(
             error,
-            hellas_sdk::paid_client::PaidClientError::Timeout {
-                stage: "offer availability"
-            }
+            hellas_sdk::paid_client::PaidClientError::OfferUnavailable { ref source }
+                if source.code() == hellas_wire::WireCode::Unavailable
+                    && source.message() == "held offer response"
         ),
         "bounded quote expiry: {error}"
     );
