@@ -602,3 +602,125 @@ async fn abandoning_an_unaccepted_scope_also_drops_its_cached_prepared_body_char
     assert_eq!(node.ram_pool().held(), 0);
     connection.cancel();
 }
+
+#[tokio::test]
+async fn correctly_signed_other_connection_cannot_take_over_an_active_proposal_upload() {
+    use futures::StreamExt;
+    use hellas_channel::work::admission::Cancellation;
+    use hellas_rpc::pb::content as pb;
+    let (_root, service, node, frames) = pending_upload_fixture().await;
+    let connection_a = Cancellation::new();
+    let mut a = service
+        .upload_stream(
+            Box::pin(futures::stream::iter(frames.clone().into_iter().map(Ok))),
+            hellas_wire::TransportContext {
+                open_exporter: Some([7; 32]),
+                ..Default::default()
+            },
+            connection_a.clone(),
+        )
+        .await
+        .unwrap();
+    a.next().await.unwrap().unwrap();
+    let held = node.stats().unwrap().outstanding;
+    let mut frames_b = frames;
+    let Some(pb::upload_request::Part::Open(open)) = &mut frames_b[0].part else {
+        panic!()
+    };
+    let opening = open.work.as_mut().unwrap();
+    opening.binding_signature = fixture::client()
+        .sign(signing_hash(hellas_channel::job::opening_digest(
+            opening, &[8; 32],
+        )))
+        .as_bytes()
+        .to_vec();
+    let context_b = hellas_wire::TransportContext {
+        open_exporter: Some([8; 32]),
+        ..Default::default()
+    };
+    let connection_b = Cancellation::new();
+    assert!(
+        service
+            .upload_stream(
+                Box::pin(futures::stream::iter(frames_b.clone().into_iter().map(Ok))),
+                context_b.clone(),
+                connection_b.clone()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(node.stats().unwrap().outstanding, held);
+    drop(a);
+    wait_for_pending_cleanup(&node).await;
+    let mut b = service
+        .upload_stream(
+            Box::pin(futures::stream::iter(frames_b.into_iter().map(Ok))),
+            context_b,
+            connection_b.clone(),
+        )
+        .await
+        .unwrap();
+    b.next().await.unwrap().unwrap();
+    connection_a.cancel();
+    // Serialize behind A's old monitor; B remains the current scope.
+    service.with_state(|_| ()).await.unwrap();
+    assert!(node.stats().unwrap().outstanding > 0);
+    while let Some(progress) = b.next().await {
+        progress.unwrap();
+    }
+    connection_b.cancel();
+    wait_for_pending_cleanup(&node).await;
+}
+
+#[tokio::test]
+async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
+    use hellas_channel::work::admission::Cancellation;
+    use prost::Message;
+    let (_root, service, _node, frames) = pending_upload_fixture().await;
+    let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &frames[0].part else {
+        panic!()
+    };
+    let request = hellas_rpc::pb::work::AcceptWorkRequest::decode(
+        open.work.as_ref().unwrap().signed_opening.as_slice(),
+    )
+    .unwrap();
+    let connection = Cancellation::new();
+    hellas_channel::test_support::drive_upload(
+        service
+            .upload_stream(
+                Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+                hellas_wire::TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                connection.clone(),
+            )
+            .await,
+    )
+    .await
+    .unwrap();
+    let response = service.accept(&request).await;
+    assert!(
+        matches!(
+            response.outcome,
+            Some(hellas_rpc::pb::work::accept_work_response::Outcome::Accepted(_))
+        ),
+        "{response:?}"
+    );
+    assert_eq!(service.content_upload_count().unwrap(), 1);
+    connection.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while service.content_upload_count().unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let work = work_id(fixture::ready().channel(), &fixture::authorization());
+    let _input = service
+        .begin_run(work, &service.readiness().await.unwrap())
+        .await
+        .unwrap();
+    service.end_run(work).await.unwrap();
+    assert_eq!(service.content_upload_count().unwrap(), 0);
+}

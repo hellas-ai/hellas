@@ -483,12 +483,12 @@ impl GrantReplayer {
                     JobState {
                         authorization: *a,
                         work_id: id,
-                        prepared_input: vec![],
+                        prepared_input: bytes::Bytes::new(),
                         client_signature: *signature,
                         provider_signature: None,
                         phase: JobPhase::HalfSigned,
                         result: None,
-                        transcript: vec![],
+                        transcript: bytes::Bytes::new(),
                     },
                     Role::Client,
                 )?
@@ -515,9 +515,12 @@ impl GrantReplayer {
                     }
                     Applied::Redundant
                 } else {
-                    state
-                        .book
-                        .record_result(*work, signed.result, signed.signature, vec![])?
+                    state.book.record_result(
+                        *work,
+                        signed.result,
+                        signed.signature,
+                        bytes::Bytes::new(),
+                    )?
                 }
             }
             Change::Clock => Applied::Changed,
@@ -570,12 +573,12 @@ impl GrantReplayer {
                 JobState {
                     authorization: j.authorization,
                     work_id: id,
-                    prepared_input: vec![],
+                    prepared_input: bytes::Bytes::new(),
                     client_signature: j.client_signature,
                     provider_signature: j.provider_signature,
                     phase,
                     result: j.result.map(|s| (s.result, s.signature)),
-                    transcript: vec![],
+                    transcript: bytes::Bytes::new(),
                 },
             );
         }

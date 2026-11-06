@@ -2257,6 +2257,9 @@ async fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> 
 /// concurrent calls of one. Acquiring it yields to other tasks. Journal I/O
 /// may await under the guard; chain, transport and backend waits must release it.
 ///
+// Reservation, authenticated connection exporter, active stream.
+type ContentUploads = std::collections::BTreeMap<Digest, (u64, [u8; 32], bool)>;
+
 /// One type carries both halves because one handler answers the wire,
 /// and the halves are not both always present: [`Self::close_only`]
 /// serves a channel that admits no new work, and every admission method
@@ -2269,6 +2272,7 @@ pub struct WorkService {
     driving: Arc<AtomicBool>,
     changed: Arc<tokio::sync::Notify>,
     progress: Arc<Mutex<std::collections::BTreeMap<Digest, stream::Progress>>>,
+    content_uploads: Arc<Mutex<ContentUploads>>,
 }
 
 /// The authority to advance this channel's cursor, and the only thing
@@ -2543,6 +2547,7 @@ impl WorkService {
             driving: Arc::new(AtomicBool::new(false)),
             changed: Arc::new(tokio::sync::Notify::new()),
             progress: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            content_uploads: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 

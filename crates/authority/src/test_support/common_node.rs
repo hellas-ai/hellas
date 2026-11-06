@@ -54,7 +54,6 @@ pub async fn bootstrap_node_with_credential(
     provider: Option<ProviderEnrollmentBundle>,
     now: auth::UnixMillis,
 ) -> Result<(NodeStore, auth::CredentialSecret), NodeStoreError> {
-    let provider = provider.expect("provider fixture");
     let authority = auth::AuthorityId(Digest::hash(b"test node authority"));
     let extra: Vec<_> = crate::operations::OPERATIONS
         .iter()
@@ -78,7 +77,7 @@ pub async fn bootstrap_node_with_credential(
             auth::Ownership::Bootstrap { root, target: None },
             administrator,
         ),
-        Some(provider),
+        provider,
         now,
     )
     .await
@@ -382,6 +381,7 @@ pub async fn provision(
         NoBackend,
         vec![],
         std::sync::Arc::new(move || now),
+        super::content_store(path).await,
     )
     .unwrap();
     let mut admin = WorkAdmin::new(service.clone(), secret, definition.policies.clone()).await;

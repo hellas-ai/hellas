@@ -49,6 +49,7 @@ pub(crate) use access::Access;
 pub use access::{GrantWork, WORK_EXECUTE, allowance_resource};
 pub(crate) use cache::ResultCache;
 pub(crate) use delivery::Delivery;
+mod content;
 
 const MAX_RAM: usize = 64 << 20;
 fn event_ram(event: &OutputEventEnvelope) -> usize {
@@ -63,7 +64,10 @@ type Admit = dyn Fn(CapacityDomain) -> Result<WorkPermit, BackendFault> + Send +
 type Run = dyn Fn(
         PreparedInvocation,
         GrantPolicy,
-        hellas_channel::content::InvocationContent,
+        (
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
         WorkAdmission,
         PaidProgress,
     ) -> BoxFuture<'static, Result<Vec<OutputEventEnvelope>, BackendFault>>
@@ -80,11 +84,10 @@ pub struct GrantService {
     run: Arc<Run>,
     draining: Arc<tokio::sync::Mutex<()>>,
     addresses: Arc<Vec<String>>,
-    upload_quota: hellas_channel::content::UploadQuota,
-    content: hellas_store::ContentStore,
+    content: hellas_store::content::DiskStore,
 }
 struct Runtime {
-    uploads: BTreeMap<Digest, hellas_channel::content::UploadStore>,
+    contents: BTreeMap<Digest, (hellas_store::content::JobContent, [u8; 32], bool)>,
     live: BTreeMap<Digest, Live>,
     status: ServiceStatus,
     tasks: BTreeMap<Digest, tokio::task::JoinHandle<()>>,
@@ -126,7 +129,7 @@ impl Runtime {
         for live in self.live.values() {
             live.cache.cancel();
         }
-        self.uploads.clear();
+        self.contents.clear();
     }
     fn fail(&mut self, error: NodeStoreError) {
         self.discard();
@@ -208,15 +211,19 @@ enum CompletionError {
 }
 
 impl GrantService {
-    pub fn with_upload_quota(mut self, quota: hellas_channel::content::UploadQuota) -> Self {
-        self.upload_quota = quota;
-        self
-    }
-    /// The provider's held content, which memory-only grant jobs may read
-    /// instead of uploading. Grant jobs never write to it.
-    pub fn with_content_store(mut self, content: hellas_store::ContentStore) -> Self {
-        self.content = content;
-        self
+    pub(crate) fn content_serving(&self, accepted: bool) -> Result<(), NodeStoreError> {
+        let held = self
+            .inner
+            .lock()
+            .map_err(|_| NodeStoreError::WriterPoisoned)?;
+        held.status.check()?;
+        if matches!(held.status, ServiceStatus::Serving)
+            || accepted && matches!(held.status, ServiceStatus::Draining)
+        {
+            Ok(())
+        } else {
+            Err(hellas_auth::authority::AuthorityError::Denied.into())
+        }
     }
     /// Shares this exact writer; the returned interface still requires an
     /// authenticated application caller for every authority mutation.
@@ -229,6 +236,7 @@ impl GrantService {
         backend: B,
         addresses: Vec<String>,
         clock: GrantClock,
+        content: hellas_store::content::DiskStore,
     ) -> Result<Self, NodeStoreError> {
         if signer.public_key()
             != PublicKey::Secp256k1(grant_producer(store.state().provider()?)?.to_bytes())
@@ -240,6 +248,7 @@ impl GrantService {
             signer,
             backend,
             addresses,
+            content,
         ))
     }
 
@@ -251,12 +260,13 @@ impl GrantService {
         signer: Arc<ProducerSigningKey>,
         backend: B,
         addresses: Vec<String>,
+        content: hellas_store::content::DiskStore,
     ) -> Result<Self, NodeStoreError> {
         node.check_provider(enrollment).await?;
         if signer.public_key() != PublicKey::Secp256k1(grant_producer(enrollment)?.to_bytes()) {
             return Err(GrantError::Signature.into());
         }
-        Ok(Self::build(node, signer, backend, addresses))
+        Ok(Self::build(node, signer, backend, addresses, content))
     }
 
     fn build<B: WorkBackend + Send + Sync + 'static>(
@@ -264,6 +274,7 @@ impl GrantService {
         signer: Arc<ProducerSigningKey>,
         backend: B,
         addresses: Vec<String>,
+        content: hellas_store::content::DiskStore,
     ) -> Self {
         // NodeStore already requires initialized authority. Losing an administrator
         // does not cancel the node's persistent assignments or settlement duties.
@@ -291,7 +302,7 @@ impl GrantService {
         Self {
             node,
             inner: Arc::new(Mutex::new(Runtime {
-                uploads: BTreeMap::new(),
+                contents: BTreeMap::new(),
                 live: BTreeMap::new(),
                 status: ServiceStatus::Serving,
                 tasks: BTreeMap::new(),
@@ -301,8 +312,7 @@ impl GrantService {
             run,
             draining: Arc::new(tokio::sync::Mutex::new(())),
             addresses: Arc::new(addresses),
-            upload_quota: Default::default(),
-            content: hellas_store::ContentStore::new(),
+            content,
         }
     }
     /// Internal serialized driver access. Public administration verifies its caller.
@@ -388,14 +398,41 @@ impl GrantService {
         }
     }
     async fn accept(&self, access: &Access, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        let result = self.accept_inner(access, request).await;
-        AcceptWorkResponse {
-            outcome: Some(match result {
-                Ok(accepted) => accept_work_response::Outcome::Accepted(accepted),
-                Err(refusal) => accept_work_response::Outcome::Refused(refusal),
-            }),
-        }
+        // Durable acceptance, RAM transfer and execution ownership complete
+        // together even when the caller drops its response future.
+        let service = self.clone();
+        let access = access.clone();
+        let request = request.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let pause = crate::test_support::GRANT_CONTENT_TRANSFER_PAUSE
+            .try_with(Clone::clone)
+            .ok();
+        tokio::spawn(async move {
+            let run = async {
+                let result = service.accept_inner(&access, &request).await;
+                AcceptWorkResponse {
+                    outcome: Some(match result {
+                        Ok(accepted) => accept_work_response::Outcome::Accepted(accepted),
+                        Err(refusal) => accept_work_response::Outcome::Refused(refusal),
+                    }),
+                }
+            };
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(pause) = pause {
+                return crate::test_support::GRANT_CONTENT_TRANSFER_PAUSE
+                    .scope(pause, run)
+                    .await;
+            }
+            run.await
+        })
+        .await
+        .unwrap_or_else(|_| AcceptWorkResponse {
+            outcome: Some(accept_work_response::Outcome::Refused(refused(
+                GrantRefusalCode::StorageUnavailable,
+            ))),
+        })
     }
+
     async fn accept_inner(
         &self,
         access: &Access,
@@ -434,15 +471,20 @@ impl GrantService {
                 let reference =
                     hellas_rpc::protocol::content::decode_reference(&request.prepared_input)
                         .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
-                let prepared_input = self
-                    .inner
-                    .lock()
-                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
-                    .uploads
-                    .get(&a.channel_id.0)
-                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?
-                    .read(id, reference, hellas_rpc::Retention::Ephemeral)
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                if reference != a.input_content {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                let job_content = self.pending_content(a.channel_id, id)?;
+                let local = hellas_store::content::LocalStore::Job(job_content.clone());
+                let scope = job_content.scope().clone();
+                let prepared_input = hellas_channel::content::read(
+                    &local,
+                    &scope,
+                    reference,
+                    hellas_channel::content::MAX_CONTENT_BYTES as u64,
+                )
+                .await
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                 let policy = store.state().policy_for(&a)?.clone();
                 let input = PreparedInvocation::from_canonical_bytes(
                     &prepared_input,
@@ -466,33 +508,42 @@ impl GrantService {
                 let manifest = input
                     .manifest()
                     .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let content = {
-                    let held = self
-                        .inner
-                        .lock()
-                        .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-                    let uploads = held
-                        .uploads
-                        .get(&a.channel_id.0)
-                        .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
-                    let root = uploads
-                        .root(id, manifest.root(), hellas_rpc::Retention::Ephemeral)
-                        .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                    let objects = hellas_channel::job::content_closure(
-                        &policy.invocation_policy,
-                        &manifest,
-                        &root,
-                        a.input_content,
-                    )
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                    uploads
-                        .invocation_content(id, &objects, hellas_rpc::Retention::Ephemeral)
+                let root = if policy
+                    .invocation_policy
+                    .content_closure(&manifest, &[])
+                    .is_ok()
+                {
+                    bytes::Bytes::new()
+                } else {
+                    hellas_channel::content::root(&local, &scope, manifest.root())
+                        .await
                         .map_err(|_| refused(GrantRefusalCode::Malformed))?
                 };
+                let objects = hellas_channel::job::content_closure(
+                    &policy.invocation_policy,
+                    &manifest,
+                    &root,
+                    a.input_content,
+                )
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                for object in &objects {
+                    if local
+                        .open_verified(&scope, *object, None)
+                        .await
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?
+                        .is_none()
+                    {
+                        return Err(refused(GrantRefusalCode::Malformed));
+                    }
+                }
+                let ephemeral_bytes = local
+                    .ephemeral_bytes(&scope)
+                    .await
+                    .map_err(|_| refused(GrantRefusalCode::StateCapacity))?;
                 let reserve = input
                     .retained_heap_bytes()
                     .unwrap_or(usize::MAX)
-                    .saturating_add(content.ephemeral_bytes().try_into().unwrap_or(usize::MAX))
+                    .saturating_add(ephemeral_bytes.try_into().unwrap_or(usize::MAX))
                     .saturating_add(facts.max_spool_bytes.try_into().unwrap_or(usize::MAX));
                 {
                     let mut held = self
@@ -528,16 +579,30 @@ impl GrantService {
                         a.terminal_deadline_ms.0.saturating_sub(now.0),
                     ))
                     .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+                let cache = ResultCache::new(a.terminal_deadline_ms, self.node.changed.clone());
+                let work = GrantWork {
+                    service: self.clone(),
+                    access: access.clone(),
+                };
+                let (scope, _) =
+                    work.content_work_locked(&mut store, scope, a, cache.cancellation())?;
+                let content = (local, scope);
                 let application = access.application(&store, now)?;
                 let signature = store
                     .accept(application, a, client_signature, &input, &self.signer, now)
                     .await?;
+                #[cfg(any(test, feature = "test-support"))]
+                crate::test_support::pause_grant_content_transfer().await;
                 self.inner
                     .lock()
                     .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
-                    .uploads
+                    .contents
                     .remove(&a.channel_id.0);
-                let cache = ResultCache::new(a.terminal_deadline_ms, self.node.changed.clone());
+                job_content
+                    .store()
+                    .accept_work(job_content.scope())
+                    .await
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
                 let registered_at = self.node.observed_time(&store);
                 let cancellation =
                     store.register_execution(id, a, access.clone(), &cache, registered_at);
@@ -617,6 +682,8 @@ impl GrantService {
                         () = service.monitor_execution(id, cancellation) => execution.await,
                     }
                     .unwrap_or_else(|_| Err(BackendFault::caused_by(ExecutionError::Panicked)));
+                    // Retain live RAM accounting until the physical content owner is gone.
+                    let _ = job_content.end().await;
                     if let Err(error) = service.finish(id, &input, output).await {
                         tracing::error!(?id, %error, "grant completion could not be made durable");
                         if let Ok(mut held) = service.inner.lock() {
@@ -634,14 +701,14 @@ impl GrantService {
                 Ok(accepted(id, signature))
             }
             .await;
-            self.finish_proposal(a.channel_id, id, result)
+            self.finish_proposal(a.channel_id, id, result).await
         }
         .await;
         decision.finish_work(result)
     }
     /// Conclusive refusal ends the client's proposal, including its staged body.
     /// Call only after verifying its original actor, channel and signature.
-    fn finish_proposal<T>(
+    async fn finish_proposal<T>(
         &self,
         channel: ChannelId,
         id: Digest,
@@ -653,18 +720,9 @@ impl GrantService {
                 Ok(WorkRefusalCode::Invalid | WorkRefusalCode::Expired | WorkRefusalCode::Declined)
             )
         {
-            let mut held = self
-                .inner
-                .lock()
+            self.end_pending(channel, id, None)
+                .await
                 .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-            if let Some(uploads) = held.uploads.get_mut(&channel.0) {
-                uploads
-                    .discard(id)
-                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-                if !uploads.is_staged() {
-                    held.uploads.remove(&channel.0);
-                }
-            }
         }
         result
     }
@@ -1045,7 +1103,7 @@ impl GrantService {
                 held.reap();
                 if matches!(held.status, ServiceStatus::Serving) {
                     held.status = ServiceStatus::Draining;
-                    held.uploads.clear();
+                    held.contents.clear();
                 }
                 match &store {
                     Ok(store) if held.status.check().is_ok() => held
@@ -1077,6 +1135,7 @@ impl GrantService {
                 }
             }
         }
+        self.node.changed.notify_waiters();
         // Keep handles in the service while joining so cancelling drain never
         // detaches an execution from a later shutdown attempt.
         futures::future::poll_fn(|cx| {

@@ -625,12 +625,12 @@ impl State {
                     JobState {
                         authorization: *a,
                         work_id: id,
-                        prepared_input: vec![],
+                        prepared_input: bytes::Bytes::new(),
                         client_signature: *client_signature,
                         provider_signature: None,
                         phase: JobPhase::HalfSigned,
                         result: None,
-                        transcript: vec![],
+                        transcript: bytes::Bytes::new(),
                     },
                     Role::Provider,
                 )?;
@@ -1142,12 +1142,12 @@ impl State {
                         JobState {
                             authorization: j.authorization,
                             work_id: work,
-                            prepared_input: vec![],
+                            prepared_input: bytes::Bytes::new(),
                             client_signature: j.client,
                             provider_signature: Some(j.provider),
                             phase,
                             result: None,
-                            transcript: vec![],
+                            transcript: bytes::Bytes::new(),
                         },
                     )
                     .is_some()

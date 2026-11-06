@@ -27,6 +27,22 @@ enum Evidence {
 }
 
 impl Access {
+    pub(crate) fn for_caller(caller: AuthenticatedCaller, authorization: GrantId) -> Self {
+        Self {
+            evidence: Arc::new(Evidence::Native(caller)),
+            authorization,
+        }
+    }
+    pub(crate) fn for_session(
+        session: AuthenticatedSession,
+        binding: Digest,
+        authorization: GrantId,
+    ) -> Self {
+        Self {
+            evidence: Arc::new(Evidence::Session(session, binding)),
+            authorization,
+        }
+    }
     pub(crate) fn authorization(&self) -> GrantId {
         self.authorization
     }

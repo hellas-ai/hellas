@@ -6,9 +6,6 @@ use hellas_store::content::{
 };
 
 impl ChannelStore {
-    pub(crate) fn has_content(&self, work: Digest) -> bool {
-        self.contents.contains_key(&work)
-    }
     pub(crate) async fn discard_unaccepted_content(
         &mut self,
         work: Digest,

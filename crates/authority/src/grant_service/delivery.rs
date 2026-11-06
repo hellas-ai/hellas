@@ -171,10 +171,24 @@ impl DeliverySource {
             Self::Content(binding) => &binding.node,
         }
     }
-    fn cancellation(&self) -> &Cancellation {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         match self {
-            Self::Work(_, delivery) => delivery.cancellation(),
-            Self::Content(binding) => &binding.cancellation,
+            Self::Work(_, delivery) => {
+                let cancellation = delivery.cancellation().clone();
+                Box::pin(async move { cancellation.cancelled().await })
+            }
+            Self::Content(binding) => {
+                let binding = binding.clone();
+                Box::pin(async move {
+                    let parent = async {
+                        match &binding.parent {
+                            Some(parent) => parent.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! { _ = binding.cancellation.cancelled() => {}, _ = parent => binding.cancellation.cancel() }
+                })
+            }
         }
     }
     fn current(&self, store: &NodeStore, now: UnixMillis) -> Option<UnixMillis> {
@@ -190,9 +204,9 @@ impl DeliverySource {
     }
 }
 fn writer(source: DeliverySource) -> hellas_wire::WriteAuthority {
-    let cancellation = source.cancellation().clone();
+    let cancelled = source.cancelled();
     hellas_wire::WriteAuthority::new(DeliveryWriter {
-        cancelled: Box::pin(async move { cancellation.cancelled().await }),
+        cancelled,
         pending: None,
         changed: Box::pin(source.node().changed.clone().notified_owned()),
         source,

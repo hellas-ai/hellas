@@ -180,12 +180,14 @@ impl Node {
                 }
                 policies
             });
+        let content = super::content_store(&self.path).await;
         let service = crate::grant_service::GrantService::new(
             store,
             Arc::new(PROVIDER.node_key()),
             common_node::NoBackend,
             vec![],
             self.clock.source(),
+            content.clone(),
         )
         .unwrap();
         let mut admin = common_node::WorkAdmin::new(service.clone(), &secret, policies).await;
@@ -226,6 +228,7 @@ impl Node {
             .unwrap();
         TestNode {
             store,
+            content,
             path: self.path,
             clock: self.clock,
             secrets,
@@ -235,6 +238,7 @@ impl Node {
 
 pub struct TestNode {
     pub store: NodeStore,
+    pub content: hellas_store::content::DiskStore,
     pub clock: TestClock,
     path: PathBuf,
     secrets: Vec<(PrincipalId, CredentialSecret)>,
@@ -297,6 +301,7 @@ impl TestNode {
             backend,
             vec![],
             self.clock.source(),
+            self.content,
         )
         .unwrap();
         TestService {
@@ -384,6 +389,7 @@ impl TestNode {
     pub async fn reopen(self) -> Self {
         let Self {
             store,
+            content,
             path,
             clock,
             secrets,
@@ -396,6 +402,7 @@ impl TestNode {
             .unwrap();
         Self {
             store,
+            content,
             path,
             clock,
             secrets,

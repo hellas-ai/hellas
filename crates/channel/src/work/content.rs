@@ -190,24 +190,36 @@ where
         .as_ref()
         .map(|bytes| ContentRef::for_bytes(bytes))
         .unwrap_or(authorization.input_content);
-    for reference in
-        std::iter::once(first).chain(closure.into_iter().filter(|reference| *reference != first))
-    {
-        let reader = if reference == authorization.input_content {
-            Some(VerifiedReader::Memory(std::io::Cursor::new(
-                prepared
-                    .canonical_bytes()
-                    .map_err(PaidWorkError::from)?
-                    .into(),
-            )))
-        } else {
-            source.0.open_verified(&source.1, reference, None).await?
-        };
-        remote
-            .upload_reader(&remote_scope, reference, None, reader)
-            .await?;
+    let prepared_bytes: bytes::Bytes = prepared
+        .canonical_bytes()
+        .map_err(PaidWorkError::from)?
+        .into();
+    let transferred = async {
+        for reference in std::iter::once(first)
+            .chain(closure.into_iter().filter(|reference| *reference != first))
+        {
+            let reader = if reference == authorization.input_content {
+                Some(VerifiedReader::Memory(std::io::Cursor::new(
+                    prepared_bytes.clone(),
+                )))
+            } else {
+                source.0.open_verified(&source.1, reference, None).await?
+            };
+            remote
+                .upload_reader(&remote_scope, reference, None, reader)
+                .await?;
+        }
+        remote.finish_uploads().await?;
+        Ok::<_, Error>(())
     }
-    remote.finish_uploads().await?;
+    .await;
+    if let Err(error) = transferred {
+        let response = client.accept_work(request.clone()).await?;
+        if matches!(response.outcome, Some(Outcome::Accepted(_))) {
+            return endpoint.client().await?.accepted(&response).await;
+        }
+        return Err(error.into());
+    }
     let response = client.accept_work(request).await?;
     endpoint.client().await?.accepted(&response).await
 }
@@ -248,6 +260,27 @@ impl ProviderEndpoint {
 }
 
 impl WorkService {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn content_upload_count(&self) -> Result<usize, WireStatus> {
+        self.content_uploads
+            .lock()
+            .map(|uploads| uploads.len())
+            .map_err(|_| status(Error::Denied))
+    }
+    fn complete_content_upload(&self, work: Digest, reservation: u64) -> Result<(), WireStatus> {
+        let mut uploads = self
+            .content_uploads
+            .lock()
+            .map_err(|_| status(Error::Denied))?;
+        let (current, _, active) = uploads
+            .get_mut(&work)
+            .ok_or_else(|| status(Error::Denied))?;
+        if *current != reservation {
+            return Err(status(Error::Denied));
+        }
+        *active = false;
+        Ok(())
+    }
     pub(super) fn content_scope(
         &self,
         scope: Scope,
@@ -322,6 +355,13 @@ impl WorkService {
                 .store
                 .discard_unaccepted_content(work, reservation)
                 .await;
+            if let Ok(mut uploads) = self.content_uploads.lock()
+                && uploads
+                    .get(&work)
+                    .is_some_and(|(current, _, _)| *current == reservation)
+            {
+                uploads.remove(&work);
+            }
         }
         self.changed.notify_waiters();
     }
@@ -415,10 +455,36 @@ impl WorkService {
                 {
                     return Err(status(Error::Denied));
                 }
+                if endpoint
+                    .state()
+                    .job_by_id(work)
+                    .is_some_and(|job| job.provider_signature().is_some())
+                {
+                    return Err(WireStatus::new(
+                        hellas_wire::WireCode::AlreadyExists,
+                        "work is already accepted",
+                    ));
+                }
+                {
+                    let uploads = host
+                        .content_uploads
+                        .lock()
+                        .map_err(|_| status(Error::Denied))?;
+                    if uploads
+                        .get(&work)
+                        .is_some_and(|(_, owner, active)| *owner != exporter || *active)
+                    {
+                        return Err(status(Error::Conflict));
+                    }
+                }
                 if endpoint.close.store.other_pending_content(work) {
                     return Err(status(Error::Conflict));
                 }
-                let fresh = !endpoint.close.store.has_content(work);
+                let fresh = !host
+                    .content_uploads
+                    .lock()
+                    .map_err(|_| status(Error::Denied))?
+                    .contains_key(&work);
                 let (store, scope) = endpoint
                     .close
                     .store
@@ -431,6 +497,13 @@ impl WorkService {
                     .await
                     .map_err(status)?;
                 let cleanup = host.pending_content_cleanup(&scope);
+                let ScopeKind::Work { reservation, .. } = scope.kind else {
+                    return Err(status(Error::Denied));
+                };
+                host.content_uploads
+                    .lock()
+                    .map_err(|_| status(Error::Denied))?
+                    .insert(work, (reservation, exporter, true));
                 Ok::<_, WireStatus>((
                     authorization,
                     manifest,
@@ -497,6 +570,7 @@ impl WorkService {
                     if endpoint.close.store.open_content_reader(id, *object).await.map_err(status)?.is_none() { Err(status(Error::Missing))?; }
                 }
             }
+            host.complete_content_upload(id, reservation)?;
             cleanup.0.clear();
         }))
     }

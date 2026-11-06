@@ -31,6 +31,8 @@ pub(crate) struct ContentBinding {
     operation: &'static str,
     work: Option<crate::model::grant::GrantJobAuthorizationV1>,
     pub(crate) cancellation: Cancellation,
+    pub(crate) parent: Option<Cancellation>,
+    service: Option<crate::grant_service::GrantService>,
 }
 impl ContentBinding {
     pub(crate) fn refresh(
@@ -39,7 +41,9 @@ impl ContentBinding {
         now: UnixMillis,
     ) -> Result<UnixMillis, NodeStoreError> {
         let result = (|| {
-            if self.cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled()
+                || self.parent.as_ref().is_some_and(Cancellation::is_cancelled)
+            {
                 return Err(AuthorityError::Revoked.into());
             }
             let authority = store.state().authority();
@@ -53,16 +57,24 @@ impl ContentBinding {
                     if book.is_some_and(|book| book.terminal_by_id(job.id).is_some()) {
                         return Err(AuthorityError::Denied.into());
                     }
-                    let deadline =
-                        if let Some(accepted) = book.and_then(|book| book.job_by_id(job.id)) {
-                            if accepted.authorization() != work {
-                                return Err(AuthorityError::Denied.into());
-                            }
-                            store.state().check_resource(work)?;
-                            work.terminal_deadline_ms
-                        } else {
-                            work.acceptance_deadline_ms
-                        };
+                    if let Some(service) = &self.service {
+                        service.content_serving(book.is_some_and(|book| {
+                            book.job_by_id(job.id)
+                                .is_some_and(|job| job.provider_signature().is_some())
+                        }))?;
+                    }
+                    let deadline = if let Some(accepted) = book
+                        .and_then(|book| book.job_by_id(job.id))
+                        .filter(|job| job.provider_signature().is_some())
+                    {
+                        if accepted.authorization() != work {
+                            return Err(AuthorityError::Denied.into());
+                        }
+                        store.state().check_resource(work)?;
+                        work.terminal_deadline_ms
+                    } else {
+                        work.acceptance_deadline_ms
+                    };
                     if now >= deadline {
                         return Err(AuthorityError::Expired.into());
                     }
@@ -175,21 +187,59 @@ impl GrantWork {
         cancellation: Cancellation,
         work: Option<crate::model::grant::GrantJobAuthorizationV1>,
     ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let node = self.service.node();
+        let mut store = node.writer().await?;
+        self.bind_content_locked(&mut store, scope, operation, cancellation, work)
+    }
+    pub(crate) fn content_work_locked(
+        &self,
+        store: &mut NodeStore,
+        scope: Scope,
+        work: crate::model::grant::GrantJobAuthorizationV1,
+        cancellation: Cancellation,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        if !matches!(scope.kind, ScopeKind::Work { .. }) {
+            return Err(AuthorityError::Denied.into());
+        }
+        self.bind_content_locked(
+            store,
+            scope,
+            crate::grant_service::WORK_EXECUTE,
+            cancellation,
+            Some(work),
+        )
+    }
+    fn bind_content_locked(
+        &self,
+        store: &mut NodeStore,
+        scope: Scope,
+        operation: &'static str,
+        parent: Cancellation,
+        work: Option<crate::model::grant::GrantJobAuthorizationV1>,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
         let binding = ContentBinding {
             node: self.service.node(),
             access: self.access.clone(),
             kind: scope.kind.clone(),
             operation,
-            cancellation,
+            cancellation: Cancellation::new(),
+            parent: Some(parent),
+            service: work.as_ref().map(|_| self.service.clone()),
             work,
         };
-        let binding = {
-            let node = binding.node.clone();
-            let mut store = node.writer().await?;
-            let now = binding.node.observed_time(&store);
-            binding.refresh(&store, now)?;
-            store.register_content(binding, now)?
-        };
+        binding.bind_locked(store, scope)
+    }
+}
+impl ContentBinding {
+    fn bind_locked(
+        self,
+        store: &mut NodeStore,
+        scope: Scope,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let binding = self;
+        let now = binding.node.observed_time(store);
+        binding.refresh(store, now)?;
+        let binding = store.register_content(binding, now)?;
         let writer = crate::grant_service::delivery::content_authority(binding.clone());
         let monitor = crate::grant_service::delivery::content_authority(binding.clone());
         let ended = async move {
@@ -221,6 +271,80 @@ impl GrantWork {
             ),
             writer,
         ))
+    }
+}
+
+impl NodeCoordinator {
+    /// Bind owner evidence without requiring a provider enrollment or Work service.
+    /// `operation` is selected by the host's RPC dispatch, never by request data.
+    pub async fn content_owner_for_caller(
+        &self,
+        caller: hellas_auth::authority::AuthenticatedCaller,
+        authorization: hellas_auth::authority::GrantId,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Access::for_caller(caller, authorization),
+            Scope::Owner,
+            operation,
+        )
+        .await
+    }
+    pub async fn content_owner_for_session(
+        &self,
+        session: hellas_auth::authority::AuthenticatedSession,
+        binding: hellas_auth::Digest,
+        authorization: hellas_auth::authority::GrantId,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Access::for_session(session, binding, authorization),
+            Scope::Owner,
+            operation,
+        )
+        .await
+    }
+    pub async fn content_read_for_session(
+        &self,
+        session: hellas_auth::authority::AuthenticatedSession,
+        binding: hellas_auth::Digest,
+        authorization: hellas_auth::authority::GrantId,
+        pin: PinName,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Access::for_session(session, binding, authorization),
+            Scope::grant(GrantHandle {
+                grant: authorization,
+                pin,
+            }),
+            READ,
+        )
+        .await
+    }
+    async fn bind_content(
+        &self,
+        access: Access,
+        scope: Scope,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        if !matches!(
+            operation,
+            READ | UPLOAD | ACQUIRE | SET_PIN | COLLECT | RESOLVE
+        ) {
+            return Err(AuthorityError::Denied.into());
+        }
+        let mut store = self.writer().await?;
+        ContentBinding {
+            node: self.clone(),
+            access,
+            kind: scope.kind.clone(),
+            operation,
+            work: None,
+            cancellation: Cancellation::new(),
+            parent: None,
+            service: None,
+        }
+        .bind_locked(&mut store, scope)
     }
 }
 
