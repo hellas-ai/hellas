@@ -962,3 +962,131 @@ async fn reopening_a_channel_on_a_ready_node_preserves_its_scope_and_spent_outpu
             .complete()
     );
 }
+
+#[tokio::test]
+async fn recovering_many_retained_jobs_loads_bodies_only_when_each_job_is_used() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = fixture::ready();
+    let mut journal = fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await;
+    let node = journal.content_store();
+    let mut jobs = Vec::new();
+    for nonce in 1..=4 {
+        let mut prepared = fixture::bundle(nonce);
+        prepared
+            .input
+            .artifacts
+            .push(hellas_rpc::protocol::invocation::Artifact::new(
+                "unused",
+                "catena.u16le.v1",
+                vec![nonce; 384 * 1024],
+            ));
+        prepared.request.input = prepared.input.content_id().unwrap();
+        let authorization = hellas_channel::job::propose(
+            ready.channel(),
+            &fixture::work_policy(),
+            &fixture::payment_policy(),
+            &prepared,
+            nonce.into(),
+            fixture::deadlines(),
+        )
+        .unwrap();
+        let work = work_id(ready.channel(), &authorization);
+        let input = prepared.canonical_bytes().unwrap();
+        fixture::seed_content(&mut journal, authorization, input.clone().into()).await;
+        fixture::commit(
+            &mut journal,
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: fixture::client().sign(signing_hash(work)),
+                prepared_input: input.clone().into(),
+                retained_tree: None,
+            },
+        )
+        .await;
+        fixture::commit(
+            &mut journal,
+            ChannelRecord::JobAccepted {
+                work_id: work,
+                provider_signature: fixture::provider().sign(signing_hash(work)),
+                retained_tree: None,
+            },
+        )
+        .await;
+        jobs.push((work, input));
+    }
+    let before = node.stats().unwrap();
+    let metadata = journal
+        .state()
+        .retained_roots()
+        .values()
+        .map(|root| root.bytes())
+        .max()
+        .unwrap();
+    let maximum = jobs
+        .iter()
+        .map(|(_, input)| input.len() as u64)
+        .max()
+        .unwrap();
+    // The existing scan worker needs its 1 MiB buffer, independently of bodies.
+    let ram_limit =
+        (maximum + metadata + fixture::environment().canonical_bytes().unwrap().len() as u64)
+            .max(1 << 20);
+    assert!(ram_limit < jobs.iter().map(|(_, input)| input.len() as u64).sum());
+    drop(journal);
+    node.close().await;
+    drop(node);
+    let node = DiskStore::open(
+        root.path().join("content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(ram_limit),
+    )
+    .await
+    .unwrap();
+    let journal = ChannelStore::open_existing(
+        root.path(),
+        ready.channel().clone(),
+        fixture::settlement(),
+        Role::Provider,
+        fixture::origin(),
+        node.clone(),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    node.finish_recovery().await.unwrap();
+    assert_eq!(node.ram_pool().held(), 0);
+    assert!(
+        journal
+            .state()
+            .jobs()
+            .all(|job| job.prepared_input().is_empty())
+    );
+    let after = node.stats().unwrap();
+    assert_eq!(
+        (after.used, after.outstanding),
+        (before.used, before.outstanding)
+    );
+    let mut endpoint =
+        hellas_channel::work::ProviderEndpoint::new(ready.clone(), journal, fixture::provider())
+            .unwrap();
+    for (work, input) in &jobs {
+        assert!(matches!(
+            endpoint.begin_run(*work, &ready).await.unwrap(),
+            hellas_channel::work::RunAdmission::Invoke(_)
+        ));
+        assert_eq!(node.ram_pool().held(), input.len() as u64);
+        assert_eq!(
+            endpoint.state().job_by_id(*work).unwrap().prepared_input(),
+            input
+        );
+        assert!(
+            endpoint
+                .state()
+                .jobs()
+                .filter(|job| job.work_id() != *work)
+                .all(|job| job.prepared_input().is_empty())
+        );
+    }
+}

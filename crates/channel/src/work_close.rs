@@ -1047,6 +1047,7 @@ pub(crate) fn expiry_at(
                     } else if height > authorization.acceptance_deadline
                         && job.phase() == JobPhase::HalfSigned
                         && job.prepared_input().is_empty()
+                        && !state.retained_roots().contains_key(&job.work_id())
                     {
                         authorization.acceptance_deadline
                     } else if height > authorization.payment_deadline

@@ -76,7 +76,7 @@ async fn accept_input(
             ChannelRecord::JobProposed {
                 authorization: a,
                 client_signature: client().sign(signing_hash(id)),
-                prepared_input: input.canonical_bytes().unwrap(),
+                prepared_input: input.canonical_bytes().unwrap().into(),
 
                 retained_tree: None,
             },
@@ -221,7 +221,16 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     let _ = serving.await;
     drop(endpoint);
     drop(service);
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(id)
+            .unwrap()
+            .transcript()
+            .is_empty()
+    );
+    recovered.load_retained_content(id).await.unwrap();
     let job = recovered.state().job_by_id(id).unwrap();
     assert_eq!(job.phase(), JobPhase::Ready);
     assert_eq!(job.result().map(|(r, _)| *r), Some(delivered.result));
@@ -660,10 +669,13 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     let mut input = fetch_bundle(1);
     input.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
     let request = endpoint
-        .propose(&hellas_channel::work::JobProposal {
-            prepared_input: input,
-            deadlines: deadlines(),
-        })
+        .propose(
+            &hellas_channel::work::JobProposal {
+                prepared_input: input,
+                deadlines: deadlines(),
+            },
+            &program_content().await,
+        )
         .await
         .unwrap();
     let response = accept_uploaded_client(&service, &endpoint, &request).await;
@@ -848,7 +860,16 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let _ = serving.await;
     drop(service);
     drop(endpoint);
-    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let mut recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(id)
+            .unwrap()
+            .transcript()
+            .is_empty()
+    );
+    recovered.load_retained_content(id).await.unwrap();
     let job = recovered.state().job_by_id(id).unwrap();
     assert_eq!(job.phase(), JobPhase::Delivered);
     assert_eq!(job.transcript(), delivered.transcript);
@@ -867,10 +888,16 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
         }
         async fn execute(&self, input: Admitted) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
             if input.capacity_domain() == hellas_channel::work::admission::CapacityDomain::Fetch {
-                assert!(input.content().retained_store().is_none());
+                assert!(matches!(
+                    input.content().0,
+                    hellas_store::content::LocalStore::Job(_)
+                ));
                 Ok(fetch_transcript(input.invocation()))
             } else {
-                assert!(input.content().retained_store().is_some());
+                assert!(matches!(
+                    input.content().0,
+                    hellas_store::content::LocalStore::Disk(_)
+                ));
                 Ok(transcript_for(&input.invocation().request, &ANSWER))
             }
         }
@@ -922,10 +949,13 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             private_needles.push(input.canonical_bytes().unwrap());
         }
         let proposal = client_endpoint
-            .propose(&hellas_channel::work::JobProposal {
-                prepared_input: input.clone(),
-                deadlines: deadlines(),
-            })
+            .propose(
+                &hellas_channel::work::JobProposal {
+                    prepared_input: input.clone(),
+                    deadlines: deadlines(),
+                },
+                &program_content().await,
+            )
             .await
             .unwrap();
         let reply = accept_uploaded_client(&service, &client_endpoint, &proposal).await;
@@ -953,8 +983,14 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
         );
         if is_fetch {
             private_needles.push(delivered.transcript);
-            assert!(!pr.path().join("content").exists());
-            assert!(!cr.path().join("content").exists());
+            for root in [pr.path(), cr.path()] {
+                assert_eq!(
+                    std::fs::read_dir(root.join("content/objects"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
         } else {
             retained_result = Some((delivered.result, delivered.transcript));
         }
@@ -970,16 +1006,16 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
         assert!(recovered.state().jobs().next().is_none());
         assert_eq!(recovered.state().ledger().credited_cumulative(), 2 * PRICE);
         let (result, transcript) = retained_result.as_ref().unwrap();
-        let content = hellas_store::ContentStore::new();
-        let path = root
-            .join("content/objects")
-            .join(result.transcript_content.id().to_string());
-        content.index(&path).unwrap();
-        let view = hellas_channel::content::InvocationContent::Retained(content);
-        assert_eq!(
-            view.read(result.transcript_content).unwrap().as_ref(),
-            transcript
-        );
+        let view = hellas_store::content::LocalStore::Disk(recovered.content_store());
+        let body = hellas_channel::content::read(
+            &view,
+            &hellas_store::content::Scope::Owner,
+            result.transcript_content,
+            result.transcript_content.bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.as_ref(), transcript);
         assert_absent(root, &private_needles);
     }
 }

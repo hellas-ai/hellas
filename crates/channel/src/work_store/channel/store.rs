@@ -178,9 +178,7 @@ impl ChannelStore {
         let Some(job) = self.state.job_by_id(work_id) else {
             return Ok(());
         };
-        if job.phase() != JobPhase::HalfSigned
-            || (!job.prepared_input().is_empty() && self.recoverable_content(work_id)?.is_some())
-        {
+        if job.phase() != JobPhase::HalfSigned || self.recoverable_content(work_id)?.is_some() {
             return Ok(());
         }
         self.commit(
@@ -242,6 +240,11 @@ impl ChannelStore {
         mut record: ChannelRecord,
         verifier: &V,
     ) -> Result<&Channel, WorkStoreError> {
+        if let ChannelRecord::JobResult { work_id, .. }
+        | ChannelRecord::ResultVerified { work_id } = &record
+        {
+            self.load_retained_content(*work_id).await?;
+        }
         self.reconcile_content().await?;
         let staged = self.prepare_record(&mut record)?;
         // Applied to a copy first: a record the rules refuse must leave

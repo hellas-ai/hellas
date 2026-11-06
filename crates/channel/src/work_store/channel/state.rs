@@ -1819,7 +1819,9 @@ mod tests {
                     result,
                     provider_signature: fixture::provider()
                         .sign(signing_hash(result_digest(ready.channel(), &result))),
-                    transcript: crate::model::work::encode_transcript(&events).unwrap(),
+                    transcript: crate::model::work::encode_transcript(&events)
+                        .unwrap()
+                        .into(),
                     retained_tree: None,
                 },
                 &hellas_kernel::Secp256k1Verifier::new(),
@@ -1960,7 +1962,7 @@ mod retained_tests {
             let proposed = ChannelRecord::JobProposed {
                 authorization,
                 client_signature: fixture::client().sign(signing_hash(id)),
-                prepared_input: input,
+                prepared_input: input.into(),
                 retained_tree: (role == Role::Client).then_some(root),
             };
             let accepted = ChannelRecord::JobAccepted {
@@ -2008,7 +2010,7 @@ mod retained_tests {
                 result,
                 provider_signature: fixture::provider()
                     .sign(signing_hash(result_digest(state.channel(), &result))),
-                transcript,
+                transcript: transcript.into(),
                 retained_tree: Some(finished),
             };
             let durable = ChannelRecord::decode(&record.encode_for_storage()).unwrap();
@@ -2074,7 +2076,7 @@ mod retained_tests {
                 &ChannelRecord::JobProposed {
                     authorization,
                     client_signature: fixture::client().sign(signing_hash(id)),
-                    prepared_input: input,
+                    prepared_input: input.into(),
                     retained_tree: Some(root),
                 },
                 &verifier,

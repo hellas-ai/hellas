@@ -468,31 +468,82 @@ impl ChannelStore {
                     .restore_output(&scope, total, initial.bytes().ok_or(Error::Capacity)?)
                     .await?;
             }
-            let transcript = if let Some((result, _)) =
-                self.state().job_by_id(work).and_then(|job| job.result())
-            {
-                Some(
-                    read(
-                        &store,
-                        &Scope::Owner,
-                        result.transcript_content,
-                        facts.max_spool_bytes,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let job = self
-                .state
+        }
+        Ok(())
+    }
+
+    /// Load one retained job only when a caller needs its authenticated bodies.
+    /// Recovery keeps references and reservations, rather than retaining every
+    /// input and transcript in the node's staging/scratch RAM pool.
+    pub async fn load_retained_content(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        if !self.state().retained_roots().contains_key(&work) {
+            return Ok(());
+        }
+        let other = self
+            .state()
+            .retained_roots()
+            .keys()
+            .copied()
+            .filter(|id| *id != work)
+            .collect::<Vec<_>>();
+        for id in other {
+            if let Some(job) = self.state.book.jobs.get_mut(&id) {
+                job.prepared_input = bytes::Bytes::new();
+                job.transcript = bytes::Bytes::new();
+            }
+        }
+        let Some(job) = self.state().job_by_id(work) else {
+            return Ok(());
+        };
+        let authorization = *job.authorization();
+        let store = LocalStore::Disk(self.content.clone());
+        if job.prepared_input().is_empty() {
+            let input = read(
+                &store,
+                &Scope::Owner,
+                authorization.input_content,
+                crate::content::MAX_CONTENT_BYTES as u64,
+            )
+            .await?;
+            self.state.restore_input(work, input)?;
+        }
+        let job = self
+            .state()
+            .job_by_id(work)
+            .ok_or(ChannelStateError::Malformed)?;
+        if job.transcript().is_empty()
+            && let Some((result, _)) = job.result()
+        {
+            let input = PreparedInvocation::from_canonical_bytes(
+                job.prepared_input(),
+                crate::content::MAX_CONTENT_BYTES,
+            )
+            .map_err(PaidWorkError::from)
+            .map_err(ChannelStateError::from)?;
+            let policy =
+                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+                    .map_err(PaidWorkError::from)
+                    .map_err(ChannelStateError::from)?;
+            let facts = crate::job::check_paid_input(
+                self.state().channel(),
+                &authorization,
+                &policy,
+                &input,
+            )
+            .map_err(ChannelStateError::from)?;
+            let transcript = read(
+                &store,
+                &Scope::Owner,
+                result.transcript_content,
+                facts.max_spool_bytes,
+            )
+            .await?;
+            self.state
                 .book
                 .jobs
                 .get_mut(&work)
-                .ok_or(ChannelStateError::Malformed)?;
-            job.prepared_input = input;
-            if let Some(transcript) = transcript {
-                job.transcript = transcript;
-            }
+                .ok_or(ChannelStateError::Malformed)?
+                .transcript = transcript;
         }
         Ok(())
     }

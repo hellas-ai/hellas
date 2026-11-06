@@ -179,11 +179,10 @@ impl ProviderEndpoint {
             job.authorization(),
             ready.payment_policy(),
         )?;
+        let terminal_deadline = job.authorization().terminal_deadline;
+        ready.check_releasable(self.state().cursor().0, terminal_deadline)?;
+        self.close.store.load_retained_content(work_id).await?;
         self.job_facts(work_id)?;
-        ready.check_releasable(
-            self.state().cursor().0,
-            job.authorization().terminal_deadline,
-        )?;
         self.close
             .store
             .commit(
@@ -366,7 +365,8 @@ where
         .open_exporter
         .ok_or(DeliverError::Unbindable)?;
     let (request, prepared, facts) = {
-        let endpoint = endpoint.client().await?;
+        let mut endpoint = endpoint.client().await?;
+        endpoint.load_retained_content(work_id).await?;
         let job = endpoint
             .state()
             .job_by_id(work_id)
@@ -499,6 +499,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_collected_body_stays_verified_and_charged_when_another_job_evicts_its_cache() {
+        use crate::test_support::channel as fixture;
+        let root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let mut provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let content = fixture::program_content().await;
+        let mut jobs = Vec::new();
+        for nonce in 1..=2 {
+            let input = fixture::bundle(nonce);
+            let proposal = client
+                .propose(
+                    &JobProposal {
+                        prepared_input: input.clone(),
+                        deadlines: fixture::deadlines(),
+                    },
+                    &content,
+                )
+                .await
+                .unwrap();
+            let response = fixture::accept_uploaded(&mut provider, &proposal).await;
+            let work = client.accepted(&response).await.unwrap();
+            provider.begin_run(work, &ready).await.unwrap();
+            let events = fixture::transcript_for(&input.request, &[9, 10]);
+            provider.record_result(work, &events).await.unwrap();
+            jobs.push(work);
+        }
+        provider
+            .close
+            .store
+            .load_retained_content(jobs[0])
+            .await
+            .unwrap();
+        let job = provider.state().job_by_id(jobs[0]).unwrap();
+        let expected = job.result().unwrap().0.transcript_content;
+        let snapshot = job.transcript.clone();
+        provider
+            .close
+            .store
+            .load_retained_content(jobs[1])
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .state()
+                .job_by_id(jobs[0])
+                .unwrap()
+                .transcript()
+                .is_empty()
+        );
+        assert_eq!(ContentRef::for_bytes(&snapshot), expected);
+        let current = provider.state().job_by_id(jobs[1]).unwrap();
+        let pool = provider.close.store.content_store().ram_pool();
+        assert_eq!(
+            pool.held(),
+            snapshot.len() as u64
+                + current.prepared_input().len() as u64
+                + current.transcript().len() as u64
+        );
+        let events = decode_transcript(&snapshot, fixture::WIDE_FRAME as usize).unwrap();
+        let reconstructed = crate::job::paid_terminal_result(
+            ready.channel(),
+            provider.state().job_by_id(jobs[0]).unwrap().authorization(),
+            ready.invocation_policy(),
+            &fixture::bundle(1),
+            &events,
+        )
+        .unwrap();
+        assert_eq!(reconstructed.transcript_content, expected);
+        let held = pool.held();
+        let bytes = snapshot.len() as u64;
+        drop(snapshot);
+        assert_eq!(pool.held(), held - bytes);
+    }
+
+    #[tokio::test]
+    async fn live_stream_authorization_reloads_its_body_after_another_retained_job_was_loaded() {
+        use crate::test_support::channel as fixture;
+        let root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let mut provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let content = fixture::program_content().await;
+        let mut jobs = Vec::new();
+        for nonce in 1..=2 {
+            let proposal = client
+                .propose(
+                    &JobProposal {
+                        prepared_input: fixture::bundle(nonce),
+                        deadlines: fixture::deadlines(),
+                    },
+                    &content,
+                )
+                .await
+                .unwrap();
+            let response = fixture::accept_uploaded(&mut provider, &proposal).await;
+            jobs.push(client.accepted(&response).await.unwrap());
+        }
+        provider.begin_run(jobs[0], &ready).await.unwrap();
+        provider
+            .close
+            .store
+            .load_retained_content(jobs[1])
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .state()
+                .job_by_id(jobs[0])
+                .unwrap()
+                .prepared_input()
+                .is_empty()
+        );
+        let request = client.request_delivery(jobs[0], &[7; 32]).unwrap();
+        let service = WorkService::new(provider);
+        let facts = service
+            .reserve_stream_durably(&request, &[7; 32])
+            .await
+            .unwrap();
+        assert!(facts.max_spool_bytes > 0);
+        let endpoint = service.endpoint().await.unwrap();
+        assert_eq!(
+            endpoint.state().job_by_id(jobs[0]).unwrap().phase(),
+            JobPhase::Streaming
+        );
+        assert!(
+            !endpoint
+                .state()
+                .job_by_id(jobs[0])
+                .unwrap()
+                .prepared_input()
+                .is_empty()
+        );
+        assert!(
+            endpoint
+                .state()
+                .job_by_id(jobs[1])
+                .unwrap()
+                .prepared_input()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_during_plaintext_append_cannot_poison_the_provider_journal() {
         use crate::model::setup::ObservedChannel;
         use crate::test_support::channel as fixture;
@@ -533,10 +699,13 @@ mod tests {
         )
         .unwrap();
         let proposal = client
-            .propose(&JobProposal {
-                prepared_input: fixture::bundle(1),
-                deadlines: fixture::deadlines(),
-            })
+            .propose(
+                &JobProposal {
+                    prepared_input: fixture::bundle(1),
+                    deadlines: fixture::deadlines(),
+                },
+                &fixture::program_content().await,
+            )
             .await
             .unwrap();
         let response = fixture::accept_uploaded(&mut provider, &proposal).await;
@@ -584,17 +753,13 @@ mod tests {
         .await
         .expect("the detached durable append finishes and the journal remains writable");
         drop(service);
-        let store = ChannelStore::open(
+        let store = fixture::store_at(
             provider_root.path(),
-            ready.channel().clone(),
-            fixture::settlement(),
+            &ready,
             Role::Provider,
-            fixture::origin(),
-            hellas_store::ContentStore::new(),
-            &Secp256k1Verifier::new(),
+            fixture::CURSOR + 1,
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             store.state().job_by_id(work).unwrap().phase(),
             JobPhase::Streaming
@@ -653,10 +818,13 @@ mod tests {
         )
         .unwrap();
         let proposal = client
-            .propose(&JobProposal {
-                prepared_input: input.clone(),
-                deadlines: fixture::deadlines(),
-            })
+            .propose(
+                &JobProposal {
+                    prepared_input: input.clone(),
+                    deadlines: fixture::deadlines(),
+                },
+                &fixture::program_content().await,
+            )
             .await
             .unwrap();
         let service = WorkService::new(provider);

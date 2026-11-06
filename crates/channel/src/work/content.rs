@@ -112,8 +112,9 @@ where
         .ok_or(ProposeError::Malformed("upload connection exporter"))?;
     let authorization = PaidJobAuthorizationV2::decode(&request.authorization)?;
     let (work, prepared, pool, retained) = {
-        let client = endpoint.client().await?;
+        let mut client = endpoint.client().await?;
         let work = work_id(client.state().channel(), &authorization);
+        client.load_retained_content(work).await?;
         let job = client
             .state()
             .job_by_id(work)

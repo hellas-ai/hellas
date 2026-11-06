@@ -915,43 +915,60 @@ impl PaidWorkSession {
                             }
                             failed || payable
                         })
-                        .map(|job| {
-                            if let Some((result, _)) = job.result()
-                                && result.outcome
-                                    == hellas_channel::model::work::ResultOutcome::Failed
-                            {
-                                return Ok(RecoveredJob::Failed(
-                                    job.work_id(),
-                                    result.transcript_content.id().digest(),
-                                ));
-                            }
-                            // Fetch journals retain accounting only. A restart cannot
-                            // reconstruct a lost request or authorize another
-                            // execution, but an already delivered result still
-                            // settles: signing payment needs no payload.
-                            if job.prepared_input().is_empty() {
-                                return Ok(
-                                    if job.phase() == hellas_channel::work_store::JobPhase::Verified
-                                    {
-                                        RecoveredJob::Delivered(job.work_id())
-                                    } else {
-                                        RecoveredJob::Unrecoverable(job.work_id())
-                                    },
-                                );
-                            }
-                            PreparedInvocation::from_canonical_bytes(
-                                job.prepared_input(),
-                                hellas_channel::content::MAX_CONTENT_BYTES,
-                            )
-                            .map(|input| {
-                                RecoveredJob::Replay(job.work_id(), job.phase(), Box::new(input))
-                            })
-                            .map_err(PaidClientError::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()
+                        .map(|job| job.work_id())
+                        .collect::<Vec<_>>()
                 })
-                .await??;
-            for recovered in pending {
+                .await?;
+            for work in pending {
+                let recovered = {
+                    let mut endpoint = client.client().await?;
+                    let settled = endpoint.state().job_by_id(work).is_some_and(|job| {
+                        job.phase() == hellas_channel::work_store::JobPhase::Verified
+                            || job.result().is_some_and(|(result, _)| {
+                                result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                            })
+                    });
+                    if !settled {
+                        endpoint.load_retained_content(work).await?;
+                    }
+                    let job = endpoint
+                        .state()
+                        .job_by_id(work)
+                        .ok_or(PaidClientError::MissingState("recovered job"))?;
+                    (|job: &hellas_channel::work_store::JobState| {
+                        if let Some((result, _)) = job.result()
+                            && result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                        {
+                            return Ok(RecoveredJob::Failed(
+                                job.work_id(),
+                                result.transcript_content.id().digest(),
+                            ));
+                        }
+                        // Fetch journals retain accounting only. A restart cannot
+                        // reconstruct a lost request or authorize another
+                        // execution, but an already delivered result still
+                        // settles: signing payment needs no payload.
+                        if job.prepared_input().is_empty()
+                            || job.phase() == hellas_channel::work_store::JobPhase::Verified
+                        {
+                            return Ok(
+                                if job.phase() == hellas_channel::work_store::JobPhase::Verified {
+                                    RecoveredJob::Delivered(job.work_id())
+                                } else {
+                                    RecoveredJob::Unrecoverable(job.work_id())
+                                },
+                            );
+                        }
+                        PreparedInvocation::from_canonical_bytes(
+                            job.prepared_input(),
+                            hellas_channel::content::MAX_CONTENT_BYTES,
+                        )
+                        .map(|input| {
+                            RecoveredJob::Replay(job.work_id(), job.phase(), Box::new(input))
+                        })
+                        .map_err(PaidClientError::from)
+                    })(job)?
+                };
                 let (work_id, phase, pending) = match recovered {
                     RecoveredJob::Failed(work_id, evidence) => {
                         client.client().await?.rejected(work_id, evidence).await?;
@@ -1085,7 +1102,9 @@ impl PaidWorkSession {
                         job.result().is_some_and(|(result, _)| {
                             result.outcome == hellas_channel::model::work::ResultOutcome::Failed
                         }) || (job.authorization().payment_deadline >= state.cursor().0
-                            && (!job.prepared_input().is_empty() || job.result().is_some()))
+                            && (!job.prepared_input().is_empty()
+                                || job.result().is_some()
+                                || state.retained_roots().contains_key(&job.work_id())))
                     })
                 })
                 .await?;
@@ -1249,7 +1268,7 @@ async fn execute_paid_job(
             .await?;
         tracing::debug!(%work_id, "retained job input restored");
     }
-    let (work_id, already_collected) = match existing.first().copied() {
+    let (work_id, collected) = match existing.first().copied() {
         Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
                 args,
@@ -1261,23 +1280,23 @@ async fn execute_paid_job(
                 proposed,
             )
             .await?,
-            false,
+            None,
         ),
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
         | Some((work_id, hellas_channel::work_store::JobPhase::Verified, _)) => {
-            let retained = client
-                .with_state(|state| {
-                    state
-                        .job_by_id(work_id)
-                        .is_some_and(|job| !job.transcript().is_empty())
-                })
-                .await?;
+            let mut endpoint = client.client().await?;
+            endpoint.load_retained_content(work_id).await?;
+            let retained = endpoint
+                .state()
+                .job_by_id(work_id)
+                .filter(|job| !job.transcript().is_empty())
+                .map(|job| job.transcript.clone());
             (work_id, retained)
         }
-        Some((work_id, _, _)) => (work_id, false),
+        Some((work_id, _, _)) => (work_id, None),
         None => (
             propose_when_ready(args, dialer, client, &proposal, content, None, proposed).await?,
-            false,
+            None,
         ),
     };
     let acceptance_signature = client
@@ -1297,17 +1316,8 @@ async fn execute_paid_job(
             provider: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         });
     }
-    let transcript = if already_collected {
-        client
-            .with_state(|state| {
-                state
-                    .job_by_id(work_id)
-                    .map(|job| job.transcript().to_vec())
-            })
-            .await?
-            .ok_or(PaidClientError::MissingState(
-                "collected job disappeared from its journal",
-            ))?
+    let transcript = if let Some(transcript) = collected {
+        transcript
     } else {
         let mut emitted = false;
         let delivery = loop {
@@ -1354,7 +1364,7 @@ async fn execute_paid_job(
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
         check_payment_window(client, work_id).await?;
-        delivery.transcript
+        delivery.transcript.into()
     };
     let verified = verify_transcript(
         &proposal.prepared_input,
@@ -1391,7 +1401,7 @@ async fn execute_paid_job(
         acceptance_signature,
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
-        transcript,
+        transcript: transcript.to_vec(),
         output,
         provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         input: proposal.prepared_input.request.input_commitment()?,

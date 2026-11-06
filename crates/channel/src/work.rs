@@ -990,6 +990,8 @@ impl ProviderEndpoint {
             authorization.payment_deadline,
         )?;
 
+        self.close.store.load_retained_content(work_id).await?;
+        let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
@@ -1046,6 +1048,7 @@ impl ProviderEndpoint {
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
+        self.close.store.load_retained_content(work_id).await?;
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
         let input = PreparedInvocation::from_canonical_bytes(
@@ -1160,7 +1163,7 @@ impl ProviderEndpoint {
             return Err(EndpointError::NotAdmitting.into());
         }
         let ready = self.admitting()?.clone();
-        if job.result().is_none() || job.transcript().is_empty() {
+        if job.result().is_none() {
             return Err(DeliverError::NoResult { phase: job.phase() });
         }
         crate::model::work::check_payment_policy_binding(
@@ -1179,6 +1182,7 @@ impl ProviderEndpoint {
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
+        self.close.store.load_retained_content(work_id).await?;
         self.close
             .store
             .commit(
@@ -3233,19 +3237,12 @@ impl ClientEndpoint {
             if rebuilt != retained {
                 continue;
             }
-            let request = wire_request(
-                &retained,
-                job.client_signature(),
-                job.prepared_input().to_vec(),
-            );
-            let id = job.work_id();
-            retry = Some((id, request));
+            retry = Some(job.work_id());
             break;
         }
 
-        if let Some((id, request)) = retry {
-            self.mark_proposal_pending(id).await?;
-            return Ok(request);
+        if let Some(id) = retry {
+            return self.resume_proposal(id).await;
         }
 
         if self.state().job_book().pending_proposal().is_some() {
@@ -3306,6 +3303,11 @@ impl ClientEndpoint {
         Ok(wire_request(&authorization, signature, prepared_input))
     }
 
+    /// Load a retained job's bodies for recovery without caching other jobs.
+    pub async fn load_retained_content(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        self.store.load_retained_content(work).await
+    }
+
     /// Resend a half-signed proposal exactly as journaled, including the
     /// original policy and deadlines. No nonce or new signature is created.
     ///
@@ -3316,6 +3318,7 @@ impl ClientEndpoint {
         &mut self,
         work_id: Digest,
     ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.store.load_retained_content(work_id).await?;
         let job = self
             .state()
             .job_by_id(work_id)
