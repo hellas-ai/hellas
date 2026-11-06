@@ -454,6 +454,9 @@ pub async fn seed_content(
         return;
     };
     let work = work_id(store.state().channel(), &authorization);
+    if store.state().terminal_by_id(work).is_some() {
+        return;
+    }
     let Ok((content, scope)) = store
         .open_content(
             work,

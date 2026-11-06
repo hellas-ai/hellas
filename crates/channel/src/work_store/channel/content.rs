@@ -233,6 +233,9 @@ impl ChannelStore {
             }
             _ => return Ok(None),
         };
+        if self.state().terminal_by_id(work).is_some() {
+            return Ok(None);
+        }
         // Earlier-record retries must keep the newer authoritative result tree.
         if transcript.is_none()
             && self
