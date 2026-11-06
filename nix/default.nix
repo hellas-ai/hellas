@@ -173,7 +173,8 @@ let
         export HOME="$TMPDIR/home"
         export XDG_CACHE_HOME="$TMPDIR/cache"
         mkdir -p "$HOME" "$XDG_CACHE_HOME"
-        cd ${nativePkg.buildSrc}
+        # Whole-tree lints: workflows, Nix files and TOML outside the crates.
+        cd ${self}
         ${command}
         touch "$out"
       '';
@@ -196,20 +197,26 @@ let
         {
           otel ? false,
         }:
-        pkgSpec.mkHellasPackage {
-          buildNoDefaultFeatures = true;
-          # Client, gateway and daemon share one native composition.
-          buildFeatures = lib.optional otel "otel";
-        }
+        pkgSpec.mkHellasPackage (
+          pkgSpec.revEnv
+          // {
+            buildNoDefaultFeatures = true;
+            # Client, gateway and daemon share one native composition.
+            buildFeatures = lib.optional otel "otel";
+          }
+        )
       ) { };
       cli-validator = lib.makeOverridable (
         {
           otel ? false,
         }:
-        pkgSpec.mkHellasPackage {
-          buildNoDefaultFeatures = true;
-          buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
-        }
+        pkgSpec.mkHellasPackage (
+          pkgSpec.revEnv
+          // {
+            buildNoDefaultFeatures = true;
+            buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
+          }
+        )
       ) { };
     };
 
@@ -258,6 +265,7 @@ let
     in
     wasmPlatform.buildRustPackage (
       nativePkg.commonArgs
+      // nativePkg.revEnv
       // {
         pname = "hellas-rpc-wasm";
         # cargoBuildHook passes the native --target explicitly, which overrides

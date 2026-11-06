@@ -45,7 +45,26 @@ let
     inherit stdenv;
   };
 
-  buildSrc = self;
+  # Only what Cargo builds and tests read, so other edits (Nix, CI, most docs)
+  # leave the Rust derivations unchanged. A missing file fails loudly: tests
+  # read these with include_str!/include_bytes! or from CARGO_MANIFEST_DIR.
+  buildSrc = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      ../clippy.toml
+      ../crates
+      ../proto
+      # Documentation that tests check against the implementation.
+      ../docs/admin.md
+      ../docs/examples/faucet-provider.toml
+      ../docs/http-gateway.md
+      ../docs/jobs.md
+      ../docs/machine-provider.json
+      ../docs/paid-gateway.md
+    ];
+  };
 
   workspaceBuildInputs = [ ];
   workspaceNativeBuildInputs = with pkgs.buildPackages; [
@@ -84,7 +103,6 @@ let
     # sqlx's query macros check against the committed `.sqlx` metadata, so a
     # build never needs a live database.
     SQLX_OFFLINE = "true";
-    GIT_REV = builtins.substring 0 12 rev;
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     buildInputs = workspaceBuildInputs;
@@ -121,6 +139,10 @@ let
   // crossEnv;
 
   mkHellasPackage = overrides: rustPlatform.buildRustPackage (commonArgs // overrides);
+
+  # Stamp the revision only on shipped artifacts. Checks and validation builds
+  # leave it out, so a commit that changes no inputs reuses their results.
+  revEnv.GIT_REV = builtins.substring 0 12 rev;
 in
 {
   inherit
@@ -129,8 +151,8 @@ in
     rustToolchain
     rustPlatform
     workspaceNativeBuildInputs
-    buildSrc
     commonArgs
     mkHellasPackage
+    revEnv
     ;
 }
