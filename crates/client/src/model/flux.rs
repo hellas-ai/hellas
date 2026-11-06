@@ -2,8 +2,9 @@
 use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
 use catena_models::flux::{config, graph, text};
-use hellas_channel::content::EphemeralContent;
+use hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
 use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use rand_chacha::rand_core::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::{
@@ -211,7 +212,7 @@ impl Flux {
             args,
         })
     }
-    pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<ComputeJob> {
+    pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<(ComputeJob, String)> {
         request.validate()?;
         let tokens = text::tokenize(&self.directory, request.prompt)?;
         ensure!(tokens.valid > 0, "empty tokenized prompt");
@@ -222,7 +223,12 @@ impl Flux {
                 .all(|id| *id < self.config.text.vocabulary_size as u64),
             "image token exceeds vocabulary"
         );
-        let mut content = EphemeralContent::default();
+        let content = (
+            LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                DEFAULT_MAX_STAGING_BYTES,
+            ))),
+            Scope::Owner,
+        );
         let source = super::program::render(&self.config.source(
             request.width,
             request.height,
@@ -233,10 +239,9 @@ impl Flux {
             "image program exceeds source limit"
         );
         let environment = Environment {
-            sources: vec![content.insert(source.into_bytes())],
+            sources: vec![hellas_rpc::ContentRef::for_bytes(source.as_bytes())],
             assets: self.assets.clone(),
         };
-        content.insert(environment.canonical_bytes()?);
         let input = |object: &str| Arg::Input {
             object: object.into(),
         };
@@ -274,23 +279,26 @@ impl Flux {
             }],
         };
         let noise = noise(request.seed, request.width, request.height)?;
-        Ok(ComputeJob {
-            environment,
-            plan,
-            content,
-            inputs: vec![
-                Artifact::new(
-                    "noise",
-                    "catena.f32le.v1",
-                    noise.into_iter().flat_map(f32::to_le_bytes).collect(),
-                ),
-                Artifact::new(
-                    "tokens",
-                    "catena.u64le.v1",
-                    tokens.ids.into_iter().flat_map(u64::to_le_bytes).collect(),
-                ),
-            ],
-        })
+        Ok((
+            ComputeJob {
+                environment,
+                plan,
+                content,
+                inputs: vec![
+                    Artifact::new(
+                        "noise",
+                        "catena.f32le.v1",
+                        noise.into_iter().flat_map(f32::to_le_bytes).collect(),
+                    ),
+                    Artifact::new(
+                        "tokens",
+                        "catena.u64le.v1",
+                        tokens.ids.into_iter().flat_map(u64::to_le_bytes).collect(),
+                    ),
+                ],
+            },
+            source,
+        ))
     }
 }
 

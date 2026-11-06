@@ -8,13 +8,16 @@ pub(super) fn render(model: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-pub(super) fn assert_shipped_module(job: &super::ComputeJob, model: &str) {
+pub(super) async fn assert_shipped_module(job: &super::ComputeJob, model: &str) {
     use catena_lang::{codegen::CodegenKind, report::CompileReport, runtime::GpuDialect};
 
     let [source] = job.environment.sources[..] else {
         panic!("one self-contained program")
     };
-    let bytes = job.content.read(source).unwrap();
+    let bytes =
+        hellas_channel::content::read(&job.content.0, &job.content.1, source, source.bytes())
+            .await
+            .unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
     let shipped = RawTheorySet::from_text(text).unwrap();
     let unpruned = RawTheorySet::from_texts(catena_models::catena::runtime_sources(model)).unwrap();

@@ -405,12 +405,9 @@ mod tests {
         use crate::{
             Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRouteRegistry,
         };
-        use hellas_channel::{
-            content::{EphemeralContent, InvocationContent},
-            work::{
-                Admitted, WorkBackend,
-                admission::{Cancellation, CapacityDomain, WorkAdmission},
-            },
+        use hellas_channel::work::{
+            Admitted, WorkBackend,
+            admission::{Cancellation, CapacityDomain, WorkAdmission},
         };
         use hellas_rpc::{
             Assurance, Retention,
@@ -471,7 +468,16 @@ mod tests {
                 input,
                 limits,
                 CapacityDomain::Fetch,
-                InvocationContent::Ephemeral(EphemeralContent::default()),
+                (
+                    hellas_store::content::LocalStore::Memory(
+                        hellas_store::content::MemoryStore::new(
+                            hellas_store::content::Reservations::ram(
+                                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                            ),
+                        ),
+                    ),
+                    hellas_store::content::Scope::Owner,
+                ),
                 admission,
             )
         };
@@ -576,13 +582,29 @@ mod tests {
             hellas_rpc::JsonBytes(compute_policy.canonical_bytes().unwrap());
         let published = Arc::new(AtomicUsize::new(0));
         let observed = published.clone();
+        let missing_content = tempfile::tempdir().unwrap();
+        let missing_store = hellas_store::content::DiskStore::open(
+            missing_content.path().into(),
+            vec![],
+            hellas_store::content::IndexMode::Resume,
+            None,
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+        )
+        .await
+        .unwrap();
+        missing_store.finish_recovery().await.unwrap();
         let events = executor
             .execute_stream(
                 Admitted::new(
                     compute.clone(),
                     limits,
                     CapacityDomain::Gpu,
-                    InvocationContent::Retained(hellas_store::ContentStore::new()),
+                    (
+                        hellas_store::content::LocalStore::Disk(missing_store),
+                        hellas_store::content::Scope::Owner,
+                    ),
                     WorkAdmission::payment(),
                 ),
                 Arc::new(move |_| {

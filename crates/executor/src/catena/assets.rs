@@ -2,8 +2,8 @@ use catena_lang::{
     codegen::GpuDialect,
     runtime::{MemOwn, MemRef},
 };
-use hellas_channel::content::InvocationContent;
 use hellas_rpc::{ContentId, ContentRef};
+use hellas_store::content::VerifiedReader;
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -64,12 +64,12 @@ impl Assets {
             dialect,
         }
     }
-    pub fn pin(&self, content: &InvocationContent, object: ContentRef) -> Result<Arc<Resident>> {
-        self.pin_for_job(content, object, &super::Cancellation::default(), None)
+    pub fn pin(&self, reader: VerifiedReader, object: ContentRef) -> Result<Arc<Resident>> {
+        self.pin_for_job(reader, object, &super::Cancellation::default(), None)
     }
     pub(crate) fn pin_for_job(
         &self,
-        content: &InvocationContent,
+        reader: VerifiedReader,
         object: ContentRef,
         cancel: &super::Cancellation,
         deadline: Option<Instant>,
@@ -119,7 +119,7 @@ impl Assets {
             let (old, _) = state.entries.remove(&victim).unwrap();
             state.used -= old.memory.byte_len();
         }
-        let words = asset_words(content, object)?;
+        let words = asset_words(reader, object)?;
         let resident = Arc::new(Resident {
             memory: MemOwn::from_u16_slice(&words, self.dialect)?,
             bytes: object.bytes(),
@@ -130,29 +130,18 @@ impl Assets {
     }
 }
 
-fn asset_words(content: &InvocationContent, object: ContentRef) -> Result<Vec<u16>> {
-    if let Some(store) = content.retained_store() {
-        let file = store
-            .open_verified(object.id().digest(), object.bytes())?
-            .ok_or("missing compute asset")?;
-        read_words(file.len(), file.into_file())
-    } else {
-        let bytes = content.read(object)?;
-        read_words(object.bytes(), bytes.as_slice())
-    }
-}
-
-fn read_words(length: u64, mut input: impl Read) -> Result<Vec<u16>> {
-    let len = usize::try_from(length)?;
+fn asset_words(reader: VerifiedReader, object: ContentRef) -> Result<Vec<u16>> {
+    let len = usize::try_from(object.bytes())?;
     let count = len.checked_add(1).ok_or("asset length overflow")? / 2;
     let mut words = Vec::new();
     words.try_reserve_exact(count)?;
     words.resize(count, 0u16);
     // Initialized u16 storage accepts arbitrary bytes; the final padding byte remains zero.
     let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), len) };
-    input.read_exact(bytes)?;
-    if input.read(&mut [0])? != 0 {
-        return Err("verified asset grew while reading".into());
+    let mut reader = reader;
+    reader.read_exact(bytes)?;
+    if reader.read(&mut [0])? != 0 || ContentRef::for_bytes(bytes) != object {
+        return Err("verified asset changed while reading".into());
     }
     Ok(words)
 }
@@ -184,18 +173,62 @@ pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reader(bytes: &[u8]) -> VerifiedReader {
+        VerifiedReader::Memory(std::io::Cursor::new(bytes.to_vec().into()))
+    }
     #[test]
     fn ram_assets_preserve_exact_bytes_and_private_padding() {
-        let mut objects = hellas_channel::content::EphemeralContent::default();
-        let object = objects.insert(vec![0x11, 0x22, 0x33]);
-        let content = InvocationContent::Ephemeral(objects);
-        assert!(content.retained_store().is_none());
-        let words = asset_words(&content, object).unwrap();
+        let bytes = [0x11, 0x22, 0x33];
+        let object = ContentRef::for_bytes(&bytes);
+        let words = asset_words(reader(&bytes), object).unwrap();
         assert_eq!(words.len(), 2);
         assert_eq!(words[0].to_ne_bytes(), [0x11, 0x22]);
         assert_eq!(words[1].to_ne_bytes(), [0x33, 0]);
-        assert!(asset_words(&content, ContentRef::new(object.id(), 4)).is_err());
-        assert!(asset_words(&content, ContentRef::for_bytes(b"absent")).is_err());
+        assert!(asset_words(reader(&bytes), ContentRef::new(object.id(), 4)).is_err());
+        assert!(asset_words(reader(&[0x44, 0x22, 0x33]), object).is_err());
+    }
+    #[tokio::test]
+    async fn file_mutation_after_verified_open_is_rejected_before_gpu_upload() {
+        use hellas_store::content::{
+            ContentStore, DiskStore, IndexMode, LocalStore, Reservations, Scope,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let lower = root.path().join("lower");
+        std::fs::create_dir(&lower).unwrap();
+        let path = lower.join("weights");
+        std::fs::write(&path, b"original").unwrap();
+        let node = DiskStore::open(
+            root.path().join("upper"),
+            vec![lower],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(1 << 20),
+        )
+        .await
+        .unwrap();
+        node.finish_recovery().await.unwrap();
+        let object = ContentRef::for_bytes(b"original");
+        let target = hellas_channel::content::object_pin(object).unwrap();
+        node.set_pin(
+            &Scope::Owner,
+            &target.name,
+            None,
+            Some(hellas_store::content::PinValue {
+                target: hellas_store::content::Target::Object(object),
+                policy: target.policy,
+                expires: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let handle = LocalStore::Disk(node.clone())
+            .open_verified(&Scope::Owner, object, None)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(&path, b"modified").unwrap();
+        assert!(asset_words(handle, object).is_err());
+        node.close().await;
     }
 
     #[test]
@@ -210,7 +243,7 @@ mod tests {
             }
             let start = Instant::now();
             let result = assets.pin_for_job(
-                &InvocationContent::Ephemeral(Default::default()),
+                reader(b"not accessed"),
                 object,
                 &cancel,
                 Some(start + Duration::from_millis(20)),

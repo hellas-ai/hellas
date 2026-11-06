@@ -23,8 +23,8 @@ pub(super) async fn router(
     work: Arc<dyn WorkExecutionBackend>,
 ) -> GatewayResult<Router> {
     let path = options.model.clone();
-    let package = tokio::task::spawn_blocking(move || ModelPackage::open(&path))
-        .await?
+    let package = ModelPackage::open(&path)
+        .await
         .map_err(|error| GatewayError::Presentation(error.into()))?;
     if !package.is_image() {
         return Err(GatewayError::Presentation(
@@ -118,19 +118,20 @@ async fn handle(
         .timeout()
         .map(|timeout| tokio::time::Instant::now() + timeout);
     let package = state.package.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        package.render_job(&ModelRequest::Image(ImageRequest {
-            prompt: &request.prompt,
-            seed: request.seed,
-            width,
-            height,
-            steps: request.steps,
-        }))
-    });
+    let prepared = async move {
+        package
+            .render_job(&ModelRequest::Image(ImageRequest {
+                prompt: &request.prompt,
+                seed: request.seed,
+                width,
+                height,
+                steps: request.steps,
+            }))
+            .await
+    };
     let job = match crate::before_deadline(deadline, prepared).await {
-        Ok(Ok(Ok(job))) => job,
-        Ok(Ok(Err(error))) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
-        Ok(Err(error)) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Ok(Ok(job)) => job,
+        Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
         Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "image preparation timed out"),
     };
     if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {

@@ -16,8 +16,8 @@ fn request() -> ImageRequest<'static> {
     }
 }
 
-#[test]
-fn shared_stage_helpers_must_have_identical_types_and_definitions() {
+#[tokio::test]
+async fn shared_stage_helpers_must_have_identical_types_and_definitions() {
     let helper = "(def program flux.shared : unit -> unit = identity)";
     let model = bundle_stages([helper, helper]).unwrap();
     let raw =
@@ -40,9 +40,9 @@ fn shared_stage_helpers_must_have_identical_types_and_definitions() {
 
 /// The same FluxPipeline used by catena-models' flux2-klein command, with its
 /// native seeded noise and then the client's exported --noise input.
-#[test]
+#[tokio::test]
 #[ignore = "needs HIP, HELLAS_TEST_FLUX_SNAPSHOT and HELLAS_TEST_FLUX_REFERENCE_DIR"]
-fn flux_reference_checks_seeded_noise() {
+async fn flux_reference_checks_seeded_noise() {
     use catena_models::flux::pipeline::{FluxPipeline, GenerationOptions};
     let snapshot = PathBuf::from(std::env::var("HELLAS_TEST_FLUX_SNAPSHOT").unwrap());
     let directory = PathBuf::from(std::env::var("HELLAS_TEST_FLUX_REFERENCE_DIR").unwrap());
@@ -83,8 +83,8 @@ fn flux_reference_checks_seeded_noise() {
     );
 }
 
-#[test]
-fn seeded_noise_matches_the_upstream_reference() {
+#[tokio::test]
+async fn seeded_noise_matches_the_upstream_reference() {
     // Captured by flux_reference_checks_seeded_noise against catena-models
     // 2c147f7: native seed 42 and this noise produced identical 512x512 PNGs.
     let bytes: Vec<_> = noise(42, 512, 512)
@@ -98,11 +98,14 @@ fn seeded_noise_matches_the_upstream_reference() {
     );
 }
 
-#[test]
-fn image_job_bundles_three_stages_and_passes_state_in_slots() {
-    let package = ModelPackage::open(&fixture()).unwrap();
+#[tokio::test]
+async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
+    let package = ModelPackage::open(&fixture()).await.unwrap();
     let request = request();
-    let job = package.render_job(&ModelRequest::Image(request)).unwrap();
+    let job = package
+        .render_job(&ModelRequest::Image(request))
+        .await
+        .unwrap();
     hellas_rpc::protocol::invocation::InvocationInput {
         parameters: JsonBytes(job.plan.canonical_bytes().unwrap()),
         artifacts: job.inputs.clone(),
@@ -111,12 +114,18 @@ fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     .unwrap();
     assert_eq!(job.environment.sources.len(), 1);
     assert_eq!(job.environment.assets.len(), 3);
-    assert!(
-        job.environment
-            .assets
-            .iter()
-            .all(|a| job.content.read(a.object).is_err())
-    );
+    for asset in &job.environment.assets {
+        assert!(
+            hellas_channel::content::read(
+                &job.content.0,
+                &job.content.1,
+                asset.object,
+                asset.object.bytes()
+            )
+            .await
+            .is_err()
+        );
+    }
     assert!(job.plan.step.is_none());
     let calls = &job.plan.calls;
     assert_eq!(calls.len(), 3);
@@ -168,6 +177,7 @@ fn image_job_bundles_three_stages_and_passes_state_in_slots() {
             seed: 43,
             ..request
         }))
+        .await
         .unwrap();
     assert_ne!(job.inputs[0].bytes, next.inputs[0].bytes);
     assert_eq!(
@@ -176,22 +186,25 @@ fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-fn shipped_flux_program_matches_catena_models() {
+async fn shipped_flux_program_matches_catena_models() {
     let request = request();
-    let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.render_job(&ModelRequest::Image(request)).unwrap();
+    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let job = package
+        .render_job(&ModelRequest::Image(request))
+        .await
+        .unwrap();
     let config = Config::read(&fixture()).unwrap();
     let model = config
         .source(request.width, request.height, request.steps)
         .unwrap();
-    crate::model::program::assert_shipped_module(&job, &model);
+    crate::model::program::assert_shipped_module(&job, &model).await;
 }
 
-#[test]
-fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
-    let model = ModelPackage::open(&fixture()).unwrap();
+#[tokio::test]
+async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
+    let model = ModelPackage::open(&fixture()).await.unwrap();
     for (width, height, steps) in [
         (0, 16, 1),
         (15, 16, 1),
@@ -209,6 +222,7 @@ fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
                     steps,
                     ..request()
                 }))
+                .await
                 .is_err()
         );
     }
@@ -233,8 +247,8 @@ fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
     );
 }
 
-#[test]
-fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
+#[tokio::test]
+async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
     let directory = tempfile::tempdir().unwrap();
     for name in METADATA.into_iter().chain(["assets.json"]) {
         let target = directory.path().join(name);
@@ -256,16 +270,17 @@ fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
             .ids[0],
         151936
     );
-    let package = ModelPackage::open(directory.path()).unwrap();
+    let package = ModelPackage::open(directory.path()).await.unwrap();
     let error = package
         .render_job(&ModelRequest::Image(request()))
+        .await
         .err()
         .expect("out-of-vocabulary token refused");
     assert!(error.to_string().contains("token exceeds vocabulary"));
 }
 
-#[test]
-fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
+#[tokio::test]
+async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
     use safetensors::{Dtype, tensor::TensorView};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.safetensors");
@@ -344,9 +359,9 @@ fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
     }
 }
 
-#[test]
-fn image_output_is_checked_and_png_quantization_matches_upstream() {
-    let model = ModelPackage::open(&fixture()).unwrap();
+#[tokio::test]
+async fn image_output_is_checked_and_png_quantization_matches_upstream() {
+    let model = ModelPackage::open(&fixture()).await.unwrap();
     let mut values = vec![0f32; 16 * 16 * 3];
     values[..6].copy_from_slice(&[-1., 0.5 / 255., 1.5 / 255., 0.5, 1., 2.]);
     let output = |values: &[f32]| InvocationOutput {

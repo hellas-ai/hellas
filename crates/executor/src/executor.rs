@@ -3,13 +3,10 @@ use crate::ExecutorMetrics;
 use crate::{ExecutorError, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch, catena};
 use futures_util::StreamExt;
 use hellas_auth::ProducerSigningKey;
-use hellas_channel::{
-    content::InvocationContent,
-    work::{
-        Admitted, BackendFault, PaidProgress, WorkBackend,
-        admission::{
-            AdmissionError, CancelOnFailure, Cancellation, CapacityDomain, RunningWork, WorkPermit,
-        },
+use hellas_channel::work::{
+    Admitted, BackendFault, PaidProgress, WorkBackend,
+    admission::{
+        AdmissionError, CancelOnFailure, Cancellation, CapacityDomain, RunningWork, WorkPermit,
     },
 };
 use hellas_rpc::{
@@ -52,7 +49,6 @@ pub struct ExecutorSpawnConfig {
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
-    pub content_store: hellas_store::ContentStore,
     pub gpu_config: GpuConfig,
 }
 impl ExecutorSpawnConfig {
@@ -70,7 +66,6 @@ impl ExecutorSpawnConfig {
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
-            content_store: hellas_store::ContentStore::new(),
             gpu_config: GpuConfig::default(),
         }
     }
@@ -208,74 +203,110 @@ impl ExecutorHandle {
             CapacityDomain::Gpu => {
                 let cancel = catena::Cancellation::default();
                 let signal = cancel.clone();
+                let stopped = Cancellation::new();
+                let dropped = stopped.clone();
                 let _cancel_on_drop =
-                    CancelOnFailure(vec![Cancellation::with_cleanup(move || signal.cancel())]);
+                    CancelOnFailure(vec![Cancellation::with_cleanup(move || {
+                        signal.cancel();
+                        dropped.cancel();
+                    })]);
                 let executor = self.inner.clone();
                 let physical = running.clone();
                 let control = cancel.clone();
-                let mut task = tokio::task::spawn_blocking(move || {
-                    let _active = active;
-                    let _physical = physical;
-                    let result = (|| {
-                        let loaded = (|| {
-                            let program = catena::program::BoundProgram::compile_cancellable(
-                                &content,
-                                &prepared,
-                                &limits,
-                                &std::env::current_exe()?,
-                                &control,
-                                executor.config.gpu_config.backend,
-                            )?;
-                            let worker = executor.pool.lease_cancellable(
-                                program.module(),
-                                Duration::from_millis(limits.execution_timeout_ms),
-                                control.clone(),
-                            )?;
-                            Ok::<_, Box<dyn std::error::Error>>((program, worker))
-                        })();
-                        let (program, mut worker) = match loaded {
-                            Ok(loaded) => loaded,
-                            Err(error) => {
-                                // Accepted work owes B a signed terminal, an
-                                // invalid plan included: B retires it unpaid.
-                                tracing::warn!(%error, "compute preparation failed");
-                                let reason = if control.is_cancelled() {
-                                    FailureReason::Cancelled
-                                } else {
-                                    FailureReason::Compilation
-                                };
-                                let (_, events) = OutputStream::new(
-                                    &prepared.request,
-                                    &executor.config.producer_key,
-                                    hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
-                                )?
-                                .fail(reason)?;
-                                if let Some(progress) = &progress {
-                                    progress(events.last().unwrap().clone())?;
-                                }
-                                return Ok(events);
+                let mut task = tokio::spawn(async move {
+                    let opened = {
+                        let opening = async {
+                            catena::program::BoundProgram::open(&content, &prepared, &limits)
+                                .await
+                                .map_err(|error| error.to_string())
+                        };
+                        tokio::pin!(opening);
+                        let expiry = async {
+                            match physical.deadline() {
+                                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                                None => std::future::pending().await,
                             }
                         };
-                        catena::driver::execute_signed(
-                            &mut worker,
-                            &program,
-                            &prepared,
-                            &limits,
-                            &executor.assets,
-                            &content,
-                            &executor.config.producer_key,
-                            |event| {
-                                if let Some(progress) = &progress {
-                                    progress(event)?;
+                        tokio::select! {
+                            result = &mut opening => result,
+                            () = physical.cancelled() => { control.cancel(); opening.await },
+                            () = stopped.cancelled() => { control.cancel(); opening.await },
+                            () = expiry => { control.cancel(); opening.await },
+                        }
+                    };
+                    // The owned task retains admission and the GPU slot through
+                    // every outstanding preparation worker, including cancellation.
+                    tokio::task::spawn_blocking(move || {
+                        let _active = active;
+                        let _physical = physical;
+                        let result = (|| {
+                            let loaded = (|| {
+                                let (environment, sources, readers) = opened?;
+                                if control.is_cancelled() {
+                                    return Err("compute preparation cancelled".into());
                                 }
-                                Ok(())
-                            },
-                        )
-                        .map(|(_, events)| events)
-                    })();
-                    result.map_err(|error: Box<dyn std::error::Error>| {
-                        ExecutorError::Execution(error.to_string())
+                                let program = catena::program::BoundProgram::compile_cancellable(
+                                    environment,
+                                    sources,
+                                    &prepared,
+                                    &limits,
+                                    &std::env::current_exe()?,
+                                    &control,
+                                    executor.config.gpu_config.backend,
+                                )?;
+                                let worker = executor.pool.lease_cancellable(
+                                    program.module(),
+                                    Duration::from_millis(limits.execution_timeout_ms),
+                                    control.clone(),
+                                )?;
+                                Ok::<_, Box<dyn std::error::Error>>((program, worker, readers))
+                            })();
+                            let (program, mut worker, mut readers) = match loaded {
+                                Ok(loaded) => loaded,
+                                Err(error) => {
+                                    // Accepted work owes B a signed terminal, an
+                                    // invalid plan included: B retires it unpaid.
+                                    tracing::warn!(%error, "compute preparation failed");
+                                    let reason = if control.is_cancelled() {
+                                        FailureReason::Cancelled
+                                    } else {
+                                        FailureReason::Compilation
+                                    };
+                                    let (_, events) = OutputStream::new(
+                                        &prepared.request,
+                                        &executor.config.producer_key,
+                                        hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
+                                    )?
+                                    .fail(reason)?;
+                                    if let Some(progress) = &progress {
+                                        progress(events.last().unwrap().clone())?;
+                                    }
+                                    return Ok(events);
+                                }
+                            };
+                            catena::driver::execute_signed(
+                                &mut worker,
+                                &program,
+                                &prepared,
+                                &limits,
+                                &executor.assets,
+                                &mut readers,
+                                &executor.config.producer_key,
+                                |event| {
+                                    if let Some(progress) = &progress {
+                                        progress(event)?;
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .map(|(_, events)| events)
+                        })();
+                        result.map_err(|error: Box<dyn std::error::Error>| {
+                            ExecutorError::Execution(error.to_string())
+                        })
                     })
+                    .await
+                    .map_err(|error| ExecutorError::Execution(error.to_string()))?
                 });
                 let deadline = async {
                     match running.deadline() {
@@ -303,7 +334,10 @@ impl ExecutorHandle {
         &self,
         prepared: PreparedInvocation,
         limits: Limits,
-        _content: InvocationContent,
+        _content: (
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
         running: Arc<RunningWork>,
         progress: Option<PaidProgress>,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
@@ -540,5 +574,105 @@ impl WorkBackend for ExecutorHandle {
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         self.invoke(input, Some(progress)).await
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+    use hellas_channel::test_support::channel as fixture;
+    use hellas_store::content::{DiskStore, IndexMode, LocalStore, Reservations, Scope};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_blocked_preopen_keeps_physical_execution_capacity_until_preparation_stops()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let node = DiskStore::open(
+            root.path().into(),
+            vec![],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        )
+        .await
+        .unwrap();
+        node.finish_recovery().await.unwrap();
+        hellas_channel::content::upload_object(
+            &node,
+            &fixture::environment().canonical_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+        let key = Arc::new(ProducerSigningKey::generate());
+        let mut config = ExecutorSpawnConfig::new(
+            key.clone(),
+            Assurance::ProducerSigned,
+            FetchRouteRegistry::new(),
+        );
+        config.queue_capacity = 0;
+        let executor = Executor::spawn_configured(config).await.unwrap();
+        let mut prepared = fixture::bundle(1);
+        prepared.request.runner_public_key = key.public_key();
+        let (entered, blocked) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
+        let (release, held) = std::sync::mpsc::channel();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let scope = Scope::Owner.bind(
+            move || {
+                let (entered, held) = (entered.clone(), held.clone());
+                async move {
+                    Ok(move || {
+                        if let Some(entered) = entered.lock().unwrap().take() {
+                            let _ = entered.send(());
+                        }
+                        held.lock()
+                            .unwrap()
+                            .recv()
+                            .map_err(|_| hellas_store::content::Error::Denied)?;
+                        Ok(())
+                    })
+                }
+            },
+            std::future::pending(),
+        );
+        let backend = executor.clone();
+        let executing = tokio::spawn(async move {
+            backend
+                .execute(Admitted::new(
+                    prepared,
+                    fixture::work_policy().limits,
+                    CapacityDomain::Gpu,
+                    (LocalStore::Disk(node), scope),
+                    hellas_channel::work::admission::WorkAdmission::payment(),
+                ))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        executing.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), executing)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(executor.inner.gpu_active.available_permits(), 0);
+        assert_eq!(executor.inner.gpu_capacity.available_permits(), 0);
+        release.send(()).unwrap();
+        // The first blocked Core read completed; later checks must not block.
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while executor.inner.gpu_capacity.available_permits() == 0
+                || executor.inner.gpu_active.available_permits() == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(executor.inner.gpu_active.available_permits(), 1);
     }
 }

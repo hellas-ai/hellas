@@ -8,7 +8,7 @@ use hellas_adaptors::{
 use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
-use std::{error::Error as StdError, sync::Arc};
+use std::sync::Arc;
 use tokio::time::Duration;
 
 /// Reject controls the native executor cannot enforce before creating a job.
@@ -95,17 +95,16 @@ impl TextState {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
         let path = options.model.clone();
-        let (text, presentation) =
-            tokio::task::spawn_blocking(move || -> Result<_, Box<dyn StdError + Send + Sync>> {
-                Ok((
-                    ModelPackage::open(&path)?,
-                    TextPresentation::from_gguf(&path)?
-                        .with_chat_template(Some(ChatTemplate::Qwen3)),
-                ))
-            })
+        let text = ModelPackage::open(&path)
             .await
-            .map_err(crate::GatewayError::Task)?
-            .map_err(crate::GatewayError::Presentation)?;
+            .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let presentation = tokio::task::spawn_blocking(move || {
+            TextPresentation::from_gguf(&path)
+                .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
+        })
+        .await
+        .map_err(crate::GatewayError::Task)?
+        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens: options.default_max_tokens,
@@ -117,7 +116,7 @@ impl TextState {
         })
     }
 
-    pub(super) fn prepare_wire_execution(
+    pub(super) async fn prepare_wire_execution(
         &self,
         req: &WireExecutionRequest,
     ) -> Result<PreparedGeneration, BackendError> {
@@ -131,10 +130,11 @@ impl TextState {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;
         self.prepare_ids(chat.input_ids, max_tokens, Some(chat.turn))
+            .await
     }
 
     /// Render a prompt into a text job and start it on the work source.
-    fn prepare_ids(
+    async fn prepare_ids(
         &self,
         input_ids: Vec<u32>,
         max_tokens: u32,
@@ -152,6 +152,7 @@ impl TextState {
                 max_new: u64::from(max_tokens),
                 stops: &[],
             })
+            .await
             .map_err(|error| {
                 BackendError::rejected(format!("Failed to prepare model input: {error:#}"))
             })?;

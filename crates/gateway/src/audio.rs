@@ -26,8 +26,8 @@ pub(super) async fn router(
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
     let path = options.model.clone();
-    let package = tokio::task::spawn_blocking(move || ModelPackage::open(&path))
-        .await?
+    let package = ModelPackage::open(&path)
+        .await
         .map_err(|error| GatewayError::Presentation(error.into()))?;
     let capacity = package
         .transcription_capacity()
@@ -135,22 +135,20 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
         .map(|timeout| tokio::time::Instant::now() + timeout);
     let package = state.package.clone();
     let max_new_tokens = state.options.default_max_tokens;
-    let job = match crate::before_deadline(
-        deadline,
-        tokio::task::spawn_blocking(move || {
-            let samples = wav::decode(&file)?;
-            package.render_job(&ModelRequest::Transcription {
+    let job = match crate::before_deadline(deadline, async move {
+        let samples = tokio::task::spawn_blocking(move || wav::decode(&file)).await??;
+        package
+            .render_job(&ModelRequest::Transcription {
                 samples: &samples,
                 language: language.as_deref(),
                 max_new_tokens,
             })
-        }),
-    )
+            .await
+    })
     .await
     {
-        Ok(Ok(Ok(job))) => job,
-        Ok(Ok(Err(error))) => return bad(error.to_string()),
-        Ok(Err(error)) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Ok(Ok(job)) => job,
+        Ok(Err(error)) => return bad(error.to_string()),
         Err(_) => {
             return json_error(
                 StatusCode::GATEWAY_TIMEOUT,

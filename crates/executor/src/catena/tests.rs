@@ -8,9 +8,7 @@ use catena_lang::{
     codegen::GpuDialect,
     runtime::{GeneratedFunction, RuntimeModule, Value, ValueKind as K},
 };
-use hellas_channel::content::InvocationContent;
 use hellas_rpc::protocol::invocation::{Limits, compute::*};
-use hellas_store::ContentStore;
 use std::{collections::BTreeMap, process::Command, sync::OnceLock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -250,7 +248,7 @@ fn counter_and_first_then_resolve_by_step_index() {
         &plan,
         &limits(),
         &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
-        &InvocationContent::Retained(ContentStore::new()),
+        &mut BTreeMap::new(),
         |v| {
             observed.push(v);
             Ok(())
@@ -293,7 +291,7 @@ fn invalid_plan_never_loads_or_calls_a_device() {
                 &plan,
                 &limit,
                 &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
-                &InvocationContent::Retained(ContentStore::new()),
+                &mut BTreeMap::new(),
                 |_| Ok(())
             )
             .is_err(),
@@ -351,16 +349,9 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
         outputs: vec![],
     };
     assert_eq!(
-        validate::validate(
-            &module,
-            &environment(),
-            &BTreeMap::new(),
-            &plan,
-            &limits(),
-            &InvocationContent::Retained(ContentStore::new())
-        )
-        .unwrap_err()
-        .call,
+        validate::validate(&module, &environment(), &BTreeMap::new(), &plan, &limits(),)
+            .unwrap_err()
+            .call,
         2
     );
     plan.calls.truncate(1);
@@ -373,15 +364,7 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
         bind: vec![],
     });
     assert!(
-        validate::validate(
-            &module,
-            &environment(),
-            &BTreeMap::new(),
-            &plan,
-            &limits(),
-            &InvocationContent::Retained(ContentStore::new())
-        )
-        .is_err()
+        validate::validate(&module, &environment(), &BTreeMap::new(), &plan, &limits(),).is_err()
     );
     plan.calls[1] = Call {
         entry: "take".into(),
@@ -399,17 +382,7 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
             object: hellas_rpc::ContentRef::for_bytes(&[0; 8]),
         }],
     };
-    assert!(
-        validate::validate(
-            &module,
-            &env,
-            &BTreeMap::new(),
-            &plan,
-            &limits(),
-            &InvocationContent::Retained(ContentStore::new())
-        )
-        .is_err()
-    );
+    assert!(validate::validate(&module, &env, &BTreeMap::new(), &plan, &limits(),).is_err());
     let mut plan = counter();
     plan.calls[0].bind = vec![Bind::Name("initial".into())];
     plan.step.as_mut().unwrap().args[0] = StepArg::FirstThen {
@@ -427,7 +400,6 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
             &BTreeMap::new(),
             &plan,
             &limits(),
-            &InvocationContent::Retained(ContentStore::new())
         )
         .is_err()
     );
@@ -530,7 +502,7 @@ fn hip_unseen_program_and_kill_respawn() {
             plan,
             &limits,
             &Assets::new(0, dialect),
-            &InvocationContent::Retained(ContentStore::new()),
+            &mut BTreeMap::new(),
             |_| Ok(()),
         )
     };
@@ -588,4 +560,180 @@ fn hip_unseen_program_and_kill_respawn() {
     let next = lease.pid().unwrap();
     assert_ne!(next, first);
     println!("increment(41) = 42 on respawned worker pid {next}");
+}
+
+async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
+    use hellas_rpc::{
+        Assurance, ContentRef, JsonBytes,
+        protocol::invocation::{
+            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
+            PreparedInvocation,
+        },
+    };
+    use hellas_store::content::{
+        ContentStore, DiskStore, IndexMode, JobContent, JobId, LocalStore, PinName, PinPolicy,
+        PinTarget, PinValue, Reservations, Scope,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let node = DiskStore::open(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
+    node.finish_recovery().await.unwrap();
+    let asset = ContentRef::for_bytes(b"weights");
+    let name = PinName::new("weights".into()).unwrap();
+    hellas_channel::content::upload_bytes(
+        &node,
+        &Scope::Owner,
+        b"weights",
+        Some(PinTarget {
+            name: name.clone(),
+            policy: PinPolicy::Jobs,
+        }),
+    )
+    .await
+    .unwrap();
+    let source_text = complete_sources(SOURCE);
+    let environment = Environment {
+        sources: source_text
+            .iter()
+            .map(|source| ContentRef::for_bytes(source.as_bytes()))
+            .collect(),
+        assets: vec![NamedAsset {
+            name: "weights".into(),
+            object: asset,
+        }],
+    };
+    let manifest = environment.manifest().unwrap();
+    let root_bytes = environment.canonical_bytes().unwrap();
+    let root_object = ContentRef::for_bytes(&root_bytes);
+    let mut limits = limits();
+    limits.max_upload_bytes = hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
+    let policy = InvocationPolicy {
+        admissions: vec![Admission::Compute {
+            evaluator: EVALUATOR.into(),
+            programs: ComputePrograms::Any {},
+        }],
+        limits,
+    };
+    let input = InvocationInput {
+        parameters: JsonBytes(counter().canonical_bytes().unwrap()),
+        artifacts: vec![],
+    };
+    let key = hellas_auth::ProducerSigningKey::generate();
+    let prepared = PreparedInvocation::new(
+        InvocationRequest {
+            execution_environment: manifest.content_id(),
+            input: input.content_id().unwrap(),
+            runner_public_key: key.public_key(),
+            nonce: [1; 32],
+            assurance: Assurance::ProducerSigned,
+            retain: false,
+        },
+        &manifest,
+        input,
+        policy.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    let job = JobContent::new(
+        &node,
+        JobId {
+            channel: hellas_auth::Digest::hash(b"channel"),
+            id: hellas_auth::Digest::hash(b"work"),
+        },
+        environment
+            .sources
+            .iter()
+            .copied()
+            .chain([root_object, asset])
+            .collect(),
+        limits.max_upload_bytes,
+    )
+    .await
+    .unwrap();
+    for source in &source_text {
+        hellas_channel::content::upload_bytes(job.store(), job.scope(), source.as_bytes(), None)
+            .await
+            .unwrap();
+    }
+    hellas_channel::content::upload_bytes(job.store(), job.scope(), &root_bytes, None)
+        .await
+        .unwrap();
+    let content = (LocalStore::Job(job.clone()), job.scope().clone());
+    let (environment, sources, mut readers) =
+        super::program::BoundProgram::open(&content, &prepared, &limits)
+            .await
+            .unwrap();
+    let compiling = prepared.clone();
+    let module = tokio::task::spawn_blocking(move || {
+        super::program::BoundProgram::compile_cancellable(
+            environment,
+            sources,
+            &compiling,
+            &limits,
+            &std::env::current_exe().unwrap(),
+            &super::Cancellation::default(),
+            GpuDialect::Hip,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!module.module().functions.is_empty());
+    let resident = if warm_gpu {
+        let assets = Assets::new(asset.bytes() + asset.bytes() % 2, GpuDialect::Hip);
+        let resident = assets
+            .pin(readers.remove(&asset.id()).unwrap(), asset)
+            .unwrap();
+        Some((assets, resident))
+    } else {
+        None
+    };
+    drop(readers);
+    let old = node
+        .pins(&Scope::Owner, "weights", Default::default())
+        .await
+        .unwrap()
+        .pins
+        .remove(0)
+        .1;
+    node.set_pin(
+        &Scope::Owner,
+        &name,
+        Some(&old),
+        Some(PinValue {
+            policy: PinPolicy::Owner,
+            ..old.clone()
+        }),
+    )
+    .await
+    .unwrap();
+    let failure = super::program::BoundProgram::open(&content, &prepared, &limits)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        failure.to_string().contains("missing compute asset"),
+        "{failure}"
+    );
+    drop(resident);
+    job.end().await.unwrap();
+    node.close().await;
+}
+
+#[tokio::test]
+async fn a_warm_program_cache_cannot_bypass_removed_job_pin_policy() {
+    cached_program_still_opens_current_pin_policy(false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a HIP device; verifies a warm GPU asset cache against current pin policy"]
+async fn a_warm_gpu_asset_cache_cannot_bypass_removed_job_pin_policy() {
+    cached_program_still_opens_current_pin_policy(true).await;
 }

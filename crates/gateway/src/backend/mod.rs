@@ -29,11 +29,17 @@ impl ExecutionBackend for GatewayBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
             let mut inference = telemetry::Inference::new(&request, &self.state.inference_metrics);
-            let mut prepared = match stateless(request.raw.value()).and_then(|()| {
-                inference
-                    .span
-                    .in_scope(|| self.state.prepare_wire_execution(&request.execution))
-            }) {
+            let prepared = match stateless(request.raw.value()) {
+                Ok(()) => {
+                    use tracing::Instrument;
+                    self.state
+                        .prepare_wire_execution(&request.execution)
+                        .instrument(inference.span.clone())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let mut prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     inference.fail(&error);

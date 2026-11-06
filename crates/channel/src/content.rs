@@ -63,6 +63,17 @@ pub async fn root(store: &LocalStore, scope: &Scope, id: ContentId) -> Result<by
     read(store, scope, object, MAX_PROGRAM_ROOT_BYTES as u64).await
 }
 
+/// Client-owned sources use explicit Owner object pins.
+pub async fn upload_object(store: &impl ContentStore, bytes: &[u8]) -> Result<ContentRef, Error> {
+    upload_bytes(
+        store,
+        &Scope::Owner,
+        bytes,
+        Some(object_pin(ContentRef::for_bytes(bytes))?),
+    )
+    .await
+}
+
 pub async fn upload_bytes(
     store: &impl ContentStore,
     scope: &Scope,
