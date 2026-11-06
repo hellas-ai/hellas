@@ -275,7 +275,7 @@ async fn open_settlement(
         descriptor.expected_settlement()?,
         Role::Client,
         origin,
-        hellas_store::ContentStore::new(),
+        args.content.clone(),
         &verifier,
     )
     .await?;

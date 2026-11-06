@@ -104,10 +104,9 @@ impl UploadSession {
     /// descriptor pages and chunks through this session's ordinary verifier.
     pub async fn copy_from(
         &mut self,
-        mut reader: super::VerifiedReader,
+        mut reader: impl std::io::Read + std::io::Seek + Send + 'static,
         pool: &super::Reservations,
     ) -> Result<()> {
-        use std::io::{Read, Seek};
         let object = self.object;
         if self.complete() {
             return Ok(());

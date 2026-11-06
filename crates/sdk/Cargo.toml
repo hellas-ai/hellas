@@ -40,6 +40,7 @@ hellas-rpc = { workspace = true, features = [
     "host-control",
 ] }
 hellas-store.workspace = true
+hellas-xet.workspace = true
 hellas-wire = { workspace = true, features = [
     "mux",
     "iroh",

@@ -24,7 +24,6 @@ use crate::work_link::WorkLink as ProviderDialer;
 use futures::StreamExt as _;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
-use hellas_channel::content::InvocationContent;
 use hellas_channel::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
 use hellas_channel::model::work::{JobDeadlines, private_policy_commitment};
 use hellas_channel::work::{
@@ -44,6 +43,7 @@ use hellas_kernel::{
     WorkPaymentTerms,
 };
 use hellas_rpc::protocol::invocation::PreparedInvocation;
+use hellas_store::content::{LocalStore, Scope};
 use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
@@ -58,6 +58,7 @@ use crate::work_config::WorkConfig;
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
     pub journal_root: PathBuf,
+    pub content: hellas_store::content::DiskStore,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
     /// Direct UDP addresses of `provider.node`.
@@ -453,6 +454,10 @@ impl PaidWorkSession {
         connection_timeout: Option<Duration>,
         funding: SessionFundingOptions,
     ) -> Result<Self> {
+        if let Some(job) = intent.job.as_deref() {
+            job.validate_content().await?;
+        }
+
         args.validate()?;
         let config = &args.config;
         config.clone().validate()?;
@@ -484,7 +489,7 @@ impl PaidWorkSession {
             .with_min_height(floor);
         let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
-        let (store, signed) = match retained {
+        let (mut store, signed) = match retained {
             Some(retained) => retained,
             None if !intent.allow_funding => {
                 return Err(PaidClientError::NoRetainedChannel);
@@ -527,6 +532,7 @@ impl PaidWorkSession {
                 (store, signed)
             }
         };
+        store.set_content_store(args.content.clone());
         signed.check()?;
         let payment_funding = signed.offer().payment_funding.clone();
         let policy = signed.offer().policy.clone();
@@ -811,7 +817,7 @@ impl PaidWorkSession {
     pub async fn run(
         &mut self,
         prepared: Option<PreparedInvocation>,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -826,7 +832,7 @@ impl PaidWorkSession {
     pub(crate) async fn run_prepared(
         &mut self,
         prepared: Option<PreparedInvocation>,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
@@ -1109,7 +1115,7 @@ async fn propose_when_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
-    content: &InvocationContent,
+    content: &(LocalStore, Scope),
     retained: Option<hellas_auth::Digest>,
     proposed: Option<&AtomicBool>,
 ) -> Result<hellas_auth::Digest> {
@@ -1187,7 +1193,7 @@ enum JobLookup {
 async fn execute_paid_job(
     args: &PaidWorkOptions,
     prepared: PreparedInvocation,
-    content: &InvocationContent,
+    content: &(LocalStore, Scope),
     dialer: &ProviderDialer,
     client: &mut ClientService,
     ready: &hellas_channel::model::setup::ReadyChannel,

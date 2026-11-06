@@ -63,6 +63,9 @@ struct GatewayConfiguration {
 
 /// The provider identity is the authority's binding, read from the store.
 pub struct HostOptions {
+    /// Shared node content, recovered before listeners start; retained journals
+    /// must all be restored before the caller finishes the recovery barrier.
+    pub content: hellas_store::content::DiskStore,
     /// The normal node transport belongs to the host, across provider restarts.
     pub transport: Option<iroh::Endpoint>,
     pub start_provider: bool,
@@ -165,7 +168,9 @@ impl HostHandle {
             endpoint: watch::channel(None).0,
         };
         let (control, listener) = if let Some((node, config)) = options.control {
-            let mut control = NodeControl::new(node).with_remote_admission(config.remote);
+            let mut control = NodeControl::new(node)
+                .with_content_store(options.content.clone())
+                .with_remote_admission(config.remote);
             control.host = Some(runtime.clone());
             let parent = config.socket.parent().ok_or_else(|| {
                 std::io::Error::new(

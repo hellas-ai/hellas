@@ -190,7 +190,6 @@ pub struct MountedWork {
     changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
     node: AdmissionNode,
-    upload_quota: hellas_channel::content::UploadQuota,
 }
 
 impl Default for MountedWork {
@@ -200,7 +199,6 @@ impl Default for MountedWork {
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: None,
             node: AdmissionNode::default(),
-            upload_quota: Default::default(),
         }
     }
 }
@@ -373,8 +371,52 @@ impl WorkHandler for MountedWorkService {
 }
 
 impl MountedWork {
-    pub fn upload_quota(&self) -> hellas_channel::content::UploadQuota {
-        self.upload_quota.clone()
+    pub(crate) async fn upload_stream(
+        &self,
+        mut requests: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<hellas_rpc::pb::content::UploadRequest, WireStatus>,
+                    > + Send,
+            >,
+        >,
+        context: TransportContext,
+        cancellation: hellas_channel::work::admission::Cancellation,
+    ) -> Result<hellas_rpc::call::ResponseStream<hellas_rpc::pb::content::UploadResponse>, WireStatus>
+    {
+        use futures::StreamExt;
+        use prost::Message;
+        let denied = || {
+            WireStatus::new(
+                hellas_wire::WireCode::PermissionDenied,
+                "invalid Work content opening",
+            )
+        };
+        let first = requests.next().await.ok_or_else(denied)??;
+        let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &first.part else {
+            return Err(denied());
+        };
+        let opening = open.work.as_ref().ok_or_else(denied)?;
+        let request =
+            AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(|_| denied())?;
+        let service = self
+            .handler(&context, request.route.as_ref())
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        if !service.node.ready() {
+            return Err(WireStatus::new(
+                hellas_wire::WireCode::Unavailable,
+                "work authority is not ready",
+            ));
+        }
+        service
+            .service
+            .upload_stream(
+                Box::pin(futures::stream::once(async move { Ok(first) }).chain(requests)),
+                context,
+                cancellation,
+            )
+            .await
     }
     pub fn with_backend<B>(backend: B) -> Self
     where
@@ -385,14 +427,12 @@ impl MountedWork {
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: Some(AcceptedWorkDriver::new(backend)),
             node: AdmissionNode::default(),
-            upload_quota: Default::default(),
         }
     }
 
     /// Mounts one channel; duplicate identities are refused without replacement.
     pub async fn mount(&self, peer: PeerId, service: &WorkService) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
-        service.set_upload_quota(self.upload_quota.clone()).await?;
         let channel = service.with_state(|state| state.channel().id()).await?;
         let mut held = self.mounted.lock().map_err(|_| MountError::Poisoned)?;
         let std::collections::btree_map::Entry::Vacant(entry) = held.entry(channel) else {
@@ -488,16 +528,16 @@ pub struct MountedSetup(
     Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>,
     AdmissionNode,
     Arc<std::sync::OnceLock<AutomaticOffers>>,
-    hellas_store::ContentStore,
+    Option<hellas_store::content::DiskStore>,
 );
 
 impl MountedSetup {
-    pub(crate) fn with_content_store(content: hellas_store::ContentStore) -> Self {
+    pub(crate) fn with_content_store(content: hellas_store::content::DiskStore) -> Self {
         Self(
             Default::default(),
             Default::default(),
             Default::default(),
-            content,
+            Some(content),
         )
     }
     /// Mounts a distinct bond under its authenticated transport peer.
@@ -993,7 +1033,9 @@ impl WorkRunner {
         let peer = PeerId::from_bytes(*peer);
         let bond_edge = offer.offer().proposal.bond_edge();
         let policy = Box::new(offer.offer().policy.clone());
-        store.set_content_store(setup_mount.3.clone());
+        if let Some(content) = &setup_mount.3 {
+            store.set_content_store(content.clone());
+        }
         let service = SetupService::new(SetupEndpoint::new(
             store,
             config.settlement_key.clone(),

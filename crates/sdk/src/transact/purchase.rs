@@ -433,7 +433,7 @@ impl Purchase {
             settlement,
             Role::Client,
             origin,
-            hellas_store::ContentStore::new(),
+            options.content.clone(),
             &Secp256k1Verifier::new(),
         )
         .await?;

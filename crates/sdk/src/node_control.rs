@@ -30,6 +30,7 @@ use crate::application_handshake as handshake;
 mod admission;
 pub mod bootstrap;
 pub mod configuration;
+mod content;
 pub mod host;
 pub use admission::RemoteControlAdmission;
 pub mod profile;
@@ -45,6 +46,7 @@ pub struct NodeControl {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
+    content: Option<hellas_store::content::DiskStore>,
     local_slots: Arc<Semaphore>,
     remote_capacity: Arc<RemoteCapacity>,
     remote_admission: RemoteControlAdmission,
@@ -62,6 +64,7 @@ impl NodeControl {
             node,
             work: None,
             host: None,
+            content: None,
             local_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             remote_capacity: Arc::new(RemoteCapacity {
                 sessions: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -69,6 +72,22 @@ impl NodeControl {
                 peers: Mutex::default(),
             }),
             remote_admission: RemoteControlAdmission::default(),
+        }
+    }
+
+    pub fn with_content_store(mut self, content: hellas_store::content::DiskStore) -> Self {
+        self.content = Some(content);
+        self
+    }
+
+    fn session(&self, session: AuthenticatedSession, binding: Digest) -> ControlSession {
+        ControlSession {
+            node: self.node.clone(),
+            work: self.work.clone(),
+            host: self.host.clone(),
+            content: self.content.clone(),
+            session: Arc::new(session),
+            binding,
         }
     }
 
@@ -197,16 +216,7 @@ impl NodeControl {
         drop(peer_slot);
         drop(handshake_slot);
         tracing::info!("remote control application session admitted");
-        serve(
-            transport,
-            self.node.clone(),
-            self.work.clone(),
-            self.host.clone(),
-            session,
-            binding,
-            deadline,
-        )
-        .await
+        serve(transport, self.session(session, binding), deadline).await
     }
 
     /// Host an admitted native byte stream with caller-configured TLS trust.
@@ -247,16 +257,7 @@ impl NodeControl {
         let transport =
             hellas_wire::local::transport(stream, hellas_wire::mux::Role::Server, context)
                 .map_err(|_| unavailable())?;
-        serve(
-            transport,
-            self.node.clone(),
-            self.work.clone(),
-            self.host.clone(),
-            session,
-            binding,
-            deadline,
-        )
-        .await
+        serve(transport, self.session(session, binding), deadline).await
     }
 }
 
@@ -368,45 +369,24 @@ where
     Ok((HostControlClientImpl::new(transport), challenge))
 }
 
-async fn serve<T>(
-    transport: T,
-    node: NodeCoordinator,
-    work: Option<hellas_authority::grant_service::WorkAdministration>,
-    host: Option<host::Runtime>,
-    session: AuthenticatedSession,
-    binding: Digest,
-    deadline: Instant,
-) -> Result<(), WireStatus>
+async fn serve<T>(transport: T, server: ControlSession, deadline: Instant) -> Result<(), WireStatus>
 where
-    T: StreamTransport + Send + Sync,
+    T: StreamTransport + Send + Sync + 'static,
     T::Stream: Send,
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
     <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
 {
-    let server = HostControlServer(ControlSession {
-        node,
-        work,
-        host,
-        session,
-        binding,
-    });
-    tokio::time::timeout_at(deadline, async {
-        loop {
-            let inbound = tokio::time::timeout(IDLE_TIMEOUT, transport.accept())
-                .await
-                .map_err(|_| denied())?
-                .map_err(|_| unavailable())?;
-            let Some(inbound) = inbound else {
-                return Ok(());
-            };
-            // Recheck the connection before request decoding. Handlers recheck
-            // again with exact grants under the writer at the effect point.
-            server.0.caller().await?;
-            Dispatcher::<T>::dispatch(&server, inbound)
-                .await
-                .map_err(|_| unavailable())?;
-        }
-    })
+    let (_quiesce, quiescing) = tokio::sync::watch::channel(false);
+    tokio::time::timeout_at(
+        deadline,
+        crate::provider::serve_loop(
+            Arc::new(transport),
+            server,
+            quiescing,
+            IDLE_TIMEOUT,
+            deadline,
+        ),
+    )
     .await
     .map_err(|_| denied())?
 }
@@ -430,11 +410,13 @@ impl Drop for CloseConnection {
     }
 }
 
+#[derive(Clone)]
 struct ControlSession {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
-    session: AuthenticatedSession,
+    content: Option<hellas_store::content::DiskStore>,
+    session: Arc<AuthenticatedSession>,
     binding: Digest,
 }
 impl ControlSession {

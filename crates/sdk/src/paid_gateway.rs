@@ -8,11 +8,11 @@ use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
 };
 use futures::future::BoxFuture;
-use hellas_channel::content::{EphemeralContent, InvocationContent};
 use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_gateway::{WorkGatewayError, WorkShutdownError};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::output::OutputEvent as FetchEvent;
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -452,8 +452,13 @@ impl PaidPool {
     }
 }
 
-fn empty_content() -> InvocationContent {
-    InvocationContent::Ephemeral(EphemeralContent::default())
+fn empty_content() -> (LocalStore, Scope) {
+    (
+        LocalStore::Memory(MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ))),
+        Scope::Owner,
+    )
 }
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {

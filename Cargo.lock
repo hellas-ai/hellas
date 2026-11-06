@@ -3561,6 +3561,7 @@ dependencies = [
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
+ "hellas-xet",
  "hex",
  "iroh",
  "iroh-mdns-address-lookup",

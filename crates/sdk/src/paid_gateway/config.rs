@@ -63,7 +63,11 @@ impl PaidGatewayOptions {
 
 /// Load the operator JSON format used by both CLI and native hosts. File paths
 /// must be absolute; existing assertion counters stay beside each channel journal.
-pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewayOptions> {
+pub fn load_pool_options(
+    path: &Path,
+    assurance: Assurance,
+    content: &hellas_store::content::DiskStore,
+) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
         hellas_channel::work_store::journal::MAX_RECORD_BYTES,
@@ -105,6 +109,7 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
             Ok(PaidWorkOptions {
                 config,
                 journal_root: p.journal_root,
+                content: content.clone(),
                 provider: p.provider,
                 provider_addrs,
                 apple_trust,

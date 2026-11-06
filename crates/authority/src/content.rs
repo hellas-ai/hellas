@@ -292,11 +292,11 @@ impl NodeCoordinator {
     }
     pub async fn content_owner_for_session(
         &self,
-        session: hellas_auth::authority::AuthenticatedSession,
+        session: std::sync::Arc<hellas_auth::authority::AuthenticatedSession>,
         binding: hellas_auth::Digest,
-        authorization: hellas_auth::authority::GrantId,
         operation: &'static str,
     ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let authorization = self.writer().await?.state().authority().root_grant();
         self.bind_content(
             Access::for_session(session, binding, authorization),
             Scope::Owner,
@@ -306,7 +306,7 @@ impl NodeCoordinator {
     }
     pub async fn content_read_for_session(
         &self,
-        session: hellas_auth::authority::AuthenticatedSession,
+        session: std::sync::Arc<hellas_auth::authority::AuthenticatedSession>,
         binding: hellas_auth::Digest,
         authorization: hellas_auth::authority::GrantId,
         pin: PinName,

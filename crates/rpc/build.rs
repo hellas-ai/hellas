@@ -758,6 +758,8 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
                     Self { transport }
                 }
 
+                pub fn transport(&self) -> &T { &self.transport }
+
                 #(#client_methods)*
             }
 

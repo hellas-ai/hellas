@@ -53,6 +53,8 @@ pub enum ProviderError {
     Address(#[from] iroh::endpoint::InvalidSocketAddr),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Content(#[from] hellas_store::content::Error),
     #[error("discovery could not start: {0}")]
     Discovery(String),
     #[error(transparent)]
@@ -83,6 +85,7 @@ pub struct FetchProviderOptions<R> {
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,
+    pub content: hellas_store::content::DiskStore,
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -139,6 +142,7 @@ impl<R> FetchProviderOptions<R> {
                 Some(options.root),
             )?),
             executor: executor_config,
+            content: options.content,
             grants: options.grants.map(|config| ProviderGrants {
                 config,
                 authority: ProviderAuthority::Journal {
@@ -216,6 +220,7 @@ impl ProviderGrants {
 /// The caller owns discovery advertising and the executing chain node's lifetime.
 pub struct ProviderOptions<R> {
     pub executor: ExecutorSpawnConfig,
+    pub content: hellas_store::content::DiskStore,
     pub grants: Option<ProviderGrants>,
     pub port: Option<u16>,
     pub build: String,
@@ -230,6 +235,7 @@ impl<R> Clone for ProviderOptions<R> {
     fn clone(&self) -> Self {
         Self {
             executor: self.executor.clone(),
+            content: self.content.clone(),
             grants: self.grants.clone(),
             port: self.port,
             build: self.build.clone(),
@@ -440,7 +446,7 @@ where
         None => None,
     };
     let signer = config.executor.producer_key.clone();
-    let content = config.executor.content_store.clone();
+    let content = config.content.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
     let remote_control = prepared_grants
         .as_ref()
@@ -471,6 +477,7 @@ where
         ),
         None => None,
     };
+    content.finish_recovery().await?;
     let alpns = advertised_alpns.clone();
     let ingress = match prepared_grants
         .as_ref()
@@ -529,10 +536,9 @@ where
                 .ip_addrs()
                 .map(ToString::to_string)
                 .collect(),
+            content.clone(),
         )
-        .await?
-        .with_upload_quota(work_mount.upload_quota())
-        .with_content_store(content.clone());
+        .await?;
         let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.configuration,
@@ -693,7 +699,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
         && let Some(chain) = node_handler.chain
@@ -702,7 +715,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             hellas_rpc::services::chain_sync::ChainSyncServer(chain),
             manager,
         );
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
@@ -714,7 +734,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             ),
             manager,
         );
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
         let connection = tokio::select! {
@@ -725,7 +752,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             },
         };
         let server = AccountingDispatcher::new(connection, manager);
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
@@ -739,7 +773,13 @@ async fn quiescing(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn serve_loop<T, S>(transport: Arc<T>, server: S, mut quiesce: watch::Receiver<bool>)
+pub(crate) async fn serve_loop<T, S>(
+    transport: Arc<T>,
+    server: S,
+    mut quiesce: watch::Receiver<bool>,
+    idle_timeout: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), WireStatus>
 where
     T: StreamTransport + Send + Sync + 'static,
     S: Dispatcher<T> + Send + Sync + 'static,
@@ -769,13 +809,14 @@ where
     });
 
     let mut dispatches = JoinSet::new();
-    let lifetime = tokio::time::sleep(MAX_LIFETIME);
+    let lifetime = tokio::time::sleep_until(deadline);
     tokio::pin!(lifetime);
     let mut draining = false;
+    let mut result = Ok(());
     loop {
         if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
             tokio::select! {
-                _ = &mut lifetime => break,
+                _ = &mut lifetime => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection expired")); break; },
                 _ = quiescing(&mut quiesce) => { draining = true; break; }
                 completed = dispatches.join_next() => log_dispatch_result(completed),
             }
@@ -785,11 +826,14 @@ where
         let idle = dispatches.is_empty();
         let next = tokio::select! {
             biased;
-            _ = &mut lifetime => break,
+            _ = &mut lifetime => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection expired")); break; },
             _ = quiescing(&mut quiesce) => { draining = true; break; }
             next = async {
                 if idle {
-                    tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await.unwrap_or(None)
+                    match tokio::time::timeout(idle_timeout, inbound_rx.recv()).await {
+                        Ok(next) => next,
+                        Err(_) => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection idle")); None }
+                    }
                 } else {
                     inbound_rx.recv().await
                 }
@@ -821,6 +865,7 @@ where
     } else {
         dispatches.shutdown().await;
     }
+    result
 }
 
 fn log_dispatch_result<E>(result: Option<Result<Result<(), E>, tokio::task::JoinError>>)

@@ -23,7 +23,7 @@ pub(crate) struct Access {
 }
 enum Evidence {
     Native(AuthenticatedCaller),
-    Session(AuthenticatedSession, Digest),
+    Session(Arc<AuthenticatedSession>, Digest),
 }
 
 impl Access {
@@ -34,7 +34,7 @@ impl Access {
         }
     }
     pub(crate) fn for_session(
-        session: AuthenticatedSession,
+        session: Arc<AuthenticatedSession>,
         binding: Digest,
         authorization: GrantId,
     ) -> Self {
@@ -169,7 +169,7 @@ impl GrantService {
         binding: Digest,
         authorization: GrantId,
     ) -> GrantWork {
-        self.with_evidence(Evidence::Session(session, binding), authorization)
+        self.with_evidence(Evidence::Session(Arc::new(session), binding), authorization)
     }
 
     fn with_evidence(&self, evidence: Evidence, authorization: GrantId) -> GrantWork {
