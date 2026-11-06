@@ -547,3 +547,253 @@ async fn cancelling_application_authentication_closes_the_uncached_connection() 
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn exact_pin_content_reads_use_the_live_grant_on_the_authenticated_work_carrier() {
+    for draining in [false, true] {
+        use futures::StreamExt as _;
+        use hellas_auth::authority::{GrantCommand, GrantSpec, OperationId, Permission};
+        use hellas_authority::{
+            content::{READ, pin_resource},
+            test_support as common,
+        };
+        use hellas_store::content::{
+            ContentStore as _, Cursor, Error, Path, PinName, PinPolicy, PinTarget, PinValue,
+            RemoteStore, Reservations, Scope, Source, Target,
+        };
+        let f = Fixture::new().await;
+        current(&f);
+        let selected = PinName::new("granted/selected".into()).unwrap();
+        let neighbor = PinName::new("granted/selected-neighbor".into()).unwrap();
+        let bytes = b"private-exact-pin-granted-body";
+        let object = hellas_channel::content::upload_bytes(
+            &f.content,
+            &Scope::Owner,
+            bytes,
+            Some(PinTarget {
+                name: selected.clone(),
+                policy: PinPolicy::Granted,
+            }),
+        )
+        .await
+        .unwrap();
+        let value = PinValue {
+            target: Target::Object(object),
+            policy: PinPolicy::Granted,
+            expires: None,
+        };
+        f.content
+            .set_pin(&Scope::Owner, &neighbor, None, Some(value.clone()))
+            .await
+            .unwrap();
+        let node = f.service.node();
+        let administrator = common::session(&node, &f.administrator).await;
+        let grant = GrantId([81; 16]);
+        let spec = GrantSpec {
+            authority: administrator.authority(),
+            subject: principal(1).0,
+            permissions: [Permission {
+                operation: OperationId::new(READ).unwrap(),
+                resource: pin_resource(administrator.authority(), &selected),
+            }]
+            .into(),
+            not_before: f.clock.now(),
+            expires: administrator.expires(),
+            delegation_depth: 0,
+            issuance: None,
+        };
+        let issued = node
+            .grant(
+                &administrator,
+                GrantCommand::Issue {
+                    authorization: GrantId([0; 16]),
+                    id: grant,
+                    spec: spec.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let [credential] = common::credentials::issue(
+            common::credentials::Issuer::Node(&node),
+            &administrator,
+            GrantId([0; 16]),
+            None,
+            spec,
+        )
+        .await;
+        let profile = ClientProfile {
+            authority: administrator.authority(),
+            authorization: grant,
+            credential,
+            local: None,
+        };
+        let pair = Pair::new().await;
+        let server = pair
+            .admit(&WorkRouter::grants(f.service.clone()), Some(&profile))
+            .await;
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let mut serving = tokio::spawn(crate::provider::serve_loop(
+            Arc::new(IrohTransport::new(pair.incoming.connection().clone())),
+            server,
+            stopped,
+            crate::transport_admission::IDLE_TIMEOUT,
+            tokio::time::Instant::now() + crate::transport_admission::MAX_LIFETIME,
+        ));
+        let remote = RemoteStore::new(
+            IrohTransport::new(pair.outgoing.connection().clone()),
+            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        );
+        let at = Path::new(selected.clone(), String::new()).unwrap();
+        // Client-side Scope::Owner cannot select the server's authority.
+        assert_eq!(
+            remote
+                .stat(&Scope::Owner, &at)
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            Target::Object(object)
+        );
+        assert!(matches!(
+            remote
+                .stat(&Scope::Owner, &Path::new(neighbor, String::new()).unwrap())
+                .await,
+            Err(Error::Denied)
+        ));
+        let pins = remote
+            .pins(&Scope::Owner, selected.as_str(), Cursor::default())
+            .await
+            .unwrap();
+        assert_eq!(pins.pins, vec![(selected.clone(), value.clone())]);
+        let mut read = remote.read(&Scope::Owner, &at, 2..8).await.unwrap();
+        let mut actual = Vec::new();
+        while let Some(chunk) = read.bytes.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(actual, bytes[2..8]);
+        assert!(matches!(
+            remote
+                .set_pin(&Scope::Owner, &selected, Some(&value), None)
+                .await,
+            Err(Error::Denied)
+        ));
+        assert!(matches!(
+            remote.collect(&Scope::Owner).await,
+            Err(Error::Denied)
+        ));
+        assert!(matches!(
+            remote
+                .acquire(
+                    &Scope::Owner,
+                    Source::Peer {
+                        node: *pair.provider.id().as_bytes(),
+                        at: at.clone()
+                    },
+                    Some(object),
+                    PinTarget {
+                        name: selected.clone(),
+                        policy: PinPolicy::Owner
+                    },
+                )
+                .await,
+            Err(Error::Denied)
+        ));
+        let client = hellas_rpc::services::content::ContentClientImpl::new(IrohTransport::new(
+            pair.outgoing.connection().clone(),
+        ));
+        let mut upload = client.upload().await.unwrap();
+        upload
+            .send(hellas_rpc::pb::content::UploadRequest {
+                part: Some(hellas_rpc::pb::content::upload_request::Part::Open(
+                    hellas_rpc::pb::content::UploadOpen {
+                        object: Some(hellas_rpc::pb::content::ContentRef {
+                            id: object.id().as_bytes().to_vec(),
+                            bytes: object.bytes(),
+                        }),
+                        pin: Some(hellas_rpc::pb::content::PinTarget {
+                            name: selected.as_str().into(),
+                            policy: None,
+                        }),
+                        work: None,
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let _ = upload.close().await;
+        assert!(upload.next().await.is_none());
+        assert_eq!(
+            upload.finish().unwrap_err().code(),
+            WireCode::PermissionDenied
+        );
+        let owner = PinValue {
+            policy: PinPolicy::Owner,
+            ..value.clone()
+        };
+        f.content
+            .set_pin(&Scope::Owner, &selected, Some(&value), Some(owner.clone()))
+            .await
+            .unwrap();
+        assert!(remote.stat(&Scope::Owner, &at).await.unwrap().is_none());
+        f.content
+            .set_pin(&Scope::Owner, &selected, Some(&owner), Some(value.clone()))
+            .await
+            .unwrap();
+        let snapshot = remote
+            .pins(&Scope::Owner, selected.as_str(), Cursor::default())
+            .await
+            .unwrap();
+        let mut watch = remote
+            .watch(&Scope::Owner, selected.as_str(), snapshot.cursor)
+            .await
+            .unwrap();
+        let timed = PinValue {
+            expires: Some(administrator.expires()),
+            ..value.clone()
+        };
+        f.content
+            .set_pin(&Scope::Owner, &selected, Some(&value), Some(timed))
+            .await
+            .unwrap();
+        assert!(
+            matches!(within(watch.next()).await.unwrap().unwrap(), hellas_store::content::PinEvent::Set { name, value: Some(_), .. } if name == selected)
+        );
+        if draining {
+            // Keep the authenticated watch and credential alive through the actual
+            // Work reply drain; no expiry, revocation or client disconnect helps it.
+            assert!(futures::poll!(watch.next()).is_pending());
+            stop.send_replace(true);
+            within(f.service.drain()).await.unwrap();
+            within(&mut serving).await.unwrap().unwrap();
+        } else {
+            node.grant(
+                &administrator,
+                GrantCommand::Revoke {
+                    authorization: GrantId([0; 16]),
+                    id: grant,
+                    expected: issued.revision(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(within(watch.next()).await, Some(Err(_)) | None));
+        if !draining {
+            assert!(matches!(
+                remote.stat(&Scope::Owner, &at).await,
+                Err(Error::Denied)
+            ));
+        }
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            0,
+            "content permission requires no Work execution grant"
+        );
+        drop(watch);
+        stop.send_replace(true);
+        if !draining {
+            within(serving).await.unwrap().unwrap();
+        }
+        pair.close().await;
+    }
+}

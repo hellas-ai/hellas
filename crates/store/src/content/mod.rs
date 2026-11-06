@@ -124,7 +124,7 @@ type AuthorityGuard = Box<dyn Fn() -> Result<()> + Send>;
 struct LiveAuthority {
     acquire:
         Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<AuthorityGuard>> + Send + Sync>,
-    ended: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+    ended: Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -169,15 +169,13 @@ impl Scope {
     }
     /// The concrete host returns a fresh-check closure owning its authority writer.
     /// Keeping that closure alive keeps the writer alive through the local commit.
-    pub fn bind<F, Fut, G>(
-        mut self,
-        acquire: F,
-        ended: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Self
+    pub fn bind<F, Fut, G, E, End>(mut self, acquire: F, ended: E) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<G>> + Send + 'static,
         G: Fn() -> Result<()> + Send + 'static,
+        E: Fn() -> End + Send + Sync + 'static,
+        End: std::future::Future<Output = ()> + Send + 'static,
     {
         use futures::FutureExt;
         self.live = Some(Arc::new(LiveAuthority {
@@ -185,13 +183,15 @@ impl Scope {
                 let future = acquire();
                 Box::pin(async move { Ok(Box::new(future.await?) as AuthorityGuard) })
             }),
-            ended: ended.boxed().shared(),
+            ended: Box::new(move || ended().boxed()),
         }));
         self
     }
+    // Each waiter owns its monitor so dropping a select branch also cancels any
+    // queued authority-writer acquisition before the carrier writes its response.
     pub async fn ended(&self) {
         match &self.live {
-            Some(live) => live.ended.clone().await,
+            Some(live) => (live.ended)().await,
             None => std::future::pending().await,
         }
     }

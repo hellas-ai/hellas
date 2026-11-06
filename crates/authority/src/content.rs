@@ -7,7 +7,13 @@ use crate::{
 };
 use hellas_auth::authority::{AuthorityError, AuthorityId, Permission, ResourceId, UnixMillis};
 use hellas_channel::work::admission::Cancellation;
+use hellas_rpc::{
+    call::{ResponseStream, WithTrailer},
+    pb::content as pb,
+    services::content::ContentHandler,
+};
 use hellas_store::content::{GrantHandle, PinName, Scope, ScopeKind};
+use hellas_wire::{TransportContext, WireCode, WireStatus};
 
 pub const READ: &str = "content.read";
 pub const UPLOAD: &str = "content.upload";
@@ -98,15 +104,20 @@ impl ContentBinding {
                     }
                     Ok(expires.min(deadline))
                 }
-                ScopeKind::Grant(handle) => self.access.authorize_permission(
-                    store,
-                    READ,
-                    Permission {
-                        operation: hellas_auth::authority::OperationId::new(READ)?,
-                        resource: pin_resource(authority.authority(), &handle.pin),
-                    },
-                    now,
-                ),
+                ScopeKind::Grant(handle) => {
+                    if let Some(service) = &self.service {
+                        service.content_serving(false)?;
+                    }
+                    self.access.authorize_permission(
+                        store,
+                        READ,
+                        Permission {
+                            operation: hellas_auth::authority::OperationId::new(READ)?,
+                            resource: pin_resource(authority.authority(), &handle.pin),
+                        },
+                        now,
+                    )
+                }
                 ScopeKind::Owner => {
                     let owner = authority
                         .grant(authority.root_grant())
@@ -134,6 +145,19 @@ impl ContentBinding {
     }
 }
 impl GrantWork {
+    async fn content_reader(
+        &self,
+        pin: &str,
+    ) -> Result<hellas_store::content::ContentService<hellas_store::content::DiskStore>, WireStatus>
+    {
+        let pin = PinName::new(pin.to_owned()).map_err(|_| content_denied())?;
+        let (scope, writer) = self.content_read(pin).await.map_err(|_| content_denied())?;
+        Ok(hellas_store::content::ContentService::new(
+            std::sync::Arc::new(self.service.content.clone()),
+            scope,
+        )
+        .with_write_authority(writer))
+    }
     /// The host selects this from the actual RPC method, never from request data.
     pub async fn content_owner(
         &self,
@@ -225,10 +249,99 @@ impl GrantWork {
             operation,
             cancellation: Cancellation::new(),
             parent: Some(parent),
-            service: work.as_ref().map(|_| self.service.clone()),
+            service: matches!(&scope.kind, ScopeKind::Grant(_) | ScopeKind::Work { .. })
+                .then(|| self.service.clone()),
             work,
         };
         binding.bind_locked(store, scope)
+    }
+}
+
+fn content_denied() -> WireStatus {
+    WireStatus::new(WireCode::PermissionDenied, "content authority unavailable")
+}
+
+// The authenticated carrier fixes the grant. Each request names its resource;
+// the same ContentService performs every read with the resulting exact-pin scope.
+impl ContentHandler for GrantWork {
+    async fn stat(
+        &self,
+        request: pb::StatRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::StatResponse>> + Send, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        let service = self.content_reader(&pin).await?;
+        Ok::<WithTrailer<pb::StatResponse>, _>(service.stat(request, context).await?.into())
+    }
+    async fn chunks(
+        &self,
+        request: pb::ChunksRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::ChunksResponse>> + Send, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        let service = self.content_reader(&pin).await?;
+        Ok::<WithTrailer<pb::ChunksResponse>, _>(service.chunks(request, context).await?.into())
+    }
+    async fn read(
+        &self,
+        request: pb::ReadRequest,
+        context: TransportContext,
+    ) -> Result<ResponseStream<pb::ReadResponse>, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        self.content_reader(&pin)
+            .await?
+            .read(request, context)
+            .await
+    }
+    async fn list_pins(
+        &self,
+        request: pb::ListPinsRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::ListPinsResponse>> + Send, WireStatus> {
+        let service = self.content_reader(&request.prefix).await?;
+        Ok::<WithTrailer<pb::ListPinsResponse>, _>(
+            service.list_pins(request, context).await?.into(),
+        )
+    }
+    async fn watch_pins(
+        &self,
+        request: pb::WatchPinsRequest,
+        context: TransportContext,
+    ) -> Result<ResponseStream<pb::WatchPinsResponse>, WireStatus> {
+        self.content_reader(&request.prefix)
+            .await?
+            .watch_pins(request, context)
+            .await
+    }
+    async fn upload(
+        &self,
+        _: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<pb::UploadRequest, WireStatus>> + Send>,
+        >,
+        _: TransportContext,
+    ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
+        Err(content_denied())
+    }
+    async fn acquire(
+        &self,
+        _: pb::AcquireRequest,
+        _: TransportContext,
+    ) -> Result<ResponseStream<pb::AcquireResponse>, WireStatus> {
+        Err(content_denied())
+    }
+    async fn set_pin(
+        &self,
+        _: pb::SetPinRequest,
+        _: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::SetPinResponse>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::SetPinResponse>, _>(content_denied())
+    }
+    async fn collect(
+        &self,
+        _: pb::CollectRequest,
+        _: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::CollectResponse>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::CollectResponse>, _>(content_denied())
     }
 }
 impl ContentBinding {
@@ -242,12 +355,15 @@ impl ContentBinding {
         binding.refresh(store, now)?;
         let binding = store.register_content(binding, now)?;
         let writer = crate::grant_service::delivery::content_authority(binding.clone());
-        let monitor = crate::grant_service::delivery::content_authority(binding.clone());
-        let ended = async move {
-            let _ = futures::future::poll_fn(|cx| {
-                monitor.poll_write(cx, &mut |_| std::task::Poll::Pending)
-            })
-            .await;
+        let monitoring = binding.clone();
+        let ended = move || {
+            let monitor = crate::grant_service::delivery::content_authority(monitoring.clone());
+            async move {
+                let _ = futures::future::poll_fn(|cx| {
+                    monitor.poll_write(cx, &mut |_| std::task::Poll::Pending)
+                })
+                .await;
+            }
         };
         Ok((
             scope.bind(

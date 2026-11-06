@@ -288,7 +288,7 @@ async fn cancelled_acceptance_response_finishes_ram_transfer_and_installs_execut
                 })
             }
         },
-        std::future::pending(),
+        std::future::pending,
     );
     let upper = job.store().clone();
     let blocker = tokio::spawn(async move {

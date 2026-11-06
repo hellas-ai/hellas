@@ -101,6 +101,7 @@ fn backend(slots: Arc<Semaphore>, calls: Arc<AtomicUsize>) -> Backend {
 }
 struct Fixture {
     root: tempfile::TempDir,
+    content: hellas_store::content::DiskStore,
     service: GrantService,
     application: Arc<ClientProfile>,
     administrator: hellas_auth::authority::CredentialSecret,
@@ -119,13 +120,15 @@ impl Fixture {
         let calls = Arc::new(AtomicUsize::new(0));
         let backend = backend(Arc::new(Semaphore::new(2)), calls.clone());
         let clock = TestClock::default();
+        let content =
+            hellas_authority::test_support::content_store(&root.path().join("provider")).await;
         let service = GrantService::new(
             store,
             Arc::new(principal(2).1),
             backend,
             vec![],
             clock.source(),
-            hellas_authority::test_support::content_store(&root.path().join("provider")).await,
+            content.clone(),
         )
         .unwrap();
         let application =
@@ -133,6 +136,7 @@ impl Fixture {
                 .await;
         Self {
             root,
+            content,
             service,
             application,
             administrator: secret,

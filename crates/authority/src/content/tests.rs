@@ -235,6 +235,36 @@ async fn revocation_between_read_chunks_checks_the_existing_authority() {
 }
 
 #[tokio::test]
+async fn cancelling_a_content_monitor_releases_its_queued_authority_writer() {
+    let f = Fixture::new().await;
+    let reader = f.reader(&name("selected"), UnixMillis(2000)).await;
+    let (scope, carrier) = reader.content_read(name("selected")).await.unwrap();
+    let node = f.service.node();
+    let held = node.writer().await.unwrap();
+    let mut ended = Box::pin(scope.ended());
+    assert!(futures::poll!(ended.as_mut()).is_pending());
+    drop(ended);
+    drop(held);
+    assert_eq!(
+        common::within(futures::future::poll_fn(|cx| {
+            carrier.poll_write(cx, &mut |_| std::task::Poll::Ready(Ok(1)))
+        }))
+        .await
+        .unwrap(),
+        1
+    );
+    f.revoke().await;
+    common::within(scope.ended()).await;
+    assert!(
+        futures::future::poll_fn(|cx| {
+            carrier.poll_write(cx, &mut |_| std::task::Poll::Ready(Ok(1)))
+        })
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn owner_upload_rechecks_after_declaration_and_rejects_revoked_payload() {
     let f = Fixture::new().await;
     let node = f.service.node();

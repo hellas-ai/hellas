@@ -282,7 +282,7 @@ mod tests {
                     })
                 }
             },
-            std::future::pending(),
+            std::future::pending,
         );
         let local = LocalStore::Job(work.clone());
         let fetching =

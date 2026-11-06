@@ -84,7 +84,7 @@ pub struct GrantService {
     run: Arc<Run>,
     draining: Arc<tokio::sync::Mutex<()>>,
     addresses: Arc<Vec<String>>,
-    content: hellas_store::content::DiskStore,
+    pub(crate) content: hellas_store::content::DiskStore,
 }
 struct Runtime {
     contents: BTreeMap<Digest, (hellas_store::content::JobContent, [u8; 32], bool)>,

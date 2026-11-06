@@ -633,7 +633,7 @@ mod content_tests {
                     })
                 }
             },
-            std::future::pending(),
+            std::future::pending,
         );
         let backend = executor.clone();
         let executing = tokio::spawn(async move {

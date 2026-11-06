@@ -226,6 +226,25 @@ impl Dispatcher<IrohTransport> for WorkConnection {
             })
             .await;
         }
+        use hellas_rpc::services::content;
+        if matches!(
+            inbound.method_id,
+            content::Stat::METHOD_ID
+                | content::Chunks::METHOD_ID
+                | content::Read::METHOD_ID
+                | content::Acquire::METHOD_ID
+                | content::SetPin::METHOD_ID
+                | content::ListPins::METHOD_ID
+                | content::WatchPins::METHOD_ID
+                | content::Collect::METHOD_ID
+        ) && let Funding::Grants(grants) = &self.server.0.funding
+        {
+            return Dispatcher::<IrohTransport>::dispatch(
+                &content::ContentServer(grants.clone()),
+                inbound,
+            )
+            .await;
+        }
         Dispatcher::<IrohTransport>::dispatch(&self.server, inbound).await
     }
 }

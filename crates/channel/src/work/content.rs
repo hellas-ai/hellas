@@ -344,7 +344,10 @@ impl WorkService {
                     held.check_content_authority(&authorization)
                 })
             }
-        }, async move {
+        }, move || {
+            let connection = connection.clone();
+            let service = service.clone();
+            async move {
             let cancelled = async { match &connection { Some(connection) => connection.cancelled().await, None => std::future::pending().await } };
             tokio::pin!(cancelled);
             loop {
@@ -359,6 +362,7 @@ impl WorkService {
                 };
                 let expiry = async { match remaining { Some(remaining) => tokio::time::sleep(remaining).await, None => std::future::pending().await } };
                 tokio::select! { biased; _ = &mut cancelled => return, _ = changed => {}, _ = expiry => {} }
+            }
             }
         })
     }

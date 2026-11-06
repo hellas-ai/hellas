@@ -39,7 +39,7 @@ async fn live_authority_checks_fresh_time_after_waiting_for_the_store_gate() {
                         })
                     }
                 },
-                std::future::pending(),
+                std::future::pending,
             )
         };
         let reading = store.clone();

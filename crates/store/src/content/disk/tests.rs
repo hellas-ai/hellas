@@ -124,7 +124,7 @@ async fn cancelling_the_caller_during_sqlite_wait_still_commits_before_watch_and
                 })
             }
         },
-        std::future::pending(),
+        std::future::pending,
     );
     let applying = store.clone();
     let caller = tokio::spawn(async move {

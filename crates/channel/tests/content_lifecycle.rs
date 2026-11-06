@@ -381,7 +381,7 @@ async fn cancelling_initial_admission_waits_for_its_core_effect_and_cleans_the_a
                 })
             }
         },
-        std::future::pending(),
+        std::future::pending,
     );
     let blocker_node = node.clone();
     let blocker = tokio::spawn(async move {
