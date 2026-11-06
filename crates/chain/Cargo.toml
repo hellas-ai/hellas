@@ -218,6 +218,7 @@ tracing = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+hellas-store.workspace = true
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true

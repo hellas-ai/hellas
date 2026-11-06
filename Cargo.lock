@@ -3101,6 +3101,7 @@ dependencies = [
  "hellas-kernel",
  "hellas-private",
  "hellas-rpc",
+ "hellas-store",
  "hellas-wire",
  "hex",
  "iroh",

@@ -286,56 +286,60 @@ impl ChannelStore {
     /// [`WorkStoreError::Channel`] when the step is not one this state
     /// may take — checked before anything is written — and
     /// [`WorkStoreError::Journal`] when an append or its sync fails.
-    pub async fn commit<V: SigVerifier>(
-        &mut self,
+    pub fn commit<'a, V: SigVerifier>(
+        &'a mut self,
         mut record: ChannelRecord,
         verifier: &V,
-    ) -> Result<&Channel, WorkStoreError> {
-        if let ChannelRecord::JobResult { work_id, .. }
-        | ChannelRecord::ResultVerified { work_id } = &record
-        {
-            self.load_retained_content(*work_id).await?;
-        }
-        self.reconcile_content().await?;
-        let staged = self.prepare_record(&mut record)?;
-        // Applied to a copy first: a record the rules refuse must leave
-        // neither the file nor the state touched. A cheap exact check
-        // first: the stream replay path offers a redundant release per
-        // emitted frame, and the copy would clone the whole transcript.
-        if self.state.is_redundant(&record) {
-            return Ok(&self.state);
-        }
-        let previous_jobs = self.state.jobs().count();
-        let mut next = self.state.clone();
-        // The `false` keeps commit-time validation at full strength even
-        // for a metadata-only journal: bodies are verified — digest and
-        // transcript-to-result authentication — before they are stripped
-        // from the bytes written. Only replay and checkpoint validation
-        // downgrade for body-less records.
-        if next.apply(&record, verifier, false)? == Applied::Changed {
-            // The signature this record carries leaves after this
-            // returns, so the state that authorises it has to be one a
-            // rotation can still carry. The proposed job is charged the
-            // fixed tail it can still add — the result it will be
-            // answered with and the terminal that pays for it — because
-            // by then there is no refusal left that costs nothing.
-            if let Some(tail) = record.checkpoint_tail() {
-                let len = next.checkpoint_for_storage().len().saturating_add(tail);
-                if len > MAX_CHECKPOINT_BYTES {
-                    return Err(JournalError::CheckpointTooLarge { len }.into());
+    ) -> impl std::future::Future<Output = Result<&'a Channel, WorkStoreError>> {
+        // Like SetupStore::commit, own the validated candidate and content I/O
+        // in this journal boundary rather than every setup/settlement poll frame.
+        Box::pin(async move {
+            if let ChannelRecord::JobResult { work_id, .. }
+            | ChannelRecord::ResultVerified { work_id } = &record
+            {
+                self.load_retained_content(*work_id).await?;
+            }
+            self.reconcile_content().await?;
+            let staged = self.prepare_record(&mut record)?;
+            // Applied to a copy first: a record the rules refuse must leave
+            // neither the file nor the state touched. A cheap exact check
+            // first: the stream replay path offers a redundant release per
+            // emitted frame, and the copy would clone the whole transcript.
+            if self.state.is_redundant(&record) {
+                return Ok(&self.state);
+            }
+            let previous_jobs = self.state.jobs().count();
+            let mut next = self.state.clone();
+            // The `false` keeps commit-time validation at full strength even
+            // for a metadata-only journal: bodies are verified — digest and
+            // transcript-to-result authentication — before they are stripped
+            // from the bytes written. Only replay and checkpoint validation
+            // downgrade for body-less records.
+            if next.apply(&record, verifier, false)? == Applied::Changed {
+                // The signature this record carries leaves after this
+                // returns, so the state that authorises it has to be one a
+                // rotation can still carry. The proposed job is charged the
+                // fixed tail it can still add — the result it will be
+                // answered with and the terminal that pays for it — because
+                // by then there is no refusal left that costs nothing.
+                if let Some(tail) = record.checkpoint_tail() {
+                    let len = next.checkpoint_for_storage().len().saturating_add(tail);
+                    if len > MAX_CHECKPOINT_BYTES {
+                        return Err(JournalError::CheckpointTooLarge { len }.into());
+                    }
+                }
+                self.rotate_if_full(record.is_new_work()).await?;
+                self.stage_record(&record, staged).await?;
+                self.journal.append(&record.encode_for_storage()).await?;
+                self.state = next;
+                self.reconcile_content().await?;
+                if self.state.jobs().count() < previous_jobs {
+                    self.rotate().await?;
                 }
             }
-            self.rotate_if_full(record.is_new_work()).await?;
-            self.stage_record(&record, staged).await?;
-            self.journal.append(&record.encode_for_storage()).await?;
-            self.state = next;
             self.reconcile_content().await?;
-            if self.state.jobs().count() < previous_jobs {
-                self.rotate().await?;
-            }
-        }
-        self.reconcile_content().await?;
-        Ok(&self.state)
+            Ok(&self.state)
+        })
     }
 
     /// Moves the journal on to its next generation, carrying this state

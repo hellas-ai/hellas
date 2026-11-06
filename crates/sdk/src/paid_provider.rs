@@ -536,7 +536,8 @@ pub struct MountedSetup(
 );
 
 impl MountedSetup {
-    pub(crate) fn with_content_store(content: hellas_store::content::DiskStore) -> Self {
+    /// Share the host store before discovering journals or mounting automatic offers.
+    pub fn with_content_store(content: hellas_store::content::DiskStore) -> Self {
         Self(
             Default::default(),
             Default::default(),
@@ -1069,13 +1070,13 @@ impl WorkRunner {
                 store.state().close_descriptor(),
                 &setup_mount.3,
             ) {
-                (Some(origin), Some(descriptor), Some(content)) => ChannelStore::recover(
+                (Some(origin), Some(descriptor), Some(content)) => Box::pin(ChannelStore::recover(
                     &config.journal_root,
                     descriptor.channel().clone(),
                     Role::Provider,
                     content.clone(),
                     &Secp256k1Verifier::new(),
-                )
+                ))
                 .await?
                 .map(|store| (store, origin)),
                 _ => None,

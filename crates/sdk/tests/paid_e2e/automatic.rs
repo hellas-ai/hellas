@@ -41,7 +41,7 @@ struct HostComputeState {
     permits: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
     calls: std::sync::atomic::AtomicUsize,
     loads: std::sync::atomic::AtomicUsize,
-    store: std::sync::Mutex<Option<hellas_store::ContentStore>>,
+    store: std::sync::Mutex<Option<LocalStore>>,
     pause: std::sync::atomic::AtomicBool,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -53,13 +53,16 @@ impl HostCompute {
     fn loads(&self) -> usize {
         self.0.loads.load(std::sync::atomic::Ordering::SeqCst)
     }
-    fn have(&self, object: hellas_rpc::ContentRef) -> bool {
-        self.0
-            .store
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|store| store.have(object.id().digest()))
+    async fn have(&self, object: hellas_rpc::ContentRef) -> bool {
+        let store = self.0.store.lock().unwrap().clone();
+        match store {
+            Some(store) => store
+                .open_verified(&Scope::Owner, object, None)
+                .await
+                .unwrap()
+                .is_some(),
+            None => false,
+        }
     }
 }
 impl WorkBackend for HostCompute {
@@ -96,24 +99,36 @@ impl WorkBackend for HostCompute {
         self.0
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self.0.store.lock().unwrap() = content.retained_store().cloned();
+        *self.0.store.lock().unwrap() = match &content.0 {
+            LocalStore::Disk(store) => Some(LocalStore::Disk(store.clone())),
+            _ => None,
+        };
         if self.0.pause.load(std::sync::atomic::Ordering::SeqCst) {
             self.0.started.notify_one();
             self.0.release.notified().await;
         }
+        let opened = BoundProgram::open(&content, &prepared, &limits)
+            .await
+            .map_err(|error| error.to_string());
         let state = self.0.clone();
         tokio::task::spawn_blocking(move || -> Result<_, String> {
             let dialect = hellas_executor::GpuDialect::Hip;
             let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
             // As the executor does: a preparation failure, an invalid plan
             // included, is a signed Failed terminal.
-            let program = match BoundProgram::compile(
-                &content,
-                &prepared,
-                &limits,
-                &std::env::current_exe().unwrap(),
-                dialect,
-            ) {
+            let (program, mut readers) = match opened.and_then(|(environment, sources, readers)| {
+                BoundProgram::compile_cancellable(
+                    environment,
+                    sources,
+                    &prepared,
+                    &limits,
+                    &std::env::current_exe().unwrap(),
+                    &hellas_executor::catena::Cancellation::default(),
+                    dialect,
+                )
+                .map(|program| (program, readers))
+                .map_err(|error| error.to_string())
+            }) {
                 Ok(program) => program,
                 Err(_) => {
                     return invocation::output::OutputStream::new(
@@ -132,7 +147,7 @@ impl WorkBackend for HostCompute {
                 &prepared,
                 &limits,
                 &Assets::new(0, dialect),
-                &content,
+                &mut readers,
                 &key,
                 |_| Ok(()),
             )
@@ -263,6 +278,7 @@ struct Provider {
     grants: hellas_authority::grant_service::GrantService,
     grant_calls: Arc<std::sync::atomic::AtomicUsize>,
     compute: HostCompute,
+    content: hellas_store::content::DiskStore,
 }
 
 #[derive(Clone)]
@@ -376,6 +392,7 @@ impl Provider {
             NodeCoordinator::new(store, Arc::new(|| UnixMillis::now().unwrap_or_default()));
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
         let grant_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let content = hellas_channel::test_support::channel::content_store(root).await;
         let grants = hellas_authority::grant_service::GrantService::from_node(
             authority.clone(),
             &enrollment,
@@ -394,6 +411,7 @@ impl Provider {
                 ..Default::default()
             },
             vec![],
+            content.clone(),
         )
         .await
         .unwrap();
@@ -413,7 +431,7 @@ impl Provider {
             .bind()
             .await
             .unwrap();
-        let setup = MountedSetup::default();
+        let setup = MountedSetup::with_content_store(content.clone());
         let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
@@ -438,6 +456,7 @@ impl Provider {
                 .map(ToString::to_string)
                 .collect(),
         );
+        content.finish_recovery().await.unwrap();
         let clock = WorkWatcher::spawn(runner);
         let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let offer_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -515,6 +534,7 @@ impl Provider {
             grants,
             grant_calls,
             compute,
+            content,
         }
     }
     async fn policy(
@@ -553,6 +573,7 @@ impl Provider {
             .unwrap()
             .unwrap();
         self.serving.await.unwrap();
+        self.content.close().await;
     }
 }
 
@@ -855,7 +876,7 @@ async fn compute_and_settle_inner(
     // it, and B pays exactly the price for the signed result.
     let client_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     let (k, nonce) = (u64::from(rand::random::<u32>()), rand::random::<u32>());
-    let (job, source) = compute_job(&increment(k), increment_plan(Arg::U64(41)));
+    let (job, source) = compute_job(&increment(k), increment_plan(Arg::U64(41))).await;
     let first_job = job.clone();
     let terms = hellas_sdk::execution::ExecutionTerms::Paid { price: job.price() };
     let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(
@@ -989,8 +1010,8 @@ async fn compute_and_settle_inner(
         result.output.artifacts[0].bytes.as_bytes(),
         (41 + k).to_le_bytes()
     );
-    assert!(compute.have(source), "A retained B's uploaded source");
-    assert_eq!(staged(&options.config.journal_root), 0);
+    assert!(compute.have(source).await, "A retained B's uploaded source");
+    assert_eq!(provider.content.stats().unwrap().outstanding, 0);
     assert_eq!((compute.calls(), compute.loads()), (1, 1));
     assert!(
         !session
@@ -1003,7 +1024,7 @@ async fn compute_and_settle_inner(
     // compiled or credited.
     let mut over = counter_plan();
     over.step.as_mut().unwrap().stop.max_steps = 65;
-    let (job, source) = compute_job(&increment(k ^ 1), over);
+    let (job, source) = compute_job(&increment(k ^ 1), over).await;
     assert!(
         session
             .run(
@@ -1015,14 +1036,14 @@ async fn compute_and_settle_inner(
             .await
             .is_err()
     );
-    assert!(!compute.have(source));
-    assert_eq!(staged(&options.config.journal_root), 0);
+    assert!(!compute.have(source).await);
+    assert_eq!(provider.content.stats().unwrap().outstanding, 0);
     assert_eq!(compute.calls(), 1);
     assert_eq!(credited(&session).await, JOB_PRICE);
 
     // 8b: a mistyped argument fails validation after acceptance. A signs the
     // Failed terminal, nothing is loaded, and B retires the job unpaid.
-    let (job, _) = compute_job(&increment(k ^ 3), increment_plan(Arg::U32(41)));
+    let (job, _) = compute_job(&increment(k ^ 3), increment_plan(Arg::U32(41))).await;
     let Err(error) = transact(&mut session, &job, &client_key, None).await else {
         panic!("a mistyped argument produced a payable result");
     };
@@ -1041,7 +1062,7 @@ async fn compute_and_settle_inner(
     // 8d: a counter streams one signed event per step and stops on its match.
     let streamed = Arc::new(std::sync::Mutex::new(0usize));
     let progress = streamed.clone();
-    let (job, _) = compute_job(COUNTER, counter_plan());
+    let (job, _) = compute_job(COUNTER, counter_plan()).await;
     let result = transact(
         &mut session,
         &job,
@@ -1070,7 +1091,7 @@ async fn compute_and_settle_inner(
     assert_eq!(result.credited_cumulative, 2 * JOB_PRICE);
 
     // 9: interrupted after A accepted, the same work resumes and pays once.
-    let (job, _) = compute_job(&increment(k ^ 2), increment_plan(Arg::U64(41)));
+    let (job, _) = compute_job(&increment(k ^ 2), increment_plan(Arg::U64(41))).await;
     let calls = compute.calls();
     compute
         .0
@@ -1230,27 +1251,27 @@ fn counter_plan() -> Plan {
         }],
     }
 }
-fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_rpc::ContentRef) {
-    let mut content = hellas_channel::content::EphemeralContent::default();
-    let mut sources: Vec<_> = catena_lang::stdlib::core_sources()
-        .map(|text| content.insert(text.as_bytes().to_vec()))
+async fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_rpc::ContentRef) {
+    let mut bytes: Vec<_> = catena_lang::stdlib::core_sources()
+        .map(|text| text.as_bytes().to_vec())
         .collect();
-    let source = content.insert(source.as_bytes().to_vec());
-    sources.push(source);
+    let mut sources: Vec<_> = bytes
+        .iter()
+        .map(|text| hellas_rpc::ContentRef::for_bytes(text))
+        .collect();
+    let source_ref = hellas_rpc::ContentRef::for_bytes(source.as_bytes());
+    sources.push(source_ref);
+    bytes.push(source.as_bytes().to_vec());
     let environment = invocation::compute::Environment {
         sources,
         assets: vec![],
     };
-    content.insert(environment.canonical_bytes().unwrap());
-    let job = hellas_sdk::job::Job::compute(
-        JOB_PRICE,
-        environment,
-        plan,
-        vec![],
-        InvocationContent::Ephemeral(content),
-    )
-    .unwrap();
-    (job, source)
+    bytes.push(environment.canonical_bytes().unwrap());
+    let content = source_content(bytes).await;
+    let job = hellas_sdk::job::Job::compute(JOB_PRICE, environment, plan, vec![], content)
+        .await
+        .unwrap();
+    (job, source_ref)
 }
 /// `Job::prepare` without B's policy pre-check, as a client that skips it.
 fn unchecked(
@@ -1321,19 +1342,6 @@ async fn credited(session: &PaidWorkSession) -> u64 {
         .with_state(|state| state.ledger().credited_cumulative())
         .await
         .unwrap()
-}
-/// Files left in A's upload staging directories.
-fn staged(root: &std::path::Path) -> usize {
-    std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .map(|entry| entry.unwrap().path())
-        .map(|path| match path.is_dir() {
-            true if path.extension().is_some_and(|e| e == "staging") => files(&path),
-            true => staged(&path),
-            false => 0,
-        })
-        .sum()
 }
 
 pub(super) fn exercise(
@@ -2179,13 +2187,12 @@ fn grant_composition<'a>(
             .await
             .unwrap();
         let environment = hellas_channel::test_support::channel::environment();
-        let mut content = hellas_channel::content::EphemeralContent::default();
-        content.insert(environment.canonical_bytes().unwrap());
+        let content = source_content([environment.canonical_bytes().unwrap()]).await;
         let input = hellas_sdk::job::JobInput::Compute {
             environment,
             plan: hellas_channel::test_support::channel::plan(),
             inputs: vec![],
-            content: hellas_channel::content::InvocationContent::Ephemeral(content),
+            content: content.into(),
         };
         let terms = hellas_sdk::execution::ExecutionTerms::Grant {
             resource: definition.policies[0].resource,
@@ -2346,6 +2353,7 @@ async fn finish(case: Box<Case>) {
         interrupted_root,
     } = *case;
     let options = PaidWorkOptions {
+        content: fresh_client_content(&root.path().join("client-store")).await,
         config: config.clone(),
         journal_root: root.path().join("client"),
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),

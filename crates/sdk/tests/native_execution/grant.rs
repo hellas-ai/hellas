@@ -72,6 +72,7 @@ async fn granted_compute_executes_through_the_native_facade() {
         },
         vec![],
         TestClock::default().source(),
+        hellas_authority::test_support::content_store(root.path()).await,
     )
     .unwrap();
     let credential =
@@ -112,13 +113,12 @@ async fn granted_compute_executes_through_the_native_facade() {
         control_timeout: Duration::from_secs(5),
     };
     let environment = hellas_channel::test_support::channel::environment();
-    let mut content = hellas_channel::content::EphemeralContent::default();
-    content.insert(environment.canonical_bytes().unwrap());
+    let content = super::source_content([environment.canonical_bytes().unwrap()]).await;
     let input = hellas_sdk::job::JobInput::Compute {
         environment,
         plan: hellas_channel::test_support::channel::plan(),
         inputs: vec![],
-        content: hellas_channel::content::InvocationContent::Ephemeral(content),
+        content: content.into(),
     };
     let terms = hellas_sdk::execution::ExecutionTerms::Grant {
         resource: grant.policies[0].resource,
@@ -216,6 +216,7 @@ async fn local_grant_session_executes_without_http() {
         backend,
         vec![],
         clock.source(),
+        hellas_authority::test_support::content_store(root.path()).await,
     )
     .unwrap();
     let credential =

@@ -736,9 +736,13 @@ mod tests {
         client_root: &std::path::Path,
         payment_funding: Funding,
         scan: SetupScan,
+        content: (
+            &hellas_store::content::DiskStore,
+            &hellas_store::content::DiskStore,
+        ),
     ) {
         let mut proposer = SetupEndpoint::new(
-            open_store(provider_root, Role::Provider).await,
+            open_store(provider_root, Role::Provider, content.0).await,
             provider(),
             PaymentAdmission::Admits(Box::new(provider_policy())),
         );
@@ -754,7 +758,7 @@ mod tests {
         }
         let service = SetupService::new(proposer);
         let mut caller = SetupEndpoint::new(
-            open_store(client_root, Role::Client).await,
+            open_store(client_root, Role::Client, content.1).await,
             client(),
             PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
@@ -775,14 +779,26 @@ mod tests {
         drop(caller);
     }
 
-    async fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
-        hellas_channel::test_support::channel::open_setup_store(
+    async fn content(root: &std::path::Path) -> hellas_store::content::DiskStore {
+        let content = hellas_channel::test_support::channel::content_store(root).await;
+        content.finish_recovery().await.unwrap();
+        content
+    }
+
+    async fn open_store(
+        root: &std::path::Path,
+        role: Role,
+        content: &hellas_store::content::DiskStore,
+    ) -> SetupStore {
+        let mut store = hellas_channel::test_support::channel::open_setup_store(
             root,
             TEST_NETWORK,
             bond_edge(),
             role,
         )
-        .await
+        .await;
+        store.set_content_store(content.clone());
+        store
     }
 
     fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -812,6 +828,8 @@ mod tests {
         run_qmdb(|runtime| async move {
             let provider_root = tempfile::tempdir().expect("a temp dir");
             let client_root = tempfile::tempdir().expect("a temp dir");
+            let provider_content = content(provider_root.path()).await;
+            let client_content = content(client_root.path()).await;
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let payment_edge = payment_edge_of(&payment_funding);
             let mut chain = Chain::start(runtime, "work_setup_e2e").await;
@@ -826,14 +844,17 @@ mod tests {
                 client_root.path(),
                 payment_funding,
                 scan_at(&floor),
+                (&provider_content, &client_content),
             )
             .await;
-            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
+            let mut provider_store =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
 
             // The client, at the same state, has nothing to do. Both
             // submissions are the provider's, and the client's journal
             // says so rather than trying to make one.
-            let mut client_store = open_store(client_root.path(), Role::Client).await;
+            let mut client_store =
+                open_store(client_root.path(), Role::Client, &client_content).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::AwaitingCounterparty,
@@ -857,7 +878,8 @@ mod tests {
                 "a sink that refuses is an error, got {refused:?}",
             );
             drop(provider_store);
-            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
+            let mut provider_store =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             assert!(
                 provider_store.state().bond_submitted(),
                 "the bond submission was journaled before it was broadcast",
@@ -905,7 +927,8 @@ mod tests {
             // The client's own journal, driven by the same function,
             // reaches the same origin. It submits nothing: every step
             // above was the provider's.
-            let mut client_store = open_store(client_root.path(), Role::Client).await;
+            let mut client_store =
+                open_store(client_root.path(), Role::Client, &client_content).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::Complete(origin),
@@ -915,14 +938,14 @@ mod tests {
             drop(provider_store);
             drop(client_store);
             assert_eq!(
-                open_store(provider_root.path(), Role::Provider)
+                open_store(provider_root.path(), Role::Provider, &provider_content)
                     .await
                     .state()
                     .origin(),
                 Some(origin),
             );
             assert_eq!(
-                open_store(client_root.path(), Role::Client)
+                open_store(client_root.path(), Role::Client, &client_content)
                     .await
                     .state()
                     .origin(),
@@ -948,7 +971,8 @@ mod tests {
                 expected_values(),
                 "the funded edge is the one the provider's policy expected",
             );
-            let recovered = open_store(provider_root.path(), Role::Provider).await;
+            let recovered =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             let armed = recovered
                 .state()
                 .close_descriptor()
@@ -990,6 +1014,8 @@ mod tests {
         run_qmdb(|runtime| async move {
             let provider_root = tempfile::tempdir().expect("a temp dir");
             let client_root = tempfile::tempdir().expect("a temp dir");
+            let provider_content = content(provider_root.path()).await;
+            let client_content = content(client_root.path()).await;
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let mut chain = Chain::start(runtime, "work_setup_journal_recovery").await;
             let blocks = WorkBlocks::new(chain.light_client());
@@ -999,13 +1025,15 @@ mod tests {
                 client_root.path(),
                 payment_funding,
                 scan_at(&floor),
+                (&provider_content, &client_content),
             )
             .await;
 
             // Crash after the real handshake export. The only values kept
             // outside the dead process are the portable Opens the peer got.
             let (bond_open, payment_open) = {
-                let recovered = open_store(provider_root.path(), Role::Provider).await;
+                let recovered =
+                    open_store(provider_root.path(), Role::Provider, &provider_content).await;
                 (
                     recovered.state().bond_open().expect("portable bond Open"),
                     recovered
@@ -1077,7 +1105,8 @@ mod tests {
                 "the real finalized history contains the adjudicated payment Close",
             );
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
+            let mut restarted =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             let mounted = step(&blocks, &blocks, &mut restarted).await;
             assert!(
                 matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
@@ -1092,6 +1121,8 @@ mod tests {
         run_qmdb(|runtime| async move {
             let provider_root = tempfile::tempdir().expect("a temp dir");
             let client_root = tempfile::tempdir().expect("a temp dir");
+            let provider_content = content(provider_root.path()).await;
+            let client_content = content(client_root.path()).await;
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let mut chain = Chain::start(runtime, "work_setup_open_obligation").await;
             let blocks = WorkBlocks::new(chain.light_client());
@@ -1101,12 +1132,14 @@ mod tests {
                 client_root.path(),
                 payment_funding,
                 scan_at(&floor),
+                (&provider_content, &client_content),
             )
             .await;
 
             let verifier = Secp256k1Verifier::new();
             let bond_open = {
-                let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
+                let mut provider_store =
+                    open_store(provider_root.path(), Role::Provider, &provider_content).await;
                 let retained = provider_store.state().bond_open().expect("retained Open");
                 let refused = advance_setup(
                     &blocks,
@@ -1120,7 +1153,8 @@ mod tests {
                 retained
             };
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
+            let mut restarted =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             let blocked = restarted.commit(
                 SetupRecord::Ended {
                     outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
@@ -1141,7 +1175,8 @@ mod tests {
                 .await;
             chain.seal().await;
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
+            let mut restarted =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier)
                 .await
                 .expect("the finalized Open is applied before the next setup decision");
@@ -1182,6 +1217,8 @@ mod tests {
         run_qmdb(|runtime| async move {
             let provider_root = tempfile::tempdir().expect("a temp dir");
             let client_root = tempfile::tempdir().expect("a temp dir");
+            let provider_content = content(provider_root.path()).await;
+            let client_content = content(client_root.path()).await;
             let payment_funding = Funding::new(
                 one_coin(CoinId::from_bytes(genesis_object_id(9).into())),
                 no_coins(),
@@ -1194,10 +1231,12 @@ mod tests {
                 client_root.path(),
                 payment_funding,
                 scan_at(&floor),
+                (&provider_content, &client_content),
             )
             .await;
 
-            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
+            let mut provider_store =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut provider_store).await,
                 SetupProgress::Aborted(SetupAbort::PaymentFundingSpent),
@@ -1212,7 +1251,7 @@ mod tests {
             );
             drop(provider_store);
             assert_eq!(
-                open_store(provider_root.path(), Role::Provider)
+                open_store(provider_root.path(), Role::Provider, &provider_content)
                     .await
                     .state()
                     .end(),
@@ -1238,6 +1277,8 @@ mod tests {
         run_qmdb(|runtime| async move {
             let provider_root = tempfile::tempdir().expect("a temp dir");
             let client_root = tempfile::tempdir().expect("a temp dir");
+            let provider_content = content(provider_root.path()).await;
+            let client_content = content(client_root.path()).await;
             let payment_funding = Funding::new(
                 one_coin(CoinId::from_bytes(genesis_object_id(9).into())),
                 no_coins(),
@@ -1250,11 +1291,13 @@ mod tests {
                 client_root.path(),
                 payment_funding,
                 scan_at(&floor),
+                (&provider_content, &client_content),
             )
             .await;
 
             // The bond, posted by something that is not this driver.
-            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
+            let mut provider_store =
+                open_store(provider_root.path(), Role::Provider, &provider_content).await;
             let bond_open = provider_store
                 .state()
                 .bond_open()

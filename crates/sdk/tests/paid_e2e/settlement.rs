@@ -26,7 +26,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 Duration::from_millis(100),
                 session.run(
                     Some(case.prepared_input.clone()),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &empty_content(),
                     false,
                     None,
                 ),
@@ -728,7 +728,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 Duration::from_millis(100),
                 session.run(
                     Some(case.prepared_input.clone()),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &empty_content(),
                     false,
                     None,
                 ),
@@ -954,7 +954,7 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                 Duration::from_millis(100),
                 session.run(
                     Some(case.prepared_input.clone()),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &empty_content(),
                     false,
                     None,
                 ),

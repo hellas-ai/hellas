@@ -262,6 +262,7 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             drop(attempt);
             // Retained selection does not require a fresh quote from the provider.
             case.provider.shutdown().await.unwrap();
+            case.provider_content.close().await;
             let mut attempt = ExecutionAttempt::open(
                 &case.root.path().join("provider-offline"),
                 job.input(),
@@ -301,7 +302,8 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
             case.provider.shutdown().await.unwrap();
-            let (provider, upstream) = start_provider(
+            case.provider_content.close().await;
+            let (provider, upstream, provider_content) = start_provider(
                 case.root.path(),
                 work_config(&case.devnet, case.root.path().join("provider-journal")),
                 case.provider_node.clone(),
@@ -310,6 +312,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             .await;
             case.options.provider_addrs = addresses(&provider);
             case.provider = provider;
+            case.provider_content = provider_content;
             fund(&mut case).await;
             let job = job();
             let terms = ExecutionTerms::Paid { price: PRICE };
@@ -531,6 +534,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             session.shutdown().await;
             case.endpoint.close().await;
             case.provider.shutdown().await.unwrap();
+            case.provider_content.close().await;
             case.relays.shutdown().await;
             case.devnet.shutdown().await;
         })
@@ -598,7 +602,7 @@ async fn record_unsigned_proposal(
         descriptor.expected_settlement().unwrap(),
         Role::Client,
         origin,
-        hellas_store::ContentStore::new(),
+        case.options.content.clone(),
         &verifier,
     )
     .await
@@ -634,7 +638,7 @@ async fn record_unsigned_proposal(
                 authorization,
                 client_signature: client_settlement()
                     .sign(hellas_channel::model::work::signing_hash(work)),
-                prepared_input: input.canonical_bytes().unwrap(),
+                prepared_input: input.canonical_bytes().unwrap().into(),
 
                 retained_tree: None,
             },
@@ -704,7 +708,8 @@ fn reused_nonce_scenario(
     Box::pin(async move {
         let mut case = paid_fixture(runtime).await;
         case.provider.shutdown().await.unwrap();
-        let (provider, upstream) = start_provider(
+        case.provider_content.close().await;
+        let (provider, upstream, provider_content) = start_provider(
             case.root.path(),
             work_config(&case.devnet, case.root.path().join("provider-journal")),
             case.provider_node.clone(),
@@ -713,6 +718,7 @@ fn reused_nonce_scenario(
         .await;
         case.options.provider_addrs = addresses(&provider);
         case.provider = provider;
+        case.provider_content = provider_content;
         fund(&mut case).await;
         let first = if same_input {
             job()
@@ -873,6 +879,7 @@ fn reused_nonce_scenario(
         session.shutdown().await;
         case.endpoint.close().await;
         case.provider.shutdown().await.unwrap();
+        case.provider_content.close().await;
         case.relays.shutdown().await;
         case.devnet.shutdown().await;
     })
