@@ -1,4 +1,4 @@
-//! Qwen3 text generation as a client-rendered Compute job.
+//! Qwen text generation as a client-rendered Compute job.
 //!
 //! The provider runs only the opaque program: catena-models renders the Hex
 //! from the GGUF configuration, this package maps its weight order onto byte
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use catena_models::{
     catena,
     checkpoint::read_gguf_model_config,
-    spec::{ModelArchitecture, ModelConfig, WeightDtype, weight_specs},
+    spec::{ModelConfig, WeightDtype, weight_specs},
 };
 use hellas_channel::content::EphemeralContent;
 use hellas_rpc::{
@@ -27,16 +27,13 @@ pub(super) struct Qwen3 {
     environment: Environment,
     content: EphemeralContent,
     views: Vec<(u64, u64)>,
+    states: Vec<String>,
 }
 
 impl Qwen3 {
     pub fn open(path: &Path) -> Result<Self> {
         let header = gguf::read_header(&mut File::open(path)?)?;
         let config = read_gguf_model_config(path)?;
-        ensure!(
-            config.architecture == ModelArchitecture::Qwen3Dense,
-            "text package requires dense Qwen3"
-        );
         let tensors: BTreeMap<_, _> = header
             .tensors
             .iter()
@@ -61,9 +58,19 @@ impl Qwen3 {
         }
         let indexed = hellas_store::ContentStore::new().index(path)?;
         let mut content = EphemeralContent::default();
-        let source = content.insert(
-            super::program::render(&catena::generated_model_source_for(&config)?)?.into_bytes(),
-        );
+        let model = catena::generated_model_source_for(&config)?;
+        let source = super::program::render(&model)?;
+        let raw = metacat::theory::RawTheorySet::from_text(&source)?;
+        let init = raw
+            .theories
+            .get(&"program".parse()?)
+            .and_then(|program| program.arrows.get(&"qwen3.init".parse().unwrap()))
+            .context("model has no qwen3.init entry")?;
+        let hexpr::Hexpr::Tensor(outputs) = &init.type_maps.1 else {
+            anyhow::bail!("model init must declare a tuple of state outputs");
+        };
+        let states = (0..outputs.len()).map(|i| format!("s{i}")).collect();
+        let source = content.insert(source.into_bytes());
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
@@ -77,6 +84,7 @@ impl Qwen3 {
             environment,
             content,
             views,
+            states,
         })
     }
 
@@ -110,23 +118,26 @@ impl Qwen3 {
         any_of.extend(self.config.eos_token_id);
         any_of.sort_unstable();
         any_of.dedup();
-        let mut args = vec![
-            StepArg::FirstThen {
-                first: Arg::Input {
-                    object: PROMPT.into(),
-                },
-                then: Arg::Slot {
-                    name: "next".into(),
-                },
+        let mut args = vec![StepArg::FirstThen {
+            first: Arg::Input {
+                object: PROMPT.into(),
             },
-            StepArg::Arg(Arg::Slot { name: "s0".into() }),
-            StepArg::Arg(Arg::Slot { name: "s1".into() }),
+            then: Arg::Slot {
+                name: "next".into(),
+            },
+        }];
+        args.extend(
+            self.states
+                .iter()
+                .map(|name| StepArg::Arg(Arg::Slot { name: name.clone() })),
+        );
+        args.extend([
             StepArg::Arg(Arg::U64(capacity)),
             StepArg::FirstThen {
                 first: Arg::U64(0),
                 then: Arg::Counter { base: prompt - 1 },
             },
-        ];
+        ]);
         args.extend(self.views.iter().map(|(offset, bytes)| {
             StepArg::Arg(Arg::Asset {
                 name: WEIGHTS.into(),
@@ -138,17 +149,18 @@ impl Qwen3 {
             calls: vec![Call {
                 entry: "qwen3.init".into(),
                 args: vec![Arg::U64(capacity)],
-                bind: vec![Bind::Name("s0".into()), Bind::Name("s1".into())],
+                bind: self.states.iter().cloned().map(Bind::Name).collect(),
             }],
             step: Some(Step {
                 entry: "qwen3".into(),
                 args,
-                bind: vec![
-                    Bind::Name("s0".into()),
-                    Bind::Name("s1".into()),
-                    Bind::Discard,
-                    Bind::Name("next".into()),
-                ],
+                bind: self
+                    .states
+                    .iter()
+                    .cloned()
+                    .map(Bind::Name)
+                    .chain([Bind::Discard, Bind::Name("next".into())])
+                    .collect(),
                 emit: "next".into(),
                 stop: Stop {
                     any_of,

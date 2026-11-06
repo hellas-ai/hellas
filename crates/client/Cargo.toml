@@ -32,6 +32,7 @@ work = ["dep:hellas-kernel", "dep:hellas-channel"]
 # Client-side model package: renders Compute jobs from model files.
 models = [
     "work",
+    "dep:hexpr",
     "dep:anyhow",
     "dep:catena-models",
     "dep:hellas-store",
@@ -65,6 +66,7 @@ hellas-kernel = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire.workspace = true
+hexpr = { version = "0.3", optional = true }
 hound = { version = "3.5", optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
