@@ -11,7 +11,7 @@ use hellas_wire::{
     iroh::IrohTransport,
 };
 use iroh::endpoint::Connection;
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::OwnedSemaphorePermit,
@@ -30,6 +30,7 @@ pub struct WorkConnection {
 }
 pub(super) struct ConnectionWork {
     funding: Funding,
+    pub(super) unverified: Mutex<Option<admission::UnverifiedConnection>>,
 }
 enum Funding {
     Grants(GrantWork),
@@ -39,7 +40,6 @@ struct ConnectionLease {
     connection: Connection,
     slot: Option<OwnedSemaphorePermit>,
     public: Option<OwnedSemaphorePermit>,
-    unverified: Option<admission::UnverifiedConnection>,
     expiry: Option<tokio::task::JoinHandle<()>>,
 }
 impl Drop for ConnectionLease {
@@ -66,14 +66,13 @@ impl WorkRouter {
             connection: transport.connection().clone(),
             slot: None,
             public: None,
-            unverified: None,
             expiry: None,
         };
         if lease.connection.alpn() != Work::ALPN.as_bytes() {
             return Err(denied());
         }
         let exporter = transport.open_exporter().map_err(|_| denied())?;
-        lease.unverified = Some(
+        let mut unverified = Some(
             self.unverified
                 .admit(lease.connection.remote_id(), tokio::time::Instant::now())?,
         );
@@ -137,7 +136,7 @@ impl WorkRouter {
                         handshake::Framing::Substream,
                     )
                     .await?;
-                    if let Some(unverified) = lease.unverified.take() {
+                    if let Some(unverified) = unverified.take() {
                         unverified.authenticated();
                     }
                     lease.slot = Some(
@@ -166,7 +165,10 @@ impl WorkRouter {
             }));
         }
         Ok(WorkConnection {
-            server: WorkServer(ConnectionWork { funding }),
+            server: WorkServer(ConnectionWork {
+                funding,
+                unverified: Mutex::new(unverified),
+            }),
             exporter,
             _lease: lease,
         })
@@ -279,3 +281,6 @@ fn denied() -> WireStatus {
         "Work connection authentication failed",
     )
 }
+
+#[cfg(test)]
+mod tests;
