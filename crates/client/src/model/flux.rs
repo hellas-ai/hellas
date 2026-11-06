@@ -3,10 +3,7 @@ use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
 use catena_models::flux::{config, graph, text};
 use hellas_channel::content::EphemeralContent;
-use hellas_rpc::{
-    ContentId, ContentRef,
-    protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
-};
+use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
 use rand_chacha::rand_core::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::{
@@ -153,10 +150,10 @@ pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAs
         file.flush()?;
         file.get_ref().sync_all()?;
         drop(file);
-        let indexed = hellas_store::ContentStore::new().index(&path)?;
+        let object = super::file_content(&path)?;
         assets.push(NamedAsset {
             name: name.into(),
-            object: ContentRef::new(ContentId::from_bytes(*indexed.id.as_bytes()), indexed.len),
+            object,
         });
     }
     for name in METADATA {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{ModelPackage, ModelRequest, ModelResponse};
+use hellas_rpc::ContentRef;
 use hellas_rpc::{JsonBytes, protocol::invocation::output::Outcome};
 
 fn fixture() -> PathBuf {

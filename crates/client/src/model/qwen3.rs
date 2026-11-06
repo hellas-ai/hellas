@@ -13,10 +13,7 @@ use catena_models::{
     spec::{ModelConfig, WeightDtype, weight_specs},
 };
 use hellas_channel::content::EphemeralContent;
-use hellas_rpc::{
-    ContentId, ContentRef,
-    protocol::invocation::{Artifact, compute::*},
-};
+use hellas_rpc::protocol::invocation::{Artifact, compute::*};
 use std::{collections::BTreeMap, fs::File, path::Path};
 
 const PROMPT: &str = "prompt";
@@ -56,7 +53,7 @@ impl Qwen3 {
             );
             views.push((tensor.offset, tensor.bytes));
         }
-        let indexed = hellas_store::ContentStore::new().index(path)?;
+        let object = super::file_content(path)?;
         let mut content = EphemeralContent::default();
         let model = catena::generated_model_source_for(&config)?;
         let source = super::program::render(&model)?;
@@ -75,7 +72,7 @@ impl Qwen3 {
             sources: vec![source],
             assets: vec![NamedAsset {
                 name: WEIGHTS.into(),
-                object: ContentRef::new(ContentId::from_bytes(*indexed.id.as_bytes()), indexed.len),
+                object,
             }],
         };
         content.insert(environment.canonical_bytes()?);

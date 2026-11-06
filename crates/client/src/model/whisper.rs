@@ -7,7 +7,7 @@ use catena_models::{
 };
 use hellas_channel::content::EphemeralContent;
 use hellas_rpc::{
-    ContentId, ContentRef,
+    ContentRef,
     protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
 };
 use serde::Deserialize;
@@ -168,12 +168,9 @@ pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentR
     for name in METADATA {
         std::fs::copy(checkpoint.join(name), staging.path().join(name))?;
     }
-    let indexed = hellas_store::ContentStore::new().index(&path)?;
+    let object = super::file_content(&path)?;
     std::fs::rename(staging.path(), destination)?;
-    Ok(ContentRef::new(
-        ContentId::from_bytes(*indexed.id.as_bytes()),
-        indexed.len,
-    ))
+    Ok(object)
 }
 
 pub(super) struct Whisper {
@@ -195,10 +192,10 @@ impl Whisper {
     pub fn open(dir: &Path) -> Result<Self> {
         let (config, generation, tokenizer) = metadata(dir)?;
         let views = views(&config)?;
-        let indexed = hellas_store::ContentStore::new().index(&dir.join(WEIGHTS_FILE))?;
+        let object = super::file_content(&dir.join(WEIGHTS_FILE))?;
         let (offset, bytes) = views.last().context("model has no weights")?;
         ensure!(
-            indexed.len == offset + bytes,
+            object.bytes() == offset + bytes,
             "derived weight file has wrong length"
         );
         let mut content = EphemeralContent::default();
@@ -208,7 +205,7 @@ impl Whisper {
             sources: vec![source],
             assets: vec![NamedAsset {
                 name: "weights".into(),
-                object: ContentRef::new(ContentId::from_bytes(*indexed.id.as_bytes()), indexed.len),
+                object,
             }],
         };
         content.insert(environment.canonical_bytes()?);
