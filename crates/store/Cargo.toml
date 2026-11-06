@@ -12,10 +12,15 @@ libc = "0.2"
 
 [dependencies]
 async-trait = "0.1"
+async-stream.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
+futures.workspace = true
+tokio.workspace = true
 hellas-auth.workspace = true
-hellas-wire = { workspace = true, features = ["mux"] }
+hellas-wire = { workspace = true, features = ["mux", "iroh"] }
+iroh = { workspace = true, features = ["tls-ring"] }
+sha2.workspace = true
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 url = "2"
 hellas-private.workspace = true
@@ -27,6 +32,7 @@ serde_ipld_dagcbor.workspace = true
 serde_json = { workspace = true }
 tempfile.workspace = true
 thiserror = { workspace = true }
+twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
 # Bundled Mozilla roots, matching the workspace `reqwest`. Deliberately
 # NOT `platform-verifier`: two HTTP clients in one binary trusting two
 # different sets of certificate authorities is a silent policy split,
@@ -37,3 +43,7 @@ ureq = { version = "3", default-features = false, features = [
     "rustls",
     "rustls-webpki-roots",
 ] }
+
+[dev-dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

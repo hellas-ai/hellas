@@ -1,7 +1,13 @@
 //! Generic verified objects, trees, pins and scoped content operations.
+mod acquire;
+mod memory;
 mod page;
+mod policy;
+mod remote;
+pub(crate) mod reservation;
 mod tree;
 mod upload;
+mod wire;
 
 use std::{ops::Range, pin::Pin};
 
@@ -14,7 +20,13 @@ use hellas_auth::{
 use hellas_rpc::ContentRef;
 use hellas_xet::Chunk;
 
+pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
+pub use policy::{
+    AllowList, Eviction, Lru, Miss, MissDecision, OnMiss, Refuse, StoreStats, Unpinned,
+};
+pub use remote::RemoteStore;
+pub use reservation::Reservations;
 pub use tree::{MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_TREE_BYTES, MAX_TREE_ENTRIES, PinName, Tree};
 pub use upload::UploadSession;
 
@@ -84,7 +96,7 @@ impl Path {
 }
 
 /// The authenticated channel and work identifier, never supplied as authority by a peer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JobId {
     pub channel: Digest,
     pub id: Digest,
@@ -161,6 +173,7 @@ pub struct Acquisition {
 
 #[derive(Clone, Debug)]
 pub struct PinPage {
+    pub cursor: Cursor,
     pub pins: Vec<(PinName, PinValue)>,
     pub next: Option<Cursor>,
 }

@@ -5,7 +5,7 @@ use prost::Message;
 use super::{ChunkPage, Cursor, Error, Result};
 
 pub fn body_limit() -> usize {
-    (hellas_wire::mux::DEFAULT_STREAM_WINDOW as usize).min(hellas_wire::frame::MAX_FRAME_BYTES)
+    hellas_wire::transport::body_limit()
 }
 
 pub(crate) fn wire_ref(object: ContentRef) -> pb::ContentRef {

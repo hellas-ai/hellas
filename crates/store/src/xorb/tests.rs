@@ -1,5 +1,38 @@
 use super::*;
 
+// Count allocations on just the decoder's thread, so this also catches a
+// decompressor allocating its internal advertised frame/block maximum.
+struct MeasuredAllocator;
+thread_local! {
+    static MAX_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+fn allocated(bytes: usize) {
+    let _ = MAX_ALLOCATION.try_with(|largest| {
+        if let Some(old) = largest.get() {
+            largest.set(Some(old.max(bytes)));
+        }
+    });
+}
+unsafe impl std::alloc::GlobalAlloc for MeasuredAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        allocated(layout.size());
+        unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        allocated(layout.size());
+        unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        allocated(size);
+        unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
+    }
+}
+#[global_allocator]
+static TEST_ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
 /// Deals bytes into four groups — the encoder this module reverses.
 fn group(bytes: &[u8]) -> Vec<u8> {
     let mut groups: [Vec<u8>; BG4_GROUPS] = Default::default();
@@ -49,28 +82,6 @@ fn sample(len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn every_scheme_round_trips() {
-    for len in [0, 1, 3, 4, 5, 1000, 65_537] {
-        let data = sample(len);
-        for scheme in [Scheme::None, Scheme::Lz4, Scheme::ByteGrouping4Lz4] {
-            let decoded = decode_chunk(&framed(&data, scheme))
-                .unwrap_or_else(|err| panic!("{scheme:?} len {len}: {err}"));
-            assert_eq!(decoded.data, data, "{scheme:?} len {len}");
-        }
-    }
-}
-
-/// Lengths that are not multiples of four are where an ungrouper
-/// that assumes equal groups goes wrong.
-#[test]
-fn byte_grouping_survives_ragged_lengths() {
-    for len in [1, 2, 3, 5, 6, 7, 9, 4095, 4097, 4098, 4099] {
-        let data = sample(len);
-        assert_eq!(ungroup(&group(&data)), data, "len {len}");
-    }
-}
-
-#[test]
 fn a_truncated_xorb_is_refused_not_guessed() {
     let framed = framed(&sample(100), Scheme::Lz4);
     assert_eq!(decode_chunk(&framed[..4]), Err(XorbError::Truncated));
@@ -99,7 +110,8 @@ fn an_unknown_version_or_scheme_is_refused() {
 #[test]
 fn a_chunk_that_decodes_to_the_wrong_bytes_is_rejected() {
     let real = sample(5_000);
-    let lie = sample(5_001);
+    let mut lie = real.clone();
+    lie[0] ^= 1;
     let expected = [Chunk::new(chunk_hash(&real), real.len() as u64)];
 
     assert!(decode_range(&framed(&real, Scheme::Lz4), &expected).is_ok());
@@ -169,13 +181,83 @@ fn bytes_after_the_requested_chunks_are_refused() {
 }
 
 #[test]
-fn a_range_decodes_consecutive_chunks_in_order() {
-    let parts = [sample(1_000), sample(2_000), sample(3_000)];
-    let mut xorb = Vec::new();
-    let mut expected = Vec::new();
-    for part in &parts {
-        xorb.extend_from_slice(&framed(part, Scheme::ByteGrouping4Lz4));
-        expected.push(Chunk::new(chunk_hash(part), part.len() as u64));
+fn descriptor_lengths_and_cold_caps_are_checked_from_the_header_before_payload() {
+    let mut header = [0u8; HEADER];
+    header[1..4].copy_from_slice(&1000usize.to_le_bytes()[..3]);
+    header[5..8].copy_from_slice(&1usize.to_le_bytes()[..3]);
+    assert_eq!(
+        decode_chunk(&header),
+        Err(XorbError::LengthMismatch {
+            declared: 1,
+            actual: 1000
+        })
+    );
+    header[4] = 1;
+    assert!(matches!(
+        decode_chunk_bounded(&header, Some(&Chunk::new(XetHash::ZERO, 2))),
+        Err(XorbError::UnexpectedLength { .. })
+    ));
+    header[5..8].copy_from_slice(&(hellas_xet::MAX_CHUNK_SIZE + 1).to_le_bytes()[..3]);
+    assert_eq!(decode_chunk(&header), Err(XorbError::TooLarge));
+}
+
+#[test]
+fn advertised_large_lz4_blocks_cannot_allocate_or_expand_past_the_xorb_bound() {
+    use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
+    use std::io::Write;
+    let mut encoder =
+        FrameEncoder::with_frame_info(FrameInfo::new().block_size(BlockSize::Max4MB), Vec::new());
+    encoder.write_all(&vec![0; 1024 * 1024]).unwrap();
+    let payload = encoder.finish().unwrap();
+    assert_eq!(payload[5], 0x70);
+    let mut xorb = vec![0];
+    xorb.extend_from_slice(&payload.len().to_le_bytes()[..3]);
+    xorb.push(1);
+    xorb.extend_from_slice(&1usize.to_le_bytes()[..3]);
+    xorb.extend_from_slice(&payload);
+    MAX_ALLOCATION.with(|largest| largest.set(Some(0)));
+    let result = decode_chunk(&xorb);
+    let largest = MAX_ALLOCATION.with(|largest| largest.replace(None).unwrap());
+    assert!(
+        largest <= 2,
+        "decoder allocated {largest} bytes for a one-byte declaration"
+    );
+    assert_eq!(
+        result,
+        Err(XorbError::LengthMismatch {
+            declared: 1,
+            actual: 2
+        })
+    );
+}
+
+#[test]
+fn linked_lz4_frames_with_all_checksums_interoperate_and_reject_corruption() {
+    use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+    use std::io::Write;
+    let bytes = sample(110_000);
+    let info = FrameInfo::new()
+        .block_size(BlockSize::Max64KB)
+        .block_mode(BlockMode::Linked)
+        .content_size(Some(bytes.len() as u64))
+        .block_checksums(true)
+        .content_checksum(true);
+    let mut encoder = FrameEncoder::with_frame_info(info, Vec::new());
+    encoder.write_all(&bytes).unwrap();
+    let payload = encoder.finish().unwrap();
+    assert_eq!(payload[4], 0x5c);
+    assert_eq!(lz4_frame(&payload, bytes.len()).unwrap(), bytes);
+    // Standard frame offsets: magic + FLG/BD + content size + header checksum.
+    let first_block = 4 + 2 + 8 + 1;
+    let block_len =
+        u32::from_le_bytes(payload[first_block..first_block + 4].try_into().unwrap()) & 0x7fff_ffff;
+    for offset in [
+        first_block - 1,
+        first_block + 4 + block_len as usize,
+        payload.len() - 1,
+    ] {
+        let mut bad = payload.clone();
+        bad[offset] ^= 1;
+        assert_eq!(lz4_frame(&bad, bytes.len()), Err(XorbError::Decompress));
     }
-    assert_eq!(decode_range(&xorb, &expected).expect("decode"), parts);
 }

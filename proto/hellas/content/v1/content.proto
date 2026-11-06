@@ -56,7 +56,7 @@ message AcquireResponse { uint64 received = 1; ContentRef complete = 2; }
 message SetPinRequest { string name = 1; PinValue expected = 2; PinValue value = 3; }
 message SetPinResponse {}
 message ListPinsRequest { string prefix = 1; Cursor cursor = 2; }
-message ListPinsResponse { repeated Pin pins = 1; Cursor next = 2; }
+message ListPinsResponse { repeated Pin pins = 1; Cursor next = 2; Cursor cursor = 3; }
 message WatchPinsRequest { string prefix = 1; Cursor from = 2; }
 message WatchPinsResponse { Cursor cursor = 1; Pin pin = 2; bool removed = 3; bool resync = 4; }
 message CollectRequest {}

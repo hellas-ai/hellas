@@ -3,9 +3,8 @@
 //! Three requests, in order:
 //!
 //! 1. `GET huggingface.co/api/{type}s/{repo}/xet-read-token/{rev}` for a
-//!    short-lived CAS token and the CAS URL. **No `Authorization`
-//!    header for public repositories** — anonymous read works, and the
-//!    token that comes back says `userId: "public"`.
+//!    short-lived CAS token and the CAS URL. The node's HF credential is
+//!    used only for HF HTTPS origins; anonymous public reads also work.
 //! 2. `GET {cas}/v2/reconstructions/{file_id}` for the file's terms.
 //! 3. `GET` each signed CDN URL for the xorb bytes those terms name.
 //!
@@ -92,6 +91,8 @@ const RECONSTRUCTION_BODY_LIMIT: u64 = 8 * 1024 * 1024;
 /// Why a fetch failed.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    #[error("source scratch reservation exhausted")]
+    Capacity,
     #[error("{context}: {source}")]
     Http {
         context: String,
@@ -124,7 +125,7 @@ pub enum FetchError {
 type Result<T> = std::result::Result<T, FetchError>;
 
 /// A CAS read token and where to spend it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XetToken {
     pub access_token: String,
     /// Where the CAS lives. Dynamic — do not hardcode it.
@@ -332,19 +333,12 @@ impl HfCas {
 
     /// Obtains a CAS read token.
     ///
-    /// Deliberately sends no `Authorization` header: public repositories
-    /// need none, and this crate holds no credentials. Private
-    /// repositories will fail here, loudly, which is the honest
-    /// behaviour for a component that was not given a secret.
+    /// Uses the node user's HF credential only for authenticated HF origins.
     pub fn token(&self) -> Result<XetToken> {
-        let url = format!(
-            "{}/api/{}/{}/xet-read-token/{}",
-            self.hub,
-            self.repo.kind.path_segment(),
-            self.repo.id,
-            self.repo.revision,
-        );
-        let body = get(&url, None, TOKEN_BODY_LIMIT)?;
+        self.repo.validate()?;
+        let url = self.hub_url(true, &["xet-read-token", &self.repo.revision])?;
+        let node_token = hf_origin(url.as_str()).then(node_token).flatten();
+        let body = get(url.as_str(), node_token.as_deref(), TOKEN_BODY_LIMIT)?;
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|err| FetchError::Malformed(format!("token response: {err}")))?;
         let field = |name: &str| {
@@ -505,11 +499,7 @@ pub fn verified(id: XetHash, assembled: &[u8], offset: u64) -> Result<&[u8]> {
 }
 
 fn get(url: &str, bearer: Option<&str>, limit: u64) -> Result<Vec<u8>> {
-    let mut request = ureq::get(url);
-    if let Some(token) = bearer {
-        request = request.header("Authorization", &format!("Bearer {token}"));
-    }
-    let (_, body) = read_body(request, url, limit)?;
+    let (_, body) = read_body(authenticated_get(url, bearer), url, limit)?;
     Ok(body)
 }
 
@@ -581,5 +571,534 @@ impl crate::Fetcher for HfCas {
 
     fn fetch(&self, id: XetHash, dest: &Path, expected: Option<&[Chunk]>) -> Result<u64> {
         Self::fetch(self, id, dest, expected)
+    }
+}
+
+impl std::fmt::Debug for XetToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("XetToken").finish_non_exhaustive()
+    }
+}
+fn hf_origin(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some_and(|host| {
+            host == "huggingface.co"
+                || host.ends_with(".huggingface.co")
+                || host == "hf.co"
+                || host.ends_with(".hf.co")
+        })
+}
+fn node_token() -> Option<String> {
+    token_from(|name| std::env::var_os(name))
+}
+fn token_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
+    if let Some(token) = env("HF_TOKEN").and_then(|value| value.into_string().ok())
+        && !token.trim().is_empty()
+    {
+        return Some(token.trim().to_owned());
+    }
+    let home = env("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env("XDG_CACHE_HOME").map(|path| std::path::PathBuf::from(path).join("huggingface"))
+        })
+        .or_else(|| {
+            env("HOME").map(|path| std::path::PathBuf::from(path).join(".cache/huggingface"))
+        })?;
+    let bytes = hellas_private::read_bounded_regular_file(
+        &home.join("token"),
+        hellas_private::MAX_SECRET_BYTES,
+    )
+    .ok()?;
+    let token = String::from_utf8(bytes).ok()?;
+    (!token.trim().is_empty()).then(|| token.trim().to_owned())
+}
+fn authenticated_get(
+    url: &str,
+    bearer: Option<&str>,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    let request = ureq::get(url);
+    if let Some(token) = bearer.filter(|_| hf_origin(url)) {
+        request.header("Authorization", &format!("Bearer {token}"))
+    } else {
+        request
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct RepoFile {
+    pub path: String,
+    pub size: u64,
+    #[serde(rename = "xetHash", default)]
+    pub xet_hash: Option<String>,
+    #[serde(default)]
+    pub lfs: Option<serde_json::Value>,
+}
+impl Repo {
+    pub fn from_uri(uri: &str) -> Result<Self> {
+        let value = uri
+            .strip_prefix("hf://")
+            .ok_or_else(|| FetchError::Malformed("expected hf://org/repo[@revision]".into()))?;
+        let (id, revision) = value.split_once('@').unwrap_or((value, "main"));
+        let repo = Self {
+            kind: RepoKind::Model,
+            id: id.into(),
+            revision: revision.into(),
+        };
+        repo.validate()?;
+        Ok(repo)
+    }
+    pub(crate) fn validate(&self) -> Result<()> {
+        let parts: Vec<_> = self.id.split('/').collect();
+        if parts.len() != 2
+            || parts.iter().any(|part| !safe_component(part))
+            || self.revision.is_empty()
+            || self.revision.contains('\0')
+        {
+            return Err(FetchError::Malformed(
+                "invalid HF repository or revision".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+impl HfCas {
+    fn hub_url(&self, api: bool, tail: &[&str]) -> Result<url::Url> {
+        let mut url =
+            url::Url::parse(&self.hub).map_err(|_| FetchError::Malformed("Hub origin".into()))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| FetchError::Malformed("Hub origin".into()))?;
+            segments.pop_if_empty();
+            if api {
+                segments.push("api").push(self.repo.kind.path_segment());
+            } else if self.repo.kind == RepoKind::Dataset {
+                segments.push("datasets");
+            }
+            segments
+                .extend(self.repo.id.split('/'))
+                .extend(tail.iter().copied());
+        }
+        Ok(url)
+    }
+    pub(crate) fn resolve_revision(&self, pool: &crate::content::Reservations) -> Result<String> {
+        self.repo.validate()?;
+        let _metadata = pool
+            .reserve(RECONSTRUCTION_BODY_LIMIT)
+            .map_err(|_| FetchError::Capacity)?;
+        let url = self.hub_url(true, &["revision", &self.repo.revision])?;
+        let token = hf_origin(url.as_str()).then(node_token).flatten();
+        let value: serde_json::Value = serde_json::from_slice(&get(
+            url.as_str(),
+            token.as_deref(),
+            RECONSTRUCTION_BODY_LIMIT,
+        )?)
+        .map_err(|_| FetchError::Malformed("repository revision response".into()))?;
+        value
+            .get("sha")
+            .and_then(serde_json::Value::as_str)
+            .filter(|sha| immutable_sha(sha))
+            .map(str::to_owned)
+            .ok_or_else(|| FetchError::Malformed("repository has no immutable SHA".into()))
+    }
+    pub(crate) fn files(
+        &self,
+        pool: &crate::content::Reservations,
+    ) -> Result<(
+        Vec<RepoFile>,
+        Vec<std::sync::Arc<crate::content::reservation::Reservation>>,
+    )> {
+        self.repo.validate()?;
+        let mut initial = self.hub_url(true, &["tree", &self.repo.revision])?;
+        initial.set_query(Some("recursive=true"));
+        let mut url = initial.to_string();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut files = Vec::new();
+        let mut charges = Vec::new();
+        loop {
+            if !seen.insert(url.clone()) {
+                return Err(FetchError::Malformed("cyclic Hub pagination".into()));
+            }
+            let charge = pool
+                .reserve(RECONSTRUCTION_BODY_LIMIT)
+                .map_err(|_| FetchError::Capacity)?;
+            let token = hf_origin(&url).then(node_token).flatten();
+            let mut response = authenticated_get(&url, token.as_deref())
+                .call()
+                .map_err(|_| FetchError::Malformed("Hub listing failed".into()))?;
+            let next = response
+                .headers()
+                .get("link")
+                .and_then(|header| header.to_str().ok())
+                .and_then(|links| links.split(',').find(|link| link.contains("rel=\"next\"")))
+                .and_then(|link| link.trim().strip_prefix('<'))
+                .and_then(|link| link.split_once('>'))
+                .map(|(url, _)| url.to_owned());
+            let mut body = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(RECONSTRUCTION_BODY_LIMIT + 1)
+                .read_to_end(&mut body)
+                .map_err(|_| FetchError::Malformed("Hub listing body".into()))?;
+            if body.len() as u64 > RECONSTRUCTION_BODY_LIMIT {
+                return Err(FetchError::Capacity);
+            }
+            let values: Vec<serde_json::Value> = serde_json::from_slice(&body)
+                .map_err(|_| FetchError::Malformed("Hub listing encoding".into()))?;
+            for value in values.into_iter().filter(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("file")
+            }) {
+                let file: RepoFile = serde_json::from_value(value)
+                    .map_err(|_| FetchError::Malformed("Hub file metadata".into()))?;
+                crate::content::Path::new(
+                    crate::content::PinName::new("hf".into())
+                        .map_err(|_| FetchError::Malformed("pin".into()))?,
+                    file.path.clone(),
+                )
+                .map_err(|_| FetchError::Malformed("Hub file path".into()))?;
+                files.push(file);
+            }
+            charges.push(charge);
+            match next {
+                Some(next) => {
+                    let origin = url::Url::parse(&self.hub)
+                        .map_err(|_| FetchError::Malformed("Hub URL".into()))?;
+                    let parsed = url::Url::parse(&next)
+                        .map_err(|_| FetchError::Malformed("Hub next URL".into()))?;
+                    if parsed.origin() != origin.origin() {
+                        return Err(FetchError::Malformed("cross-origin Hub pagination".into()));
+                    }
+                    url = next;
+                }
+                None => return Ok((files, charges)),
+            }
+        }
+    }
+    pub(crate) fn small_file(&self, path: &str) -> Result<impl std::io::Read + use<>> {
+        let mut url = self.hub_url(false, &["resolve", &self.repo.revision])?;
+        url.path_segments_mut()
+            .map_err(|_| FetchError::Malformed("Hub path".into()))?
+            .extend(path.split('/'));
+        let url = url.to_string();
+        let token = hf_origin(&url).then(node_token).flatten();
+        let response = authenticated_get(&url, token.as_deref())
+            .call()
+            .map_err(|_| FetchError::Malformed("Hub file request failed".into()))?;
+        if response.status() != 200 {
+            return Err(FetchError::Malformed("Hub file status".into()));
+        }
+        Ok(response.into_body().into_reader())
+    }
+    /// Reconstruction streams framed chunks; no whole xorb or file assembly.
+    pub(crate) fn write_xet(
+        &self,
+        id: XetHash,
+        len: u64,
+        expected: Option<&[Chunk]>,
+        writer: &mut impl std::io::Write,
+        pool: &crate::content::Reservations,
+    ) -> Result<()> {
+        if let Some(chunks) = expected {
+            let total = chunks
+                .iter()
+                .try_fold(0u64, |total, chunk| total.checked_add(chunk.data_len));
+            if total != Some(len)
+                || hellas_xet::file_hash(chunks) != id
+                || chunks.iter().any(|chunk| {
+                    chunk.data_len == 0 || chunk.data_len > hellas_xet::MAX_CHUNK_SIZE as u64
+                })
+                || chunks
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .any(|chunk| chunk.data_len < hellas_xet::MIN_CHUNK_SIZE as u64)
+            {
+                return Err(FetchError::Malformed(
+                    "expected descriptor commitment".into(),
+                ));
+            }
+        }
+        let _metadata = pool
+            .reserve(TOKEN_BODY_LIMIT + RECONSTRUCTION_BODY_LIMIT)
+            .map_err(|_| FetchError::Capacity)?;
+        let token = self.token()?;
+        let plan = self.reconstruction(&token, id)?;
+        let declared = plan
+            .terms
+            .iter()
+            .try_fold(0u64, |sum, term| sum.checked_add(term.unpacked_length))
+            .ok_or_else(|| FetchError::Malformed("reconstruction length overflow".into()))?;
+        if declared.checked_sub(plan.offset_into_first_range) != Some(len) {
+            return Err(FetchError::Malformed(
+                "reconstruction length contract".into(),
+            ));
+        }
+        let mut skip = plan.offset_into_first_range;
+        let mut descriptor = 0usize;
+        let mut written = 0u64;
+        for term in &plan.terms {
+            if term.chunks.end - term.chunks.start
+                > term.unpacked_length / hellas_xet::MIN_CHUNK_SIZE as u64 + 1
+            {
+                return Err(FetchError::Malformed("reconstruction chunk count".into()));
+            }
+            let mut next = term.chunks.start;
+            let mut unpacked = 0u64;
+            for range in plan.ranges_for(term) {
+                let length = range
+                    .bytes
+                    .end()
+                    .checked_sub(*range.bytes.start())
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or_else(|| FetchError::Malformed("reconstruction byte range".into()))?;
+                let count = range.chunks.end - range.chunks.start;
+                if count > length / crate::xorb::HEADER as u64 {
+                    return Err(FetchError::Malformed("reconstruction framing count".into()));
+                }
+                let mut response = ureq::get(&range.url)
+                    .header(
+                        "Range",
+                        &format!("bytes={}-{}", range.bytes.start(), range.bytes.end()),
+                    )
+                    .call()
+                    .map_err(|_| FetchError::Malformed("CAS range request failed".into()))?;
+                if response.status() != 206 {
+                    return Err(FetchError::Malformed("CAS range status".into()));
+                }
+                let mut reader = response
+                    .body_mut()
+                    .as_reader()
+                    .take(length.saturating_add(1));
+                let mut consumed = 0u64;
+                for index in range.chunks.clone() {
+                    let mut header = [0u8; crate::xorb::HEADER];
+                    reader
+                        .read_exact(&mut header)
+                        .map_err(|_| FetchError::Malformed("truncated xorb header".into()))?;
+                    let compressed =
+                        u32::from_le_bytes([header[1], header[2], header[3], 0]) as usize;
+                    consumed = consumed
+                        .checked_add((header.len() + compressed) as u64)
+                        .filter(|bytes| *bytes <= length)
+                        .ok_or_else(|| FetchError::Malformed("xorb frame exceeds range".into()))?;
+                    let _scratch = pool
+                        .reserve(
+                            (header.len() + compressed + 2 * (hellas_xet::MAX_CHUNK_SIZE + 1))
+                                as u64,
+                        )
+                        .map_err(|_| FetchError::Capacity)?;
+                    let mut frame = Vec::with_capacity(header.len() + compressed);
+                    frame.extend_from_slice(&header);
+                    frame.resize(header.len() + compressed, 0);
+                    reader
+                        .read_exact(&mut frame[header.len()..])
+                        .map_err(|_| FetchError::Malformed("truncated xorb payload".into()))?;
+                    let in_term = term.chunks.contains(&index);
+                    let chunk = if in_term {
+                        expected
+                            .map(|expected| {
+                                expected.get(descriptor).ok_or_else(|| {
+                                    FetchError::Malformed(
+                                        "reconstruction exceeded descriptors".into(),
+                                    )
+                                })
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    let decoded = crate::xorb::decode_chunk_bounded(&frame, chunk)?;
+                    if !in_term {
+                        continue;
+                    }
+                    if index != next {
+                        return Err(FetchError::Malformed(
+                            "overlapping or missing reconstruction chunks".into(),
+                        ));
+                    }
+                    next += 1;
+                    unpacked = unpacked
+                        .checked_add(decoded.data.len() as u64)
+                        .ok_or_else(|| FetchError::Malformed("term length overflow".into()))?;
+                    let trim = skip.min(decoded.data.len() as u64) as usize;
+                    skip -= trim as u64;
+                    let bytes = &decoded.data[trim..];
+                    written = written
+                        .checked_add(bytes.len() as u64)
+                        .filter(|written| *written <= len)
+                        .ok_or_else(|| {
+                            FetchError::Malformed("reconstruction exceeds reservation".into())
+                        })?;
+                    writer
+                        .write_all(bytes)
+                        .map_err(|_| FetchError::Malformed("staging reconstructed bytes".into()))?;
+                    descriptor += 1;
+                }
+                let mut sentinel = [0];
+                if consumed != length
+                    || reader
+                        .read(&mut sentinel)
+                        .map_err(|_| FetchError::Malformed("CAS range sentinel".into()))?
+                        != 0
+                {
+                    return Err(FetchError::Malformed("CAS range length".into()));
+                }
+            }
+            if next != term.chunks.end || unpacked != term.unpacked_length {
+                return Err(FetchError::Malformed("reconstruction term length".into()));
+            }
+        }
+        if written != len
+            || skip != 0
+            || expected.is_some_and(|expected| descriptor != expected.len())
+        {
+            return Err(FetchError::Malformed("short reconstruction".into()));
+        }
+        Ok(())
+    }
+}
+pub(crate) fn immutable_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod credentials_tests {
+    use super::*;
+    #[test]
+    fn credential_sources_and_origin_filtering_use_the_supplied_node_secret() {
+        use std::collections::BTreeMap;
+        let home = tempfile::tempdir().unwrap();
+        for directory in [
+            home.path().join("hf"),
+            home.path().join("xdg/huggingface"),
+            home.path().join(".cache/huggingface"),
+        ] {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("token"),
+                directory.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+        }
+        let mut env = BTreeMap::<&str, std::ffi::OsString>::from([
+            ("HF_TOKEN", " sentinel-private-token ".into()),
+            ("HF_HOME", home.path().join("hf").into()),
+            ("XDG_CACHE_HOME", home.path().join("xdg").into()),
+            ("HOME", home.path().into()),
+        ]);
+        let secret = token_from(|name| env.get(name).cloned()).unwrap();
+        assert_eq!(secret, "sentinel-private-token");
+        for origin in [
+            "https://huggingface.co/private/file",
+            "https://cas-server.xethub.hf.co/file",
+        ] {
+            let request = authenticated_get(origin, Some(&secret));
+            assert_eq!(
+                request.headers_ref().unwrap()["authorization"],
+                "Bearer sentinel-private-token"
+            );
+        }
+        for origin in [
+            "http://huggingface.co/file",
+            "https://huggingface.co.evil.invalid/file",
+            "https://evil.invalid/file",
+        ] {
+            assert!(
+                !authenticated_get(origin, Some(&secret))
+                    .headers_ref()
+                    .unwrap()
+                    .contains_key("authorization")
+            );
+        }
+        env.remove("HF_TOKEN");
+        assert_eq!(
+            token_from(|name| env.get(name).cloned()).as_deref(),
+            Some("hf")
+        );
+        env.remove("HF_HOME");
+        assert_eq!(
+            token_from(|name| env.get(name).cloned()).as_deref(),
+            Some("huggingface")
+        );
+        std::fs::write(home.path().join(".cache/huggingface/token"), " home-token ").unwrap();
+        env.remove("XDG_CACHE_HOME");
+        assert_eq!(
+            token_from(|name| env.get(name).cloned()).as_deref(),
+            Some("home-token")
+        );
+    }
+    #[test]
+    fn revision_metadata_requires_a_reservation_before_any_request() {
+        let cas = HfCas::new(Repo {
+            kind: RepoKind::Model,
+            id: "org/repo".into(),
+            revision: "main".into(),
+        });
+        assert!(matches!(
+            cas.resolve_revision(&crate::content::Reservations::ram(0)),
+            Err(FetchError::Capacity)
+        ));
+    }
+    #[test]
+    fn redirects_strip_the_authorization_header() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", first.local_addr().unwrap());
+        let target = format!("http://{}", second.local_addr().unwrap());
+        let serving = std::thread::spawn(move || {
+            for (listener, auth, redirect) in [(first, true, Some(target)), (second, false, None)] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut input = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut authorization = None;
+                loop {
+                    let mut line = String::new();
+                    input.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        authorization = Some(line);
+                    }
+                }
+                assert_eq!(authorization.is_some(), auth);
+                if auth {
+                    assert!(authorization.unwrap().contains("sentinel-private-token"));
+                }
+                if let Some(target) = redirect {
+                    write!(socket, "HTTP/1.1 302 Found\r\nLocation: {target}/file\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let (_, body) = read_body(
+            ureq::get(&url).header("Authorization", "Bearer sentinel-private-token"),
+            &url,
+            2,
+        )
+        .unwrap();
+        assert_eq!(body, b"ok");
+        serving.join().unwrap();
     }
 }

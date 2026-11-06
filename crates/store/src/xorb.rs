@@ -38,7 +38,7 @@
 use hellas_xet::{Chunk, XetHash, chunk_hash};
 
 /// Bytes of header before each chunk's payload.
-const HEADER: usize = 8;
+pub(crate) const HEADER: usize = 8;
 /// Groups the byte-grouping scheme splits a payload into.
 const BG4_GROUPS: usize = 4;
 
@@ -77,6 +77,10 @@ pub enum XorbError {
     Decompress,
     #[error("chunk decompressed to {actual} bytes, header declared {declared}")]
     LengthMismatch { declared: usize, actual: usize },
+    #[error("chunk header length {declared} differs from expected {expected}")]
+    UnexpectedLength { expected: u64, declared: usize },
+    #[error("chunk header length exceeds canonical maximum")]
+    TooLarge,
     #[error("chunk hashed to {actual}, expected {expected}")]
     HashMismatch { expected: XetHash, actual: XetHash },
     #[error("{trailing} bytes follow the {count} chunks that were asked for")]
@@ -94,6 +98,13 @@ pub struct Decoded {
 
 /// Decodes the chunk beginning at the start of `bytes`.
 pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
+    decode_chunk_bounded(bytes, None)
+}
+
+pub(crate) fn decode_chunk_bounded(
+    bytes: &[u8],
+    expected: Option<&Chunk>,
+) -> Result<Decoded, XorbError> {
     let header = bytes.get(..HEADER).ok_or(XorbError::Truncated)?;
     let version = header[0];
     if version != 0 {
@@ -102,7 +113,24 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
     let compressed_size = u24(&header[1..4]);
     let scheme = Scheme::from_tag(header[4])?;
     let uncompressed_size = u24(&header[5..8]);
+    if uncompressed_size > hellas_xet::MAX_CHUNK_SIZE {
+        return Err(XorbError::TooLarge);
+    }
+    if let Some(expected) = expected
+        && uncompressed_size as u64 != expected.data_len
+    {
+        return Err(XorbError::UnexpectedLength {
+            expected: expected.data_len,
+            declared: uncompressed_size,
+        });
+    }
 
+    if matches!(scheme, Scheme::None) && compressed_size != uncompressed_size {
+        return Err(XorbError::LengthMismatch {
+            declared: uncompressed_size,
+            actual: compressed_size,
+        });
+    }
     let payload = bytes
         .get(HEADER..HEADER + compressed_size)
         .ok_or(XorbError::Truncated)?;
@@ -113,7 +141,15 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
     // the length — and the check that follows is only reached if the
     // allocation succeeded.
     let data = match scheme {
-        Scheme::None => payload.to_vec(),
+        Scheme::None => {
+            if compressed_size != uncompressed_size {
+                return Err(XorbError::LengthMismatch {
+                    declared: uncompressed_size,
+                    actual: compressed_size,
+                });
+            }
+            payload.to_vec()
+        }
         Scheme::Lz4 => lz4_frame(payload, uncompressed_size)?,
         Scheme::ByteGrouping4Lz4 => ungroup(&lz4_frame(payload, uncompressed_size)?),
     };
@@ -122,6 +158,15 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
             declared: uncompressed_size,
             actual: data.len(),
         });
+    }
+    if let Some(expected) = expected {
+        let actual = chunk_hash(&data);
+        if actual != expected.hash {
+            return Err(XorbError::HashMismatch {
+                expected: expected.hash,
+                actual,
+            });
+        }
     }
     Ok(Decoded {
         data,
@@ -153,7 +198,10 @@ pub fn decode_chunks(
     let mut decoded = Vec::with_capacity(count);
     let mut offset = 0;
     for index in 0..count {
-        let next = decode_chunk(bytes.get(offset..).ok_or(XorbError::Truncated)?)?;
+        let next = decode_chunk_bounded(
+            bytes.get(offset..).ok_or(XorbError::Truncated)?,
+            expected.and_then(|chunks| chunks.get(index)),
+        )?;
         if let Some(chunk) = expected.and_then(|chunks| chunks.get(index)) {
             let actual = chunk_hash(&next.data);
             if actual != chunk.hash {
@@ -189,12 +237,99 @@ fn u24(bytes: &[u8]) -> usize {
 /// agreement with the header, and the caller's length check — the thing
 /// that catches a lying header — would pass.
 fn lz4_frame(payload: &[u8], declared: usize) -> Result<Vec<u8>, XorbError> {
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    lz4_flex::frame::FrameDecoder::new(payload)
-        .take(declared.saturating_add(1) as u64)
-        .read_to_end(&mut out)
-        .map_err(|_| XorbError::Decompress)?;
+    // FrameDecoder allocates its advertised block maximum (up to 4 MiB)
+    // before Read::take can bound it. Decode blocks directly into the bounded
+    // output instead; lz4_flex still owns the actual LZ4 decoding.
+    fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], XorbError> {
+        let (head, tail) = input.split_at_checked(count).ok_or(XorbError::Decompress)?;
+        *input = tail;
+        Ok(head)
+    }
+    fn word(input: &mut &[u8]) -> Result<u32, XorbError> {
+        Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
+    }
+    let overflow = || XorbError::LengthMismatch {
+        declared,
+        actual: declared + 1,
+    };
+    let mut input = payload;
+    if word(&mut input)? != 0x184d2204 {
+        return Err(XorbError::Decompress);
+    }
+    let flags = take(&mut input, 1)?[0];
+    let bd = take(&mut input, 1)?[0];
+    // Standard v1 frame, no reserved bits or external dictionary.
+    if flags & 0xc3 != 0x40 || bd & 0x8f != 0 || !(4..=7).contains(&(bd >> 4)) {
+        return Err(XorbError::Decompress);
+    }
+    let max_block = 1usize << (8 + 2 * (bd >> 4));
+    let content_size = if flags & 8 != 0 {
+        Some(u64::from_le_bytes(take(&mut input, 8)?.try_into().unwrap()))
+    } else {
+        None
+    };
+    let header_end = payload.len() - input.len();
+    let checksum = take(&mut input, 1)?[0];
+    if (twox_hash::XxHash32::oneshot(0, &payload[4..header_end]) >> 8) as u8 != checksum {
+        return Err(XorbError::Decompress);
+    }
+    if content_size.is_some_and(|size| size > declared as u64) {
+        return Err(overflow());
+    }
+    let mut out = vec![0; declared + 1];
+    let mut filled = 0;
+    loop {
+        let block = word(&mut input)?;
+        if block == 0 {
+            break;
+        }
+        let raw = block & 0x80000000 != 0;
+        let count = (block & 0x7fffffff) as usize;
+        if count == 0 || count > max_block {
+            return Err(XorbError::Decompress);
+        }
+        let block = take(&mut input, count)?;
+        if flags & 0x10 != 0 && word(&mut input)? != twox_hash::XxHash32::oneshot(0, block) {
+            return Err(XorbError::Decompress);
+        }
+        let (dictionary, remaining) = out.split_at_mut(filled);
+        let writable = remaining.len().min(max_block);
+        let written = if raw {
+            if count > writable {
+                return Err(overflow());
+            }
+            remaining[..count].copy_from_slice(block);
+            count
+        } else {
+            let decoded = if flags & 0x20 != 0 {
+                lz4_flex::block::decompress_into(block, &mut remaining[..writable])
+            } else {
+                lz4_flex::block::decompress_into_with_dict(
+                    block,
+                    &mut remaining[..writable],
+                    dictionary,
+                )
+            };
+            decoded.map_err(|error| match error {
+                lz4_flex::block::DecompressError::OutputTooSmall { .. } => overflow(),
+                _ => XorbError::Decompress,
+            })?
+        };
+        filled += written;
+        if filled > declared {
+            return Err(overflow());
+        }
+    }
+    out.truncate(filled);
+    if content_size.is_some_and(|size| size != filled as u64) {
+        return Err(XorbError::Decompress);
+    }
+    if flags & 4 != 0 && word(&mut input)? != twox_hash::XxHash32::oneshot(0, &out) {
+        return Err(XorbError::Decompress);
+    }
+    if !input.is_empty() {
+        return Err(XorbError::Decompress);
+    }
     Ok(out)
 }
 

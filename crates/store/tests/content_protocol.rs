@@ -80,25 +80,25 @@ fn tree_and_pin_limits_are_checked_in_bytes() {
     assert!(PinName::new(format!("{path}/x")).is_err());
 }
 
-#[test]
-fn upload_requires_a_complete_manifest_and_rejects_noncanonical_boundaries() {
+#[tokio::test]
+async fn upload_requires_a_complete_manifest_and_rejects_noncanonical_boundaries() {
     let data = vec![b'x'; 150_000];
     let descriptors = chunk(&data);
     let mut session = UploadSession::new(ContentRef::for_bytes(&data));
     assert!(!session.complete());
-    session.declare(&descriptors, true).unwrap();
+    session.declare(&descriptors, true).await.unwrap();
     let mut start = 0;
     for descriptor in &descriptors {
         let end = start + descriptor.data_len as usize;
-        session.accept_chunk(&data[start..end]).unwrap();
+        session.accept_chunk(&data[start..end]).await.unwrap();
         start = end;
     }
     assert!(session.complete());
-    assert!(session.accept_chunk(b"extra").is_err());
+    assert!(session.accept_chunk(b"extra").await.is_err());
     assert!(!session.complete());
     let mut early = UploadSession::new(ContentRef::for_bytes(b"x"));
-    assert!(early.accept_chunk(b"x").is_err());
-    assert!(early.declare(&chunk(b"x"), true).is_err());
+    assert!(early.accept_chunk(b"x").await.is_err());
+    assert!(early.declare(&chunk(b"x"), true).await.is_err());
 
     // Both declared hashes are valid, but an early arbitrary cut changes identity.
     let split = 16_384;
@@ -112,29 +112,30 @@ fn upload_requires_a_complete_manifest_and_rejects_noncanonical_boundaries() {
     );
     assert_ne!(object.id(), ContentId::hash(&data[..2 * split]));
     let mut bad = UploadSession::new(object);
-    bad.declare(&wrong, true).unwrap();
-    let first = bad.accept_chunk(&data[..split]);
-    assert!(first.is_err() || bad.accept_chunk(&data[split..2 * split]).is_err());
+    bad.declare(&wrong, true).await.unwrap();
+    let first = bad.accept_chunk(&data[..split]).await;
+    assert!(first.is_err() || bad.accept_chunk(&data[split..2 * split]).await.is_err());
     assert!(!bad.complete());
 }
 
-#[test]
-fn empty_object_is_complete_on_declaration_and_bad_lists_poison_sessions() {
+#[tokio::test]
+async fn empty_object_is_complete_on_declaration_and_bad_lists_poison_sessions() {
     let mut empty = UploadSession::new(ContentRef::new(ContentId::from_bytes([0; 32]), 0));
-    empty.declare(&[], true).unwrap();
+    empty.declare(&[], true).await.unwrap();
     assert!(empty.complete());
     let mut wrong = UploadSession::new(ContentRef::for_bytes(b"hello"));
-    assert!(wrong.declare(&chunk(b"other"), true).is_err());
-    assert!(wrong.declare(&chunk(b"hello"), true).is_err());
+    assert!(wrong.declare(&chunk(b"other"), true).await.is_err());
+    assert!(wrong.declare(&chunk(b"hello"), true).await.is_err());
     let mut over = UploadSession::new(ContentRef::for_bytes(b"x"));
     assert!(
         over.declare(&[Chunk::new(XetHash::ZERO, u64::MAX)], true)
+            .await
             .is_err()
     );
 }
 
-#[test]
-fn chunk_pages_fit_real_protobuf_envelopes_and_bind_the_object() {
+#[tokio::test]
+async fn chunk_pages_fit_real_protobuf_envelopes_and_bind_the_object() {
     let descriptors = vec![Chunk::new(XetHash::ZERO, 131_072); 40_000];
     let object = ContentRef::new(
         ContentId::from_bytes(file_hash(&descriptors).into_bytes()),
@@ -172,5 +173,5 @@ fn chunk_pages_fit_real_protobuf_envelopes_and_bind_the_object() {
     assert_eq!(page.chunks.len() + rest.chunks.len(), descriptors.len());
     assert!(rest.next.is_none());
     let mut upload = UploadSession::new(object);
-    assert!(upload.declare(&descriptors, true).is_err());
+    assert!(upload.declare(&descriptors, true).await.is_err());
 }

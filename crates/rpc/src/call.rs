@@ -17,11 +17,21 @@ use hellas_wire::TransportError;
 use hellas_wire::metadata::{Metadata, Trailer};
 use hellas_wire::status::{WireCode, WireStatus};
 use hellas_wire::transport::{
-    MethodMarker, RecvHalf, SendHalf, Stream as WireStream, StreamTransport,
+    MethodMarker, RecvHalf, SendHalf, ServiceMarker, Stream as WireStream, StreamTransport,
 };
 
 use crate::observe::{LEVEL, TARGET, Timing};
 use crate::telemetry::CallSpan;
+
+// Content pages use the usable stream window, even on transports whose parser
+// permits larger frames. Check raw bytes before prost allocates repeated fields.
+fn method_body_limit<M: MethodMarker>() -> Option<usize> {
+    matches!(
+        M::Service::NAME,
+        "hellas.content.v1.Content" | "hellas.resolve.v1.Resolve"
+    )
+    .then_some(hellas_wire::transport::body_limit())
+}
 
 /// Unary call: send one request, receive one response.
 pub async fn unary<T, M>(
@@ -68,6 +78,11 @@ where
                 .await
                 .map_err(transport_to_status)?;
             let (mut send, mut recv) = WireStream::split(stream);
+            if let Some(status) =
+                raw_request_limit_status(request.encoded_len(), method_body_limit::<M>())
+            {
+                return Err(status);
+            }
             send_request(&mut send, &mut recv, request).await?;
 
             // Unary protocol shape: exactly one body chunk, then EOF, then a
@@ -107,6 +122,9 @@ where
                 .ok_or_else(|| WireStatus::internal("unary call ended without terminal trailer"))?;
             if trailer.status != WireCode::Ok {
                 return Err(trailer_to_status(trailer));
+            }
+            if let Some(status) = raw_request_limit_status(chunk.len(), method_body_limit::<M>()) {
+                return Err(status);
             }
             let response = M::Response::decode(&chunk[..])
                 .map_err(|e| WireStatus::internal(format!("prost decode: {e}")))?;
@@ -207,9 +225,18 @@ where
                 .await
                 .map_err(transport_to_status)?;
             let (mut send, mut recv) = WireStream::split(stream);
+            if let Some(status) =
+                raw_request_limit_status(request.encoded_len(), method_body_limit::<M>())
+            {
+                return Err(status);
+            }
             send_request(&mut send, &mut recv, request).await?;
 
-            Ok(StreamingCall::new(recv, operation))
+            Ok(StreamingCall::new(
+                recv,
+                operation,
+                method_body_limit::<M>(),
+            ))
         },
         span,
     )
@@ -252,7 +279,12 @@ where
                 .await
                 .map_err(transport_to_status)?;
             let (send, recv) = WireStream::split(stream);
-            Ok(BidiStreamingCall::new(send, recv, operation))
+            Ok(BidiStreamingCall::new(
+                send,
+                recv,
+                operation,
+                method_body_limit::<M>(),
+            ))
         },
         span,
     )
@@ -284,6 +316,7 @@ fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
 pub struct StreamingCall<R> {
     inner: Pin<Box<dyn ErasedRecv + Send>>,
     eof: bool,
+    max_body: Option<usize>,
     call: CallSpan,
     _r: PhantomData<R>,
 }
@@ -386,7 +419,7 @@ where
 }
 
 impl<R> StreamingCall<R> {
-    fn new<H>(recv: H, call: CallSpan) -> Self
+    fn new<H>(recv: H, call: CallSpan, max_body: Option<usize>) -> Self
     where
         H: RecvHalf + Unpin + Send + 'static,
         H::Error: std::error::Error + Send + Sync + 'static,
@@ -394,6 +427,7 @@ impl<R> StreamingCall<R> {
         Self {
             inner: Box::pin(RecvAdapter { recv }),
             eof: false,
+            max_body,
             call,
             _r: PhantomData,
         }
@@ -438,15 +472,22 @@ impl<R: Message + Default> futures_core::Stream for StreamingCall<R> {
         let span = self.call.span().clone();
         let _entered = span.enter();
         match self.inner.as_mut().poll_chunk(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match R::decode(&bytes[..]) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => {
-                    self.call.finish(WireCode::Internal);
-                    Poll::Ready(Some(Err(WireStatus::internal(format!(
-                        "prost decode: {e}"
-                    )))))
+            Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(status) = raw_request_limit_status(bytes.len(), self.max_body) {
+                    self.eof = true;
+                    self.call.finish(status.code);
+                    return Poll::Ready(Some(Err(status)));
                 }
-            },
+                match R::decode(&bytes[..]) {
+                    Ok(msg) => Poll::Ready(Some(Ok(msg))),
+                    Err(e) => {
+                        self.call.finish(WireCode::Internal);
+                        Poll::Ready(Some(Err(WireStatus::internal(format!(
+                            "prost decode: {e}"
+                        )))))
+                    }
+                }
+            }
             Poll::Ready(Some(Err(s))) => {
                 self.call.finish(s.code);
                 Poll::Ready(Some(Err(s)))
@@ -465,6 +506,7 @@ impl<R: Message + Default> futures_core::Stream for StreamingCall<R> {
 pub struct StreamingSink<Q> {
     inner: Pin<Box<dyn ErasedSend + Send>>,
     closed: bool,
+    max_body: Option<usize>,
     call: CallSpan,
     _q: PhantomData<Q>,
 }
@@ -472,7 +514,7 @@ pub struct StreamingSink<Q> {
 impl<Q> Unpin for StreamingSink<Q> {}
 
 impl<Q> StreamingSink<Q> {
-    fn new<S>(send: S, call: CallSpan) -> Self
+    fn new<S>(send: S, call: CallSpan, max_body: Option<usize>) -> Self
     where
         S: SendHalf + 'static,
         S::Error: std::error::Error + Send + Sync + 'static,
@@ -480,6 +522,7 @@ impl<Q> StreamingSink<Q> {
         Self {
             inner: Box::pin(SendAdapter { send }),
             closed: false,
+            max_body,
             call,
             _q: PhantomData,
         }
@@ -499,6 +542,9 @@ impl<Q: Message> StreamingSink<Q> {
                 WireCode::FailedPrecondition,
                 "request stream is already closed",
             ));
+        }
+        if let Some(status) = raw_request_limit_status(request.encoded_len(), self.max_body) {
+            return Err(status);
         }
         let mut buf = BytesMut::with_capacity(request.encoded_len());
         request
@@ -549,7 +595,7 @@ pub struct BidiStreamingCall<Q, R> {
 impl<Q, R> Unpin for BidiStreamingCall<Q, R> {}
 
 impl<Q, R> BidiStreamingCall<Q, R> {
-    fn new<S, H>(send: S, recv: H, call: CallSpan) -> Self
+    fn new<S, H>(send: S, recv: H, call: CallSpan, max_body: Option<usize>) -> Self
     where
         S: SendHalf + 'static,
         S::Error: std::error::Error + Send + Sync + 'static,
@@ -557,8 +603,8 @@ impl<Q, R> BidiStreamingCall<Q, R> {
         H::Error: std::error::Error + Send + Sync + 'static,
     {
         Self {
-            sink: StreamingSink::new(send, call.clone()),
-            responses: StreamingCall::new(recv, call),
+            sink: StreamingSink::new(send, call.clone(), max_body),
+            responses: StreamingCall::new(recv, call, max_body),
         }
     }
 
@@ -935,6 +981,11 @@ where
             // rather than worker.
             let worked = Timing::start();
             let _worker = route.workers.acquire().await;
+            if let Some(status) =
+                raw_request_limit_status(req_bytes.len(), method_body_limit::<M>())
+            {
+                return write_trailer(&mut send, status.into(), &operation).await;
+            }
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
             let handled = handler(request, inbound.context).await;
@@ -1107,6 +1158,10 @@ where
                 Some(Err(e)) => return Err(TransportError::Io(format!("recv: {e}"))),
                 None => return Err(TransportError::Protocol("empty unary request".into())),
             };
+            let max_request_bytes = match (max_request_bytes, method_body_limit::<M>()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             if let Some(status) = raw_request_limit_status(req_bytes.len(), max_request_bytes) {
                 let code = status.code;
                 send.close_send(Some(status.into()))
@@ -1206,6 +1261,11 @@ where
                 None => return Err(TransportError::Protocol("empty stream request".into())),
             };
             finish_unary_request(recv.as_mut().get_mut()).await?;
+            if let Some(status) =
+                raw_request_limit_status(req_bytes.len(), method_body_limit::<M>())
+            {
+                return write_trailer(&mut send, status.into(), &operation).await;
+            }
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
@@ -1252,7 +1312,7 @@ where
     let result = tracing::Instrument::instrument(
         async move {
             let (mut send, recv) = WireStream::split(inbound.stream);
-            let requests = RequestStream::new(recv, operation.clone());
+            let requests = RequestStream::new(recv, operation.clone(), method_body_limit::<M>());
             let stream = match handler(requests).await {
                 Ok(s) => s,
                 Err(status) => {
@@ -1276,6 +1336,7 @@ where
 /// Decoded request stream passed to bidirectional server handlers.
 pub struct RequestStream<Q> {
     call: CallSpan,
+    max_body: Option<usize>,
     inner: Pin<Box<dyn ErasedRecv + Send>>,
     eof: bool,
     _q: PhantomData<Q>,
@@ -1284,13 +1345,14 @@ pub struct RequestStream<Q> {
 impl<Q> Unpin for RequestStream<Q> {}
 
 impl<Q> RequestStream<Q> {
-    fn new<H>(recv: H, call: CallSpan) -> Self
+    fn new<H>(recv: H, call: CallSpan, max_body: Option<usize>) -> Self
     where
         H: RecvHalf + Unpin + Send + 'static,
         H::Error: std::error::Error + Send + Sync + 'static,
     {
         Self {
             call,
+            max_body,
             inner: Box::pin(RecvAdapter { recv }),
             eof: false,
             _q: PhantomData,
@@ -1307,15 +1369,22 @@ impl<Q: Message + Default> futures_core::Stream for RequestStream<Q> {
             return Poll::Ready(None);
         }
         match this.inner.as_mut().poll_chunk(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match Q::decode(&bytes[..]) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => {
-                    this.call.finish(WireCode::Internal);
-                    Poll::Ready(Some(Err(WireStatus::internal(format!(
-                        "prost decode: {e}"
-                    )))))
+            Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(status) = raw_request_limit_status(bytes.len(), this.max_body) {
+                    this.eof = true;
+                    this.call.finish(status.code);
+                    return Poll::Ready(Some(Err(status)));
                 }
-            },
+                match Q::decode(&bytes[..]) {
+                    Ok(msg) => Poll::Ready(Some(Ok(msg))),
+                    Err(e) => {
+                        this.call.finish(WireCode::Internal);
+                        Poll::Ready(Some(Err(WireStatus::internal(format!(
+                            "prost decode: {e}"
+                        )))))
+                    }
+                }
+            }
             Poll::Ready(Some(Err(s))) => {
                 this.call.finish(s.code);
                 Poll::Ready(Some(Err(s)))
@@ -1438,6 +1507,7 @@ mod streaming_call_tests {
             }),
             eof: false,
             call: CallSpan::new(tracing::Span::none()),
+            max_body: None,
             _r: PhantomData,
         }
     }
@@ -1825,6 +1895,7 @@ mod streaming_call_tests {
                         state: MockSendState::default(),
                     },
                     observer,
+                    None,
                 );
                 assert!(response.next().await.is_none());
                 if finish_first {
@@ -2043,6 +2114,7 @@ mod streaming_call_tests {
                 trailer: Some(Trailer::ok()),
             }),
             eof: false,
+            max_body: None,
             _q: PhantomData::<U32Msg>,
         };
 
@@ -2059,6 +2131,7 @@ mod streaming_call_tests {
                 trailer: Some(Trailer::from_status(WireCode::Cancelled, "client closed")),
             }),
             eof: false,
+            max_body: None,
             _q: PhantomData::<U32Msg>,
         };
 
@@ -2076,6 +2149,7 @@ mod streaming_call_tests {
                 state: state.clone(),
             },
             CallSpan::new(tracing::Span::none()),
+            None,
         );
 
         sink.send(U32Msg { x: 34 }).await.unwrap();
@@ -2086,6 +2160,50 @@ mod streaming_call_tests {
         assert_eq!(U32Msg::decode(&bodies[0][..]).unwrap().x, 34);
         assert!(state.close.lock().unwrap().is_some());
         assert!(state.reset.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn content_raw_bodies_are_refused_before_protobuf_decode() {
+        use crate::{
+            pb::content as pb,
+            services::content::{ContentClientImpl, Upload},
+        };
+        let cap = hellas_wire::transport::body_limit();
+        // The native transport can deliver a body larger than the mux window.
+        // Malformed protobuf distinguishes the raw cap from a decoder failure.
+        for streaming in [false, true] {
+            let (inbound, _) = route_inbound(Some(Bytes::from(vec![0xff; cap + 1])), false, None);
+            let client = ContentClientImpl::new(ReplyTransport(Mutex::new(Some(inbound.stream))));
+            let error = if streaming {
+                client
+                    .read(pb::ReadRequest::default())
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+            } else {
+                client.stat(pb::StatRequest::default()).await.unwrap_err()
+            };
+            assert_eq!(error.code, WireCode::InvalidArgument);
+            assert!(error.message.contains("exceeds"));
+        }
+        let (inbound, state) = route_inbound(Some(Bytes::from(vec![0xff; cap + 1])), false, None);
+        dispatch_bidi_streaming::<MockTransport, Upload, _, _, _>(
+            inbound,
+            |mut requests| async move {
+                let error = requests.next().await.unwrap().unwrap_err();
+                assert_eq!(error.code, WireCode::InvalidArgument);
+                assert!(requests.next().await.is_none());
+                Ok(ResponseStream::new(futures_util::stream::empty::<
+                    Result<pb::UploadResponse, WireStatus>,
+                >()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(state.bodies.lock().unwrap().is_empty());
     }
 
     #[test]

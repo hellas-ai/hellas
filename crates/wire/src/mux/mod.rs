@@ -24,9 +24,4 @@ pub use wire::{
     KeyedFrame, MAX_KEYED_FRAME_BYTES, StreamKey, decode_keyed_frame, encode_keyed_frame,
 };
 
-/// Default maximum unconsumed body bytes per direction per stream.
-///
-/// A body is atomic at the RPC layer, so the window is also the maximum
-/// body-frame size. Keeping those as one value makes it impossible to
-/// configure a body that can never acquire enough credit to be sent.
-pub const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024; // 1 MiB
+pub use crate::transport::DEFAULT_STREAM_WINDOW;

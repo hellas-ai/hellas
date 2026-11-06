@@ -1,12 +1,38 @@
 use hellas_rpc::ContentRef;
 use hellas_xet::{Chunk, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, file_hash};
 
-use super::{Error, Result};
+use super::reservation::Reservation;
+use super::{Error, MemoryStore, PinTarget, ReservationId, Result, Scope};
 use prost::Message;
+use std::sync::Arc;
 
 /// Declare-then-fill verification. Payload is accepted only after the complete
 /// descriptor commitment; one preceding chunk suffices to verify CDC boundaries.
+pub(crate) struct LocalSession {
+    pub store: MemoryStore,
+    pub scope: Scope,
+    pub pin: Option<PinTarget>,
+    pub object: ContentRef,
+    pub reservation: ReservationId,
+    pub charge: Arc<Reservation>,
+    pub bytes: Vec<u8>,
+    pub finished: bool,
+}
+impl Drop for LocalSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.store.abandon(self.reservation, self.object.id());
+        }
+    }
+}
+enum Destination {
+    Verify,
+    Local(LocalSession),
+    Remote(super::remote::RemoteSession),
+    Present,
+}
 pub struct UploadSession {
+    destination: Destination,
     object: ContentRef,
     chunks: Vec<Chunk>,
     declared_bytes: u64,
@@ -14,10 +40,12 @@ pub struct UploadSession {
     next: usize,
     previous: Vec<u8>,
     failed: bool,
+    published: bool,
 }
 impl UploadSession {
     pub fn new(object: ContentRef) -> Self {
         Self {
+            destination: Destination::Verify,
             object,
             chunks: Vec::new(),
             declared_bytes: 0,
@@ -25,6 +53,7 @@ impl UploadSession {
             next: 0,
             previous: Vec::new(),
             failed: false,
+            published: false,
         }
     }
     pub fn object(&self) -> ContentRef {
@@ -37,17 +66,58 @@ impl UploadSession {
         self.next
     }
     pub fn complete(&self) -> bool {
+        !self.failed && self.published
+    }
+    fn verified(&self) -> bool {
         !self.failed && self.declared && self.next == self.chunks.len()
     }
-    pub fn declare(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
-        let result = self.declare_inner(chunks, complete);
+    fn fail(&mut self) {
+        self.failed = true;
+        self.published = false;
+        self.previous = Vec::new();
+        self.chunks = Vec::new();
+        self.destination = Destination::Verify;
+    }
+    pub(crate) fn local(object: ContentRef, destination: LocalSession) -> Self {
+        let mut session = Self::new(object);
+        session.destination = Destination::Local(destination);
+        session
+    }
+    pub(crate) fn remote(object: ContentRef, destination: super::remote::RemoteSession) -> Self {
+        let mut session = Self::new(object);
+        session.destination = Destination::Remote(destination);
+        session
+    }
+    pub(crate) fn present(object: ContentRef) -> Self {
+        let mut session = Self::new(object);
+        session.destination = Destination::Present;
+        session.published = true;
+        session
+    }
+    pub async fn declare(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
+        let result = self.declare_checked(chunks, complete).await;
         if result.is_err() {
-            self.failed = true;
+            self.fail();
         }
         result
     }
+    async fn declare_checked(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
+        if let Destination::Local(local) = &self.destination {
+            local.store.check(&local.scope)?;
+        }
+        self.declare_inner(chunks, complete)?;
+        let verified = self.verified();
+        if let Destination::Remote(remote) = &mut self.destination {
+            // Cancellation leaves this verifier terminal, so a lost acknowledgement
+            // cannot be mistaken for accepted remote progress on a retry.
+            self.failed = true;
+            remote.declare(chunks, complete, verified).await?;
+            self.failed = false;
+        }
+        self.publish()
+    }
     fn declare_inner(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
-        if self.failed || self.declared {
+        if self.failed || self.declared || self.published {
             return Err(Error::Invalid("upload declaration state"));
         }
         let count = self
@@ -118,15 +188,43 @@ impl UploadSession {
         }
         Ok(())
     }
-    pub fn accept_chunk(&mut self, bytes: &[u8]) -> Result<()> {
-        let result = self.accept_inner(bytes);
+    pub async fn accept_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        let result = self.accept_checked(bytes).await;
         if result.is_err() {
-            self.failed = true;
+            self.fail();
         }
         result
     }
+    async fn accept_checked(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Destination::Local(local) = &self.destination {
+            local.store.check(&local.scope)?;
+        }
+        self.accept_inner(bytes)?;
+        let verified = self.verified();
+        match &mut self.destination {
+            Destination::Local(local) => local.bytes.extend_from_slice(bytes),
+            Destination::Remote(remote) => {
+                self.failed = true;
+                remote.chunk(bytes, self.next, verified).await?;
+                self.failed = false;
+            }
+            _ => {}
+        }
+        self.publish()
+    }
+    fn publish(&mut self) -> Result<()> {
+        if !self.verified() {
+            return Ok(());
+        }
+        if let Destination::Local(local) = &mut self.destination {
+            local.store.clone().publish(local, self.chunks.clone())?;
+        }
+        self.published = true;
+        self.previous = Vec::new();
+        Ok(())
+    }
     fn accept_inner(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.failed || !self.declared {
+        if self.failed || !self.declared || self.published {
             return Err(Error::Invalid("payload before declaration"));
         }
         let expected = self
