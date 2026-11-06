@@ -524,7 +524,11 @@ fn plan_service(service: &RpcService, index: &SchemaIndex) -> ServicePlan {
                 }
             };
             MethodPlan {
-                marker: format_ident!("{}", m.proto_name),
+                marker: if m.proto_name == service.proto_name {
+                    format_ident!("{}Method", m.proto_name)
+                } else {
+                    format_ident!("{}", m.proto_name)
+                },
                 fn_name: format_ident!("{}", to_snake_case(&m.proto_name)),
                 name: m.proto_name.clone(),
                 method_id,
@@ -575,7 +579,10 @@ const CHAIN_PACKAGE: &str = "hellas.chain.v1";
 const WORK_PACKAGE: &str = "hellas.work.v1";
 
 fn connection_bound(package: &str) -> bool {
-    package == WORK_PACKAGE
+    matches!(
+        package,
+        WORK_PACKAGE | "hellas.content.v1" | "hellas.resolve.v1"
+    )
 }
 
 fn build_method_schema(service_fqn: &str, method: &RpcMethod, index: &SchemaIndex) -> MethodSchema {
@@ -645,6 +652,7 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
         server,
         ..
     } = plan;
+    let gate = (!feature.is_empty()).then(|| quote! { #[cfg(feature = #feature)] });
     let service_id = hex_u32(plan.service_id);
 
     let markers = plan.methods.iter().map(|m| {
@@ -704,7 +712,7 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
     };
 
     quote! {
-        #[cfg(feature = #feature)]
+        #gate
         pub mod #module {
             use ::hellas_wire::{MethodMarker, ServiceMarker};
 
@@ -905,6 +913,17 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
             }
         };
     }
+    if m.connection_bound && m.shape == Shape::BidiStreaming {
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                let context = inbound.context.clone();
+                crate::call::dispatch_bidi_streaming::<T, #marker, _, _, _>(inbound, |req| {
+                    let h = &self.0;
+                    async move { h.#fn_name(::std::boxed::Box::pin(req), context).await }
+                }).await
+            }
+        };
+    }
     if m.bounded_submit_tx {
         assert!(m.shape == Shape::Unary, "raw request limits are unary-only");
         return quote! {
@@ -987,6 +1006,7 @@ fn rust_path(proto_fqn: &str) -> syn::Path {
 
 fn feature_for_package(package: &str) -> &'static str {
     match package {
+        "hellas.content.v1" | "hellas.resolve.v1" => "",
         "hellas.v1" => "execute",
         "hellas.fetch.v1" => "fetch",
         "hellas.swarm.v1" => "swarm",

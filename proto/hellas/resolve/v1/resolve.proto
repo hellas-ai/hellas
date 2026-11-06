@@ -1,0 +1,7 @@
+syntax = "proto3";
+package hellas.resolve.v1;
+import "hellas/content/v1/content.proto";
+
+service Resolve { rpc Resolve(ResolveRequest) returns (ResolveResponse); }
+message ResolveRequest { string uri = 1; }
+message ResolveResponse { string commit_sha = 1; hellas.content.v1.ContentRef tree = 2; }

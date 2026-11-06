@@ -3587,17 +3587,24 @@ dependencies = [
 name = "hellas-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-core",
+ "hellas-auth",
  "hellas-private",
  "hellas-rpc",
+ "hellas-wire",
  "hellas-xet",
  "libc",
  "lz4_flex 0.14.0",
+ "prost",
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "ureq",
+ "url",
 ]
 
 [[package]]

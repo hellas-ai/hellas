@@ -11,6 +11,16 @@
 
 #[doc(hidden)]
 pub mod hellas {
+    pub mod content {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.content.v1.rs"));
+        }
+    }
+    pub mod resolve {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/hellas.resolve.v1.rs"));
+        }
+    }
     #[cfg(feature = "execute")]
     #[allow(dead_code)]
     pub mod v1 {
@@ -57,6 +67,8 @@ pub mod hellas {
         }
     }
 }
+
+pub use hellas::{content::v1 as content, resolve::v1 as resolve};
 
 /// Re-exports of the Hellas core execution types (`hellas.v1`).
 #[cfg(feature = "execute")]

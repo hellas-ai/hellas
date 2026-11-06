@@ -1,0 +1,63 @@
+syntax = "proto3";
+package hellas.content.v1;
+
+service Content {
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Chunks(ChunksRequest) returns (ChunksResponse);
+  rpc Read(ReadRequest) returns (stream ReadResponse);
+  rpc Upload(stream UploadRequest) returns (stream UploadResponse);
+  rpc Acquire(AcquireRequest) returns (stream AcquireResponse);
+  rpc SetPin(SetPinRequest) returns (SetPinResponse);
+  rpc ListPins(ListPinsRequest) returns (ListPinsResponse);
+  rpc WatchPins(WatchPinsRequest) returns (stream WatchPinsResponse);
+  rpc Collect(CollectRequest) returns (CollectResponse);
+}
+
+message ContentRef { bytes id = 1; uint64 bytes = 2; }
+message Target { ContentRef object = 1; bool tree = 2; }
+message PinPolicy {
+  enum Kind { KIND_UNSPECIFIED = 0; KIND_OWNER = 1; KIND_JOBS = 2; KIND_CHANNEL = 3; KIND_GRANTED = 4; KIND_PUBLIC = 5; }
+  Kind kind = 1;
+  bytes channel_id = 2;
+}
+message PinTarget { string name = 1; PinPolicy policy = 2; }
+message PinValue { Target target = 1; PinPolicy policy = 2; optional uint64 expires_ms = 3; }
+message Pin { string name = 1; PinValue value = 2; }
+message Path { string pin = 1; string path = 2; }
+// Opaque to callers; chunk cursors are bound to a single resolved reference.
+message Cursor { uint64 offset = 1; ContentRef object = 2; uint64 generation = 3; }
+message Chunk { bytes hash = 1; uint64 bytes = 2; }
+message StatRequest { Path at = 1; }
+message StatResponse { Target target = 1; }
+message ChunksRequest { Path at = 1; Cursor cursor = 2; }
+message ChunksResponse { ContentRef object = 1; repeated Chunk chunks = 2; Cursor next = 3; }
+message ReadRequest { Path at = 1; uint64 start = 2; uint64 end = 3; ContentRef expect = 4; }
+// Each data item contains a whole verified chunk; the client slices the range.
+message ReadResponse { ContentRef object = 1; uint64 offset = 2; bytes data = 3; }
+// The host authenticates this opaque application opening before minting Work.
+// The root is a reference, never embedded root bytes.
+// signed_opening is the complete signed, routed application opening, not an
+// authorization body. The funding host decodes its existing AcceptWorkRequest
+// envelope (route, authorization, client signature and prepared reference).
+// Generic content storage never interprets this application-owned envelope.
+message WorkOpening { bytes signed_opening = 1; bytes manifest = 2; ContentRef root = 3; }
+message UploadOpen { ContentRef object = 1; PinTarget pin = 2; WorkOpening work = 3; }
+message ChunkList { repeated Chunk chunks = 1; bool complete = 2; }
+message UploadRequest {
+  oneof part { UploadOpen open = 1; ChunkList list = 2; bytes chunk = 3; }
+}
+message UploadResponse { uint64 next_chunk = 1; bool missing = 2; bool complete = 3; }
+message Peer { bytes node = 1; Path at = 2; }
+message HfXet { string repo = 1; string commit = 2; optional string path = 3; bool dataset = 4; }
+message Https { string url = 1; optional bytes sha256 = 2; uint64 bytes = 3; }
+message Source { oneof kind { Peer peer = 1; HfXet hf_xet = 2; Https https = 3; } }
+message AcquireRequest { Source source = 1; ContentRef expect = 2; PinTarget pin = 3; }
+message AcquireResponse { uint64 received = 1; ContentRef complete = 2; }
+message SetPinRequest { string name = 1; PinValue expected = 2; PinValue value = 3; }
+message SetPinResponse {}
+message ListPinsRequest { string prefix = 1; Cursor cursor = 2; }
+message ListPinsResponse { repeated Pin pins = 1; Cursor next = 2; }
+message WatchPinsRequest { string prefix = 1; Cursor from = 2; }
+message WatchPinsResponse { Cursor cursor = 1; Pin pin = 2; bool removed = 3; bool resync = 4; }
+message CollectRequest {}
+message CollectResponse { uint64 objects = 1; uint64 bytes = 2; }
