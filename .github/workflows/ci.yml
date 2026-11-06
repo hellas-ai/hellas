@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [master, devnet]
-  push:
-    branches: [master]
 
 permissions:
   contents: read

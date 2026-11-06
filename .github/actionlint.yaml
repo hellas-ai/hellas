@@ -1,0 +1,5 @@
+paths:
+  .github/workflows/publish.yml:
+    # GitHub supports queue: max; actionlint 1.7.12 does not yet recognize it.
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\.'

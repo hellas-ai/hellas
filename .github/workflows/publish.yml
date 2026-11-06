@@ -1,11 +1,10 @@
 name: Publish
 
-# Publishes the newest revision whose Hydra CLI and GPU channels both
-# succeeded. The tool fetches the signed artifacts from the cache and never
-# rebuilds; reruns are idempotent, and existing tags must name the same content.
+# Publishes the exact Hydra evaluation in the dispatch once both channels pass.
+# Manual runs can select a revision or the newest common green revision.
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  repository_dispatch:
+    types: [hydra-channel-advanced]
   workflow_dispatch:
     inputs:
       revision:
@@ -22,7 +21,7 @@ permissions:
 
 concurrency:
   group: publish
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
@@ -42,8 +41,14 @@ jobs:
           GHCR_USER: ${{ github.actor }}
           REVISION: ${{ inputs.revision }}
           DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          HYDRA_JOBSET: ${{ github.event.client_payload.jobset }}
+          HYDRA_EVALUATION: ${{ github.event.client_payload.evaluation }}
+          HYDRA_REVISION: ${{ github.event.client_payload.revision }}
         run: |
           args=()
-          if [ -n "$REVISION" ]; then args+=(--revision "$REVISION"); fi
+          if [ "$EVENT_NAME" = repository_dispatch ]; then
+            args+=(--revision "$HYDRA_REVISION" --jobset "$HYDRA_JOBSET" --evaluation "$HYDRA_EVALUATION")
+          elif [ -n "$REVISION" ]; then args+=(--revision "$REVISION"); fi
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
           nix run --accept-flake-config .#publish -- "${args[@]}"
