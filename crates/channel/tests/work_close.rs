@@ -3832,7 +3832,9 @@ async fn a_restart_samples_the_replay_it_ran() {
     let replay = &replays[0];
     assert_eq!(replay.field("kind"), Some("Channel"));
     assert_eq!(replay.field("role"), Some("Provider"));
-    assert_eq!(replay.field("generation"), Some("1"));
+    // The initial durable funding checkpoint precedes the paid-job retirement
+    // checkpoint; this restart therefore replays the second generation.
+    assert_eq!(replay.field("generation"), Some("2"));
 
     let number = |name: &str| match replay.field(name).map(str::parse::<u64>) {
         Some(Ok(value)) => value,

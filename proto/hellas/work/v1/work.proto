@@ -19,8 +19,6 @@ service Work {
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
 
-  // Exporter-bound signed chunks for the proposal's missing content objects.
-
   // Private grant status and current Offer, bound to this connection. A stale
   // generation may discover the current one; it cannot authorize new work.
   rpc GetStanding(GetStandingRequest) returns (GetStandingResponse);

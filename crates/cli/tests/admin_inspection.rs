@@ -32,6 +32,9 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
         "{}",
         String::from_utf8_lossy(&locked.stderr)
     );
+    // Finish the fixture content DB close before taking the read-only snapshot.
+    // Pool drop alone can remove its WAL asynchronously during inspection.
+    world.content.close().await;
     drop(world);
     let journal = hellas_channel::work_store::journal::Journal::path(&root, "grants");
     let sidecars_before = hellas_channel::test_support::all_files(&root);

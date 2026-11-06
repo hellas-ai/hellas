@@ -1,12 +1,18 @@
 # Paid gateway
 
+Paid pool content lives beside the pool configuration: `/srv/hellas/pool.json`
+uses `/srv/hellas/pool.content`. Provision that private upper for the gateway
+service user and preserve it together with all client journals. The Nix module
+adds the derived upper to mount and write requirements.
+
+
 `hellas --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json
 --text-model qwen3.gguf` renders each text request as a Compute job, sends it
 to the configured providers and pays through their real funded work channels.
 Each provider has its own endpoint identity, bond, payment funding, and client
 journals. The gateway skips busy provider channels and serializes requests
 within each channel. Providers must already hold the GGUF named by the job (for
-example via `hellas store adopt`); the gateway never uploads the weights.
+example through `[content]` lower directories and declared Jobs pins); the gateway never uploads the weights.
 
 The Qwen3 BF16 program's HIP kernels require a supported gfx11 target, including
 the Strix Halo gfx1151 used in the demo. A gfx1010 GPU can run a scalar smoke
@@ -28,13 +34,16 @@ hellas convert-whisper --checkpoint /models/whisper-tiny-original --output /mode
 ```
 
 The resulting `weights.bf16` is the only model asset a provider holds; supply it
-through the ordinary content store or `serve --content /models/whisper-tiny/weights.bf16`.
+through a Jobs pin in the provider's `--content-config` declaration.
 Providers need no renderer, tokenizer, preprocessing code, or preinstalled program.
 The converted directory and its metadata stay on the client. An existing gateway
 configuration can add `--audio-model /models/whisper-tiny` alongside `--text-model`.
 The directory name (`whisper-tiny` here) is its HTTP model name. The same option
 works with a paid pool, `--offer` for an owned remote node, or `--local-grant` with
-`--content /models/whisper-tiny/weights.bf16` on a supported local GPU.
+a `--content-config` declaration for those weights on a supported local GPU.
+Use the dedicated local-grant upper (the default), separate from any paid node's
+upper. Owner CLI commands normally use the authenticated daemon `--profile`;
+offline fallback refuses stores that have ever opened paid Work/Channel scopes.
 
 ```sh
 curl http://127.0.0.1:8080/v1/audio/transcriptions \

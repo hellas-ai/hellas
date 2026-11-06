@@ -264,7 +264,7 @@ let
         # CARGO_BUILD_TARGET. Select the wasm target in the actual command.
         buildPhase = ''
           runHook preBuild
-          cargo build --offline --release --target wasm32-unknown-unknown -p hellas-rpc --jobs "$NIX_BUILD_CORES"
+          cargo build --offline --release --target wasm32-unknown-unknown -p hellas-rpc --no-default-features --jobs "$NIX_BUILD_CORES"
           runHook postBuild
         '';
         # Wasm tests need a wasm test runtime.

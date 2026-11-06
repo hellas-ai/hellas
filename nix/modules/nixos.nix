@@ -36,25 +36,45 @@ let
     "/var/lib/hellas-gateway"
     "/var/cache/hellas-gateway"
   ];
-  providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content ++ cfg.contentRoots));
-  providerWritablePaths = lib.unique (
-    lib.optional (
-      cfg.contentIndex != null
-      && outsideManagedRoots providerManagedWritableRoots (
-        builtins.dirOf (normalizeRuntimePath cfg.contentIndex)
-      )
-    ) (builtins.dirOf (normalizeRuntimePath cfg.contentIndex))
+  providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content.lower or [ ]));
+  providerUpper = normalizeRuntimePath (
+    cfg.content.upper or "${hellasLib.defaultStateDir}/.hellas/store"
   );
-  gatewayWritablePaths = lib.unique (
-    map normalizeRuntimePath gateway.paidWorkJournalRoots
-    ++ lib.optional (
-      gateway.authorityJournal != null
-      && outsideManagedRoots gatewayManagedWritableRoots gateway.authorityJournal
-    ) (normalizeRuntimePath gateway.authorityJournal)
+  providerWritablePaths = lib.optional (outsideManagedRoots providerManagedWritableRoots providerUpper) providerUpper;
+  gatewayContentPaths = lib.unique (map normalizeRuntimePath (gateway.content.lower or [ ]));
+  # The principal component of the dedicated local upper is runtime data.
+  # Its existing grant-data base protects every such authority-local upper.
+  gatewayGrantData = toString (
+    cfg.environment.HELLAS_GRANT_DATA_DIR or "/var/lib/hellas-gateway/.hellas/grants"
   );
+  gatewayGrantDataPath =
+    if lib.hasPrefix "/" gatewayGrantData then
+      gatewayGrantData
+    else
+      "/var/lib/hellas-gateway/${gatewayGrantData}";
+  gatewayPaidUpper =
+    if gateway.paidWorkConfig == null then
+      null
+    else
+      let
+        name = builtins.baseNameOf gateway.paidWorkConfig;
+        extension = builtins.match "(.+)\\.[^.]*" name;
+        stem = if extension == null then name else builtins.head extension;
+      in
+      "${builtins.dirOf gateway.paidWorkConfig}/${stem}.content";
+  gatewayWriteRoots = lib.unique (
+    map normalizeRuntimePath (
+      gateway.paidWorkJournalRoots
+      ++ lib.optional (gateway.content ? upper) gateway.content.upper
+      ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
+      ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
+      ++ lib.optional (gateway.localGrant != null) gatewayGrantDataPath
+    )
+  );
+  gatewayWritablePaths = lib.filter (outsideManagedRoots gatewayManagedWritableRoots) gatewayWriteRoots;
   providerWritablePathsAreDisjoint = lib.all (
-    writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
-  ) providerWritablePaths;
+    content: !pathsOverlap providerUpper content
+  ) providerContentPaths;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
   providerLocalExecutionEnabled =
     hellas.catenaConfigured cfg
@@ -105,9 +125,8 @@ let
   providerRuntimePaths = [
     cfg.identityPath
   ]
-  ++ cfg.content
-  ++ cfg.contentRoots
-  ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
+  ++ (cfg.content.lower or [ ])
+  ++ lib.optional (cfg.content ? upper) cfg.content.upper
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
   ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
   ++ lib.optional (cfg.awaitOwner != null) cfg.awaitOwner
@@ -117,6 +136,10 @@ let
   gatewayRuntimePaths = lib.optionals gateway.enable (
     lib.optional (gateway.textModel != null) gateway.textModel
     ++ [ gateway.identityPath ]
+    ++ (gateway.content.lower or [ ])
+    ++ lib.optional (gateway.content ? upper) gateway.content.upper
+    ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
+    ++ lib.optional (gateway.localGrant != null) gatewayGrantDataPath
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
     ++ lib.optional (gateway.grantPoolConfig != null) gateway.grantPoolConfig
@@ -162,7 +185,7 @@ in
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
-      gateway = hellas.gatewayOptions { inherit lib; } // {
+      gateway = hellas.gatewayOptions { inherit lib pkgs; } // {
         package = mkOption {
           type = types.package;
           default = cfg.package;
@@ -232,15 +255,27 @@ in
       }
       {
         assertion = !cfg.enable || lib.all (path: path != "/") providerWritablePaths;
-        message = "services.hellas the parent of contentIndex must not expose the filesystem root as writable.";
+        message = "services.hellas content.upper must not expose the filesystem root as writable.";
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
         message = "services.hellas.gateway writable journal paths must not expose the filesystem root as writable.";
       }
       {
+        assertion =
+          !gateway.enable
+          || lib.all (
+            writable: lib.all (lower: !pathsOverlap writable lower) (gateway.content.lower or [ ])
+          ) gatewayWriteRoots;
+        message = "services.hellas.gateway content.lower must be disjoint from writable journal and upper paths.";
+      }
+      {
+        assertion = gateway.content == { } || gateway.localGrant != null;
+        message = "services.hellas.gateway.content requires localGrant.";
+      }
+      {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
-        message = "services.hellas external contentIndex parent must be dedicated writable locations outside content and contentRoots.";
+        message = "services.hellas content.upper must be disjoint from content.lower.";
       }
       {
         assertion = cfg.memoryMaxBytes == null || cfg.memoryMaxBytes > effectiveGpuSessionAssetBytes;
@@ -256,7 +291,7 @@ in
       }
       {
         assertion = hellas.catenaPlatform pkgs || !providerCatenaConfigured;
-        message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds on this platform.";
+        message = "Local Catena execution is supported only on x86_64-linux; omit GPU backend and resource bounds on this platform.";
       }
       {
         assertion =
@@ -355,7 +390,7 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${cfg.package}/bin/hellas" ]
           ++ hellas.mkServeArgs {
-            inherit lib;
+            inherit lib pkgs;
             serve = cfg;
             inherit (cfg) otel;
           }
@@ -434,7 +469,7 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
-            inherit lib gateway;
+            inherit lib pkgs gateway;
             inherit (cfg) otel;
           }
         );
@@ -447,6 +482,9 @@ in
       }
       // lib.optionalAttrs (gatewayWritablePaths != [ ]) {
         ReadWritePaths = gatewayWritablePaths;
+      }
+      // lib.optionalAttrs (gatewayContentPaths != [ ]) {
+        ReadOnlyPaths = gatewayContentPaths;
       }
       // lib.optionalAttrs (gateway.environmentFile != null) {
         EnvironmentFile = gateway.environmentFile;

@@ -68,10 +68,11 @@ and its matching backend, including CUDA driver-library setup where needed. In R
 ["--identity", "/var/lib/hellas/worker.identity", "--software-root",
  "--await-owner", "/var/lib/hellas/authority",
  "--grant-config", "/var/lib/hellas/resources.json",
- "--content-root", "/var/lib/hellas/content"]
+ "--content-config", "/var/lib/hellas/content.toml"]
 ```
 
-Prepare `resources.json` and the weights on the persistent volume before using
+Prepare `resources.json`, a `[content]` declaration with lower directories and
+Jobs pins, and the weights on the persistent volume before using
 that command; a template does not create an allowance or download models.
 Use the [node configuration and bootstrap procedure](admin.md#explicit-offline-initialization-and-recovery),
 then issue/import access and run a job as in the

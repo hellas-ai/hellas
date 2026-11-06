@@ -172,8 +172,8 @@ in
             port = executorPort;
             openFirewall = true;
             queueSize = 2;
-            contentRoots = [ "/srv/hellas-content" ];
-            contentIndex = "/var/lib/hellas/content-index.bin";
+            content.lower = [ "/srv/hellas-content" ];
+            content.upper = "/var/lib/hellas/content-store";
             gpuSessionPrograms = 3;
             gpuSessionAssetBytes = 1073741824;
             memoryMaxBytes = 1879048192;
@@ -189,7 +189,7 @@ in
     testScript = ''
       start_all()
       machine.wait_for_unit("hellas.service")
-      machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
+      machine.wait_until_succeeds("test -e /var/lib/hellas/content-store/fastresume.bin", timeout=30)
 
       machine.fail("${package}/bin/hellas llm --help")
 
@@ -198,8 +198,12 @@ in
           "--property=Environment --property=ExecStart --property=LimitMEMLOCK "
           "--property=MemoryMax --property=MemorySwapMax --property=OOMPolicy"
       )
-      assert "--content-root /srv/hellas-content" in unit
-      assert "--content-index /var/lib/hellas/content-index.bin" in unit
+      assert "--content-config" in unit
+      command = machine.succeed("systemctl show hellas.service --property=ExecStart --value")
+      assert "hellas-content.toml" in command
+      config = machine.succeed("cat " + command.split("--content-config ", 1)[1].split()[0])
+      assert "/srv/hellas-content" in config
+      assert "/var/lib/hellas/content-store" in config
       assert "--gpu-session-programs 3" in unit
       assert "--gpu-session-asset-bytes 1073741824" in unit
       assert "MemoryMax=1879048192" in unit

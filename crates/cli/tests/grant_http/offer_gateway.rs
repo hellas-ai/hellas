@@ -725,7 +725,7 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         serde_json::to_vec(&CredentialHolder::Bearer).unwrap(),
     )
     .unwrap();
-    let control = root.join("gateway-control");
+    let control = root.join("ctl");
     hellas_private::create_dir_all_durable(&control).unwrap();
     hellas_private::restrict_directory(&control).unwrap();
     let (certificate, key) = control_tls(&control);
@@ -751,7 +751,7 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
     let root = host.root();
     let trust_root = host.approve_trust().await;
     let (gateway_profile, admin) = controlled_gateway_profile(root).await;
-    let socket = root.join("gateway-control/control.sock");
+    let socket = root.join("ctl/control.sock");
     let mut process = host.client.spawn(
         &[
             "gateway",
