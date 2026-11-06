@@ -82,7 +82,7 @@ let
     actions =
       mk "check-actions"
         ''
-          actionlint .github/workflows/*.yml
+          actionlint -config-file /dev/null .github/workflows/*.yml
           shellcheck --shell=sh install.sh
         ''
         [

@@ -390,7 +390,7 @@ let
         pkgs.actionlint
         pkgs.shellcheck
       ];
-      command = "actionlint .github/workflows/*.yml";
+      command = "actionlint -config-file /dev/null .github/workflows/*.yml";
     };
     "no-catgrad-lock" = noCatgradLock;
 
