@@ -222,6 +222,63 @@ pub async fn connect(
 mod tests {
     use super::*;
     use {hellas_authority::test_support::common_node, hellas_channel::test_support::actors::ROOT};
+
+    #[test]
+    fn provider_runtime_dials_tls_relay_with_default_stack() {
+        use commonware_runtime::Runner as _;
+        use tokio::io::AsyncBufReadExt as _;
+
+        commonware_runtime::tokio::Runner::default().start(|_| async {
+            let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+            let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay: iroh::RelayUrl = format!("https://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Custom(relay.clone().into()))
+                .net_report_config(iroh::NetReportConfig::minimal())
+                .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([cert
+                    .cert
+                    .der()
+                    .clone()]))
+                .bind()
+                .await
+                .unwrap();
+            let remote = iroh::EndpointAddr::new(iroh::SecretKey::from_bytes(&[42; 32]).public())
+                .with_relay_url(relay);
+            let dialing = tokio::spawn({
+                let endpoint = endpoint.clone();
+                async move { endpoint.connect(remote, b"stack-regression").await }
+            });
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut request = String::new();
+            tokio::io::BufReader::new(tls)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert_eq!(request, "GET /relay HTTP/1.1\r\n");
+            dialing.abort();
+            let _ = dialing.await;
+            endpoint.close().await;
+        });
+    }
+
     async fn endpoints() -> (iroh::Endpoint, iroh::Endpoint) {
         let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())

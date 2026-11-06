@@ -101,7 +101,7 @@ let
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy =
       mkCargo "check-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api -- -D warnings"
+        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames"
         (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.

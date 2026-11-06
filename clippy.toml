@@ -1,0 +1,2 @@
+future-size-threshold = 131072
+stack-size-threshold = 262144

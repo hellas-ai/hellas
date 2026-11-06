@@ -41,7 +41,7 @@ struct ResponseFixture {
 async fn response_fixture(
     runtime: commonware_runtime::tokio::Context,
     partition: &'static str,
-) -> ResponseFixture {
+) -> Box<ResponseFixture> {
     response_fixture_with_contests(runtime, partition, 1).await
 }
 
@@ -49,7 +49,7 @@ async fn response_fixture_with_contests(
     runtime: commonware_runtime::tokio::Context,
     partition: &'static str,
     contest_count: usize,
-) -> ResponseFixture {
+) -> Box<ResponseFixture> {
     use hellas_kernel::{
         Auth, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties,
         Party, PaymentCloseStart, Payout, Secp256k1Signer, Terms, WorkPaymentTerms,
@@ -193,11 +193,9 @@ async fn response_fixture_with_contests(
             ));
         }
         valid_responses.push(valid);
-        transactions.extend([
-            Transaction::Kernel(bond_open),
-            Transaction::Kernel(payment_open),
-            Transaction::Kernel(start),
-        ]);
+        transactions.push(Transaction::Kernel(bond_open));
+        transactions.push(Transaction::Kernel(payment_open));
+        transactions.push(Transaction::Kernel(start));
     }
     let (valid, second, bad_action, start_id, terms_hash, understated_digest, start_digest) =
         first_responses.expect("response fixture has at least one contest");
@@ -264,7 +262,7 @@ async fn response_fixture_with_contests(
             network_id: network.as_str().to_string(),
         },
     );
-    ResponseFixture {
+    Box::new(ResponseFixture {
         client,
         database,
         owner_index,
@@ -277,7 +275,7 @@ async fn response_fixture_with_contests(
         absent,
         valid_responses,
         _indexer: handle,
-    }
+    })
 }
 
 fn response_transaction(response: &PaymentCloseResponse) -> Transaction {
