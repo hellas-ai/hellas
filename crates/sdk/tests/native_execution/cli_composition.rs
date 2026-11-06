@@ -53,8 +53,8 @@ pub(super) fn run_gateway<'a>(
                         return;
                     };
                     while let Ok(Some(inbound)) = transport.accept().await {
-                        if dispatcher.dispatch(inbound).await.is_err() {
-                            break;
+                        if let Err(error) = dispatcher.dispatch(inbound).await {
+                            eprintln!("fixture Work dispatch failed: {error}");
                         }
                     }
                 });
