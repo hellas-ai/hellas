@@ -98,6 +98,17 @@ pub struct Purchase {
     tracked: bool,
 }
 impl Purchase {
+    pub(crate) fn bound_channel(&self) -> Option<(Digest, EdgeId)> {
+        self.record
+            .as_ref()
+            .filter(|record| !matches!(record.phase, Phase::InputBound | Phase::TargetBound))
+            .map(|record| {
+                (
+                    Digest::from_bytes(record.channel),
+                    EdgeId::from_bytes(record.bond),
+                )
+            })
+    }
     pub fn open(path: &Path, job: &Job, buy_again: bool) -> Result<Self> {
         let mut purchase = Self::open_identity(path, job.digest(), job.price(), false)?;
         purchase.buy_again = buy_again;

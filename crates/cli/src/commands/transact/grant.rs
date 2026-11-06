@@ -116,7 +116,6 @@ pub(super) async fn execute(
         job.input(),
         terms,
     )?;
-    attempt.retain_results(true);
     attempt.bind_target(ExecutionTarget {
         network: offer.offer().network,
         provider,

@@ -57,17 +57,17 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
                 result.attempt.reported()?;
                 return Ok(());
             }
-            let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
+            purchase_and_execute(&args.client, &context, &job, |result| {
             let ModelResponse::Image(image) = package.decode(&result.output)? else {
                 bail!("expected image");
             };
             let png = image.png(args.width, args.height)?;
             std::fs::write(&args.output, png)?;
-            save_outputs(&directory.join("result"), &job, &result)?;
+            save_outputs(&directory.join("result"), &job, result)?;
             println!("{}", args.output.display());
             std::io::stdout().lock().flush()?;
-            purchase.reported()?;
             Ok(())
+            }).await
         },
         |timeout| {
             format!("image generation exceeded {timeout:?}; use the saved job folder to recover the existing attempt")

@@ -261,7 +261,6 @@ async fn local_grant_session_executes_without_http() {
     };
     let path = root.path().join("attempt.json");
     let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(&path, &input, terms).unwrap();
-    attempt.retain_results(true);
     let options = GrantSessionOptions {
         target,
         principal: principal(1).0,

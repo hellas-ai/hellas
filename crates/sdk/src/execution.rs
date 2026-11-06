@@ -33,6 +33,8 @@ pub enum ExecutionError {
     Identity,
     #[error("the original attempt is unresolved; recover it without proposing new work")]
     RecoveryRequired,
+    #[error("paid output is unavailable; recover the original attempt or explicitly buy again")]
+    ResultUnavailable,
     #[error(transparent)]
     Purchase(#[from] crate::transact::PurchaseError),
     #[error(transparent)]
@@ -164,7 +166,6 @@ pub struct ExecutionAttempt {
     terms: ExecutionTerms,
     record: AttemptRecord,
     newly_bound: bool,
-    retain_results: bool,
 }
 impl ExecutionAttempt {
     pub fn open(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
@@ -270,13 +271,7 @@ impl ExecutionAttempt {
             terms,
             record,
             newly_bound: false,
-            retain_results: false,
         })
-    }
-
-    /// Opt into private storage of verified output and transcript bytes.
-    pub fn retain_results(&mut self, retain: bool) {
-        self.retain_results = retain;
     }
 
     pub fn bind_target(&mut self, target: ExecutionTarget) -> Result<()> {
@@ -544,6 +539,11 @@ impl<'a> ExecutionSession<'a> {
                     &result.output,
                     result.transcript.clone(),
                     true,
+                    Some(PaidDelivery {
+                        channel_id: result.channel_id,
+                        bond_edge: result.bond_edge.to_bytes(),
+                        provider_key: result.provider_key,
+                    }),
                 )?,
                 ExecutionResult::Grant(result) => {
                     let transcript = hellas_channel::model::work::encode_transcript(&result.events)
@@ -554,6 +554,7 @@ impl<'a> ExecutionSession<'a> {
                         transcript,
                         result.result.outcome
                             == hellas_channel::model::work::ResultOutcome::Finished,
+                        None,
                     )?;
                 }
             }
@@ -565,6 +566,8 @@ impl<'a> ExecutionSession<'a> {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paid: Option<PaidDelivery>,
     format: String,
     input: [u8; 32],
     terms: ExecutionTerms,
@@ -585,6 +588,23 @@ struct RetainedResult {
 pub struct RetainedExecutionResult {
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub transcript: Vec<u8>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PaidDelivery {
+    channel_id: Digest,
+    bond_edge: [u8; 32],
+    provider_key: hellas_auth::PublicKey,
+}
+
+/// Retained paid output, without fabricating a new execution or settlement.
+pub struct PaidCompletion {
+    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
+    pub transcript: Vec<u8>,
+    pub work_id: Digest,
+    pub job_price: u64,
+    pub channel_id: Digest,
+    pub bond_edge: hellas_kernel::EdgeId,
+    pub provider_key: hellas_auth::PublicKey,
 }
 const MAX_RESULT_RECEIPT_BYTES: usize =
     2 * hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES + 4096;
@@ -630,6 +650,7 @@ impl ExecutionAttempt {
         output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
         transcript: Vec<u8>,
         finished: bool,
+        paid: Option<PaidDelivery>,
     ) -> Result<()> {
         if self.read_receipt()?.is_some() {
             return Err(ExecutionError::RecoveryRequired);
@@ -639,19 +660,18 @@ impl ExecutionAttempt {
         }
         let output_id = output.content_id().map_err(|_| ExecutionError::Identity)?;
         let transcript_ref = hellas_rpc::ContentRef::for_bytes(&transcript);
-        if self.retain_results {
-            let artifact = RetainedResult {
-                output: output.clone(),
-                transcript: transcript.into(),
-            };
-            let bytes =
-                hellas_rpc::protocol::value::encode_bounded(&artifact, MAX_RESULT_RECEIPT_BYTES)
-                    .map_err(|_| ExecutionError::Identity)?;
-            let path = self.sidecar(".result")?;
-            hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
-            hellas_private::write_atomically(&path, ".writing", &bytes)?;
-        }
+        let artifact = RetainedResult {
+            output: output.clone(),
+            transcript: transcript.into(),
+        };
+        let bytes =
+            hellas_rpc::protocol::value::encode_bounded(&artifact, MAX_RESULT_RECEIPT_BYTES)
+                .map_err(|_| ExecutionError::Identity)?;
+        let path = self.sidecar(".result")?;
+        hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
+        hellas_private::write_atomically(&path, ".writing", &bytes)?;
         let receipt = CompletionReceipt {
+            paid,
             format: WORK_COMPLETION_FORMAT.into(),
             input: *self.input.as_bytes(),
             terms: self.terms,
@@ -659,7 +679,7 @@ impl ExecutionAttempt {
             output: output_id,
             transcript: transcript_ref,
             finished,
-            retained: self.retain_results,
+            retained: true,
             reported: false,
         };
         let path = self.sidecar(".receipt")?;
@@ -700,6 +720,38 @@ impl ExecutionAttempt {
             transcript: artifact.transcript.into_vec(),
         }))
     }
+    /// Load paid delivery without opening a channel or proposing work again.
+    pub fn retained_paid_result(&self) -> Result<Option<PaidCompletion>> {
+        let Some(retained) = self.retained_result()? else {
+            let facts = self.inspect()?;
+            if facts.payment == Payment::Paid || facts.reported || self.read_receipt()?.is_some() {
+                return Err(ExecutionError::ResultUnavailable);
+            }
+            return Ok(None);
+        };
+        let receipt = self.read_receipt()?.ok_or(ExecutionError::Identity)?;
+        let ExecutionTerms::Paid { price } = receipt.terms else {
+            return Err(ExecutionError::Identity);
+        };
+        let paid = receipt.paid.ok_or(ExecutionError::Identity)?;
+        let AttemptRecord::Paid(purchase) = &self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        let bond_edge = hellas_kernel::EdgeId::from_bytes(paid.bond_edge);
+        if purchase.bound_channel() != Some((paid.channel_id, bond_edge)) {
+            return Err(ExecutionError::Identity);
+        }
+        Ok(Some(PaidCompletion {
+            output: retained.output,
+            transcript: retained.transcript,
+            work_id: Digest::from_bytes(receipt.work),
+            job_price: price,
+            channel_id: paid.channel_id,
+            bond_edge,
+            provider_key: paid.provider_key,
+        }))
+    }
+
     /// Record delivery only after the caller has committed its own result.
     pub fn reported(&mut self) -> Result<()> {
         let mut receipt = self

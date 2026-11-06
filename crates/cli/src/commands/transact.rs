@@ -5,9 +5,11 @@ use hellas_auth::ProducerSigningKey;
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
 use hellas_sdk::{
-    execution::{ExecutionAttempt, ExecutionResult, ExecutionSession, ExecutionTerms},
+    execution::{
+        ExecutionAttempt, ExecutionResult, ExecutionSession, ExecutionTerms, PaidCompletion,
+    },
     job::{Job, JobInput},
-    paid_client::{PaidWorkOptions, PaidWorkResult, bind_paid_endpoint, request_paid_quote},
+    paid_client::{PaidWorkOptions, bind_paid_endpoint, request_paid_quote, settle_channel},
     transact::PurchaseRecovery,
 };
 use std::{
@@ -408,15 +410,17 @@ async fn execute(
     options: PaidWorkOptions,
     endpoint: iroh::Endpoint,
     purchase: &mut ExecutionAttempt,
-) -> super::CliResult<PaidWorkResult> {
-    let facts = purchase.inspect()?;
-    if facts.reported || matches!(facts.terminal, hellas_sdk::execution::Terminal::Rejected) {
-        bail!("this attempt is already terminal; use --buy-again for a new attempt");
+) -> super::CliResult<PaidCompletion> {
+    if let Some(result) = purchase.retained_paid_result()? {
+        purchase.bind_target(hellas_sdk::execution::ExecutionTarget {
+            network: options.config.chain.network,
+            provider: options.provider,
+        })?;
+        return Ok(result);
     }
-    if matches!(facts.payment, hellas_sdk::execution::Payment::Paid) {
-        bail!(
-            "the original attempt was paid but its output is unavailable; use --buy-again for a new attempt"
-        );
+    let facts = purchase.inspect()?;
+    if matches!(facts.terminal, hellas_sdk::execution::Terminal::Rejected) {
+        bail!("this attempt is already terminal; use --buy-again for a new attempt");
     }
     let owner = args.owner(context)?;
     let mut session = purchase
@@ -439,14 +443,10 @@ async fn execute(
             Some(purchase),
         )
         .await;
-    let result: super::CliResult<PaidWorkResult> = async {
+    let result: super::CliResult<PaidCompletion> = async {
         match result {
-            Ok(ExecutionResult::Paid(mut result)) => {
-                if args.settle {
-                    result.settled_provider_payout = Some(session.settle().await?);
-                }
-                Ok(result)
-            }
+            Ok(ExecutionResult::Paid(_)) => purchase.retained_paid_result()?
+                .context("paid output was not retained"),
             Ok(ExecutionResult::Grant(_)) => unreachable!("paid session returned grant result"),
             Err(hellas_sdk::execution::ExecutionError::RecoveryRequired) => {
                 let facts = ExecutionSession::Paid(&mut session).recover(purchase).await?;
@@ -464,7 +464,8 @@ async fn purchase_and_execute(
     args: &ClientArgs,
     context: &Context,
     job: &Job,
-) -> super::CliResult<(ExecutionAttempt, PaidWorkResult)> {
+    deliver: impl FnOnce(&PaidCompletion) -> super::CliResult<()>,
+) -> super::CliResult<()> {
     ensure!(
         job.price() > 0,
         "paid execution requires a positive job payment; select --offer for grant work"
@@ -472,9 +473,63 @@ async fn purchase_and_execute(
     let options = args.options(context, job.price(), job.assurance()).await?;
     let mut purchase = args.purchase(context, job, &options).await?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-    let result = execute(args, context, job, options, endpoint.clone(), &mut purchase).await;
+    let result = execute(
+        args,
+        context,
+        job,
+        options.clone(),
+        endpoint.clone(),
+        &mut purchase,
+    )
+    .await;
     endpoint.close().await;
-    Ok((purchase, result?))
+    deliver_paid(args, context, &options, &mut purchase, &result?, deliver).await
+}
+
+async fn deliver_then_settle(
+    deliver: impl FnOnce() -> super::CliResult<()>,
+    settle: impl std::future::Future<Output = super::CliResult<()>>,
+) -> super::CliResult<()> {
+    deliver()?;
+    settle.await
+}
+
+async fn deliver_paid(
+    args: &ClientArgs,
+    context: &Context,
+    options: &PaidWorkOptions,
+    purchase: &mut ExecutionAttempt,
+    result: &PaidCompletion,
+    deliver: impl FnOnce(&PaidCompletion) -> super::CliResult<()>,
+) -> super::CliResult<()> {
+    deliver_then_settle(
+        || {
+            deliver(result)?;
+            purchase.reported()?;
+            Ok(())
+        },
+        async {
+            if args.settle {
+                let receipt = settle_channel(
+                    options,
+                    result.bond_edge,
+                    args.owner(context)?.principal(),
+                    &context.settlement,
+                )
+                .await?;
+                ensure!(
+                    receipt.channel == result.channel_id,
+                    "settlement channel mismatch"
+                );
+                eprintln!(
+                    "settled channel {}: provider payout {}",
+                    receipt.channel, receipt.provider_payout
+                );
+            }
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
@@ -485,18 +540,18 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         if args.grant.offer.is_some() {
             return grant::run(&args.grant, &args.client, &context, &job, args.output.as_deref()).await;
         }
-        let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
-        if let Some(directory) = args.output { save_outputs(&directory, &job, &result)?; }
+        purchase_and_execute(&args.client, &context, &job, |result| {
+        if let Some(directory) = &args.output { save_outputs(directory, &job, result)?; }
         else if matches!(job.input(), JobInput::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1) {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
-            println!("output-0000 (base64): {}", STANDARD.encode(http_body(&job, &result)?));
+            println!("output-0000 (base64): {}", STANDARD.encode(http_body(&job, result)?));
         } else {
             println!("output: {}", serde_json::to_string(&hellas_channel::model::work::decode_transcript(&result.transcript, result.transcript.len())?)?);
         }
-        println!("{}", wording(args.client.paid_provider()?, &job, &result));
+        println!("{}", wording(args.client.paid_provider()?, &job, result));
         std::io::stdout().lock().flush()?;
-        purchase.reported()?;
         Ok(())
+        }).await
     }, |timeout| format!("transaction exceeded {timeout:?}; use the same folder to recover its existing attempt")).await
 }
 
@@ -571,22 +626,23 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     &args.client,
                     &context,
                     &job,
-                    options,
+                    options.clone(),
                     endpoint.clone(),
                     &mut purchase,
                 )
                 .await?;
-                let body = http_body(&job, &result)?;
+                deliver_paid(&args.client, &context, &options, &mut purchase, &result, |result| {
+                let body = http_body(&job, result)?;
                 if let Some(path) = &args.output {
                     write(path, &body)?;
                 } else {
                     std::io::stdout().lock().write_all(&body)?;
                 }
-                eprintln!("{}", wording(args.client.paid_provider()?, &job, &result));
+                eprintln!("{}", wording(args.client.paid_provider()?, &job, result));
                 std::io::stdout().lock().flush()?;
                 std::io::stderr().lock().flush()?;
-                purchase.reported()?;
                 Ok(())
+                }).await
             }
             .await;
             endpoint.close().await;
@@ -681,7 +737,7 @@ impl FetchArgs {
     }
 }
 
-fn http_body(job: &Job, result: &PaidWorkResult) -> super::CliResult<Vec<u8>> {
+fn http_body(job: &Job, result: &PaidCompletion) -> super::CliResult<Vec<u8>> {
     decode_http_body(job, &result.output, &result.provider_key)
 }
 
@@ -705,13 +761,13 @@ fn decode_http_body(
     Ok(hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &output)?.body)
 }
 
-fn save_outputs(directory: &Path, job: &Job, result: &PaidWorkResult) -> super::CliResult<()> {
+fn save_outputs(directory: &Path, job: &Job, result: &PaidCompletion) -> super::CliResult<()> {
     hellas_private::create_dir_all_durable(directory)?;
     write(&directory.join("transcript.cbor"), &result.transcript)?;
     write(
         &directory.join("result.json"),
         &serde_json::to_vec_pretty(
-            &serde_json::json!({"job": job.digest().to_string(), "work": result.work_id.to_string(), "channel": result.channel_id.to_string(), "paid": result.job_price, "settled": result.settled_provider_payout.is_some()}),
+            &serde_json::json!({"job": job.digest().to_string(), "work": result.work_id.to_string(), "channel": result.channel_id.to_string(), "paid": result.job_price}),
         )?,
     )?;
     save_invocation_outputs(directory, job, &result.output, &result.provider_key)
@@ -749,9 +805,9 @@ fn write(path: &Path, bytes: &[u8]) -> super::CliResult<()> {
     Ok(())
 }
 
-fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
+fn wording(provider: &Provider, job: &Job, result: &PaidCompletion) -> String {
     format!(
-        "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} ({})",
+        "signed by provider {} and matches this job {} (evaluator {}, adaptor {})\nHellas did not re-run this job. The signature shows who answered, not that the answer is right.\npaid {} · work {} · channel {} (`hellas transact --settle --provider {}` settles this provider's channels)",
         provider.address,
         job.digest(),
         job.manifest().application().evaluator(),
@@ -759,13 +815,6 @@ fn wording(provider: &Provider, job: &Job, result: &PaidWorkResult) -> String {
         result.job_price,
         result.work_id,
         result.channel_id,
-        if result.settled_provider_payout.is_some() {
-            "settled".to_owned()
-        } else {
-            format!(
-                "open; `hellas transact --settle --provider {}` closes it",
-                provider.address
-            )
-        }
+        provider.address,
     )
 }

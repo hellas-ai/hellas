@@ -870,7 +870,6 @@ async fn compute_and_settle_inner(
             provider: options.provider,
         })
         .unwrap();
-    attempt.retain_results(true);
     let result = hellas_sdk::execution::ExecutionSession::Paid(&mut session)
         .execute(
             job.input().clone(),
