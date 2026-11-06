@@ -185,11 +185,8 @@ impl Publication {
         let page =
             crate::execution::owner_tree::prove_stored_owner_page(&reader, owner, offset, limit)
                 .await?;
-        Ok(Some(verified.verify_owner_page(
-            serde_json::to_vec(&page)?,
-            owner,
-            offset,
-            limit,
-        )?))
+        Ok(Some(
+            verified.verify_owner_page(&page, owner, offset, limit)?,
+        ))
     }
 }

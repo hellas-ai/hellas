@@ -1412,13 +1412,13 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     devnet.seal().await;
     let trust_config = work_config(&devnet, root.path().join("paid"));
     let profile = trust_config.chain.profile();
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity().unwrap(),
-        validators: profile.validators().to_vec(),
-    };
-    let verifier =
-        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
     let chain = RemoteLightClient::connect(devnet.light_client_url(0), verifier)
         .await
         .unwrap();

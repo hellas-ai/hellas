@@ -25,7 +25,7 @@ message GetOperationsResponse {
 }
 
 service LightClient {
-  rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse);
+  rpc GetObjectProofs(GetObjectProofsRequest) returns (GetObjectProofsResponse);
   rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
@@ -45,6 +45,70 @@ service LightClient {
   rpc GetEdgesByOwner(GetEdgesByOwnerRequest) returns (GetEdgesByOwnerResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
   rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
+}
+
+message GetObjectProofsRequest {
+  repeated bytes object_ids = 1;
+  optional bytes payload = 2;
+  optional bytes owner = 3;
+  uint64 owner_offset = 4;
+  uint32 owner_limit = 5;
+  optional bytes owner_after_key = 6;
+}
+
+message ObjectProof {
+  bytes object_id = 1;
+  optional bytes object = 2;
+  bytes proof = 3;
+}
+
+message GetObjectProofsResponse {
+  FinalizedBlock block = 1;
+  repeated ObjectProof proofs = 2;
+  OwnerPageProof owner_page = 3;
+}
+
+message OwnerCommitment {
+  bytes hash = 1;
+  uint64 count = 2;
+  bytes balance = 3;
+}
+
+message OwnerLeaf {
+  oneof value {
+    OwnerCommitment summary = 1;
+    OwnerHoldingLeaf holding = 2;
+  }
+}
+
+message OwnerHoldingLeaf {
+  uint32 kind = 1;
+  uint64 balance = 2;
+}
+
+message OwnerSibling {
+  uint32 depth = 1;
+  OwnerCommitment commitment = 2;
+}
+
+message OwnerPathProof {
+  OwnerLeaf leaf = 1;
+  repeated OwnerSibling siblings = 2;
+}
+
+message HoldingProof {
+  bytes object_id = 1;
+  OwnerPathProof path = 2;
+}
+
+message OwnerPageProof {
+  string owner = 1;
+  OwnerPathProof summary = 2;
+  uint64 offset = 3;
+  uint32 limit = 4;
+  repeated HoldingProof holdings = 5;
+  optional bytes after_key = 6;
+  OwnerPathProof after_path = 7;
 }
 
 message GetStateRootRequest {}

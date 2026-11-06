@@ -3,7 +3,7 @@ use super::*;
 fn fixture() -> Genesis {
     Genesis {
         schema_version: GENESIS_SCHEMA_VERSION,
-        network_id: HELLAS_DEVNET_1_ID.to_string(),
+        network_id: HELLAS_DEVNET_2_ID.to_string(),
         validators: vec![
             GenesisValidator {
                 public_key: "11".repeat(32),
@@ -60,6 +60,7 @@ fn every_known_network_document_declares_the_id_the_registry_claims() {
         assert_eq!(known_network(network.id), Some(network));
     }
     assert_eq!(known_network("mainnet"), None);
+    assert_eq!(known_network("hellas-devnet-1"), None);
     assert_eq!(known_network(""), None);
 }
 
@@ -118,27 +119,27 @@ fn shipped_networks_share_no_name_id_committee_or_account() {
 fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
     use sha2::{Digest as _, Sha256};
 
-    let digest = Sha256::digest(HELLAS_DEVNET_1_JSON.as_bytes());
+    let digest = Sha256::digest(HELLAS_DEVNET_2_JSON.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex,
-        "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17"
+        "35b2444df762b668cc66df28e784348ff9019d1dc0ee16ec2bea3949b4828c75"
     );
 }
 
 #[test]
 fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
-    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
     genesis.validate().unwrap();
-    assert_eq!(genesis.network_id, HELLAS_DEVNET_1_ID);
+    assert_eq!(genesis.network_id, HELLAS_DEVNET_2_ID);
     assert_eq!(genesis.validators.len(), 6);
     assert_eq!(genesis.allocations.len(), 103);
 }
 
 #[test]
 fn every_public_faucet_account_has_exactly_931145_credits() {
-    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
     assert_eq!(accounts.len(), 100);
     let mut addresses = BTreeSet::new();
     for (index, account) in accounts.iter().enumerate() {

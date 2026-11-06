@@ -11,6 +11,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
+fn test_proof_verifier() -> Arc<crate::proof_verify::ProofVerifier> {
+    let profile = crate::genesis::ChainProfile::known(crate::genesis::Chain::Devnet);
+    Arc::new(
+        crate::proof_verify::ProofVerifier::with_genesis(
+            profile.trust().clone(),
+            profile.genesis_json().as_bytes(),
+        )
+        .unwrap(),
+    )
+}
+
 struct ResponseBlocker {
     started: AtomicUsize,
     notify: Notify,
@@ -543,12 +554,9 @@ async fn activity_stream_does_not_block_unary_requests() {
     )
     .await
     .unwrap();
-    let client = RemoteLightClient::connect(
-        format!("ws://{addr}"),
-        crate::client::test_consensus_verifier(),
-    )
-    .await
-    .unwrap();
+    let client = RemoteLightClient::connect(format!("ws://{addr}"), test_proof_verifier())
+        .await
+        .unwrap();
     let _activity = client.subscribe_activity(Vec::new()).await.unwrap();
 
     let validators = tokio::time::timeout(Duration::from_secs(1), client.get_validators())
@@ -810,7 +818,7 @@ async fn one_validator_submission_is_one_rpc_sample() {
         server_transport,
         LightClientRpc::new(MempoolClient::default(), activity_tx),
     ));
-    let client = RemoteLightClient::new(client_transport, crate::client::test_consensus_verifier());
+    let client = RemoteLightClient::new(client_transport, test_proof_verifier());
     let samples = std::sync::Arc::new(Samples::new());
 
     let tx = Transaction::Kernel(valid_open_tx().expect("general transaction fixture"));

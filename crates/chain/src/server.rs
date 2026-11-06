@@ -275,12 +275,12 @@ impl<T> LightClientHandler for LightClientRpc<T>
 where
     T: LightClientApi,
 {
-    async fn get_operations(
+    async fn get_object_proofs(
         &self,
-        request: pb::GetOperationsRequest,
-    ) -> Result<pb::GetOperationsResponse, WireStatus> {
+        request: pb::GetObjectProofsRequest,
+    ) -> Result<pb::GetObjectProofsResponse, WireStatus> {
         self.client
-            .get_operations(request)
+            .get_object_proofs(request)
             .await
             .map_err(WireStatus::from)
     }

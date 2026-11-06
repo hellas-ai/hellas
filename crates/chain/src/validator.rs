@@ -579,7 +579,7 @@ mod genesis_allocation_tests {
         let directory = tempfile::tempdir().unwrap();
         let output_dir = directory.path().join("network");
         generate_network(GenerateNetworkArgs {
-            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.into(),
+            network_id: hellas_genesis::HELLAS_DEVNET_2_ID.into(),
             validators: 1,
             labels: vec!["demo".into()],
             addresses: vec!["127.0.0.1".into()],

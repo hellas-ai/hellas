@@ -212,7 +212,7 @@ impl EncodeSize for HellasBlock {
 
 impl Write for HellasBlock {
     fn write(&self, buf: &mut impl BufMut) {
-        buf.put_slice(b"HLS2");
+        buf.put_slice(b"HLS3");
         self.context.write(buf);
         self.parent.write(buf);
         self.height.write(buf);
@@ -228,7 +228,7 @@ impl Read for HellasBlock {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        if <[u8; 4]>::read(buf)? != *b"HLS2" {
+        if <[u8; 4]>::read(buf)? != *b"HLS3" {
             return Err(CodecError::Invalid(
                 "HellasBlock",
                 "unsupported block format; devnet reset required",

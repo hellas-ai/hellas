@@ -3,14 +3,6 @@ use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, Own
 use hellas_kernel::{Payout, Secp256k1Signer, SoftPasskey};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-fn consensus_verifier(devnet: &Devnet) -> hellas_chain::ConsensusVerifier {
-    hellas_chain::ConsensusVerifier::new(
-        devnet.consensus_info(),
-        hellas_chain::genesis_digest(devnet.genesis()),
-    )
-    .unwrap()
-}
-
 struct Approval {
     key: SoftPasskey,
     count: AtomicUsize,
@@ -167,7 +159,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             let state = crate::test_support::chain_dir_with_genesis(root.path(), devnet.genesis());
             devnet.seal().await;
             let chain =
-                RemoteLightClient::connect(devnet.light_client_url(0), consensus_verifier(&devnet))
+                RemoteLightClient::connect(devnet.light_client_url(0), devnet.proof_verifier())
                     .await
                     .unwrap();
             let approval = Arc::new(Approval::new());
@@ -422,7 +414,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             let state = crate::test_support::chain_dir_with_genesis(root.path(), devnet.genesis());
             devnet.seal().await;
             let chain =
-                RemoteLightClient::connect(devnet.light_client_url(0), consensus_verifier(&devnet))
+                RemoteLightClient::connect(devnet.light_client_url(0), devnet.proof_verifier())
                     .await
                     .unwrap();
             let genesis =

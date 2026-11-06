@@ -298,14 +298,18 @@ impl PaidWork {
             loop {
                 let check = async {
                     let client = chain.view()?.client();
-                    if let Some(listing) = client.get_coins_by_delegate(key.party_key().into()).await? {
-                        for (id, value) in listing.coins {
+                    let mut after = None;
+                    loop {
+                        let Some(page) = client.get_coins_by_delegate_page(key.party_key().into(), after).await? else { break; };
+                        for (id, value) in page.coins {
                             if value > 0 && value <= cap
-                                && let Some(coin) = client.get_coin(listing.snapshot.payload, id).await?
+                                && let Some(coin) = client.get_coin(page.snapshot.payload, id).await?
                                 && coin.owner.into_kernel() == owner.party_key()
                                 && coin.delegate == Some(key.party_key().into())
                             { return Ok::<_, anyhow::Error>(true); }
                         }
+                        let Some(next) = page.next else { break; };
+                        after = Some(next);
                     }
                     Ok(false)
                 }.await;
@@ -607,27 +611,32 @@ impl PaidWork {
                 64 * 1024,
             )?)?
         } else {
-            let (input, height) = loop {
-                if let Some(listing) = client.get_coins_by_owner(owner.into()).await? {
+            let (input, height) = 'search: loop {
+                let mut after = None;
+                while let Some(page) = client.get_coins_by_owner_page(owner.into(), after).await? {
                     let mut selected = None;
-                    let mut coins = listing.coins;
+                    let mut coins = page.coins;
                     coins.sort_by_key(|(id, value)| (*value, *id));
                     for (id, value) in coins {
                         if value < policy.offers.max_stake_per_client {
                             continue;
                         }
-                        if let Some(coin) = client.get_coin(listing.snapshot.payload, id).await?
+                        if let Some(coin) = client.get_coin(page.snapshot.payload, id).await?
                             && coin.owner.into_kernel() == owner
                             && coin.delegate.is_none()
                             && coin.value == value
                         {
-                            selected = Some((id, listing.snapshot.height));
+                            selected = Some((id, page.snapshot.height));
                             break;
                         }
                     }
                     if let Some(selected) = selected {
-                        break selected;
+                        break 'search selected;
                     }
+                    let Some(next) = page.next else {
+                        break;
+                    };
+                    after = Some(next);
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };

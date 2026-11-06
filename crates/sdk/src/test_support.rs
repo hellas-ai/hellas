@@ -124,7 +124,7 @@ impl PaidFixture {
     /// genesis itself; no network endpoint is trusted to choose its execution inputs.
     pub async fn node(&mut self) -> crate::FullNode {
         let mut genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
+            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
         genesis.network_id = self.config.network().as_str().into();
         genesis.allocations.clear();
         use commonware_cryptography::{Hasher as _, Sha256};

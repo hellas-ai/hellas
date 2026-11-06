@@ -5,9 +5,9 @@ use crate::domain::Transaction;
 use crate::domain::{Activity, PublicKey, Scheme, SettlementKey};
 #[cfg(feature = "full-node")]
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
-use crate::execution::store::empty_state;
 #[cfg(feature = "full-node")]
-use crate::execution::store::{UtxoDatabase, UtxoSyncTarget};
+use crate::execution::store::UtxoDatabase;
+use crate::execution::store::empty_state;
 #[cfg(feature = "full-node")]
 use crate::execution::{ChainVerifier, execute_proposal};
 use crate::light_client::{ConsensusActivity, ProposalInfo};
@@ -43,9 +43,8 @@ use commonware_runtime::Spawner;
 use commonware_runtime::telemetry::metrics::Registered;
 use commonware_storage::Context as StorageContext;
 #[cfg(feature = "full-node")]
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
 #[cfg(feature = "full-node")]
-use commonware_utils::{SystemTimeExt, non_empty_range};
+use commonware_utils::SystemTimeExt;
 #[cfg(feature = "full-node")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
@@ -359,20 +358,6 @@ impl Application {
 }
 
 #[cfg(feature = "full-node")]
-fn sync_target_from_merkleized<E>(
-    merkleized: &<UtxoDatabase<E> as DatabaseSet<E>>::Merkleized,
-) -> UtxoSyncTarget
-where
-    E: StorageContext + Spawner + Send + Sync + 'static,
-{
-    let bounds = merkleized.bounds();
-    Target {
-        root: merkleized.root(),
-        range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
-    }
-}
-
-#[cfg(feature = "full-node")]
 fn kernel_context(
     network: NetworkId,
     height: Height,
@@ -500,7 +485,7 @@ where
             block_height,
             timestamp,
             merkleized.root(),
-            sync_target_from_merkleized(&merkleized),
+            crate::execution::store::sync_target(&merkleized),
             txs,
         )
         .with_owner_root(owner_root);

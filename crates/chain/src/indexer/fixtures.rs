@@ -113,7 +113,7 @@ where
         partition_prefix,
         config,
         trust,
-        hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes(),
+        hellas_genesis::HELLAS_DEVNET_2_JSON.as_bytes(),
         genesis_block,
     )
     .await

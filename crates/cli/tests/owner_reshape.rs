@@ -160,13 +160,13 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     );
     let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
     let network = config.network_id(profile.genesis()).unwrap();
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity().unwrap(),
-        validators: profile.validators().to_vec(),
-    };
-    let verifier =
-        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
@@ -371,13 +371,13 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
         ],
     );
     let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity().unwrap(),
-        validators: profile.validators().to_vec(),
-    };
-    let verifier =
-        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
     // A hang guard, not a speed requirement: the property is that RPC starts
     // only after the full peer-floor probe, asserted below.
     let client = tokio::time::timeout(Duration::from_secs(180), async {

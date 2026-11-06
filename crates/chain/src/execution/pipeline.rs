@@ -60,8 +60,8 @@ where
             },
             // QMDB must retain the ack window for crash recovery. The archive's
             // independent retention cap keeps the complete archive by default.
-            // QMDB keeps 256 blocks of history so a verified remote read of the
-            // latest certified range survives a prune landing mid-read (decision 51).
+            // QMDB keeps 256 blocks of history for full-node state sync and
+            // recovery across archive acknowledgments.
             // Stateful requires marshal to retain at least as many blocks as QMDB.
             prune_config: Some(stateful::PruneConfig {
                 max_pending_acks: NonZeroUsize::MIN,
@@ -182,7 +182,10 @@ pub(crate) async fn restore(
         };
         if let Some(block) = block
             && reader.root() == block.state_root()
-            && block.sync_target().root == reader.root()
+            && block.sync_target()
+                == <super::store::UtxoDb<Context> as commonware_glue::stateful::db::ManagedDb<
+                    Context,
+                >>::sync_target(&reader)
             && super::owner_tree::stored_root(&reader)
                 .await
                 .map_err(|e| crate::QueryError::StateUnavailable(e.to_string()))?

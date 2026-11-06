@@ -1,6 +1,6 @@
-# `hellas-devnet-1`
+# `hellas-devnet-2`
 
-This is the canonical development-only genesis document consumed by Hellas
+This is the reset development-only genesis document consumed by Hellas
 validators, relays, indexers, and clients. It is not a released network and
 must not hold anything of value.
 
@@ -24,14 +24,14 @@ value-bearing deployment. Anyone can spend them; account selection does not
 reserve an account or replenish its balance.
 
 For index `N`, the 32-byte secret scalar is
-`SHA256(b"hellas-devnet-1/faucet/v1\0" || N.to_be_bytes())`, where `N` is an
+`SHA256(b"hellas-devnet-2/faucet/v1\0" || N.to_be_bytes())`, where `N` is an
 unsigned 32-bit integer and the domain ends in one zero byte. Interpret the
 digest as a big-endian P-256 scalar. All 100 digests are valid nonzero P-256
 scalars. The address is base58 of the 33-byte compressed SEC1 public key.
 For example, the scalar of account 7 can be reproduced with:
 
 ```sh
-python3 -c 'import hashlib; print(hashlib.sha256(b"hellas-devnet-1/faucet/v1\0" + (7).to_bytes(4, "big")).hexdigest())'
+python3 -c 'import hashlib; print(hashlib.sha256(b"hellas-devnet-2/faucet/v1\0" + (7).to_bytes(4, "big")).hexdigest())'
 ```
 
 The CLI's global `--faucet` selects one random account for that invocation.

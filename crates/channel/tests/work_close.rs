@@ -3937,15 +3937,16 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
     );
 }
 
-/// An old journal needs the exact accepted history, including a same-block
-/// response. Missing or inconsistent evidence cannot authorize a payout.
+/// A finalized contest remains adjudicable after the origin prunes every block
+/// before its current tip. Ordinary observation retained the accepted response.
 #[tokio::test]
-async fn client_replays_contest_history_and_waits_for_finalized_close() {
+async fn pruned_contest_history_adjudicates_from_the_durable_journal() {
     let fixture = paid_job().await;
     let channel = fixture.ready.channel().clone();
     let payment = fixture.client.state().last_payment().unwrap();
     let certificate = (payment.certificate, payment.certificate_signature);
     let inclusion = CURSOR + 1;
+    let deadline = inclusion + payment_terms().omit_response_blocks;
     let start = close_start(&channel, Party::Maker, CURSOR, None, &client()).unwrap();
     let id = hellas_kernel::start_id(start_body_digest(&channel, &start), inclusion);
     let response =
@@ -3958,34 +3959,6 @@ async fn client_replays_contest_history_and_waits_for_finalized_close() {
         ],
     );
     drop(fixture.client);
-    let mut store = store_at(
-        fixture.client_root.path(),
-        &fixture.ready,
-        Role::Client,
-        CURSOR,
-    )
-    .await;
-    commit(
-        &mut store,
-        ChannelRecord::CloseOpened {
-            start_id: id,
-            opener: Party::Maker,
-            response_deadline: inclusion + payment_terms().omit_response_blocks,
-            claimed: 0,
-        },
-    )
-    .await;
-    commit(
-        &mut store,
-        ChannelRecord::CursorAdvanced {
-            height: inclusion,
-            parent: opening.parent,
-            payload: opening.payload,
-        },
-    )
-    .await;
-    store.rotate().await.unwrap(); // pre-extension checkpoint, no history field
-    drop(store);
     let store = store_at(
         fixture.client_root.path(),
         &fixture.ready,
@@ -3993,258 +3966,36 @@ async fn client_replays_contest_history_and_waits_for_finalized_close() {
         CURSOR,
     )
     .await;
-    assert!(store.state().close_history().is_none());
     let mut endpoint = ClientEndpoint::new(fixture.ready.clone(), store, client()).unwrap();
-    let sink = Mempool::default();
-    let mut history = Chain {
-        blocks: vec![opening],
+    endpoint.observe_finalized(&opening).await.unwrap();
+    for height in (inclusion + 1)..=deadline {
+        endpoint
+            .observe_finalized(&block(height, Vec::new()))
+            .await
+            .unwrap();
+    }
+    drop(endpoint);
+
+    let store = store_at(
+        fixture.client_root.path(),
+        &fixture.ready,
+        Role::Client,
+        CURSOR,
+    )
+    .await;
+    let mut endpoint = ClientEndpoint::new(fixture.ready, store, client()).unwrap();
+    let pruned = Chain {
+        blocks: vec![block(deadline, Vec::new())],
         withheld: Some(inclusion),
     };
+    let sink = Mempool::default();
     assert!(
-        matches!(endpoint.advance_close(&history, &sink).await, Err(CatchUpError::Missing { height }) if height == inclusion)
-    );
-    assert!(sink.taken().is_empty());
-    history.withheld = None;
-    history.blocks[0].payload[0] ^= 1;
-    assert!(endpoint.advance_close(&history, &sink).await.is_err());
-    assert!(sink.taken().is_empty());
-    history.blocks[0].payload[0] ^= 1;
-    let original = history.blocks[0].txs.clone();
-    history.blocks[0].txs.reverse();
-    assert!(
-        endpoint.advance_close(&history, &sink).await.is_err(),
-        "a response cannot precede its start"
-    );
-    assert!(sink.taken().is_empty());
-    history.blocks[0].txs = original;
-
-    assert!(
-        matches!(endpoint.advance_close(&history, &sink).await.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
+        matches!(endpoint.advance_close(&pruned, &sink).await.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id),
+        "adjudication uses retained canonical contest history after archive pruning"
     );
     let submitted = sink.taken();
     assert_eq!(submitted.len(), 1);
-    let hellas_kernel::Tx::Close { outputs, .. } = &submitted[0] else {
-        panic!("client submits final close")
-    };
-    assert_eq!(
-        outputs
-            .as_slice()
-            .iter()
-            .find(|payout| payout.owner() == channel.payment_terms().parties().taker().owner())
-            .unwrap()
-            .value(),
-        PRICE + OMISSION_BOND
-    );
-    assert!(
-        endpoint.state().close_settled().is_none(),
-        "submission cannot establish a return"
-    );
-    assert!(matches!(
-        endpoint.advance_close(&history, &sink).await.unwrap(),
-        CloseProgress::AdjudicationSubmitted { .. }
-    ));
-    assert_eq!(
-        sink.taken(),
-        vec![submitted[0].clone(), submitted[0].clone()],
-        "an unfinalized close is retried verbatim"
-    );
-    history.blocks.push(block(inclusion + 1, submitted));
-    assert!(
-        matches!(endpoint.advance_close(&history, &sink).await.unwrap(), CloseProgress::Settled { provider_payout } if provider_payout == PRICE + OMISSION_BOND)
-    );
-}
-
-/// Repeated bounded calls make durable progress through the largest legal
-/// response window, even after rotation of a legacy journal and cancellation.
-#[tokio::test]
-async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
-    use hellas_channel::model::work::PaidChannel;
-    struct Pause {
-        height: std::sync::atomic::AtomicU64,
-        submission: std::sync::atomic::AtomicBool,
-        reached: tokio::sync::Notify,
-    }
-    struct PausedSink<'a> {
-        mempool: Mempool,
-        pause: &'a Pause,
-    }
-    impl hellas_channel::work_close::TxSink for PausedSink<'_> {
-        async fn submit(
-            &self,
-            tx: hellas_kernel::Tx,
-        ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
-            if self.pause.submission.swap(false, Ordering::SeqCst) {
-                self.pause.reached.notify_one();
-                std::future::pending::<()>().await;
-            }
-            hellas_channel::work_close::TxSink::submit(&self.mempool, tx).await
-        }
-    }
-    struct DelayedHistory<'a> {
-        pause: &'a Pause,
-        start: PaymentCloseStart,
-        inclusion: u64,
-        deadline: u64,
-        latest: u64,
-        reads: std::sync::Mutex<Vec<u64>>,
-    }
-    impl FinalizedBlocks for DelayedHistory<'_> {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            Ok(Some(self.latest))
-        }
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            assert!(
-                (self.inclusion..=self.deadline).contains(&height),
-                "the already-read quiet tail is not fetched"
-            );
-            self.reads.lock().unwrap().push(height);
-            if height == self.pause.height.load(Ordering::SeqCst) {
-                self.pause.reached.notify_one();
-                std::future::pending::<()>().await;
-            }
-            Ok(Some(block(
-                height,
-                if height == self.inclusion {
-                    vec![hellas_kernel::Tx::move_action(
-                        hellas_kernel::Move::StartPaymentClose(self.start.clone()),
-                    )]
-                } else {
-                    vec![]
-                },
-            )))
-        }
-    }
-    let root = temp();
-    let mut terms = payment_terms();
-    terms.omit_response_blocks = hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS;
-    let channel =
-        PaidChannel::new(network(), payment_edge(), terms, &SALT, channel_policy()).unwrap();
-    let inclusion = CURSOR + 1;
-    let deadline = inclusion + hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS;
-    let latest = deadline + 256;
-    let start = close_start(&channel, Party::Maker, CURSOR, None, &client()).unwrap();
-    let id = hellas_kernel::start_id(start_body_digest(&channel, &start), inclusion);
-    let verifier = Secp256k1Verifier::new();
-    let open = || {
-        ChannelStore::open(
-            root.path(),
-            channel.clone(),
-            settlement(),
-            Role::Client,
-            origin(),
-            hellas_store::ContentStore::new(),
-            &verifier,
-        )
-    };
-    let mut store = open().await.unwrap();
-    advance(&mut store, CURSOR).await;
-    commit(
-        &mut store,
-        ChannelRecord::CloseOpened {
-            start_id: id,
-            opener: Party::Maker,
-            response_deadline: deadline,
-            claimed: 0,
-        },
-    )
-    .await;
-    // Canonical records emitted by the old watcher, before history was retained.
-    for height in inclusion..=latest {
-        commit(
-            &mut store,
-            ChannelRecord::CursorAdvanced {
-                height,
-                parent: payload_at(height - 1),
-                payload: payload_at(height),
-            },
-        )
-        .await;
-    }
-    store.rotate().await.unwrap();
-    drop(store);
-    let pause = Pause {
-        height: std::sync::atomic::AtomicU64::new(0),
-        submission: std::sync::atomic::AtomicBool::new(true),
-        reached: tokio::sync::Notify::new(),
-    };
-    let source = DelayedHistory {
-        pause: &pause,
-        start,
-        inclusion,
-        deadline,
-        latest,
-        reads: Default::default(),
-    };
-    let sink = PausedSink {
-        mempool: Mempool::default(),
-        pause: &pause,
-    };
-    let mut previous = inclusion - 1;
-    let mut completed = false;
-    let mut interruptions = 0;
-    for _ in 0..200 {
-        let mut store = open().await.unwrap();
-        let reached = store
-            .state()
-            .close_history()
-            .map_or(inclusion - 1, |history| history.height);
-        assert!(reached >= previous);
-        if interruptions > 0 {
-            assert!(
-                reached > previous,
-                "every cancelled call preserves completed block verification"
-            );
-        }
-        previous = reached;
-        // Exercise checkpoints with and without the extension on every retry.
-        store.rotate().await.unwrap();
-        let mut endpoint = ClientEndpoint::recover(store, client()).unwrap();
-        source.reads.lock().unwrap().clear();
-        // Cancel only after 64 blocks have been verified and committed, or
-        // immediately before submission once the entire history is durable.
-        pause.height.store(previous + 65, Ordering::SeqCst);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            tokio::select! {
-                result = endpoint.advance_close(&source, &sink) => Some(result),
-                () = pause.reached.notified() => None,
-            }
-        })
-        .await
-        .expect("close recovery reaches a controlled cancellation point or completes");
-        let queried = source.reads.lock().unwrap().clone();
-        if previous < deadline {
-            assert_eq!(
-                queried.first().copied(),
-                Some(previous + 1),
-                "retry begins after durable progress"
-            );
-        } else {
-            assert!(
-                queried.is_empty(),
-                "fully durable history needs no reads after cancelled submission"
-            );
-        }
-        if let Some(result) = result {
-            assert_eq!(previous, deadline, "retry retains the complete history");
-            assert!(
-                matches!(result.unwrap(), CloseProgress::AdjudicationSubmitted { start_id, .. } if start_id == id)
-            );
-            completed = true;
-            break;
-        }
-        assert!(
-            sink.mempool.taken().is_empty(),
-            "partial history cannot authorize a payout"
-        );
-        interruptions += 1;
-        drop(endpoint);
-    }
-    assert!(
-        completed,
-        "bounded retries eventually reconstruct all 4097 blocks"
-    );
-    assert!(interruptions > 1);
-    assert_eq!(sink.mempool.taken().len(), 1);
+    assert!(matches!(&submitted[0], hellas_kernel::Tx::Close { .. }));
 }
 
 #[tokio::test]
