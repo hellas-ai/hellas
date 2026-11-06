@@ -391,7 +391,12 @@ fn served_alpns(
     grants_configured: bool,
     remote_control: bool,
 ) -> Vec<Vec<u8>> {
-    let mut alpns = vec![Node::ALPN.as_bytes().to_vec()];
+    let mut alpns = vec![
+        Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::content::Content::ALPN
+            .as_bytes()
+            .to_vec(),
+    ];
     if work_configured {
         alpns.extend([
             hellas_rpc::services::chain_sync::ChainSync::ALPN
@@ -612,6 +617,7 @@ where
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
+            let content_for_conn = content.clone();
             let mut stopping = quiesced.clone();
             connections.spawn(async move {
                 let admitted = match incoming {
@@ -640,6 +646,7 @@ where
                         setup_for_conn,
                         work_for_conn,
                         admin_for_conn,
+                        content_for_conn,
                         stopping,
                     ))
                     .await
@@ -684,8 +691,12 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     setup: Option<MountedSetup>,
     work: Option<WorkRouter>,
     admin: Option<crate::node_control::NodeControl>,
+    content: hellas_store::content::DiskStore,
     mut quiesce: watch::Receiver<bool>,
 ) -> Result<(), ProviderError> {
+    if alpn == hellas_rpc::services::content::Content::ALPN.as_bytes() {
+        return serve_content(conn, content, quiesce).await;
+    }
     if alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes() {
         let admin = admin
             .ok_or_else(|| WireStatus::new(WireCode::Unavailable, "node control is unavailable"))?;
@@ -765,6 +776,30 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
         Ok(())
     }
+}
+
+pub(crate) async fn serve_content(
+    connection: Connection,
+    content: hellas_store::content::DiskStore,
+    mut quiesce: watch::Receiver<bool>,
+) -> Result<(), ProviderError> {
+    let service = hellas_store::content::ContentService::new(
+        Arc::new(content),
+        hellas_store::content::Scope::Public,
+    );
+    let serving = serve_loop(
+        Arc::new(IrohTransport::new(connection)),
+        hellas_rpc::services::content::ContentServer(service),
+        quiesce.clone(),
+        RPC_CONNECTION_IDLE_TIMEOUT,
+        tokio::time::Instant::now() + MAX_LIFETIME,
+    );
+    // Public reads and watches carry no reply obligation during shutdown.
+    tokio::select! {
+        _ = quiescing(&mut quiesce) => {},
+        _ = serving => {},
+    }
+    Ok(())
 }
 
 async fn quiescing(receiver: &mut watch::Receiver<bool>) {

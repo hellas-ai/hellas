@@ -193,6 +193,7 @@ impl HostHandle {
                 endpoint.clone(),
                 control.clone(),
                 runtime.clone(),
+                options.content.clone(),
                 stopped.clone(),
             ));
             (endpoint, task)
@@ -762,6 +763,7 @@ async fn accept(
     endpoint: iroh::Endpoint,
     control: Option<NodeControl>,
     runtime: Runtime,
+    content: hellas_store::content::DiskStore,
     mut stopped: watch::Receiver<bool>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
@@ -783,6 +785,8 @@ async fn accept(
         };
         let control = control.clone();
         let runtime = runtime.clone();
+        let content = content.clone();
+        let stopped = stopped.clone();
         tasks.spawn(async move {
             let Some(admitted) = pending.finish().await else {
                 return;
@@ -792,6 +796,10 @@ async fn accept(
                 if let Some(control) = control {
                     let _ = admitted.run(control.serve_iroh(connection)).await;
                 }
+            } else if connection.alpn() == hellas_rpc::services::content::Content::ALPN.as_bytes() {
+                let _ = admitted
+                    .run(crate::provider::serve_content(connection, content, stopped))
+                    .await;
             } else {
                 let sender = runtime.with(|state| state.ingress.clone()).ok().flatten();
                 if sender
@@ -876,6 +884,9 @@ pub async fn bind_transport(
 fn transport_alpns() -> Vec<Vec<u8>> {
     vec![
         hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::content::Content::ALPN
+            .as_bytes()
+            .to_vec(),
         hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
         hellas_rpc::services::work_setup::WorkSetup::ALPN
             .as_bytes()
