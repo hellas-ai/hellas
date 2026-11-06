@@ -9,7 +9,7 @@ use hellas_channel::work::PaidProgress;
 use hellas_rpc::ContentRef;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
 pub(crate) use purchase::PurchaseTarget;
-pub use purchase::{Purchase, PurchaseError, PurchaseRecovery, PurchaseStatus};
+pub use purchase::{PaidAttemptPath, Purchase, PurchaseError, PurchaseStatus};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, thiserror::Error)]

@@ -33,8 +33,6 @@ impl ManagedWorker {
         let https = Https::start(None).await;
         let resources = root.join("resources.json");
         std::fs::write(&resources, json!({
-            "journal_root":state.join("provider"),"control_socket":state.join("control.sock"),
-            "control_certificate":state.join("control.cert.der"),"control_private_key":state.join("control.key.der"),
             "max_job_millis":10000,
             "machine":{"max_in_flight":2,"limits":[{"meter":"OutputTokens","window":"Total","amount":10}]},
             "accounts":[{"account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],
@@ -63,7 +61,6 @@ impl ManagedWorker {
             &[
                 "serve",
                 "--await-owner",
-                string(&state),
                 "--grant-config",
                 string(&resources),
                 "--port",
@@ -274,8 +271,6 @@ impl ManagedWorker {
                 "0",
                 "--gateway-profile",
                 string(&self.gateway_profile),
-                "--archive-dir",
-                string(&self.root.path().join("archive")),
                 "--zdr",
             ],
             "managed-gateway.log",

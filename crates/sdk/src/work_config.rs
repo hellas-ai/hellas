@@ -1,28 +1,29 @@
 //! Process-owned paid chain configuration.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 mod error;
 #[cfg(test)]
 mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
-use hellas_chain::genesis::{ChainProfile, CustomChainFile};
+use hellas_chain::genesis::{ChainDir, ChainProfile, CustomChainFile};
 
 /// One process chain and its transport, journal and observation settings.
 #[derive(Clone, Debug)]
 pub struct WorkConfig {
-    pub chain: ChainProfile,
-    /// Internal chain journal root; callers choose the operator base.
-    pub journal_root: PathBuf,
+    pub chain: ChainDir,
     pub poll: Duration,
     pub max_observation_age: Duration,
 }
 
 impl WorkConfig {
     pub fn for_chain(chain: ChainProfile, root: &Path) -> Result<Self> {
+        Self::from_chain_dir(ChainDir::open(root, &chain)?)
+    }
+
+    pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {
         Self {
             chain,
-            journal_root: root.join("channels"),
             poll: Duration::from_millis(500),
             max_observation_age: hellas_chain::node::RECOVERY_TIMEOUT,
         }
@@ -46,12 +47,6 @@ impl WorkConfig {
             },
             self.chain.consensus_digest().into(),
         )?;
-        if self.journal_root.as_os_str().is_empty() {
-            return Err(WorkConfigError::Invalid {
-                field: "journal.root",
-                reason: "must be a path",
-            });
-        }
         if self.poll.is_zero() {
             return Err(WorkConfigError::Invalid {
                 field: "poll_ms",
@@ -69,19 +64,22 @@ impl WorkConfig {
 
     pub fn node_config(
         &self,
-        storage_dir: PathBuf,
         archive_blocks: Option<std::num::NonZeroU64>,
     ) -> Result<hellas_chain::node::Config> {
-        Ok(hellas_chain::node::Config::for_profile(
-            self.chain.clone(),
-            storage_dir,
-            Vec::new(),
-            archive_blocks,
+        Ok(
+            hellas_chain::node::Config::for_profile(self.chain.clone(), Vec::new(), archive_blocks)
+                .map_err(|_| WorkConfigError::Invalid {
+                    field: "chain",
+                    reason: "full genesis and selected pins are required for execution",
+                })?,
         )
-        .map_err(|_| WorkConfigError::Invalid {
-            field: "chain",
-            reason: "full genesis and selected pins are required for execution",
-        })?)
+    }
+
+    pub fn client_journal_root(&self) -> std::path::PathBuf {
+        self.chain.client().join("channels")
+    }
+    pub fn provider_journal_root(&self) -> std::path::PathBuf {
+        self.chain.provider().join("channels")
     }
 
     pub fn check_node(&self, node: &hellas_chain::node::FullNode) -> Result<()> {

@@ -36,10 +36,7 @@ impl LocalCompute {
         assert!(export.status.success());
         let enrollment = decode_enrollment(&export.stdout).unwrap();
         let principal = owner.principal();
-        let journal = root
-            .join("grants")
-            .join(format!("p256-{}", hex::encode(principal.as_bytes())))
-            .join("provider");
+        let journal = owner.home.join("provider");
         let (store, secret) = common_node::bootstrap_node_with_credential(
             &journal,
             grant_network(),
@@ -115,9 +112,8 @@ impl LocalCompute {
         drop(node);
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
         let trust_root = approve(root, "local", enrollment.content_id());
-        let index = std::env::var("HELLAS_TEST_CONTENT_INDEX")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("content-index.bin"));
+        let index = owner.home.join("store/fastresume.bin");
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
         // Hash large checkpoints before the ordinary gateway startup check.
         let store = hellas_store::ContentStore::new();
         let _ = store.records().load(&index);
@@ -130,7 +126,6 @@ impl LocalCompute {
         };
         store.records().save(&index).unwrap();
         let allowance = hex::encode(allowance.0);
-        let archive = root.join("archive");
         let mut args = vec![
             "gateway",
             "--trust-store",
@@ -145,16 +140,12 @@ impl LocalCompute {
             string(model),
             content_flag,
             string(content),
-            "--content-index",
-            string(&index),
             "--gpu-backend",
             "hip",
             "--port",
             "0",
             "--gateway-profile",
             string(&gateway_profile),
-            "--archive-dir",
-            string(&archive),
             "--zdr",
         ];
         args.extend_from_slice(extra);

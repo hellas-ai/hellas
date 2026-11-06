@@ -210,7 +210,7 @@ impl OfferAllocator {
             &hellas_auth::PublicKey::Secp256k1(key),
             &hellas_auth::Signature::Secp256k1(signature),
             request_digest(
-                self.config.network,
+                self.config.network(),
                 self.provider.content_id(),
                 &request,
                 &exporter,
@@ -231,7 +231,7 @@ impl OfferAllocator {
         {
             return Err(unavailable("offer lifetime exceeds chain maximum"));
         }
-        let policy = current.provider_policy(self.config.network);
+        let policy = current.provider_policy(self.config.network());
         let values = policy.expected_payment_values;
         // The node's consensus fee schedule is fixed. Reject terms that could
         // quote a capacity the finalized Open cannot produce.
@@ -401,8 +401,8 @@ impl OfferAllocator {
         let adoption = self.adopt.try_reserve().map_err(unavailable)?;
         let provisioned = provision_offer(
             ProvisionOptions {
-                network: self.config.network,
-                journal_root: self.config.journal_root.clone(),
+                network: self.config.network(),
+                journal_root: self.config.journal_root(),
                 policy,
                 omission_bond: current.policy.offers.omission_bond,
                 peer,
@@ -432,8 +432,8 @@ impl OfferAllocator {
         .await
         .map_err(unavailable)?;
         let store = SetupStore::open(
-            &self.config.journal_root,
-            self.config.network,
+            &self.config.journal_root(),
+            self.config.network(),
             provisioned.bond_edge,
             Role::Provider,
             &Secp256k1Verifier::new(),

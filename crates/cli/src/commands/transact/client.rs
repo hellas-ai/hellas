@@ -3,16 +3,10 @@ use hellas_sdk::paid_client::{
     finalized_channel_settlement, retained_settlement_channels, settle_channel,
 };
 use hellas_sdk::work_config::WorkConfig;
-use std::path::Path;
 type CliResult<T> = super::super::CliResult<T>;
 
-pub(super) async fn config(
-    args: &ClientArgs,
-    context: &Context,
-    root: &Path,
-) -> CliResult<WorkConfig> {
-    let mut config = WorkConfig::for_chain(context.chain.clone(), root)?;
-    config.journal_root = root.join("chain-reads");
+pub(super) async fn config(args: &ClientArgs, context: &Context) -> CliResult<WorkConfig> {
+    let mut config = WorkConfig::from_chain_dir(context.chain.clone())?;
     if !args.validators.is_empty() {
         config.chain = config.chain.with_validators(args.validators.clone())?;
     }
@@ -22,7 +16,7 @@ pub(super) async fn config(
 pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()> {
     let provider = args.paid_provider()?;
     let root = args.root(context);
-    let config = config(args, context, &root).await?;
+    let config = config(args, context).await?;
     let journals = args.journals(&root)?;
     if !journals.exists() {
         println!("no open channels with {}", provider.address);

@@ -56,7 +56,7 @@ registered network ID must keep its shipped genesis:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
-hellas --chain-config network/chain.json chain indexer serve --rpc ws://127.0.0.1:8789 --storage-dir network/indexer
+hellas --chain-config network/chain.json chain indexer serve --rpc ws://127.0.0.1:8789 --home network/indexer
 ```
 
 The exporter checks the genesis against the validator configuration and emits
@@ -81,7 +81,7 @@ light-client pins without allocations. Without `--chain-config`, CLI commands
 select the compiled Devnet profile.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
---storage-dir /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
+--home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
 origin over a full executing chain node. Repeat `--rpc` for multiple validator
 or relay seeds; the node also discovers iroh ChainSync peers from its provisioned
 committee. Trust and genesis are always provisioned locally. Publish or protect

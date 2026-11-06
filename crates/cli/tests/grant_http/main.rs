@@ -142,6 +142,7 @@ const STRANGER_PASSKEY: [u8; 32] = [0x16; 32];
 /// software passkey file.
 struct Cli {
     root: PathBuf,
+    home: PathBuf,
     identity: PathBuf,
     passkey: PathBuf,
     metrics_endpoint: Option<String>,
@@ -151,9 +152,12 @@ impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
         let path = root.join(format!("{name}.passkey"));
         std::fs::write(&path, hex::encode(passkey)).unwrap();
+        let home = root.join(name);
+        std::fs::create_dir_all(&home).unwrap();
         Self {
             root: root.into(),
-            identity: root.join(name),
+            identity: home.join("identity"),
+            home,
             passkey: path,
             metrics_endpoint: None,
             metrics_address: None,
@@ -177,27 +181,19 @@ impl Cli {
     async fn holder_file(&self) -> PathBuf {
         let path = self.root.join(format!(
             "{}-holder.json",
-            self.identity.file_name().unwrap().to_string_lossy()
+            self.home.file_name().unwrap().to_string_lossy()
         ));
         std::fs::write(&path, self.run(&["identity", "show-holder"]).await).unwrap();
         path
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hellas"));
-        // These commands use no node identity and refuse `--identity`.
-        if !matches!(
-            args,
-            ["trust", ..] | ["contact", ..] | ["offer", "import", ..]
-        ) {
-            command.arg("--identity").arg(&self.identity);
-        }
+        command.arg("--home").arg(&self.home);
         if args.first() != Some(&"trust") {
             command.arg("--passkey").arg(&self.passkey);
         }
         command
             .args(args)
-            .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
-            .env("HELLAS_STORE_DIR", self.root.join("store"))
             .env("RUST_LOG", "warn,hellas_gateway=info,hellas::metrics=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())

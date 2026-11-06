@@ -8,18 +8,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
-    #[arg(long)]
-    pub(crate) store_dir: Option<PathBuf>,
     /// Local file that may satisfy a submitted source or asset reference.
     #[arg(long = "content", value_name = "PATH")]
     pub(crate) content_paths: Vec<PathBuf>,
     /// Local directory tree to adopt without downloading content.
     #[arg(long = "content-root", value_name = "DIR")]
     pub(crate) content_roots: Vec<PathBuf>,
-    /// Fast-resume index for local content.
-    #[arg(long = "content-index", value_name = "FILE")]
-    pub(crate) content_index: Option<PathBuf>,
     /// Refuse unindexed or changed content instead of hashing at startup.
     /// Prepare files with `store index`; directory adoption is not supported.
     #[arg(long, conflicts_with = "content_roots")]
@@ -35,23 +29,17 @@ pub(crate) struct ServeArgs {
     pub(crate) gpu_session_asset_bytes: u64,
 }
 impl ServeArgs {
-    pub(crate) fn configure(self, executor: &mut ExecutorSpawnConfig) -> CliResult<()> {
+    pub(crate) fn configure(
+        self,
+        executor: &mut ExecutorSpawnConfig,
+        home: &Path,
+    ) -> CliResult<()> {
         executor.gpu_config = GpuConfig {
             backend: self.gpu_backend,
             session_programs: self.gpu_session_programs,
             session_asset_bytes: self.gpu_session_asset_bytes,
         };
-        let index = self
-            .content_index
-            .or_else(|| {
-                self.store_dir
-                    .as_deref()
-                    .map(hellas_store::state::records_path_at)
-            })
-            .or_else(hellas_store::state::records_path)
-            .ok_or_else(|| {
-                anyhow::anyhow!("no store location; set HELLAS_STORE_DIR or --store-dir")
-            })?;
+        let index = hellas_store::state::records_path_at(&home.join("store"));
         let mode = if self.require_content_index {
             IndexMode::Require
         } else {

@@ -13,7 +13,6 @@ use std::{
 /// Per-provider routing and payment terms; the pool owns one shared chain.
 #[derive(Clone)]
 pub struct GatewayProviderOptions {
-    pub journal_root: PathBuf,
     pub provider: hellas_client::ProviderAddress,
     pub provider_addrs: Vec<SocketAddr>,
     pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
@@ -27,9 +26,11 @@ pub struct GatewayProviderOptions {
 
 impl GatewayProviderOptions {
     pub fn with_config(self, config: WorkConfig) -> PaidWorkOptions {
+        let journal_root =
+            crate::paid_client::PaidJournalDir::gateway(&config.chain, self.provider);
         PaidWorkOptions {
             config,
-            journal_root: self.journal_root,
+            journal_root,
             provider: self.provider,
             provider_addrs: self.provider_addrs,
             apple_trust: self.apple_trust,
@@ -67,7 +68,6 @@ impl PaidGatewayOptions {
             ));
         }
         self.config.clone().validate()?;
-        let mut journals = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         for provider in &self.providers {
             provider
@@ -83,14 +83,6 @@ impl PaidGatewayOptions {
                     "timeouts and deadline spans must be positive",
                 ));
             }
-            if !provider.journal_root.is_absolute() {
-                return Err(PoolError::Invalid("journal_root must be absolute"));
-            }
-            if !journals.insert(&provider.journal_root) {
-                return Err(PoolError::Invalid(
-                    "paid providers must have distinct journal roots",
-                ));
-            }
             if !endpoints.insert(provider.provider.node) {
                 return Err(PoolError::DuplicateProvider(provider.provider.node));
             }
@@ -100,7 +92,7 @@ impl PaidGatewayOptions {
 }
 
 /// Load the operator JSON format used by both CLI and native hosts. File paths
-/// must be absolute; existing assertion counters stay beside each channel journal.
+/// must be absolute; assertion counters live in the shared process home.
 pub fn load_pool_options(
     path: &Path,
     assurance: Assurance,
@@ -128,7 +120,7 @@ pub fn load_pool_options(
                         id,
                         assurance,
                         std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-                            p.journal_root.join("apple-counters"),
+                            config.chain.home().join("apple-app-attest-open-counters"),
                         )),
                     )?)
                 }
@@ -141,7 +133,6 @@ pub fn load_pool_options(
             };
             let provider_addrs = p.provider_addrs;
             Ok(GatewayProviderOptions {
-                journal_root: p.journal_root,
                 provider: p.provider,
                 provider_addrs,
                 apple_trust,
@@ -198,7 +189,6 @@ const fn max_pending_requests() -> usize {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderFile {
-    journal_root: PathBuf,
     provider: hellas_client::ProviderAddress,
     #[serde(default)]
     provider_addrs: Vec<SocketAddr>,

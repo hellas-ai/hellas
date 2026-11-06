@@ -1,7 +1,11 @@
 use crate::{Chain, Genesis, TrustDocument};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    io,
+    path::{Path, PathBuf},
+};
 
 /// One authenticated chain identity and its untrusted transport routes.
 #[derive(Clone, Debug)]
@@ -101,6 +105,11 @@ impl ChainProfile {
     #[must_use]
     pub const fn consensus_digest(&self) -> [u8; 32] {
         self.consensus_digest
+    }
+
+    #[must_use]
+    pub fn state_key(&self) -> String {
+        hex::encode(self.consensus_digest)
     }
 
     #[must_use]
@@ -247,5 +256,122 @@ impl ChainProfile {
                 .ok_or(ChainProfileError::MissingExecution)?,
             self.genesis_payload,
         ))
+    }
+}
+
+/// The one directory owned by a selected chain under a process home.
+#[derive(Clone, Debug)]
+pub struct ChainDir {
+    home: PathBuf,
+    root: PathBuf,
+    profile: ChainProfile,
+}
+
+impl ChainDir {
+    pub fn open(home: &Path, profile: &ChainProfile) -> io::Result<Self> {
+        let root = home.join("chains").join(profile.state_key());
+        hellas_private::create_dir_all_durable(&root)?;
+        Ok(Self {
+            home: home.to_path_buf(),
+            root,
+            profile: profile.clone(),
+        })
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.root
+    }
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+    pub fn profile(&self) -> &ChainProfile {
+        &self.profile
+    }
+    pub fn with_validators(mut self, validators: Vec<String>) -> Result<Self, ChainProfileError> {
+        self.profile = self.profile.with_validators(validators)?;
+        Ok(self)
+    }
+    pub fn rotate_validators(&mut self) {
+        self.profile.rotate_validators();
+    }
+    pub fn node(&self) -> PathBuf {
+        self.root.join("node")
+    }
+    pub fn head(&self) -> PathBuf {
+        self.root.join("head")
+    }
+    pub fn client(&self) -> PathBuf {
+        self.root.join("client")
+    }
+    pub fn provider(&self) -> PathBuf {
+        self.root.join("provider")
+    }
+    pub fn gateway(&self, provider: &str) -> io::Result<PathBuf> {
+        if provider.is_empty()
+            || !provider
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid provider key",
+            ));
+        }
+        Ok(self.root.join("gateway").join(provider))
+    }
+    pub fn indexer(&self) -> PathBuf {
+        self.root.join("indexer")
+    }
+    pub fn validator(&self) -> PathBuf {
+        self.root.join("validator")
+    }
+    pub fn faucet_account(&self) -> PathBuf {
+        self.root.join("faucet-account")
+    }
+}
+
+impl std::ops::Deref for ChainDir {
+    type Target = ChainProfile;
+    fn deref(&self) -> &Self::Target {
+        &self.profile
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_digest_separates_same_id_and_rejects_traversal_before_open() {
+        let home = tempfile::tempdir().unwrap();
+        let known = ChainProfile::known(Chain::Devnet);
+        let mut trust = known.trust().clone();
+        trust.network_id = "custom-1".into();
+        let make = |digest: &str, trust: TrustDocument| {
+            ChainProfile::custom(CustomChainFile {
+                consensus_digest: digest.into(),
+                trust,
+                validators: vec!["ws://127.0.0.1:9080".into()],
+                genesis_json: None,
+                genesis_payload: None,
+            })
+        };
+        let first = make(&"01".repeat(32), trust.clone()).unwrap();
+        let second = make(&("01".repeat(31) + "02"), trust.clone()).unwrap();
+        let a = ChainDir::open(home.path(), &first).unwrap();
+        let b = ChainDir::open(home.path(), &second).unwrap();
+        assert_eq!(a.profile().network_id(), b.profile().network_id());
+        assert_ne!(a.as_path(), b.as_path());
+        assert_eq!(
+            a.as_path().file_name().unwrap().to_str().unwrap(),
+            "01".repeat(32)
+        );
+        assert_eq!(a.state_key().len(), 64);
+        assert!(a.as_path().is_dir() && b.as_path().is_dir());
+
+        trust.network_id = "../../escape".into();
+        assert!(make(&"03".repeat(32), trust).is_err());
+        assert!(!home.path().join("escape").exists());
+        assert!(a.gateway("../escape").is_err());
     }
 }

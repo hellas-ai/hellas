@@ -58,7 +58,7 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
-    let identity = crate::identity::load_or_create(Some(&identity_path)).unwrap();
+    let identity = crate::identity::load_or_create(&identity_path).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
     let owner = cli
         .owner
@@ -70,7 +70,7 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
     let context = Context::new(
         &identity,
         Some(&owner),
-        Some(&identity_path),
+        root.path(),
         &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
@@ -127,26 +127,42 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     )
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    let legacy = root.path().join(format!("{}.json", job.digest()));
-    let pointer = legacy.with_extension("latest");
-    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    let chain = hellas_chain::genesis::ChainDir::open(
+        root.path(),
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
+    let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();
+    let owner = hellas_auth::authority::PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+        passkey.party_key().to_bytes(),
+    ))
+    .unwrap();
+    let legacy = PaidAttemptPath::new(&chain, provider().parse().unwrap(), owner, job.digest());
+    let pointer = legacy.as_path().with_extension("latest");
+    drop(select_attempt(&legacy, &job, false).unwrap());
     let first = std::fs::read_to_string(&pointer).unwrap();
-    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    drop(select_attempt(&legacy, &job, false).unwrap());
     assert_eq!(std::fs::read_to_string(&pointer).unwrap(), first);
     std::fs::remove_file(&pointer).unwrap();
     assert!(select_attempt(&legacy, &job, false).is_err());
     std::fs::write(&pointer, &first).unwrap();
-    drop(select_attempt(&legacy, &job, true).unwrap().unwrap());
+    drop(select_attempt(&legacy, &job, true).unwrap());
     let second = std::fs::read_to_string(&pointer).unwrap();
     assert_ne!(first, second);
     assert!(
-        root.path()
+        legacy
+            .as_path()
+            .parent()
+            .unwrap()
             .join(format!("{}.{}.json", job.digest(), first))
             .exists()
     );
-    let second_path = root
-        .path()
-        .join(format!("{}.{}.json", job.digest(), second));
+    let second_path =
+        legacy
+            .as_path()
+            .parent()
+            .unwrap()
+            .join(format!("{}.{}.json", job.digest(), second));
     std::fs::remove_file(second_path).unwrap();
     assert!(select_attempt(&legacy, &job, false).is_err());
     assert_eq!(std::fs::read_to_string(&pointer).unwrap(), second);

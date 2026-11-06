@@ -147,7 +147,7 @@ fn refuses_chatgpt_route_without_account_id() {
         br#"{"version":1,"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":null,"refresh_token_blocked":null}"#,
     )
     .unwrap();
-    assert!(CodexResponsesFetchProvider::new(Some(&path)).is_err());
+    assert!(CodexResponsesFetchProvider::new(&path).is_err());
 }
 
 #[test]

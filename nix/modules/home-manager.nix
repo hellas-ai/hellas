@@ -23,15 +23,13 @@ let
   outsideStoreString = hellas.runtimeStringIsOutsideStore lib;
   userEnvironmentStrings = lib.filter builtins.isString (lib.attrValues cfg.environment);
   serveRuntimePaths = [
-    cfg.serve.identityPath
+    cfg.serve.home
   ]
   ++ cfg.serve.content
   ++ cfg.serve.contentRoots
-  ++ lib.optional (cfg.serve.contentIndex != null) cfg.serve.contentIndex
   ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
   ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.grantConfigFile != null) cfg.serve.grantConfigFile
-  ++ lib.optional (cfg.serve.awaitOwner != null) cfg.serve.awaitOwner
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
   ++ lib.optional (cfg.serve.fetchConfigFile != null) cfg.serve.fetchConfigFile
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;
@@ -110,9 +108,7 @@ in
 
   config = mkMerge [
     {
-      # The shared serve option defaults to the NixOS StateDirectory. Preserve
-      # the CLI's HOME-relative identity for the Darwin user daemon.
-      programs.hellas.serve.identityPath = lib.mkDefault "${config.home.homeDirectory}/.hellas/identity";
+      programs.hellas.serve.home = lib.mkDefault "${config.home.homeDirectory}/.hellas";
     }
 
     (mkIf cfg.enable {

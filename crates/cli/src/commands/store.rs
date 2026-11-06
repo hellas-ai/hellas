@@ -63,8 +63,8 @@ pub enum StoreCommand {
     },
 }
 
-pub async fn run(command: StoreCommand, root: Option<PathBuf>) -> CliResult {
-    let default_records = root.as_deref().map(hellas_store::state::records_path_at);
+pub async fn run(command: StoreCommand, home: &Path) -> CliResult {
+    let default_records = Some(hellas_store::state::records_path_at(&home.join("store")));
     match command {
         StoreCommand::Index {
             paths,
@@ -99,9 +99,7 @@ pub async fn run(command: StoreCommand, root: Option<PathBuf>) -> CliResult {
 }
 
 fn records_path(explicit: Option<PathBuf>) -> CliResult<PathBuf> {
-    explicit
-        .or_else(hellas_store::state::records_path)
-        .ok_or_else(|| anyhow::anyhow!("no home directory; pass --records"))
+    explicit.ok_or_else(|| anyhow::anyhow!("store records path is required"))
 }
 
 fn adopt(cache: Option<PathBuf>, records: Option<PathBuf>, recheck: bool) -> CliResult {

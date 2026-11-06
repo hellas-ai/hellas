@@ -12,16 +12,15 @@ use axum::{
     routing::get,
 };
 use commonware_runtime::{Runner as _, tokio};
-use hellas_genesis::ChainProfile;
+use hellas_genesis::ChainDir;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct OriginOptions {
-    pub profile: ChainProfile,
+    pub chain: ChainDir,
     pub peers: Vec<iroh::EndpointAddr>,
-    pub storage_dir: PathBuf,
     pub partition_prefix: String,
     pub listen: SocketAddr,
     pub archive_blocks: Option<std::num::NonZeroU64>,
@@ -32,20 +31,20 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         return Err("private indexer api must bind to loopback".into());
     }
     let genesis_json = options
-        .profile
+        .chain
+        .profile()
         .genesis_json()
         .ok_or("indexer requires full chain genesis")?
         .as_bytes()
         .to_vec();
-    let trust = options.profile.trust().clone();
+    let trust = options.chain.profile().trust().clone();
     let runtime = tokio::Config::new()
-        .with_storage_directory(&options.storage_dir)
+        .with_storage_directory(options.chain.indexer())
         .with_tcp_nodelay(Some(true));
     tokio::Runner::new(runtime).start(move |_context| async move {
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config::for_indexed_profile(
-                options.profile,
-                options.storage_dir.clone(),
+                options.chain,
                 options.peers,
                 options.archive_blocks,
             )?,

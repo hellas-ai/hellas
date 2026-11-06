@@ -625,7 +625,15 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .is_err()
             );
             let mut missing = case.options.clone();
-            missing.journal_root = case.root.path().join("missing-journals");
+            missing.config.chain = hellas_chain::genesis::ChainDir::open(
+                &case.root.path().join("missing-journals"),
+                missing.config.chain.profile(),
+            )
+            .unwrap();
+            missing.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
+                &missing.config.chain,
+                missing.provider,
+            );
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &missing,
@@ -639,7 +647,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let mut wrong_network = case.options.clone();
             let mut trust = wrong_network.config.chain.trust().clone();
             trust.network_id = "wrong-network".into();
-            wrong_network.config.chain = hellas_chain::genesis::ChainProfile::custom(
+            let wrong_profile = hellas_chain::genesis::ChainProfile::custom(
                 hellas_chain::genesis::CustomChainFile {
                     consensus_digest: hex::encode(wrong_network.config.chain.consensus_digest()),
                     trust,
@@ -649,6 +657,12 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 },
             )
             .unwrap();
+            wrong_network.config.chain =
+                hellas_chain::genesis::ChainDir::open(case.root.path(), &wrong_profile).unwrap();
+            wrong_network.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
+                &wrong_network.config.chain,
+                wrong_network.provider,
+            );
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &wrong_network,
@@ -761,11 +775,14 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             drop(session);
             let root = case.root.path();
             let state = root.join("cli-state");
-            let journals = state
-                .join("channels")
-                .join(case.options.provider.to_string());
-            std::fs::create_dir_all(journals.parent().unwrap()).unwrap();
-            std::fs::rename(&case.options.journal_root, &journals).unwrap();
+            let cli_chain =
+                hellas_chain::genesis::ChainDir::open(&state, case.options.config.chain.profile())
+                    .unwrap();
+            let journals =
+                hellas_sdk::paid_client::PaidJournalDir::client(&cli_chain, case.options.provider);
+            std::fs::create_dir_all(journals.as_ref().parent().unwrap()).unwrap();
+            std::fs::rename(&case.options.journal_root, journals.as_ref()).unwrap();
+            case.options.config.chain = cli_chain;
             case.options.journal_root = journals;
 
             // The client's already-funded node signer is [0x21; 32]. Encode a

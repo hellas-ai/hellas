@@ -5,12 +5,12 @@ use hellas_auth::Signature;
 fn creates_and_reloads_one_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
-    let first = load_or_create(Some(&path)).unwrap();
+    let first = load_or_create(&path).unwrap();
     let persisted = fs::read(&path).unwrap();
     let stored = StoredIdentity::from_canonical_bytes(&persisted).unwrap();
     assert_eq!(stored.version, VERSION);
     assert_eq!(stored.canonical_bytes(), persisted);
-    let second = load_or_create(Some(&path)).unwrap();
+    let second = load_or_create(&path).unwrap();
 
     assert_eq!(
         first.transport_key.to_bytes(),
@@ -31,7 +31,7 @@ fn creates_and_reloads_one_identity() {
         first.enrollment.genesis.statement.producer_public_key,
         first.node_key.public_key()
     );
-    let other = load_or_create(Some(&dir.path().join("other"))).unwrap();
+    let other = load_or_create(&dir.path().join("other")).unwrap();
     assert_ne!(
         first.enrollment.genesis.statement.installation_nonce,
         other.enrollment.genesis.statement.installation_nonce
@@ -52,7 +52,7 @@ fn rejects_old_key_file() {
     let path = dir.path().join("identity");
     fs::write(&path, [0; 32]).unwrap();
     assert!(
-        load_existing(Some(&path))
+        load_existing(&path)
             .err()
             .unwrap()
             .to_string()
@@ -66,7 +66,7 @@ fn rejects_v2_json_identity() {
     let path = dir.path().join("identity");
     fs::write(&path, br#"{"version":2}"#).unwrap();
     assert!(
-        load_existing(Some(&path))
+        load_existing(&path)
             .err()
             .unwrap()
             .to_string()
@@ -78,7 +78,7 @@ fn rejects_v2_json_identity() {
 fn identity_canonical_decode_contract() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
-    load_or_create(Some(&path)).unwrap();
+    load_or_create(&path).unwrap();
     let persisted = fs::read(&path).unwrap();
     let stored = StoredIdentity::from_canonical_bytes(&persisted).unwrap();
     assert_eq!(stored.canonical_bytes(), persisted);
@@ -102,14 +102,14 @@ fn identity_canonical_decode_contract() {
     let mut noncanonical = vec![0x98, 0x06];
     noncanonical.extend_from_slice(&persisted[1..]);
     fs::write(&path, noncanonical).unwrap();
-    assert!(load_existing(Some(&path)).is_err());
+    assert!(load_existing(&path).is_err());
 }
 
 #[test]
 fn rejects_tampered_root_signature() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
-    load_or_create(Some(&path)).unwrap();
+    load_or_create(&path).unwrap();
     let mut stored = StoredIdentity::from_canonical_bytes(&fs::read(&path).unwrap()).unwrap();
     let RootProof::Software(Signature::Secp256k1(signature)) =
         &mut stored.enrollment.genesis.root_proof
@@ -118,14 +118,14 @@ fn rejects_tampered_root_signature() {
     };
     signature[0] ^= 1;
     fs::write(&path, stored.canonical_bytes()).unwrap();
-    assert!(load_existing(Some(&path)).is_err());
+    assert!(load_existing(&path).is_err());
 }
 
 #[test]
 fn creates_parent_directory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub/dir/identity");
-    load_or_create(Some(&path)).unwrap();
+    load_or_create(&path).unwrap();
     assert!(path.exists());
 }
 
@@ -136,12 +136,7 @@ fn concurrent_creation_converges() {
     let handles: Vec<_> = (0..4)
         .map(|_| {
             let path = path.clone();
-            std::thread::spawn(move || {
-                load_or_create(Some(&path))
-                    .unwrap()
-                    .transport_key
-                    .to_bytes()
-            })
+            std::thread::spawn(move || load_or_create(&path).unwrap().transport_key.to_bytes())
         })
         .collect();
     let keys: Vec<_> = handles

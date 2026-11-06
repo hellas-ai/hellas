@@ -53,11 +53,54 @@ use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
 
+/// A paid journal selected from the same chain as its Work configuration.
+#[derive(Clone, Debug)]
+pub struct PaidJournalDir {
+    path: PathBuf,
+    chain_root: PathBuf,
+}
+
+impl PaidJournalDir {
+    pub fn client(
+        chain: &hellas_chain::genesis::ChainDir,
+        provider: hellas_client::ProviderAddress,
+    ) -> Self {
+        Self {
+            path: chain.client().join("channels").join(provider.to_string()),
+            chain_root: chain.as_path().to_path_buf(),
+        }
+    }
+    pub fn gateway(
+        chain: &hellas_chain::genesis::ChainDir,
+        provider: hellas_client::ProviderAddress,
+    ) -> Self {
+        Self {
+            path: chain
+                .gateway(&provider.node.to_string())
+                .expect("canonical endpoint ID"),
+            chain_root: chain.as_path().to_path_buf(),
+        }
+    }
+}
+
+impl std::ops::Deref for PaidJournalDir {
+    type Target = PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for PaidJournalDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// Options shared by all jobs on a paid channel.
 #[derive(Clone)]
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
-    pub journal_root: PathBuf,
+    pub journal_root: PaidJournalDir,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
     /// Direct UDP addresses of `provider.node`.
@@ -144,6 +187,11 @@ async fn within<T>(
 impl PaidWorkOptions {
     /// Reject impossible deadlines and collateral before connecting or signing.
     pub fn validate(&self) -> Result<()> {
+        if self.journal_root.chain_root != self.config.chain.as_path() {
+            return Err(PaidClientError::InvalidOptions(
+                "paid journal belongs to another chain",
+            ));
+        }
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
             return Err(PaidClientError::InvalidOptions(
                 "deadline spans must be positive",
@@ -456,6 +504,11 @@ impl PaidWorkSession {
         args.validate()?;
         let config = &args.config;
         config.clone().validate()?;
+        if owner.chain_root() != config.chain.as_path() {
+            return Err(PaidClientError::InvalidOptions(
+                "funding owner belongs to another chain directory",
+            ));
+        }
         if owner.delegate() != settlement_key.party_key() {
             return Err(PaidClientError::InvalidOptions(
                 "funding delegate differs from the settlement key",
@@ -464,7 +517,7 @@ impl PaidWorkSession {
         let read_timeout = read_timeout(args.timeout);
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
-                path: args.journal_root.clone(),
+                path: args.journal_root.path.clone(),
                 source,
             }
         })?;

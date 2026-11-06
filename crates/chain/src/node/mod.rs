@@ -42,11 +42,12 @@ pub(crate) use transport::serve_validator_archive;
 /// Independently provisioned execution inputs. Peers supply blocks, never these pins.
 #[derive(Clone, Debug)]
 pub struct Config {
+    chain: hellas_genesis::ChainDir,
+    indexed: bool,
     genesis: hellas_genesis::Genesis,
     threshold_identity: Vec<u8>,
     /// Optional independently provisioned H0 pin; startup retains the locally derived value.
     genesis_payload: Option<Digest>,
-    pub storage_dir: PathBuf,
     /// Validator transaction ingress URLs; replication uses ChainSync peers.
     pub validators: Vec<String>,
     /// Additional untrusted sources discovered or configured by the host.
@@ -91,37 +92,50 @@ impl Config {
     }
 
     pub fn for_profile(
-        profile: hellas_genesis::ChainProfile,
-        storage_dir: PathBuf,
+        chain: hellas_genesis::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
-        profile
+        chain
+            .profile()
             .static_threshold_identity()
             .map_err(|error| Error::Config(error.to_string()))?;
-        Self::for_indexed_profile(profile, storage_dir, peers, archive_blocks)
+        let mut config = Self::for_indexed_profile(chain, peers, archive_blocks)?;
+        config.indexed = false;
+        Ok(config)
     }
 
     pub(crate) fn for_indexed_profile(
-        profile: hellas_genesis::ChainProfile,
-        storage_dir: PathBuf,
+        chain: hellas_genesis::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
+        let profile = chain.profile();
         let (genesis, genesis_payload) = profile
             .execution()
             .map_err(|error| Error::Config(error.to_string()))?;
         let threshold_identity = hex::decode(&profile.trust().epochs[0].threshold_identity)
             .map_err(|error| Error::Config(error.to_string()))?;
+        let validators = profile.validators().to_vec();
+        let genesis = genesis.clone();
         Ok(Self {
-            genesis: genesis.clone(),
+            chain,
+            indexed: true,
+            genesis,
             threshold_identity,
             genesis_payload: genesis_payload.map(Into::into),
-            storage_dir,
-            validators: profile.validators().to_vec(),
+            validators,
             peers,
             archive_blocks,
         })
+    }
+
+    pub fn storage_dir(&self) -> PathBuf {
+        if self.indexed {
+            self.chain.indexer()
+        } else {
+            self.chain.node()
+        }
     }
 
     fn info(&self) -> Result<ConsensusInfo, Error> {
@@ -399,7 +413,8 @@ impl Core {
         use commonware_glue::stateful::SyncPlan;
         use commonware_resolver::opaque;
         use commonware_utils::NZUsize;
-        let lock = crate::execution::pipeline::lock(&config.storage_dir).map_err(storage)?;
+        let storage_dir = config.storage_dir();
+        let lock = crate::execution::pipeline::lock(&storage_dir).map_err(storage)?;
         let info = config.info()?;
         let chain_config = ArchiveConfig::default();
         let leader = config
@@ -431,13 +446,6 @@ impl Core {
         {
             return Err(Error::Config("genesis payload differs from its pin".into()));
         }
-        crate::execution::pipeline::pin(
-            &config.storage_dir,
-            &config.genesis,
-            &config.threshold_identity,
-            genesis.digest(),
-        )
-        .map_err(storage)?;
         let owner = application.owner_index();
         let mut plan = SyncPlan::<_, crate::domain::Scheme, Standard<HellasBlock>>::init(
             &context.child("startup"),
@@ -483,7 +491,7 @@ impl Core {
                     verifier.trust_sha256(),
                 );
                 let index = crate::edge_index::EdgeIndex::open(
-                    &config.storage_dir.join(format!(
+                    &storage_dir.join(format!(
                         "{partition}-edge-index-v{}-{scope}.redb",
                         crate::edge_index::SCHEMA_VERSION
                     )),

@@ -19,6 +19,8 @@ use crate::commands::CliResult;
 
 #[derive(Subcommand)]
 pub enum ChainCommand {
+    /// Print the selected chain's state namespace key.
+    StateKey,
     /// Query the chain light-client API
     Query {
         /// RPC endpoint; defaults to the selected chain's first validator.
@@ -217,8 +219,6 @@ pub enum IndexerCommand {
         /// ChainSync peer as ENDPOINT_ID@IP:PORT; repeat for multiple peers
         #[arg(long = "peer", value_parser = parse_chain_peer)]
         peers: Vec<iroh::EndpointAddr>,
-        #[arg(long)]
-        storage_dir: PathBuf,
         #[arg(long, default_value = "hellas-explorer")]
         partition_prefix: String,
         /// Retain only the last N executed blocks; the default keeps the complete archive
@@ -336,8 +336,13 @@ pub async fn run(
     command: ChainCommand,
     owner: Option<&hellas_kernel::SoftPasskey>,
     profile: &ChainProfile,
+    _home: &std::path::Path,
 ) -> CliResult {
     match command {
+        ChainCommand::StateKey => {
+            println!("{}", profile.state_key());
+            Ok(())
+        }
         ChainCommand::Delegate { coins, node, split } => {
             anyhow::ensure!(
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
@@ -365,9 +370,9 @@ pub async fn run(
         ChainCommand::Open(args) => run_open(args, profile).await,
         ChainCommand::Close(args) => run_close(args, profile).await,
         #[cfg(feature = "indexer")]
-        ChainCommand::Indexer { command } => run_indexer(command, profile).await,
+        ChainCommand::Indexer { command } => run_indexer(command, profile, _home).await,
         #[cfg(feature = "validator")]
-        ChainCommand::Validator { command } => run_validator(command, profile).await,
+        ChainCommand::Validator { command } => run_validator(command, profile, _home).await,
     }
 }
 
@@ -813,12 +818,15 @@ fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
 }
 
 #[cfg(feature = "indexer")]
-async fn run_indexer(command: IndexerCommand, profile: &ChainProfile) -> CliResult {
+async fn run_indexer(
+    command: IndexerCommand,
+    profile: &ChainProfile,
+    home: &std::path::Path,
+) -> CliResult {
     match command {
         IndexerCommand::Serve {
             rpc,
             peers,
-            storage_dir,
             partition_prefix,
             chain_archive_blocks,
             listen,
@@ -828,11 +836,11 @@ async fn run_indexer(command: IndexerCommand, profile: &ChainProfile) -> CliResu
             } else {
                 profile.clone().with_validators(rpc)?
             };
+            let chain = hellas_chain::genesis::ChainDir::open(home, &selected)?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
-                    profile: selected,
+                    chain,
                     peers,
-                    storage_dir,
                     partition_prefix,
                     listen,
                     archive_blocks: chain_archive_blocks,
@@ -858,7 +866,11 @@ fn parse_chain_peer(raw: &str) -> Result<iroh::EndpointAddr, String> {
 }
 
 #[cfg(feature = "validator")]
-async fn run_validator(command: ValidatorCommand, profile: &ChainProfile) -> CliResult {
+async fn run_validator(
+    command: ValidatorCommand,
+    profile: &ChainProfile,
+    home: &std::path::Path,
+) -> CliResult {
     let command = match command {
         ValidatorCommand::ExportTrust { config, genesis } => {
             hellas_chain::validator::Command::ExportTrust { config, genesis }
@@ -920,6 +932,7 @@ async fn run_validator(command: ValidatorCommand, profile: &ChainProfile) -> Cli
         ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run {
             config,
             profile: profile.clone(),
+            home: home.to_path_buf(),
         },
         ValidatorCommand::CheckConfig { config } => {
             hellas_chain::validator::Command::CheckConfig { config }
@@ -1010,6 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_rejects_an_invalid_node_before_network_or_owner_access() {
+        let home = tempfile::tempdir().unwrap();
         let error = run(
             ChainCommand::Delegate {
                 split: None,
@@ -1021,6 +1035,7 @@ mod tests {
             },
             None,
             &ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            home.path(),
         )
         .await
         .unwrap_err();

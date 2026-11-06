@@ -268,4 +268,4 @@ mod tests;
 mod trust;
 pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
 mod profile;
-pub use profile::{ChainProfile, ChainProfileError, CustomChainFile};
+pub use profile::{ChainDir, ChainProfile, ChainProfileError, CustomChainFile};

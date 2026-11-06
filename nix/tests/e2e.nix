@@ -131,7 +131,7 @@ let
           f"{cli} {trust_args} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
       )
       machine.succeed(
-          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} {trust_args} chain validator run "
+          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} --home ${homePrefix}/validator-home/.hellas {trust_args} chain validator run "
           f"--config ${homePrefix}/validator.toml "
           f"> {validator_log} 2>&1 & echo $! > ${homePrefix}/validator.pid"
       )
@@ -141,8 +141,8 @@ let
           print(machine.succeed(f"cat {validator_log} || true"))
           raise
       machine.succeed(
-          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} {trust_args} chain indexer serve "
-          f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
+          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} --home ${homePrefix}/follower-store {trust_args} chain indexer serve "
+          f"--rpc {rpc} "
           f"--peer {peer_id}@127.0.0.1:31248 "
           "--partition-prefix ${followerPartitionPrefix} "
           "--listen 127.0.0.1:31247 "
@@ -171,7 +171,7 @@ in
           systemd.services.hellas-monitor = {
             environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
             serviceConfig = {
-              ExecStart = "${package}/bin/hellas --identity /tmp/hellas-monitor.key monitor";
+              ExecStart = "${package}/bin/hellas --home /tmp/hellas-monitor monitor";
               KillSignal = "SIGINT";
               StandardOutput = "file:/tmp/hellas-monitor.log";
               StandardError = "inherit";
@@ -186,7 +186,6 @@ in
             openFirewall = true;
             queueSize = 2;
             contentRoots = [ "/srv/hellas-content" ];
-            contentIndex = "/var/lib/hellas/content-index.bin";
             gpuSessionPrograms = 3;
             gpuSessionAssetBytes = 1073741824;
             memoryMaxBytes = 1879048192;
@@ -202,7 +201,7 @@ in
     testScript = ''
       start_all()
       machine.wait_for_unit("hellas.service")
-      machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
+      machine.wait_until_succeeds("test -e /var/lib/hellas/.hellas/store/fastresume.bin", timeout=30)
 
       machine.fail("${package}/bin/hellas llm --help")
 
@@ -212,7 +211,6 @@ in
           "--property=MemoryMax --property=MemorySwapMax --property=OOMPolicy"
       )
       assert "--content-root /srv/hellas-content" in unit
-      assert "--content-index /var/lib/hellas/content-index.bin" in unit
       assert "--gpu-session-programs 3" in unit
       assert "--gpu-session-asset-bytes 1073741824" in unit
       assert "MemoryMax=1879048192" in unit

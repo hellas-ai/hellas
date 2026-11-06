@@ -89,9 +89,9 @@ fn identity_init_has_an_explicit_dispatch_command() {
 }
 
 #[test]
-fn identity_free_commands_reject_global_identity_options() {
-    for args in [
-        vec![
+fn identity_free_commands_reject_software_root_but_allow_home() {
+    assert!(
+        Cli::try_parse_from([
             "hellas",
             "--identity",
             "unused.identity",
@@ -99,34 +99,30 @@ fn identity_free_commands_reject_global_identity_options() {
             "import",
             "provider.offer",
             "--name",
-            "provider",
-        ],
-        vec![
-            "hellas",
-            "offer",
-            "import",
-            "provider.offer",
-            "--name",
-            "provider",
-            "--software-root",
-        ],
-    ] {
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert!(
-            validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root,)
-                .is_err()
-        );
-    }
+            "provider"
+        ])
+        .is_err()
+    );
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "--home",
+        "/state",
+        "offer",
+        "import",
+        "provider.offer",
+        "--name",
+        "provider",
+        "--software-root",
+    ])
+    .unwrap();
+    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
 }
 
 #[test]
 fn identity_queries_reject_a_root_selection_they_cannot_use() {
     let cli =
         Cli::try_parse_from(["hellas", "identity", "show-node-id", "--software-root"]).unwrap();
-    assert!(
-        validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root,)
-            .is_err()
-    );
+    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
 }
 
 #[test]
@@ -311,18 +307,18 @@ fn gateway_responses_fetch_takes_overrides_and_its_models() {
 }
 
 #[test]
-fn identity_show_holder_accepts_global_identity_path() {
+fn identity_show_holder_accepts_global_home() {
     let cli = Cli::try_parse_from([
         "hellas",
-        "--identity",
-        "/tmp/hellas-identity",
+        "--home",
+        "/state/hellas",
         "identity",
         "show-holder",
     ])
     .unwrap();
     assert_eq!(
-        cli.identity.as_deref(),
-        Some(std::path::Path::new("/tmp/hellas-identity"))
+        cli.home.as_deref(),
+        Some(std::path::Path::new("/state/hellas"))
     );
     assert!(matches!(
         cli.command,
@@ -363,7 +359,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let paid =
         Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
 
-    let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
+    let Err(error) = load_command_identity(&paid.command, &path) else {
         panic!("an identity file that is not one is not a key to settle with");
     };
 
@@ -413,53 +409,37 @@ fn serve_rejects_zero_fetch_concurrency() {
 }
 
 #[test]
-fn codex_auth_status_accepts_auth_path() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "codex-auth",
-        "status",
-        "--auth-path",
-        "/tmp/codex-auth.json",
-    ])
-    .unwrap();
+fn codex_auth_status_uses_home() {
+    let cli =
+        Cli::try_parse_from(["hellas", "codex-auth", "status", "--home", "/state/hellas"]).unwrap();
     match cli.command {
         Commands::CodexAuth {
-            command: CodexAuthCommand::Status { auth_path },
+            command: CodexAuthCommand::Status,
         } => assert_eq!(
-            auth_path.as_deref(),
-            Some(std::path::Path::new("/tmp/codex-auth.json"))
+            cli.home.as_deref(),
+            Some(std::path::Path::new("/state/hellas"))
         ),
         _ => panic!("expected codex-auth status command"),
     }
 }
 
 #[test]
-fn codex_auth_import_accepts_paths() {
+fn codex_auth_import_accepts_external_source() {
     let cli = Cli::try_parse_from([
         "hellas",
         "codex-auth",
         "import",
-        "--auth-path",
-        "/tmp/hellas-codex-auth.json",
         "--from",
-        "/tmp/codex-auth.json",
+        "/state/external-codex-auth.json",
     ])
     .unwrap();
     match cli.command {
         Commands::CodexAuth {
-            command:
-                CodexAuthCommand::Import {
-                    auth_path,
-                    source_path,
-                },
+            command: CodexAuthCommand::Import { source_path },
         } => {
             assert_eq!(
-                auth_path.as_deref(),
-                Some(std::path::Path::new("/tmp/hellas-codex-auth.json"))
-            );
-            assert_eq!(
                 source_path.as_deref(),
-                Some(std::path::Path::new("/tmp/codex-auth.json"))
+                Some(std::path::Path::new("/state/external-codex-auth.json"))
             );
         }
         _ => panic!("expected codex-auth import command"),
@@ -503,10 +483,10 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
         "/gateway.json",
     ])
     .unwrap();
-    assert!(validate_identity_options(&cli.command, None, true).is_err());
+    assert!(validate_identity_options(&cli.command, true).is_err());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("missing-identity");
-    assert!(load_command_identity(&cli.command, Some(&path)).is_err());
+    assert!(load_command_identity(&cli.command, &path).is_err());
     assert!(!path.exists());
     let Commands::Gateway {
         grant_policy,

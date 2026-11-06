@@ -15,12 +15,11 @@ use std::process::Command;
 #[test]
 fn gateway_checks_a_real_pool_before_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let identity = dir.path().join("identity");
     let binary = env!("CARGO_BIN_EXE_hellas");
     let init = Command::new(binary)
         .args([
-            "--identity",
-            identity.to_str().unwrap(),
+            "--home",
+            dir.path().to_str().unwrap(),
             "--software-root",
             "identity",
             "init",
@@ -34,8 +33,8 @@ fn gateway_checks_a_real_pool_before_startup() {
     );
     let show = Command::new(binary)
         .args([
-            "--identity",
-            identity.to_str().unwrap(),
+            "--home",
+            dir.path().to_str().unwrap(),
             "identity",
             "show-holder",
         ])
@@ -102,10 +101,9 @@ fn gateway_checks_a_real_pool_before_startup() {
     let config = dir.path().join("pool.json");
     std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"channels":[{"offer":imported.offers[0].name,"work_profile":"shared","trust_policy":"provider","resources":[resource.0.to_string()]}]})).unwrap()).unwrap();
     let check = Command::new(binary)
-        .env("HELLAS_GRANT_DATA_DIR", &data)
         .args([
-            "--identity",
-            identity.to_str().unwrap(),
+            "--home",
+            dir.path().to_str().unwrap(),
             "--passkey",
             passkey.to_str().unwrap(),
             "gateway",
@@ -125,10 +123,9 @@ fn gateway_checks_a_real_pool_before_startup() {
     assert!(String::from_utf8_lossy(&check.stdout).contains("configuration is valid"));
     std::fs::write(&config, b"{\"channels\":[]}").unwrap();
     let bad = Command::new(binary)
-        .env("HELLAS_GRANT_DATA_DIR", &data)
         .args([
-            "--identity",
-            identity.to_str().unwrap(),
+            "--home",
+            dir.path().to_str().unwrap(),
             "--passkey",
             passkey.to_str().unwrap(),
             "gateway",

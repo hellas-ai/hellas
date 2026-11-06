@@ -66,6 +66,7 @@ async fn run(
         passkey
             .as_ref()
             .map(|key| key as &dyn hellas_authority::authenticator::Authenticator),
+        Path::new("."),
     )
     .await
 }
@@ -91,12 +92,11 @@ impl Daemon {
             .tempdir_in(scratch.canonicalize().unwrap())
             .unwrap();
         hellas_private::restrict_directory(root.path()).unwrap();
-        let identity =
-            crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+        let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
         let provider_identity =
-            crate::identity::load_or_create(Some(&root.path().join("provider-identity"))).unwrap();
+            crate::identity::load_or_create(&root.path().join("provider-identity")).unwrap();
         let wrong_identity =
-            crate::identity::load_or_create(Some(&root.path().join("other-identity"))).unwrap();
+            crate::identity::load_or_create(&root.path().join("other-identity")).unwrap();
         let authority = auth::AuthorityId(Digest::hash(b"daemon control fixture"));
         let root_grant = ROOT_GRANT;
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
@@ -125,7 +125,7 @@ impl Daemon {
         )
         .unwrap();
         let offline = || OfflineArgs {
-            journal: grant_config.journal_root.clone(),
+            journal: grant_config.journal_root().to_path_buf(),
             administrator: scope_file.clone(),
             credential_scope: scope_file.clone(),
             holder: admin_holder.clone(),
@@ -147,13 +147,13 @@ impl Daemon {
         .unwrap();
         let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         hellas_private::write_atomically(
-            &grant_config.control_certificate,
+            grant_config.control_certificate(),
             ".writing",
             tls.cert.der(),
         )
         .unwrap();
         hellas_private::write_atomically(
-            &grant_config.control_private_key,
+            grant_config.control_private_key(),
             ".writing",
             &tls.signing_key.serialize_der(),
         )
@@ -170,8 +170,8 @@ impl Daemon {
             &serde_json::to_vec(&profile_json).unwrap(),
         )
         .unwrap();
-        let socket = grant_config.control_socket.clone();
-        let journal = grant_config.journal_root.clone();
+        let socket = grant_config.control_socket().to_path_buf();
+        let journal = grant_config.journal_root().to_path_buf();
         let mut executor = ExecutorSpawnConfig::new(
             Arc::new(provider_identity.node_key.clone()),
             Assurance::ProducerSigned,
@@ -195,6 +195,7 @@ impl Daemon {
             Some(grant_config),
             None,
             None,
+            root.path(),
         )
         .await
         .unwrap();
@@ -587,7 +588,7 @@ async fn offline_recovery_publishes_a_usable_replacement_credential() {
 #[tokio::test]
 async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let root = tempfile::tempdir().unwrap();
-    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
     let (passkey_file, owner) = passkey(root.path(), "operator.passkey", 0x33);
     let authority = auth::AuthorityId(Digest::hash(b"gateway bearer fixture"));
     let now = auth::UnixMillis::now().unwrap_or_default();

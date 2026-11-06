@@ -117,6 +117,28 @@ fn delegate() -> Key {
 fn provider(n: u8) -> iroh::EndpointId {
     iroh::SecretKey::from_bytes(&[n; 32]).public()
 }
+
+#[test]
+fn owner_state_uses_the_consensus_digest_and_ignores_legacy_funding() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join("identity.funding/client/owner.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, b"old untrusted wallet marker").unwrap();
+    let network = NetworkId::new("same-sdk-network").unwrap();
+    let first = crate::test_support::chain_dir_with_digest(home.path(), network, [1; 32]);
+    let second = crate::test_support::chain_dir_with_digest(home.path(), network, [2; 32]);
+    assert_eq!(first.network_id(), second.network_id());
+    let approval = Arc::new(Approval::new());
+    let a = ClientOwner::new(approval.clone(), delegate(), &first).unwrap();
+    let b = ClientOwner::new(approval, delegate(), &second).unwrap();
+    assert_ne!(a.root, b.root);
+    assert_eq!(a.chain_root(), first.as_path());
+    assert_eq!(b.chain_root(), second.as_path());
+    assert_eq!(
+        std::fs::read(legacy).unwrap(),
+        b"old untrusted wallet marker"
+    );
+}
 async fn sealing<T>(devnet: &mut Devnet, work: impl Future<Output = T>) -> T {
     tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(2), async {
         tokio::pin!(work);
@@ -141,6 +163,11 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                 },
             )
             .await;
+            let state = crate::test_support::chain_dir_with_digest(
+                root.path(),
+                devnet.network(),
+                hellas_chain::genesis_digest(devnet.genesis()).0,
+            );
             devnet.seal().await;
             let chain = RemoteLightClient::connect(devnet.light_client_url(0))
                 .await
@@ -148,9 +175,9 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                 .with_consensus_verifier(devnet.consensus_verifier());
             let approval = Arc::new(Approval::new());
             let gate = Gate::default();
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             assert!(matches!(
-                ClientOwner::new(approval.clone(), delegate(), root.path()),
+                ClientOwner::new(approval.clone(), delegate(), &state),
                 Err(ClientOwnerError::Locked(_))
             ));
             assert!(
@@ -251,7 +278,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             // publishing the active record.
             std::fs::remove_file(owner.path(devnet.network(), provider(3))).unwrap();
             drop(owner);
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             let network = devnet.network();
             let first = sealing(
                 &mut devnet,
@@ -405,6 +432,11 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                 },
             )
             .await;
+            let state = crate::test_support::chain_dir_with_digest(
+                root.path(),
+                devnet.network(),
+                hellas_chain::genesis_digest(devnet.genesis()).0,
+            );
             devnet.seal().await;
             let chain = RemoteLightClient::connect(devnet.light_client_url(0))
                 .await
@@ -425,7 +457,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             devnet.seal().await;
             let approval = Arc::new(Approval::new());
             approval.pause.store(true, Ordering::SeqCst);
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             let funding = owner.fund(
                 &chain,
                 devnet.network(),

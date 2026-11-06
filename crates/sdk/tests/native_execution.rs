@@ -150,7 +150,10 @@ async fn check_other_enrollment_refused(
     approvals: &Approvals,
 ) {
     let mut elsewhere = other_provider(options);
-    elsewhere.journal_root = options.journal_root.with_file_name("elsewhere-journal");
+    elsewhere.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
+        &elsewhere.config.chain,
+        elsewhere.provider,
+    );
     let refused = |error: String| {
         assert!(error.contains("genesis pin mismatch"), "{error}");
     };
@@ -179,8 +182,7 @@ async fn check_other_enrollment_refused(
         .expect("channel with another enrollment")
         .to_string(),
     );
-    let mut gateway = elsewhere.clone();
-    gateway.journal_root = options.journal_root.with_file_name("elsewhere-gateway");
+    let gateway = elsewhere.clone();
     let error = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
             config: gateway.config.clone(),
@@ -286,23 +288,8 @@ fn work_policy() -> InvocationPolicy {
 }
 
 fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig {
-    use commonware_cryptography::{Hasher as _, Sha256};
-    use hellas_chain::genesis::{Chain, ChainProfile, CustomChainFile};
-    let genesis_json = serde_json::to_string(devnet.genesis()).unwrap();
-    let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
-    trust.network_id = devnet.network().as_str().to_owned();
-    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
-    trust.epochs[0].threshold_identity = hex::encode(&devnet.consensus_info().threshold_identity);
     WorkConfig {
-        chain: ChainProfile::custom(CustomChainFile {
-            consensus_digest: hex::encode(hellas_chain::genesis_digest(devnet.genesis()).0),
-            trust,
-            validators: devnet.light_client_urls(),
-            genesis_json: Some(genesis_json),
-            genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
-        })
-        .unwrap(),
-        journal_root,
+        chain: devnet.chain_dir(&journal_root, 0),
         poll: Duration::from_millis(20),
         max_observation_age: Duration::from_secs(60),
     }
@@ -310,7 +297,6 @@ fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig 
 
 fn gateway_provider(options: &PaidWorkOptions) -> hellas_sdk::paid_gateway::GatewayProviderOptions {
     hellas_sdk::paid_gateway::GatewayProviderOptions {
-        journal_root: options.journal_root.clone(),
         provider: options.provider,
         provider_addrs: options.provider_addrs.clone(),
         apple_trust: options.apple_trust.clone(),
@@ -362,7 +348,7 @@ async fn start_provider(
             identity: identity.clone(),
             enrollment: provider_enrollment(identity),
             root: Arc::new(SoftwareRoot),
-            state_directory: root.join("provider-state"),
+            home: root.join("provider-state"),
             grants: Some(hellas_sdk::GrantProviderOptions {
                 configuration: Default::default(),
                 max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
@@ -686,8 +672,7 @@ async fn check_gateway_quote(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
 ) {
     use hellas_gateway::WorkExecutionBackend as _;
-    let mut args = options.clone();
-    args.journal_root = options.journal_root.with_file_name("gateway-client");
+    let args = options.clone();
     let journal = args.journal_root.clone();
     let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
@@ -702,10 +687,7 @@ async fn check_gateway_quote(
     .await
     .unwrap();
     assert!(!journal.exists(), "gateway discovery only requests a quote");
-    assert!(
-        !options.config.journal_root.exists(),
-        "gateway quotes never stake"
-    );
+    assert!(!options.journal_root.exists(), "gateway quotes never stake");
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
@@ -738,7 +720,7 @@ async fn check_gateway_quote(
     );
     gateway.drain().await.unwrap();
     assert!(!journal.exists());
-    assert!(!options.config.journal_root.exists());
+    assert!(!options.journal_root.exists());
 }
 
 /// The provider earns exactly the price from the payment close, and its
@@ -925,15 +907,21 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         [0; 32],
     )
     .unwrap();
+    let client_home = root.path().join("requester");
     let mut client_config = config;
+    client_config.chain = devnet.chain_dir(&client_home, 0);
     client_config.chain = client_config
         .chain
         .with_validators(relays.urls.clone())
         .unwrap();
+    let provider_address =
+        hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap();
+    let journal_root =
+        hellas_sdk::paid_client::PaidJournalDir::client(&client_config.chain, provider_address);
     let options = PaidWorkOptions {
         config: client_config,
-        journal_root: root.path().join("client-journal"),
-        provider: hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap(),
+        journal_root,
+        provider: provider_address,
         provider_addrs,
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
@@ -944,17 +932,16 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         timeout: Some(Duration::from_secs(120)),
     };
     let approvals = Arc::new(Approvals::default());
-    let client_home = root.path().join("requester");
     let owner = Arc::new(
         hellas_sdk::client_owner::ClientOwner::new(
             approvals.clone(),
             client_settlement().party_key(),
-            &client_home.join("funding"),
+            &options.config.chain,
         )
         .unwrap(),
     );
     let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
-    assert!(!options.config.journal_root.exists());
+    assert!(!options.journal_root.exists());
     Box::pin(check_other_enrollment_refused(
         &options,
         &endpoint,
@@ -962,10 +949,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         &approvals,
     ))
     .await;
-    let mut fresh = options.clone();
-    fresh.journal_root = options
-        .journal_root
-        .with_file_name("other-contract-journal");
+    let fresh = options.clone();
     Box::pin(check_other_contract_refused(
         &fresh,
         &endpoint,
@@ -992,7 +976,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         PRICE * 10
     );
     assert!(
-        !options.config.journal_root.exists(),
+        !options.journal_root.exists(),
         "a quote creates no paid journal"
     );
     Box::pin(check_gateway_quote(&options, owner.clone())).await;
@@ -1332,7 +1316,12 @@ async fn paid_finish(case: PaidScenario) {
     .unwrap();
     let job_folder = root.path().join("job");
     job.save(&job_folder).unwrap();
-    let purchase_path = root.path().join("purchases/job.json");
+    let purchase_path = hellas_sdk::transact::PaidAttemptPath::new(
+        &options.config.chain,
+        options.provider,
+        owner.principal(),
+        job.digest(),
+    );
     let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
     let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
     let mut session = PaidWorkSession::open(
@@ -1392,7 +1381,7 @@ async fn paid_finish(case: PaidScenario) {
         .await
         .unwrap();
     assert!(!purchase.is_pending());
-    assert!(!purchase_path.exists());
+    assert!(!purchase_path.as_path().exists());
     assert!(!session.needs_recovery());
     session.shutdown().await;
     drop(session);
@@ -1530,7 +1519,7 @@ async fn paid_finish(case: PaidScenario) {
         "the settled close paid the provider the price",
     );
     assert_eq!(upstream.calls("openai", "responses", BODY), 1);
-    let marker = std::fs::read(&purchase_path).unwrap();
+    let marker = std::fs::read(purchase_path.as_path()).unwrap();
     assert!(
         !marker.windows(BODY.len()).any(|bytes| bytes == BODY),
         "purchase state contains no request bytes"

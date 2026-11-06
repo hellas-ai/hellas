@@ -104,12 +104,17 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                let mut purchase = hellas_sdk::transact::Purchase::open(
-                    &case.root.path().join(format!("purchase-{n}.json")),
-                    &job,
-                    false,
+                let mut nonce = [0; 16];
+                nonce[8..].copy_from_slice(&(n as u64).to_be_bytes());
+                let attempt = hellas_sdk::transact::PaidAttemptPath::new(
+                    &case.options.config.chain,
+                    case.options.provider,
+                    case.owner.principal(),
+                    job.digest(),
                 )
-                .unwrap();
+                .with_nonce(nonce);
+                let mut purchase =
+                    hellas_sdk::transact::Purchase::open(&attempt, &job, false).unwrap();
                 let result = tokio::time::timeout(
                     Duration::from_secs(30),
                     hellas_sdk::transact::transact(

@@ -23,28 +23,17 @@ impl OwnerArgs {
         self.faucet || self.faucet_account.is_some()
     }
 
-    fn faucet_root(identity: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
-        let mut path = identity
-            .map(PathBuf::from)
-            .map(Ok)
-            .unwrap_or_else(crate::identity::default_path)?
-            .into_os_string();
-        path.push(".faucet");
-        Ok(PathBuf::from(path))
-    }
-
     /// Keep the selected public owner with this identity across restarts.
     pub(crate) fn load_persistent(
         &self,
-        identity: Option<&std::path::Path>,
+        home: &std::path::Path,
         chain: &ChainProfile,
     ) -> anyhow::Result<Option<SoftPasskey>> {
         if !self.is_faucet() {
             return self.load(chain);
         }
-        let root = Self::faucet_root(identity)?;
-        hellas_private::create_dir_all_durable(&root)?;
-        let path = root.join("account");
+        let path = hellas_chain::genesis::ChainDir::open(home, chain)?.faucet_account();
+        let root = path.parent().expect("faucet account has a chain directory");
         if !path.try_exists()? {
             let index = self
                 .faucet_account
@@ -148,12 +137,11 @@ mod tests {
     fn a_selected_account_stays_with_its_identity() {
         let chain = ChainProfile::known(Chain::Devnet);
         let root = tempfile::tempdir().unwrap();
-        let identity = root.path().join("identity");
         let load = |args: &[&str]| {
             crate::Cli::try_parse_from(args)
                 .unwrap()
                 .owner
-                .load_persistent(Some(&identity), &chain)
+                .load_persistent(root.path(), &chain)
         };
         let first = load(&["hellas", "serve", "--faucet-account", "7"])
             .unwrap()

@@ -40,8 +40,7 @@ stays inside the user-private state boundary.
 
 ## Persisting hashing work
 
-`adopt` writes `fastresume.bin` under `$HOME/.hellas/store` — or
-`$HELLAS_STORE_DIR`, and never inside the HuggingFace cache, which is not
+`adopt` writes `fastresume.bin` under `<home>/store` (`--home` or `HELLAS_HOME` selects home), and never inside the HuggingFace cache, which is not
 ours. The record contains the file identity, content id, and chunk list
 from earlier hashing work, so a later run can skip unchanged files.
 

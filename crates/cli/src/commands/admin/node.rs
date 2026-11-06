@@ -1,8 +1,5 @@
 use super::{AdminArgs, AdminCommand, OfflineArgs};
-use crate::{
-    commands::contributions::{data_root, offer_fingerprints, principal},
-    identity::LocalIdentity,
-};
+use crate::{commands::contributions::offer_fingerprints, identity::LocalIdentity};
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
@@ -62,6 +59,7 @@ pub async fn run(
     args: AdminArgs,
     identity: &LocalIdentity,
     passkey: Option<&dyn Authenticator>,
+    home: &Path,
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
         ensure!(
@@ -161,10 +159,7 @@ pub async fn run(
             .context("profile requires local server trust")?;
         let socket = match args.control_socket {
             Some(path) => path,
-            None => data_root(&principal(passkey.context(
-                "the default control socket is the principal's; pass --passkey or --control-socket",
-            )?)?)?
-            .join("control.sock"),
+            None => home.join("provider").join("control.sock"),
         };
         let (client, challenge) = node_control::connect_local(
             &socket,

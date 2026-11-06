@@ -26,7 +26,8 @@ pub struct OpenAiProviderOptions<R> {
     pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
-    pub state_directory: PathBuf,
+    /// Process home; the SDK derives chain-agnostic grant state beneath it.
+    pub home: PathBuf,
     pub service: String,
     pub method: String,
     pub bearer_token: String,
@@ -74,7 +75,7 @@ where
         identity: options.identity.clone(),
         enrollment: options.enrollment.clone(),
         root: options.root.clone(),
-        state_directory: options.state_directory.clone(),
+        home: options.home.clone(),
         routes,
         grants: Some(GrantProviderOptions {
             configuration: hellas_authority::model::grant::configuration::NodeConfiguration::new(

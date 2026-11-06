@@ -68,7 +68,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 identity,
                 enrollment,
                 root: root.clone(),
-                state_directory: state,
+                home: state,
                 routes,
                 fetch_max_in_flight: 1,
                 fetch_queue_capacity: 1,

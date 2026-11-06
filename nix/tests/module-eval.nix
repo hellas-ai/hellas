@@ -373,18 +373,20 @@ let
     environmentFile = "${builtins.storeDir}/secret.env";
   };
   storePathIdentityGateway = evalGateway {
-    identityPath = "${builtins.storeDir}/identity";
+    home = "${builtins.storeDir}/hellas";
   };
   storePathTextModelGateway = evalGateway {
     textModel = "${builtins.storeDir}/model.gguf";
   };
   storePathIdentityProvider = evalProvider {
-    identityPath = "${builtins.storeDir}/identity";
+    home = "${builtins.storeDir}/hellas";
   };
   storePathContentProvider = evalProvider {
     content = [ "${builtins.storeDir}/model.hex" ];
   };
   defaultIdentityProvider = evalProvider { };
+  customHomeProvider = evalProvider { home = "/srv/hellas-home"; };
+  customHomeGateway = evalGateway { home = "/srv/hellas-gateway-home"; };
   storePathWorkConfig = evalProvider {
     workConfigFile = "${builtins.storeDir}/work.toml";
   };
@@ -395,7 +397,7 @@ let
     environmentFile = "${builtins.storeDir}/provider.env";
   };
   rootJournalGateway = evalGateway {
-    paidWorkJournalRoots = [ "/" ];
+    home = "/";
   };
   unsafeServeExtraArgs = evalProvider {
     extraArgs = [ "--content=${builtins.storeDir}/model.hex" ];
@@ -444,7 +446,7 @@ let
     passkey = "/run/hellas/principal.passkey";
   };
   awaitOwnerHipProvider = evalProvider {
-    awaitOwner = "/var/lib/hellas/await-owner";
+    awaitOwner = true;
     gpuBackend = "hip";
   };
   cudaProvider = evalProvider {
@@ -530,7 +532,7 @@ let
     };
   };
   homeManagerDarwinServe = evalDarwinServe {
-    identityPath = "/Users/hellas/Library/Application Support/Hellas/identity";
+    home = "/Users/hellas/Library/Application Support/Hellas";
     environmentFile = "/Users/hellas/.config/hellas/provider.env";
     fetchConfigFile = "/Users/hellas/.config/hellas/fetch.json";
     assurance = "apple-app-attest";
@@ -539,7 +541,7 @@ let
   homeManagerDarwinProgramArguments = homeManagerDarwinService.config.ProgramArguments;
   homeManagerDarwinDirect = evalDarwinServe { };
   homeManagerDarwinStoreIdentity = evalDarwinServe {
-    identityPath = "${builtins.storeDir}/identity";
+    home = "${builtins.storeDir}/hellas";
   };
   homeManagerDarwinStoreContent = evalDarwinServe {
     content = [ "${builtins.storeDir}/model.hex" ];
@@ -614,9 +616,8 @@ let
           inherit package;
           # An operator explicitly enables arbitrary locally satisfiable
           # Evaluate work, including restart from an already-populated index.
-          identityPath = "/var/lib/hellas/.hellas/identity-v3";
+          home = "/var/lib/hellas/.hellas-v3";
           contentRoots = [ "/srv/hellas/content" ];
-          contentIndex = "/srv/hellas-index/content-index.bin";
           gpuSessionAssetBytes = 1073741824;
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.toml";
@@ -660,14 +661,33 @@ let
 in
 {
   provider-content-index-eval =
-    assert lib.hasInfix "--chain devnet" (evalProvider { chain = "devnet"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalProvider { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/chain.json" (evalProvider { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--chain devnet" (evalGateway { chain = "devnet"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalGateway { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.any (item: !item.assertion && lib.hasInfix "chain and chainConfig are mutually exclusive" item.message) (evalProvider { chain = "devnet"; chainConfig = "/run/hellas/chain.json"; }).config.assertions;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalValidators { chainConfig = "/run/hellas/chain.json"; networkId = "hellas-custom-1"; }).config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/chain.json" (evalValidators { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas-validator-devnet-node0.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--chain devnet"
+      (evalProvider { chain = "devnet"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
+      (evalProvider { chainConfig = "/run/hellas/chain.json"; })
+      .config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/chain.json"
+      (evalProvider { chainConfig = "/run/hellas/chain.json"; })
+      .config.systemd.services.hellas.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--chain devnet"
+      (evalGateway { chain = "devnet"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
+      (evalGateway { chainConfig = "/run/hellas/chain.json"; })
+      .config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.any
+      (item: !item.assertion && lib.hasInfix "chain and chainConfig are mutually exclusive" item.message)
+      (evalProvider {
+        chain = "devnet";
+        chainConfig = "/run/hellas/chain.json";
+      }).config.assertions;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
+      (evalValidators {
+        chainConfig = "/run/hellas/chain.json";
+        networkId = "hellas-custom-1";
+      }).config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/chain.json"
+      (evalValidators { chainConfig = "/run/hellas/chain.json"; })
+      .config.systemd.services.hellas-validator-devnet-node0.unitConfig.RequiresMountsFor;
     assert service.environment ? ROCM_PATH;
     assert service.environment ? HIP_PATH;
     assert service.environment.TMPDIR == "/run/hellas";
@@ -701,28 +721,32 @@ in
     assert !(managedContentProviderService.serviceConfig ? SupplementaryGroups);
     assert !(managedContentProviderService.serviceConfig ? DeviceAllow);
     assert !(managedContentProviderService.serviceConfig ? LimitMEMLOCK);
-    assert lib.hasInfix "--identity /var/lib/hellas/.hellas/identity-v3"
-      service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--identity /var/lib/hellas/.hellas/identity"
+    assert lib.hasInfix "--home /var/lib/hellas/.hellas-v3" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--home /var/lib/hellas/.hellas"
       defaultIdentityProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.hasInfix "--home /srv/hellas-home"
+      customHomeProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.elem "/srv/hellas-home"
+      customHomeProvider.config.systemd.services.hellas.serviceConfig.ReadWritePaths;
+    assert lib.elem "/srv/hellas-home"
+      customHomeProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--home /srv/hellas-gateway-home"
+      customHomeGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.elem "/srv/hellas-gateway-home"
+      customHomeGateway.config.systemd.services.hellas-gateway.serviceConfig.ReadWritePaths;
+    assert lib.elem "/srv/hellas-gateway-home"
+      customHomeGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--queue-size 0" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--content-index /srv/hellas-index/content-index.bin"
-      service.serviceConfig.ExecStart;
     assert lib.hasInfix "--assurance producer-signed" service.serviceConfig.ExecStart;
     assert lib.all (path: lib.elem path service.unitConfig.RequiresMountsFor) [
-      "/var/lib/hellas/.hellas/identity-v3"
+      "/var/lib/hellas/.hellas-v3"
       "/srv/hellas/content"
-      "/srv/hellas-index/content-index.bin"
       "/run/hellas/work.toml"
       "/run/hellas/fetch.json"
       "/run/hellas/provider.env"
     ];
-    assert
-      service.serviceConfig.ReadWritePaths == [
-        "/srv/hellas-index"
-      ];
+    assert !(service.serviceConfig ? ReadWritePaths);
     assert service.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
-    assert !(lib.elem "/srv/hellas/content" service.serviceConfig.ReadWritePaths);
     assert
       managedContentProviderService.serviceConfig.ReadOnlyPaths == [
         "/var/lib/hellas/content"
@@ -901,7 +925,7 @@ in
     assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
     assert lib.elem "/run/hellas/grant.json"
       grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--await-owner /var/lib/hellas/await-owner"
+    assert lib.hasInfix "--await-owner"
       awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert
       !(lib.hasInfix "--paid-work-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
@@ -918,8 +942,6 @@ in
       awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
     assert
       awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
-    assert lib.elem "/var/lib/hellas/await-owner"
-      awaitOwnerHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !environmentPathEvaluation.success;
@@ -952,8 +974,7 @@ in
       scalarEnvironment.config.systemd.services.hellas.environment.TEST_BOOLEAN == builtins.toString true;
     assert scalarEnvironment.config.systemd.services.hellas.environment.TEST_INTEGER == "7";
     assert !(homeManagerPlatformAssertion homeManagerLinuxServe).assertion;
-    assert
-      homeManagerLinuxServe.config.programs.hellas.serve.identityPath == "/home/hellas/.hellas/identity";
+    assert homeManagerLinuxServe.config.programs.hellas.serve.home == "/home/hellas/.hellas";
     assert homeManagerDarwinService.enable;
     assert lib.hasSuffix "-hellas-runtime-environment" (
       builtins.head homeManagerDarwinProgramArguments
@@ -963,8 +984,8 @@ in
         "/Users/hellas/.config/hellas/provider.env"
         "${package}/bin/hellas"
         "serve"
-        "--identity"
-        "/Users/hellas/Library/Application Support/Hellas/identity"
+        "--home"
+        "/Users/hellas/Library/Application Support/Hellas"
         "--port"
         "31145"
         "--assurance"
@@ -978,8 +999,8 @@ in
       homeManagerDarwinDirect.config.launchd.agents.hellas.config.ProgramArguments == [
         "${package}/bin/hellas"
         "serve"
-        "--identity"
-        "/Users/hellas/.hellas/identity"
+        "--home"
+        "/Users/hellas/.hellas"
         "--port"
         "31145"
         "--assurance"

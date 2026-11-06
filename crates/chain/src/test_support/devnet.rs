@@ -503,7 +503,7 @@ impl Devnet {
 
     /// A full-node configuration that submits through `validator` and
     /// syncs from it. The caller owns the node it starts.
-    pub fn full_node_config(&self, storage_dir: PathBuf, validator: usize) -> crate::node::Config {
+    pub fn profile(&self, validator: usize) -> crate::genesis::ChainProfile {
         use crate::genesis::{Chain, ChainProfile, CustomChainFile};
         use commonware_cryptography::{Hasher as _, Sha256};
         let validator = &self.validators[validator];
@@ -512,18 +512,24 @@ impl Devnet {
         trust.network_id = self.document.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
-        let profile = ChainProfile::custom(CustomChainFile {
+        ChainProfile::custom(CustomChainFile {
             consensus_digest: hex::encode(crate::genesis_digest(&self.document).0),
             trust,
             validators: vec![validator.light_client_url.clone()],
             genesis_json: Some(genesis_json),
             genesis_payload: Some(hex::encode(self.genesis_payload.0)),
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    pub fn chain_dir(&self, home: &std::path::Path, validator: usize) -> crate::genesis::ChainDir {
+        crate::genesis::ChainDir::open(home, &self.profile(validator)).unwrap()
+    }
+
+    pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {
         crate::node::Config::for_profile(
-            profile,
-            storage_dir,
-            vec![validator.chain_sync.clone()],
+            self.chain_dir(&home, validator),
+            vec![self.validators[validator].chain_sync.clone()],
             None,
         )
         .unwrap()

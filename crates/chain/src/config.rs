@@ -27,8 +27,6 @@ pub enum ConfigError {
     InvalidHex(#[from] hex::FromHexError),
     #[error("invalid key bytes")]
     InvalidKey(#[from] commonware_codec::Error),
-    #[error("unable to determine local data directory")]
-    MissingDataDirectory,
     #[error("duplicate public keys in config")]
     DuplicatePublicKeys,
     #[error("invalid genesis document")]
@@ -199,12 +197,6 @@ impl ValidatorConfig {
             bytes.as_slice(),
             &(max_participants, ModeVersion::v0()),
         )?)
-    }
-
-    pub fn storage_directory(&self) -> Result<PathBuf, ConfigError> {
-        let base = dirs::data_local_dir().ok_or(ConfigError::MissingDataDirectory)?;
-        let pk_hex = hex::encode(self.public_key()?.encode());
-        Ok(base.join("hellas").join(&pk_hex[..16]))
     }
 
     pub fn public_key(&self) -> Result<PublicKey, ConfigError> {

@@ -5,11 +5,12 @@ use anyhow::Context as _;
 use hellas_authority::model::grant::grant_network;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTarget, GrantTransport};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 /// Opens this node's own provider store and serves `grant` from an in-process
 /// executor. The allowance must already be configured on this node.
 pub async fn prepare(
+    home: &Path,
     grant: &str,
     native: ServeArgs,
     identity: &LocalIdentity,
@@ -20,7 +21,7 @@ pub async fn prepare(
     let grant = grant
         .parse()
         .context("--local-grant must be a 16-byte hexadecimal ID")?;
-    let root = crate::commands::contributions::data_root(&principal)?;
+    let root = crate::commands::contributions::data_root(home, &principal)?;
     let store = hellas_authority::work_store::grant::NodeStore::open(
         &root.join("provider"),
         grant_network(),
@@ -38,7 +39,7 @@ pub async fn prepare(
         hellas_rpc::Assurance::ProducerSigned,
         FetchRouteRegistry::default(),
     );
-    native.configure(&mut executor)?;
+    native.configure(&mut executor, home)?;
     let content = executor.content_store.clone();
     let backend = Executor::spawn_configured(executor)
         .await
@@ -75,7 +76,7 @@ pub async fn prepare(
             principal,
             signer,
             application,
-            journal_root: crate::commands::contributions::client_journal_root(&principal)?,
+            journal_root: crate::commands::contributions::client_journal_root(home, &principal)?,
             control_timeout,
         },
         transport,

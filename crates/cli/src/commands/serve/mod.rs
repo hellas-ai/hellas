@@ -20,6 +20,7 @@ pub mod paid;
 pub use hellas_sdk::work_config::WorkConfig;
 
 pub struct ServeOptions {
+    pub home: PathBuf,
     pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
@@ -68,18 +69,18 @@ fn provider_resources(
 pub fn validate_provider_config(
     fetch: Option<&std::path::Path>,
     grant: Option<&std::path::Path>,
+    home: &std::path::Path,
 ) -> CliResult<()> {
     anyhow::ensure!(
         fetch.is_some() || grant.is_some(),
         "--check-config requires --fetch-config or --grant-config"
     );
     let routes = fetch
-        .map(load_fetch_config)
+        .map(|path| load_fetch_config(path, home))
         .transpose()?
         .unwrap_or_default();
     if let Some(path) = grant {
-        let config =
-            hellas_sdk::grant_config::GrantConfig::load(path, Some(&std::env::current_dir()?))?;
+        let config = hellas_sdk::grant_config::GrantConfig::load(path, home)?;
         validate_grant_resources(&config, &routes)?;
     }
     Ok(())
@@ -90,7 +91,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         // The config file is the single source of fetch truth: routes,
         // capabilities, cross-validated at load. No file
         // means this node serves no Fetch routes. Work authorizes every execution.
-        Some(path) => load_fetch_config(path)?,
+        Some(path) => load_fetch_config(path, &options.home)?,
         None => FetchRouteRegistry::default(),
     };
     let mut executor = ExecutorSpawnConfig::new(
@@ -101,7 +102,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     executor.queue_capacity = options.queue_size;
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;
-    options.native.configure(&mut executor)?;
+    options.native.configure(&mut executor, &options.home)?;
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every
@@ -112,7 +113,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         info!(
             network = %work.network(),
             validators = work.chain.validators().len(),
-            journal_root = %work.journal_root.display(),
+            journal_root = %work.provider_journal_root().display(),
             poll_ms = work.poll.as_millis(),
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
@@ -123,8 +124,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         let chain = options.chain_node.start(work).await?;
         work_runner = Some((
             hellas_sdk::paid_provider::WorkRunnerConfig {
-                network: work.network(),
-                journal_root: work.journal_root.clone(),
+                chain: work.chain.clone(),
                 poll: work.poll,
                 max_observation_age: work.max_observation_age,
                 settlement_key: options.settlement_key.clone(),
@@ -178,6 +178,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
             options.grants,
             options.fetch_config_file,
             options.transport,
+            &options.home,
         )
         .await
         .context("failed to start node server")?,
@@ -273,7 +274,10 @@ fn paid_fetch_contract(
     }
 }
 
-fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
+fn load_fetch_config(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> CliResult<FetchRouteRegistry> {
     let file = read_fetch_config(path)?;
 
     let mut registry = FetchRouteRegistry::new();
@@ -283,7 +287,7 @@ fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
         }
         let entry = route
             .destination
-            .into_entry(route.capabilities.into_policy()?)?;
+            .into_entry(route.capabilities.into_policy()?, home)?;
         info!(
             service = %route.service,
             method = %route.method,
@@ -328,10 +332,7 @@ enum FetchDestination {
         config: hellas_providers::HttpProviderConfig,
     },
     /// Official Codex Responses, authenticated by the local Codex OAuth store.
-    CodexResponses {
-        #[serde(default)]
-        auth_path: Option<PathBuf>,
-    },
+    CodexResponses,
 }
 
 impl FetchDestination {
@@ -339,16 +340,20 @@ impl FetchDestination {
     fn contract(&self) -> CliResult<hellas_rpc::FetchContract> {
         match self {
             Self::Http { .. } => Ok(hellas_rpc::FetchContract::http()?),
-            Self::CodexResponses { .. } => Ok(hellas_providers::codex_responses_contract()?),
+            Self::CodexResponses => Ok(hellas_providers::codex_responses_contract()?),
         }
     }
 
-    fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
+    fn into_entry(
+        self,
+        capabilities: FetchRoutePolicy,
+        home: &std::path::Path,
+    ) -> CliResult<FetchRouteEntry> {
         let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
             Self::Http { config } => return Ok(config.into_entry(capabilities)?),
-            Self::CodexResponses { auth_path } => Arc::new(
-                codex_provider::CodexResponsesFetchProvider::new(auth_path.as_deref())?,
-            ),
+            Self::CodexResponses => Arc::new(codex_provider::CodexResponsesFetchProvider::new(
+                &home.join("codex-auth.json"),
+            )?),
         };
         let adaptor_factory = Arc::new(hellas_providers::CodexResponsesAdaptorFactory::new()?);
         Ok(FetchRouteEntry::new(

@@ -102,7 +102,7 @@ For an existing fleet daemon, keep the owner key on the administration machine.
 Approve the same TOML file remotely with its owner profile:
 
 ```sh
-hellas --identity laptop.identity --passkey owner.key admin \
+hellas --home laptop-home --passkey owner.key admin \
   --profile node-admin.json --node NODE_ID --address HOST:31145 \
   set-paid-policy --terms paid.toml --expected-revision 0
 ```
@@ -124,9 +124,8 @@ These commands print submission status and resulting coin IDs; submission is
 not finalization. Check finalized coin state before relying on the funding.
 
 The first paid daemon startup synchronizes authenticated devnet state before
-serving requests. This can take several minutes. Retain its `--chain-store-dir`
-across restarts; the CLI reports the wait. A buyer's `--faucet` chooses a public
-devnet account and records that choice beside its identity. Use a dedicated
+serving requests. This can take several minutes. Retain its `--home` directory across restarts; the CLI reports the wait. Chain state is stored under `<home>/chains/<full consensus digest>/`. A buyer's `--faucet` chooses a public
+devnet account and records that choice in its selected chain directory. Use a dedicated
 identity and retain its wallet/channel state through settlement.
 
 Paid CLI jobs default to 300 admission blocks, 3000 execution/delivery blocks,
@@ -160,7 +159,6 @@ The pool selects providers and expected prices. It obtains each policy with
 {
   "providers": [
     {
-      "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "ENROLLMENT_ID@NODE_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "payment": 20
@@ -323,7 +321,7 @@ Every request checks current credential and grant rights. Non-loopback listeners
 also require `--allow-remote`; use a trusted network or a TLS reverse proxy.
 
 The NixOS options are `services.hellas.gateway.paidWorkConfig`,
-`paidWorkJournalRoots` (writable client journals), `gatewayProfile`, and
+`home` (containing client journals), `gatewayProfile`, and
 `authorityJournal` when the authority journal is outside the managed state directory.
 
 

@@ -1,7 +1,7 @@
 //! Native work execution and caller-owned attempt tracking.
 use crate::job::{Job, JobInput};
 use crate::paid_client::{PaidWorkOptions, PaidWorkResult, PaidWorkSession};
-use crate::transact::{Purchase, PurchaseTarget};
+use crate::transact::{PaidAttemptPath, Purchase, PurchaseTarget};
 use hellas_auth::{Digest, ProducerSigningKey, authority::ResourceId};
 use hellas_channel::model::grant::ChannelId;
 use hellas_channel::model::work::PrivateRecord;
@@ -169,12 +169,30 @@ pub struct ExecutionAttempt {
 }
 impl ExecutionAttempt {
     pub fn open(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
         Self::open_inner(path, input, terms, true)
     }
 
     /// Open only an existing attempt, failing closed if its record was lost.
     pub fn open_existing(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
         Self::open_inner(path, input, terms, false)
+    }
+
+    pub fn open_paid(path: &PaidAttemptPath, input: &JobInput, price: u64) -> Result<Self> {
+        Self::open_inner(path.as_path(), input, ExecutionTerms::Paid { price }, true)
+    }
+
+    pub fn open_existing_paid(
+        path: &PaidAttemptPath,
+        input: &JobInput,
+        price: u64,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_path(), input, ExecutionTerms::Paid { price }, false)
     }
 
     fn open_inner(

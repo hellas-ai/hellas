@@ -21,7 +21,7 @@ path (`--attempt FILE`) is an explicit request to execute again and consume the 
 `run`, `image` and `transcribe` accept `--offer NAME.POLICY` as the exclusive
 alternative to `--payment`; they save a zero-price job and use this same route.
 Grant channel journals share the imported offers' data directory with the
-gateway (`HELLAS_GRANT_DATA_DIR`); `--state-dir` is for paid execution.
+gateway under `<home>/grants`; paid execution lives under `<home>/chains/<full consensus digest>/`.
 Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
@@ -57,8 +57,7 @@ development keys. The default chain is the shipped devnet. Select a compiled cha
 `--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
 The profile contains `consensus_digest`, `trust`, and a nonempty `validators` URL list;
 light clients need no full genesis allocation document. `--timeout 90s` bounds the whole operation;
-without it the command waits until the job is done. `--state-dir DIR` selects
-requester state.
+without it the command waits until the job is done. `--home DIR` selects the directory for identity and requester state.
 
 The authenticated quote must admit the application's exact manifest and price.
 Those checks and the advertised input limits run before new channel funding.

@@ -82,7 +82,8 @@ pub struct FetchProviderOptions<R> {
     pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
-    pub state_directory: PathBuf,
+    /// Process home for chain-agnostic grant authority state.
+    pub home: PathBuf,
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -115,8 +116,7 @@ impl<R> FetchProviderOptions<R> {
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
-                    network: config.network(),
-                    journal_root: config.journal_root,
+                    chain: config.chain.clone(),
                     poll: config.poll,
                     max_observation_age: config.max_observation_age,
                     settlement_key,
@@ -142,7 +142,7 @@ impl<R> FetchProviderOptions<R> {
             grants: options.grants.map(|config| ProviderGrants {
                 config,
                 authority: ProviderAuthority::Journal {
-                    root: options.state_directory.join("grants"),
+                    root: options.home.join("grants"),
                 },
             }),
             work: work_config,

@@ -1,6 +1,7 @@
 //! Caller purchase/report state. This contains identifiers only, never input or output.
 use super::super::{job::Job, paid_client::PaidWorkOptions};
 use hellas_auth::Digest;
+use hellas_auth::authority::PrincipalId;
 use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
 use hellas_kernel::{EdgeId, Secp256k1Verifier};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,42 @@ use std::{
     fs::File,
     path::{Path, PathBuf},
 };
+
+/// A paid attempt location bound to one selected chain before any record opens.
+#[derive(Clone, Debug)]
+pub struct PaidAttemptPath(PathBuf);
+
+impl PaidAttemptPath {
+    pub fn new(
+        chain: &hellas_chain::genesis::ChainDir,
+        provider: hellas_client::ProviderAddress,
+        owner: PrincipalId,
+        job: Digest,
+    ) -> Self {
+        Self(
+            chain
+                .client()
+                .join("purchases")
+                .join(provider.to_string())
+                .join(hex::encode(owner.as_bytes()))
+                .join(format!("{job}.json")),
+        )
+    }
+
+    pub fn with_nonce(&self, nonce: [u8; 16]) -> Self {
+        let mut path = self.0.clone();
+        path.set_file_name(format!(
+            "{}.{}.json",
+            path.file_stem().unwrap().to_string_lossy(),
+            hex::encode(nonce)
+        ));
+        Self(path)
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PurchaseError {
@@ -109,7 +146,8 @@ impl Purchase {
                 )
             })
     }
-    pub fn open(path: &Path, job: &Job, buy_again: bool) -> Result<Self> {
+    pub fn open(path: &PaidAttemptPath, job: &Job, buy_again: bool) -> Result<Self> {
+        let path = path.as_path();
         let mut purchase = Self::open_identity(path, job.digest(), job.price(), false)?;
         purchase.buy_again = buy_again;
         if let Some(record) = &purchase.record
@@ -129,7 +167,7 @@ impl Purchase {
     }
 
     /// Open a caller-owned attempt without clearing a terminal record.
-    pub fn open_tracked(path: &Path, job: &Job) -> Result<Self> {
+    pub(crate) fn open_tracked(path: &Path, job: &Job) -> Result<Self> {
         Self::open_tracked_inner(path, job, true)
     }
 
@@ -668,10 +706,6 @@ impl Purchase {
     }
 }
 
-/// An exclusively locked, recovery-only view of a purchase marker. It never
-/// opens a channel, allocates a proposal, or needs the original payload.
-pub struct PurchaseRecovery(Purchase);
-
 /// Local purchase facts. An absent marker cannot establish whether an older
 /// application attempt existed before its metadata was retained.
 #[derive(Debug, PartialEq, Eq)]
@@ -684,32 +718,6 @@ pub enum PurchaseStatus {
     Paying { work: Digest },
     Paid { work: Digest, reported: bool },
     Rejected { work: Digest },
-}
-
-impl PurchaseRecovery {
-    pub fn open(path: &Path, job: Digest, price: u64) -> Result<Self> {
-        Purchase::open_identity(path, job, price, true).map(Self)
-    }
-
-    pub fn channel(&self) -> Option<Digest> {
-        self.0
-            .record
-            .as_ref()
-            .filter(|record| !matches!(record.phase, Phase::InputBound | Phase::TargetBound))
-            .map(|record| Digest::from_bytes(record.channel))
-    }
-
-    pub fn inspect(&self) -> Result<PurchaseStatus> {
-        self.0.status()
-    }
-
-    pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<PurchaseStatus> {
-        match self.0.reconcile(options).await {
-            Ok(()) | Err(PurchaseError::ResultLost { .. }) => (),
-            Err(error) => return Err(error),
-        }
-        self.inspect()
-    }
 }
 
 #[cfg(test)]
@@ -775,7 +783,7 @@ mod tests {
         }
         // Untracked purchases are a current mode, not old tracked records.
         let path = root.path().join("untracked");
-        let mut purchase = Purchase::open(&path, &job, false).unwrap();
+        let mut purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, false).unwrap();
         purchase
             .begin(
                 Digest::from_bytes([1; 32]),
@@ -786,9 +794,9 @@ mod tests {
             .unwrap();
         drop(purchase);
         assert_eq!(
-            PurchaseRecovery::open(&path, job.digest(), job.price())
+            Purchase::open(&PaidAttemptPath(path.clone()), &job, false)
                 .unwrap()
-                .inspect()
+                .status()
                 .unwrap(),
             PurchaseStatus::Running { work: None }
         );
@@ -835,10 +843,13 @@ mod tests {
                     purchase.unpaid(work).unwrap();
                 }
             }
-            let recovered = PurchaseRecovery::open(&path, job.digest(), job.price()).unwrap();
-            assert_eq!(recovered.channel(), Some(channel));
+            let recovered = Purchase::open_existing_tracked(&path, &job).unwrap();
             assert_eq!(
-                recovered.inspect().unwrap(),
+                recovered.bound_channel().map(|(found, _)| found),
+                Some(channel)
+            );
+            assert_eq!(
+                recovered.status().unwrap(),
                 if reported {
                     PurchaseStatus::Paid {
                         work,
@@ -922,7 +933,8 @@ mod tests {
         assert_eq!(reopened.request_nonce(channel, 1), nonce);
         let second = Purchase::open_tracked(&root.path().join("second"), &job).unwrap();
         assert_ne!(second.request_nonce(channel, 1), nonce);
-        let untracked = Purchase::open(&root.path().join("folder"), &job, false).unwrap();
+        let untracked =
+            Purchase::open(&PaidAttemptPath(root.path().join("folder")), &job, false).unwrap();
         assert_eq!(
             untracked.request_nonce(channel, 1),
             job.purchase_nonce(channel, 1)
@@ -939,9 +951,12 @@ mod tests {
         let job = job();
         let work = Digest::from_bytes([7; 32]);
         {
-            let mut purchase = Purchase::open(&path, &job, false).unwrap();
+            let mut purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, false).unwrap();
             assert!(
-                matches!(Purchase::open(&path, &job, true), Err(PurchaseError::Busy)),
+                matches!(
+                    Purchase::open(&PaidAttemptPath(path.clone()), &job, true),
+                    Err(PurchaseError::Busy)
+                ),
                 "buy-again cannot bypass the live command lock"
             );
             purchase
@@ -957,7 +972,7 @@ mod tests {
             purchase.paid(work).unwrap();
         }
         assert!(
-            matches!(Purchase::open(&path, &job, false), Err(PurchaseError::ResultLost { work: id, price: 20 }) if id == work)
+            matches!(Purchase::open(&PaidAttemptPath(path.clone()), &job, false), Err(PurchaseError::ResultLost { work: id, price: 20 }) if id == work)
         );
         let marker = std::fs::read_to_string(&path).unwrap();
         assert!(!marker.contains("private-input-sentinel"));
@@ -974,7 +989,7 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         );
-        let purchase = Purchase::open(&path, &job, true).unwrap();
+        let purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, true).unwrap();
         assert!(purchase.buys_again());
         assert!(!purchase.is_pending());
     }
@@ -985,7 +1000,7 @@ mod tests {
         let job = job();
         let channel = Digest::from_bytes([1; 32]);
         {
-            let mut purchase = Purchase::open(&path, &job, false).unwrap();
+            let mut purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, false).unwrap();
             purchase
                 .begin(
                     channel,
@@ -996,14 +1011,14 @@ mod tests {
                 .unwrap();
         }
         {
-            let mut purchase = Purchase::open(&path, &job, true).unwrap();
+            let mut purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, true).unwrap();
             assert_eq!(purchase.nonce(channel).unwrap(), Some(3));
             assert!(!purchase.buys_again());
             assert!(purchase.nonce(Digest::from_bytes([9; 32])).is_err());
             purchase.paid(Digest::from_bytes([7; 32])).unwrap();
             purchase.reported().unwrap();
         }
-        let purchase = Purchase::open(&path, &job, false).unwrap();
+        let purchase = Purchase::open(&PaidAttemptPath(path.clone()), &job, false).unwrap();
         assert!(!purchase.is_pending());
         assert_eq!(purchase.nonce(channel).unwrap(), None);
     }

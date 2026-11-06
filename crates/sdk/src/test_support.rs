@@ -4,6 +4,33 @@ pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollm
 use crate::work_config::WorkConfig;
 use hellas_auth::ProducerSigningKey;
 use hellas_chain::genesis::{ChainProfile, CustomChainFile};
+
+pub(crate) fn chain_dir(
+    home: &std::path::Path,
+    network: NetworkId,
+) -> hellas_chain::genesis::ChainDir {
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    chain_dir_with_digest(home, network, known.consensus_digest())
+}
+
+pub(crate) fn chain_dir_with_digest(
+    home: &std::path::Path,
+    network: NetworkId,
+    digest: [u8; 32],
+) -> hellas_chain::genesis::ChainDir {
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let mut trust = known.trust().clone();
+    trust.network_id = network.as_str().into();
+    let profile = ChainProfile::custom(CustomChainFile {
+        consensus_digest: hex::encode(digest),
+        trust,
+        validators: vec!["ws://unused.invalid".into()],
+        genesis_json: None,
+        genesis_payload: None,
+    })
+    .unwrap();
+    hellas_chain::genesis::ChainDir::open(home, &profile).unwrap()
+}
 use hellas_channel::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
@@ -123,7 +150,7 @@ impl PaidFixture {
         let genesis_json = serde_json::to_string(&genesis).unwrap();
         let mut trust = self.config.chain.trust().clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
-        self.config.chain = ChainProfile::custom(CustomChainFile {
+        let profile = ChainProfile::custom(CustomChainFile {
             consensus_digest: hex::encode(genesis_document.0),
             trust,
             validators: self.config.chain.validators().to_vec(),
@@ -131,10 +158,9 @@ impl PaidFixture {
             genesis_payload: Some(hex::encode(digest.0)),
         })
         .unwrap();
-        let mut config = self
-            .config
-            .node_config(self.root.path().join("chain"), None)
-            .unwrap();
+        self.config.chain =
+            hellas_chain::genesis::ChainDir::open(self.root.path(), &profile).unwrap();
+        let mut config = self.config.node_config(None).unwrap();
         config.validators.clear();
         crate::FullNode::start(config).await.unwrap()
     }
@@ -260,7 +286,7 @@ impl PaidFixture {
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         let config = WorkConfig {
-            chain: {
+            chain: hellas_chain::genesis::ChainDir::open(root.path(), &{
                 let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
                 let mut trust = known.trust().clone();
                 trust.network_id = network.as_str().into();
@@ -272,8 +298,8 @@ impl PaidFixture {
                     genesis_payload: None,
                 })
                 .unwrap()
-            },
-            journal_root: root.path().join("provider"),
+            })
+            .unwrap(),
             poll: std::time::Duration::from_millis(10),
             max_observation_age: std::time::Duration::from_secs(60),
         };

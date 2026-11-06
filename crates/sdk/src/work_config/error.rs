@@ -3,6 +3,8 @@ use std::path::PathBuf;
 /// Configuration errors retain the field or file that failed.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkConfigError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("failed to read {}: {source}", path.display())]
     Read {
         path: PathBuf,

@@ -184,14 +184,13 @@ rec {
   # typed runtime-path options that the platform modules verify stay outside
   # the store.
   protectedServeExtraArgs = [
-    "--identity"
+    "--home"
     "--log-file"
     "--assurance"
     "--port"
     "--queue-size"
     "--content"
     "--content-root"
-    "--content-index"
     "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
@@ -218,7 +217,7 @@ rec {
     "--grant-pool-config"
     "--local-grant"
     "--gateway-profile"
-    "--identity"
+    "--home"
     "--log-file"
     "--assurance"
     "--text-model"
@@ -243,7 +242,6 @@ rec {
     serve:
     serve.content != [ ]
     || serve.contentRoots != [ ]
-    || serve.contentIndex != null
     || serve.gpuBackend != null
     || serve.gpuSessionPrograms != null
     || serve.gpuSessionAssetBytes != null;
@@ -368,16 +366,11 @@ rec {
         default = hellasLib.executorPort;
         description = "Port for the Hellas node to listen on. Null lets the CLI auto-select.";
       };
-      identityPath = mkOption {
+      home = mkOption {
         type = runtimePath;
-        default = "${hellasLib.defaultStateDir}/.hellas/identity";
-        example = "/var/lib/hellas/.hellas/identity-v3";
-        description = ''
-          Versioned provider identity passed as --identity. This is the
-          provider's persistent trust anchor, so select the existing identity
-          explicitly when migrating from another filename. The file is
-          operator-managed runtime data and must remain outside the Nix store.
-        '';
+        default = "${hellasLib.defaultStateDir}/.hellas";
+        example = "/var/lib/hellas/.hellas";
+        description = "Provider home passed as --home. Identity and all Hellas state live below this operator-managed directory.";
       };
       queueSize = mkOption {
         type = types.nullOr types.ints.unsigned;
@@ -406,21 +399,6 @@ rec {
           passed as repeatable --content-root arguments. No remote fetch is
           performed. Values are strings so their contents do not enter the
           Nix store.
-        '';
-      };
-      contentIndex = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        description = ''
-          Persistent fast-resume index for locally available content. Null
-          uses the artifact-store default. Atomic publication writes a sibling
-          temporary file, so a custom NixOS path must use a dedicated parent
-          outside content and contentRoots. Pre-create that parent and grant
-          durable ownership through an id-mapped mount, or override the unit to
-          use a dedicated static user that owns it. A group-writable parent
-          alone is insufficient because index files are owner-only. Never
-          chown persistent data to a transient numeric dynamic UID. Keep the
-          path and its ancestors stable and trusted while the service runs.
         '';
       };
       gpuBackend = mkOption {
@@ -480,14 +458,12 @@ rec {
         '';
       };
       awaitOwner = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/var/lib/hellas/await-owner";
+        type = types.bool;
+        default = false;
+        example = true;
         description = ''
           Wait for one owner pairing when the grant journal is uninitialized,
-          using this directory for node state, passed as --await-owner. Null
-          disables owner pairing. The directory is operator-managed runtime
-          data and must remain outside the Nix store.
+          storing authority state under the configured home/provider directory.
         '';
       };
       passkey = mkOption {
@@ -594,11 +570,6 @@ rec {
           grantPoolConfig.
         '';
       };
-      paidWorkJournalRoots = mkOption {
-        type = types.listOf runtimePath;
-        default = [ ];
-        description = "Client journal directories named in paidWorkConfig, made writable in the service sandbox. Preserve these across restarts and provision ownership before starting the service.";
-      };
       allowRemote = mkEnableOption "non-loopback gateway listening";
       gatewayProfile = mkOption {
         type = types.nullOr runtimePath;
@@ -694,10 +665,10 @@ rec {
         default = null;
         description = "Previously approved enrollment, assurance, manifest and software policy ID.";
       };
-      identityPath = mkOption {
+      home = mkOption {
         type = runtimePath;
-        default = "/var/lib/hellas-gateway/.hellas/identity";
-        description = "Versioned provider identity used by the HTTP gateway. This is operator-managed runtime state, not a Nix-store artifact.";
+        default = "/var/lib/hellas-gateway/.hellas";
+        description = "Gateway home passed as --home. Identity, archives, counters and chain journals live below this directory.";
       };
       environmentFile = mkOption {
         type = types.nullOr runtimePath;
@@ -764,8 +735,8 @@ rec {
     in
     [
       "serve"
-      "--identity"
-      serve.identityPath
+      "--home"
+      serve.home
     ]
     ++ optArg "--port" serve.port
     ++ optArg "--queue-size" serve.queueSize
@@ -777,7 +748,6 @@ rec {
       "--content-root"
       path
     ]) serve.contentRoots
-    ++ optArg "--content-index" serve.contentIndex
     ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
@@ -785,7 +755,7 @@ rec {
     ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--grant-config" serve.grantConfigFile
-    ++ optArg "--await-owner" serve.awaitOwner
+    ++ lib.optional serve.awaitOwner "--await-owner"
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"
@@ -818,8 +788,8 @@ rec {
         ];
     in
     [
-      "--identity"
-      gateway.identityPath
+      "--home"
+      gateway.home
       "gateway"
       "--assurance"
       gateway.assurance

@@ -6,6 +6,52 @@ use hellas_rpc::pb::work::{
 use hellas_rpc::services::work_setup::{Open, RequestOffer, WorkSetup};
 use hellas_wire::{ServiceMarker as _, StreamTransport as _, iroh::IrohTransport};
 
+#[tokio::test]
+async fn gateway_refuses_funding_owner_from_another_genesis() {
+    let fixture = crate::test_support::PaidFixture::new();
+    let owner = Arc::new(
+        crate::client_owner::ClientOwner::new(
+            Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
+            crate::test_support::signer(7).party_key(),
+            &fixture.config.chain,
+        )
+        .unwrap(),
+    );
+    let original_network = fixture.config.chain.network_id().to_owned();
+    let mut config = fixture.config;
+    config.chain =
+        crate::test_support::chain_dir_with_digest(fixture.root.path(), config.network(), [2; 32]);
+    assert_eq!(original_network, config.chain.network_id());
+    assert_ne!(owner.chain_root(), config.chain.as_path());
+    let provider = crate::test_support::address(iroh::SecretKey::generate().public());
+    let options = crate::paid_gateway::PaidGatewayOptions {
+        config,
+        max_pending_requests: 1,
+        providers: vec![crate::paid_gateway::GatewayProviderOptions {
+            provider,
+            provider_addrs: vec![],
+            apple_trust: None,
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            expected_price: 1,
+            acceptance_blocks: 1,
+            terminal_blocks: 1,
+            payment_blocks: 1,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        }],
+    };
+    let identity =
+        crate::NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
+            .unwrap();
+    let error = crate::paid_gateway::PaidGateway::open(options, identity, owner)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(
+        error,
+        crate::paid_gateway::PoolError::Invalid("funding owner belongs to another chain directory")
+    ));
+}
+
 struct QuoteServer {
     endpoint: Endpoint,
     serving: tokio::task::JoinHandle<()>,
@@ -127,7 +173,7 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 crate::client_owner::ClientOwner::new(
                     approvals.clone(),
                     pool.settlement_key.party_key(),
-                    &fixture.root.path().join("counted-funding"),
+                    &fixture.config.chain,
                 )
                 .unwrap(),
             );
@@ -142,15 +188,20 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             trust.epochs[0].threshold_identity =
                 hex::encode(&devnet.consensus_info().threshold_identity);
             let config = crate::work_config::WorkConfig {
-                chain: ChainProfile::custom(CustomChainFile {
-                    consensus_digest: hex::encode(hellas_chain::genesis_digest(devnet.genesis()).0),
-                    trust,
-                    validators: devnet.light_client_urls(),
-                    genesis_json: Some(genesis_json),
-                    genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
-                })
+                chain: hellas_chain::genesis::ChainDir::open(
+                    fixture.root.path(),
+                    &ChainProfile::custom(CustomChainFile {
+                        consensus_digest: hex::encode(
+                            hellas_chain::genesis_digest(devnet.genesis()).0,
+                        ),
+                        trust,
+                        validators: devnet.light_client_urls(),
+                        genesis_json: Some(genesis_json),
+                        genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
+                    })
+                    .unwrap(),
+                )
                 .unwrap(),
-                journal_root: fixture.root.path().join("provider"),
                 poll: Duration::from_millis(20),
                 max_observation_age: Duration::from_secs(30),
             };
@@ -170,11 +221,12 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             .unwrap();
             drop(stalled);
             let original = pool.providers.remove(0);
-            for (index, endpoint) in [&first.endpoint, &second.endpoint].into_iter().enumerate() {
+            for endpoint in [&first.endpoint, &second.endpoint] {
                 let mut args = original.args.clone();
                 args.config = config.clone();
-                args.journal_root = fixture.root.path().join(format!("client-{index}"));
                 args.provider = crate::test_identity::address(endpoint.id());
+                args.journal_root =
+                    crate::paid_client::PaidJournalDir::gateway(&config.chain, args.provider);
                 args.provider_addrs = endpoint.bound_sockets();
                 args.timeout = Some(Duration::from_secs(60));
                 pool.providers.push(Arc::new(Provider {

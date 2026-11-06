@@ -14,7 +14,7 @@ fn a_single_authenticated_route_is_usable() {
     let config = config.validate().unwrap();
     assert_eq!(config.chain.validators(), ["wss://example.com/"]);
     assert_eq!(config.network().as_str(), "hellas-devnet-1");
-    assert!(config.node_config(root.path().join("node"), None).is_ok());
+    assert!(config.node_config(None).is_ok());
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn custom_light_profile_needs_no_execution_genesis_or_payload() {
     assert!(!profile.has_execution());
     let config = WorkConfig::for_chain(profile, root.path()).unwrap();
     assert_eq!(config.network().as_str(), "custom-light-1");
-    assert!(config.node_config(root.path().join("node"), None).is_err());
+    assert!(config.node_config(None).is_err());
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn custom_full_genesis_can_derive_h0_at_node_start() {
     .unwrap();
     let node = WorkConfig::for_chain(profile, root.path())
         .unwrap()
-        .node_config(root.path().join("node"), None)
+        .node_config(None)
         .unwrap();
     assert!(node.genesis_payload().is_none());
 }

@@ -173,6 +173,11 @@ impl PaidGateway {
         funding: crate::paid_client::SessionFundingOptions,
     ) -> Result<Arc<Self>> {
         options.validate()?;
+        if owner.chain_root() != options.config.chain.as_path() {
+            return Err(PoolError::Invalid(
+                "funding owner belongs to another chain directory",
+            ));
+        }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
         let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
@@ -679,7 +684,6 @@ mod tests {
             config: fixture.config.clone(),
             max_pending_requests: 4,
             providers: vec![GatewayProviderOptions {
-                journal_root: fixture.root.path().join("client"),
                 provider: crate::test_support::address(
                     iroh::SecretKey::from_bytes(&[3; 32]).public(),
                 ),
@@ -708,8 +712,7 @@ mod tests {
         assert!(matches!(zero.validate(), Err(PoolError::Invalid(_))));
 
         let mut duplicate = pool_options(&fixture);
-        let mut second = duplicate.providers[0].clone();
-        second.journal_root = fixture.root.path().join("second");
+        let second = duplicate.providers[0].clone();
         duplicate.providers.push(second);
         assert!(matches!(
             duplicate.validate(),
@@ -718,7 +721,6 @@ mod tests {
 
         let mut shared = pool_options(&fixture);
         let mut other = shared.providers[0].clone();
-        other.journal_root = fixture.root.path().join("other");
         other.provider =
             crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
         shared.providers.push(other);
@@ -740,7 +742,7 @@ mod tests {
                     Secp256k1Signer::from_secret_scalar([7; 32])
                         .unwrap()
                         .party_key(),
-                    &fixture.root.path().join("funding"),
+                    &fixture.config.chain,
                 )
                 .unwrap(),
             ),
@@ -919,7 +921,7 @@ mod tests {
                 Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
                     .unwrap()
                     .party_key(),
-                &fixture.root.path().join("funding"),
+                &fixture.config.chain,
             )
             .unwrap(),
         );

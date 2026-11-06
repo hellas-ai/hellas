@@ -153,6 +153,7 @@ pub enum Command {
     Run {
         config: PathBuf,
         profile: hellas_genesis::ChainProfile,
+        home: PathBuf,
     },
     CheckConfig {
         config: PathBuf,
@@ -221,7 +222,11 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             genesis,
             genesis_allocations,
         }),
-        Command::Run { config, profile } => run(config, profile),
+        Command::Run {
+            config,
+            profile,
+            home,
+        } => run(config, profile, home),
         Command::CheckConfig { config } => check_config(config),
     }
 }
@@ -820,7 +825,11 @@ fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     Ok(())
 }
 
-fn run(config_path: PathBuf, profile: hellas_genesis::ChainProfile) -> Result<(), ValidatorError> {
+fn run(
+    config_path: PathBuf,
+    profile: hellas_genesis::ChainProfile,
+    home: PathBuf,
+) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
 
@@ -909,7 +918,7 @@ fn run(config_path: PathBuf, profile: hellas_genesis::ChainProfile) -> Result<()
     };
 
     // Configure tokio runtime
-    let storage_dir = validator_config.storage_directory()?;
+    let storage_dir = hellas_genesis::ChainDir::open(&home, &profile)?.validator();
     let _directory_lock = crate::execution::pipeline::lock(&storage_dir)?;
     let storage_dir_utf8 = storage_dir
         .to_str()
@@ -1006,13 +1015,6 @@ fn run(config_path: PathBuf, profile: hellas_genesis::ChainProfile) -> Result<()
         let mempool = application.mempool();
         let owner_index = application.owner_index();
         let genesis_block = application.genesis_block();
-        crate::execution::pipeline::pin(
-            &storage_dir,
-            &validator_config.genesis,
-            &consensus_info.threshold_identity,
-            genesis_block.digest(),
-        )
-        .expect("provisioned chain identity");
         let stateful_startup_context = context.child("stateful_startup");
         let mut plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
             &stateful_startup_context,

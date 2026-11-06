@@ -63,14 +63,13 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
         .unwrap(),
     )
     .unwrap();
-    let identity = home.path().join("identity");
+    let identity = home.path().join("app").join("identity");
     let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join("data"))
+        .arg("--home")
+        .arg(home.path().join("app"))
         .arg("--chain-config")
         .arg(&path)
-        .arg("--identity")
-        .arg(&identity)
         .arg("--faucet")
         .args(["contact", "export", "--display-name", "Public devnet user"])
         .output()
@@ -78,7 +77,7 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("require the compiled devnet chain"));
     assert!(!identity.exists());
-    assert!(!home.path().join("data").exists());
+    assert!(!home.path().join("app").exists());
 }
 
 #[test]

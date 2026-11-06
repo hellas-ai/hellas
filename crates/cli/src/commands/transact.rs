@@ -10,7 +10,7 @@ use hellas_sdk::{
     },
     job::{Job, JobInput},
     paid_client::{PaidWorkOptions, bind_paid_endpoint, request_paid_quote, settle_channel},
-    transact::PurchaseRecovery,
+    transact::PaidAttemptPath,
 };
 use std::{
     io::Write as _,
@@ -90,9 +90,6 @@ pub struct ClientArgs {
     /// Additional direct UDP addresses for the provider.
     #[arg(long = "address", value_delimiter = ',')]
     addresses: Vec<SocketAddr>,
-    /// Caller-owned wallet and channel journals (default: beside the identity).
-    #[arg(long, value_name = "DIR")]
-    state_dir: Option<PathBuf>,
     /// Wall-clock deadline for quote, funding, execution and payment.
     /// Without it, wait until the job is done.
     #[arg(long, value_parser = duration)]
@@ -178,15 +175,15 @@ pub struct Context {
     pub settlement: Secp256k1Signer,
     pub producer: ProducerSigningKey,
     pub owner: hellas_kernel::SoftPasskey,
-    pub root: PathBuf,
-    pub chain: hellas_chain::genesis::ChainProfile,
+    pub home: PathBuf,
+    pub chain: hellas_chain::genesis::ChainDir,
 }
 
 impl Context {
     pub(crate) fn new(
         identity: &crate::identity::LocalIdentity,
         owner: Option<&hellas_kernel::SoftPasskey>,
-        path: Option<&Path>,
+        home: &Path,
         chain: &hellas_chain::genesis::ChainProfile,
     ) -> super::CliResult<Self> {
         Ok(Self {
@@ -196,8 +193,8 @@ impl Context {
             owner: owner
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
-            root: crate::identity::funding_root(path)?,
-            chain: chain.clone(),
+            home: home.to_path_buf(),
+            chain: hellas_chain::genesis::ChainDir::open(home, chain)?,
         })
     }
 }
@@ -210,9 +207,7 @@ impl ClientArgs {
     }
 
     fn root(&self, context: &Context) -> PathBuf {
-        self.state_dir
-            .clone()
-            .unwrap_or_else(|| context.root.join("client"))
+        context.chain.client()
     }
     fn owner(
         &self,
@@ -221,38 +216,23 @@ impl ClientArgs {
         Ok(Arc::new(hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(context.owner.clone()),
             context.settlement.party_key(),
-            &self.root(context),
+            &context.chain,
         )?))
     }
-    async fn purchase(
+    fn purchase(
         &self,
         context: &Context,
         job: &Job,
         options: &PaidWorkOptions,
     ) -> super::CliResult<ExecutionAttempt> {
         let owner = self.owner(context)?;
-        let path = self
-            .root(context)
-            .join("purchases")
-            .join(
-                hellas_auth::hash_tuple(
-                    "hellas.job.chain.v1",
-                    &[
-                        options.config.network().as_str().as_bytes(),
-                        options.config.chain.consensus_digest().as_slice(),
-                    ],
-                )
-                .to_string(),
-            )
-            .join(options.provider.to_string())
-            .join(hex::encode(owner.principal().as_bytes()))
-            .join(format!("{}.json", job.digest()));
-        if let Some(attempt) = select_attempt(&path, job, self.buy_again)? {
-            return Ok(attempt);
-        }
-        let mut legacy = PurchaseRecovery::open(&path, job.digest(), job.price())?;
-        let status = legacy.reconcile(options).await?;
-        bail!("existing purchase is {status:?}; use --buy-again to create a new attempt");
+        let path = PaidAttemptPath::new(
+            &context.chain,
+            options.provider,
+            owner.principal(),
+            job.digest(),
+        );
+        select_attempt(&path, job, self.buy_again)
     }
 
     /// One directory of channel journals per provider address.
@@ -269,8 +249,7 @@ impl ClientArgs {
         assurance: Assurance,
     ) -> super::CliResult<PaidWorkOptions> {
         self.paid_provider()?;
-        let root = self.root(context);
-        let config = client::config(self, context, &root).await?;
+        let config = client::config(self, context).await?;
         self.options_with_config(context, price, assurance, config)
     }
 
@@ -282,20 +261,22 @@ impl ClientArgs {
         config: hellas_sdk::work_config::WorkConfig,
     ) -> super::CliResult<PaidWorkOptions> {
         let provider = self.paid_provider()?;
-        let root = self.root(context);
         let apple_trust = match (&self.trust_store, &self.trust_policy, assurance) {
             (Some(directory), Some(id), _) => Some(
                 hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
                     id,
                     assurance,
-                    crate::identity::assertion_counters()?,
+                    crate::identity::assertion_counters(&context.home)?,
                 )?,
             ),
             (None, None, Assurance::ProducerSigned) => None,
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: self.journals(&root)?,
+            journal_root: hellas_sdk::paid_client::PaidJournalDir::client(
+                &config.chain,
+                provider.address,
+            ),
             config,
             provider: provider.address,
             provider_addrs: provider
@@ -316,13 +297,16 @@ impl ClientArgs {
 }
 
 fn select_attempt(
-    path: &Path,
+    path: &PaidAttemptPath,
     job: &Job,
     buy_again: bool,
-) -> super::CliResult<Option<ExecutionAttempt>> {
-    let parent = path.parent().context("purchase directory is missing")?;
+) -> super::CliResult<ExecutionAttempt> {
+    let parent = path
+        .as_path()
+        .parent()
+        .context("purchase directory is missing")?;
     hellas_private::create_dir_all_durable(parent)?;
-    let pointer = path.with_extension("latest");
+    let pointer = path.as_path().with_extension("latest");
     struct AttemptPointerLock(std::fs::File);
     impl Drop for AttemptPointerLock {
         fn drop(&mut self) {
@@ -338,7 +322,6 @@ fn select_attempt(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let terms = ExecutionTerms::Paid { price: job.price() };
     if !buy_again && let Some(id) = existing {
         let id = std::str::from_utf8(&id)?;
         ensure!(
@@ -348,15 +331,15 @@ fn select_attempt(
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "invalid purchase attempt pointer"
         );
-        let attempt_path = parent.join(format!("{}.{}.json", job.digest(), id));
-        return Ok(Some(ExecutionAttempt::open_existing(
+        let nonce: [u8; 16] = hex::decode(id)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid purchase attempt pointer"))?;
+        let attempt_path = path.with_nonce(nonce);
+        return Ok(ExecutionAttempt::open_existing_paid(
             &attempt_path,
             job.input(),
-            terms,
-        )?));
-    }
-    if !buy_again && path.try_exists()? {
-        return Ok(None);
+            job.price(),
+        )?);
     }
     if !buy_again {
         let prefix = format!("{}.", job.digest());
@@ -375,15 +358,16 @@ fn select_attempt(
             }
         }
     }
-    let id = hex::encode(rand::random::<[u8; 16]>());
-    let attempt_path = parent.join(format!("{}.{}.json", job.digest(), id));
+    let nonce = rand::random::<[u8; 16]>();
+    let id = hex::encode(nonce);
+    let attempt_path = path.with_nonce(nonce);
     ensure!(
-        !attempt_path.try_exists()?,
+        !attempt_path.as_path().try_exists()?,
         "purchase attempt identity already exists"
     );
-    let attempt = ExecutionAttempt::open(&attempt_path, job.input(), terms)?;
+    let attempt = ExecutionAttempt::open_paid(&attempt_path, job.input(), job.price())?;
     hellas_private::write_atomically(&pointer, ".writing", id.as_bytes())?;
-    Ok(Some(attempt))
+    Ok(attempt)
 }
 
 /// Bound `work` by `--timeout`; without one, wait until it is done.
@@ -468,7 +452,7 @@ async fn purchase_and_execute(
         "paid execution requires a positive job payment; select --offer for grant work"
     );
     let options = args.options(context, job.price(), job.assurance()).await?;
-    let mut purchase = args.purchase(context, job, &options).await?;
+    let mut purchase = args.purchase(context, job, &options)?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
     let result = execute(
         args,
@@ -618,7 +602,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 });
                 job.save(&directory)?;
                 eprintln!("job: {}", directory.display());
-                let mut purchase = args.client.purchase(&context, &job, &options).await?;
+                let mut purchase = args.client.purchase(&context, &job, &options)?;
                 let result = execute(
                     &args.client,
                     &context,

@@ -417,8 +417,7 @@ impl Provider {
         let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                network: config.network(),
-                journal_root: config.journal_root,
+                chain: config.chain.clone(),
                 poll: config.poll,
                 max_observation_age: config.max_observation_age,
                 settlement_key: provider_settlement(),
@@ -708,7 +707,7 @@ async fn compute_and_settle_inner(
         hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(FRIEND.passkey()),
             key.party_key(),
-            &root.join("client-funding"),
+            &options.config.chain,
         )
         .unwrap(),
     );
@@ -987,7 +986,7 @@ async fn compute_and_settle_inner(
         (41 + k).to_le_bytes()
     );
     assert!(compute.have(source), "A retained B's uploaded source");
-    assert_eq!(staged(&options.config.journal_root), 0);
+    assert_eq!(staged(&options.journal_root), 0);
     assert_eq!((compute.calls(), compute.loads()), (1, 1));
     assert!(
         !session
@@ -1013,7 +1012,7 @@ async fn compute_and_settle_inner(
             .is_err()
     );
     assert!(!compute.have(source));
-    assert_eq!(staged(&options.config.journal_root), 0);
+    assert_eq!(staged(&options.journal_root), 0);
     assert_eq!(compute.calls(), 1);
     assert_eq!(credited(&session).await, JOB_PRICE);
 
@@ -1356,7 +1355,6 @@ struct Case {
     first: Box<SignedPaidOffer>,
     second: Box<SignedPaidOffer>,
     third: Box<SignedPaidOffer>,
-    interrupted_root: std::path::PathBuf,
 }
 
 async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
@@ -1613,7 +1611,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         OfferRefusalCode::NoPolicy,
     );
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let mut policy = paid_policy();
     policy.invocation_policy = InvocationPolicy {
         admissions: vec![Admission::Compute {
@@ -1656,7 +1654,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             "signed {field}"
         );
     }
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     refused(
         request(
             &endpoint,
@@ -1723,7 +1721,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             OfferRefusalCode::NeedsFunding,
         );
     }
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let quote = request(
         &endpoint,
         &provider,
@@ -1739,8 +1737,12 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         panic!("quote")
     };
     assert_eq!(quote.funding_value, FUNDING);
-    assert_eq!(files(&config.journal_root), 0);
-    std::fs::write(&config.journal_root, b"blocked journal root").unwrap();
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
+    std::fs::write(
+        &config.chain.provider().join("channels"),
+        b"blocked journal root",
+    )
+    .unwrap();
     assert!(
         request(
             &endpoint,
@@ -1754,7 +1756,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .await
         .is_err()
     );
-    std::fs::remove_file(&config.journal_root).unwrap();
+    std::fs::remove_file(&config.chain.provider().join("channels")).unwrap();
     assert!(
         request(
             &endpoint,
@@ -1799,7 +1801,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         )
         .unwrap()
     );
-    let before = files(&config.journal_root);
+    let before = files(&config.chain.provider().join("channels"));
     assert!(
         request(
             &endpoint,
@@ -1846,7 +1848,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         first.encode().unwrap()
     );
-    assert_eq!(files(&config.journal_root), before);
+    assert_eq!(files(&config.chain.provider().join("channels")), before);
     let other_peer = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
@@ -1962,7 +1964,13 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     // Simulate a client interrupted after accepting revision one. Its funding
     // stays live; recovery after the horizon must ask for a fresh offer.
-    let interrupted_root = root.path().join("interrupted-client");
+    let interrupted_chain = devnet.chain_dir(&root.path().join("interrupted-home"), 0);
+    let interrupted_root = hellas_sdk::paid_client::PaidJournalDir::client(
+        &interrupted_chain,
+        hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
+    )
+    .as_ref()
+    .to_path_buf();
     let mut interrupted = SetupStore::open(
         &interrupted_root,
         devnet.network(),
@@ -2079,7 +2087,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first,
         second,
         third,
-        interrupted_root,
     })
 }
 
@@ -2340,11 +2347,13 @@ async fn finish(case: Box<Case>) {
         first,
         second,
         third,
-        interrupted_root,
     } = *case;
     let options = PaidWorkOptions {
         config: config.clone(),
-        journal_root: root.path().join("client"),
+        journal_root: hellas_sdk::paid_client::PaidJournalDir::client(
+            &config.chain,
+            hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
+        ),
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,
@@ -2436,7 +2445,7 @@ async fn finish(case: Box<Case>) {
     drop(transport);
     provider.shutdown().await;
     let store = SetupStore::open(
-        &config.journal_root,
+        &config.chain.provider().join("channels"),
         devnet.network(),
         third.offer().proposal.bond_edge(),
         Role::Provider,
@@ -2476,13 +2485,17 @@ async fn finish(case: Box<Case>) {
     policy.offers.max_stake_per_client = 12;
     provider.policy(&secret, 4, policy).await;
     let mut fresh_args = options;
-    fresh_args.journal_root = interrupted_root;
+    fresh_args.config.chain = devnet.chain_dir(&root.path().join("interrupted-home"), 0);
+    fresh_args.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
+        &fresh_args.config.chain,
+        fresh_args.provider,
+    );
     fresh_args.provider_addrs = provider.endpoint.bound_sockets();
     let agent_owner = Arc::new(
         hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(AGENT.passkey()),
             keys[3].party_key(),
-            &root.path().join("agent-funding"),
+            &fresh_args.config.chain,
         )
         .unwrap(),
     );

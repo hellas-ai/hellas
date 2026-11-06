@@ -89,13 +89,12 @@ that exceeds the execution limit is killed with its worker and is not paid.
 Compilation has no time limit. Sources and weights a job names by content ID
 must be available to A: index local files with `serve --content FILE` or
 `--content-root DIR`, or adopt a HuggingFace cache with `hellas store adopt`.
-Both commands default to the same store (`HELLAS_STORE_DIR` or
-`~/.hellas/store`).
+Both commands default to the same store (`<home>/store`, with `--home` or `HELLAS_HOME` selecting home).
 
 To prepare specific files outside daemon startup, run
-`hellas store index --records /private/content.fastresume /assets/weights.bin`
+`hellas --home /var/lib/hellas/.hellas store index --records /var/lib/hellas/.hellas/store/fastresume.bin /assets/weights.bin`
 as the provider's service user, then start it with `--content /assets/weights.bin`,
-`--content-index /private/content.fastresume` and `--require-content-index`.
+`--require-content-index` with the index under `<home>/store/fastresume.bin`.
 This refuses missing or stale index records instead of hashing at startup.
 Without the required-index flag, changed file identities trigger verification
 again. Use `store index --recheck` to force verification. Keep weights on persistent local
@@ -141,9 +140,9 @@ docker run -d --name hellas-gpu --network host --device nvidia.com/gpu=all \
   --user "$(id -u):$(id -g)" \
   -v "$PWD/worker:/state" -v "$PWD/whisper-tiny:/models/whisper-tiny:ro" \
   "ghcr.io/hellas-ai/hellas:sha-${REVISION}-cuda" \
-  --identity /state/worker.identity --software-root \
-  --await-owner /state/node --audio-model /models/whisper-tiny \
-  --store-dir /state/store --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
+  --home /state --software-root \
+  --await-owner --audio-model /models/whisper-tiny \
+  --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
 ```
 
 For Strix Halo, use the matching `-hip` image, replace the NVIDIA device option
@@ -187,14 +186,14 @@ For a second principal, the recipient creates their own key/device and exports
 only their contact and holder. To exercise this locally with separate credentials:
 
 ```sh
-hellas --identity guest.identity --software-root identity init --passkey-out guest.passkey
+hellas --home guest-home --software-root identity init --passkey-out guest.passkey
 hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
-hellas --identity guest.identity identity show-holder > guest.holder
+hellas --home guest-home identity show-holder > guest.holder
 hellas --passkey owner.passkey admin --profile operator/profile.json share \
   --contact guest.contact --holder guest.holder --resource whisper-tiny \
   --limit requests:total:1 --max-job 15m --expires 1h --out guest.access
-hellas --identity guest.identity --passkey guest.passkey offer import-bundle guest.access --name box
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey offer import-bundle guest.access --name box
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-result
 ```
 
@@ -205,7 +204,7 @@ its existing counters. See [renewal](docs/admin.md) before replacing a credentia
 A different request must now fail the guest's one-request quota:
 
 ```sh
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --max-tokens 255
 ```
 
@@ -214,7 +213,7 @@ result and consumes no additional request:
 
 ```sh
 docker stop hellas-gpu
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-replay
 cmp guest-result/transcript.cbor guest-replay/transcript.cbor
 ```

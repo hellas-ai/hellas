@@ -77,7 +77,7 @@ impl Harness {
                                 root: Arc::new(
                                     hellas_channel::test_support::actors::PROVIDER.node_key(),
                                 ),
-                                state_directory: forbidden_journal,
+                                home: forbidden_journal,
                                 grants: Some(crate::GrantProviderOptions {
                                     configuration: Default::default(),
                                     max_job_millis: std::num::NonZeroU64::MIN,

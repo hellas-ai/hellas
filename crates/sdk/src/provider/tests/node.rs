@@ -476,9 +476,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let setup_mount = MountedSetup::default();
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: dir.path().to_path_buf(),
+            chain: crate::test_support::chain_dir(dir.path(), network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -605,9 +603,7 @@ async fn discover_two_route_runner(
 ) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -2293,9 +2289,7 @@ impl TxSink for NodeChain {
 async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -2776,9 +2770,7 @@ impl RunningPaidNode {
         });
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
-                network: network(),
-
-                journal_root: root.to_path_buf(),
+                chain: crate::test_support::chain_dir(root, network()),
 
                 poll: Duration::from_millis(1),
                 max_observation_age: TEST_TIMEOUT,
