@@ -36,6 +36,7 @@ impl Stored {
     }
 }
 struct Work {
+    root_recovery: bool,
     input_reserved: u64,
     output_remaining: u64,
     output_allowance: u64,
@@ -108,6 +109,9 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         if let Some((id, work)) = state.work.iter().find(|(_, work)| work.job == job) {
+            if work.root_recovery {
+                return Err(Error::Denied);
+            }
             return Ok(Scope::work(job, work.closure.clone(), *id));
         }
         let closure = canonical_closure(closure)?;
@@ -138,6 +142,7 @@ impl Core {
         state.work.insert(
             reservation,
             Work {
+                root_recovery: false,
                 input_reserved: missing,
                 output_remaining: 0,
                 output_allowance: 0,
@@ -1279,9 +1284,7 @@ impl Core {
 
 impl Core {
     pub(crate) fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
-        if self.disk.as_ref().is_none_or(|disk| disk.ready()) {
-            return Err(Error::Denied);
-        }
+        let recovering = !self.disk.as_ref().ok_or(Error::Denied)?.ready();
         let remaining = total.checked_sub(consumed).ok_or(Error::Capacity)?;
         let mut state = self
             .state
@@ -1293,9 +1296,17 @@ impl Core {
         };
         let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
         if work.output_allowance != 0 {
-            return Err(Error::Conflict);
+            return if work.output_allowance == total {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
         }
-        work.charge.restore(remaining)?;
+        if recovering {
+            work.charge.restore(remaining)?;
+        } else {
+            work.charge.extend(remaining)?;
+        }
         work.output_allowance = total;
         work.output_remaining = remaining;
         Ok(())
@@ -1461,6 +1472,87 @@ impl Core {
             .clone();
         state.publish(staged, target, pin)?;
         Ok(())
+    }
+    pub(crate) fn restore_root(
+        &self,
+        job: JobId,
+        target: Target,
+        mut pin: PinTarget,
+        previous: Option<PinName>,
+    ) -> Result<Option<Scope>> {
+        let existing = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            state
+                .work
+                .iter()
+                .find(|(_, work)| work.job == job)
+                .map(|(id, work)| {
+                    (
+                        Scope::work(job, work.closure.clone(), *id),
+                        work.root_recovery,
+                    )
+                })
+        };
+        let (scope, temporary) = match existing {
+            Some(existing) => existing,
+            None => {
+                let scope = self.open_work(job, vec![], 0)?;
+                let ScopeKind::Work { reservation, .. } = scope.kind else {
+                    return Err(Error::Denied);
+                };
+                self.state
+                    .lock()
+                    .map_err(|_| Error::Invalid("store lock"))?
+                    .work
+                    .get_mut(&reservation)
+                    .ok_or(Error::Denied)?
+                    .root_recovery = true;
+                (scope, true)
+            }
+        };
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            if let Some(value) = state
+                .pins
+                .get(&pin.name)
+                .or_else(|| previous.as_ref().and_then(|name| state.pins.get(name)))
+            {
+                pin.policy = value.policy.clone();
+            }
+        }
+        let name = pin.name.clone();
+        self.promote_work(&scope, target, pin)?;
+        if let Some(previous) = previous.filter(|previous| *previous != name) {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            if state.pins.contains_key(&previous) {
+                state.change_pin(previous, None)?;
+            }
+        }
+        if temporary {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            let closure = state.walk([target])?.into_iter().collect();
+            let ScopeKind::Work { reservation, .. } = scope.kind else {
+                return Err(Error::Denied);
+            };
+            state
+                .work
+                .get_mut(&reservation)
+                .ok_or(Error::Denied)?
+                .closure = closure;
+        }
+        Ok(temporary.then_some(scope))
     }
     pub(crate) fn live_jobs(&self) -> Result<BTreeSet<JobId>> {
         Ok(self

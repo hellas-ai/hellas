@@ -693,12 +693,14 @@ impl DiskStore {
             .effect(&Scope::Owner, move |core| core.end_work(&scope))
             .await
     }
-    /// Restore journal-derived output accounting before the host opens recovery.
+    /// Restore journal-derived output accounting. Before recovery completes this
+    /// restores the obligation; on a running node it uses ordinary admission.
     /// `consumed` counts authoritative generated metadata already owned on disk.
+    /// An existing allowance is preserved, including any bytes spent since then.
     pub async fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
         let scope = scope.clone();
         self.core
-            .access(&scope.clone(), move |core| {
+            .admit(&scope.clone(), move |core| {
                 core.restore_output(&scope, total, consumed)
             })
             .await
@@ -865,6 +867,32 @@ impl FileObject {
     }
 }
 impl DiskStore {
+    /// Reconcile a journal root and optional previous pin name under one effect.
+    /// Recovery scopes protect files through persistence and cannot be adopted
+    /// by ordinary open_work callers, including after a failed pin commit.
+    pub async fn restore_root(
+        &self,
+        job: JobId,
+        target: Target,
+        pin: PinTarget,
+        previous: Option<PinName>,
+    ) -> Result<()> {
+        let core = self.core.clone();
+        tokio::spawn(async move {
+            let temporary = core
+                .effect(&Scope::Owner, move |core| {
+                    core.restore_root(job, target, pin, previous)
+                })
+                .await?;
+            if let Some(scope) = temporary {
+                core.effect(&Scope::Owner, move |core| core.end_work(&scope))
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Invalid("root recovery task"))?
+    }
     pub async fn promote_work(&self, scope: &Scope, target: Target, pin: PinTarget) -> Result<()> {
         let scope = scope.clone();
         self.core

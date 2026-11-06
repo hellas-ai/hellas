@@ -310,7 +310,14 @@ impl ChannelStore {
         }
         let mut desired = BTreeMap::new();
         for (work, root) in self.state().retained_roots() {
-            let pin = channel_pin(channel, *work, self.proposal_pin(*work))?;
+            let mut pin = channel_pin(channel, *work, self.proposal_pin(*work))?;
+            let previous = channel_pin(channel, *work, !self.proposal_pin(*work))?;
+            if let Some(value) = existing
+                .get(&pin.name)
+                .or_else(|| existing.get(&previous.name))
+            {
+                pin.policy = value.policy.clone();
+            }
             let expected = PinValue {
                 target: Target::Tree(*root),
                 policy: pin.policy.clone(),
@@ -320,26 +327,25 @@ impl ChannelStore {
             if existing.get(&pin.name) == Some(&expected) {
                 continue;
             }
-            if let Some((LocalStore::Disk(_), scope)) = self.contents.get(work) {
-                self.content
-                    .promote_work(scope, Target::Tree(*root), pin)
-                    .await?;
-            } else {
-                let scope = self
-                    .content
-                    .open_work(JobId { channel, id: *work }, vec![], 0)
-                    .await?;
-                self.content
-                    .promote_work(&scope, Target::Tree(*root), pin)
-                    .await?;
-                self.content.end_work(&scope).await?;
-            }
+            self.content
+                .restore_root(
+                    JobId { channel, id: *work },
+                    Target::Tree(*root),
+                    pin,
+                    Some(previous.name),
+                )
+                .await?;
         }
         for (name, value) in existing {
             if !desired.contains_key(&name) {
-                self.content
+                match self
+                    .content
                     .set_pin(&Scope::Owner, &name, Some(&value), None)
-                    .await?;
+                    .await
+                {
+                    Ok(()) | Err(Error::Conflict) => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         let ended = self
@@ -371,25 +377,17 @@ impl ChannelStore {
     pub(super) async fn restore_content(&mut self) -> Result<(), WorkStoreError> {
         self.reconcile_content().await?;
         for (work, root) in self.state().retained_roots() {
-            let scope = self
-                .content
-                .open_work(
-                    JobId {
-                        channel: self.state().channel().id(),
-                        id: *work,
-                    },
-                    vec![],
-                    0,
-                )
-                .await?;
+            let channel = self.state().channel().id();
+            let pin = channel_pin(channel, *work, self.proposal_pin(*work))?;
+            let previous = channel_pin(channel, *work, !self.proposal_pin(*work))?;
             self.content
-                .promote_work(
-                    &scope,
+                .restore_root(
+                    JobId { channel, id: *work },
                     Target::Tree(*root),
-                    channel_pin(self.state().channel().id(), *work, self.proposal_pin(*work))?,
+                    pin,
+                    Some(previous.name),
                 )
                 .await?;
-            self.content.end_work(&scope).await?;
         }
         let jobs = self
             .state()

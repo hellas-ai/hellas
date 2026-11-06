@@ -508,3 +508,180 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
         b"private bytes"
     );
 }
+
+fn recovery_job() -> JobId {
+    JobId {
+        channel: hellas_auth::Digest::from_bytes([11; 32]),
+        id: hellas_auth::Digest::from_bytes([12; 32]),
+    }
+}
+
+#[tokio::test]
+async fn root_reconciliation_preserves_an_owner_policy_change_queued_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    let object = put(&store, "proposal", b"root").await;
+    let old = store
+        .pins(&Scope::Owner, "proposal", Cursor::default())
+        .await
+        .unwrap()
+        .pins
+        .remove(0)
+        .1;
+    let disk = store.core.disk.as_ref().unwrap();
+    let tx = disk.db.begin().await.unwrap();
+    let generation = store.core.state.lock().unwrap().generation;
+    let owner = store.clone();
+    let update = tokio::spawn(async move {
+        owner
+            .set_pin(
+                &Scope::Owner,
+                &pin("proposal").name,
+                Some(&old),
+                Some(PinValue {
+                    policy: PinPolicy::Owner,
+                    ..old.clone()
+                }),
+            )
+            .await
+    });
+    while store.core.state.lock().unwrap().generation == generation {
+        tokio::task::yield_now().await;
+    }
+    let publishing = store.clone();
+    // This stale candidate is what reconciliation prepared before the Owner CAS.
+    let reconcile = tokio::spawn(async move {
+        publishing
+            .restore_root(
+                recovery_job(),
+                Target::Object(object),
+                PinTarget {
+                    policy: PinPolicy::Jobs,
+                    ..pin("accepted")
+                },
+                Some(pin("proposal").name),
+            )
+            .await
+    });
+    tx.rollback().await.unwrap();
+    update.await.unwrap().unwrap();
+    reconcile.await.unwrap().unwrap();
+    let pins = store
+        .pins(&Scope::Owner, "", Cursor::default())
+        .await
+        .unwrap()
+        .pins;
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].0, pin("accepted").name);
+    assert_eq!(pins[0].1.policy, PinPolicy::Owner);
+    assert!(
+        store
+            .stat(&Scope::Public, &at("accepted"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn failed_root_reconciliation_stays_protected_and_retry_cleans_its_temporary_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    let object = put(&store, "cache", b"journal-authoritative root").await;
+    let old = store
+        .pins(&Scope::Owner, "cache", Cursor::default())
+        .await
+        .unwrap()
+        .pins
+        .remove(0)
+        .1;
+    store
+        .set_pin(&Scope::Owner, &pin("cache").name, Some(&old), None)
+        .await
+        .unwrap();
+    let disk = store.core.disk.as_ref().unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_pin BEFORE INSERT ON pins BEGIN SELECT RAISE(ABORT,'injected'); END;").execute(&disk.db).await.unwrap();
+    assert!(
+        store
+            .restore_root(
+                recovery_job(),
+                Target::Object(object),
+                pin("retained"),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.collect(&Scope::Owner).await.unwrap().bytes, 0);
+    assert!(matches!(
+        store
+            .open_work(recovery_job(), vec![object], object.bytes())
+            .await,
+        Err(Error::Denied)
+    ));
+    sqlx::raw_sql("DROP TRIGGER reject_pin")
+        .execute(&disk.db)
+        .await
+        .unwrap();
+    store
+        .restore_root(
+            recovery_job(),
+            Target::Object(object),
+            pin("retained"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store.core.live_jobs().unwrap().is_empty());
+    assert_eq!(store.collect(&Scope::Owner).await.unwrap().bytes, 0);
+    store.close().await;
+    drop(store);
+    let store = open(root.path()).await;
+    let mut read = store
+        .read(&Scope::Public, &at("retained"), 0..object.bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        read.bytes.next().await.unwrap().unwrap().as_ref(),
+        b"journal-authoritative root"
+    );
+}
+
+#[tokio::test]
+async fn an_opener_cannot_adopt_the_temporary_root_scope_while_its_pin_is_committing() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    let object = put(&store, "base", b"root").await;
+    let disk = store.core.disk.as_ref().unwrap();
+    let tx = disk.db.begin().await.unwrap();
+    let generation = store.core.state.lock().unwrap().generation;
+    let recovering = store.clone();
+    let restored = tokio::spawn(async move {
+        recovering
+            .restore_root(
+                recovery_job(),
+                Target::Object(object),
+                pin("retained"),
+                None,
+            )
+            .await
+    });
+    while store.core.state.lock().unwrap().generation == generation {
+        tokio::task::yield_now().await;
+    }
+    let adopting = store.open_work(recovery_job(), vec![object], object.bytes());
+    tokio::pin!(adopting);
+    assert!(adopting.as_mut().now_or_never().is_none());
+    tx.rollback().await.unwrap();
+    let adopted = adopting.await;
+    restored.await.unwrap().unwrap();
+    match adopted {
+        Err(Error::Denied) => {}
+        Ok(scope) => {
+            store.reserve_output(&scope, 1).await.unwrap();
+            store.end_work(&scope).await.unwrap();
+        }
+        Err(error) => panic!("unexpected admission error: {error}"),
+    }
+    assert!(store.core.live_jobs().unwrap().is_empty());
+}

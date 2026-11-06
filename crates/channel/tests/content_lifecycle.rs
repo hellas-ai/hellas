@@ -724,3 +724,241 @@ async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
     service.end_run(work).await.unwrap();
     assert_eq!(service.content_upload_count().unwrap(), 0);
 }
+
+#[tokio::test]
+async fn owner_lifecycle_pin_policy_survives_acceptance_pin_move_and_boot_recovery() {
+    for role in [Role::Client, Role::Provider] {
+        let root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let mut journal = fixture::store_at(root.path(), &ready, role, fixture::CURSOR).await;
+        let node = journal.content_store();
+        let authorization = fixture::authorization();
+        let work = work_id(ready.channel(), &authorization);
+        let bytes = fixture::bundle(fixture::NONCE).canonical_bytes().unwrap();
+        fixture::seed_content(&mut journal, authorization, bytes.clone().into()).await;
+        fixture::commit(
+            &mut journal,
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: fixture::client().sign(signing_hash(work)),
+                prepared_input: bytes.clone().into(),
+                retained_tree: None,
+            },
+        )
+        .await;
+        if role == Role::Provider {
+            fixture::commit(
+                &mut journal,
+                ChannelRecord::JobAccepted {
+                    work_id: work,
+                    provider_signature: fixture::provider().sign(signing_hash(work)),
+                    retained_tree: None,
+                },
+            )
+            .await;
+        }
+        let (name, old) = node
+            .pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .remove(0);
+        node.set_pin(
+            &Scope::Owner,
+            &name,
+            Some(&old),
+            Some(PinValue {
+                policy: PinPolicy::Owner,
+                ..old.clone()
+            }),
+        )
+        .await
+        .unwrap();
+        fixture::commit(
+            &mut journal,
+            ChannelRecord::JobAccepted {
+                work_id: work,
+                provider_signature: fixture::provider().sign(signing_hash(work)),
+                retained_tree: None,
+            },
+        )
+        .await;
+        let pins = node
+            .pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].1.policy, PinPolicy::Owner);
+        let closure = hellas_channel::job::content_closure(
+            &fixture::work_policy(),
+            &fixture::manifest(),
+            &fixture::environment().canonical_bytes().unwrap(),
+            authorization.input_content,
+        )
+        .unwrap();
+        let (local, scope) = journal
+            .open_content(
+                work,
+                authorization.retention,
+                closure.clone(),
+                fixture::work_policy().limits.max_upload_bytes,
+            )
+            .await
+            .unwrap();
+        assert!(
+            local
+                .open_verified(&scope, authorization.input_content, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(local);
+        drop(journal);
+        node.close().await;
+        drop(node);
+        let node = DiskStore::open(
+            root.path().join("content"),
+            vec![],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        )
+        .await
+        .unwrap();
+        let mut journal = ChannelStore::open(
+            root.path(),
+            ready.channel().clone(),
+            fixture::settlement(),
+            role,
+            fixture::origin(),
+            node.clone(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        node.finish_recovery().await.unwrap();
+        let pins = node
+            .pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].1.policy, PinPolicy::Owner);
+        let (local, scope) = journal
+            .open_content(
+                work,
+                authorization.retention,
+                closure,
+                fixture::work_policy().limits.max_upload_bytes,
+            )
+            .await
+            .unwrap();
+        assert!(
+            local
+                .open_verified(&scope, authorization.input_content, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn reopening_a_channel_on_a_ready_node_preserves_its_scope_and_spent_output_allowance() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = fixture::ready();
+    let mut journal = fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await;
+    let node = journal.content_store();
+    let authorization = fixture::authorization();
+    let work = work_id(ready.channel(), &authorization);
+    let input = fixture::bundle(fixture::NONCE).canonical_bytes().unwrap();
+    fixture::seed_content(&mut journal, authorization, input.clone().into()).await;
+    fixture::commit(
+        &mut journal,
+        ChannelRecord::JobProposed {
+            authorization,
+            client_signature: fixture::client().sign(signing_hash(work)),
+            prepared_input: input.into(),
+            retained_tree: None,
+        },
+    )
+    .await;
+    fixture::commit(
+        &mut journal,
+        ChannelRecord::JobAccepted {
+            work_id: work,
+            provider_signature: fixture::provider().sign(signing_hash(work)),
+            retained_tree: None,
+        },
+    )
+    .await;
+    let closure = hellas_channel::job::content_closure(
+        &fixture::work_policy(),
+        &fixture::manifest(),
+        &fixture::environment().canonical_bytes().unwrap(),
+        authorization.input_content,
+    )
+    .unwrap();
+    let (local, scope) = journal
+        .open_content(
+            work,
+            authorization.retention,
+            closure.clone(),
+            fixture::work_policy().limits.max_upload_bytes,
+        )
+        .await
+        .unwrap();
+    let output = b"private output still being built";
+    node.stage_output(&scope, ContentRef::for_bytes(output))
+        .await
+        .unwrap()
+        .copy_from(std::io::Cursor::new(output.to_vec()), &node.ram_pool())
+        .await
+        .unwrap();
+    let before = node.stats().unwrap();
+    drop(journal);
+    let mut reopened = ChannelStore::open_existing(
+        root.path(),
+        ready.channel().clone(),
+        fixture::settlement(),
+        Role::Provider,
+        fixture::origin(),
+        node.clone(),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    let after = node.stats().unwrap();
+    assert_eq!(
+        (after.used, after.outstanding),
+        (before.used, before.outstanding)
+    );
+    assert!(
+        local
+            .open_verified(&scope, authorization.input_content, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (_, again) = reopened
+        .open_content(
+            work,
+            authorization.retention,
+            closure,
+            fixture::work_policy().limits.max_upload_bytes,
+        )
+        .await
+        .unwrap();
+    let reservation = |scope: &Scope| match scope.kind {
+        ScopeKind::Work { reservation, .. } => reservation,
+        _ => panic!(),
+    };
+    assert_eq!(reservation(&again), reservation(&scope));
+    assert!(
+        node.stage_output(&again, ContentRef::for_bytes(output))
+            .await
+            .unwrap()
+            .complete()
+    );
+}
