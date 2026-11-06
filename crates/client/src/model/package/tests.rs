@@ -160,3 +160,5 @@ fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
     assert!(package.text_job(&[2], 1, &[4]).is_err());
     assert!(package.text_job(&[2], 127, &[3]).is_ok());
 }
+
+mod qwen35;
