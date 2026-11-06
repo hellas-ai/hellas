@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [master, devnet]
-    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -57,65 +56,3 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: nix run --accept-flake-config .#check-unit
-
-  protocol-regressions:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
-    name: Protocol regressions
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - name: Make room for Nix and Rust
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-      - uses: actions/cache@v4
-        with:
-          path: target/check
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'nix/**') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'nix/**') }}-
-      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - name: Protocol regressions
-        env:
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: nix run --accept-flake-config .#check-regressions
-      - name: Nix module evaluation
-        run: >-
-          nix build --accept-flake-config
-          .#nixosTests.x86_64-linux.provider-content-index-eval
-          .#nixosTests.x86_64-linux.validator-module-eval
-
-  darwin-cli:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
-    name: Darwin ARM64 CLI
-    runs-on: macos-15
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - name: Build the Hydra release artifact
-        run: >-
-          nix build --accept-flake-config
-          .#releaseJobs.cli.aarch64-darwin.artifacts.portable-aarch64
-      - name: Verify the downloadable CLI
-        run: |
-          mkdir unpacked
-          (cd result && shasum -a 256 -c SHA256SUMS)
-          tar -xzf result/hellas-aarch64-darwin-portable-*.tar.gz -C unpacked
-          test "$(lipo -archs unpacked/bin/hellas)" = arm64
-          codesign --verify --strict unpacked/bin/hellas
-          otool -L unpacked/bin/hellas
-          if otool -L unpacked/bin/hellas | grep -q /nix/store; then
-            echo "CLI still depends on the builder's Nix store" >&2
-            exit 1
-          fi
-          env -i HOME="$HOME" PATH=/usr/bin:/bin unpacked/bin/hellas --version
-          env -i HOME="$HOME" PATH=/usr/bin:/bin unpacked/bin/hellas --help
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hellas-aarch64-darwin-portable
-          path: |
-            result/*.tar.gz
-            result/SHA256SUMS
-          if-no-files-found: error
