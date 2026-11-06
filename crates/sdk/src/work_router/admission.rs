@@ -73,8 +73,8 @@ impl UnverifiedAdmission {
     }
 }
 
-/// Pending and public payment connections retain this lease. Successful grant
-/// authentication releases it and returns the token; failed attempts consume it.
+/// Pending connections retain this lease until grant authentication or paid work
+/// acceptance returns the token. Failed attempts consume it.
 pub(super) struct UnverifiedConnection {
     admission: UnverifiedAdmission,
     peer: EndpointId,
