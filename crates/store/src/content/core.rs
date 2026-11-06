@@ -595,6 +595,21 @@ impl State {
                 .transpose()?
                 .unwrap_or(false))
     }
+    fn verified_present(&self, scope: &Scope, object: ContentRef) -> Result<bool> {
+        let readable = self.readable_refs(scope)?;
+        if !readable.contains(&object) {
+            return if readable.iter().any(|held| held.id() == object.id()) {
+                Err(Error::Invalid("content length contract"))
+            } else {
+                Ok(false)
+            };
+        }
+        self.objects
+            .get(&object.id())
+            .map(|stored| available(stored, object))
+            .transpose()
+            .map(|present| present.unwrap_or(false))
+    }
     fn held(&self, scope: &Scope, closure: &[ContentRef]) -> Result<BTreeSet<ContentId>> {
         let reachable = self.readable_refs(scope)?;
         Ok(closure
@@ -1546,7 +1561,7 @@ impl Core {
             Some(at) => state
                 .resolve(scope, at)?
                 .is_some_and(|target| target.object() == object),
-            None => state.present(scope, object)?,
+            None => state.verified_present(scope, object)?,
         };
         if readable && let Some(stored) = state.objects.get(&object.id()) {
             let reader = super::local::reader(&stored.data, object)?;
@@ -1562,7 +1577,7 @@ impl Core {
                 Some(at) => lower
                     .resolve_path(scope, at)?
                     .is_some_and(|target| target.object() == object),
-                None => lower.present(scope, object)?,
+                None => lower.verified_present(scope, object)?,
             };
             if readable && let Some(stored) = lower.objects.get(&object.id()) {
                 let reader = super::local::reader(&stored.data, object)?;

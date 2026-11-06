@@ -573,7 +573,12 @@ async fn implicit_job_reads_and_missing_use_full_pin_references_while_gc_marks_i
     node.finish_recovery().await.unwrap();
     let object = put(&node, "leaf", b"correct bytes").await;
     let wrong = ContentRef::new(object.id(), object.bytes() + 1);
-    let tree = Tree::new(vec![("leaf".into(), Target::Object(wrong))]).unwrap();
+    let short = ContentRef::new(object.id(), object.bytes() - 1);
+    let tree = Tree::new(vec![
+        ("long".into(), Target::Object(wrong)),
+        ("short".into(), Target::Object(short)),
+    ])
+    .unwrap();
     let root = put(&node, "tree", &tree.bytes()).await;
     let value = PinValue {
         target: Target::Object(root),
@@ -600,13 +605,10 @@ async fn implicit_job_reads_and_missing_use_full_pin_references_while_gc_marks_i
         .await
         .unwrap();
     let local = LocalStore::Job(scope.clone());
-    assert!(
-        local
-            .open_verified(scope.scope(), object, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(matches!(
+        local.open_verified(scope.scope(), object, None).await,
+        Err(Error::Invalid("content length contract"))
+    ));
     let missing = scope
         .store()
         .upload(scope.scope(), object, None)
