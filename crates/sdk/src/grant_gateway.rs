@@ -61,7 +61,10 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
         .and_then(|r| C::try_from(r.code).ok()),
         _ => None,
     };
-    if matches!(e, GrantClientError::Timeout) {
+    if matches!(
+        e,
+        GrantClientError::Timeout | GrantClientError::AdmissionExpired
+    ) {
         return WorkGatewayError::Timeout(Box::new(e));
     }
     let unreachable = match &e {
@@ -822,63 +825,71 @@ impl GrantSource {
             if requester.is_closed() {
                 return Err(WorkGatewayBusy.into());
             }
-            tokio::select! {
-                biased;
-                _ = requester.closed() => return Ok(None),
-                recovered = async {
-                    session.recover().await?;
-                    session.refresh().await
-                } => { recovered.map_err(client_error)?; }
-            }
-            // Re-admit the original request against the selected resource after refresh.
-            let offer = session.offer();
-            let policy = offer
-                .offer()
-                .grant
-                .policies
-                .iter()
-                .find(|policy| policy.resource == resource)
-                .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-            let input = request
-                .admitted(
-                    &policy.invocation_policy,
-                    policy.https.as_ref(),
-                    self.assurance,
-                    false,
+            let mut retried = false;
+            let output = loop {
+                tokio::select! {
+                    biased;
+                    _ = requester.closed() => return Ok(None),
+                    recovered = async {
+                        session.recover().await?;
+                        session.refresh().await
+                    } => { recovered.map_err(client_error)?; }
+                }
+                // Re-admit the original request against the selected resource after refresh.
+                let offer = session.offer();
+                let policy = offer
+                    .offer()
+                    .grant
+                    .policies
+                    .iter()
+                    .find(|policy| policy.resource == resource)
+                    .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
+                let input = request
+                    .admitted(
+                        &policy.invocation_policy,
+                        policy.https.as_ref(),
+                        self.assurance,
+                        false,
+                    )
+                    .map_err(rejected)?;
+                let prepared = crate::execution::prepare_grant_input(
+                    &input,
+                    policy,
+                    offer,
+                    session.execution_signer(),
                 )
                 .map_err(rejected)?;
-            let prepared = crate::execution::prepare_grant_input(
-                &input,
-                policy,
-                offer,
-                session.execution_signer(),
-            )
-            .map_err(rejected)?;
-            if requester.is_closed() {
-                return Err(WorkGatewayBusy.into());
-            }
-            let proposed = std::sync::atomic::AtomicBool::new(false);
-            let content = input.content();
-            let operation = session.run_current(
-                resource,
-                prepared,
-                &content,
-                Some(requester.progress()),
-                Some(requester.accepted()),
-                Some(&proposed),
-            );
-            tokio::pin!(operation);
-            let output = tokio::select! {
-                biased;
-                _ = requester.closed() => {
-                    if !proposed.load(std::sync::atomic::Ordering::Acquire) {
-                        return Ok(None);
-                    }
-                    operation.await
+                if requester.is_closed() {
+                    return Err(WorkGatewayBusy.into());
                 }
-                output = &mut operation => output,
-            }
-            .map_err(client_error)?;
+                let proposed = std::sync::atomic::AtomicBool::new(false);
+                let content = input.content();
+                let operation = session.run_current(
+                    resource,
+                    prepared,
+                    &content,
+                    Some(requester.progress()),
+                    Some(requester.accepted()),
+                    Some(&proposed),
+                );
+                tokio::pin!(operation);
+                let output = tokio::select! {
+                    biased;
+                    _ = requester.closed() => {
+                        if !proposed.load(std::sync::atomic::Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        operation.await
+                    }
+                    output = &mut operation => output,
+                };
+                match output {
+                    Err(GrantClientError::AdmissionExpired) if !retried => {
+                        retried = true;
+                    }
+                    result => break result.map_err(client_error)?,
+                }
+            };
             Ok(Some(Completed {
                 transcript: hellas_channel::model::work::encode_transcript(&output.events)
                     .map_err(error)?,

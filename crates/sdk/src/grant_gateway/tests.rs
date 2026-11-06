@@ -1,3 +1,5 @@
+mod expiry;
+
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
@@ -1112,6 +1114,17 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
             WorkGatewayError::Denied(_) | WorkGatewayError::Execution(_)
         ),
         "{error:?}"
+    );
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.gateway.source.channels[0]
+            .session
+            .lock()
+            .await
+            .store()
+            .next_nonce()
+            .unwrap(),
+        2
     );
     fixture.host.backend.first.as_ref().unwrap().release();
     fixture.shutdown().await;

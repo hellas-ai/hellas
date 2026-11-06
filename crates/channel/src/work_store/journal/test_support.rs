@@ -1,4 +1,49 @@
 use super::*;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+type Hook = Arc<dyn Fn(&[u8]) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+static APPEND_HOOKS: OnceLock<Mutex<BTreeMap<PathBuf, Hook>>> = OnceLock::new();
+
+/// A directory-scoped delay at the durable append boundary. Other tests' journals
+/// are unaffected. Dropping this guard removes the hook, including on panic.
+pub struct AppendHook(PathBuf);
+impl AppendHook {
+    /// Run after the real SQL commit, before the caller may acknowledge it.
+    /// The hook receives the actual frame so tests can select transitions rather
+    /// than depending on how many intervening clock writes happen to coalesce.
+    pub fn new(
+        directory: &Path,
+        hook: impl Fn(&[u8]) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        let path = directory.to_path_buf();
+        let previous = APPEND_HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Arc::new(hook));
+        assert!(previous.is_none(), "journal hook already installed");
+        Self(path)
+    }
+}
+impl Drop for AppendHook {
+    fn drop(&mut self) {
+        APPEND_HOOKS.get().unwrap().lock().unwrap().remove(&self.0);
+    }
+}
+pub(super) async fn after_append(path: &Path, payload: &[u8]) {
+    let hook = APPEND_HOOKS.get().and_then(|hooks| {
+        hooks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(directory, _)| path.starts_with(directory))
+            .map(|(_, hook)| hook.clone())
+    });
+    if let Some(hook) = hook {
+        hook(payload).await;
+    }
+}
 
 impl Journal {
     /// Pause the next statement on SQLite's worker until the sender is dropped.

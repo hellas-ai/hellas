@@ -429,9 +429,11 @@ impl GrantService {
                     return Ok(accepted(id, signature));
                 }
                 // Refresh after the durable probe; its wait must not extend the job deadline.
-                let observed_at = Instant::now();
                 let now = self.node.observed_time(&store);
                 access.authorize(&store, a.grant_id, now)?;
+                if now > a.acceptance_deadline_ms {
+                    return Err(refused(GrantRefusalCode::Expired));
+                }
                 let reference =
                     hellas_rpc::protocol::content_upload::decode_reference(&request.prepared_input)
                         .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
@@ -524,6 +526,8 @@ impl GrantService {
                 if permit.domain() != domain {
                     return Err(refused(GrantRefusalCode::QueueCapacity));
                 }
+                let observed_at = Instant::now();
+                let now = self.node.observed_time(&store);
                 let deadline = observed_at
                     .checked_add(Duration::from_millis(
                         a.terminal_deadline_ms.0.saturating_sub(now.0),
