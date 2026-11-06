@@ -806,6 +806,8 @@ async fn terminated_provider(
             authorization,
             client_signature,
             prepared_input: bundle_bytes(1),
+
+            retained_tree: None,
         },
         ChannelRecord::JobTerminated {
             work_id: held,
@@ -1512,6 +1514,8 @@ async fn a_crash_between_the_two_commits_co_signs_on_retry() {
             authorization,
             client_signature: signature,
             prepared_input: bundle_bytes(1),
+
+            retained_tree: None,
         },
     )
     .await;

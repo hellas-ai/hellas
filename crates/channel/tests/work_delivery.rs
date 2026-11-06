@@ -77,6 +77,8 @@ async fn accept_input(
                 authorization: a,
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: input.canonical_bytes().unwrap(),
+
+                retained_tree: None,
             },
         )
         .await;
@@ -85,6 +87,8 @@ async fn accept_input(
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
+
+                retained_tree: None,
             },
         )
         .await;

@@ -3237,6 +3237,8 @@ async fn each_deadline_ends_its_own_job() {
                 client_signature: client()
                     .sign(signing_hash(work_id(ready.channel(), &authorization))),
                 prepared_input,
+
+                retained_tree: None,
             },
         )
         .await;

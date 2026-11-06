@@ -847,6 +847,8 @@ impl ProviderEndpoint {
                     authorization,
                     client_signature,
                     prepared_input: prepared_input.clone(),
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -860,6 +862,8 @@ impl ProviderEndpoint {
                 ChannelRecord::JobAccepted {
                     work_id,
                     provider_signature: signature,
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -1089,6 +1093,8 @@ impl ProviderEndpoint {
                     result,
                     provider_signature: signature,
                     transcript: spool,
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -3273,6 +3279,8 @@ impl ClientEndpoint {
                     authorization,
                     client_signature: signature,
                     prepared_input: prepared_input.clone(),
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -3392,6 +3400,8 @@ impl ClientEndpoint {
                 ChannelRecord::JobAccepted {
                     work_id,
                     provider_signature: signature,
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -3499,6 +3509,8 @@ impl ClientEndpoint {
                     result,
                     provider_signature: signature,
                     transcript: delivered.transcript.clone(),
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )

@@ -245,6 +245,8 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
                     request.client_signature.clone().try_into().unwrap(),
                 ),
                 prepared_input: bytes.clone(),
+
+                retained_tree: None,
             },
             &Secp256k1Verifier::new(),
         )
@@ -325,6 +327,8 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
                     request.client_signature.clone().try_into().unwrap(),
                 ),
                 prepared_input: bytes,
+
+                retained_tree: None,
             },
             &Secp256k1Verifier::new(),
         )
@@ -412,6 +416,8 @@ async fn failed_cosign_journal_append_cannot_publish_content_and_retry_recovers(
     let tag = ChannelRecord::JobAccepted {
         work_id: Digest::hash(b"tag"),
         provider_signature: Sig::from_bytes([0; 64]),
+
+        retained_tree: None,
     }
     .encode()[0];
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE TRIGGER reject_cosign BEFORE INSERT ON record WHEN hex(substr(NEW.payload,1,1)) = '{tag:02X}' BEGIN SELECT RAISE(ABORT, 'injected cosign storage failure'); END")))

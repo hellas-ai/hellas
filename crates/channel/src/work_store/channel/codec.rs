@@ -73,10 +73,12 @@ impl ChannelRecord {
                 authorization,
                 client_signature,
                 prepared_input,
+                retained_tree,
             } => {
                 out.push(tag::PROPOSED);
                 out.extend_from_slice(&authorization.encode());
                 out.extend_from_slice(client_signature.as_bytes());
+                put_option(&mut out, retained_tree.as_ref(), put_content);
                 // Last field, and the whole of the rest: the journal
                 // frame already carries this record's length, and a
                 // second length here could disagree with it.
@@ -87,10 +89,12 @@ impl ChannelRecord {
             Self::JobAccepted {
                 work_id,
                 provider_signature,
+                retained_tree,
             } => {
                 out.push(tag::ACCEPTED);
                 out.extend_from_slice(work_id.as_bytes());
                 out.extend_from_slice(provider_signature.as_bytes());
+                put_option(&mut out, retained_tree.as_ref(), put_content);
             }
             Self::JobRunning { work_id } => {
                 out.push(tag::RUNNING);
@@ -101,11 +105,13 @@ impl ChannelRecord {
                 result,
                 provider_signature,
                 transcript,
+                retained_tree,
             } => {
                 out.push(tag::RESULT);
                 out.extend_from_slice(work_id.as_bytes());
                 out.extend_from_slice(&result.encode());
                 out.extend_from_slice(provider_signature.as_bytes());
+                put_option(&mut out, retained_tree.as_ref(), put_content);
                 // Last field, and the whole of the rest, for the reason
                 // `JobProposed`'s bundle is: the journal frame already
                 // carries this record's length.
@@ -196,11 +202,21 @@ impl ChannelRecord {
             tag::PROPOSED => Self::JobProposed {
                 authorization: private_record(&mut cursor)?,
                 client_signature: signature(&mut cursor)?,
+                retained_tree: take_option(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                    take_content,
+                )?,
                 prepared_input: cursor.rest().to_vec(),
             },
             tag::ACCEPTED => Self::JobAccepted {
                 work_id: digest(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
+                retained_tree: take_option(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                    take_content,
+                )?,
             },
             tag::RUNNING => Self::JobRunning {
                 work_id: digest(&mut cursor)?,
@@ -209,6 +225,11 @@ impl ChannelRecord {
                 work_id: digest(&mut cursor)?,
                 result: private_record(&mut cursor)?,
                 provider_signature: signature(&mut cursor)?,
+                retained_tree: take_option(
+                    &mut cursor,
+                    ChannelStateError::Malformed,
+                    take_content,
+                )?,
                 transcript: cursor.rest().to_vec(),
             },
             tag::PLAINTEXT => Self::PlaintextReleased {
@@ -451,6 +472,7 @@ impl Channel<PaymentFunding> {
                     close_history,
                     close_responded,
                     close_settled,
+                    retained_roots,
                 },
             role,
             ledger,
@@ -538,10 +560,11 @@ impl Channel<PaymentFunding> {
         put_option(&mut out, pending_proposal.as_ref(), |out, id| {
             out.extend_from_slice(id.as_bytes())
         });
-        // Optional tail extension. Existing checkpoints without replay progress
-        // retain their exact encoding and decode as no cached contest history.
-        if close_history.is_some() {
-            put_option(&mut out, close_history.as_ref(), put_close_history);
+        put_option(&mut out, close_history.as_ref(), put_close_history);
+        put_u64(&mut out, retained_roots.len() as u64);
+        for (work, root) in retained_roots {
+            out.extend_from_slice(work.as_bytes());
+            put_content(&mut out, root);
         }
         out
     }
@@ -677,18 +700,25 @@ impl Channel<PaymentFunding> {
             })
         })?;
         let pending_proposal = take_option(&mut cursor, ChannelStateError::Malformed, digest)?;
-        let close_history = if cursor.is_empty() {
-            None
-        } else {
-            Some(
-                take_option(
-                    &mut cursor,
-                    ChannelStateError::Malformed,
-                    take_close_history,
-                )?
-                .ok_or(ChannelStateError::Malformed)?,
-            )
-        };
+        let close_history = take_option(
+            &mut cursor,
+            ChannelStateError::Malformed,
+            take_close_history,
+        )?;
+        let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let mut retained_roots = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..count {
+            let work = digest(&mut cursor)?;
+            let root = take_content(&mut cursor)?;
+            if previous.is_some_and(|previous| previous >= work) {
+                return Err(ChannelStateError::Malformed);
+            }
+            previous = Some(work);
+            if retained_roots.insert(work, root).is_some() {
+                return Err(ChannelStateError::Malformed);
+            }
+        }
         let state = Self {
             funding: PaymentState {
                 channel,
@@ -700,6 +730,7 @@ impl Channel<PaymentFunding> {
                 close_history,
                 close_responded,
                 close_settled,
+                retained_roots,
             },
             role,
             ledger: CreditLedger::from_credited_cumulative(credited),
@@ -731,4 +762,14 @@ fn take_close_history(cursor: &mut Cursor<'_>) -> Result<CloseHistory, ChannelSt
         payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
         pending: decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)?,
     })
+}
+
+fn put_content(out: &mut Vec<u8>, object: &ContentRef) {
+    out.extend_from_slice(&hellas_rpc::protocol::content::encode_reference(*object));
+}
+fn take_content(cursor: &mut Cursor<'_>) -> Result<ContentRef, ChannelStateError> {
+    let bytes = cursor
+        .array::<{ hellas_rpc::protocol::content::CONTENT_REF_BYTES }>()
+        .ok_or(ChannelStateError::Malformed)?;
+    hellas_rpc::protocol::content::decode_reference(&bytes).ok_or(ChannelStateError::Malformed)
 }

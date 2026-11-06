@@ -1818,6 +1818,8 @@ mod tests {
                 authorization,
                 client_signature: fixture::client().sign(signing_hash(id)),
                 prepared_input: input.canonical_bytes().unwrap(),
+
+                retained_tree: None,
             },
         )
         .await;
@@ -1827,7 +1829,9 @@ mod tests {
                 .commit(
                     ChannelRecord::JobAccepted {
                         work_id: id,
-                        provider_signature: fixture::provider().sign(signing_hash(id))
+                        provider_signature: fixture::provider().sign(signing_hash(id)),
+
+                        retained_tree: None,
                     },
                     &Secp256k1Verifier::new()
                 )

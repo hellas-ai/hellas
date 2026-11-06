@@ -635,6 +635,8 @@ async fn record_unsigned_proposal(
                 client_signature: client_settlement()
                     .sign(hellas_channel::model::work::signing_hash(work)),
                 prepared_input: input.canonical_bytes().unwrap(),
+
+                retained_tree: None,
             },
             &verifier,
         )

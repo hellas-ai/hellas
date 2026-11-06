@@ -1520,6 +1520,8 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
+
+            retained_tree: None,
         },
     )
     .await;
@@ -1528,6 +1530,8 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -1574,6 +1578,8 @@ async fn write_contested_channel(root: &Path) -> StartId {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture transcript encodes: {error}"),
             },
+
+            retained_tree: None,
         },
     )
     .await;

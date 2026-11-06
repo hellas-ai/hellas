@@ -28,6 +28,7 @@ use crate::work_store::{
     Applied, WorkStoreError, put_bytes, put_option, put_u64, take_bytes, take_option,
 };
 use hellas_auth::Digest;
+use hellas_rpc::ContentRef;
 use hellas_rpc::protocol::invocation::{InvocationPolicy, PreparedInvocation};
 
 mod book;
@@ -417,6 +418,8 @@ pub enum ChannelRecord {
         /// The canonical prepared-input bundle the authorization's
         /// `prepared_input_digest` commits to.
         prepared_input: Vec<u8>,
+        /// Locally staged retained tree, journaled before its pin is published.
+        retained_tree: Option<ContentRef>,
     },
     /// The provider's co-signature over the same `work_id`.
     JobAccepted {
@@ -424,6 +427,8 @@ pub enum ChannelRecord {
         work_id: Digest,
         /// The provider's signature.
         provider_signature: Sig,
+        /// Locally staged retained tree, journaled before its pin is published.
+        retained_tree: Option<ContentRef>,
     },
     /// The provider is about to invoke the backend.
     JobRunning {
@@ -445,6 +450,8 @@ pub enum ChannelRecord {
         provider_signature: Sig,
         /// The transcript the result was derived from.
         transcript: Vec<u8>,
+        /// Locally staged retained tree, journaled before its pin is published.
+        retained_tree: Option<ContentRef>,
     },
     /// The provider is about to release the plaintext.
     PlaintextReleased {
@@ -592,7 +599,9 @@ const JOB_TAIL_BYTES: usize = 2 * (PaidJobResultV1::ENCODED_SIZE + Sig::LENGTH)
     + EarnedCertificate::ENCODED_SIZE
     + 4 * Sig::LENGTH
     + 64
-    + 33;
+    + 33
+    + 2 * std::mem::size_of::<[u8; 32]>()
+    + std::mem::size_of::<u64>();
 
 /// One active job on a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -719,6 +728,7 @@ pub struct PaymentState {
     close_history: Option<CloseHistory>,
     close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,
+    retained_roots: BTreeMap<Digest, ContentRef>,
 }
 
 /// A finalized close contest on this channel's payment edge, and

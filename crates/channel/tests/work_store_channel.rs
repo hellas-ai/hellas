@@ -283,6 +283,8 @@ impl Job {
             authorization: self.authorization,
             client_signature: client().sign(payload(self.work_id)),
             prepared_input: self.input.clone(),
+
+            retained_tree: None,
         }
     }
 
@@ -290,6 +292,8 @@ impl Job {
         ChannelRecord::JobAccepted {
             work_id: self.work_id,
             provider_signature: provider().sign(payload(self.work_id)),
+
+            retained_tree: None,
         }
     }
 
@@ -299,6 +303,8 @@ impl Job {
             result: self.result,
             provider_signature: provider().sign(payload(result_digest(channel, &self.result))),
             transcript: spool(&self.transcript),
+
+            retained_tree: None,
         }
     }
 
@@ -641,6 +647,8 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
                 result: job.result,
                 provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
                 transcript: spool(&other_answer),
+
+                retained_tree: None,
             },
             &verifier,
         )
@@ -669,6 +677,8 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
                 result: altered,
                 provider_signature: provider().sign(payload(result_digest(&channel, &altered))),
                 transcript: spool(&job.transcript),
+
+                retained_tree: None,
             },
             &verifier,
         )
@@ -1280,6 +1290,8 @@ async fn a_half_signed_job_keeps_its_bytes() {
                 authorization: different,
                 client_signature: client().sign(payload(work_id(&channel, &different))),
                 prepared_input: bundle_bytes(different.proposal_nonce),
+
+                retained_tree: None,
             },
             &Secp256k1Verifier::new(),
         )
@@ -1474,6 +1486,8 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
                 authorization: job.authorization,
                 client_signature: provider().sign(payload(job.work_id)),
                 prepared_input: bundle_bytes(job.authorization.proposal_nonce),
+
+                retained_tree: None,
             },
         ),
         (
@@ -1482,6 +1496,8 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobAccepted {
                 work_id: job.work_id,
                 provider_signature: client().sign(payload(job.work_id)),
+
+                retained_tree: None,
             },
         ),
         (
@@ -1498,6 +1514,8 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
                 result: job.result,
                 provider_signature: provider().sign(payload(job.work_id)),
                 transcript: spool(&job.transcript),
+
+                retained_tree: None,
             },
         ),
         (
@@ -2002,9 +2020,25 @@ fn the_record_codec_is_exact_and_ordered() {
     let mut expected = vec![1_u8];
     expected.extend_from_slice(&job.authorization.encode());
     expected.extend_from_slice(client().sign(payload(job.work_id)).as_bytes());
+    expected.push(0); // absent retained tree, before the trailing input body
     expected.extend_from_slice(&bundle_bytes(1));
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(proposed));
+
+    let mut with_tree = job.proposed();
+    let root = hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([0x91; 32]), 123);
+    if let ChannelRecord::JobProposed { retained_tree, .. } = &mut with_tree {
+        *retained_tree = Some(root);
+    }
+    let mut expected_tree = vec![1_u8];
+    expected_tree.extend_from_slice(&job.authorization.encode());
+    expected_tree.extend_from_slice(client().sign(payload(job.work_id)).as_bytes());
+    expected_tree.push(1);
+    expected_tree.extend_from_slice(&[0x91; 32]);
+    expected_tree.extend_from_slice(&123u64.to_be_bytes());
+    expected_tree.extend_from_slice(&bundle_bytes(1));
+    assert_eq!(with_tree.encode(), expected_tree);
+    assert_eq!(ChannelRecord::decode(&expected_tree), Ok(with_tree));
 
     // The result record: body, then signature, then the transcript as
     // the whole of the rest.
@@ -2018,6 +2052,7 @@ fn the_record_codec_is_exact_and_ordered() {
             .sign(payload(result_digest(&channel, &job.result)))
             .as_bytes(),
     );
+    expected.push(0); // absent retained tree, before the trailing transcript
     expected.extend_from_slice(&spool(&job.transcript));
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(recorded));
@@ -2165,6 +2200,8 @@ async fn replay_checks_the_signatures_again() {
         authorization: job.authorization,
         client_signature: provider().sign(payload(job.work_id)),
         prepared_input: bundle_bytes(job.authorization.proposal_nonce),
+
+        retained_tree: None,
     };
     {
         let Ok(mut credulous) = ChannelStore::open(
@@ -2286,6 +2323,8 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
                 authorization: job.authorization,
                 client_signature: client().sign(payload(job.work_id)),
                 prepared_input: bundle_bytes(2),
+
+                retained_tree: None,
             },
             &Secp256k1Verifier::new(),
         )
@@ -2304,6 +2343,8 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
                 authorization: job.authorization,
                 client_signature: client().sign(payload(job.work_id)),
                 prepared_input: vec![0xff; 8],
+
+                retained_tree: None,
             },
             &Secp256k1Verifier::new(),
         )

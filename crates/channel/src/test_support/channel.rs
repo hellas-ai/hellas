@@ -668,6 +668,8 @@ pub async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
                 authorization,
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: prepared_input.clone(),
+
+                retained_tree: None,
             },
         )
         .await;
@@ -676,6 +678,8 @@ pub async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
+
+                retained_tree: None,
             },
         )
         .await;

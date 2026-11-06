@@ -114,6 +114,8 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
             authorization,
             client_signature: client().sign(signing_hash(id)),
             prepared_input: bundle_bytes(nonce),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -122,6 +124,8 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -524,6 +528,8 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
             authorization,
             client_signature: client().sign(signing_hash(id)),
             prepared_input: bundle_bytes(1),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -550,6 +556,8 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
