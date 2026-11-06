@@ -64,9 +64,10 @@
       checks = forAllSystems (system: perSystem.${system}.checks);
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
-      # The `hellas` Hydra jobset builds master and admitted PRs. It builds the
-      # compiled dependencies only, so GitHub-hosted checks substitute them
-      # from cache.hellas.ai; the checks themselves run on GitHub.
+      # The `hellas` Hydra jobset builds these from master only. They are the
+      # compiled dependencies, which GitHub-hosted checks substitute from
+      # cache.hellas.ai; the checks themselves run on GitHub. A PR that changes
+      # dependencies or the toolchain builds its own until it merges.
       hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
       # Selected explicitly by the component's Hydra jobset, never by PR CI.
       releaseJobs =
