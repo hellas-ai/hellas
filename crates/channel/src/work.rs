@@ -2835,8 +2835,23 @@ impl WorkService {
 
     /// Answers one proposal, or says the endpoint is unreachable.
     pub async fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        match self.endpoint().await {
-            Ok(mut endpoint) => endpoint.accept(request).await,
+        let result = match self.endpoint.lock_owned().await {
+            Ok(mut endpoint) => {
+                let (request, changed) = (request.clone(), self.changed.clone());
+                // Acceptance, publication and RAM transfer retain the writer even
+                // when the RPC drops its response after a journal append started.
+                tokio::spawn(async move {
+                    let response = endpoint.accept(&request).await;
+                    changed.notify_waiters();
+                    response
+                })
+                .await
+                .map_err(|_| EndpointError::Poisoned)
+            }
+            Err(_) => Err(EndpointError::Poisoned),
+        };
+        match result {
+            Ok(response) => response,
             Err(error) => AcceptWorkResponse::refused(WorkRefused {
                 grant: None,
                 code: endpoint_refusal(error).code() as i32,

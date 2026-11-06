@@ -793,12 +793,9 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         client_signature: super::client().sign(signing_hash(id)).as_bytes().to_vec(),
         prepared_input: retained.prepared_input.canonical_bytes().unwrap(),
     };
+    let service = service(provider_dir.path()).await;
     assert!(matches!(
-        service(provider_dir.path())
-            .await
-            .accept(&request)
-            .await
-            .outcome,
+        service.accept(&request).await.outcome,
         Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
     ));
     assert_no_bodies(provider_dir.path());

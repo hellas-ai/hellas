@@ -499,6 +499,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_paid_acceptance_finishes_journaling_and_ram_transfer_before_upload_cleanup()
+    {
+        use crate::test_support::channel as fixture;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready_of(
+            &fixture::descriptor_with(fixture::fetch_policy()),
+            fixture::CURSOR,
+        );
+        let journal = fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await;
+        let node = journal.content_store();
+        let service = WorkService::new(
+            ProviderEndpoint::new(ready.clone(), journal, fixture::provider()).unwrap(),
+        );
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let input = fixture::fetch_bundle(1);
+        let request = client
+            .propose(
+                &JobProposal {
+                    prepared_input: input.clone(),
+                    deadlines: fixture::deadlines(),
+                },
+                &fixture::program_content().await,
+            )
+            .await
+            .unwrap();
+        let (wire, frames) =
+            fixture::input_uploads(ready.channel(), &request, &input.canonical_bytes().unwrap());
+        let connection = admission::Cancellation::new();
+        crate::test_support::drive_upload(
+            service
+                .upload_stream(
+                    Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+                    TransportContext {
+                        open_exporter: Some([7; 32]),
+                        ..Default::default()
+                    },
+                    connection.clone(),
+                )
+                .await,
+        )
+        .await
+        .unwrap();
+        let (entered, release) = service
+            .endpoint()
+            .await
+            .unwrap()
+            .close
+            .store
+            .pause_next_statement_for_test()
+            .await;
+        let (accepting, proposal) = (service.clone(), wire.clone());
+        let caller = tokio::spawn(async move { accepting.accept(&proposal).await });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        connection.cancel();
+        assert!(
+            node.ram_pool().held() > 0,
+            "the owned transition retains staged bytes while the real SQLite worker waits"
+        );
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), service.accept(&wire))
+            .await
+            .unwrap();
+        let work = client.accepted(&response).await.unwrap();
+        assert_eq!(
+            node.ram_pool().held(),
+            0,
+            "accepted input moves out of staging accounting"
+        );
+        assert!(matches!(
+            service.begin_run(work, &ready).await.unwrap(),
+            RunAdmission::Invoke(_)
+        ));
+        service.end_run(work).await.unwrap();
+        for path in crate::test_support::all_files(root.path()) {
+            let bytes = std::fs::read(path).unwrap();
+            let body = input.canonical_bytes().unwrap();
+            assert!(!bytes.windows(body.len()).any(|window| window == body));
+        }
+    }
+
+    #[tokio::test]
     async fn owned_collected_body_stays_verified_and_charged_when_another_job_evicts_its_cache() {
         use crate::test_support::channel as fixture;
         let root = tempfile::tempdir().unwrap();
