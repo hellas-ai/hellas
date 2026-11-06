@@ -17,6 +17,101 @@ fn job() -> hellas_sdk::job::Job {
     .unwrap()
 }
 
+#[test]
+fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            fund(&mut case).await;
+            let job = job();
+            let terms = ExecutionTerms::Paid { price: PRICE };
+            let path = case.root.path().join("retained-paid");
+            let mut attempt = ExecutionAttempt::open(&path, job.input(), terms).unwrap();
+            let mut session = attempt
+                .open_paid_session(
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+            sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                ExecutionSession::Paid(&mut session).execute(
+                    job.input().clone(),
+                    terms,
+                    &signer,
+                    Default::default(),
+                    Some(&mut attempt),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(attempt.inspect().unwrap().payment, Payment::Paid);
+            let paid_marker = std::fs::read(&path).unwrap();
+            let result = attempt.retained_paid_result().unwrap().unwrap();
+            let output = result.output.content_id().unwrap();
+            let channel = result.channel_id;
+            let bond = result.bond_edge;
+            attempt.reported().unwrap();
+            session.shutdown().await;
+            drop(session);
+            // An actual settlement error must not take already-paid output away.
+            let wrong_delegate =
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([0x7d; 32]).unwrap();
+            assert!(matches!(
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &wrong_delegate,
+                )
+                .await,
+                Err(PaidClientError::InputMismatch("settlement client identity"))
+            ));
+            drop(attempt);
+            case.endpoint.close().await;
+            let approvals = case.approvals.0.lock().unwrap().len();
+            let mut attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let replay = attempt.retained_paid_result().unwrap().unwrap();
+            assert_eq!(replay.output.content_id().unwrap(), output);
+            assert_eq!((replay.channel_id, replay.bond_edge), (channel, bond));
+            attempt.reported().unwrap();
+            assert_eq!(case.approvals.0.lock().unwrap().len(), approvals);
+            let result_path = case.root.path().join(".hellas-execution").join(format!(
+                "{}.result",
+                hex::encode(Digest::hash(b"retained-paid").as_bytes()),
+            ));
+            std::fs::remove_file(&result_path).unwrap();
+            assert!(matches!(
+                attempt.retained_paid_result(),
+                Err(ExecutionError::ResultUnavailable)
+            ));
+            drop(attempt);
+            // An older paid marker may have no completion receipt at all.
+            std::fs::remove_file(result_path.with_extension("receipt")).unwrap();
+            std::fs::write(&path, paid_marker).unwrap();
+            let attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let facts = attempt.inspect().unwrap();
+            assert_eq!(facts.payment, Payment::Paid);
+            assert!(!facts.reported);
+            assert!(matches!(
+                attempt.retained_paid_result(),
+                Err(ExecutionError::ResultUnavailable)
+            ));
+            assert_eq!(case.approvals.0.lock().unwrap().len(), approvals);
+            case.provider.shutdown().await.unwrap();
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
 // Establish fixture funding separately from the tracked attempts under test.
 // The SDK owns bounded funding retries on the original connection.
 async fn fund(case: &mut PaidScenario<()>) {

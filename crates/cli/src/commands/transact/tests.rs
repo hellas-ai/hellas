@@ -1,6 +1,32 @@
 use super::*;
 use clap::Parser as _;
 
+#[tokio::test]
+async fn paid_output_is_flushed_before_a_failed_settlement() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("output");
+    let result = deliver_then_settle(
+        || {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
+            writer.write_all(b"paid result")?;
+            writer.flush()?;
+            Ok(())
+        },
+        async {
+            assert_eq!(std::fs::read(&output).unwrap(), b"paid result");
+            bail!("injected settlement failure")
+        },
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("injected settlement failure")
+    );
+    assert_eq!(std::fs::read(output).unwrap(), b"paid result");
+}
+
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let base = ["hellas", "transact", "--job", "job"];
@@ -414,9 +440,8 @@ fn output_claims_only_provider_signature_and_job_binding() {
         Assurance::ProducerSigned,
     )
     .unwrap();
-    let result = PaidWorkResult {
+    let result = PaidCompletion {
         bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
-        payment_edge: hellas_kernel::EdgeId::from_bytes([2; 32]),
         channel_id: hellas_auth::Digest::from_bytes([3; 32]),
         transcript: vec![],
         output: hellas_rpc::protocol::invocation::output::InvocationOutput {
@@ -425,14 +450,10 @@ fn output_claims_only_provider_signature_and_job_binding() {
             metadata: hellas_rpc::JsonBytes(vec![]),
         },
         work_id: hellas_auth::Digest::from_bytes([4; 32]),
-        acceptance_signature: hellas_kernel::Sig::from_bytes([0; hellas_kernel::Sig::LENGTH]),
-        credited_cumulative: 20,
         job_price: 20,
         provider_key: ProducerSigningKey::from_secret_bytes([8; 32])
             .unwrap()
             .public_key(),
-        input: hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([5; 32])),
-        settled_provider_payout: None,
     };
     let output = wording(args.client.paid_provider().unwrap(), &job, &result);
     assert_eq!(
