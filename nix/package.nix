@@ -140,6 +140,79 @@ let
 
   mkHellasPackage = overrides: rustPlatform.buildRustPackage (commonArgs // overrides);
 
+  # Crane builds the workspace's external dependencies once (`cargoDeps`) and
+  # hands the compiled target directory to each check, which then compiles
+  # only Hellas crates. Hydra populates cache.hellas.ai with these outputs.
+  craneLib =
+    ((self.inputs.crane.mkLib pkgs).overrideToolchain (_: rustToolchain)).overrideScope
+      (_: _: { stdenvSelector = p: p.clangStdenv; });
+
+  # Feature set that clippy and the regression suite build with.
+  integrationFeatures = "integration-tests,hellas-chain/indexer-api";
+
+  craneArgs = {
+    pname = "hellas";
+    version = "0.1.0";
+    src = buildSrc;
+    strictDeps = true;
+    # Git dependencies are fetched at the revisions in Cargo.lock, so bumping
+    # them needs no hash update here.
+    cargoVendorDir = craneLib.vendorCargoDeps { src = buildSrc; };
+    # No --profile flag: `cargo test` keeps the test profile, `cargo check`
+    # and `cargo clippy` the dev profile, matching plain cargo in a checkout.
+    CARGO_PROFILE = "";
+    inherit (commonArgs)
+      RUST_MIN_STACK
+      SQLX_OFFLINE
+      SSL_CERT_FILE
+      NIX_SSL_CERT_FILE
+      ;
+    buildInputs = workspaceBuildInputs;
+    nativeBuildInputs = workspaceNativeBuildInputs;
+  };
+
+  cargoDeps = craneLib.buildDepsOnly (
+    craneArgs
+    // {
+      # Every configuration the checks build, so none recompiles dependencies.
+      buildPhaseCargoCommand = ''
+        cargo check --locked --workspace --all-targets --features ${integrationFeatures}
+        cargo test --locked --workspace --no-run
+        cargo test --locked --workspace --features ${integrationFeatures} --no-run
+      '';
+      doCheck = false;
+    }
+  );
+
+  craneChecks = {
+    clippy = craneLib.cargoClippy (
+      craneArgs
+      // {
+        cargoArtifacts = cargoDeps;
+        cargoClippyExtraArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings";
+      }
+    );
+    unit = craneLib.cargoTest (
+      craneArgs
+      // {
+        pname = "hellas-unit";
+        cargoArtifacts = cargoDeps;
+        cargoTestExtraArgs = "--workspace";
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+        RUST_TEST_THREADS = "1";
+      }
+    );
+    regressions = craneLib.cargoTest (
+      craneArgs
+      // {
+        pname = "hellas-regressions";
+        cargoArtifacts = cargoDeps;
+        cargoTestExtraArgs = "--workspace --features ${integrationFeatures} -- --test-threads=1";
+      }
+    );
+  };
+
   # Stamp the revision only on shipped artifacts. Checks and validation builds
   # leave it out, so a commit that changes no inputs reuses their results.
   revEnv.GIT_REV = builtins.substring 0 12 rev;
@@ -154,5 +227,7 @@ in
     commonArgs
     mkHellasPackage
     revEnv
+    cargoDeps
+    craneChecks
     ;
 }

@@ -17,6 +17,7 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane.url = "github:ipetkov/crane";
     # Public, pinned HIP 7.15+ ROCm package set.
     nix-strix-halo = {
       url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
@@ -28,6 +29,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      crane,
       nix-strix-halo,
     }:
     let
@@ -61,6 +63,10 @@
       checks = forAllSystems (system: perSystem.${system}.checks);
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
+      # The `hellas` Hydra jobset builds master and admitted PRs. It builds the
+      # compiled dependencies only, so GitHub-hosted checks substitute them
+      # from cache.hellas.ai; the checks themselves run on GitHub.
+      hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
       # Selected explicitly by the component's Hydra jobset, never by PR CI.
       releaseJobs =
         builtins.mapAttrs

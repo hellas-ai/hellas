@@ -415,20 +415,7 @@ let
       command = "cargo fmt --all -- --check";
     };
 
-    clippy = nativePkg.mkHellasPackage {
-      pname = "hellas-check-clippy";
-      cargoBuildType = "debug";
-      buildPhase = ''
-        runHook preBuild
-        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --offline -- -D warnings
-        runHook postBuild
-      '';
-      doCheck = false;
-      installPhase = ''
-        mkdir -p "$out"
-        touch "$out/passed"
-      '';
-    };
+    inherit (nativePkg.craneChecks) clippy;
 
     taplo = mkHydraSourceCheck {
       name = "check-taplo";
@@ -468,26 +455,7 @@ let
 
   };
 
-  hydraUnit = nativePkg.mkHellasPackage (
-    {
-      pname = "hellas-check-unit";
-      buildType = "debug";
-      dontBuild = true;
-      doCheck = true;
-      cargoTestFlags = [
-        "--locked"
-        "--workspace"
-      ];
-      installPhase = ''
-        mkdir -p "$out"
-        touch "$out/passed"
-      '';
-    }
-    // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-      cargoTestJobs = 1;
-      RUST_TEST_THREADS = "1";
-    }
-  );
+  hydraUnit = nativePkg.craneChecks.unit;
 
 in
 {
@@ -552,6 +520,9 @@ in
 
   checks = hydraLints // {
     unit = hydraUnit;
+    inherit (nativePkg.craneChecks) regressions;
+    # Published so later builds substitute compiled dependencies.
+    cargo-deps = nativePkg.cargoDeps;
   };
   nixosTests = linuxOutputs.nixosTests or { };
 
