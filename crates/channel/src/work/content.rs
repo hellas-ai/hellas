@@ -209,6 +209,10 @@ where
                 Some(VerifiedReader::Memory(std::io::Cursor::new(
                     prepared_bytes.clone(),
                 )))
+            } else if matches!(&source.1.kind, ScopeKind::Work { closure, .. } if !closure.contains(&reference)) {
+                // A retained client share excludes provider-held assets. Probe
+                // the signed remote closure without reading outside that share.
+                None
             } else {
                 source.0.open_verified(&source.1, reference, None).await?
             };
@@ -284,6 +288,13 @@ impl WorkService {
         self.content_uploads
             .lock()
             .map(|uploads| uploads.len())
+            .map_err(|_| status(Error::Denied))
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completed_content_upload(&self, work: Digest) -> Result<bool, WireStatus> {
+        self.content_uploads
+            .lock()
+            .map(|uploads| uploads.get(&work).is_some_and(|(_, _, active)| !*active))
             .map_err(|_| status(Error::Denied))
     }
     fn complete_content_upload(&self, work: Digest, reservation: u64) -> Result<(), WireStatus> {
