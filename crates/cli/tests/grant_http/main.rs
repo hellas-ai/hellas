@@ -27,6 +27,11 @@ use tokio::{
     sync::Semaphore,
 };
 
+/// Bound for a hung process or request, not a performance requirement. These
+/// tests start real nodes that compile, sign and journal while CI runs many
+/// suites at once; the properties under test never depend on how fast that is.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
 struct Https {
     origin: String,
     root_der: String,
@@ -214,7 +219,7 @@ impl Cli {
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
-        tokio::time::timeout(Duration::from_secs(30), self.command(args).output())
+        tokio::time::timeout(HANG_GUARD, self.command(args).output())
             .await
             .unwrap()
             .unwrap()
@@ -246,7 +251,7 @@ struct Process {
 }
 impl Process {
     async fn wait_for(&mut self, marker: &str) -> String {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + HANG_GUARD;
         loop {
             let log = std::fs::read_to_string(&self.log).unwrap();
             if let Some((_, tail)) = log.split_once(marker) {
@@ -267,7 +272,7 @@ impl Process {
         unsafe {
             libc::kill(self.child.id().unwrap() as i32, libc::SIGTERM);
         }
-        let status = tokio::time::timeout(Duration::from_secs(15), self.child.wait())
+        let status = tokio::time::timeout(HANG_GUARD, self.child.wait())
             .await
             .unwrap()
             .unwrap();
@@ -591,7 +596,7 @@ fn gateway_client(token: &str) -> reqwest::Client {
                 .into_iter()
                 .collect(),
         )
-        .timeout(Duration::from_secs(10))
+        .timeout(HANG_GUARD)
         .build()
         .unwrap()
 }

@@ -626,7 +626,7 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
             b"hellas.gateway.http.requests".as_slice(),
             b"hellas.execution.executions_completed".as_slice(),
         ];
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !names.is_empty() {
                 let body = exports.recv().await.unwrap();
                 names.retain(|name| !body.windows(name.len()).any(|window| window == *name));

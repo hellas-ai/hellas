@@ -378,7 +378,9 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
     };
     let verifier =
         hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
-    let client = tokio::time::timeout(Duration::from_secs(45), async {
+    // A hang guard, not a speed requirement: the property is that RPC starts
+    // only after the full peer-floor probe, asserted below.
+    let client = tokio::time::timeout(Duration::from_secs(180), async {
         loop {
             assert!(
                 validator.process.try_wait().unwrap().is_none(),
