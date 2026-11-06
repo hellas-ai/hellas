@@ -161,7 +161,7 @@ impl PaidWork {
     ) -> CliResult<Self> {
         let file = PaidWorkFile::read(path)?;
         let chain = WorkConfig::for_chain(profile, &home)?;
-        let root = home.join("provider");
+        let root = hellas_sdk::grant_config::GrantConfig::provider_dir(&home);
         let policy = file.checked_policy(path, fetch_config)?;
         hellas_private::create_dir_all_durable(&root)?;
         hellas_private::create_dir_all_durable(&chain.chain.provider())?;
@@ -327,7 +327,7 @@ impl PaidWork {
         let network = hellas_authority::model::grant::grant_network();
         let bootstrap_path = self.root.join("bootstrap.json");
         let store = match NodeStore::open(
-            config.journal_root(),
+            &config.journal_root(),
             network,
             Some(enrollment.clone()),
             now,
@@ -401,16 +401,16 @@ impl PaidWork {
                     ) {
                         (true, true) => {
                             profile::server_identity(
-                                config.control_certificate(),
-                                config.control_private_key(),
+                                &config.control_certificate(),
+                                &config.control_private_key(),
                             )?;
                             (
                                 hellas_private::read_bounded_regular_file(
-                                    config.control_certificate(),
+                                    &config.control_certificate(),
                                     64 * 1024,
                                 )?,
                                 hellas_private::read_bounded_regular_file(
-                                    config.control_private_key(),
+                                    &config.control_private_key(),
                                     64 * 1024,
                                 )?,
                             )
@@ -442,15 +442,15 @@ impl PaidWork {
                 ] {
                     if path.try_exists()? {
                         ensure!(
-                            hellas_private::read_bounded_regular_file(path, 64 * 1024)? == *bytes,
+                            hellas_private::read_bounded_regular_file(&path, 64 * 1024)? == *bytes,
                             "paid control TLS differs from its saved initialization"
                         );
                     } else {
-                        publish(path, bytes)?;
+                        publish(&path, bytes)?;
                     }
                 }
                 NodeStore::bootstrap_prepared(
-                    config.journal_root(),
+                    &config.journal_root(),
                     network,
                     GrantId([0; 16]),
                     data.approval,
@@ -598,14 +598,8 @@ impl PaidWork {
         let owner = signer.party_key();
         let path = self.chain.chain.provider().join("delegation.json");
         let mut pins = Vec::from(hellas_chain::genesis_digest(chain.config().genesis()).as_ref());
-        pins.extend_from_slice(
-            chain
-                .config()
-                .genesis_payload()
-                .expect("started node has H0")
-                .as_ref(),
-        );
-        pins.extend_from_slice(chain.config().threshold_identity());
+        pins.extend_from_slice(chain.genesis_payload().as_ref());
+        pins.extend_from_slice(&chain.config().threshold_identity());
         let genesis = hex::encode(Digest::hash(&pins).as_bytes());
         let mut receipt: Delegation = if path.try_exists()? {
             serde_json::from_slice(&hellas_private::read_bounded_regular_file(

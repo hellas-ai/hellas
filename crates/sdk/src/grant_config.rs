@@ -61,36 +61,35 @@ struct ConfigFile {
     resources: Vec<ResourceFile>,
 }
 pub struct GrantConfig {
-    pub(crate) journal_root: PathBuf,
-    pub(crate) control_socket: PathBuf,
-    pub(crate) control_certificate: PathBuf,
-    pub(crate) control_private_key: PathBuf,
+    provider_dir: PathBuf,
     pub remote_control: crate::node_control::RemoteControlAdmission,
     pub max_job_millis: NonZeroU64,
     pub configuration: NodeConfiguration,
 }
 impl GrantConfig {
-    pub fn journal_root(&self) -> &Path {
-        &self.journal_root
+    pub fn provider_dir(home: &Path) -> PathBuf {
+        home.join("provider")
     }
-    pub fn control_socket(&self) -> &Path {
-        &self.control_socket
+    pub fn journal_dir(home: &Path) -> PathBuf {
+        Self::provider_dir(home).join("authority")
     }
-    pub fn control_certificate(&self) -> &Path {
-        &self.control_certificate
+    pub fn journal_root(&self) -> PathBuf {
+        self.provider_dir.join("authority")
     }
-    pub fn control_private_key(&self) -> &Path {
-        &self.control_private_key
+    pub fn control_socket(&self) -> PathBuf {
+        self.provider_dir.join("control.sock")
+    }
+    pub fn control_certificate(&self) -> PathBuf {
+        self.provider_dir.join("control.cert.der")
+    }
+    pub fn control_private_key(&self) -> PathBuf {
+        self.provider_dir.join("control.key.der")
     }
 
     /// Serves no resources and configures no budgets; never supplies permissions.
     pub fn unconfigured(root: &Path) -> Self {
-        let provider = root.join("provider");
         Self {
-            journal_root: provider.clone(),
-            control_socket: provider.join("control.sock"),
-            control_certificate: provider.join("control.cert.der"),
-            control_private_key: provider.join("control.key.der"),
+            provider_dir: Self::provider_dir(root),
             remote_control: Default::default(),
             max_job_millis: NonZeroU64::MIN.saturating_add(1_799_999), // 30 minutes
             configuration: NodeConfiguration::default(),
@@ -107,14 +106,6 @@ impl GrantConfig {
             crate::node_control::RemoteControlAdmission::new(file.remote_control_peers)
                 .map_err(|_| GrantError::Limits)?
         };
-        let provider = home.join("provider");
-        let journal_root = provider.clone();
-        let control_socket = provider.join("control.sock");
-        let control_certificate = provider.join("control.cert.der");
-        let control_private_key = provider.join("control.key.der");
-        if !home.is_absolute() {
-            return Err(GrantError::Limits.into());
-        }
         let resources = file
             .resources
             .into_iter()
@@ -140,15 +131,11 @@ impl GrantConfig {
             }
         }
         let configuration = NodeConfiguration::new(file.machine, accounts, resources)?;
-        Ok(Self {
-            journal_root,
-            control_socket,
-            control_certificate,
-            control_private_key,
-            remote_control,
-            max_job_millis: file.max_job_millis,
-            configuration,
-        })
+        let mut config = Self::unconfigured(home);
+        config.remote_control = remote_control;
+        config.max_job_millis = file.max_job_millis;
+        config.configuration = configuration;
+        Ok(config)
     }
 }
 
@@ -221,9 +208,12 @@ mod tests {
         let mut config = json!({"max_job_millis":10000,"resources":[]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let loaded = GrantConfig::load(&path, directory.path()).unwrap();
-        assert_eq!(loaded.journal_root, directory.path().join("provider"));
         assert_eq!(
-            loaded.control_private_key,
+            loaded.journal_root(),
+            directory.path().join("provider/authority")
+        );
+        assert_eq!(
+            loaded.control_private_key(),
             directory.path().join("provider/control.key.der")
         );
         config["journal_root"] = json!(directory.path().join("elsewhere"));
@@ -287,7 +277,7 @@ mod tests {
             parsed.configuration.machine().unwrap().max_in_flight.get(),
             8
         );
-        assert!(!parsed.journal_root.exists());
+        assert!(!parsed.journal_root().exists());
         // The configuration owns the budget tree above pools, completely: a
         // resource needs a machine and a declared account, and every declared
         // account is used exactly once.

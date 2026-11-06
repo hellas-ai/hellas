@@ -53,7 +53,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
             .is_err()
     );
     let store = NodeStore::open(
-        config.journal_root(),
+        &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         UnixMillis::now().unwrap(),
@@ -280,10 +280,7 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
             "routes": [{
                 "service": "codex",
                 "method": "responses",
-                "destination": {
-                    "type": "codex-responses",
-                    "auth_path": "target/hellas-test-codex-auth.json"
-                }
+                "destination": { "type": "codex-responses" }
             }]
         })
         .to_string(),

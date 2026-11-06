@@ -9,7 +9,9 @@ use hellas_sdk::{
         ExecutionAttempt, ExecutionResult, ExecutionSession, ExecutionTerms, PaidCompletion,
     },
     job::{Job, JobInput},
-    paid_client::{PaidWorkOptions, bind_paid_endpoint, request_paid_quote, settle_channel},
+    paid_client::{
+        PaidJournalKind, PaidWorkOptions, bind_paid_endpoint, request_paid_quote, settle_channel,
+    },
     transact::PaidAttemptPath,
 };
 use std::{
@@ -176,7 +178,7 @@ pub struct Context {
     pub producer: ProducerSigningKey,
     pub owner: hellas_kernel::SoftPasskey,
     pub home: PathBuf,
-    pub chain: hellas_chain::genesis::ChainDir,
+    pub chain: hellas_chain::chain_dir::ChainDir,
 }
 
 impl Context {
@@ -194,7 +196,7 @@ impl Context {
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
             home: home.to_path_buf(),
-            chain: hellas_chain::genesis::ChainDir::open(home, chain)?,
+            chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
         })
     }
 }
@@ -235,13 +237,6 @@ impl ClientArgs {
         select_attempt(&path, job, self.buy_again)
     }
 
-    /// One directory of channel journals per provider address.
-    fn journals(&self, root: &Path) -> super::CliResult<PathBuf> {
-        Ok(root
-            .join("channels")
-            .join(self.paid_provider()?.address.to_string()))
-    }
-
     async fn options(
         &self,
         context: &Context,
@@ -273,10 +268,7 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
-            journal_root: hellas_sdk::paid_client::PaidJournalDir::client(
-                &config.chain,
-                provider.address,
-            ),
+            journal_kind: PaidJournalKind::Client,
             config,
             provider: provider.address,
             provider_addrs: provider

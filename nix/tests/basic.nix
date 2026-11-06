@@ -26,7 +26,7 @@
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-policy"
         ${package}/bin/hellas gateway --help | grep -F -- "--trust-store"
         ${package}/bin/hellas serve --help | grep -F -- "--content <PATH>"
-        ${package}/bin/hellas serve --help | grep -F -- "--home <HOME>"
+        ${package}/bin/hellas --help | grep -F -- "--home <DIR>"
         ${package}/bin/hellas serve --help | grep -F -- "--content-root <DIR>"
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-programs"
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-asset-bytes"

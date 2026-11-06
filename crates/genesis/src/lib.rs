@@ -47,6 +47,8 @@ pub struct FaucetAccount {
 /// A network whose genesis document ships inside the binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownNetwork {
+    /// The selector for this compiled identity.
+    pub chain: Chain,
     /// Short name to select it by, e.g. `devnet`.
     pub name: &'static str,
     /// Full network id the document declares, e.g. `hellas-devnet-1`.
@@ -71,28 +73,27 @@ pub enum Chain {
 
 impl Default for Chain {
     fn default() -> Self {
-        Self::Devnet
+        KNOWN_NETWORKS[0].chain
     }
 }
 
 impl Chain {
     #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Devnet => "devnet",
-        }
+    pub fn name(self) -> &'static str {
+        self.network().name
     }
 
     #[must_use]
     pub fn parse(selector: &str) -> Option<Self> {
-        (selector == HELLAS_DEVNET_1_ID || selector == "devnet").then_some(Self::Devnet)
+        known_network(selector).map(|network| network.chain)
     }
 
     #[must_use]
     pub fn network(self) -> &'static KnownNetwork {
-        match self {
-            Self::Devnet => &KNOWN_NETWORKS[0],
-        }
+        KNOWN_NETWORKS
+            .iter()
+            .find(|network| network.chain == self)
+            .expect("compiled chain registry entry")
     }
 }
 
@@ -103,9 +104,11 @@ impl Chain {
 /// document passed by path is a document that can be swapped.
 ///
 /// This registry supplies the default compiled Chain and explicit selection.
-/// Adding a chain adds an entry; it never edits an existing identity.
+/// A reset of this ephemeral devnet replaces its entry and bumps its network id.
+/// Adding another deployed chain adds a separate entry.
 /// Callers resolve one Chain or provide a custom profile.
 pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
+    chain: Chain::Devnet,
     name: "devnet",
     id: HELLAS_DEVNET_1_ID,
     json: HELLAS_DEVNET_1_JSON,
@@ -268,4 +271,4 @@ mod tests;
 mod trust;
 pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
 mod profile;
-pub use profile::{ChainDir, ChainProfile, ChainProfileError, CustomChainFile};
+pub use profile::{ChainProfile, ChainProfileError, CustomChainFile};

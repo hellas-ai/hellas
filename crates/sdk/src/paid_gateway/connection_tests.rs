@@ -20,9 +20,9 @@ async fn gateway_refuses_funding_owner_from_another_genesis() {
     let original_network = fixture.config.chain.network_id().to_owned();
     let mut config = fixture.config;
     config.chain =
-        crate::test_support::chain_dir_with_digest(fixture.root.path(), config.network(), [2; 32]);
+        crate::test_support::chain_dir_with_variant(fixture.root.path(), config.network(), 2);
     assert_eq!(original_network, config.chain.network_id());
-    assert_ne!(owner.chain_root(), config.chain.as_path());
+    assert_ne!(owner.chain().as_path(), config.chain.as_path());
     let provider = crate::test_support::address(iroh::SecretKey::generate().public());
     let options = crate::paid_gateway::PaidGatewayOptions {
         config,
@@ -169,14 +169,6 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             let fixture = crate::test_support::PaidFixture::on_network(devnet.network());
             let mut pool = super::tests::test_pool(&fixture, fixture.policy.clone()).await;
             let approvals = Arc::new(Approvals::default());
-            pool.owner = Arc::new(
-                crate::client_owner::ClientOwner::new(
-                    approvals.clone(),
-                    pool.settlement_key.party_key(),
-                    &fixture.config.chain,
-                )
-                .unwrap(),
-            );
             let first = quote_server(true).await;
             let second = quote_server(false).await;
             use commonware_cryptography::{Hasher as _, Sha256};
@@ -188,16 +180,12 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             trust.epochs[0].threshold_identity =
                 hex::encode(&devnet.consensus_info().threshold_identity);
             let config = crate::work_config::WorkConfig {
-                chain: hellas_chain::genesis::ChainDir::open(
+                chain: hellas_chain::chain_dir::ChainDir::open(
                     fixture.root.path(),
                     &ChainProfile::custom(CustomChainFile {
-                        consensus_digest: hex::encode(
-                            hellas_chain::genesis_digest(devnet.genesis()).0,
-                        ),
                         trust,
                         validators: devnet.light_client_urls(),
-                        genesis_json: Some(genesis_json),
-                        genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
+                        genesis_json,
                     })
                     .unwrap(),
                 )
@@ -205,6 +193,14 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 poll: Duration::from_millis(20),
                 max_observation_age: Duration::from_secs(30),
             };
+            pool.owner = Arc::new(
+                crate::client_owner::ClientOwner::new(
+                    approvals.clone(),
+                    pool.settlement_key.party_key(),
+                    &config.chain,
+                )
+                .unwrap(),
+            );
             // A peer that accepts TCP but never completes WebSocket setup must
             // not hold up another peer's already verified snapshot.
             let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,8 +221,6 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 let mut args = original.args.clone();
                 args.config = config.clone();
                 args.provider = crate::test_identity::address(endpoint.id());
-                args.journal_root =
-                    crate::paid_client::PaidJournalDir::gateway(&config.chain, args.provider);
                 args.provider_addrs = endpoint.bound_sockets();
                 args.timeout = Some(Duration::from_secs(60));
                 pool.providers.push(Arc::new(Provider {
@@ -252,7 +246,7 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             let second_contact = *second.reached.lock().unwrap();
             for provider in &pool.providers {
                 let found = hellas_channel::work_store::discover_setups(
-                    &provider.args.journal_root,
+                    &provider.args.journal_root(),
                     devnet.network(),
                 )
                 .await

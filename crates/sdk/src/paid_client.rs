@@ -2,7 +2,6 @@
 //! journal recovery, payment, and finalized settlement. Journals are client-owned.
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
@@ -53,54 +52,18 @@ use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
 
-/// A paid journal selected from the same chain as its Work configuration.
-#[derive(Clone, Debug)]
-pub struct PaidJournalDir {
-    path: PathBuf,
-    chain_root: PathBuf,
-}
-
-impl PaidJournalDir {
-    pub fn client(
-        chain: &hellas_chain::genesis::ChainDir,
-        provider: hellas_client::ProviderAddress,
-    ) -> Self {
-        Self {
-            path: chain.client().join("channels").join(provider.to_string()),
-            chain_root: chain.as_path().to_path_buf(),
-        }
-    }
-    pub fn gateway(
-        chain: &hellas_chain::genesis::ChainDir,
-        provider: hellas_client::ProviderAddress,
-    ) -> Self {
-        Self {
-            path: chain
-                .gateway(&provider.node.to_string())
-                .expect("canonical endpoint ID"),
-            chain_root: chain.as_path().to_path_buf(),
-        }
-    }
-}
-
-impl std::ops::Deref for PaidJournalDir {
-    type Target = PathBuf;
-    fn deref(&self) -> &Self::Target {
-        &self.path
-    }
-}
-
-impl AsRef<std::path::Path> for PaidJournalDir {
-    fn as_ref(&self) -> &std::path::Path {
-        &self.path
-    }
+/// Client purchases and gateway pools own distinct journal layouts.
+#[derive(Clone, Copy, Debug)]
+pub enum PaidJournalKind {
+    Client,
+    Gateway,
 }
 
 /// Options shared by all jobs on a paid channel.
 #[derive(Clone)]
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
-    pub journal_root: PaidJournalDir,
+    pub journal_kind: PaidJournalKind,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
     /// Direct UDP addresses of `provider.node`.
@@ -185,13 +148,18 @@ async fn within<T>(
 }
 
 impl PaidWorkOptions {
+    pub fn journal_root(&self) -> std::path::PathBuf {
+        match self.journal_kind {
+            PaidJournalKind::Client => self
+                .config
+                .chain
+                .client_journals(&self.provider.to_string()),
+            PaidJournalKind::Gateway => self.config.chain.gateway(&self.provider.node.to_string()),
+        }
+    }
+
     /// Reject impossible deadlines and collateral before connecting or signing.
     pub fn validate(&self) -> Result<()> {
-        if self.journal_root.chain_root != self.config.chain.as_path() {
-            return Err(PaidClientError::InvalidOptions(
-                "paid journal belongs to another chain",
-            ));
-        }
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
             return Err(PaidClientError::InvalidOptions(
                 "deadline spans must be positive",
@@ -504,7 +472,7 @@ impl PaidWorkSession {
         args.validate()?;
         let config = &args.config;
         config.clone().validate()?;
-        if owner.chain_root() != config.chain.as_path() {
+        if owner.chain().as_path() != config.chain.as_path() {
             return Err(PaidClientError::InvalidOptions(
                 "funding owner belongs to another chain directory",
             ));
@@ -515,9 +483,10 @@ impl PaidWorkSession {
             ));
         }
         let read_timeout = read_timeout(args.timeout);
-        std::fs::create_dir_all(&args.journal_root).map_err(|source| {
+        let journal_root = args.journal_root();
+        std::fs::create_dir_all(&journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
-                path: args.journal_root.path.clone(),
+                path: journal_root.clone(),
                 source,
             }
         })?;
@@ -525,8 +494,7 @@ impl PaidWorkSession {
         // has not reached. Establish that floor before a source is chosen;
         // recovery reads below it would only be refused by the same guard.
         let setups =
-            offer::RetainedSetups::discover(&args.journal_root, config.network(), args.provider)
-                .await?;
+            offer::RetainedSetups::discover(&journal_root, config.network(), args.provider).await?;
         let floor = setups.floor();
         let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
         let chain = WorkBlocks::new(remote.clone())
@@ -567,7 +535,7 @@ impl PaidWorkSession {
                 .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
-                    &args.journal_root,
+                    &args.journal_root(),
                     config.network(),
                     signed.offer().proposal.bond_edge(),
                     Role::Client,
@@ -609,9 +577,7 @@ impl PaidWorkSession {
                 .import_offer(*args.provider.node.as_bytes(), signed)
                 .await?;
         }
-        owner
-            .claim(config.network(), args.provider.node, &payment_funding)
-            .await?;
+        owner.claim(args.provider.node, &payment_funding).await?;
         let bundle = setup
             .state()
             .bundle()

@@ -513,17 +513,19 @@ impl Devnet {
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
         ChainProfile::custom(CustomChainFile {
-            consensus_digest: hex::encode(crate::genesis_digest(&self.document).0),
             trust,
             validators: vec![validator.light_client_url.clone()],
-            genesis_json: Some(genesis_json),
-            genesis_payload: Some(hex::encode(self.genesis_payload.0)),
+            genesis_json,
         })
         .unwrap()
     }
 
-    pub fn chain_dir(&self, home: &std::path::Path, validator: usize) -> crate::genesis::ChainDir {
-        crate::genesis::ChainDir::open(home, &self.profile(validator)).unwrap()
+    pub fn chain_dir(
+        &self,
+        home: &std::path::Path,
+        validator: usize,
+    ) -> crate::chain_dir::ChainDir {
+        crate::chain_dir::ChainDir::open(home, &self.profile(validator)).unwrap()
     }
 
     pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {

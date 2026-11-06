@@ -12,10 +12,22 @@ fn secp256k1_key_from_scalar(scalar: u8) -> SettlementKey {
     )
 }
 
-fn config_with_genesis(address: String) -> ValidatorConfig {
+fn config_with_genesis(address: String) -> (ValidatorConfig, Genesis) {
     let private_key = ed25519::PrivateKey::from_seed(1);
     let public_key = hex::encode(private_key.public_key().encode());
-    ValidatorConfig {
+    let genesis = Genesis {
+        schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
+        network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
+        validators: vec![GenesisValidator {
+            public_key,
+            label: "validator-0".to_string(),
+        }],
+        allocations: vec![GenesisEntry {
+            address,
+            balance: 10,
+        }],
+    };
+    let config = ValidatorConfig {
         private_key: encode_private_key(&private_key),
         threshold_share: String::new(),
         threshold_polynomial: String::new(),
@@ -26,26 +38,15 @@ fn config_with_genesis(address: String) -> ValidatorConfig {
         chain_sync_bind: None,
         archive_blocks: None,
         relay_urls: Vec::new(),
-        genesis: Genesis {
-            schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
-            validators: vec![GenesisValidator {
-                public_key,
-                label: "validator-0".to_string(),
-            }],
-            allocations: vec![GenesisEntry {
-                address,
-                balance: 10,
-            }],
-        },
         peers: Vec::new(),
-    }
+    };
+    (config, genesis)
 }
 
 #[cfg(feature = "validator")]
 #[test]
 fn an_omitted_light_client_bind_keeps_the_listener_off() {
-    let config = config_with_genesis("owner".to_string());
+    let (config, _) = config_with_genesis("owner".to_string());
     let rendered = toml::to_string(&config).expect("serialize validator config");
     assert!(!rendered.contains("light_client_bind"));
 
@@ -58,7 +59,7 @@ fn an_omitted_light_client_bind_keeps_the_listener_off() {
 #[cfg(feature = "validator")]
 #[test]
 fn a_light_client_bind_is_an_address_by_parse_and_not_by_spelling() {
-    let mut config = config_with_genesis("owner".to_string());
+    let (mut config, _) = config_with_genesis("owner".to_string());
     let bind = SocketAddr::from(([0, 0, 0, 0], 31_246));
     config.light_client_bind = Some(bind);
     let rendered = toml::to_string(&config).expect("serialize validator config");
@@ -147,27 +148,27 @@ fn genesis_parser_accepts_secp256k1_scalar_4() {
 
 #[test]
 fn genesis_committee_must_include_local_identity() {
-    let mut config = config_with_genesis(p256_key(7).to_string());
+    let (config, mut genesis) = config_with_genesis(p256_key(7).to_string());
     let other = ed25519::PrivateKey::from_seed(2);
-    config.genesis.validators[0].public_key = hex::encode(other.public_key().encode());
+    genesis.validators[0].public_key = hex::encode(other.public_key().encode());
 
     assert!(matches!(
-        config.participants(),
+        config.participants(&genesis),
         Err(ConfigError::MissingLocalValidator)
     ));
 }
 
 #[test]
 fn peer_topology_must_cover_exact_genesis_committee() {
-    let mut config = config_with_genesis(p256_key(7).to_string());
+    let (config, mut genesis) = config_with_genesis(p256_key(7).to_string());
     let other = ed25519::PrivateKey::from_seed(2);
-    config.genesis.validators.push(GenesisValidator {
+    genesis.validators.push(GenesisValidator {
         public_key: hex::encode(other.public_key().encode()),
         label: "validator-1".to_string(),
     });
 
     assert!(matches!(
-        config.peer_address_map(),
+        config.peer_address_map(&genesis),
         Err(ConfigError::PeerSetMismatch)
     ));
 }
@@ -176,12 +177,14 @@ fn peer_topology_must_cover_exact_genesis_committee() {
 fn any_valid_genesis_network_id_is_accepted_and_carried() {
     let address = p256_key(7).to_string();
     for id in ["hellas-devnet-1", "another-network", "someone-elses-net"] {
-        let mut config = config_with_genesis(address.clone());
-        config.genesis.network_id = id.to_string();
+        let (config, mut genesis) = config_with_genesis(address.clone());
+        genesis.network_id = id.to_string();
 
-        config.validate_genesis().expect("a valid genesis is valid");
+        config
+            .validate_genesis(&genesis)
+            .expect("a valid genesis is valid");
         assert_eq!(
-            config.network_id().expect("id fits").as_str(),
+            config.network_id(&genesis).expect("id fits").as_str(),
             id,
             "the configured network must be the one the node signs under",
         );
@@ -203,7 +206,7 @@ fn p256_key(scalar: u8) -> SettlementKey {
 
 #[test]
 fn validator_metrics_default_to_loopback_and_remote_bind_is_explicit() {
-    let mut value = serde_json::to_value(config_with_genesis(String::new())).unwrap();
+    let mut value = serde_json::to_value(config_with_genesis(String::new()).0).unwrap();
     value["metrics_port"] = serde_json::json!(9090);
     value
         .as_object_mut()

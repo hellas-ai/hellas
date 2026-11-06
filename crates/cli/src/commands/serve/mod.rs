@@ -113,8 +113,8 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         info!(
             network = %work.network(),
             validators = work.chain.validators().len(),
-            journal_root = %work.provider_journal_root().display(),
-            poll_ms = work.poll.as_millis(),
+            journal_root = %work.chain.provider_journals().display(),
+            poll_ms = work.poll().as_millis(),
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
             // that can settle nothing, and this is where they find out.
@@ -125,8 +125,8 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         work_runner = Some((
             hellas_sdk::paid_provider::WorkRunnerConfig {
                 chain: work.chain.clone(),
-                poll: work.poll,
-                max_observation_age: work.max_observation_age,
+                poll: work.poll(),
+                max_observation_age: work.max_observation_age(),
                 settlement_key: options.settlement_key.clone(),
             },
             chain,
@@ -332,7 +332,7 @@ enum FetchDestination {
         config: hellas_providers::HttpProviderConfig,
     },
     /// Official Codex Responses, authenticated by the local Codex OAuth store.
-    CodexResponses,
+    CodexResponses {},
 }
 
 impl FetchDestination {
@@ -340,7 +340,7 @@ impl FetchDestination {
     fn contract(&self) -> CliResult<hellas_rpc::FetchContract> {
         match self {
             Self::Http { .. } => Ok(hellas_rpc::FetchContract::http()?),
-            Self::CodexResponses => Ok(hellas_providers::codex_responses_contract()?),
+            Self::CodexResponses {} => Ok(hellas_providers::codex_responses_contract()?),
         }
     }
 
@@ -351,7 +351,7 @@ impl FetchDestination {
     ) -> CliResult<FetchRouteEntry> {
         let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
             Self::Http { config } => return Ok(config.into_entry(capabilities)?),
-            Self::CodexResponses => Arc::new(codex_provider::CodexResponsesFetchProvider::new(
+            Self::CodexResponses {} => Arc::new(codex_provider::CodexResponsesFetchProvider::new(
                 &home.join("codex-auth.json"),
             )?),
         };

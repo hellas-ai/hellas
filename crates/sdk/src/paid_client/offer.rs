@@ -231,13 +231,7 @@ pub(super) async fn fund_offer(
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
     let funding = owner
-        .fund_with_approval(
-            chain,
-            args.config.network(),
-            args.provider.node,
-            quote.funding_value,
-            controls,
-        )
+        .fund_with_approval(chain, args.provider.node, quote.funding_value, controls)
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;
     let offer = match connection

@@ -63,6 +63,8 @@ impl ManagedWorker {
                 "--await-owner",
                 "--grant-config",
                 string(&resources),
+                "--fetch-config",
+                string(&state.join("fetch.json")),
                 "--port",
                 "0",
                 "--no-discovery",

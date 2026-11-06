@@ -159,7 +159,7 @@ pub async fn run(
             .context("profile requires local server trust")?;
         let socket = match args.control_socket {
             Some(path) => path,
-            None => home.join("provider").join("control.sock"),
+            None => hellas_sdk::grant_config::GrantConfig::provider_dir(home).join("control.sock"),
         };
         let (client, challenge) = node_control::connect_local(
             &socket,

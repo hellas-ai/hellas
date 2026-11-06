@@ -39,7 +39,7 @@ impl ServeArgs {
             session_programs: self.gpu_session_programs,
             session_asset_bytes: self.gpu_session_asset_bytes,
         };
-        let index = hellas_store::state::records_path_at(&home.join("store"));
+        let index = hellas_store::state::records_path_in(home);
         let mode = if self.require_content_index {
             IndexMode::Require
         } else {

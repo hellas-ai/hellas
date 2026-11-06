@@ -40,7 +40,6 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
         &["--buy-again"],
         &["--validator", "ws://localhost"],
         &["--address", "127.0.0.1:1"],
-        &["--state-dir", "paid-state"],
         &["--acceptance-blocks", "300"],
         &["--terminal-blocks", "3000"],
         &["--payment-blocks", "600"],
@@ -127,7 +126,7 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     )
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    let chain = hellas_chain::genesis::ChainDir::open(
+    let chain = hellas_chain::chain_dir::ChainDir::open(
         root.path(),
         &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )

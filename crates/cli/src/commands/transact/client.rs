@@ -15,9 +15,8 @@ pub(super) async fn config(args: &ClientArgs, context: &Context) -> CliResult<Wo
 
 pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()> {
     let provider = args.paid_provider()?;
-    let root = args.root(context);
     let config = config(args, context).await?;
-    let journals = args.journals(&root)?;
+    let journals = context.chain.client_journals(&provider.address.to_string());
     if !journals.exists() {
         println!("no open channels with {}", provider.address);
         return Ok(());

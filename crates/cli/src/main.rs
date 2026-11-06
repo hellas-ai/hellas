@@ -117,7 +117,7 @@ struct Cli {
     chain: Option<String>,
 
     /// Complete independently authenticated custom chain profile.
-    #[arg(long, global = true, value_name = "FILE", conflicts_with = "chain")]
+    #[arg(long, global = true, value_name = "FILE")]
     chain_config: Option<PathBuf>,
     /// Process state home (default: HELLAS_HOME or $HOME/.hellas).
     #[arg(long, global = true, value_name = "DIR")]
@@ -525,17 +525,16 @@ async fn async_main() {
         }
     };
     let identity_path = home.join("identity");
-    let selected_chain = match (&cli.chain, &cli.chain_config) {
-        (Some(name), None) => hellas_chain::genesis::Chain::parse(name)
+    let selected_chain = if let Some(path) = &cli.chain_config {
+        hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
+    } else if let Some(name) = &cli.chain {
+        hellas_chain::genesis::Chain::parse(name)
             .map(hellas_chain::genesis::ChainProfile::known)
-            .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}")),
-        (None, Some(path)) => {
-            hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
-        }
-        (None, None) => Ok(hellas_chain::genesis::ChainProfile::known(
+            .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}"))
+    } else {
+        Ok(hellas_chain::genesis::ChainProfile::known(
             hellas_chain::genesis::Chain::default(),
-        )),
-        (Some(_), Some(_)) => unreachable!("clap rejects both chain selectors"),
+        ))
     };
     let selected_chain = match selected_chain {
         Ok(chain) => chain,
@@ -544,12 +543,6 @@ async fn async_main() {
             std::process::exit(2);
         }
     };
-    if cli.owner.is_faucet()
-        && selected_chain.known_chain() != Some(hellas_chain::genesis::Chain::Devnet)
-    {
-        eprintln!("error: --faucet and --faucet-account require the compiled devnet chain");
-        std::process::exit(2);
-    }
     if let Err(error) = validate_identity_options(&cli.command, cli.software_root) {
         eprintln!("error: {error}");
         std::process::exit(2);
@@ -901,7 +894,9 @@ async fn async_main() {
                         let fetch_config_file = match (fetch_config_file, await_owner) {
                             (Some(path), _) => Some(path),
                             (None, true) => {
-                                let path = home.join("provider").join("fetch.json");
+                                let path =
+                                    hellas_sdk::grant_config::GrantConfig::provider_dir(&home)
+                                        .join("fetch.json");
                                 if !path.try_exists()? {
                                     hellas_private::write_atomically(
                                         &path,

@@ -19,9 +19,5 @@ fn provisioning_uses_the_generic_client_side_commands_without_an_identity() {
         }
         let cli = Cli::try_parse_from(args).unwrap();
         validate_identity_options(&cli.command, false).unwrap();
-        assert!(
-            Cli::try_parse_from(["hellas", "--identity", "identity.json", "machines", "list"])
-                .is_err()
-        );
     }
 }

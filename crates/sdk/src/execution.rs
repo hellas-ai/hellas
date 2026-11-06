@@ -162,6 +162,7 @@ enum AttemptRecord {
 /// same file and lock as Purchase; grant attempts contain identifiers only.
 pub struct ExecutionAttempt {
     path: PathBuf,
+    paid_state_key: Option<String>,
     input: Digest,
     terms: ExecutionTerms,
     record: AttemptRecord,
@@ -172,7 +173,7 @@ impl ExecutionAttempt {
         if matches!(terms, ExecutionTerms::Paid { .. }) {
             return Err(ExecutionError::Identity);
         }
-        Self::open_inner(path, input, terms, true)
+        Self::open_inner(path, input, terms, true, None)
     }
 
     /// Open only an existing attempt, failing closed if its record was lost.
@@ -180,11 +181,17 @@ impl ExecutionAttempt {
         if matches!(terms, ExecutionTerms::Paid { .. }) {
             return Err(ExecutionError::Identity);
         }
-        Self::open_inner(path, input, terms, false)
+        Self::open_inner(path, input, terms, false, None)
     }
 
     pub fn open_paid(path: &PaidAttemptPath, input: &JobInput, price: u64) -> Result<Self> {
-        Self::open_inner(path.as_path(), input, ExecutionTerms::Paid { price }, true)
+        Self::open_inner(
+            path.as_path(),
+            input,
+            ExecutionTerms::Paid { price },
+            true,
+            Some(path.state_key()),
+        )
     }
 
     pub fn open_existing_paid(
@@ -192,7 +199,13 @@ impl ExecutionAttempt {
         input: &JobInput,
         price: u64,
     ) -> Result<Self> {
-        Self::open_inner(path.as_path(), input, ExecutionTerms::Paid { price }, false)
+        Self::open_inner(
+            path.as_path(),
+            input,
+            ExecutionTerms::Paid { price },
+            false,
+            Some(path.state_key()),
+        )
     }
 
     fn open_inner(
@@ -200,6 +213,7 @@ impl ExecutionAttempt {
         input: &JobInput,
         terms: ExecutionTerms,
         create: bool,
+        paid_state_key: Option<&str>,
     ) -> Result<Self> {
         // Keep caller records out of the reserved completion namespace so one
         // attempt cannot overwrite another attempt's payload or receipt.
@@ -285,6 +299,7 @@ impl ExecutionAttempt {
         };
         Ok(Self {
             path: path.to_owned(),
+            paid_state_key: paid_state_key.map(str::to_owned),
             input: digest,
             terms,
             record,
@@ -356,6 +371,9 @@ impl ExecutionAttempt {
         owner: std::sync::Arc<crate::client_owner::ClientOwner>,
         funding: crate::paid_client::SessionFundingOptions,
     ) -> Result<PaidWorkSession> {
+        if self.paid_state_key.as_deref() != Some(options.config.chain.state_key().as_str()) {
+            return Err(ExecutionError::Identity);
+        }
         let terms = ExecutionTerms::Paid {
             price: options.expected_price,
         };

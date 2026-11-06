@@ -1,74 +1,63 @@
 use crate::{Chain, Genesis, TrustDocument};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::{
-    collections::BTreeSet,
-    io,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeSet;
+
+const STATE_KEY_DOMAIN: &[u8] = b"hellas.chain-state.v1\0";
 
 /// One authenticated chain identity and its untrusted transport routes.
 #[derive(Clone, Debug)]
 pub struct ChainProfile {
     known: Option<Chain>,
     consensus_digest: [u8; 32],
+    state_key: [u8; 32],
     trust: TrustDocument,
     validators: Vec<String>,
-    genesis: Option<Genesis>,
+    genesis: Genesis,
     /// Exact authenticated bytes when full-node execution is requested.
-    genesis_json: Option<String>,
-    genesis_payload: Option<[u8; 32]>,
+    genesis_json: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainProfileError {
     #[error("validator routes need at least one ws:// or wss:// URL with a host")]
     Routes,
-    #[error("validator routes must be distinct")]
-    DuplicateRoute,
     #[error("invalid chain trust: {0}")]
     Trust(#[from] crate::TrustError),
     #[error("invalid chain genesis: {0}")]
     Genesis(#[from] crate::GenesisError),
-    #[error("invalid chain digest")]
-    Digest,
-    #[error("invalid chain genesis payload")]
-    Payload,
+    #[error("invalid chain genesis JSON: {0}")]
+    GenesisJson(#[from] serde_json::Error),
+    #[error("chain trust does not bind the supplied genesis JSON")]
+    Binding,
     #[error("this binary is out of date for {0}; please update")]
     OutOfDate(&'static str),
-    #[error("this chain needs full genesis for execution")]
-    MissingExecution,
     #[error("this role requires one open trusted epoch beginning at zero")]
     UnsupportedSchedule,
 }
 
-/// Complete authenticated light input; execution fields are needed only by full nodes.
+/// Complete authenticated chain input, including the genesis document.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomChainFile {
-    pub consensus_digest: String,
     pub trust: TrustDocument,
     pub validators: Vec<String>,
-    pub genesis_json: Option<String>,
-    pub genesis_payload: Option<String>,
-}
-
-fn digest_hex(value: &str) -> Result<[u8; 32], ChainProfileError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(ChainProfileError::Digest);
-    }
-    hex::decode(value)
-        .map_err(|_| ChainProfileError::Digest)?
-        .try_into()
-        .map_err(|_| ChainProfileError::Digest)
+    pub genesis_json: String,
 }
 
 fn canonical_digest(genesis: &Genesis) -> [u8; 32] {
     Sha256::digest(serde_json::to_vec(genesis).expect("genesis serializes")).into()
+}
+
+fn state_key(consensus_digest: [u8; 32], trust: &TrustDocument) -> [u8; 32] {
+    // Validation makes epoch zero and its fixed-width hexadecimal identity mandatory.
+    // Later epochs deliberately do not change a directory's initial authority.
+    let initial = hex::decode(&trust.epochs[0].threshold_identity).expect("validated epoch zero");
+    let mut hash = Sha256::new();
+    hash.update(STATE_KEY_DOMAIN);
+    hash.update(consensus_digest);
+    hash.update(initial);
+    hash.finalize().into()
 }
 
 fn validate_routes(routes: Vec<String>) -> Result<Vec<String>, ChainProfileError> {
@@ -84,7 +73,7 @@ fn validate_routes(routes: Vec<String>) -> Result<Vec<String>, ChainProfileError
         }
         let normalized = parsed.to_string();
         if !seen.insert(normalized.clone()) {
-            return Err(ChainProfileError::DuplicateRoute);
+            return Err(ChainProfileError::Routes);
         }
         out.push(normalized);
     }
@@ -109,7 +98,7 @@ impl ChainProfile {
 
     #[must_use]
     pub fn state_key(&self) -> String {
-        hex::encode(self.consensus_digest)
+        hex::encode(self.state_key)
     }
 
     #[must_use]
@@ -138,18 +127,23 @@ impl ChainProfile {
     }
 
     #[must_use]
-    pub fn genesis_json(&self) -> Option<&str> {
-        self.genesis_json.as_deref()
+    pub fn genesis_json(&self) -> &str {
+        &self.genesis_json
     }
 
     #[must_use]
-    pub fn genesis(&self) -> Option<&Genesis> {
-        self.genesis.as_ref()
+    pub fn genesis(&self) -> &Genesis {
+        &self.genesis
     }
 
     #[must_use]
-    pub fn has_execution(&self) -> bool {
-        self.genesis.is_some()
+    pub fn known_genesis_payload_pin(&self) -> Option<[u8; 32]> {
+        self.known.map(|chain| {
+            hex::decode(chain.network().genesis_payload_hex.trim())
+                .expect("shipped genesis payload decodes")
+                .try_into()
+                .expect("shipped genesis payload is 32 bytes")
+        })
     }
 
     pub fn with_validators(mut self, routes: Vec<String>) -> Result<Self, ChainProfileError> {
@@ -164,214 +158,119 @@ impl ChainProfile {
     pub fn known(chain: Chain) -> Self {
         let network = chain.network();
         let genesis: Genesis = serde_json::from_str(network.json).expect("shipped genesis decodes");
-        genesis.validate().expect("shipped genesis validates");
         let trust: TrustDocument =
             serde_json::from_str(network.trust_json).expect("shipped trust decodes");
-        trust.validate().expect("shipped trust validates");
-        assert_eq!(
-            trust.network_id, genesis.network_id,
-            "shipped network mismatch"
-        );
-        assert_eq!(
-            trust.genesis_sha256,
-            hex::encode(Sha256::digest(network.json)),
-            "shipped genesis file mismatch"
-        );
+        let consensus_digest = canonical_digest(&genesis);
         Self {
             known: Some(chain),
-            consensus_digest: canonical_digest(&genesis),
+            consensus_digest,
+            state_key: state_key(consensus_digest, &trust),
             trust,
-            validators: validate_routes(
-                network
-                    .validators
-                    .iter()
-                    .map(|route| (*route).to_owned())
-                    .collect(),
-            )
-            .expect("shipped validator routes"),
-            genesis: Some(genesis),
-            genesis_json: Some(network.json.to_owned()),
-            genesis_payload: Some(
-                digest_hex(network.genesis_payload_hex.trim())
-                    .expect("shipped genesis payload decodes"),
-            ),
+            validators: network
+                .validators
+                .iter()
+                .map(|route| (*route).to_owned())
+                .collect(),
+            genesis,
+            genesis_json: network.json.to_owned(),
         }
     }
 
     pub fn custom(file: CustomChainFile) -> Result<Self, ChainProfileError> {
         file.trust.validate()?;
-        let network_id = file.trust.network_id.clone();
-        let consensus_digest = digest_hex(&file.consensus_digest)?;
-        let genesis = file
-            .genesis_json
-            .as_ref()
-            .map(|json| -> Result<Genesis, ChainProfileError> {
-                let parsed: Genesis =
-                    serde_json::from_str(json).map_err(|_| ChainProfileError::Digest)?;
-                parsed.validate()?;
-                if parsed.network_id != network_id
-                    || canonical_digest(&parsed) != consensus_digest
-                    || hex::encode(Sha256::digest(json)) != file.trust.genesis_sha256
-                {
-                    return Err(ChainProfileError::Digest);
-                }
-                Ok(parsed)
-            })
-            .transpose()?;
-        let genesis_payload = file
-            .genesis_payload
-            .as_deref()
-            .map(|raw| digest_hex(raw).map_err(|_| ChainProfileError::Payload))
-            .transpose()?;
-        for chain in [Chain::Devnet] {
-            if network_id == chain.network().id {
+        let genesis: Genesis = serde_json::from_str(&file.genesis_json)?;
+        genesis.validate()?;
+        let consensus_digest = canonical_digest(&genesis);
+        let file_digest = hex::encode(Sha256::digest(&file.genesis_json));
+        for network in crate::KNOWN_NETWORKS {
+            let chain = network.chain;
+            if genesis.network_id == chain.network().id {
                 let shipped = Self::known(chain);
                 if consensus_digest != shipped.consensus_digest
                     || file.trust != shipped.trust
-                    || genesis
-                        .as_ref()
-                        .is_some_and(|value| Some(value) != shipped.genesis.as_ref())
-                    || genesis_payload.is_some_and(|value| Some(value) != shipped.genesis_payload)
+                    || file_digest != file.trust.genesis_sha256
                 {
                     return Err(ChainProfileError::OutOfDate(chain.name()));
                 }
                 return shipped.with_validators(file.validators);
             }
         }
+        if genesis.network_id != file.trust.network_id || file_digest != file.trust.genesis_sha256 {
+            return Err(ChainProfileError::Binding);
+        }
+        let state_key = state_key(consensus_digest, &file.trust);
         Ok(Self {
             known: None,
             consensus_digest,
+            state_key,
             trust: file.trust,
             validators: validate_routes(file.validators)?,
             genesis,
             genesis_json: file.genesis_json,
-            genesis_payload,
         })
     }
 
-    pub fn execution(&self) -> Result<(&Genesis, Option<[u8; 32]>), ChainProfileError> {
-        Ok((
-            self.genesis
-                .as_ref()
-                .ok_or(ChainProfileError::MissingExecution)?,
-            self.genesis_payload,
-        ))
-    }
-}
-
-/// The one directory owned by a selected chain under a process home.
-#[derive(Clone, Debug)]
-pub struct ChainDir {
-    home: PathBuf,
-    root: PathBuf,
-    profile: ChainProfile,
-}
-
-impl ChainDir {
-    pub fn open(home: &Path, profile: &ChainProfile) -> io::Result<Self> {
-        let root = home.join("chains").join(profile.state_key());
-        hellas_private::create_dir_all_durable(&root)?;
-        Ok(Self {
-            home: home.to_path_buf(),
-            root,
-            profile: profile.clone(),
-        })
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.root
-    }
-    pub fn home(&self) -> &Path {
-        &self.home
-    }
-    pub fn profile(&self) -> &ChainProfile {
-        &self.profile
-    }
-    pub fn with_validators(mut self, validators: Vec<String>) -> Result<Self, ChainProfileError> {
-        self.profile = self.profile.with_validators(validators)?;
-        Ok(self)
-    }
-    pub fn rotate_validators(&mut self) {
-        self.profile.rotate_validators();
-    }
-    pub fn node(&self) -> PathBuf {
-        self.root.join("node")
-    }
-    pub fn head(&self) -> PathBuf {
-        self.root.join("head")
-    }
-    pub fn client(&self) -> PathBuf {
-        self.root.join("client")
-    }
-    pub fn provider(&self) -> PathBuf {
-        self.root.join("provider")
-    }
-    pub fn gateway(&self, provider: &str) -> io::Result<PathBuf> {
-        if provider.is_empty()
-            || !provider
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid provider key",
-            ));
-        }
-        Ok(self.root.join("gateway").join(provider))
-    }
-    pub fn indexer(&self) -> PathBuf {
-        self.root.join("indexer")
-    }
-    pub fn validator(&self) -> PathBuf {
-        self.root.join("validator")
-    }
-    pub fn faucet_account(&self) -> PathBuf {
-        self.root.join("faucet-account")
-    }
-}
-
-impl std::ops::Deref for ChainDir {
-    type Target = ChainProfile;
-    fn deref(&self) -> &Self::Target {
-        &self.profile
+    pub fn execution(&self) -> &Genesis {
+        &self.genesis
     }
 }
 
 #[cfg(test)]
-mod namespace_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn canonical_digest_separates_same_id_and_rejects_traversal_before_open() {
-        let home = tempfile::tempdir().unwrap();
+    fn initial_authority_changes_state_key_but_later_epochs_do_not() {
         let known = ChainProfile::known(Chain::Devnet);
+        let mut genesis = known.genesis().clone();
+        genesis.network_id = "custom-1".into();
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
         let mut trust = known.trust().clone();
-        trust.network_id = "custom-1".into();
-        let make = |digest: &str, trust: TrustDocument| {
+        trust.network_id = genesis.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
+        let make = |trust: TrustDocument| {
             ChainProfile::custom(CustomChainFile {
-                consensus_digest: digest.into(),
                 trust,
                 validators: vec!["ws://127.0.0.1:9080".into()],
-                genesis_json: None,
-                genesis_payload: None,
+                genesis_json: genesis_json.clone(),
             })
+            .unwrap()
         };
-        let first = make(&"01".repeat(32), trust.clone()).unwrap();
-        let second = make(&("01".repeat(31) + "02"), trust.clone()).unwrap();
-        let a = ChainDir::open(home.path(), &first).unwrap();
-        let b = ChainDir::open(home.path(), &second).unwrap();
-        assert_eq!(a.profile().network_id(), b.profile().network_id());
-        assert_ne!(a.as_path(), b.as_path());
-        assert_eq!(
-            a.as_path().file_name().unwrap().to_str().unwrap(),
-            "01".repeat(32)
-        );
-        assert_eq!(a.state_key().len(), 64);
-        assert!(a.as_path().is_dir() && b.as_path().is_dir());
+        let first = make(trust.clone());
 
-        trust.network_id = "../../escape".into();
-        assert!(make(&"03".repeat(32), trust).is_err());
-        assert!(!home.path().join("escape").exists());
-        assert!(a.gateway("../escape").is_err());
+        let mut other_authority = trust.clone();
+        let mut key = hex::decode(&other_authority.epochs[0].threshold_identity).unwrap();
+        key[0] ^= 1;
+        other_authority.epochs[0].threshold_identity = hex::encode(key);
+        assert_ne!(first.state_key(), make(other_authority).state_key());
+
+        trust.epochs[0].end_height = Some(10);
+        let mut next = trust.epochs[0].clone();
+        next.epoch += 1;
+        next.start_height = 10;
+        next.end_height = None;
+        trust.epochs.push(next);
+        assert_eq!(first.state_key(), make(trust).state_key());
+    }
+
+    #[test]
+    fn custom_profile_requires_genesis_bytes_and_rejects_a_foreign_name() {
+        let known = ChainProfile::known(Chain::Devnet);
+        let without_genesis = serde_json::json!({
+            "trust": known.trust(),
+            "validators": ["ws://127.0.0.1:9080"]
+        });
+        assert!(serde_json::from_value::<CustomChainFile>(without_genesis).is_err());
+
+        let mut trust = known.trust().clone();
+        trust.network_id = "unrelated-1".into();
+        assert!(matches!(
+            ChainProfile::custom(CustomChainFile {
+                trust,
+                validators: vec!["ws://127.0.0.1:9080".into()],
+                genesis_json: known.genesis_json().to_owned(),
+            }),
+            Err(ChainProfileError::OutOfDate("devnet"))
+        ));
     }
 }

@@ -6,17 +6,25 @@ mod error;
 mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
-use hellas_chain::genesis::{ChainDir, ChainProfile, CustomChainFile};
+use hellas_chain::chain_dir::ChainDir;
+use hellas_chain::genesis::{ChainProfile, CustomChainFile};
 
 /// One process chain and its transport, journal and observation settings.
 #[derive(Clone, Debug)]
 pub struct WorkConfig {
     pub chain: ChainDir,
-    pub poll: Duration,
-    pub max_observation_age: Duration,
+    pub(crate) poll: Duration,
+    pub(crate) max_observation_age: Duration,
 }
 
 impl WorkConfig {
+    pub fn poll(&self) -> Duration {
+        self.poll
+    }
+
+    pub fn max_observation_age(&self) -> Duration {
+        self.max_observation_age
+    }
     pub fn for_chain(chain: ChainProfile, root: &Path) -> Result<Self> {
         Self::from_chain_dir(ChainDir::open(root, &chain)?)
     }
@@ -47,18 +55,6 @@ impl WorkConfig {
             },
             self.chain.consensus_digest().into(),
         )?;
-        if self.poll.is_zero() {
-            return Err(WorkConfigError::Invalid {
-                field: "poll_ms",
-                reason: "must be greater than zero",
-            });
-        }
-        if self.max_observation_age <= self.poll {
-            return Err(WorkConfigError::Invalid {
-                field: "max_observation_age_ms",
-                reason: "must exceed poll_ms",
-            });
-        }
         Ok(self)
     }
 
@@ -66,38 +62,17 @@ impl WorkConfig {
         &self,
         archive_blocks: Option<std::num::NonZeroU64>,
     ) -> Result<hellas_chain::node::Config> {
-        Ok(
-            hellas_chain::node::Config::for_profile(self.chain.clone(), Vec::new(), archive_blocks)
-                .map_err(|_| WorkConfigError::Invalid {
-                    field: "chain",
-                    reason: "full genesis and selected pins are required for execution",
-                })?,
-        )
-    }
-
-    pub fn client_journal_root(&self) -> std::path::PathBuf {
-        self.chain.client().join("channels")
-    }
-    pub fn provider_journal_root(&self) -> std::path::PathBuf {
-        self.chain.provider().join("channels")
+        hellas_chain::node::Config::for_profile(self.chain.clone(), Vec::new(), archive_blocks)
+            .map_err(|_| WorkConfigError::Invalid {
+                field: "chain",
+                reason: "selected trust schedule cannot run a static full node",
+            })
     }
 
     pub fn check_node(&self, node: &hellas_chain::node::FullNode) -> Result<()> {
-        let (genesis, payload) = self
-            .chain
-            .execution()
-            .map_err(|_| WorkConfigError::Invalid {
-                field: "chain",
-                reason: "full genesis is required for execution",
-            })?;
-        let actual = node.config();
-        if genesis != actual.genesis()
-            || self.threshold_identity()? != actual.threshold_identity()
-            || payload.is_some_and(|pin| {
-                actual
-                    .genesis_payload()
-                    .is_none_or(|found| pin.as_slice() != found.as_ref())
-            })
+        let actual = node.config().chain();
+        if self.chain.consensus_digest() != actual.consensus_digest()
+            || self.chain.trust() != actual.trust()
         {
             return Err(WorkConfigError::Invalid {
                 field: "chain",

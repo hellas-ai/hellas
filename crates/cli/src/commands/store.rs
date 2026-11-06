@@ -64,7 +64,7 @@ pub enum StoreCommand {
 }
 
 pub async fn run(command: StoreCommand, home: &Path) -> CliResult {
-    let default_records = Some(hellas_store::state::records_path_at(&home.join("store")));
+    let default_records = Some(hellas_store::state::records_path_in(home));
     match command {
         StoreCommand::Index {
             paths,

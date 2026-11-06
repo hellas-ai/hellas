@@ -75,7 +75,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 calls: 0,
             })));
             let mut bond = None;
-            for n in 0..10 {
+            for n in 0u64..10 {
                 // The SDK retries funding visibility on the same connection;
                 // a failed session open must fail the test, not start another.
                 let open = PaidWorkSession::open(
@@ -105,7 +105,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     session.descriptor().bond_edge()
                 );
                 let mut nonce = [0; 16];
-                nonce[8..].copy_from_slice(&(n as u64).to_be_bytes());
+                nonce[8..].copy_from_slice(&n.to_be_bytes());
                 let attempt = hellas_sdk::transact::PaidAttemptPath::new(
                     &case.options.config.chain,
                     case.options.provider,
@@ -157,7 +157,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             let bond = bond.expect("ten jobs used one retained bond");
             let verifier = hellas_kernel::Secp256k1Verifier::new();
             let setup = hellas_channel::work_store::SetupStore::open_existing(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 case.options.config.network(),
                 bond,
                 hellas_channel::work_store::Role::Client,
@@ -169,7 +169,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             let origin = setup.state().origin().unwrap();
             drop(setup);
             let channel = hellas_channel::work_store::ChannelStore::open_existing(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 descriptor.channel().clone(),
                 descriptor.expected_settlement().unwrap(),
                 hellas_channel::work_store::Role::Client,

@@ -147,13 +147,13 @@ impl Daemon {
         .unwrap();
         let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         hellas_private::write_atomically(
-            grant_config.control_certificate(),
+            &grant_config.control_certificate(),
             ".writing",
             tls.cert.der(),
         )
         .unwrap();
         hellas_private::write_atomically(
-            grant_config.control_private_key(),
+            &grant_config.control_private_key(),
             ".writing",
             &tls.signing_key.serialize_der(),
         )
@@ -162,7 +162,7 @@ impl Daemon {
         let profile_json = serde_json::json!({
             "authority": authority, "authorization": root_grant,
             "credential": "app.credential",
-            "local": {"certificate": "control.cert.der", "server_name": "localhost"},
+            "local": {"certificate": grant_config.control_certificate(), "server_name": "localhost"},
         });
         hellas_private::write_atomically(
             &profile_path,

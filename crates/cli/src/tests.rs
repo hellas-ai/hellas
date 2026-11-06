@@ -90,19 +90,6 @@ fn identity_init_has_an_explicit_dispatch_command() {
 
 #[test]
 fn identity_free_commands_reject_software_root_but_allow_home() {
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "--identity",
-            "unused.identity",
-            "offer",
-            "import",
-            "provider.offer",
-            "--name",
-            "provider"
-        ])
-        .is_err()
-    );
     let cli = Cli::try_parse_from([
         "hellas",
         "--home",
@@ -228,7 +215,6 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
         for invalid in [
             vec!["--address", "127.0.0.1:9000"],
             vec!["--node", "node.enrollment", "--control-socket", "node.sock"],
-            vec!["--store-dir", "store"],
             vec!["--output-cache", "off"],
         ] {
             let mut argv = vec!["hellas", "admin"];

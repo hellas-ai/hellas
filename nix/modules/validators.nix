@@ -517,23 +517,7 @@ in
                 }
                 // optionalAttrs (validator.memoryMax != null) { MemoryMax = validator.memoryMax; }
                 // optionalAttrs (validator.stateGeneration > 0) {
-                  ExecStartPre =
-                    let
-                      resetState = pkgs.writeShellScript "hellas-validator-state-check" ''
-                        set -eu
-                        key=$(${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain state-key)
-                        state=${escapeShellArg home}/chains/"$key"/validator
-                        stamp="$state/.state-generation"
-                        target=${toString validator.stateGeneration}
-                        current=$(${pkgs.coreutils}/bin/cat "$stamp" 2>/dev/null || echo 0)
-                        if [ "$current" != "$target" ]; then
-                          ${pkgs.coreutils}/bin/mkdir -p "$state"
-                          ${pkgs.findutils}/bin/find "$state" -mindepth 1 -delete
-                          echo "$target" > "$stamp"
-                        fi
-                      '';
-                    in
-                    "+${resetState}";
+                  ExecStartPre = "${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain validator state-generation --generation ${toString validator.stateGeneration}";
                 };
               };
             }

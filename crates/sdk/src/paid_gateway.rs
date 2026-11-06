@@ -173,7 +173,7 @@ impl PaidGateway {
         funding: crate::paid_client::SessionFundingOptions,
     ) -> Result<Arc<Self>> {
         options.validate()?;
-        if owner.chain_root() != options.config.chain.as_path() {
+        if owner.chain().as_path() != options.config.chain.as_path() {
             return Err(PoolError::Invalid(
                 "funding owner belongs to another chain directory",
             ));
@@ -192,7 +192,7 @@ impl PaidGateway {
             // Retained policy journals can depend on a height behind a fast
             // validator; select a source that already serves it.
             let setups = crate::paid_client::offer::RetainedSetups::discover(
-                &args.journal_root,
+                &args.journal_root(),
                 args.config.network(),
                 args.provider,
             )
@@ -461,7 +461,7 @@ fn empty_content() -> InvocationContent {
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
     let found = hellas_channel::work_store::discover_setups(
-        &options.journal_root,
+        &options.journal_root(),
         options.config.network(),
     )
     .await?;
@@ -862,17 +862,17 @@ mod tests {
             .clone()
             .with_config(options.config.clone());
         assert!(!has_retained_setup(provider).await.unwrap());
-        std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
+        std::fs::create_dir_all(provider.journal_root().join("apple-counters")).unwrap();
         std::fs::write(
             provider
-                .journal_root
+                .journal_root()
                 .join("apple-counters/producer.counter"),
             [1],
         )
         .unwrap();
         assert!(!has_retained_setup(provider).await.unwrap());
         let store = hellas_channel::work_store::SetupStore::open(
-            &provider.journal_root,
+            &provider.journal_root(),
             provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
@@ -886,7 +886,7 @@ mod tests {
             "an unsigned header carries no recovery obligation"
         );
         let store = hellas_channel::work_store::SetupStore::open(
-            &provider.journal_root,
+            &provider.journal_root(),
             provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
@@ -904,35 +904,6 @@ mod tests {
         endpoint.import(&fixture.proposal.encode()).await.unwrap();
         drop(endpoint);
         assert!(has_retained_setup(provider).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn shared_pool_rejects_reused_journal_before_opening_or_writing() {
-        let fixture = crate::test_support::PaidFixture::new();
-        let mut options = pool_options(&fixture);
-        let mut second = options.providers[0].clone();
-        second.provider =
-            crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
-        options.providers.push(second);
-        let identity = crate::NodeIdentity::generate();
-        let owner = Arc::new(
-            crate::client_owner::ClientOwner::new(
-                Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
-                Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
-                    .unwrap()
-                    .party_key(),
-                &fixture.config.chain,
-            )
-            .unwrap(),
-        );
-        let result = PaidGateway::open(options, identity, owner).await;
-        assert!(matches!(
-            result,
-            Err(PoolError::Invalid(
-                "paid providers must have distinct journal roots"
-            ))
-        ));
-        assert!(!fixture.root.path().join("client").exists());
     }
 
     #[tokio::test]

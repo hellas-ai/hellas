@@ -42,12 +42,8 @@ pub(crate) use transport::serve_validator_archive;
 /// Independently provisioned execution inputs. Peers supply blocks, never these pins.
 #[derive(Clone, Debug)]
 pub struct Config {
-    chain: hellas_genesis::ChainDir,
+    chain: crate::chain_dir::ChainDir,
     indexed: bool,
-    genesis: hellas_genesis::Genesis,
-    threshold_identity: Vec<u8>,
-    /// Optional independently provisioned H0 pin; startup retains the locally derived value.
-    genesis_payload: Option<Digest>,
     /// Validator transaction ingress URLs; replication uses ChainSync peers.
     pub validators: Vec<String>,
     /// Additional untrusted sources discovered or configured by the host.
@@ -60,8 +56,6 @@ pub(crate) enum Indexing {
     Off,
     #[cfg(feature = "indexer-api")]
     On {
-        trust: hellas_genesis::TrustDocument,
-        genesis_json: Vec<u8>,
         partition: String,
     },
 }
@@ -80,19 +74,20 @@ pub enum Error {
 
 impl Config {
     pub fn genesis(&self) -> &hellas_genesis::Genesis {
-        &self.genesis
+        self.chain.profile().genesis()
     }
 
-    pub fn threshold_identity(&self) -> &[u8] {
-        &self.threshold_identity
+    pub fn threshold_identity(&self) -> Vec<u8> {
+        hex::decode(&self.chain.profile().trust().epochs[0].threshold_identity)
+            .expect("validated trust identity")
     }
 
-    pub fn genesis_payload(&self) -> Option<Digest> {
-        self.genesis_payload
+    pub fn chain(&self) -> &crate::chain_dir::ChainDir {
+        &self.chain
     }
 
     pub fn for_profile(
-        chain: hellas_genesis::ChainDir,
+        chain: crate::chain_dir::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
@@ -100,34 +95,32 @@ impl Config {
             .profile()
             .static_threshold_identity()
             .map_err(|error| Error::Config(error.to_string()))?;
-        let mut config = Self::for_indexed_profile(chain, peers, archive_blocks)?;
-        config.indexed = false;
-        Ok(config)
+        Ok(Self::from_profile(chain, peers, archive_blocks, false))
     }
 
+    #[cfg(feature = "indexer-api")]
     pub(crate) fn for_indexed_profile(
-        chain: hellas_genesis::ChainDir,
+        chain: crate::chain_dir::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
-        let profile = chain.profile();
-        let (genesis, genesis_payload) = profile
-            .execution()
-            .map_err(|error| Error::Config(error.to_string()))?;
-        let threshold_identity = hex::decode(&profile.trust().epochs[0].threshold_identity)
-            .map_err(|error| Error::Config(error.to_string()))?;
-        let validators = profile.validators().to_vec();
-        let genesis = genesis.clone();
-        Ok(Self {
+        Ok(Self::from_profile(chain, peers, archive_blocks, true))
+    }
+
+    fn from_profile(
+        chain: crate::chain_dir::ChainDir,
+        peers: Vec<iroh::EndpointAddr>,
+        archive_blocks: Option<NonZeroU64>,
+        indexed: bool,
+    ) -> Self {
+        let validators = chain.profile().validators().to_vec();
+        Self {
             chain,
-            indexed: true,
-            genesis,
-            threshold_identity,
-            genesis_payload: genesis_payload.map(Into::into),
+            indexed,
             validators,
             peers,
             archive_blocks,
-        })
+        }
     }
 
     pub fn storage_dir(&self) -> PathBuf {
@@ -144,20 +137,17 @@ impl Config {
                 "at most 64 chain sources may be configured".into(),
             ));
         }
-        self.genesis
-            .validate()
-            .map_err(|e| Error::Config(e.to_string()))?;
+        let genesis = self.genesis();
         let info = ConsensusInfo {
-            network_id: self.genesis.network_id.clone(),
-            validators: self
-                .genesis
+            network_id: genesis.network_id.clone(),
+            validators: genesis
                 .validators
                 .iter()
                 .map(|v| v.public_key.clone())
                 .collect(),
-            threshold_identity: self.threshold_identity.clone(),
+            threshold_identity: self.threshold_identity(),
         };
-        ConsensusVerifier::new(&info, crate::genesis_digest(&self.genesis))
+        ConsensusVerifier::new(&info, crate::genesis_digest(genesis))
             .map_err(|e| Error::Config(e.to_string()))?;
         Ok(info)
     }
@@ -418,7 +408,7 @@ impl Core {
         let info = config.info()?;
         let chain_config = ArchiveConfig::default();
         let leader = config
-            .genesis
+            .genesis()
             .validators
             .iter()
             .map(|v| {
@@ -431,18 +421,20 @@ impl Core {
             .ok_or_else(|| invalid("empty genesis committee"))?;
         let mut application = crate::Application::new(
             context.child("app"),
-            crate::domain::network_id(&config.genesis).map_err(invalid)?,
-            crate::genesis_digest(&config.genesis),
+            crate::domain::network_id(config.genesis()).map_err(invalid)?,
+            crate::genesis_digest(config.genesis()),
             leader,
-            genesis_allocations(&config.genesis).map_err(invalid)?,
+            genesis_allocations(config.genesis()).map_err(invalid)?,
             "chain",
             crate::ApplicationConfig::default(),
         )
         .await;
         let genesis = application.genesis_block();
         if config
-            .genesis_payload
-            .is_some_and(|pin| genesis.digest() != pin)
+            .chain
+            .profile()
+            .known_genesis_payload_pin()
+            .is_some_and(|pin| genesis.digest().0 != pin)
         {
             return Err(Error::Config("genesis payload differs from its pin".into()));
         }
@@ -477,17 +469,13 @@ impl Core {
         #[cfg(feature = "indexer-api")]
         let publication = match indexing {
             Indexing::Off => None,
-            Indexing::On {
-                trust,
-                genesis_json: _,
-                partition,
-            } => {
+            Indexing::On { partition } => {
                 let Trust::Schedule(_, verifier) = &network.trust else {
                     return Err(invalid("index requires a trust schedule"));
                 };
                 let scope = crate::edge_index::query::cursor_scope(
-                    &config.genesis.network_id,
-                    &trust.genesis_sha256,
+                    &config.genesis().network_id,
+                    &config.chain.profile().trust().genesis_sha256,
                     verifier.trust_sha256(),
                 );
                 let index = crate::edge_index::EdgeIndex::open(
@@ -495,8 +483,8 @@ impl Core {
                         "{partition}-edge-index-v{}-{scope}.redb",
                         crate::edge_index::SCHEMA_VERSION
                     )),
-                    config.genesis.network_id.clone(),
-                    trust.genesis_sha256,
+                    config.genesis().network_id.clone(),
+                    config.chain.profile().trust().genesis_sha256.clone(),
                     verifier.trust_sha256().into(),
                 )
                 .map_err(storage)?;

@@ -79,9 +79,9 @@ fn build_open_identity(
 }
 
 pub(crate) fn load_or_create(path: &Path) -> anyhow::Result<LocalIdentity> {
-    match fs::read(&path) {
-        Ok(bytes) => decode(&path, &bytes),
-        Err(error) if error.kind() == ErrorKind::NotFound => create(&path),
+    match fs::read(path) {
+        Ok(bytes) => decode(path, &bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => create(path),
         Err(error) => {
             Err(error).with_context(|| format!("failed to read identity file {}", path.display()))
         }
@@ -98,9 +98,9 @@ pub(crate) fn settlement_signer(
 }
 
 pub(crate) fn load_existing(path: &Path) -> anyhow::Result<LocalIdentity> {
-    let bytes = fs::read(&path)
+    let bytes = fs::read(path)
         .with_context(|| format!("failed to read identity file {}", path.display()))?;
-    decode(&path, &bytes)
+    decode(path, &bytes)
 }
 
 pub(crate) fn grant_data_path(home: &Path) -> PathBuf {

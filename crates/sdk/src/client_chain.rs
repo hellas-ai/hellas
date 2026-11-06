@@ -75,7 +75,7 @@ pub async fn connect_at(
                 let verifier = verifier.clone();
                 async move {
                     tokio::time::timeout(timeout.min(Duration::from_secs(5)), async {
-                        let client = RemoteLightClient::connect(url).await?;
+                        let client = RemoteLightClient::connect(url, verifier).await?;
                         let reported = client.get_consensus_info().await?;
                         if reported.network_id != pinned.network_id
                             || reported.threshold_identity != pinned.threshold_identity
@@ -91,7 +91,6 @@ pub async fn connect_at(
                                 }
                             }));
                         }
-                        let client = client.with_consensus_verifier(verifier);
                         let latest = client.get_latest_block().await?.ok_or_else(|| {
                             QueryError::StateUnavailable("chain is catching up".into())
                         })?;

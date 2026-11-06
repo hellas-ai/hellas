@@ -545,11 +545,6 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     relays.source.forged.store(false, Ordering::SeqCst);
     assert!(client.get_objects(keys.clone()).await.unwrap().is_some());
-    let unpinned = RemoteLightClient::connect(&relays.urls[0]).await.unwrap();
-    assert!(matches!(
-        unpinned.get_objects(keys.clone()).await,
-        Err(QueryError::Remote(_))
-    ));
     assert!(matches!(
         client.get_objects(vec![coin_object_id(missing); 33]).await,
         Err(QueryError::Remote(_))

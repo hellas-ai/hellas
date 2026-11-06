@@ -14,4 +14,9 @@ pub fn records_path_at(root: &Path) -> PathBuf {
     root.join(RECORDS_FILE)
 }
 
+#[must_use]
+pub fn records_path_in(home: &Path) -> PathBuf {
+    records_path_at(&home.join("store"))
+}
+
 const RECORDS_FILE: &str = "fastresume.bin";

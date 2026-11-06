@@ -475,8 +475,8 @@ Work inspection and standing queries calculate current windows without writing c
 ticks. Existing spending and reservations are preserved.
 
 ```sh
-hellas --home node-home --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
-hellas --home node-home --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
+hellas --home node-home --passkey operator.passkey admin bootstrap --journal node-home/provider/authority --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas --home node-home --passkey operator.passkey admin recover --journal node-home/provider/authority --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
 
 Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
@@ -493,8 +493,9 @@ subject fingerprint, never the secret. Build the caller profile using the initia
 authority and grant values.
 
 For local service startup, independently provision `control.cert.der` and its
-PKCS#8 `control.key.der` under `<home>/provider`. The grant authority journal,
-control socket, certificate and key all use this directory. The daemon validates TLS identity before
+PKCS#8 `control.key.der` under `<home>/provider`. The control socket and TLS files
+use that directory; the grant authority journal is `<home>/provider/authority`.
+The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
 After explicit initialization, start the daemon with `--grant-config`. Its file
 contains `max_job_millis`, optional listener settings, machine/account budgets

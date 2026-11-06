@@ -149,11 +149,7 @@ async fn check_other_enrollment_refused(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
     approvals: &Approvals,
 ) {
-    let mut elsewhere = other_provider(options);
-    elsewhere.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
-        &elsewhere.config.chain,
-        elsewhere.provider,
-    );
+    let elsewhere = other_provider(options);
     let refused = |error: String| {
         assert!(error.contains("genesis pin mismatch"), "{error}");
     };
@@ -203,7 +199,7 @@ async fn check_other_enrollment_refused(
     );
     assert!(
         hellas_channel::work_store::discover_setups(
-            &elsewhere.journal_root,
+            &elsewhere.journal_root(),
             elsewhere.config.network()
         )
         .await
@@ -288,11 +284,7 @@ fn work_policy() -> InvocationPolicy {
 }
 
 fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig {
-    WorkConfig {
-        chain: devnet.chain_dir(&journal_root, 0),
-        poll: Duration::from_millis(20),
-        max_observation_age: Duration::from_secs(60),
-    }
+    WorkConfig::from_chain_dir(devnet.chain_dir(&journal_root, 0)).unwrap()
 }
 
 fn gateway_provider(options: &PaidWorkOptions) -> hellas_sdk::paid_gateway::GatewayProviderOptions {
@@ -673,7 +665,7 @@ async fn check_gateway_quote(
 ) {
     use hellas_gateway::WorkExecutionBackend as _;
     let args = options.clone();
-    let journal = args.journal_root.clone();
+    let journal = args.config.chain.gateway(&args.provider.node.to_string());
     let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
             config: args.config.clone(),
@@ -687,7 +679,6 @@ async fn check_gateway_quote(
     .await
     .unwrap();
     assert!(!journal.exists(), "gateway discovery only requests a quote");
-    assert!(!options.journal_root.exists(), "gateway quotes never stake");
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
@@ -720,7 +711,6 @@ async fn check_gateway_quote(
     );
     gateway.drain().await.unwrap();
     assert!(!journal.exists());
-    assert!(!options.journal_root.exists());
 }
 
 /// The provider earns exactly the price from the payment close, and its
@@ -748,6 +738,7 @@ struct PaidScenario<S = PaidWorkSession> {
     client_home: std::path::PathBuf,
     client_transport: iroh::SecretKey,
     endpoint: iroh::Endpoint,
+    provider_config: WorkConfig,
     options: PaidWorkOptions,
     prepared_input: PreparedInvocation,
     quote: hellas_sdk::paid_client::PaidQuote,
@@ -796,7 +787,15 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         &PROVIDER_OWNER,
         provider_settlement().party_key().into(),
     );
-    let submitter = RemoteLightClient::connect(devnet.light_client_url(2))
+    let profile = devnet.profile(0);
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().unwrap(),
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    let submitter = RemoteLightClient::connect(devnet.light_client_url(2), verifier)
         .await
         .unwrap();
     for tx in [provider_funding] {
@@ -810,7 +809,9 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     // The owner stores standing policy once; no client route or bond exists.
     let (store, secret) =
         hellas_authority::test_support::common_node::bootstrap_node_with_credential(
-            &root.path().join("provider-state/grants"),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(
+                &root.path().join("provider-state"),
+            ),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment(&identity)),
             now,
@@ -908,7 +909,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     )
     .unwrap();
     let client_home = root.path().join("requester");
-    let mut client_config = config;
+    let mut client_config = config.clone();
     client_config.chain = devnet.chain_dir(&client_home, 0);
     client_config.chain = client_config
         .chain
@@ -916,11 +917,9 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         .unwrap();
     let provider_address =
         hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap();
-    let journal_root =
-        hellas_sdk::paid_client::PaidJournalDir::client(&client_config.chain, provider_address);
     let options = PaidWorkOptions {
         config: client_config,
-        journal_root,
+        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: provider_address,
         provider_addrs,
         assurance: Assurance::ProducerSigned,
@@ -941,7 +940,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         .unwrap(),
     );
     let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
-    assert!(!options.journal_root.exists());
+    assert!(!options.journal_root().exists());
     Box::pin(check_other_enrollment_refused(
         &options,
         &endpoint,
@@ -975,10 +974,13 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         .capacity(),
         PRICE * 10
     );
-    assert!(
-        !options.journal_root.exists(),
-        "a quote creates no paid journal"
-    );
+    let journals = hellas_channel::work_store::discover_setups(
+        &options.journal_root(),
+        options.config.network(),
+    )
+    .await
+    .unwrap();
+    assert!(journals.setups.is_empty() && journals.unidentified.is_empty());
     Box::pin(check_gateway_quote(&options, owner.clone())).await;
     assert!(
         approvals.0.lock().unwrap().is_empty(),
@@ -996,6 +998,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         client_home,
         client_transport,
         endpoint,
+        provider_config: config,
         options,
         prepared_input,
         quote,
@@ -1019,6 +1022,7 @@ async fn paid_setup(
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1102,6 +1106,7 @@ async fn paid_setup(
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1123,6 +1128,7 @@ async fn paid_finish(case: PaidScenario) {
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1158,7 +1164,7 @@ async fn paid_finish(case: PaidScenario) {
             if session.with_state(|state| state.cursor().0).await.unwrap() == resumed_height {
                 break;
             }
-            tokio::time::sleep(options.config.poll).await;
+            tokio::time::sleep(options.config.poll()).await;
         }
     })
     .await
@@ -1176,13 +1182,8 @@ async fn paid_finish(case: PaidScenario) {
     endpoint.close().await;
 
     provider.shutdown().await.unwrap();
-    let (provider, upstream) = start_provider(
-        root.path(),
-        options.config.clone(),
-        provider_node,
-        &identity,
-    )
-    .await;
+    let (provider, upstream) =
+        start_provider(root.path(), provider_config, provider_node, &identity).await;
     assert_eq!(
         provider
             .administration()
@@ -1274,9 +1275,11 @@ async fn paid_finish(case: PaidScenario) {
     );
     recovered.shutdown().await;
     drop(recovered);
-    // Restart recovery re-verifies the retained offer against the address.
+    // A different enrollment has a separate derived journal directory.
+    let other = other_provider(&options);
+    assert_ne!(other.journal_root(), options.journal_root());
     let error = PaidWorkSession::open(
-        other_provider(&options),
+        other,
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
@@ -1285,12 +1288,11 @@ async fn paid_finish(case: PaidScenario) {
     )
     .await
     .err()
-    .expect("retained channel under another enrollment");
+    .expect("no retained channel under another enrollment");
     assert!(
         matches!(
             error,
-            hellas_sdk::paid_client::PaidClientError::RetainedEnrollment(address)
-                if address == other_provider(&options).provider
+            hellas_sdk::paid_client::PaidClientError::NoRetainedChannel
         ),
         "{error}"
     );
@@ -1605,7 +1607,7 @@ async fn paid_finish(case: PaidScenario) {
     second.shutdown().await;
     drop(second);
     let retained = hellas_sdk::paid_client::retained_settlement_channels(
-        &options.journal_root,
+        &options.journal_root(),
         options.config.network(),
         options.provider,
         owner.principal(),
@@ -1795,7 +1797,7 @@ fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
         let node = devnet.full_node(0).clone();
         let client = node.view().unwrap().client();
         let timeout = hellas_chain::node::RECOVERY_TIMEOUT;
-        let poll = work_config(&devnet, std::path::PathBuf::new()).poll;
+        let poll = work_config(&devnet, std::path::PathBuf::new()).poll();
         let source = WorkBlocks::new(client.clone()).with_read_retry(poll, timeout);
         let query = SetupQuery {
             bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),

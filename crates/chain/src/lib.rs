@@ -4,6 +4,8 @@ mod app;
 pub mod block;
 #[cfg(feature = "client-core")]
 pub mod block_view;
+#[cfg(all(feature = "chain-dir", not(target_arch = "wasm32")))]
+pub mod chain_dir;
 #[cfg(feature = "client-core")]
 pub mod client;
 #[cfg(any(feature = "indexer", feature = "validator"))]

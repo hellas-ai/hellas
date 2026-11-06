@@ -1,4 +1,5 @@
 //! Loopback read API over one full node and its atomic EdgeIndex publication.
+use crate::chain_dir::ChainDir;
 use crate::{
     ChainIndexer, FinalizedBlockQuery,
     domain::Digest,
@@ -12,7 +13,6 @@ use axum::{
     routing::get,
 };
 use commonware_runtime::{Runner as _, tokio};
-use hellas_genesis::ChainDir;
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
 
@@ -30,14 +30,6 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
     if !options.listen.ip().is_loopback() {
         return Err("private indexer api must bind to loopback".into());
     }
-    let genesis_json = options
-        .chain
-        .profile()
-        .genesis_json()
-        .ok_or("indexer requires full chain genesis")?
-        .as_bytes()
-        .to_vec();
-    let trust = options.chain.profile().trust().clone();
     let runtime = tokio::Config::new()
         .with_storage_directory(options.chain.indexer())
         .with_tcp_nodelay(Some(true));
@@ -48,8 +40,6 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
                 options.peers,
                 options.archive_blocks,
             )?,
-            trust,
-            genesis_json,
             options.partition_prefix,
         )
         .await?;

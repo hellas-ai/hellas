@@ -8,28 +8,46 @@ use hellas_chain::genesis::{ChainProfile, CustomChainFile};
 pub(crate) fn chain_dir(
     home: &std::path::Path,
     network: NetworkId,
-) -> hellas_chain::genesis::ChainDir {
+) -> hellas_chain::chain_dir::ChainDir {
     let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    chain_dir_with_digest(home, network, known.consensus_digest())
+    if network.as_str() == known.network_id() {
+        return hellas_chain::chain_dir::ChainDir::open(home, &known).unwrap();
+    }
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = network.as_str().into();
+    chain_dir_with_genesis(home, &genesis)
 }
 
-pub(crate) fn chain_dir_with_digest(
+pub(crate) fn chain_dir_with_genesis(
     home: &std::path::Path,
-    network: NetworkId,
-    digest: [u8; 32],
-) -> hellas_chain::genesis::ChainDir {
+    genesis: &hellas_chain::genesis::Genesis,
+) -> hellas_chain::chain_dir::ChainDir {
+    use commonware_cryptography::{Hasher as _, Sha256};
     let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let genesis_json = serde_json::to_string(genesis).unwrap();
     let mut trust = known.trust().clone();
-    trust.network_id = network.as_str().into();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
     let profile = ChainProfile::custom(CustomChainFile {
-        consensus_digest: hex::encode(digest),
         trust,
         validators: vec!["ws://unused.invalid".into()],
-        genesis_json: None,
-        genesis_payload: None,
+        genesis_json,
     })
     .unwrap();
-    hellas_chain::genesis::ChainDir::open(home, &profile).unwrap()
+    hellas_chain::chain_dir::ChainDir::open(home, &profile).unwrap()
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) fn chain_dir_with_variant(
+    home: &std::path::Path,
+    network: NetworkId,
+    variant: u64,
+) -> hellas_chain::chain_dir::ChainDir {
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = network.as_str().into();
+    genesis.allocations[0].balance += variant;
+    chain_dir_with_genesis(home, &genesis)
 }
 use hellas_channel::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
@@ -105,61 +123,22 @@ impl PaidFixture {
     /// A real idle node for SDK startup/admission tests. The fixture supplies
     /// genesis itself; no network endpoint is trusted to choose its execution inputs.
     pub async fn node(&mut self) -> crate::FullNode {
-        use commonware_codec::DecodeExt as _;
-        use commonware_cryptography::Digestible as _;
-        use commonware_runtime::Runner as _;
         let mut genesis: hellas_chain::genesis::Genesis =
             serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
         genesis.network_id = self.config.network().as_str().into();
         genesis.allocations.clear();
-        let leader = genesis
-            .validators
-            .iter()
-            .map(|validator| {
-                hellas_chain::domain::PublicKey::decode(
-                    hex::decode(&validator.public_key).unwrap().as_slice(),
-                )
-                .unwrap()
-            })
-            .min()
-            .unwrap();
-        let directory = self.root.path().join("genesis-probe");
-        let network = self.config.network();
-        let genesis_document = hellas_chain::genesis_digest(&genesis);
-        let digest = tokio::task::spawn_blocking(move || {
-            let runtime = commonware_runtime::tokio::Runner::new(
-                commonware_runtime::tokio::Config::new().with_storage_directory(directory),
-            );
-            runtime.start(move |context| async move {
-                let application = hellas_chain::Application::new(
-                    context,
-                    network,
-                    genesis_document,
-                    leader,
-                    vec![],
-                    "fixture",
-                    Default::default(),
-                )
-                .await;
-                application.genesis_block().digest()
-            })
-        })
-        .await
-        .unwrap();
         use commonware_cryptography::{Hasher as _, Sha256};
         let genesis_json = serde_json::to_string(&genesis).unwrap();
         let mut trust = self.config.chain.trust().clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         let profile = ChainProfile::custom(CustomChainFile {
-            consensus_digest: hex::encode(genesis_document.0),
             trust,
             validators: self.config.chain.validators().to_vec(),
-            genesis_json: Some(genesis_json),
-            genesis_payload: Some(hex::encode(digest.0)),
+            genesis_json,
         })
         .unwrap();
         self.config.chain =
-            hellas_chain::genesis::ChainDir::open(self.root.path(), &profile).unwrap();
+            hellas_chain::chain_dir::ChainDir::open(self.root.path(), &profile).unwrap();
         let mut config = self.config.node_config(None).unwrap();
         config.validators.clear();
         crate::FullNode::start(config).await.unwrap()
@@ -286,20 +265,7 @@ impl PaidFixture {
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         let config = WorkConfig {
-            chain: hellas_chain::genesis::ChainDir::open(root.path(), &{
-                let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-                let mut trust = known.trust().clone();
-                trust.network_id = network.as_str().into();
-                ChainProfile::custom(CustomChainFile {
-                    consensus_digest: hex::encode(known.consensus_digest()),
-                    trust,
-                    validators: vec!["ws://unused.invalid".into()],
-                    genesis_json: None,
-                    genesis_payload: None,
-                })
-                .unwrap()
-            })
-            .unwrap(),
+            chain: chain_dir(root.path(), network),
             poll: std::time::Duration::from_millis(10),
             max_observation_age: std::time::Duration::from_secs(60),
         };

@@ -13,7 +13,7 @@ pub async fn prepare(
     port: Option<u16>,
     configured: Option<GrantConfig>,
 ) -> Result<(GrantConfig, Option<iroh::Endpoint>)> {
-    let root = home.join("provider");
+    let root = GrantConfig::provider_dir(home);
     let mut config = configured.unwrap_or_else(|| GrantConfig::unconfigured(home));
     // --await-owner is the explicit opt-in to credential-gated remote ingress.
     // An existing allowlist remains a narrower operator-selected restriction.
@@ -22,7 +22,7 @@ pub async fn prepare(
     }
     let now = hellas_auth::authority::UnixMillis::now()?;
     match hellas_authority::work_store::grant::NodeStore::open(
-        config.journal_root(),
+        &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         now,
@@ -40,9 +40,9 @@ pub async fn prepare(
     // No client trusts local TLS before initialization. Generate it before the
     // authority commit; after a crash, committed store state skips regeneration.
     let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    hellas_private::write_atomically(config.control_certificate(), ".writing", tls.cert.der())?;
+    hellas_private::write_atomically(&config.control_certificate(), ".writing", tls.cert.der())?;
     hellas_private::write_atomically(
-        config.control_private_key(),
+        &config.control_private_key(),
         ".writing",
         &tls.signing_key.serialize_der(),
     )?;
@@ -67,7 +67,7 @@ pub async fn prepare(
     let result = bootstrap::accept(
         &endpoint,
         &invitation,
-        config.journal_root(),
+        &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
     )

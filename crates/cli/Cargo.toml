@@ -18,6 +18,10 @@ path = "src/main.rs"
 [features]
 # Opt in to tests that start local nodes or exercise complete host processes.
 integration-tests = []
+gateway-vm-fixture = [
+    "hellas-authority/test-support",
+    "hellas-channel/test-support",
+]
 default = []
 
 indexer = ["hellas-chain/indexer-api"]
@@ -53,6 +57,7 @@ hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
+    "chain-dir",
     "client",
     "proof-verify",
     "work-watcher",
@@ -134,3 +139,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 name = "grant_http"
 path = "tests/grant_http/main.rs"
 required-features = ["integration-tests"]
+
+[[example]]
+name = "gateway-fixture"
+path = "examples/gateway-fixture.rs"
+required-features = ["gateway-vm-fixture"]

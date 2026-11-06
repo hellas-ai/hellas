@@ -84,15 +84,13 @@ impl Fixture {
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
         let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
-            consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
             trust,
             validators: vec!["ws://unused.invalid".into()],
-            genesis_json: Some(genesis_json),
-            genesis_payload: Some(hex::encode(head.digest().0)),
+            genesis_json,
         })
         .unwrap();
         let mut config = Config::for_profile(
-            hellas_genesis::ChainDir::open(directory, &profile).unwrap(),
+            crate::chain_dir::ChainDir::open(directory, &profile).unwrap(),
             vec![],
             None,
         )
@@ -115,7 +113,7 @@ impl Fixture {
         let height = self.head.height().get() + 1;
         let batch = crate::execution::execute_all(
             hellas_kernel::Context::with_fees(
-                crate::domain::network_id(&self.config.genesis).unwrap(),
+                crate::domain::network_id(self.config.genesis()).unwrap(),
                 hellas_kernel::BlockHeight::new(height),
                 hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
                 domain::KERNEL_FEES,
@@ -300,9 +298,11 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         apply(&seed, block.clone()).await.unwrap();
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
-        config.chain =
-            hellas_genesis::ChainDir::open(&directory.path().join("relay"), config.chain.profile())
-                .unwrap();
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("relay"),
+            config.chain.profile(),
+        )
+        .unwrap();
         config.peers = vec![seed.endpoint_addr()];
         let a = FullNode::start(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(20), a.wait_ready())
@@ -320,7 +320,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
         config.chain =
-            hellas_genesis::ChainDir::open(&directory.path().join("b"), config.chain.profile())
+            crate::chain_dir::ChainDir::open(&directory.path().join("b"), config.chain.profile())
                 .unwrap();
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
@@ -488,12 +488,6 @@ fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong_genesis = fixture.config.clone();
-        wrong_genesis.genesis_payload = Some([0xff; 32].into());
-        assert!(matches!(
-            FullNode::start(wrong_genesis).await,
-            Err(Error::Config(_))
-        ));
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         assert!(matches!(
             FullNode::start(fixture.config.clone()).await,
@@ -638,7 +632,7 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
                 None,
             );
             let (endpoint, serving) = serve_source(server).await;
-            fixture.config.chain = hellas_genesis::ChainDir::open(
+            fixture.config.chain = crate::chain_dir::ChainDir::open(
                 &directory.path().join(if corrupt_certificate {
                     "bad-certificate"
                 } else {
@@ -691,37 +685,19 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
 #[cfg(feature = "indexer-api")]
 #[test]
 fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state() {
-    use commonware_cryptography::{Hasher as _, Sha256};
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new_in(
             runtime,
             directory.path(),
-            hellas_kernel::NetworkId::new(hellas_genesis::HELLAS_DEVNET_1_ID).unwrap(),
+            hellas_kernel::NetworkId::new("custom-indexed-node").unwrap(),
             5000,
         )
         .await;
         fixture.config.archive_blocks = NonZeroU64::new(1);
-        let json = serde_json::to_vec(&fixture.config.genesis).unwrap();
-        let trust = hellas_genesis::TrustDocument {
-            schema_version: 1,
-            network_id: fixture.config.genesis.network_id.clone(),
-            genesis_sha256: hex::encode(Sha256::hash(&json)),
-            epochs: vec![hellas_genesis::TrustEpoch {
-                epoch: 0,
-                start_height: 0,
-                end_height: None,
-                threshold_identity: hex::encode(&fixture.config.threshold_identity),
-            }],
-        };
-        let node = FullNode::start_indexed(
-            fixture.config.clone(),
-            trust.clone(),
-            json.clone(),
-            "read".into(),
-        )
-        .await
-        .unwrap();
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
+            .await
+            .unwrap();
         let mut last = fixture.next().await;
         apply(&node, last.clone()).await.unwrap();
         for _ in 1..3 {
@@ -743,7 +719,7 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
         assert_eq!(coins.coins.len(), 1);
         assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
-        let node = FullNode::start_indexed(fixture.config.clone(), trust, json, "read".into())
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
             .await
             .unwrap();
         assert!(node.view().is_err());
@@ -889,7 +865,7 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
             endpoints.push(endpoint);
         }
         let mut config = fixture.config.clone();
-        config.chain = hellas_genesis::ChainDir::open(
+        config.chain = crate::chain_dir::ChainDir::open(
             &directory.path().join("replica"),
             config.chain.profile(),
         )
@@ -958,12 +934,6 @@ fn provisioned_anchor_ignores_legacy_chain_directory() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong = fixture.config.clone();
-        wrong.genesis_payload = Some(Digest::from([99; 32]));
-        assert!(matches!(
-            FullNode::start(wrong).await,
-            Err(Error::Config(_))
-        ));
         let legacy = directory.path().join("chain/legacy-network");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("old-state"), b"obsolete").unwrap();
@@ -1011,16 +981,16 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         tokio::task::spawn_blocking(move || {
             let _lock = pipeline::lock(&config.storage_dir()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(&config.storage_dir()),
+                runtime::Config::new().with_storage_directory(config.storage_dir()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
                 let mut app = crate::Application::new(
                     context.child("app"),
-                    domain::network_id(&config.genesis).unwrap(),
-                    crate::genesis_digest(&config.genesis),
+                    domain::network_id(config.genesis()).unwrap(),
+                    crate::genesis_digest(config.genesis()),
                     signer.participants().iter().min().unwrap().clone(),
-                    genesis_allocations(&config.genesis).unwrap(),
+                    genesis_allocations(config.genesis()).unwrap(),
                     "chain",
                     crate::ApplicationConfig::default(),
                 )
@@ -1104,7 +1074,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 );
                 assert_eq!(
                     client
-                        .get_coins_by_owner(genesis_allocations(&config.genesis).unwrap()[0].0)
+                        .get_coins_by_owner(genesis_allocations(config.genesis()).unwrap()[0].0)
                         .await
                         .unwrap()
                         .unwrap()
@@ -1203,7 +1173,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         ))
         .await;
         let mut config = fixture.config.clone();
-        config.chain = hellas_genesis::ChainDir::open(
+        config.chain = crate::chain_dir::ChainDir::open(
             &directory.path().join("replica"),
             config.chain.profile(),
         )
@@ -1284,12 +1254,12 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
             let verifier = ConsensusVerifier::new(
                 &target.config.info().unwrap(),
-                crate::genesis_digest(&target.config.genesis),
+                crate::genesis_digest(target.config.genesis()),
             )
             .unwrap();
             let trust = Trust::Genesis(Arc::new(verifier));
@@ -1321,7 +1291,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
 }
 
 #[test]
-fn genesis_payload_pin_distinguishes_allocations_and_networks() {
+fn genesis_digest_distinguishes_allocations_and_networks() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let source = Fixture::new(runtime.child("source"), &directory.path().join("source")).await;
@@ -1341,24 +1311,25 @@ fn genesis_payload_pin_distinguishes_allocations_and_networks() {
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
-            assert_ne!(source.config.genesis_payload, target.config.genesis_payload);
+            assert_ne!(
+                crate::genesis_digest(source.config.genesis()),
+                crate::genesis_digest(target.config.genesis())
+            );
         }
     });
 }
 
 #[test]
-fn full_node_derives_h0_when_custom_genesis_has_no_payload_pin() {
+fn full_node_derives_h0_from_the_selected_custom_genesis() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(runtime, directory.path()).await;
-        let expected = fixture.config.genesis_payload;
-        let mut unpinned = fixture.config;
-        unpinned.genesis_payload = None;
-        let node = FullNode::start(unpinned).await.unwrap();
-        assert_eq!(node.config().genesis_payload, expected);
+        let expected = fixture.head.digest();
+        let node = FullNode::start(fixture.config).await.unwrap();
+        assert_eq!(node.genesis_payload(), expected);
         node.shutdown().await.unwrap();
     });
 }
@@ -1382,15 +1353,13 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     next.end_height = None;
     trust.epochs.push(next);
     let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
-        consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
-        genesis_json: Some(genesis_json),
-        genesis_payload: None,
+        genesis_json,
     })
     .unwrap();
     let home = tempfile::tempdir().unwrap();
-    let chain = hellas_genesis::ChainDir::open(home.path(), &profile).unwrap();
+    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile).unwrap();
     let error = Config::for_profile(chain, vec![], None).unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }

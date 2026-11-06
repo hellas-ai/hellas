@@ -64,8 +64,10 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 let endpoint = bind_paid_endpoint(case.client_transport.clone())
                     .await
                     .unwrap();
+                let gateway_options =
+                    gateway_provider(&case.options).with_config(case.options.config.clone());
                 let mut session = PaidWorkSession::open(
-                    case.options.clone(),
+                    gateway_options,
                     endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),

@@ -173,9 +173,10 @@ The pool selects providers and expected prices. It obtains each policy with
 ```
 
 The process selects one chain with `--chain devnet` or `--chain-config FILE`.
-The custom JSON file contains `consensus_digest`, `trust`, and a nonempty
-`validators` URL list. The requester and gateway start no chain node. They authenticate
-remote state against the selected consensus pins; relay URLs supply transport only.
+The custom JSON file contains the exact `genesis_json` bytes as a JSON string,
+`trust`, and a nonempty `validators` URL list. The requester and gateway start
+no chain node. They authenticate remote state against the selected genesis and
+trust; relay URLs supply transport only.
 `transact` defaults to the embedded devnet trust and
 `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
 keys are created on first use and retained with the identity.

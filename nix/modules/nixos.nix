@@ -371,7 +371,7 @@ in
         StateDirectoryMode = "0700";
         CacheDirectory = "hellas";
         CacheDirectoryMode = "0700";
-        WorkingDirectory = cfg.home;
+        WorkingDirectory = hellasLib.defaultStateDir;
         UMask = "0077";
         # Keep memory exhaustion inside this unit. OOMPolicy=kill sets
         # memory.oom.group=1, so a child OOM cannot leave a half-alive parent.
@@ -445,7 +445,7 @@ in
         DynamicUser = true;
         StateDirectory = "hellas-gateway";
         StateDirectoryMode = "0700";
-        WorkingDirectory = gateway.home;
+        WorkingDirectory = "/var/lib/hellas-gateway";
         UMask = "0077";
       }
       // lib.optionalAttrs (gatewayWritablePaths != [ ]) {

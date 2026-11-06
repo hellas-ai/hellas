@@ -49,8 +49,7 @@ pub enum ClientOwnerError {
 /// The requester's passkey and funding metadata. It starts no authority or node.
 /// Clones of its Arc share both the prompt lock and pending coin reservations.
 pub struct ClientOwner {
-    network: NetworkId,
-    chain_root: PathBuf,
+    chain: hellas_chain::chain_dir::ChainDir,
     authenticator: Arc<dyn Authenticator>,
     public: PublicKey,
     principal: PrincipalId,
@@ -105,27 +104,21 @@ impl ClientOwner {
     pub(crate) fn recover_funding_intent<'a>(
         &'a self,
         chain: &'a RemoteLightClient,
-        network: NetworkId,
         provider: iroh::EndpointId,
         reservation: [u8; 16],
         controls: FundingControls<'a>,
     ) -> impl Future<Output = Result<Funding, ClientOwnerError>> + 'a {
-        Box::pin(self.recover_funding_intent_inner(chain, network, provider, reservation, controls))
+        Box::pin(self.recover_funding_intent_inner(chain, provider, reservation, controls))
     }
 
     async fn recover_funding_intent_inner(
         &self,
         chain: &RemoteLightClient,
-        network: NetworkId,
         provider: iroh::EndpointId,
         reservation: [u8; 16],
         controls: FundingControls<'_>,
     ) -> Result<Funding, ClientOwnerError> {
-        if network != self.network {
-            return Err(ClientOwnerError::Record(
-                "funding network differs from selected chain",
-            ));
-        }
+        let network = self.network();
         let FundingControls {
             poll,
             timeout,
@@ -218,7 +211,7 @@ impl ClientOwner {
     pub fn new(
         authenticator: Arc<dyn Authenticator>,
         delegate: Key,
-        chain: &hellas_chain::genesis::ChainDir,
+        chain: &hellas_chain::chain_dir::ChainDir,
     ) -> Result<Self, ClientOwnerError> {
         let public = authenticator.public_key()?;
         let principal =
@@ -235,8 +228,7 @@ impl ClientOwner {
             .try_lock()
             .map_err(|error| ClientOwnerError::Locked(error.to_string()))?;
         Ok(Self {
-            network: NetworkId::new(chain.network_id()).expect("validated chain profile"),
-            chain_root: chain.as_path().to_path_buf(),
+            chain: chain.clone(),
             authenticator,
             public,
             principal,
@@ -254,17 +246,17 @@ impl ClientOwner {
     pub const fn delegate(&self) -> Key {
         self.delegate
     }
-    pub fn chain_root(&self) -> &Path {
-        &self.chain_root
+    pub fn chain(&self) -> &hellas_chain::chain_dir::ChainDir {
+        &self.chain
     }
 
-    fn path(&self, network: NetworkId, provider: iroh::EndpointId) -> PathBuf {
-        let key = hellas_auth::hash_tuple(
-            "hellas.client.funding.v1",
-            &[network.as_str().as_bytes(), provider.as_bytes()],
-        );
+    fn network(&self) -> NetworkId {
+        NetworkId::new(self.chain.network_id()).expect("validated chain profile")
+    }
+
+    fn path(&self, provider: iroh::EndpointId) -> PathBuf {
         self.root
-            .join(format!("{}.json", hex::encode(key.as_bytes())))
+            .join(format!("{}.json", hex::encode(provider.as_bytes())))
     }
 
     fn decode(
@@ -272,6 +264,11 @@ impl ClientOwner {
         record: &Record,
     ) -> Result<(NetworkId, iroh::EndpointId, Reshape), ClientOwnerError> {
         let network = NetworkId::new(&record.network).ok_or(ClientOwnerError::Record("network"))?;
+        if network != self.network() {
+            return Err(ClientOwnerError::Record(
+                "funding network differs from selected chain",
+            ));
+        }
         let provider = record
             .provider
             .parse()
@@ -312,8 +309,8 @@ impl ClientOwner {
                 Reshape::MAX_ENCODED_SIZE * 2 + 1024,
             )?;
             let record: Record = serde_json::from_slice(&bytes)?;
-            let (network, provider, reshape) = self.decode(&record)?;
-            if path != self.path(network, provider) {
+            let (_, provider, reshape) = self.decode(&record)?;
+            if path != self.path(provider) {
                 return Err(ClientOwnerError::Record("file binding"));
             }
             records.push((path, record, reshape));
@@ -328,17 +325,12 @@ impl ClientOwner {
 
     pub(crate) async fn claim(
         &self,
-        network: NetworkId,
         provider: iroh::EndpointId,
         funding: &Funding,
     ) -> Result<(), ClientOwnerError> {
-        if network != self.network {
-            return Err(ClientOwnerError::Record(
-                "funding network differs from selected chain",
-            ));
-        }
+        let network = self.network();
         let _serial = self.serial.lock().await;
-        let path = self.path(network, provider);
+        let path = self.path(provider);
         for (found, mut record, reshape) in self.records()? {
             if found != path {
                 continue;
@@ -360,7 +352,6 @@ impl ClientOwner {
     pub(crate) async fn fund(
         &self,
         chain: &RemoteLightClient,
-        network: NetworkId,
         provider: iroh::EndpointId,
         need: u64,
         poll: Duration,
@@ -368,7 +359,6 @@ impl ClientOwner {
     ) -> Result<Funding, ClientOwnerError> {
         self.fund_with_approval(
             chain,
-            network,
             provider,
             need,
             FundingControls {
@@ -384,27 +374,21 @@ impl ClientOwner {
     pub(crate) fn fund_with_approval<'a>(
         &'a self,
         chain: &'a RemoteLightClient,
-        network: NetworkId,
         provider: iroh::EndpointId,
         need: u64,
         controls: FundingControls<'a>,
     ) -> impl Future<Output = Result<Funding, ClientOwnerError>> + 'a {
-        Box::pin(self.fund_with_approval_inner(chain, network, provider, need, controls))
+        Box::pin(self.fund_with_approval_inner(chain, provider, need, controls))
     }
 
     async fn fund_with_approval_inner(
         &self,
         chain: &RemoteLightClient,
-        network: NetworkId,
         provider: iroh::EndpointId,
         need: u64,
         controls: FundingControls<'_>,
     ) -> Result<Funding, ClientOwnerError> {
-        if network != self.network {
-            return Err(ClientOwnerError::Record(
-                "funding network differs from selected chain",
-            ));
-        }
+        let network = self.network();
         let FundingControls {
             poll,
             timeout,
@@ -413,7 +397,7 @@ impl ClientOwner {
         } = controls;
         tokio::time::timeout(timeout, async {
             let _serial = self.serial.lock().await;
-            let path = self.path(network, provider);
+            let path = self.path(provider);
             if let Some(gate) = approval {
                 let reservation = gate.reservation(network, provider);
                 let archive = self

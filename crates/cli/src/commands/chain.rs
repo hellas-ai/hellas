@@ -19,8 +19,6 @@ use crate::commands::CliResult;
 
 #[derive(Subcommand)]
 pub enum ChainCommand {
-    /// Print the selected chain's state namespace key.
-    StateKey,
     /// Query the chain light-client API
     Query {
         /// RPC endpoint; defaults to the selected chain's first validator.
@@ -233,6 +231,11 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
+    /// Reset this chain's validator state once when its generation changes.
+    StateGeneration {
+        #[arg(long)]
+        generation: u64,
+    },
     /// Export public epoch-zero explorer trust from a validator config and exact genesis file
     ExportTrust {
         #[arg(long)]
@@ -314,6 +317,9 @@ pub enum ValidatorCommand {
         /// Canonical genesis JSON; validator identities must match --seed
         #[arg(long)]
         genesis: Option<PathBuf>,
+        /// Write the exact generated genesis JSON to this file.
+        #[arg(long)]
+        genesis_out: Option<PathBuf>,
         /// Genesis allocation as address:balance
         #[arg(long = "genesis-allocation")]
         genesis_allocations: Vec<String>,
@@ -339,10 +345,6 @@ pub async fn run(
     _home: &std::path::Path,
 ) -> CliResult {
     match command {
-        ChainCommand::StateKey => {
-            println!("{}", profile.state_key());
-            Ok(())
-        }
         ChainCommand::Delegate { coins, node, split } => {
             anyhow::ensure!(
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
@@ -688,10 +690,30 @@ async fn connect_with_verified_snapshots(
     let rpc = rpc
         .or_else(|| profile.validators().first().cloned())
         .context("selected chain has no validator routes")?;
-    let client = RemoteLightClient::connect(rpc).await?;
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity()?,
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into())?;
+    let client = RemoteLightClient::connect(rpc, verifier).await?;
     let reported = client.get_consensus_info().await?;
-    let verifier = hellas_sdk::client_chain::pinned_consensus_verifier(profile, &reported)?;
-    Ok(client.with_consensus_verifier(verifier))
+    if reported.network_id != pinned.network_id
+        || reported.threshold_identity != pinned.threshold_identity
+    {
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
+            ),
+            None => {
+                "endpoint consensus identity differs from the authenticated trust document".into()
+            }
+        };
+        anyhow::bail!("{reason}");
+    }
+    Ok(client)
 }
 
 /// Refuses if the node on the other end is not on `network`.
@@ -836,7 +858,7 @@ async fn run_indexer(
             } else {
                 profile.clone().with_validators(rpc)?
             };
-            let chain = hellas_chain::genesis::ChainDir::open(home, &selected)?;
+            let chain = hellas_chain::chain_dir::ChainDir::open(home, &selected)?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
                     chain,
@@ -872,6 +894,9 @@ async fn run_validator(
     home: &std::path::Path,
 ) -> CliResult {
     let command = match command {
+        ValidatorCommand::StateGeneration { generation } => {
+            return reset_validator_generation(profile, home, generation);
+        }
         ValidatorCommand::ExportTrust { config, genesis } => {
             hellas_chain::validator::Command::ExportTrust { config, genesis }
         }
@@ -912,6 +937,7 @@ async fn run_validator(
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
             network_id,
@@ -927,6 +953,7 @@ async fn run_validator(
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         },
         ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run {
@@ -934,11 +961,43 @@ async fn run_validator(
             profile: profile.clone(),
             home: home.to_path_buf(),
         },
-        ValidatorCommand::CheckConfig { config } => {
-            hellas_chain::validator::Command::CheckConfig { config }
-        }
+        ValidatorCommand::CheckConfig { config } => hellas_chain::validator::Command::CheckConfig {
+            config,
+            profile: profile.clone(),
+        },
     };
     tokio::task::spawn_blocking(move || hellas_chain::validator::run_command(command)).await??;
+    Ok(())
+}
+
+#[cfg(feature = "validator")]
+fn reset_validator_generation(
+    profile: &ChainProfile,
+    home: &std::path::Path,
+    generation: u64,
+) -> CliResult {
+    anyhow::ensure!(generation > 0, "generation must be positive");
+    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile)?;
+    let state = chain.validator();
+    let stamp = state.join(".state-generation");
+    let current = match fs::read_to_string(&stamp) {
+        Ok(value) => value.trim().parse::<u64>().ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current == Some(generation) {
+        return Ok(());
+    }
+    fs::create_dir_all(&state)?;
+    for entry in fs::read_dir(&state)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::write(stamp, generation.to_string())?;
     Ok(())
 }
 
@@ -966,24 +1025,6 @@ fn finalized_block_query(
 mod tests {
     use super::*;
     use hellas_kernel::{Key, MAX_PARTY_INPUTS};
-
-    #[test]
-    fn known_chain_reports_stale_binary_on_remote_identity_mismatch() {
-        let profile = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-        let reported = hellas_chain::ConsensusInfo {
-            network_id: "different-network".into(),
-            threshold_identity: hex::decode(&profile.trust().epochs[0].threshold_identity).unwrap(),
-            validators: vec![],
-        };
-        let error = hellas_sdk::client_chain::pinned_consensus_verifier(&profile, &reported)
-            .err()
-            .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("this binary is out of date for devnet; please update")
-        );
-    }
 
     #[test]
     fn owner_commands_use_global_passkey_and_one_coin_parser() {

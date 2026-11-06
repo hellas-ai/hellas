@@ -82,7 +82,7 @@ pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
 #[derive(Clone)]
 pub struct WorkRunnerConfig {
-    pub chain: hellas_chain::genesis::ChainDir,
+    pub chain: hellas_chain::chain_dir::ChainDir,
     /// How often the clock ticks.
     pub poll: Duration,
     /// Bounds observer stalls and the age of local admission evidence.
@@ -111,7 +111,7 @@ impl WorkRunnerConfig {
         NetworkId::new(self.chain.network_id()).expect("validated chain profile")
     }
     pub fn journal_root(&self) -> PathBuf {
-        self.chain.provider().join("channels")
+        self.chain.provider_journals()
     }
     /// Validate observation policy before startup performs I/O.
     pub fn validate(&self) -> Result<(), PaidProviderError> {
@@ -1411,6 +1411,6 @@ mod tests {
             runner.await,
             Err(PaidProviderError::InvalidObservationPolicy)
         ));
-        assert!(!config.provider_journal_root().exists());
+        assert!(!config.chain.provider_journals().exists());
     }
 }

@@ -1,6 +1,5 @@
 use super::*;
 use hellas_chain::genesis::Chain;
-use serde_json::json;
 
 #[test]
 fn a_single_authenticated_route_is_usable() {
@@ -18,29 +17,6 @@ fn a_single_authenticated_route_is_usable() {
 }
 
 #[test]
-fn custom_light_profile_needs_no_execution_genesis_or_payload() {
-    let root = tempfile::tempdir().unwrap();
-    let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
-    trust.network_id = "custom-light-1".into();
-    let path = root.path().join("chain.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&json!({
-            "consensus_digest": "12".repeat(32),
-            "trust": trust,
-            "validators": ["ws://127.0.0.1:9080"],
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let profile = load_chain_profile(&path).unwrap();
-    assert!(!profile.has_execution());
-    let config = WorkConfig::for_chain(profile, root.path()).unwrap();
-    assert_eq!(config.network().as_str(), "custom-light-1");
-    assert!(config.node_config(None).is_err());
-}
-
-#[test]
 fn custom_full_genesis_can_derive_h0_at_node_start() {
     use commonware_cryptography::{Hasher as _, Sha256};
     let root = tempfile::tempdir().unwrap();
@@ -52,39 +28,38 @@ fn custom_full_genesis_can_derive_h0_at_node_start() {
     trust.network_id = genesis.network_id.clone();
     trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
     let profile = ChainProfile::custom(CustomChainFile {
-        consensus_digest: hex::encode(hellas_chain::genesis_digest(&genesis).0),
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
-        genesis_json: Some(genesis_json),
-        genesis_payload: None,
+        genesis_json,
     })
     .unwrap();
     let node = WorkConfig::for_chain(profile, root.path())
         .unwrap()
         .node_config(None)
         .unwrap();
-    assert!(node.genesis_payload().is_none());
+    assert_eq!(node.genesis().network_id, "custom-execution-1");
 }
 
 #[test]
 fn a_registered_id_cannot_rebind_pins_but_can_change_routes() {
     let known = ChainProfile::known(Chain::Devnet);
     let changed_route = ChainProfile::custom(CustomChainFile {
-        consensus_digest: hex::encode(known.consensus_digest()),
         trust: known.trust().clone(),
         validators: vec!["ws://127.0.0.1:9080".into()],
-        genesis_json: None,
-        genesis_payload: None,
+        genesis_json: known.genesis_json().to_owned(),
     })
     .unwrap();
     assert_eq!(changed_route.known_chain(), Some(Chain::Devnet));
-    assert!(changed_route.has_execution());
+    let mut changed_genesis = known.genesis().clone();
+    changed_genesis.allocations[0].balance += 1;
+    let changed_json = serde_json::to_string(&changed_genesis).unwrap();
+    let mut changed_trust = known.trust().clone();
+    use commonware_cryptography::{Hasher as _, Sha256};
+    changed_trust.genesis_sha256 = hex::encode(Sha256::hash(changed_json.as_bytes()));
     let error = ChainProfile::custom(CustomChainFile {
-        consensus_digest: "00".repeat(32),
-        trust: known.trust().clone(),
+        trust: changed_trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
-        genesis_json: None,
-        genesis_payload: None,
+        genesis_json: changed_json,
     })
     .unwrap_err();
     assert!(
@@ -95,11 +70,16 @@ fn a_registered_id_cannot_rebind_pins_but_can_change_routes() {
 }
 
 #[test]
-fn static_paid_client_refuses_an_expiring_threshold_key() {
+fn static_paid_client_rejects_a_rotating_trust_schedule() {
     let root = tempfile::tempdir().unwrap();
     let known = ChainProfile::known(Chain::Devnet);
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = "custom-rotating-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
     let mut trust = known.trust().clone();
     trust.network_id = "custom-rotating-1".into();
+    use commonware_cryptography::{Hasher as _, Sha256};
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
     trust.epochs[0].end_height = Some(2);
     let mut next = trust.epochs[0].clone();
     next.epoch = 1;
@@ -107,11 +87,9 @@ fn static_paid_client_refuses_an_expiring_threshold_key() {
     next.end_height = None;
     trust.epochs.push(next);
     let profile = ChainProfile::custom(CustomChainFile {
-        consensus_digest: hex::encode(known.consensus_digest()),
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
-        genesis_json: None,
-        genesis_payload: None,
+        genesis_json,
     })
     .unwrap();
     let error = WorkConfig::for_chain(profile, root.path()).unwrap_err();

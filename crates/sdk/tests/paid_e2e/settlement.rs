@@ -1,4 +1,5 @@
 use super::*;
+use commonware_cryptography::{Hasher as _, Sha256};
 use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 
 #[test]
@@ -38,7 +39,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             session.shutdown().await;
             drop(session);
             let discovered = hellas_sdk::paid_client::retained_settlement_channels(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 case.options.config.network(),
                 case.options.provider,
                 case.owner.principal(),
@@ -52,7 +53,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             assert_eq!(discovered[0].assurance, Assurance::ProducerSigned);
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &case.options.journal_root,
+                    &case.options.journal_root(),
                     case.options.config.network(),
                     case.options.provider,
                     ROOT.principal(),
@@ -63,7 +64,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             );
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &case.options.journal_root,
+                    &case.options.journal_root(),
                     case.options.config.network(),
                     case.options.provider,
                     case.owner.principal(),
@@ -74,7 +75,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             );
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &case.options.journal_root,
+                    &case.options.journal_root(),
                     case.options.config.network(),
                     other_provider(&case.options).provider,
                     case.owner.principal(),
@@ -97,7 +98,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             );
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &case.options.journal_root,
+                    &case.options.journal_root(),
                     hellas_kernel::NetworkId::new("wrong-network").unwrap(),
                     case.options.provider,
                     case.owner.principal(),
@@ -315,10 +316,15 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             assert_eq!(*gate.amounts.lock().unwrap(), vec![CLIENT_FUNDING]);
             assert!(case.approvals.0.lock().unwrap().is_empty());
             // A crash after target binding cannot authorize fresh funding on reopen.
-            let path = case.root.path().join("bound-attempt.json");
-            let terms = hellas_sdk::execution::ExecutionTerms::Paid { price: PRICE };
+            let path = hellas_sdk::transact::PaidAttemptPath::new(
+                &case.options.config.chain,
+                case.options.provider,
+                case.owner.principal(),
+                job.digest(),
+            );
             let mut attempt =
-                hellas_sdk::execution::ExecutionAttempt::open(&path, job.input(), terms).unwrap();
+                hellas_sdk::execution::ExecutionAttempt::open_paid(&path, job.input(), PRICE)
+                    .unwrap();
             attempt
                 .bind_target(hellas_sdk::execution::ExecutionTarget {
                     network: case.options.config.network(),
@@ -326,9 +332,12 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 })
                 .unwrap();
             drop(attempt);
-            let mut attempt =
-                hellas_sdk::execution::ExecutionAttempt::open_existing(&path, job.input(), terms)
-                    .unwrap();
+            let mut attempt = hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
+                &path,
+                job.input(),
+                PRICE,
+            )
+            .unwrap();
             assert!(
                 attempt
                     .open_paid_session(
@@ -347,6 +356,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             );
             assert_eq!(*gate.amounts.lock().unwrap(), vec![CLIENT_FUNDING]);
             assert!(case.approvals.0.lock().unwrap().is_empty());
+            drop(attempt);
             gate.allow.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut session = sealing_while(
                 &mut case.devnet,
@@ -373,6 +383,56 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let bond = session.descriptor().bond_edge();
             session.shutdown().await;
             drop(session);
+            // Select another authenticated chain under the same home, then
+            // return to the funded one. Its retained journal must be found
+            // only after selecting A again.
+            let a_chain = case.options.config.chain.clone();
+            let a_journals = case.options.journal_root();
+            let mut b_genesis = a_chain.genesis().clone();
+            b_genesis.allocations[0].balance += 1;
+            let b_genesis_json = serde_json::to_string(&b_genesis).unwrap();
+            let mut b_trust = a_chain.trust().clone();
+            b_trust.genesis_sha256 = hex::encode(Sha256::hash(b_genesis_json.as_bytes()));
+            let b_profile = hellas_chain::genesis::ChainProfile::custom(
+                hellas_chain::genesis::CustomChainFile {
+                    genesis_json: b_genesis_json,
+                    trust: b_trust,
+                    validators: a_chain.validators().to_vec(),
+                },
+            )
+            .unwrap();
+            case.options.config.chain =
+                hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile).unwrap();
+            assert_ne!(case.options.journal_root(), a_journals);
+            let mut cross_chain_attempt =
+                hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
+                    &path,
+                    job.input(),
+                    PRICE,
+                )
+                .unwrap();
+            assert!(matches!(
+                cross_chain_attempt
+                    .open_paid_session(
+                        job.input(),
+                        case.options.clone(),
+                        case.endpoint.clone(),
+                        client_settlement(),
+                        case.owner.clone(),
+                        hellas_sdk::paid_client::SessionFundingOptions::default(),
+                    )
+                    .await,
+                Err(hellas_sdk::execution::ExecutionError::Identity)
+            ));
+            drop(cross_chain_attempt);
+            assert!(
+                hellas_sdk::paid_client::recover_funding_channels(&case.options, &case.owner)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "chain B cannot recover chain A's funded channel"
+            );
+            case.options.config.chain = a_chain;
             let associations =
                 hellas_sdk::paid_client::recover_funding_channels(&case.options, &case.owner)
                     .await
@@ -415,7 +475,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
             retained.shutdown().await;
             drop(retained);
-            let journals = case.options.journal_root.join("journals");
+            let journals = case.options.journal_root().join("journals");
             let journal = std::fs::read_dir(&journals)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -495,7 +555,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             );
             let stem = journal.file_stem().unwrap().to_str().unwrap();
             let (_, replay) = hellas_channel::work_store::journal::Journal::inspect(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 stem,
             )
             .await
@@ -625,15 +685,11 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .is_err()
             );
             let mut missing = case.options.clone();
-            missing.config.chain = hellas_chain::genesis::ChainDir::open(
+            missing.config.chain = hellas_chain::chain_dir::ChainDir::open(
                 &case.root.path().join("missing-journals"),
                 missing.config.chain.profile(),
             )
             .unwrap();
-            missing.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
-                &missing.config.chain,
-                missing.provider,
-            );
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &missing,
@@ -645,24 +701,22 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .is_err()
             );
             let mut wrong_network = case.options.clone();
+            let mut wrong_genesis = wrong_network.config.chain.genesis().clone();
+            wrong_genesis.network_id = "wrong-network".into();
+            let wrong_genesis_json = serde_json::to_string(&wrong_genesis).unwrap();
             let mut trust = wrong_network.config.chain.trust().clone();
             trust.network_id = "wrong-network".into();
+            trust.genesis_sha256 = hex::encode(Sha256::hash(wrong_genesis_json.as_bytes()));
             let wrong_profile = hellas_chain::genesis::ChainProfile::custom(
                 hellas_chain::genesis::CustomChainFile {
-                    consensus_digest: hex::encode(wrong_network.config.chain.consensus_digest()),
                     trust,
                     validators: wrong_network.config.chain.validators().to_vec(),
-                    genesis_json: None,
-                    genesis_payload: None,
+                    genesis_json: wrong_genesis_json,
                 },
             )
             .unwrap();
             wrong_network.config.chain =
-                hellas_chain::genesis::ChainDir::open(case.root.path(), &wrong_profile).unwrap();
-            wrong_network.journal_root = hellas_sdk::paid_client::PaidJournalDir::client(
-                &wrong_network.config.chain,
-                wrong_network.provider,
-            );
+                hellas_chain::chain_dir::ChainDir::open(case.root.path(), &wrong_profile).unwrap();
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &wrong_network,
@@ -686,7 +740,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             // Two reservation IDs naming the same signed funding coin must never
             // become two budget returns. Corrupt amounts must fail signature/output
             // validation rather than matching by a nearby quote.
-            let funding_root = case.root.path().join("requester/funding");
+            let funding_root = case.owner.chain().client().join("owners");
             let history = std::fs::read_dir(&funding_root)
                 .unwrap()
                 .map(|entry| entry.unwrap().path().join("funding-intents"))
@@ -775,15 +829,15 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             drop(session);
             let root = case.root.path();
             let state = root.join("cli-state");
-            let cli_chain =
-                hellas_chain::genesis::ChainDir::open(&state, case.options.config.chain.profile())
-                    .unwrap();
-            let journals =
-                hellas_sdk::paid_client::PaidJournalDir::client(&cli_chain, case.options.provider);
-            std::fs::create_dir_all(journals.as_ref().parent().unwrap()).unwrap();
-            std::fs::rename(&case.options.journal_root, journals.as_ref()).unwrap();
+            let cli_chain = hellas_chain::chain_dir::ChainDir::open(
+                &state,
+                case.options.config.chain.profile(),
+            )
+            .unwrap();
+            let journals = cli_chain.client_journals(&case.options.provider.to_string());
+            std::fs::create_dir_all(journals.parent().unwrap()).unwrap();
+            std::fs::rename(case.options.journal_root(), &journals).unwrap();
             case.options.config.chain = cli_chain;
-            case.options.journal_root = journals;
 
             // The client's already-funded node signer is [0x21; 32]. Encode a
             // normal private identity containing exactly that signer for the CLI.
@@ -806,7 +860,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             identity.bytes(&[0x21; 32]);
             identity.bytes(&[0x42; 32]);
             identity.bytes(&enrollment.canonical_bytes());
-            let identity_path = root.join("cli-identity");
+            let identity_path = state.join("identity");
             hellas_private::write_atomically(&identity_path, ".writing", &identity.into_bytes())
                 .unwrap();
             let passkey = root.join("cli-passkey");
@@ -820,11 +874,16 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                             "threshold_identity":hex::encode(&case.devnet.consensus_info().threshold_identity)}],
             });
             let chain_path = root.join("cli-chain.json");
-            std::fs::write(&chain_path, serde_json::to_vec(&serde_json::json!({
-                "consensus_digest": hex::encode(hellas_chain::genesis_digest(case.devnet.genesis()).0),
-                "trust": trust,
-                "validators": case.relays.urls,
-            })).unwrap()).unwrap();
+            std::fs::write(
+                &chain_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "trust": trust,
+                    "validators": case.relays.urls,
+                    "genesis_json": String::from_utf8(genesis).unwrap(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
             case.provider.shutdown().await.unwrap();
             // Drain execution-phase RPCs before counting settlement proof reads.
             case.relays.shutdown().await;
@@ -852,7 +911,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .await
                 .is_err()
             );
-            let journal = std::fs::read_dir(case.options.journal_root.join("journals"))
+            let journal = std::fs::read_dir(case.options.journal_root().join("journals"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .find(|path| {
@@ -865,7 +924,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .unwrap();
             let stem = journal.file_stem().unwrap().to_str().unwrap();
             let (_, replay) = hellas_channel::work_store::journal::Journal::inspect(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 stem,
             )
             .await
@@ -879,8 +938,8 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             );
             let mut command = tokio::process::Command::new(&binary);
             command
-                .arg("--identity")
-                .arg(&identity_path)
+                .arg("--home")
+                .arg(&state)
                 .arg("--passkey")
                 .arg(&passkey)
                 .arg("--chain-config")
@@ -889,8 +948,6 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .arg("--settle")
                 .arg("--provider")
                 .arg(case.options.provider.to_string())
-                .arg("--state-dir")
-                .arg(&state)
                 .arg("--timeout")
                 .arg("60s");
             for validator in &case.relays.urls {
@@ -927,8 +984,8 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             hellas_private::write_atomically(&wrong_passkey, ".writing", &[0x11; 32]).unwrap();
             let mut wrong = tokio::process::Command::new(&binary);
             wrong
-                .arg("--identity")
-                .arg(&identity_path)
+                .arg("--home")
+                .arg(&state)
                 .arg("--passkey")
                 .arg(&wrong_passkey)
                 .arg("--chain-config")
@@ -937,8 +994,6 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .arg("--settle")
                 .arg("--provider")
                 .arg(case.options.provider.to_string())
-                .arg("--state-dir")
-                .arg(&state)
                 .arg("--timeout")
                 .arg("60s");
             for validator in &case.relays.urls {

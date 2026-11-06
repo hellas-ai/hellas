@@ -36,7 +36,7 @@ fn initialize_identity_and_owner_key_with_bare_filenames() {
 }
 
 #[test]
-fn one_home_selects_identity_and_chain_state_key() {
+fn home_flag_overrides_environment_and_os_home() {
     let root = tempfile::tempdir().unwrap();
     let from_home = root.path().join("os-home");
     let from_env = root.path().join("env-home");
@@ -50,22 +50,6 @@ fn one_home_selects_identity_and_chain_state_key() {
             .output()
             .unwrap()
     };
-    let key = run(&["--chain", "devnet", "chain", "state-key"]);
-    assert!(
-        key.status.success(),
-        "{}",
-        String::from_utf8_lossy(&key.stderr)
-    );
-    let key = String::from_utf8(key.stdout).unwrap();
-    assert_eq!(key.trim().len(), 64);
-    assert!(
-        key.trim()
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    );
-    let default = run(&["chain", "state-key"]);
-    assert_eq!(default.stdout, key.as_bytes());
-
     let output = run(&["--software-root", "identity", "init"]);
     assert!(
         output.status.success(),

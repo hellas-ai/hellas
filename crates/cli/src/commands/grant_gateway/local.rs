@@ -21,9 +21,8 @@ pub async fn prepare(
     let grant = grant
         .parse()
         .context("--local-grant must be a 16-byte hexadecimal ID")?;
-    let root = crate::commands::contributions::data_root(home, &principal)?;
     let store = hellas_authority::work_store::grant::NodeStore::open(
-        &root.join("provider"),
+        &hellas_sdk::grant_config::GrantConfig::journal_dir(home),
         grant_network(),
         Some(identity.enrollment.clone()),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),

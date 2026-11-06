@@ -79,6 +79,7 @@ fn start_validator(
     allocations: [String; 2],
 ) -> (Validator, String, ValidatorConfig, PathBuf) {
     let rpc = format!("ws://127.0.0.1:{}", port());
+    let genesis_path = home.join("genesis.json");
     let mut config_command = command(home);
     config_command.args([
         "chain",
@@ -100,21 +101,20 @@ fn start_validator(
         &allocations[0],
         "--genesis-allocation",
         &allocations[1],
+        "--genesis-out",
+        genesis_path.to_str().unwrap(),
     ]);
     let config_output = output(config_command);
     let config: ValidatorConfig =
         toml::from_str(std::str::from_utf8(&config_output.stdout).unwrap()).unwrap();
     let config_path = home.join("validator.toml");
     std::fs::write(&config_path, &config_output.stdout).unwrap();
-    let genesis_path = home.join("genesis.json");
-    std::fs::write(&genesis_path, serde_json::to_vec(&config.genesis).unwrap()).unwrap();
     let genesis_json = std::fs::read_to_string(&genesis_path).unwrap();
     let trust = hellas_chain::validator::export_trust(&config, genesis_json.as_bytes()).unwrap();
     let chain_path = home.join("chain.json");
     std::fs::write(
         &chain_path,
         serde_json::to_vec(&serde_json::json!({
-            "consensus_digest": hex::encode(hellas_chain::genesis_digest(&config.genesis).0),
             "trust": trust,
             "validators": [rpc],
             "genesis_json": genesis_json,
@@ -158,19 +158,22 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             format!("{}:2000", SettlementKey::from(native.party_key())),
         ],
     );
-    let network = config.network_id().unwrap();
+    let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
+    let network = config.network_id(profile.genesis()).unwrap();
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().unwrap(),
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
+            if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
-                break client.with_consensus_verifier(
-                    hellas_chain::ConsensusVerifier::new(
-                        &info,
-                        hellas_chain::genesis_digest(&config.genesis),
-                    )
-                    .unwrap(),
-                );
+                let _ = info;
+                break client;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -359,7 +362,7 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
     let owner = Secp256k1Signer::from_secret_scalar([24; 32]).unwrap();
     let other_owner = Secp256k1Signer::from_secret_scalar([25; 32]).unwrap();
     let started = std::time::Instant::now();
-    let (mut validator, rpc, _, _) = start_validator(
+    let (mut validator, rpc, _, chain_path) = start_validator(
         home.path(),
         4,
         [
@@ -367,6 +370,14 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
             format!("{}:2000", SettlementKey::from(other_owner.party_key())),
         ],
     );
+    let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().unwrap(),
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             assert!(
@@ -374,7 +385,7 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
                 "validator exited: {}",
                 std::fs::read_to_string(&validator.log).unwrap()
             );
-            if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
+            if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
                 assert_eq!(info.validators.len(), 4);

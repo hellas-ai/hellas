@@ -75,7 +75,7 @@ impl OfferHost {
         assert!(exported.status.success());
         let provider_enrollment = decode_enrollment(&exported.stdout).unwrap();
         let (store, app_secret) = common_node::bootstrap_node_with_credential(
-            &provider.home.join("provider"),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(&provider.home),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
@@ -941,7 +941,7 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         .await;
     let secret = hellas_sdk::node_control::profile::read_credential(&credential_file).unwrap();
     let administrator_profile = profile(
-        root,
+        &hellas_sdk::grant_config::GrantConfig::provider_dir(&host.provider.home),
         "sharing-admin-control",
         authority,
         authorization,
@@ -963,7 +963,11 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         !own.status.success(),
         "an execution-only ceiling must not expose the administrative assignment"
     );
-    assert!(String::from_utf8_lossy(&own.stderr).contains("authorization failed"));
+    assert!(
+        String::from_utf8_lossy(&own.stderr).contains("authorization failed"),
+        "{}",
+        String::from_utf8_lossy(&own.stderr)
+    );
     let query = request_file(root, &auth::InspectionQuery::Grants { after: None });
     let visible: auth::AuthorityInspection = serde_json::from_str(
         &administrator

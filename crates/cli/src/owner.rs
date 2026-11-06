@@ -32,13 +32,13 @@ impl OwnerArgs {
         if !self.is_faucet() {
             return self.load(chain);
         }
-        let path = hellas_chain::genesis::ChainDir::open(home, chain)?.faucet_account();
+        let path = hellas_chain::chain_dir::ChainDir::open(home, chain)?.faucet_account();
         let root = path.parent().expect("faucet account has a chain directory");
         if !path.try_exists()? {
             let index = self
                 .faucet_account
                 .unwrap_or_else(|| rand::random_range(0..100));
-            let temporary = hellas_private::private_tempfile(&root, ".account-", ".new")?;
+            let temporary = hellas_private::private_tempfile(root, ".account-", ".new")?;
             match hellas_sdk::node_control::profile::publish_private(temporary, &path, &[index]) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

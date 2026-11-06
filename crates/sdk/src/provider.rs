@@ -142,7 +142,7 @@ impl<R> FetchProviderOptions<R> {
             grants: options.grants.map(|config| ProviderGrants {
                 config,
                 authority: ProviderAuthority::Journal {
-                    root: options.home.join("grants"),
+                    root: crate::grant_config::GrantConfig::journal_dir(&options.home),
                 },
             }),
             work: work_config,

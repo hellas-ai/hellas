@@ -26,11 +26,9 @@ pub struct GatewayProviderOptions {
 
 impl GatewayProviderOptions {
     pub fn with_config(self, config: WorkConfig) -> PaidWorkOptions {
-        let journal_root =
-            crate::paid_client::PaidJournalDir::gateway(&config.chain, self.provider);
         PaidWorkOptions {
             config,
-            journal_root,
+            journal_kind: crate::paid_client::PaidJournalKind::Gateway,
             provider: self.provider,
             provider_addrs: self.provider_addrs,
             apple_trust: self.apple_trust,
@@ -200,8 +198,7 @@ struct ProviderFile {
 mod tests {
     use super::*;
     fn provider() -> serde_json::Value {
-        serde_json::json!({"journal_root":"/state/client",
-            "provider":crate::test_support::address(iroh::SecretKey::from_bytes(&[4;32]).public()),
+        serde_json::json!({"provider":crate::test_support::address(iroh::SecretKey::from_bytes(&[4;32]).public()),
             "payment":10})
     }
     #[test]

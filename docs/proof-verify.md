@@ -56,15 +56,24 @@ registered network ID must keep its shipped genesis:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+root = Path("network")
+profile = {
+    "genesis_json": (root / "genesis.json").read_bytes().decode("utf-8"),
+    "trust": json.loads((root / "trust.json").read_text()),
+    "validators": ["ws://127.0.0.1:8789"],
+}
+(root / "chain.json").write_text(json.dumps(profile))
+PY
 hellas --chain-config network/chain.json chain indexer serve --rpc ws://127.0.0.1:8789 --home network/indexer
 ```
 
-The exporter checks the genesis against the validator configuration and emits
-public trust data. Authenticate `network/trust.json` and the exact genesis file
-separately from the RPC peer. Put the authenticated canonical consensus digest,
-trust document, validator URLs, and exact genesis JSON in `network/chain.json`
-before starting the indexer. Full Genesis is needed for execution; an optional
-genesis block payload checks the locally derived H0 against an additional pin.
+The exporter checks the genesis committee against the validator configuration
+and emits public trust data. Authenticate `network/trust.json` and the exact genesis file
+separately from the RPC peer. Put the trust document, validator URLs, and exact
+genesis bytes as a JSON string in `network/chain.json` before starting the indexer.
 Do not parse, reserialize, trim, or otherwise change the
 provisioned genesis bytes when calculating its exact-file SHA-256.
 
@@ -76,8 +85,8 @@ the CLI labels them accordingly. RPC snapshot verification currently accepts
 one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
 
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
-`ProofVerifier::with_digest(trust, canonical_digest)` accepts authenticated
-light-client pins without allocations. Without `--chain-config`, CLI commands
+`ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
+light-client pin. Without `--chain-config`, CLI commands
 select the compiled Devnet profile.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws

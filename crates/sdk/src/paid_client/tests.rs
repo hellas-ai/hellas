@@ -192,10 +192,10 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
     let fixture = crate::test_support::PaidFixture::on_network(policy.network);
     let config = fixture.config.clone();
     let provider = crate::test_support::address(SecretKey::generate().public());
-    let journal_root = PaidJournalDir::client(&config.chain, provider);
+    let journal_root = config.chain.client_journals(&provider.to_string());
     let args = PaidWorkOptions {
         config,
-        journal_root: journal_root.clone(),
+        journal_kind: PaidJournalKind::Client,
         provider,
         provider_addrs: vec![],
         assurance: Assurance::ProducerSigned,
@@ -216,49 +216,6 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
         ))
     ));
     assert!(!journal_root.exists());
-}
-
-#[test]
-fn paid_journal_rejects_another_genesis_with_the_same_network_id() {
-    use hellas_chain::genesis::{ChainDir, ChainProfile, CustomChainFile};
-    let fixture = crate::test_support::PaidFixture::new();
-    let config = fixture.config;
-    let provider = crate::test_support::address(SecretKey::generate().public());
-    let own = PaidJournalDir::client(&config.chain, provider);
-    let other_profile = ChainProfile::custom(CustomChainFile {
-        consensus_digest: "57".repeat(32),
-        trust: config.chain.trust().clone(),
-        validators: config.chain.validators().to_vec(),
-        genesis_json: None,
-        genesis_payload: None,
-    })
-    .unwrap();
-    let other = ChainDir::open(fixture.root.path(), &other_profile).unwrap();
-    assert_eq!(other.network_id(), config.chain.network_id());
-    assert_ne!(other.as_path(), config.chain.as_path());
-
-    let mut options = PaidWorkOptions {
-        config,
-        journal_root: own,
-        provider,
-        provider_addrs: vec![],
-        assurance: Assurance::ProducerSigned,
-        apple_trust: None,
-        expected_price: 1,
-        acceptance_blocks: 1,
-        terminal_blocks: 1,
-        payment_blocks: 1,
-        timeout: None,
-    };
-    assert!(options.validate().is_ok());
-    options.journal_root = PaidJournalDir::client(&other, provider);
-    assert!(matches!(
-        options.validate(),
-        Err(PaidClientError::InvalidOptions(
-            "paid journal belongs to another chain"
-        ))
-    ));
-    assert!(!options.journal_root.exists());
 }
 
 async fn serve_open<M>(

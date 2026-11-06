@@ -28,7 +28,10 @@ fn fixture() -> Genesis {
 /// own id would put a node on a network it did not ask for.
 #[test]
 fn every_known_network_document_declares_the_id_the_registry_claims() {
+    use sha2::{Digest as _, Sha256};
+
     assert!(!KNOWN_NETWORKS.is_empty());
+    assert_eq!(Chain::default(), KNOWN_NETWORKS[0].chain);
     for network in KNOWN_NETWORKS {
         let genesis: Genesis = serde_json::from_str(network.json)
             .unwrap_or_else(|err| panic!("{} document parses: {err}", network.name));
@@ -36,6 +39,23 @@ fn every_known_network_document_declares_the_id_the_registry_claims() {
             .validate()
             .unwrap_or_else(|err| panic!("{} document validates: {err}", network.name));
         assert_eq!(genesis.network_id, network.id, "{}", network.name);
+        let trust: TrustDocument = serde_json::from_str(network.trust_json).unwrap();
+        trust.validate().unwrap();
+        assert_eq!(trust.network_id, network.id, "{} trust id", network.name);
+        assert_eq!(
+            trust.genesis_sha256,
+            hex::encode(Sha256::digest(network.json)),
+            "{} trust must bind exact shipped genesis bytes",
+            network.name
+        );
+        let mut routes = BTreeSet::new();
+        assert!(!network.validators.is_empty());
+        for route in network.validators {
+            let parsed = url::Url::parse(route).unwrap();
+            assert!(parsed.host_str().is_some() && matches!(parsed.scheme(), "ws" | "wss"));
+            assert!(routes.insert(parsed.to_string()), "duplicate shipped route");
+        }
+        assert_eq!(network.chain.name(), network.name);
         assert_eq!(known_network(network.name), Some(network));
         assert_eq!(known_network(network.id), Some(network));
     }
@@ -50,11 +70,16 @@ fn every_known_network_document_declares_the_id_the_registry_claims() {
 #[test]
 fn shipped_networks_share_no_name_id_committee_or_account() {
     let mut names = BTreeSet::new();
+    let mut chains = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut keys = BTreeSet::new();
     let mut addresses = BTreeSet::new();
 
     for network in KNOWN_NETWORKS {
+        assert!(
+            chains.insert(network.chain),
+            "duplicate compiled Chain selector"
+        );
         assert!(
             names.insert(network.name),
             "duplicate name {}",

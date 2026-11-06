@@ -126,7 +126,7 @@ fn core_cli_rejects_moved_openai_hosting_and_operator_endpoints() {
     );
     let codex: FetchDestination =
         serde_json::from_value(serde_json::json!({"type":"codex-responses"})).unwrap();
-    assert!(matches!(codex, FetchDestination::CodexResponses));
+    assert!(matches!(codex, FetchDestination::CodexResponses {}));
 
     for value in [
         serde_json::json!({"type":"openai-responses","api_key_env":"HELLAS_TEST_OPENAI_KEY"}),

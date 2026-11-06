@@ -642,7 +642,4 @@ fn attempt_identity_and_exclusive_lock_are_enforced() {
         .is_err()
     );
     assert!(ExecutionAttempt::open(&path, &input, ExecutionTerms::Paid { price: 1 }).is_err());
-    let paid_path = root.path().join("paid-attempt");
-    drop(ExecutionAttempt::open(&paid_path, &input, ExecutionTerms::Paid { price: 1 }).unwrap());
-    assert!(ExecutionAttempt::open(&paid_path, &input, ExecutionTerms::Paid { price: 2 }).is_err());
 }

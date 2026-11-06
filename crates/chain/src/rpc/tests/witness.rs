@@ -204,10 +204,9 @@ async fn fixture(runtime: commonware_runtime::tokio::Context) -> Fixture {
     )
     .await
     .unwrap();
-    let remote = RemoteLightClient::connect(format!("ws://{address}"))
+    let remote = RemoteLightClient::connect(format!("ws://{address}"), committee.verifier)
         .await
-        .unwrap()
-        .with_consensus_verifier(committee.verifier);
+        .unwrap();
     Fixture {
         database,
         owners,

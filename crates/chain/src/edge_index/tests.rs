@@ -170,23 +170,18 @@ impl Harness {
         let allocations = crate::config::genesis_allocations(&genesis).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
-            consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
             trust: trust.clone(),
             validators: vec!["ws://unused.invalid".into()],
-            genesis_json: Some(String::from_utf8(genesis_json.clone()).unwrap()),
-            genesis_payload: Some(hex::encode(head.digest().0)),
+            genesis_json: String::from_utf8(genesis_json.clone()).unwrap(),
         })
         .unwrap();
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config::for_indexed_profile(
-                profile,
-                directory.path().join("node"),
+                crate::chain_dir::ChainDir::open(directory.path(), &profile).unwrap(),
                 Vec::new(),
                 None,
             )
             .unwrap(),
-            trust.clone(),
-            genesis_json.clone(),
             "edge-test".into(),
         )
         .await
@@ -297,7 +292,7 @@ impl Harness {
     }
 
     fn index_path(&self) -> std::path::PathBuf {
-        let mut paths = std::fs::read_dir(self.node.config().storage_dir.clone())
+        let mut paths = std::fs::read_dir(self.node.config().storage_dir())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "redb"));
@@ -312,14 +307,9 @@ impl Harness {
         self.node.shutdown().await.unwrap();
         drop(self.index);
         edit(&index_path);
-        self.node = crate::node::FullNode::start_indexed(
-            config,
-            self.trust.clone(),
-            self.genesis_json.clone(),
-            "edge-test".into(),
-        )
-        .await
-        .unwrap();
+        self.node = crate::node::FullNode::start_indexed(config, "edge-test".into())
+            .await
+            .unwrap();
         self.index = self.node.publication().unwrap().index;
         // A fresh certified observation restores live-read readiness after restart.
         self.node

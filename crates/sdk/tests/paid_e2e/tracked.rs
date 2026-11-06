@@ -17,6 +17,22 @@ fn job() -> hellas_sdk::job::Job {
     .unwrap()
 }
 
+fn paid_path<S>(
+    case: &PaidScenario<S>,
+    job: &hellas_sdk::job::Job,
+    label: &str,
+) -> hellas_sdk::transact::PaidAttemptPath {
+    let digest = Digest::hash(label.as_bytes());
+    let nonce = digest.as_bytes()[..16].try_into().unwrap();
+    hellas_sdk::transact::PaidAttemptPath::new(
+        &case.options.config.chain,
+        case.options.provider,
+        case.owner.principal(),
+        job.digest(),
+    )
+    .with_nonce(nonce)
+}
+
 #[test]
 fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
     run(|runtime| {
@@ -25,8 +41,9 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             fund(&mut case).await;
             let job = job();
             let terms = ExecutionTerms::Paid { price: PRICE };
-            let path = case.root.path().join("retained-paid");
-            let mut attempt = ExecutionAttempt::open(&path, job.input(), terms).unwrap();
+            let paid_path = paid_path(&case, &job, "retained-paid");
+            let path = paid_path.as_path().to_path_buf();
+            let mut attempt = ExecutionAttempt::open_paid(&paid_path, job.input(), PRICE).unwrap();
             let mut session = attempt
                 .open_paid_session(
                     job.input(),
@@ -77,16 +94,23 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             drop(attempt);
             case.endpoint.close().await;
             let approvals = case.approvals.0.lock().unwrap().len();
-            let mut attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let mut attempt =
+                ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE).unwrap();
             let replay = attempt.retained_paid_result().unwrap().unwrap();
             assert_eq!(replay.output.content_id().unwrap(), output);
             assert_eq!((replay.channel_id, replay.bond_edge), (channel, bond));
             attempt.reported().unwrap();
             assert_eq!(case.approvals.0.lock().unwrap().len(), approvals);
-            let result_path = case.root.path().join(".hellas-execution").join(format!(
-                "{}.result",
-                hex::encode(Digest::hash(b"retained-paid").as_bytes()),
-            ));
+            let result_path = path
+                .parent()
+                .unwrap()
+                .join(".hellas-execution")
+                .join(format!(
+                    "{}.result",
+                    hex::encode(
+                        Digest::hash(path.file_name().unwrap().as_encoded_bytes()).as_bytes()
+                    ),
+                ));
             std::fs::remove_file(&result_path).unwrap();
             assert!(matches!(
                 attempt.retained_paid_result(),
@@ -96,7 +120,8 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             // An older paid marker may have no completion receipt at all.
             std::fs::remove_file(result_path.with_extension("receipt")).unwrap();
             std::fs::write(&path, paid_marker).unwrap();
-            let attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let attempt =
+                ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE).unwrap();
             let facts = attempt.inspect().unwrap();
             assert_eq!(facts.payment, Payment::Paid);
             assert!(!facts.reported);
@@ -140,10 +165,10 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             let job = job();
             let terms = ExecutionTerms::Paid { price: PRICE };
             let gate = Arc::new(RetryFunding::default());
-            let mut mismatch = ExecutionAttempt::open(
-                &case.root.path().join("target-mismatch"),
+            let mut mismatch = ExecutionAttempt::open_paid(
+                &paid_path(&case, &job, "target-mismatch"),
                 job.input(),
-                terms,
+                PRICE,
             )
             .unwrap();
             mismatch
@@ -172,9 +197,9 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             ));
             assert_eq!(gate.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             drop(mismatch);
+            let unfunded_path = paid_path(&case, &job, "unfunded");
             let mut unfunded =
-                ExecutionAttempt::open(&case.root.path().join("unfunded"), job.input(), terms)
-                    .unwrap();
+                ExecutionAttempt::open_paid(&unfunded_path, job.input(), PRICE).unwrap();
             assert!(matches!(
                 unfunded
                     .open_paid_session(
@@ -216,12 +241,8 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             drop(unfunded);
             // Correcting a non-spending preflight failure on this same marker
             // can still open a fresh funded channel, including after restart.
-            let mut unfunded = ExecutionAttempt::open_existing(
-                &case.root.path().join("unfunded"),
-                job.input(),
-                terms,
-            )
-            .unwrap();
+            let mut unfunded =
+                ExecutionAttempt::open_existing_paid(&unfunded_path, job.input(), PRICE).unwrap();
             let mut funded = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
@@ -247,12 +268,13 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             let mut bond = None;
             for n in 0..2 {
-                let attempt_path = case.root.path().join(format!("tracked-{n}"));
-                let lost_path = case.root.path().join(format!("terminal-prefix-{n}"));
-                let marker_path = attempt_path.clone();
+                let attempt_path = paid_path(&case, &job, &format!("tracked-{n}"));
+                let lost_attempt_path = paid_path(&case, &job, &format!("terminal-prefix-{n}"));
+                let lost_path = lost_attempt_path.as_path().to_path_buf();
+                let marker_path = attempt_path.as_path().to_path_buf();
                 let prefix_path = lost_path.clone();
                 let mut attempt =
-                    ExecutionAttempt::open(&attempt_path, job.input(), terms).unwrap();
+                    ExecutionAttempt::open_paid(&attempt_path, job.input(), PRICE).unwrap();
                 let mut session = attempt
                     .open_paid_session(
                         job.input(),
@@ -305,7 +327,8 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                 );
                 let before = std::fs::read(&lost_path).unwrap();
                 let mut lost =
-                    ExecutionAttempt::open_existing(&lost_path, job.input(), terms).unwrap();
+                    ExecutionAttempt::open_existing_paid(&lost_attempt_path, job.input(), PRICE)
+                        .unwrap();
                 assert!(matches!(
                     ExecutionSession::Paid(&mut session)
                         .recover(&mut lost)
@@ -331,10 +354,10 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             }
             // Selection must validate the job against this channel's signed policy.
             let wrong = other_contract_job();
-            let mut attempt = ExecutionAttempt::open(
-                &case.root.path().join("wrong-policy"),
+            let mut attempt = ExecutionAttempt::open_paid(
+                &paid_path(&case, &wrong, "wrong-policy"),
                 wrong.input(),
-                terms,
+                PRICE,
             )
             .unwrap();
             assert!(
@@ -356,13 +379,10 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             assert!(!attempt.inspect().unwrap().target_bound);
             drop(attempt);
             // Retained selection does not require a fresh quote from the provider.
+            let offline_path = paid_path(&case, &job, "provider-offline");
             case.provider.shutdown().await.unwrap();
-            let mut attempt = ExecutionAttempt::open(
-                &case.root.path().join("provider-offline"),
-                job.input(),
-                terms,
-            )
-            .unwrap();
+            let mut attempt =
+                ExecutionAttempt::open_paid(&offline_path, job.input(), PRICE).unwrap();
             let mut session = tokio::time::timeout(
                 Duration::from_secs(30),
                 attempt.open_paid_session(
@@ -408,8 +428,10 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             fund(&mut case).await;
             let job = job();
             let terms = ExecutionTerms::Paid { price: PRICE };
-            let path = case.root.path().join("interrupted");
-            let mut attempt = ExecutionAttempt::open(&path, job.input(), terms).unwrap();
+            let interrupted_path = paid_path(&case, &job, "interrupted");
+            let path = interrupted_path.as_path().to_path_buf();
+            let mut attempt =
+                ExecutionAttempt::open_paid(&interrupted_path, job.input(), PRICE).unwrap();
             let mut session = attempt
                 .open_paid_session(
                     job.input(),
@@ -430,7 +452,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             prefix["work"] = serde_json::Value::Null;
             assert!(prefix["request_commitment"].is_array());
             assert!(prefix["attempt_nonce"].is_array());
-            assert_missing_bindings_refused(case.root.path(), &prefix, work);
+            assert_missing_bindings_refused(&case, &prefix, work);
             // While input bytes are present, a different caller job must not attach
             // to this acceptance even if its marker names this channel and nonce.
             let other = hellas_sdk::job::Job::fetch(
@@ -444,10 +466,12 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             .unwrap();
             let mut wrong_job = prefix.clone();
             wrong_job["job"] = serde_json::json!(other.digest().as_bytes());
-            let wrong_path = case.root.path().join("wrong-job");
+            let wrong_paid_path = paid_path(&case, &other, "wrong-job");
+            let wrong_path = wrong_paid_path.as_path().to_path_buf();
             write_marker(&wrong_path, &wrong_job);
             let mut wrong_attempt =
-                ExecutionAttempt::open_existing(&wrong_path, other.input(), terms).unwrap();
+                ExecutionAttempt::open_existing_paid(&wrong_paid_path, other.input(), PRICE)
+                    .unwrap();
             assert!(
                 ExecutionSession::Paid(&mut session)
                     .recover(&mut wrong_attempt)
@@ -461,7 +485,9 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             // The durable prefix after JobAccepted but before purchase.accepting:
             // the original nonce and its request commitment, still no work ID.
             write_marker(&path, &prefix);
-            let mut attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let mut attempt =
+                ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
+                    .unwrap();
             let mut session = attempt
                 .open_paid_session(
                     job.input(),
@@ -497,10 +523,12 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                     }
                     _ => unreachable!(),
                 }
-                let wrong_path = case.root.path().join(format!("wrong-{field}"));
+                let wrong_paid_path = paid_path(&case, &job, &format!("wrong-{field}"));
+                let wrong_path = wrong_paid_path.as_path().to_path_buf();
                 write_marker(&wrong_path, &wrong);
                 let mut wrong_attempt =
-                    ExecutionAttempt::open_existing(&wrong_path, job.input(), terms).unwrap();
+                    ExecutionAttempt::open_existing_paid(&wrong_paid_path, job.input(), PRICE)
+                        .unwrap();
                 assert!(
                     ExecutionSession::Paid(&mut session)
                         .recover(&mut wrong_attempt)
@@ -509,12 +537,14 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                     "{field}"
                 );
             }
-            let pending_path = case.root.path().join("no-proof");
+            let pending_paid_path = paid_path(&case, &job, "no-proof");
+            let pending_path = pending_paid_path.as_path().to_path_buf();
             let mut pending = prefix.clone();
             pending["nonce"] = serde_json::json!(nonce + 1);
             write_marker(&pending_path, &pending);
             let mut pending_attempt =
-                ExecutionAttempt::open_existing(&pending_path, job.input(), terms).unwrap();
+                ExecutionAttempt::open_existing_paid(&pending_paid_path, job.input(), PRICE)
+                    .unwrap();
             assert_pending(&mut session, &mut pending_attempt, &job, &signer).await;
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&std::fs::read(&pending_path).unwrap())
@@ -564,17 +594,21 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             drop(session);
             drop(attempt);
             // The recovered ID survives another caller reopen without changing nonce.
-            let attempt = ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap();
+            let attempt =
+                ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
+                    .unwrap();
             assert_eq!(attempt.inspect().unwrap().work, Some(work));
             drop(attempt);
             // A client signature alone does not establish provider acceptance.
             let (unsigned, request_commitment) =
                 record_unsigned_proposal(&case, &job, &signer, bond, nonce + 1).await;
             pending["request_commitment"] = serde_json::json!(request_commitment.as_bytes());
-            let unsigned_path = case.root.path().join("unsigned");
+            let unsigned_paid_path = paid_path(&case, &job, "unsigned");
+            let unsigned_path = unsigned_paid_path.as_path().to_path_buf();
             write_marker(&unsigned_path, &pending);
             let mut attempt =
-                ExecutionAttempt::open_existing(&unsigned_path, job.input(), terms).unwrap();
+                ExecutionAttempt::open_existing_paid(&unsigned_paid_path, job.input(), PRICE)
+                    .unwrap();
             let mut session = attempt
                 .open_paid_session(
                     job.input(),
@@ -676,7 +710,7 @@ async fn record_unsigned_proposal(
     use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore};
     let verifier = hellas_kernel::Secp256k1Verifier::new();
     let setup = SetupStore::open_existing(
-        &case.options.journal_root,
+        &case.options.journal_root(),
         case.options.config.network(),
         bond,
         Role::Client,
@@ -688,7 +722,7 @@ async fn record_unsigned_proposal(
     let origin = setup.state().origin().unwrap();
     drop(setup);
     let mut channel = ChannelStore::open_existing(
-        &case.options.journal_root,
+        &case.options.journal_root(),
         descriptor.channel().clone(),
         descriptor.expected_settlement().unwrap(),
         Role::Client,
@@ -821,8 +855,10 @@ fn reused_nonce_scenario(
             .unwrap()
         };
         let terms = ExecutionTerms::Paid { price: PRICE };
-        let first_path = case.root.path().join("before-proposal");
-        let mut first_attempt = ExecutionAttempt::open(&first_path, first.input(), terms).unwrap();
+        let first_paid_path = paid_path(&case, &first, "before-proposal");
+        let first_path = first_paid_path.as_path().to_path_buf();
+        let mut first_attempt =
+            ExecutionAttempt::open_paid(&first_paid_path, first.input(), PRICE).unwrap();
         let mut session = first_attempt
             .open_paid_session(
                 first.input(),
@@ -869,12 +905,9 @@ fn reused_nonce_scenario(
         drop(first_attempt);
         // A deliberate later attempt uses the still-free channel nonce.
         let second = job();
-        let mut second_attempt = ExecutionAttempt::open(
-            &case.root.path().join("later-attempt"),
-            second.input(),
-            terms,
-        )
-        .unwrap();
+        let second_paid_path = paid_path(&case, &second, "later-attempt");
+        let mut second_attempt =
+            ExecutionAttempt::open_paid(&second_paid_path, second.input(), PRICE).unwrap();
         let mut session = second_attempt
             .open_paid_session(
                 second.input(),
@@ -899,8 +932,7 @@ fn reused_nonce_scenario(
         .await;
         assert_eq!(nonce, 1);
         let second_record: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(case.root.path().join("later-attempt")).unwrap())
-                .unwrap();
+            serde_json::from_slice(&std::fs::read(second_paid_path.as_path()).unwrap()).unwrap();
         assert_ne!(
             first_record["attempt_nonce"],
             second_record["attempt_nonce"]
@@ -913,7 +945,7 @@ fn reused_nonce_scenario(
         drop(session);
         drop(second_attempt);
         let mut first_attempt =
-            ExecutionAttempt::open_existing(&first_path, first.input(), terms).unwrap();
+            ExecutionAttempt::open_existing_paid(&first_paid_path, first.input(), PRICE).unwrap();
         let mut session = first_attempt
             .open_paid_session(
                 first.input(),
@@ -972,7 +1004,7 @@ fn reused_nonce_scenario(
 }
 
 fn assert_missing_bindings_refused(
-    root: &std::path::Path,
+    case: &PaidScenario<()>,
     prefix: &serde_json::Value,
     work: Digest,
 ) {
@@ -986,20 +1018,17 @@ fn assert_missing_bindings_refused(
             } else {
                 serde_json::Value::Null
             };
-            let path = root.join(format!("missing-{field}-{known_work}"));
-            write_marker(&path, &record);
-            let before = std::fs::read(&path).unwrap();
+            let paid_path = paid_path(case, &job, &format!("missing-{field}-{known_work}"));
+            let path = paid_path.as_path();
+            write_marker(path, &record);
+            let before = std::fs::read(path).unwrap();
             assert!(matches!(
-                ExecutionAttempt::open_existing(
-                    &path,
-                    job.input(),
-                    ExecutionTerms::Paid { price: PRICE },
-                ),
+                ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE),
                 Err(ExecutionError::Purchase(
                     hellas_sdk::transact::PurchaseError::Identity
                 ))
             ));
-            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read(path).unwrap(), before);
         }
     }
 }

@@ -1,5 +1,6 @@
 use hellas_authority::model::grant::records::decode_contact_card;
 use hellas_chain::genesis::{Chain, ChainProfile, FaucetAccount, HELLAS_DEVNET_1_FAUCET_JSON};
+use sha2::Digest as _;
 use std::process::Command;
 
 #[test]
@@ -52,13 +53,18 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
     let known = ChainProfile::known(Chain::Devnet);
     let mut trust = known.trust().clone();
     trust.network_id = "custom-faucet-test".into();
+    let mut genesis: serde_json::Value =
+        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
+    genesis["network_id"] = serde_json::json!("custom-faucet-test");
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    trust.genesis_sha256 = hex::encode(sha2::Sha256::digest(genesis_json.as_bytes()));
     let path = home.path().join("chain.json");
     std::fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({
-            "consensus_digest": hex::encode(known.consensus_digest()),
             "trust": trust,
             "validators": ["ws://127.0.0.1:9080"],
+            "genesis_json": genesis_json,
         }))
         .unwrap(),
     )
@@ -75,34 +81,9 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("require the compiled devnet chain"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("selected chain has no faucet accounts")
+    );
     assert!(!identity.exists());
     assert!(!home.path().join("app").exists());
-}
-
-#[test]
-fn known_chain_pin_mismatch_reports_outdated_binary() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("chain.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!({
-            "consensus_digest": "00".repeat(32),
-            "trust": ChainProfile::known(Chain::Devnet).trust(),
-            "validators": ["ws://127.0.0.1:9080"],
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
-        .arg("--chain-config")
-        .arg(path)
-        .args(["contact", "export", "--display-name", "Anyone"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("this binary is out of date for devnet; please update")
-    );
 }
