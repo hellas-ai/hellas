@@ -653,6 +653,14 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
         ..
     } = plan;
     let gate = (!feature.is_empty()).then(|| quote! { #[cfg(feature = #feature)] });
+    let body_limit = if matches!(
+        plan.fqn.as_str(),
+        "hellas.content.v1.Content" | "hellas.resolve.v1.Resolve"
+    ) {
+        quote! { ::hellas_wire::transport::body_limit() }
+    } else {
+        quote! { ::hellas_wire::frame::MAX_FRAME_BYTES }
+    };
     let service_id = hex_u32(plan.service_id);
 
     let markers = plan.methods.iter().map(|m| {
@@ -722,6 +730,7 @@ fn render_service_block(plan: &ServicePlan) -> TokenStream {
                 const NAME: &'static str = #fqn;
                 const ALPN: &'static str = #alpn;
                 const SERVICE_ID: u32 = #service_id;
+                const MAX_BODY_BYTES: usize = #body_limit;
             }
 
             #(#markers)*

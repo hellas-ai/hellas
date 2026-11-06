@@ -172,6 +172,12 @@ impl Records {
         }
     }
 
+    pub(crate) fn forget(&self, identity: FileIdentity) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(&identity);
+        }
+    }
+
     /// Discards every record, forcing a re-hash of everything.
     ///
     /// The "force recheck" every fastresume implementation needs,

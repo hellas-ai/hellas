@@ -218,8 +218,12 @@ pub trait RecvHalf:
 pub const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024; // 1 MiB
 
 /// Usable body size shared by paged protocols and their raw codecs.
-pub fn body_limit() -> usize {
-    (DEFAULT_STREAM_WINDOW as usize).min(crate::frame::MAX_FRAME_BYTES)
+pub const fn body_limit() -> usize {
+    if (DEFAULT_STREAM_WINDOW as usize) < crate::frame::MAX_FRAME_BYTES {
+        DEFAULT_STREAM_WINDOW as usize
+    } else {
+        crate::frame::MAX_FRAME_BYTES
+    }
 }
 
 /// Compile-time identity of a proto service. The build script emits one
@@ -231,6 +235,8 @@ pub trait ServiceMarker {
     const ALPN: &'static str;
     /// Truncated 32-bit service id (Xet hash of schema, low 4 bytes LE).
     const SERVICE_ID: u32;
+    /// Raw protobuf body bound, checked before decoding.
+    const MAX_BODY_BYTES: usize = crate::frame::MAX_FRAME_BYTES;
 }
 
 /// Compile-time identity of a proto rpc method. The build script emits one

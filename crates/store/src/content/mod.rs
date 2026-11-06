@@ -1,10 +1,14 @@
 //! Generic verified objects, trees, pins and scoped content operations.
 mod acquire;
+mod core;
+mod disk;
+mod local;
 mod memory;
 mod page;
 mod policy;
 mod remote;
 pub(crate) mod reservation;
+mod storage;
 mod tree;
 mod upload;
 mod wire;
@@ -20,6 +24,8 @@ use hellas_auth::{
 use hellas_rpc::ContentRef;
 use hellas_xet::Chunk;
 
+pub use disk::{DiskStore, IndexMode};
+pub use local::{JobContent, LocalStore, VerifiedReader};
 pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
 pub use policy::{
@@ -226,3 +232,59 @@ pub trait ContentStore: Send + Sync {
     async fn watch(&self, s: &Scope, prefix: &str, from: Cursor) -> Result<PinEvents>;
     async fn collect(&self, s: &Scope) -> Result<Collected>;
 }
+
+// Both local backends execute one implementation of every scoped operation.
+macro_rules! impl_local_content {
+    ($backend:ty) => {
+        #[async_trait::async_trait]
+        impl ContentStore for $backend {
+            async fn stat(&self, s: &Scope, at: &Path) -> Result<Option<Stat>> {
+                self.core.stat(s, at).await
+            }
+            async fn chunks(&self, s: &Scope, at: &Path, page: Cursor) -> Result<ChunkPage> {
+                self.core.chunks(s, at, page).await
+            }
+            async fn read(&self, s: &Scope, at: &Path, range: Range<u64>) -> Result<ByteStream> {
+                self.core.read(s, at, range).await
+            }
+            async fn upload(
+                &self,
+                s: &Scope,
+                object: ContentRef,
+                pin: Option<PinTarget>,
+            ) -> Result<UploadSession> {
+                self.core.upload(s, object, pin).await
+            }
+            async fn acquire(
+                &self,
+                s: &Scope,
+                source: Source,
+                expect: Option<ContentRef>,
+                pin: PinTarget,
+            ) -> Result<Acquisition> {
+                self.core.acquire(s, source, expect, pin).await
+            }
+            async fn set_pin(
+                &self,
+                s: &Scope,
+                name: &PinName,
+                expected: Option<&PinValue>,
+                new: Option<PinValue>,
+            ) -> Result<()> {
+                self.core.set_pin(s, name, expected, new).await
+            }
+            async fn pins(&self, s: &Scope, prefix: &str, page: Cursor) -> Result<PinPage> {
+                self.core.pins(s, prefix, page).await
+            }
+            async fn watch(&self, s: &Scope, prefix: &str, from: Cursor) -> Result<PinEvents> {
+                self.core.watch(s, prefix, from).await
+            }
+            async fn collect(&self, s: &Scope) -> Result<Collected> {
+                self.core.collect(s).await
+            }
+        }
+    };
+}
+impl_local_content!(MemoryStore);
+
+impl_local_content!(DiskStore);

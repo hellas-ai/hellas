@@ -898,8 +898,14 @@ impl HfCas {
                         .ok_or_else(|| FetchError::Malformed("xorb frame exceeds range".into()))?;
                     let _scratch = pool
                         .reserve(
-                            (header.len() + compressed + 2 * (hellas_xet::MAX_CHUNK_SIZE + 1))
-                                as u64,
+                            (header.len()
+                                + compressed
+                                + 2 * (hellas_xet::MAX_CHUNK_SIZE + 1)
+                                + if header[4] == 0 {
+                                    0
+                                } else {
+                                    crate::xorb::LZ4_SCRATCH_BYTES
+                                }) as u64,
                         )
                         .map_err(|_| FetchError::Capacity)?;
                     let mut frame = Vec::with_capacity(header.len() + compressed);

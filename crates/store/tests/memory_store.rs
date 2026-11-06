@@ -131,9 +131,11 @@ async fn private_objects_and_other_scopes_progress_do_not_count_as_missing_answe
     let object = put(&store, "private", payload, PinPolicy::Owner).await;
     let first = store
         .open_work(job(1, 1), vec![object], object.bytes())
+        .await
         .unwrap();
     let second = store
         .open_work(job(2, 1), vec![object], object.bytes())
+        .await
         .unwrap();
     let mut one = store.upload(&first, object, None).await.unwrap();
     one.declare(&hellas_xet::chunk(payload), true)
@@ -181,9 +183,9 @@ async fn declared_jobs_and_channel_policy_both_limit_access_and_cas_covers_polic
         PinPolicy::Channel(job(1, 1).channel),
     )
     .await;
-    let allowed = store.open_work(job(1, 1), vec![a, b], 100).unwrap();
-    let other = store.open_work(job(2, 1), vec![a, b], 100).unwrap();
-    let undeclared = store.open_work(job(1, 2), vec![a], 100).unwrap();
+    let allowed = store.open_work(job(1, 1), vec![a, b], 100).await.unwrap();
+    let other = store.open_work(job(2, 1), vec![a, b], 100).await.unwrap();
+    let undeclared = store.open_work(job(1, 2), vec![a], 100).await.unwrap();
     assert!(
         store
             .stat(&allowed, &at("channel", ""))
@@ -264,7 +266,7 @@ async fn a_resolved_tree_with_absent_leaves_does_not_bypass_ram_admission() {
         .await
         .unwrap();
     assert!(matches!(
-        store.open_work(job(1, 1), vec![leaf], leaf.bytes()),
+        store.open_work(job(1, 1), vec![leaf], leaf.bytes()).await,
         Err(Error::Capacity)
     ));
     assert_eq!(pool.held(), tree_object.bytes());
@@ -275,7 +277,7 @@ async fn loss_of_a_readable_pin_rechecks_reservation_before_accepting_payload() 
     let pool = Reservations::ram(300);
     let store = MemoryStore::new(pool.clone());
     let object = put(&store, "held", &vec![8; 256], PinPolicy::Jobs).await;
-    let scope = store.open_work(job(1, 1), vec![object], 256).unwrap();
+    let scope = store.open_work(job(1, 1), vec![object], 256).await.unwrap();
     assert_eq!(pool.held(), 256);
     remove(&store, "held").await;
     assert!(matches!(
@@ -291,7 +293,7 @@ async fn acceptance_transfers_staging_charge_to_live_ram_without_losing_bytes() 
     let store = MemoryStore::new(pool.clone());
     let bytes = vec![9; 512];
     let object = ContentRef::for_bytes(&bytes);
-    let scope = store.open_work(job(1, 1), vec![object], 512).unwrap();
+    let scope = store.open_work(job(1, 1), vec![object], 512).await.unwrap();
     let mut session = store.upload(&scope, object, None).await.unwrap();
     session
         .declare(&hellas_xet::chunk(&bytes), true)
@@ -300,7 +302,9 @@ async fn acceptance_transfers_staging_charge_to_live_ram_without_losing_bytes() 
     session.accept_chunk(&bytes).await.unwrap();
     drop(session);
     assert!(matches!(
-        store.open_work(job(2, 1), vec![ContentRef::for_bytes(&vec![1; 600])], 600),
+        store
+            .open_work(job(2, 1), vec![ContentRef::for_bytes(&vec![1; 600])], 600)
+            .await,
         Err(Error::Capacity)
     ));
     store.accept_work(&scope).unwrap();
@@ -311,6 +315,7 @@ async fn acceptance_transfers_staging_charge_to_live_ram_without_losing_bytes() 
     );
     store
         .open_work(job(2, 1), vec![ContentRef::for_bytes(&vec![1; 600])], 600)
+        .await
         .unwrap();
     store.end_work(&scope).unwrap();
     assert!(store.own_bytes(&scope, object).is_err());
@@ -446,7 +451,7 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
         lagged.next().await.unwrap().unwrap(),
         PinEvent::Resync { .. }
     ));
-    let scope = store.open_work(job(1, 1), vec![object], 100).unwrap();
+    let scope = store.open_work(job(1, 1), vec![object], 100).await.unwrap();
     let mut work_watch = store
         .watch(
             &scope,
@@ -482,12 +487,12 @@ async fn retained_read_and_upper_handles_keep_their_ram_charge_until_drop() {
     store.collect(&Scope::Owner).await.unwrap();
     assert_eq!(pool.held(), 512);
     assert!(matches!(
-        store.open_work(job(1, 1), vec![object], 512),
+        store.open_work(job(1, 1), vec![object], 512).await,
         Err(Error::Capacity)
     ));
     drop(held);
     assert_eq!(pool.held(), 0);
-    let scope = store.open_work(job(1, 1), vec![object], 512).unwrap();
+    let scope = store.open_work(job(1, 1), vec![object], 512).await.unwrap();
     let mut session = store.upload(&scope, object, None).await.unwrap();
     session
         .declare(&hellas_xet::chunk(&vec![5; 512]), true)
@@ -508,7 +513,7 @@ async fn own_progress_retries_do_not_allocate_again_and_undeclared_metadata_is_h
     let store = MemoryStore::new(pool.clone());
     let payload = vec![6; 512];
     let object = ContentRef::for_bytes(&payload);
-    let scope = store.open_work(job(1, 1), vec![object], 512).unwrap();
+    let scope = store.open_work(job(1, 1), vec![object], 512).await.unwrap();
     let mut first = store.upload(&scope, object, None).await.unwrap();
     assert!(matches!(
         store.upload(&scope, object, None).await,
@@ -527,6 +532,7 @@ async fn own_progress_retries_do_not_allocate_again_and_undeclared_metadata_is_h
     let served = put(&store, "undeclared", b"secret id", PinPolicy::Jobs).await;
     let scope = store
         .open_work(job(2, 1), vec![ContentRef::for_bytes(b"other")], 100)
+        .await
         .unwrap();
     assert!(
         store
@@ -595,7 +601,7 @@ async fn globally_pinning_a_private_copy_cannot_reuse_its_ram_for_another_object
     let store = MemoryStore::new(pool.clone());
     let a = put(&store, "a", b"aaaa", PinPolicy::Owner).await;
     let b = put(&store, "b", b"bbbb", PinPolicy::Jobs).await;
-    let scope = store.open_work(job(1, 2), vec![a, b], 8).unwrap();
+    let scope = store.open_work(job(1, 2), vec![a, b], 8).await.unwrap();
     let mut session = store.upload(&scope, a, None).await.unwrap();
     session
         .declare(&hellas_xet::chunk(b"aaaa"), true)

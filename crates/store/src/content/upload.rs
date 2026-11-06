@@ -1,33 +1,36 @@
 use hellas_rpc::ContentRef;
 use hellas_xet::{Chunk, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, file_hash};
 
-use super::reservation::Reservation;
-use super::{Error, MemoryStore, PinTarget, ReservationId, Result, Scope};
+use super::{Error, PinTarget, ReservationId, Result, Scope, core::Core};
 use prost::Message;
-use std::sync::Arc;
 
 /// Declare-then-fill verification. Payload is accepted only after the complete
 /// descriptor commitment; one preceding chunk suffices to verify CDC boundaries.
 pub(crate) struct LocalSession {
-    pub store: MemoryStore,
+    pub store: Core,
     pub scope: Scope,
     pub pin: Option<PinTarget>,
     pub object: ContentRef,
     pub reservation: ReservationId,
-    pub charge: Arc<Reservation>,
-    pub bytes: Vec<u8>,
+    pub bytes: Option<super::storage::Buffer>,
     pub finished: bool,
+    pub output: bool,
 }
 impl Drop for LocalSession {
     fn drop(&mut self) {
         if !self.finished {
-            self.store.abandon(self.reservation, self.object.id());
+            drop(self.bytes.take());
+            self.store.abandon(
+                self.reservation,
+                self.object.id(),
+                if self.output { self.object.bytes() } else { 0 },
+            );
         }
     }
 }
 enum Destination {
     Verify,
-    Local(LocalSession),
+    Local(Box<LocalSession>),
     Remote(super::remote::RemoteSession),
     Present,
 }
@@ -80,7 +83,7 @@ impl UploadSession {
     }
     pub(crate) fn local(object: ContentRef, destination: LocalSession) -> Self {
         let mut session = Self::new(object);
-        session.destination = Destination::Local(destination);
+        session.destination = Destination::Local(Box::new(destination));
         session
     }
     pub(crate) fn remote(object: ContentRef, destination: super::remote::RemoteSession) -> Self {
@@ -114,7 +117,7 @@ impl UploadSession {
             remote.declare(chunks, complete, verified).await?;
             self.failed = false;
         }
-        self.publish()
+        self.publish().await
     }
     fn declare_inner(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
         if self.failed || self.declared || self.published {
@@ -202,7 +205,28 @@ impl UploadSession {
         self.accept_inner(bytes)?;
         let verified = self.verified();
         match &mut self.destination {
-            Destination::Local(local) => local.bytes.extend_from_slice(bytes),
+            Destination::Local(local) if local.store.disk.is_none() => {
+                use std::io::Write;
+                local
+                    .bytes
+                    .as_mut()
+                    .ok_or(Error::Invalid("upload already published"))?
+                    .write_all(bytes)?;
+            }
+            Destination::Local(_) => {
+                let Destination::Local(local) =
+                    std::mem::replace(&mut self.destination, Destination::Verify)
+                else {
+                    unreachable!()
+                };
+                let core = local.store.clone();
+                let charge = core.pool.reserve(bytes.len() as u64)?;
+                let bytes = super::storage::charged(bytes::Bytes::copy_from_slice(bytes), charge);
+                self.failed = true;
+                self.destination =
+                    Destination::Local(Box::new(core.write_local(*local, bytes).await?));
+                self.failed = false;
+            }
             Destination::Remote(remote) => {
                 self.failed = true;
                 remote.chunk(bytes, self.next, verified).await?;
@@ -210,14 +234,26 @@ impl UploadSession {
             }
             _ => {}
         }
-        self.publish()
+        self.publish().await
     }
-    fn publish(&mut self) -> Result<()> {
+    async fn publish(&mut self) -> Result<()> {
         if !self.verified() {
             return Ok(());
         }
-        if let Destination::Local(local) = &mut self.destination {
-            local.store.clone().publish(local, self.chunks.clone())?;
+        if matches!(&self.destination, Destination::Local(_)) {
+            let Destination::Local(mut local) =
+                std::mem::replace(&mut self.destination, Destination::Verify)
+            else {
+                unreachable!()
+            };
+            let chunks = self.chunks.clone();
+            self.failed = true;
+            local
+                .store
+                .clone()
+                .effect(move |core| core.publish(&mut local, chunks))
+                .await?;
+            self.failed = false;
         }
         self.published = true;
         self.previous = Vec::new();

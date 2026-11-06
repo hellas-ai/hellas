@@ -1,4 +1,6 @@
 use super::*;
+use sha2::{Digest as _, Sha256};
+use std::{io::Read, sync::Arc};
 use std::{
     io::{BufRead, Write},
     net::TcpListener,
@@ -81,7 +83,7 @@ async fn cold_https_acquisition_pins_only_verified_bytes_and_sha_is_not_the_id()
     let (url, http, serving) = https(b"canonical HTTPS bytes");
     let pool = Reservations::ram(10_000);
     let mut store = MemoryStore::new(pool.clone());
-    store.http = http;
+    store.core.http = http;
     let sha: [u8; 32] = Sha256::digest(b"canonical HTTPS bytes").into();
     let got = store
         .acquire(
@@ -117,7 +119,7 @@ async fn mismatched_https_expectation_or_transport_digest_leaves_no_pin_or_ram()
         let (url, http, serving) = https(b"never publish me");
         let pool = Reservations::ram(10_000);
         let mut store = MemoryStore::new(pool.clone());
-        store.http = http;
+        store.core.http = http;
         let expect = (!wrong_sha).then(|| ContentRef::for_bytes(b"wrong content id"));
         let result = store
             .acquire(
@@ -175,21 +177,21 @@ async fn cancellation_keeps_the_worker_charge_until_the_blocking_reader_stops() 
     let charge = pool.reserve(1).unwrap();
     let (entered, waiting) = mpsc::channel();
     let (release, blocked) = mpsc::channel();
+    let core = Core::new(pool.clone());
     let worker = tokio::task::spawn_blocking(move || {
-        finish(
-            read_bytes(
+        let mut buffer = Buffer::new(&core, 1, charge).unwrap();
+        buffer
+            .fill(
                 Reader {
                     entered: Some(entered),
                     release: blocked,
                     sent: false,
                 },
-                1,
                 None,
+                &core.pool,
             )
-            .unwrap(),
-            None,
-            charge,
-        )
+            .unwrap();
+        finish(buffer, None)
     });
     waiting.recv().unwrap();
     drop(worker);
@@ -278,7 +280,7 @@ fn hf_git_paths_are_encoded_and_dataset_files_use_the_dataset_endpoint() {
         xet_hash: None,
         lfs: None,
     };
-    let stage = hf_file(&cas, &file, &pool, None).unwrap();
+    let stage = hf_file(&cas, &file, &Core::new(pool.clone()), None).unwrap();
     serving.join().unwrap();
     assert_eq!(stage.object, ContentRef::for_bytes(b"git file"));
     assert_eq!(pool.held(), 8);
@@ -360,11 +362,13 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     });
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
-    let (stages, root) = hf_stages(&cas, &pool, None, None, false).unwrap();
+    let (stages, root) = hf_stages(&cas, &Core::new(pool.clone()), None, None, false).unwrap();
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());
-    publish(&store, stages, root, pin("resolved")).unwrap();
+    publish(&store.core, stages, root, pin("resolved"))
+        .await
+        .unwrap();
     assert_eq!(pool.held(), root.object().bytes() + 2);
     assert!(
         store
@@ -419,4 +423,50 @@ fn known_hf_reconstruction_checks_the_expected_chunk_hash_before_writing() {
     serving.join().unwrap();
     assert!(bytes.is_empty());
     assert_eq!(pool.held(), 0);
+}
+
+#[tokio::test]
+async fn disk_cold_https_streams_an_object_larger_than_any_tree_without_ram_materialization() {
+    let data: &'static [u8] = Box::leak(vec![9; MAX_TREE_BYTES + 1].into_boxed_slice());
+    let (url, http, serving) = https(data);
+    let root = tempfile::tempdir().unwrap();
+    let ram = Reservations::ram(2 << 20);
+    let mut store = DiskStore::open(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        Some(data.len() as u64),
+        ram.clone(),
+    )
+    .await
+    .unwrap();
+    store.core.http = http;
+    store.finish_recovery().await.unwrap();
+    let acquired = store
+        .acquire(
+            &Scope::Owner,
+            Source::Https {
+                url,
+                sha256: None,
+                bytes: data.len() as u64,
+            },
+            None,
+            pin("large"),
+        )
+        .await
+        .unwrap();
+    serving.join().unwrap();
+    assert_eq!(acquired.object, ContentRef::for_bytes(data));
+    assert_eq!(store.stats().unwrap().used, data.len() as u64);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    assert_eq!(ram.held(), 0);
+    let mut read = store
+        .read(&Scope::Public, &path("large"), 120_000..140_000)
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    while let Some(chunk) = read.bytes.next().await {
+        actual.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(actual, data[120_000..140_000]);
 }

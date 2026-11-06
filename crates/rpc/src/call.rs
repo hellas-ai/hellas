@@ -23,16 +23,6 @@ use hellas_wire::transport::{
 use crate::observe::{LEVEL, TARGET, Timing};
 use crate::telemetry::CallSpan;
 
-// Content pages use the usable stream window, even on transports whose parser
-// permits larger frames. Check raw bytes before prost allocates repeated fields.
-fn method_body_limit<M: MethodMarker>() -> Option<usize> {
-    matches!(
-        M::Service::NAME,
-        "hellas.content.v1.Content" | "hellas.resolve.v1.Resolve"
-    )
-    .then_some(hellas_wire::transport::body_limit())
-}
-
 /// Unary call: send one request, receive one response.
 pub async fn unary<T, M>(
     transport: &T,
@@ -79,7 +69,7 @@ where
                 .map_err(transport_to_status)?;
             let (mut send, mut recv) = WireStream::split(stream);
             if let Some(status) =
-                raw_request_limit_status(request.encoded_len(), method_body_limit::<M>())
+                raw_request_limit_status(request.encoded_len(), Some(M::Service::MAX_BODY_BYTES))
             {
                 return Err(status);
             }
@@ -123,7 +113,9 @@ where
             if trailer.status != WireCode::Ok {
                 return Err(trailer_to_status(trailer));
             }
-            if let Some(status) = raw_request_limit_status(chunk.len(), method_body_limit::<M>()) {
+            if let Some(status) =
+                raw_request_limit_status(chunk.len(), Some(M::Service::MAX_BODY_BYTES))
+            {
                 return Err(status);
             }
             let response = M::Response::decode(&chunk[..])
@@ -226,7 +218,7 @@ where
                 .map_err(transport_to_status)?;
             let (mut send, mut recv) = WireStream::split(stream);
             if let Some(status) =
-                raw_request_limit_status(request.encoded_len(), method_body_limit::<M>())
+                raw_request_limit_status(request.encoded_len(), Some(M::Service::MAX_BODY_BYTES))
             {
                 return Err(status);
             }
@@ -235,7 +227,7 @@ where
             Ok(StreamingCall::new(
                 recv,
                 operation,
-                method_body_limit::<M>(),
+                Some(M::Service::MAX_BODY_BYTES),
             ))
         },
         span,
@@ -283,7 +275,7 @@ where
                 send,
                 recv,
                 operation,
-                method_body_limit::<M>(),
+                Some(M::Service::MAX_BODY_BYTES),
             ))
         },
         span,
@@ -982,7 +974,7 @@ where
             let worked = Timing::start();
             let _worker = route.workers.acquire().await;
             if let Some(status) =
-                raw_request_limit_status(req_bytes.len(), method_body_limit::<M>())
+                raw_request_limit_status(req_bytes.len(), Some(M::Service::MAX_BODY_BYTES))
             {
                 return write_trailer(&mut send, status.into(), &operation).await;
             }
@@ -1158,7 +1150,7 @@ where
                 Some(Err(e)) => return Err(TransportError::Io(format!("recv: {e}"))),
                 None => return Err(TransportError::Protocol("empty unary request".into())),
             };
-            let max_request_bytes = match (max_request_bytes, method_body_limit::<M>()) {
+            let max_request_bytes = match (max_request_bytes, Some(M::Service::MAX_BODY_BYTES)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
@@ -1262,7 +1254,7 @@ where
             };
             finish_unary_request(recv.as_mut().get_mut()).await?;
             if let Some(status) =
-                raw_request_limit_status(req_bytes.len(), method_body_limit::<M>())
+                raw_request_limit_status(req_bytes.len(), Some(M::Service::MAX_BODY_BYTES))
             {
                 return write_trailer(&mut send, status.into(), &operation).await;
             }
@@ -1312,7 +1304,8 @@ where
     let result = tracing::Instrument::instrument(
         async move {
             let (mut send, recv) = WireStream::split(inbound.stream);
-            let requests = RequestStream::new(recv, operation.clone(), method_body_limit::<M>());
+            let requests =
+                RequestStream::new(recv, operation.clone(), Some(M::Service::MAX_BODY_BYTES));
             let stream = match handler(requests).await {
                 Ok(s) => s,
                 Err(status) => {

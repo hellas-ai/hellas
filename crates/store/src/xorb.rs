@@ -39,6 +39,9 @@ use hellas_xet::{Chunk, XetHash, chunk_hash};
 
 /// Bytes of header before each chunk's payload.
 pub(crate) const HEADER: usize = 8;
+// LZ4 standard-frame maximum block is 4 MiB. FrameDecoder retains one input
+// block, up to two output blocks and its 64-KiB linked history window.
+pub(crate) const LZ4_SCRATCH_BYTES: usize = 3 * (4 * 1024 * 1024) + 64 * 1024;
 /// Groups the byte-grouping scheme splits a payload into.
 const BG4_GROUPS: usize = 4;
 
@@ -237,99 +240,28 @@ fn u24(bytes: &[u8]) -> usize {
 /// agreement with the header, and the caller's length check — the thing
 /// that catches a lying header — would pass.
 fn lz4_frame(payload: &[u8], declared: usize) -> Result<Vec<u8>, XorbError> {
-    // FrameDecoder allocates its advertised block maximum (up to 4 MiB)
-    // before Read::take can bound it. Decode blocks directly into the bounded
-    // output instead; lz4_flex still owns the actual LZ4 decoding.
-    fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], XorbError> {
-        let (head, tail) = input.split_at_checked(count).ok_or(XorbError::Decompress)?;
-        *input = tail;
-        Ok(head)
-    }
-    fn word(input: &mut &[u8]) -> Result<u32, XorbError> {
-        Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
-    }
-    let overflow = || XorbError::LengthMismatch {
-        declared,
-        actual: declared + 1,
-    };
-    let mut input = payload;
-    if word(&mut input)? != 0x184d2204 {
+    use std::io::Read;
+    // Reject legacy/nonstandard frames: the standard frame format limits blocks
+    // to 4 MiB, which bounds FrameDecoder's internal scratch allocation.
+    if payload.get(..4) != Some(&[0x04, 0x22, 0x4d, 0x18]) {
         return Err(XorbError::Decompress);
     }
-    let flags = take(&mut input, 1)?[0];
-    let bd = take(&mut input, 1)?[0];
-    // Standard v1 frame, no reserved bits or external dictionary.
-    if flags & 0xc3 != 0x40 || bd & 0x8f != 0 || !(4..=7).contains(&(bd >> 4)) {
-        return Err(XorbError::Decompress);
-    }
-    let max_block = 1usize << (8 + 2 * (bd >> 4));
-    let content_size = if flags & 8 != 0 {
-        Some(u64::from_le_bytes(take(&mut input, 8)?.try_into().unwrap()))
-    } else {
-        None
-    };
-    let header_end = payload.len() - input.len();
-    let checksum = take(&mut input, 1)?[0];
-    if (twox_hash::XxHash32::oneshot(0, &payload[4..header_end]) >> 8) as u8 != checksum {
-        return Err(XorbError::Decompress);
-    }
-    if content_size.is_some_and(|size| size > declared as u64) {
-        return Err(overflow());
-    }
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(payload).take((declared + 1) as u64);
     let mut out = vec![0; declared + 1];
     let mut filled = 0;
-    loop {
-        let block = word(&mut input)?;
-        if block == 0 {
+    while filled < out.len() {
+        let read = decoder
+            .read(&mut out[filled..])
+            .map_err(|_| XorbError::Decompress)?;
+        if read == 0 {
             break;
         }
-        let raw = block & 0x80000000 != 0;
-        let count = (block & 0x7fffffff) as usize;
-        if count == 0 || count > max_block {
-            return Err(XorbError::Decompress);
-        }
-        let block = take(&mut input, count)?;
-        if flags & 0x10 != 0 && word(&mut input)? != twox_hash::XxHash32::oneshot(0, block) {
-            return Err(XorbError::Decompress);
-        }
-        let (dictionary, remaining) = out.split_at_mut(filled);
-        let writable = remaining.len().min(max_block);
-        let written = if raw {
-            if count > writable {
-                return Err(overflow());
-            }
-            remaining[..count].copy_from_slice(block);
-            count
-        } else {
-            let decoded = if flags & 0x20 != 0 {
-                lz4_flex::block::decompress_into(block, &mut remaining[..writable])
-            } else {
-                lz4_flex::block::decompress_into_with_dict(
-                    block,
-                    &mut remaining[..writable],
-                    dictionary,
-                )
-            };
-            decoded.map_err(|error| match error {
-                lz4_flex::block::DecompressError::OutputTooSmall { .. } => overflow(),
-                _ => XorbError::Decompress,
-            })?
-        };
-        filled += written;
-        if filled > declared {
-            return Err(overflow());
-        }
+        filled += read;
+    }
+    if filled <= declared && !decoder.get_ref().get_ref().is_empty() {
+        return Err(XorbError::Decompress);
     }
     out.truncate(filled);
-    if content_size.is_some_and(|size| size != filled as u64) {
-        return Err(XorbError::Decompress);
-    }
-    if flags & 4 != 0 && word(&mut input)? != twox_hash::XxHash32::oneshot(0, &out) {
-        return Err(XorbError::Decompress);
-    }
-    if !input.is_empty() {
-        return Err(XorbError::Decompress);
-    }
     Ok(out)
 }
 

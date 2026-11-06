@@ -1,65 +1,33 @@
-use super::{reservation::Reservation, *};
-use bytes::Bytes;
+use super::{
+    core::Core,
+    storage::{Buffer, Data},
+    *,
+};
 use futures::StreamExt;
 use hellas_rpc::{ContentId, ContentRef};
-use hellas_xet::{Chunk, MAX_CHUNK_SIZE, XetFileHasher};
-use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, io::Read, sync::Arc};
+use hellas_xet::Chunk;
+use std::{collections::BTreeMap, io::Write};
 
 pub(crate) struct Staged {
     object: ContentRef,
-    bytes: Bytes,
+    data: Data,
     chunks: Vec<Chunk>,
-    charge: Arc<Reservation>,
 }
-fn finish(
-    bytes: Vec<u8>,
-    expected: Option<ContentRef>,
-    charge: Arc<Reservation>,
-) -> Result<Staged> {
-    let mut hasher = XetFileHasher::new();
-    hasher.update(&bytes);
-    let chunks = hasher.finalize_chunks();
+fn finish(mut bytes: Buffer, expected: Option<ContentRef>) -> Result<Staged> {
+    let chunks = bytes.canonical()?;
     let object = ContentRef::new(
         ContentId::from_bytes(hellas_xet::file_hash(&chunks).into_bytes()),
-        bytes.len() as u64,
+        bytes.len(),
     );
     if expected.is_some_and(|expected| expected != object) {
         return Err(Error::Invalid("acquisition content mismatch"));
     }
+    let data = bytes.finish(object, chunks.clone())?;
     Ok(Staged {
         object,
-        bytes: Bytes::from(bytes),
+        data,
         chunks,
-        charge,
     })
-}
-/// Exact-length bounded streaming copy, shared by HTTPS and git-stored HF files.
-fn read_bytes(mut reader: impl Read, len: u64, sha256: Option<[u8; 32]>) -> Result<Vec<u8>> {
-    let capacity = usize::try_from(len).map_err(|_| Error::Capacity)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| Error::Capacity)?;
-    bytes.resize(capacity, 0);
-    let mut hash = Sha256::new();
-    let mut filled = 0;
-    while filled < capacity {
-        let end = filled.saturating_add(MAX_CHUNK_SIZE).min(capacity);
-        let read = reader.read(&mut bytes[filled..end])?;
-        if read == 0 {
-            return Err(Error::Invalid("source shorter than declared bytes"));
-        }
-        hash.update(&bytes[filled..filled + read]);
-        filled += read;
-    }
-    let mut sentinel = [0];
-    if reader.read(&mut sentinel)? != 0
-        || sha256.is_some_and(|expected| hash.finalize().as_slice() != expected)
-    {
-        return Err(Error::Invalid("source length or SHA-256"));
-    }
-    Ok(bytes)
 }
 fn hf_error(error: crate::hf::FetchError) -> Error {
     if matches!(error, crate::hf::FetchError::Capacity) {
@@ -68,25 +36,29 @@ fn hf_error(error: crate::hf::FetchError) -> Error {
         Error::Invalid("HF acquisition failed")
     }
 }
-fn publish(
-    store: &MemoryStore,
+async fn publish(
+    store: &Core,
     stages: BTreeMap<ContentId, Staged>,
     target: Target,
     pin: PinTarget,
 ) -> Result<Acquisition> {
     let object = target.object();
-    store.publish_acquired(
-        stages
-            .into_values()
-            .map(|stage| (stage.object, stage.bytes, stage.chunks, stage.charge))
-            .collect(),
-        target,
-        pin,
-    )?;
+    store
+        .effect(move |store| {
+            store.publish_acquired(
+                stages
+                    .into_values()
+                    .map(|stage| (stage.object, stage.data, stage.chunks))
+                    .collect(),
+                target,
+                pin,
+            )
+        })
+        .await?;
     Ok(Acquisition { object })
 }
 pub(crate) async fn memory(
-    store: &MemoryStore,
+    store: &Core,
     source: Source,
     expect: Option<ContentRef>,
     pin: PinTarget,
@@ -105,7 +77,8 @@ pub(crate) async fn memory(
             if expect.is_some_and(|expect| expect.bytes() != bytes) {
                 return Err(Error::Invalid("source length contract"));
             }
-            let charge = store.pool.reserve(bytes)?;
+            let charge = store.data_pool().reserve(bytes)?;
+            let core = store.clone();
             let http = store.http.clone();
             let stage = tokio::task::spawn_blocking(move || {
                 let response = http
@@ -115,8 +88,9 @@ pub(crate) async fn memory(
                 if response.status() != 200 {
                     return Err(Error::Invalid("HTTPS response status"));
                 }
-                let bytes = read_bytes(response.into_body().into_reader(), bytes, sha256)?;
-                finish(bytes, expect, charge)
+                let mut body = Buffer::new(&core, bytes, charge)?;
+                body.fill(response.into_body().into_reader(), sha256, &core.pool)?;
+                finish(body, expect)
             })
             .await
             .map_err(|_| Error::Invalid("acquisition worker failed"))??;
@@ -127,6 +101,7 @@ pub(crate) async fn memory(
                 target,
                 pin,
             )
+            .await
         }
         Source::Peer { node, at } => {
             let pool = store
@@ -157,7 +132,7 @@ pub(crate) async fn memory(
                     return Err(Error::Invalid("peer tree byte limit"));
                 }
                 if let std::collections::btree_map::Entry::Vacant(e) = stages.entry(object.id()) {
-                    let charge = store.pool.reserve(object.bytes())?;
+                    let charge = store.data_pool().reserve(object.bytes())?;
                     let path = Path::new(at.pin.clone(), join_path(&at.path, &path))?;
                     let mut read = remote
                         .read(&Scope::Public, &path, 0..object.bytes())
@@ -165,24 +140,21 @@ pub(crate) async fn memory(
                     if read.object != object {
                         return Err(Error::Conflict);
                     }
-                    let mut bytes = Vec::new();
-                    bytes
-                        .try_reserve_exact(
-                            usize::try_from(object.bytes()).map_err(|_| Error::Capacity)?,
-                        )
-                        .map_err(|_| Error::Capacity)?;
+                    let core = store.clone();
+                    let mut bytes = core
+                        .clone()
+                        .run(move |core| Buffer::new(&core, object.bytes(), charge))
+                        .await?;
                     while let Some(chunk) = read.bytes.next().await {
                         let chunk = chunk?;
-                        if bytes.len() as u64 + chunk.len() as u64 > object.bytes() {
-                            return Err(Error::Invalid("peer length"));
-                        }
-                        bytes.extend_from_slice(&chunk);
+                        bytes = store
+                            .run(move |_| {
+                                bytes.write_all(&chunk)?;
+                                Ok(bytes)
+                            })
+                            .await?;
                     }
-                    // Canonical hashing is blocking work, even with a verified peer list.
-                    let stage =
-                        tokio::task::spawn_blocking(move || finish(bytes, Some(object), charge))
-                            .await
-                            .map_err(|_| Error::Invalid("hash worker failed"))??;
+                    let stage = store.run(move |_| finish(bytes, Some(object))).await?;
                     e.insert(stage);
                 }
                 if let Target::Tree(_) = target {
@@ -193,7 +165,11 @@ pub(crate) async fn memory(
                         continue;
                     }
                     longest.insert(object.id(), path.len());
-                    for (name, child) in Tree::decode(&stages[&object.id()].bytes)?.entries() {
+                    let data = stages[&object.id()].data.clone();
+                    let entries = store
+                        .run(move |_| Ok(Tree::decode(&data.load(object)?)?.entries().to_vec()))
+                        .await?;
+                    for (name, child) in &entries {
                         let path = join_path(&path, name);
                         super::tree::validate_path(&path, false)?;
                         let queue_charge = store
@@ -203,7 +179,7 @@ pub(crate) async fn memory(
                     }
                 }
             }
-            publish(store, stages, root, pin)
+            publish(store, stages, root, pin).await
         }
         Source::HfXet { repo, commit, path } => {
             repo.validate().map_err(hf_error)?;
@@ -213,14 +189,14 @@ pub(crate) async fn memory(
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
             }
-            let pool = store.pool.clone();
+            let core = store.clone();
             let (stages, root) = tokio::task::spawn_blocking(move || {
                 let cas = crate::hf::HfCas::new(repo);
-                hf_stages(&cas, &pool, path.as_deref(), expect, true)
+                hf_stages(&cas, &core, path.as_deref(), expect, true)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            publish(store, stages, root, pin)
+            publish(store, stages, root, pin).await
         }
     }
 }
@@ -234,10 +210,10 @@ fn join_path(parent: &str, name: &str) -> String {
 fn hf_file(
     cas: &crate::hf::HfCas,
     file: &crate::hf::RepoFile,
-    pool: &Reservations,
+    core: &Core,
     expect: Option<ContentRef>,
 ) -> Result<Staged> {
-    let charge = pool.reserve(file.size)?;
+    let charge = core.data_pool().reserve(file.size)?;
     let advertised = file
         .xet_hash
         .as_ref()
@@ -252,41 +228,43 @@ fn hf_file(
     }) {
         return Err(Error::Invalid("HF expected reference"));
     }
-    let bytes = if let Some(advertised) = advertised {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(usize::try_from(file.size).map_err(|_| Error::Capacity)?)
-            .map_err(|_| Error::Capacity)?;
-        cas.write_xet(advertised.id().digest(), file.size, None, &mut bytes, pool)
-            .map_err(hf_error)?;
-        bytes
+    let mut bytes = Buffer::new(core, file.size, charge)?;
+    if let Some(advertised) = advertised {
+        cas.write_xet(
+            advertised.id().digest(),
+            file.size,
+            None,
+            &mut bytes,
+            &core.pool,
+        )
+        .map_err(hf_error)?;
     } else {
         if file.lfs.is_some() {
             return Err(Error::Invalid("legacy LFS has no canonical Xet identity"));
         }
-        read_bytes(
+        bytes.fill(
             cas.small_file(&file.path).map_err(hf_error)?,
-            file.size,
             None,
-        )?
-    };
-    finish(bytes, expect.or(advertised), charge)
+            &core.pool,
+        )?;
+    }
+    finish(bytes, expect.or(advertised))
 }
 fn hf_stages(
     cas: &crate::hf::HfCas,
-    pool: &Reservations,
+    core: &Core,
     path: Option<&str>,
     expect: Option<ContentRef>,
     weights: bool,
 ) -> Result<(BTreeMap<ContentId, Staged>, Target)> {
-    let (files, _metadata) = cas.files(pool).map_err(hf_error)?;
+    let (files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
     let mut stages = BTreeMap::new();
     if let Some(path) = path {
         let file = files
             .iter()
             .find(|file| file.path == path)
             .ok_or(Error::Missing)?;
-        let stage = hf_file(cas, file, pool, expect)?;
+        let stage = hf_file(cas, file, core, expect)?;
         let root = Target::Object(stage.object);
         stages.insert(stage.object.id(), stage);
         return Ok((stages, root));
@@ -300,7 +278,7 @@ fn hf_stages(
                 file.size,
             )
         } else {
-            let stage = hf_file(cas, file, pool, None)?;
+            let stage = hf_file(cas, file, core, None)?;
             let object = stage.object;
             stages.insert(object.id(), stage);
             object
@@ -309,7 +287,7 @@ fn hf_stages(
             return Err(Error::Invalid("duplicate Hub file"));
         }
     }
-    let root = trees(leaves, pool, &mut stages)?;
+    let root = trees(leaves, core, &mut stages)?;
     if expect.is_some_and(|expect| expect != root) {
         return Err(Error::Invalid("HF tree expectation"));
     }
@@ -322,7 +300,7 @@ fn hf_stages(
                     file.size,
                 );
                 if let std::collections::btree_map::Entry::Vacant(e) = stages.entry(object.id()) {
-                    let stage = hf_file(cas, file, pool, Some(object))?;
+                    let stage = hf_file(cas, file, core, Some(object))?;
                     e.insert(stage);
                 }
             }
@@ -332,7 +310,7 @@ fn hf_stages(
 }
 fn trees(
     leaves: BTreeMap<String, ContentRef>,
-    pool: &Reservations,
+    core: &Core,
     stages: &mut BTreeMap<ContentId, Staged>,
 ) -> Result<ContentRef> {
     let mut directories: BTreeMap<String, Vec<(String, Target)>> =
@@ -353,8 +331,10 @@ fn trees(
     while let Some((path, entries)) = directories.pop_last() {
         let tree = Tree::new(entries)?;
         let bytes = tree.bytes();
-        let charge = pool.reserve(bytes.len() as u64)?;
-        let stage = finish(bytes, None, charge)?;
+        let charge = core.data_pool().reserve(bytes.len() as u64)?;
+        let mut buffer = Buffer::new(core, bytes.len() as u64, charge)?;
+        buffer.write_all(&bytes)?;
+        let stage = finish(buffer, None)?;
         let object = stage.object;
         stages.entry(object.id()).or_insert(stage);
         if path.is_empty() {
@@ -368,7 +348,7 @@ fn trees(
     }
     Err(Error::Invalid("tree root"))
 }
-impl MemoryStore {
+impl Core {
     /// Resolve learns immutable names and small-file IDs, without downloading weights.
     pub async fn resolve_hf(
         &self,
@@ -378,17 +358,17 @@ impl MemoryStore {
         if !matches!(scope, Scope::Owner) {
             return Err(Error::Denied);
         }
-        let pool = self.pool.clone();
+        let core = self.clone();
         let id = repo.id.clone();
         let (sha, stages, root) = tokio::task::spawn_blocking(move || {
             let sha = crate::hf::HfCas::new(repo.clone())
-                .resolve_revision(&pool)
+                .resolve_revision(&core.pool)
                 .map_err(hf_error)?;
             let repo = crate::hf::Repo {
                 revision: sha.clone(),
                 ..repo
             };
-            let (stages, root) = hf_stages(&crate::hf::HfCas::new(repo), &pool, None, None, false)?;
+            let (stages, root) = hf_stages(&crate::hf::HfCas::new(repo), &core, None, None, false)?;
             Ok::<_, Error>((sha, stages, root))
         })
         .await
@@ -397,7 +377,7 @@ impl MemoryStore {
             name: PinName::new(format!("hf/{id}@{sha}"))?,
             policy: PinPolicy::Owner,
         };
-        let object = publish(self, stages, root, pin)?.object;
+        let object = publish(self, stages, root, pin).await?.object;
         Ok((sha, object))
     }
 }

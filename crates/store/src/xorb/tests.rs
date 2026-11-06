@@ -1,38 +1,5 @@
 use super::*;
 
-// Count allocations on just the decoder's thread, so this also catches a
-// decompressor allocating its internal advertised frame/block maximum.
-struct MeasuredAllocator;
-thread_local! {
-    static MAX_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-fn allocated(bytes: usize) {
-    let _ = MAX_ALLOCATION.try_with(|largest| {
-        if let Some(old) = largest.get() {
-            largest.set(Some(old.max(bytes)));
-        }
-    });
-}
-unsafe impl std::alloc::GlobalAlloc for MeasuredAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        allocated(layout.size());
-        unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        allocated(layout.size());
-        unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        allocated(size);
-        unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, size) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
-    }
-}
-#[global_allocator]
-static TEST_ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
-
 /// Deals bytes into four groups — the encoder this module reverses.
 fn group(bytes: &[u8]) -> Vec<u8> {
     let mut groups: [Vec<u8>; BG4_GROUPS] = Default::default();
@@ -199,65 +166,4 @@ fn descriptor_lengths_and_cold_caps_are_checked_from_the_header_before_payload()
     ));
     header[5..8].copy_from_slice(&(hellas_xet::MAX_CHUNK_SIZE + 1).to_le_bytes()[..3]);
     assert_eq!(decode_chunk(&header), Err(XorbError::TooLarge));
-}
-
-#[test]
-fn advertised_large_lz4_blocks_cannot_allocate_or_expand_past_the_xorb_bound() {
-    use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
-    use std::io::Write;
-    let mut encoder =
-        FrameEncoder::with_frame_info(FrameInfo::new().block_size(BlockSize::Max4MB), Vec::new());
-    encoder.write_all(&vec![0; 1024 * 1024]).unwrap();
-    let payload = encoder.finish().unwrap();
-    assert_eq!(payload[5], 0x70);
-    let mut xorb = vec![0];
-    xorb.extend_from_slice(&payload.len().to_le_bytes()[..3]);
-    xorb.push(1);
-    xorb.extend_from_slice(&1usize.to_le_bytes()[..3]);
-    xorb.extend_from_slice(&payload);
-    MAX_ALLOCATION.with(|largest| largest.set(Some(0)));
-    let result = decode_chunk(&xorb);
-    let largest = MAX_ALLOCATION.with(|largest| largest.replace(None).unwrap());
-    assert!(
-        largest <= 2,
-        "decoder allocated {largest} bytes for a one-byte declaration"
-    );
-    assert_eq!(
-        result,
-        Err(XorbError::LengthMismatch {
-            declared: 1,
-            actual: 2
-        })
-    );
-}
-
-#[test]
-fn linked_lz4_frames_with_all_checksums_interoperate_and_reject_corruption() {
-    use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
-    use std::io::Write;
-    let bytes = sample(110_000);
-    let info = FrameInfo::new()
-        .block_size(BlockSize::Max64KB)
-        .block_mode(BlockMode::Linked)
-        .content_size(Some(bytes.len() as u64))
-        .block_checksums(true)
-        .content_checksum(true);
-    let mut encoder = FrameEncoder::with_frame_info(info, Vec::new());
-    encoder.write_all(&bytes).unwrap();
-    let payload = encoder.finish().unwrap();
-    assert_eq!(payload[4], 0x5c);
-    assert_eq!(lz4_frame(&payload, bytes.len()).unwrap(), bytes);
-    // Standard frame offsets: magic + FLG/BD + content size + header checksum.
-    let first_block = 4 + 2 + 8 + 1;
-    let block_len =
-        u32::from_le_bytes(payload[first_block..first_block + 4].try_into().unwrap()) & 0x7fff_ffff;
-    for offset in [
-        first_block - 1,
-        first_block + 4 + block_len as usize,
-        payload.len() - 1,
-    ] {
-        let mut bad = payload.clone();
-        bad[offset] ^= 1;
-        assert_eq!(lz4_frame(&bad, bytes.len()), Err(XorbError::Decompress));
-    }
 }

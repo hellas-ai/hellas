@@ -1,0 +1,330 @@
+use hellas_auth::Digest;
+use hellas_rpc::ContentRef;
+use hellas_store::content::*;
+fn pin(name: &str) -> PinTarget {
+    PinTarget {
+        name: PinName::new(name.into()).unwrap(),
+        policy: PinPolicy::Owner,
+    }
+}
+fn job() -> JobId {
+    JobId {
+        channel: Digest::from_bytes([1; 32]),
+        id: Digest::from_bytes([2; 32]),
+    }
+}
+async fn store(root: &std::path::Path, capacity: u64) -> DiskStore {
+    let store = DiskStore::open(
+        root.into(),
+        vec![],
+        IndexMode::Resume,
+        Some(capacity),
+        Reservations::ram(8 << 20),
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    store
+}
+async fn fill(mut session: UploadSession, bytes: &[u8]) {
+    session
+        .declare(&hellas_xet::chunk(bytes), true)
+        .await
+        .unwrap();
+    let mut offset = 0;
+    for chunk in hellas_xet::chunk(bytes) {
+        let end = offset + chunk.data_len as usize;
+        session.accept_chunk(&bytes[offset..end]).await.unwrap();
+        offset = end;
+    }
+    assert!(session.complete());
+}
+#[tokio::test]
+async fn concurrent_real_uploads_cannot_each_spend_the_same_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path(), 12).await;
+    let requests = (0..8).map(|n| {
+        let store = &store;
+        async move {
+            store
+                .upload(
+                    &Scope::Owner,
+                    ContentRef::for_bytes(&[n; 4]),
+                    Some(pin(&format!("p/{n}"))),
+                )
+                .await
+        }
+    });
+    let sessions = futures::future::join_all(requests)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 3);
+    assert_eq!(store.stats().unwrap().used, 0);
+    assert_eq!(store.stats().unwrap().outstanding, 12);
+    drop(sessions);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+}
+#[tokio::test]
+async fn input_conversion_keeps_output_reserved_and_parallel_outputs_cannot_overcommit() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path(), 12).await;
+    let input = ContentRef::for_bytes(b"data");
+    let scope = store.open_work(job(), vec![input], 4).await.unwrap();
+    store.reserve_output(&scope, 8).await.unwrap();
+    fill(store.upload(&scope, input, None).await.unwrap(), b"data").await;
+    assert_eq!(store.stats().unwrap().used, 4);
+    assert_eq!(store.stats().unwrap().outstanding, 8);
+    let output = ContentRef::for_bytes(b"output");
+    let session = store.stage_output(&scope, output).await.unwrap();
+    assert!(matches!(
+        store
+            .stage_output(&scope, ContentRef::for_bytes(b"new"))
+            .await,
+        Err(Error::Capacity)
+    ));
+    drop(session);
+    let session = store.stage_output(&scope, output).await.unwrap();
+    fill(session, b"output").await;
+    assert_eq!(store.stats().unwrap().used, 10);
+    assert_eq!(store.stats().unwrap().outstanding, 2);
+    store
+        .promote_work(&scope, Target::Object(output), pin("transcript"))
+        .await
+        .unwrap();
+    store.end_work(&scope).await.unwrap();
+    assert_eq!(store.stats().unwrap().used, 6);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+}
+#[tokio::test]
+async fn admission_collects_oldest_cache_and_stops_once_it_fits() {
+    use futures::StreamExt;
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path(), 12).await;
+    for (name, data) in [("old", b"aaaa"), ("new", b"bbbb")] {
+        fill(
+            store
+                .upload(&Scope::Owner, ContentRef::for_bytes(data), Some(pin(name)))
+                .await
+                .unwrap(),
+            data,
+        )
+        .await;
+    }
+    let at = Path::new(PinName::new("new".into()).unwrap(), String::new()).unwrap();
+    let mut read = store.read(&Scope::Owner, &at, 0..4).await.unwrap();
+    assert_eq!(read.bytes.next().await.unwrap().unwrap().as_ref(), b"bbbb");
+    drop(read);
+    for key in ["old", "new"] {
+        let value = store
+            .pins(&Scope::Owner, key, Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .remove(0)
+            .1;
+        store
+            .set_pin(
+                &Scope::Owner,
+                &PinName::new(key.into()).unwrap(),
+                Some(&value),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let scope = store
+        .open_work(job(), vec![ContentRef::for_bytes(b"12345678")], 8)
+        .await
+        .unwrap();
+    assert_eq!(store.stats().unwrap().used, 4);
+    assert_eq!(store.stats().unwrap().outstanding, 8);
+    assert!(
+        !root
+            .path()
+            .join("objects")
+            .join(ContentRef::for_bytes(b"aaaa").id().to_string())
+            .exists()
+    );
+    assert!(
+        root.path()
+            .join("objects")
+            .join(ContentRef::for_bytes(b"bbbb").id().to_string())
+            .exists()
+    );
+    store.end_work(&scope).await.unwrap();
+}
+#[test]
+fn durable_private_output_survives_actual_process_exit_before_pin() {
+    const CHILD: &str = "HELLAS_CONTENT_STAGE_CRASH_ROOT";
+    let input = ContentRef::for_bytes(b"input");
+    let output = ContentRef::for_bytes(b"transcript");
+    if let Some(root) = std::env::var_os(CHILD) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = store(std::path::Path::new(&root), 64).await;
+            let scope = store
+                .open_work(job(), vec![input], input.bytes())
+                .await
+                .unwrap();
+            store.reserve_output(&scope, output.bytes()).await.unwrap();
+            fill(store.upload(&scope, input, None).await.unwrap(), b"input").await;
+            fill(
+                store.stage_output(&scope, output).await.unwrap(),
+                b"transcript",
+            )
+            .await;
+            // Stand-in for the application's durable reference: no pin yet.
+            let path = std::path::Path::new(&root).join("journal-reference");
+            std::fs::write(&path, output.id().to_string()).unwrap();
+            std::fs::File::open(path).unwrap().sync_all().unwrap();
+            std::process::exit(0);
+        });
+        unreachable!();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durable_private_output_survives_actual_process_exit_before_pin",
+            "--nocapture",
+        ])
+        .env(CHILD, root.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let store = DiskStore::open(
+            root.path().into(),
+            vec![],
+            IndexMode::Resume,
+            Some(64),
+            Reservations::ram(8 << 20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("journal-reference")).unwrap(),
+            output.id().to_string()
+        );
+        assert!(matches!(
+            store.collect(&Scope::Owner).await,
+            Err(Error::Denied)
+        ));
+        let scope = store
+            .open_work(job(), vec![input], input.bytes())
+            .await
+            .unwrap();
+        assert_eq!(store.stats().unwrap().outstanding, 0);
+        store
+            .promote_work(&scope, Target::Object(output), pin("transcript"))
+            .await
+            .unwrap();
+        store.finish_recovery().await.unwrap();
+        let at = Path::new(PinName::new("transcript".into()).unwrap(), String::new()).unwrap();
+        let mut read = store
+            .read(&Scope::Owner, &at, 0..output.bytes())
+            .await
+            .unwrap();
+        use futures::StreamExt;
+        assert_eq!(
+            read.bytes.next().await.unwrap().unwrap().as_ref(),
+            b"transcript"
+        );
+        store.end_work(&scope).await.unwrap();
+        assert_eq!(store.stats().unwrap().used, output.bytes());
+    });
+}
+
+#[tokio::test]
+async fn output_allowance_cannot_mask_a_later_input_reservation_extension() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path(), 20).await;
+    let a = ContentRef::for_bytes(b"aaaa");
+    let b = ContentRef::for_bytes(b"bbbb");
+    fill(
+        store
+            .upload(&Scope::Owner, a, Some(pin("a")))
+            .await
+            .unwrap(),
+        b"aaaa",
+    )
+    .await;
+    fill(
+        store
+            .upload(
+                &Scope::Owner,
+                b,
+                Some(PinTarget {
+                    policy: PinPolicy::Jobs,
+                    ..pin("b")
+                }),
+            )
+            .await
+            .unwrap(),
+        b"bbbb",
+    )
+    .await;
+    let scope = store.open_work(job(), vec![a, b], 8).await.unwrap();
+    store.reserve_output(&scope, 8).await.unwrap();
+    fill(store.upload(&scope, a, None).await.unwrap(), b"aaaa").await;
+    for (name, policy) in [("a", PinPolicy::Jobs), ("b", PinPolicy::Owner)] {
+        let old = store
+            .pins(&Scope::Owner, name, Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .remove(0)
+            .1;
+        store
+            .set_pin(
+                &Scope::Owner,
+                &pin(name).name,
+                Some(&old),
+                Some(PinValue {
+                    policy,
+                    ..old.clone()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        store.upload(&scope, b, None).await,
+        Err(Error::Capacity)
+    ));
+    assert_eq!(store.stats().unwrap().used, 12);
+    assert_eq!(store.stats().unwrap().outstanding, 8);
+    store.end_work(&scope).await.unwrap();
+    assert_eq!(store.stats().unwrap().used, 8);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+}
+#[tokio::test]
+async fn reopening_root_only_then_widening_does_not_reserve_recovered_inputs_twice() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path(), 16).await;
+    let a = ContentRef::for_bytes(b"root");
+    let b = ContentRef::for_bytes(b"leaf");
+    let scope = store.open_work(job(), vec![a, b], 8).await.unwrap();
+    fill(store.upload(&scope, a, None).await.unwrap(), b"root").await;
+    fill(store.upload(&scope, b, None).await.unwrap(), b"leaf").await;
+    store.close().await;
+    drop(store);
+    let store = DiskStore::open(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        Some(16),
+        Reservations::ram(8 << 20),
+    )
+    .await
+    .unwrap();
+    let scope = store.open_work(job(), vec![a], 8).await.unwrap();
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    let scope = store.widen_work(&scope, vec![a, b], 8).await.unwrap();
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    assert!(store.open_staged(&scope, a).await.unwrap().is_some());
+    store.finish_recovery().await.unwrap();
+    store.end_work(&scope).await.unwrap();
+    assert_eq!(store.stats().unwrap().used, 0);
+}
