@@ -148,6 +148,7 @@ impl Drop for PurchaseLock {
 /// The lock serializes invocations of the same job, including --buy-again.
 pub struct Purchase {
     path: PathBuf,
+    state_key: String,
     _lock: PurchaseLock,
     job: [u8; 32],
     price: u64,
@@ -168,7 +169,6 @@ impl Purchase {
             })
     }
     pub fn open(path: &PaidAttemptPath, job: &Job, buy_again: bool) -> Result<Self> {
-        let path = path.as_path();
         let mut purchase = Self::open_identity(path, job.digest(), job.price(), false)?;
         purchase.buy_again = buy_again;
         if let Some(record) = &purchase.record
@@ -188,15 +188,15 @@ impl Purchase {
     }
 
     /// Open a caller-owned attempt without clearing a terminal record.
-    pub(crate) fn open_tracked(path: &Path, job: &Job) -> Result<Self> {
+    pub(crate) fn open_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
         Self::open_tracked_inner(path, job, true)
     }
 
-    pub(crate) fn open_existing_tracked(path: &Path, job: &Job) -> Result<Self> {
+    pub(crate) fn open_existing_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
         Self::open_tracked_inner(path, job, false)
     }
 
-    fn open_tracked_inner(path: &Path, job: &Job, create: bool) -> Result<Self> {
+    fn open_tracked_inner(path: &PaidAttemptPath, job: &Job, create: bool) -> Result<Self> {
         let mut purchase = Self::open_identity(path, job.digest(), job.price(), true)?;
         if let Some(record) = &purchase.record
             && (record.attempt_nonce.is_none()
@@ -225,7 +225,14 @@ impl Purchase {
         Ok(purchase)
     }
 
-    fn open_identity(path: &Path, job: Digest, price: u64, tracked: bool) -> Result<Self> {
+    fn open_identity(
+        path: &PaidAttemptPath,
+        job: Digest,
+        price: u64,
+        tracked: bool,
+    ) -> Result<Self> {
+        let state_key = path.state_key().to_owned();
+        let path = path.as_path();
         let parent = path.parent().ok_or(PurchaseError::Identity)?;
         hellas_private::create_dir_all_durable(parent)?;
         let lock = hellas_private::open_lock_beside(path)?;
@@ -253,6 +260,7 @@ impl Purchase {
         }
         Ok(Self {
             path: path.to_owned(),
+            state_key,
             _lock: lock,
             job: *job.as_bytes(),
             price,
@@ -260,6 +268,17 @@ impl Purchase {
             buy_again: false,
             tracked,
         })
+    }
+
+    pub(crate) fn ensure_state_key(&self, state_key: &str) -> Result<()> {
+        if self.state_key != state_key {
+            return Err(PurchaseError::Identity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_chain(&self, session: &crate::paid_client::PaidWorkSession) -> Result<()> {
+        self.ensure_state_key(&session.state_key())
     }
 
     pub(super) fn ensure_executable(&self) -> Result<()> {
@@ -444,6 +463,7 @@ impl Purchase {
     /// Resolve the crash window between payment intent and payment completion
     /// from the existing signed channel journal, even after channel settlement.
     pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<()> {
+        self.ensure_state_key(&options.config.chain.state_key())?;
         let Some(record) = self.record.clone() else {
             return Ok(());
         };
@@ -745,12 +765,16 @@ pub enum PurchaseStatus {
 mod tests {
     use super::*;
 
+    fn tracked(path: &Path) -> PaidAttemptPath {
+        PaidAttemptPath::test(path.to_owned())
+    }
+
     #[test]
     fn tracked_open_requires_attempt_and_proposed_request_bindings() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("attempt");
         let job = job();
-        drop(Purchase::open_tracked(&path, &job).unwrap());
+        drop(Purchase::open_tracked(&tracked(&path), &job).unwrap());
         let initial: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for phase in [
             Phase::InputBound,
@@ -780,7 +804,7 @@ mod tests {
                     hellas_private::write_atomically(&path, ".writing", &bytes).unwrap();
                     assert!(
                         matches!(
-                            Purchase::open_existing_tracked(&path, &job),
+                            Purchase::open_existing_tracked(&tracked(&path), &job),
                             Err(PurchaseError::Identity)
                         ),
                         "{phase:?} {field}, known work: {}",
@@ -800,7 +824,7 @@ mod tests {
                 &serde_json::to_vec(&record).unwrap(),
             )
             .unwrap();
-            drop(Purchase::open_existing_tracked(&path, &job).unwrap());
+            drop(Purchase::open_existing_tracked(&tracked(&path), &job).unwrap());
         }
         // Untracked purchases are a current mode, not old tracked records.
         let path = root.path().join("untracked");
@@ -835,7 +859,7 @@ mod tests {
                 .path()
                 .join(if reported { "reported" } else { "rejected" });
             {
-                let mut purchase = Purchase::open_tracked(&path, &job).unwrap();
+                let mut purchase = Purchase::open_tracked(&tracked(&path), &job).unwrap();
                 purchase
                     .bind_target(PurchaseTarget {
                         network: "fixture".into(),
@@ -865,7 +889,7 @@ mod tests {
                     purchase.unpaid(work).unwrap();
                 }
             }
-            let recovered = Purchase::open_existing_tracked(&path, &job).unwrap();
+            let recovered = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
             assert_eq!(
                 recovered.bound_channel().map(|(found, _)| found),
                 Some(channel)
@@ -882,7 +906,7 @@ mod tests {
                 }
             );
             drop(recovered);
-            let purchase = Purchase::open_tracked(&path, &job).unwrap();
+            let purchase = Purchase::open_tracked(&tracked(&path), &job).unwrap();
             assert!(matches!(
                 purchase.ensure_executable(),
                 Err(PurchaseError::AlreadyReported | PurchaseError::Rejected)
@@ -905,7 +929,7 @@ mod tests {
         let channel = Digest::from_bytes([1; 32]);
         let bond = EdgeId::from_bytes([2; 32]);
         {
-            let mut attempt = Purchase::open_tracked(&path, &job).unwrap();
+            let mut attempt = Purchase::open_tracked(&tracked(&path), &job).unwrap();
             assert!(attempt.bind_target(target.clone()).unwrap());
             assert!(!attempt.bind_target(target.clone()).unwrap());
             let mut other = target.clone();
@@ -919,7 +943,7 @@ mod tests {
                     .is_err()
             );
         }
-        let mut attempt = Purchase::open_tracked(&path, &job).unwrap();
+        let mut attempt = Purchase::open_tracked(&tracked(&path), &job).unwrap();
         assert!(!attempt.bind_target(target).unwrap());
         assert_eq!(attempt.nonce(channel).unwrap(), None);
         attempt
@@ -936,7 +960,7 @@ mod tests {
         assert!(attempt.has_proposal_intent());
         drop(attempt);
         assert!(
-            Purchase::open_tracked(&path, &job)
+            Purchase::open_tracked(&tracked(&path), &job)
                 .unwrap()
                 .has_proposal_intent()
         );
@@ -948,12 +972,12 @@ mod tests {
         let job = job();
         let channel = Digest::from_bytes([1; 32]);
         let path = root.path().join("first");
-        let first = Purchase::open_tracked(&path, &job).unwrap();
+        let first = Purchase::open_tracked(&tracked(&path), &job).unwrap();
         let nonce = first.request_nonce(channel, 1);
         drop(first);
-        let reopened = Purchase::open_existing_tracked(&path, &job).unwrap();
+        let reopened = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
         assert_eq!(reopened.request_nonce(channel, 1), nonce);
-        let second = Purchase::open_tracked(&root.path().join("second"), &job).unwrap();
+        let second = Purchase::open_tracked(&tracked(&root.path().join("second")), &job).unwrap();
         assert_ne!(second.request_nonce(channel, 1), nonce);
         let untracked = Purchase::open(
             &PaidAttemptPath::test(root.path().join("folder")),

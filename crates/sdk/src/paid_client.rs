@@ -371,6 +371,10 @@ pub enum SessionOpenMode<'a> {
 }
 
 impl PaidWorkSession {
+    pub(crate) fn state_key(&self) -> String {
+        self.args.config.chain.state_key()
+    }
+
     pub(crate) fn execution_target(&self) -> crate::execution::ExecutionTarget {
         crate::execution::ExecutionTarget {
             network: self.args.config.network(),

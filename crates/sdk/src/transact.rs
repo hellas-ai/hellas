@@ -140,6 +140,7 @@ pub async fn transact(
     mut options: TransactionOptions<'_>,
 ) -> Result<PaidWorkResult> {
     if let Some(purchase) = options.purchase.as_deref() {
+        purchase.ensure_chain(session)?;
         purchase.ensure_executable()?;
     }
     let quoted = session.descriptor().payment_policy().fixed_price;

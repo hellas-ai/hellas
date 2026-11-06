@@ -1,9 +1,151 @@
 use super::*;
+use commonware_cryptography::{Hasher as _, Sha256};
 use hellas_sdk::execution::{
     Acceptance, ExecutionAttempt, ExecutionError, ExecutionObservers, ExecutionResult,
     ExecutionSession, ExecutionTerms, Payment, Terminal,
 };
 use hellas_sdk::paid_client::{PaidClientError, SessionFundingOptions, SessionOpenMode};
+
+#[test]
+fn paid_public_boundaries_reject_another_chain_before_proposal() {
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            fund(&mut case).await;
+            let job = job();
+            let b_chain = &case.options.config.chain;
+            let mut a_genesis = b_chain.genesis().clone();
+            a_genesis.allocations[0].balance += 1;
+            let a_genesis_json = serde_json::to_string(&a_genesis).unwrap();
+            let mut a_trust = b_chain.trust().clone();
+            a_trust.genesis_sha256 = hex::encode(Sha256::hash(a_genesis_json.as_bytes()));
+            let a_profile = hellas_chain::genesis::ChainProfile::custom(
+                hellas_chain::genesis::CustomChainFile {
+                    genesis_json: a_genesis_json,
+                    trust: a_trust,
+                    validators: b_chain.validators().to_vec(),
+                },
+            )
+            .unwrap();
+            let a_chain =
+                hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile).unwrap();
+            assert_eq!(a_chain.network_id(), b_chain.network_id());
+            assert_ne!(a_chain.state_key(), b_chain.state_key());
+            let path = hellas_sdk::transact::PaidAttemptPath::new(
+                &a_chain,
+                case.options.provider,
+                case.owner.principal(),
+                job.digest(),
+            );
+            let mut session = PaidWorkSession::open(
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionOpenMode::Job(&job),
+                SessionFundingOptions {
+                    max_funding: Some(0),
+                    approval: None,
+                },
+            )
+            .await
+            .unwrap();
+            let proposals_before = session
+                .with_state(|state| state.proposal_nonce_high_water())
+                .await
+                .unwrap();
+            let approvals_before = case.approvals.0.lock().unwrap().len();
+            let target = hellas_sdk::execution::ExecutionTarget {
+                network: case.options.config.network(),
+                provider: case.options.provider,
+            };
+
+            let recover_path = path.with_nonce([1; 16]);
+            let mut recover_attempt =
+                ExecutionAttempt::open_paid(&recover_path, job.input(), PRICE).unwrap();
+            recover_attempt.bind_target(target).unwrap();
+            let recover_marker = std::fs::read(recover_path.as_path()).unwrap();
+            assert!(matches!(
+                ExecutionSession::Paid(&mut session)
+                    .recover(&mut recover_attempt)
+                    .await,
+                Err(ExecutionError::Identity)
+                    | Err(ExecutionError::Purchase(
+                        hellas_sdk::transact::PurchaseError::Identity
+                    ))
+            ));
+            assert_eq!(
+                std::fs::read(recover_path.as_path()).unwrap(),
+                recover_marker
+            );
+
+            let execute_path = path.with_nonce([2; 16]);
+            let mut execute_attempt =
+                ExecutionAttempt::open_paid(&execute_path, job.input(), PRICE).unwrap();
+            execute_attempt.bind_target(target).unwrap();
+            let execute_marker = std::fs::read(execute_path.as_path()).unwrap();
+            let proposed = std::sync::atomic::AtomicBool::new(false);
+            let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+            assert!(matches!(
+                ExecutionSession::Paid(&mut session)
+                    .execute(
+                        job.input().clone(),
+                        ExecutionTerms::Paid { price: PRICE },
+                        &signer,
+                        ExecutionObservers::default(),
+                        Some(&mut execute_attempt),
+                    )
+                    .await,
+                Err(ExecutionError::Identity)
+                    | Err(ExecutionError::Purchase(
+                        hellas_sdk::transact::PurchaseError::Identity
+                    ))
+            ));
+            assert_eq!(
+                std::fs::read(execute_path.as_path()).unwrap(),
+                execute_marker
+            );
+
+            let purchase_path = path.with_nonce([3; 16]);
+            let mut purchase =
+                hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
+            assert!(matches!(
+                purchase.reconcile(&case.options).await,
+                Err(hellas_sdk::transact::PurchaseError::Identity)
+            ));
+            assert!(!purchase_path.as_path().exists());
+            assert!(matches!(
+                hellas_sdk::transact::transact(
+                    &mut session,
+                    &job,
+                    &signer,
+                    hellas_sdk::transact::TransactionOptions {
+                        purchase: Some(&mut purchase),
+                        proposed: Some(&proposed),
+                        ..Default::default()
+                    },
+                )
+                .await,
+                Err(hellas_sdk::transact::TransactError::Purchase(
+                    hellas_sdk::transact::PurchaseError::Identity
+                ))
+            ));
+            assert!(!purchase_path.as_path().exists());
+            assert!(!proposed.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                session
+                    .with_state(|state| state.proposal_nonce_high_water())
+                    .await
+                    .unwrap(),
+                proposals_before
+            );
+            assert_eq!(case.approvals.0.lock().unwrap().len(), approvals_before);
+            session.shutdown().await;
+            case.endpoint.close().await;
+            case.provider.shutdown().await.unwrap();
+        })
+    });
+}
 
 fn job() -> hellas_sdk::job::Job {
     hellas_sdk::job::Job::fetch(
