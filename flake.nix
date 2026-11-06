@@ -9,8 +9,14 @@
   };
 
   inputs = {
+    # Downstream repositories share these pins instead of keeping their own:
+    #   inputs.nixpkgs.follows = "hellas/nixpkgs";
+    #   inputs.rust-overlay.follows = "hellas/rust-overlay";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     # Public, pinned HIP 7.15+ ROCm package set.
     nix-strix-halo = {
       url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
@@ -46,6 +52,9 @@
       );
     in
     {
+      # Flake plumbing shared with downstream repositories.
+      lib = { inherit systems forAllSystems; };
+
       packages = forAllSystems (system: perSystem.${system}.packages);
       apps = forAllSystems (system: perSystem.${system}.apps);
       devShells = forAllSystems (system: perSystem.${system}.devShells);
