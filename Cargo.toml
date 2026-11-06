@@ -139,3 +139,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 web-time = "1"
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
 x509-cert = { version = "0.3", default-features = false }
+
+# Keep cryptographic dependencies fast in test builds.
+[profile.test.package."*"]
+opt-level = 2
