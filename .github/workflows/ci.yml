@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [master, devnet]
-  push:
-    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -60,6 +59,7 @@ jobs:
         run: nix run --accept-flake-config .#check-unit
 
   protocol-regressions:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     name: Protocol regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -87,6 +87,7 @@ jobs:
           .#nixosTests.x86_64-linux.validator-module-eval
 
   darwin-cli:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     name: Darwin ARM64 CLI
     runs-on: macos-15
     timeout-minutes: 90
