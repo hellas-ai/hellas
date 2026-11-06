@@ -56,7 +56,12 @@
     in
     {
       # Flake plumbing shared with downstream repositories.
-      lib = { inherit systems forAllSystems; };
+      lib = {
+        inherit systems forAllSystems;
+        # The Rust toolchain for Hellas and its downstream repositories, from
+        # this repository's rust-toolchain.toml. `pkgs` needs rust-overlay.
+        rustToolchain = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      };
 
       packages = forAllSystems (system: perSystem.${system}.packages);
       apps = forAllSystems (system: perSystem.${system}.apps);
