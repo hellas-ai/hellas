@@ -1407,7 +1407,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     )
     .unwrap();
     let job_dir = root.join("grant-job");
-    job.save(&job_dir).unwrap();
+    job.save(&job_dir).await.unwrap();
     let provider = shared["provider"].as_str().unwrap().to_owned();
     assert_eq!(
         provider,
@@ -1473,6 +1473,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     hellas_sdk::job::Job::from_input(20, changed_input)
         .unwrap()
         .save(&changed_dir)
+        .await
         .unwrap();
     let mut changed_args = args.to_vec();
     let at = changed_args.iter().position(|arg| *arg == "--job").unwrap();
@@ -1567,7 +1568,13 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         );
         assert!(!String::from_utf8_lossy(&failed.stdout).contains("completed"));
     }
-    assert_eq!(hellas_sdk::job::Job::load(&invalid_dir).unwrap().price(), 0);
+    assert_eq!(
+        hellas_sdk::job::Job::load(&invalid_dir)
+            .await
+            .unwrap()
+            .price(),
+        0
+    );
     let retained = std::fs::read(failed_result.join("result.json")).unwrap();
     let mut replay_command = host.client.command(&failed_args);
     let retained_path = failed_result.join("result.json");

@@ -299,11 +299,8 @@ impl FileObject {
         let mut chosen = None;
         let before = entries.len();
         entries.retain_mut(|entry| {
-            let mut opened = crate::open_indexed_file(
-                self.object.id().digest(),
-                crate::LengthContract::Exact(self.object.bytes()),
-                entry,
-            );
+            let mut opened =
+                crate::open_indexed_file(self.object.id().digest(), self.object.bytes(), entry);
             // Store-owned hard-link publication/removal changes ctime. Reverify
             // that upper backing before refreshing its identity; changed lowers
             // are still marked bad and require an explicit rescan.
@@ -314,11 +311,8 @@ impl FileObject {
                 && indexed.len == self.object.bytes()
             {
                 *entry = refreshed;
-                opened = crate::open_indexed_file(
-                    self.object.id().digest(),
-                    crate::LengthContract::Exact(self.object.bytes()),
-                    entry,
-                );
+                opened =
+                    crate::open_indexed_file(self.object.id().digest(), self.object.bytes(), entry);
             }
             match opened {
                 Ok(Some(file)) => {

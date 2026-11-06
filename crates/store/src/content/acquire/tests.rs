@@ -1,3 +1,5 @@
+mod hub_responses;
+
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::{io::Read, sync::Arc};

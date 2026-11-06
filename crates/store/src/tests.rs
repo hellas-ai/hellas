@@ -24,38 +24,52 @@ fn required_records_never_hash_missing_changed_or_replaced_content() {
     let path = dir.join("weights");
     let records = dir.join("content.fastresume");
     std::fs::write(&path, b"weights").unwrap();
-    let empty = ContentStore::new();
+    use content::{IndexMode, Reservations};
+    let ram = Reservations::ram(STREAM_BUFFER as u64);
+    let empty = fastresume::Records::default();
     let before = HASH_CALLS.get();
-    assert!(matches!(
-        empty.index_remembered(&path),
-        Err(StoreError::Unindexed { .. })
-    ));
+    assert!(empty.index_entry(&path, IndexMode::Require, &ram).is_err());
     assert_eq!(HASH_CALLS.get(), before);
-    let prepared = ContentStore::new();
-    let expected = prepared.index(&path).unwrap();
-    prepared.records().save(&records).unwrap();
-    let resumed = ContentStore::new();
-    assert_eq!(resumed.records().load(&records), 1);
+    let prepared = fastresume::Records::default();
+    let expected = prepared.index_file(&path, &ram).unwrap();
+    prepared.save(&records).unwrap();
+    let resumed = fastresume::Records::default();
+    assert_eq!(resumed.load(&records), 1);
     let before = HASH_CALLS.get();
-    assert_eq!(resumed.index_remembered(&path).unwrap().id, expected.id);
-    assert_eq!(resumed.locate(expected.id).unwrap(), path);
+    let (indexed, entry) = resumed
+        .index_entry(&path, IndexMode::Require, &ram)
+        .unwrap();
+    assert_eq!(indexed.id, expected.id);
+    assert!(
+        open_indexed_file(indexed.id, indexed.len, &entry)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(HASH_CALLS.get(), before);
     std::fs::write(&path, b"changed weights").unwrap();
-    assert!(matches!(
-        resumed.index_remembered(&path),
-        Err(StoreError::Unindexed { .. })
-    ));
+    assert!(
+        resumed
+            .index_entry(&path, IndexMode::Require, &ram)
+            .is_err()
+    );
     std::fs::write(dir.join("replacement"), b"weights").unwrap();
     std::fs::rename(dir.join("replacement"), &path).unwrap();
-    assert!(matches!(
-        resumed.index_remembered(&path),
-        Err(StoreError::Unindexed { .. })
-    ));
+    assert!(
+        resumed
+            .index_entry(&path, IndexMode::Require, &ram)
+            .is_err()
+    );
     assert_eq!(HASH_CALLS.get(), before);
-    // An explicit preparation permits the replacement on the next restart.
-    resumed.index(&path).unwrap();
+    resumed.index_file(&path, &ram).unwrap();
     assert_eq!(HASH_CALLS.get(), before + 1);
-    assert_eq!(resumed.index_remembered(&path).unwrap().id, expected.id);
+    assert_eq!(
+        resumed
+            .index_entry(&path, IndexMode::Require, &ram)
+            .unwrap()
+            .0
+            .id,
+        expected.id
+    );
     assert_eq!(HASH_CALLS.get(), before + 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -245,7 +259,7 @@ fn what_was_read_is_bound_to_the_name_it_is_recorded_against() {
 }
 
 /// The path lookup and the descriptor open are deliberately separate in
-/// `open_verified`; exercise both sides of that boundary without hoping to
+/// `open_indexed_file`; exercise both sides of that boundary without hoping to
 /// win a scheduler race.
 #[test]
 fn a_path_replacement_cannot_change_the_inode_being_lent() {
@@ -260,15 +274,14 @@ fn a_path_replacement_cannot_change_the_inode_being_lent() {
     let link = dir.join("weights.bin");
     std::os::unix::fs::symlink(blobs.join("a"), &link).expect("symlink");
 
-    let store = ContentStore::new();
-    let indexed = store.index(&link).expect("index through link");
-    let entry = store
-        .index
-        .read()
-        .expect("index lock")
-        .get(&indexed.id)
-        .expect("entry")
-        .clone();
+    let records = fastresume::Records::default();
+    let (indexed, entry) = records
+        .index_entry(
+            &link,
+            content::IndexMode::Resume,
+            &content::Reservations::ram(STREAM_BUFFER as u64),
+        )
+        .expect("index through link");
 
     // This descriptor models replacement after `open`: repointing the
     // symlink does not and cannot retarget an already-open file.
@@ -277,14 +290,10 @@ fn a_path_replacement_cannot_change_the_inode_being_lent() {
     std::os::unix::fs::symlink(blobs.join("b"), &swap).expect("replacement link");
     std::fs::rename(&swap, &link).expect("replace link");
 
-    let verified = verify_opened_indexed_file(
-        indexed.id,
-        LengthContract::Exact(indexed.len),
-        &entry,
-        opened_before_replacement,
-    )
-    .expect("verify open descriptor")
-    .expect("the old inode is still verified");
+    let verified =
+        verify_opened_indexed_file(indexed.id, indexed.len, &entry, opened_before_replacement)
+            .expect("verify open descriptor")
+            .expect("the old inode is still verified");
     let mut file = verified.into_file();
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).expect("read old inode");
@@ -293,18 +302,53 @@ fn a_path_replacement_cannot_change_the_inode_being_lent() {
     // This call models replacement between lookup and `open`: opening the
     // stale name reaches blob b, whose descriptor identity is refused.
     assert!(
-        open_indexed_file(indexed.id, LengthContract::Exact(indexed.len), &entry)
+        open_indexed_file(indexed.id, indexed.len, &entry)
             .expect("inspect replacement")
             .is_none(),
         "the replacement inode must not be lent under blob a's id",
     );
-    assert!(
-        store
-            .open_verified(indexed.id, indexed.len)
-            .expect("public open")
-            .is_none(),
-        "a stale index entry becomes a local miss",
-    );
-
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fifo_replacing_an_indexed_name_is_refused_before_reading() {
+    use std::os::fd::AsRawFd as _;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("weights");
+    std::fs::write(&path, b"ordinary bytes").unwrap();
+    let (_, entry) = fastresume::Records::default()
+        .index_entry(
+            &path,
+            content::IndexMode::Resume,
+            &content::Reservations::ram(STREAM_BUFFER as u64),
+        )
+        .unwrap();
+    let object = XetHash::hash(b"ordinary bytes");
+    let file = open_indexed_file(object, 14, &entry)
+        .unwrap()
+        .unwrap()
+        .into_file();
+    // Inspect the actual lent descriptor, rather than the options used to open it.
+    let access = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert!(access >= 0);
+    assert_eq!(access & libc::O_ACCMODE, libc::O_RDONLY);
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        send.send(open_indexed_file(object, 14, &entry)).unwrap();
+    });
+    assert!(
+        matches!(receive.recv_timeout(std::time::Duration::from_secs(2)).expect("FIFO open blocked"),
+        Err(StoreError::Read { source, .. }) if source.kind() == io::ErrorKind::InvalidInput)
+    );
 }

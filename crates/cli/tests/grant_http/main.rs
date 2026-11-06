@@ -151,6 +151,7 @@ impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
         let path = root.join(format!("{name}.passkey"));
         std::fs::write(&path, hex::encode(passkey)).unwrap();
+        std::fs::create_dir_all(root.join("homes").join(name)).unwrap();
         Self {
             root: root.into(),
             identity: root.join(name),
@@ -197,7 +198,12 @@ impl Cli {
         command
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
-            .env("HELLAS_STORE_DIR", self.root.join("store"))
+            .env(
+                "HOME",
+                self.root
+                    .join("homes")
+                    .join(self.identity.file_name().unwrap()),
+            )
             .env("RUST_LOG", "warn,hellas_gateway=info,hellas::metrics=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())

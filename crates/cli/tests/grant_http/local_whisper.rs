@@ -107,6 +107,7 @@ async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
     };
     let hellas_client::model::ModelResponse::Transcription(expected_text) =
         hellas_client::model::ModelPackage::open(&model)
+            .await
             .unwrap()
             .decode(&expected)
             .unwrap()

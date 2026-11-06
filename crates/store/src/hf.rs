@@ -37,9 +37,8 @@
 //! no chunk hashes.
 
 use std::io::Read as _;
-use std::path::Path;
 
-use hellas_xet::{Chunk, XetFileHasher, XetHash};
+use hellas_xet::{Chunk, XetHash};
 
 /// Which kind of repository a model lives in. The API path pluralises
 /// it, which is why this is not just a string.
@@ -109,17 +108,8 @@ pub enum FetchError {
     Malformed(String),
     #[error("decoding a xorb: {0}")]
     Xorb(#[from] crate::xorb::XorbError),
-    #[error("reconstructed content hashed to {actual}, asked for {expected}")]
-    WrongContent { expected: XetHash, actual: XetHash },
     #[error("{context}: response is longer than the {limit} bytes allowed")]
     TooLarge { context: String, limit: u64 },
-    #[error("{context}: asked for {expected} bytes, got {actual} with status {status}")]
-    BadRange {
-        context: String,
-        status: u16,
-        expected: u64,
-        actual: u64,
-    },
 }
 
 type Result<T> = std::result::Result<T, FetchError>;
@@ -362,170 +352,10 @@ impl HfCas {
             .map_err(|_| FetchError::Malformed("reconstruction is not UTF-8".to_string()))?;
         Reconstruction::parse(&json)
     }
-
-    /// Materialises content `id` at `dest`, refusing to write anything
-    /// that does not hash to `id`.
-    ///
-    /// The file is assembled in memory before being written, so the
-    /// store never contains a partially-fetched file under a real name.
-    /// That costs one file's worth of memory and buys the guarantee that
-    /// a path in the store always holds the content its id claims.
-    pub fn fetch(&self, id: XetHash, dest: &Path, expected: Option<&[Chunk]>) -> Result<u64> {
-        let token = self.token()?;
-        let plan = self.reconstruction(&token, id)?;
-
-        let mut assembled: Vec<u8> = Vec::new();
-        let mut chunk_index = 0_usize;
-        for term in &plan.terms {
-            for range in plan.ranges_for(term) {
-                let bytes = get_range(&range.url, *range.bytes.start(), *range.bytes.end())?;
-                let count = range
-                    .chunks
-                    .end
-                    .checked_sub(range.chunks.start)
-                    .and_then(|count| usize::try_from(count).ok())
-                    .ok_or_else(|| FetchError::Malformed("absurd chunk count".to_string()))?;
-                // Verify per-chunk when we already know what to expect.
-                // Without a chunk list this is impossible: the response
-                // carries no chunk hashes.
-                let slice = expected
-                    .map(|chunks| {
-                        chunks
-                            .get(chunk_index..chunk_index + count)
-                            .ok_or_else(|| FetchError::Malformed("chunk list too short".into()))
-                    })
-                    .transpose()?;
-                let decoded = crate::xorb::decode_chunks(&bytes, count, slice)?;
-                for data in decoded {
-                    assembled.extend_from_slice(&data);
-                }
-                chunk_index += count;
-            }
-        }
-
-        let content = verified(id, &assembled, plan.offset_into_first_range)?;
-        publish(dest, content)?;
-        Ok(content.len() as u64)
-    }
-}
-
-/// Puts verified bytes at `dest`, atomically, without following anything.
-///
-/// Public for the same reason [`verified`] is: it is only ever called
-/// after a network fetch, and a step that can only run against
-/// production is a step nobody can regression-test.
-///
-/// The bytes cannot change once verified, but the destination can.
-/// `std::fs::write` opens `dest` by name, which follows a symlink to
-/// wherever it points, truncates whatever it finds, and — if the write
-/// fails halfway — leaves a short file under a name that now claims to be
-/// a whole one. Two materializations of different content to the same
-/// path could interleave into a mixture of both.
-///
-/// So: a uniquely named sibling opened with `create_new`, which cannot
-/// follow anything because it refuses to open something that exists;
-/// `sync_all`, so a crash cannot leave the rename pointing at a file the
-/// page cache never wrote; then `rename`, which is atomic. A reader at
-/// `dest` sees the old file or the whole new one, never a prefix.
-pub fn publish(dest: &Path, content: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| FetchError::Io {
-            context: format!("creating {}", parent.display()),
-            source,
-        })?;
-    }
-
-    let name = dest
-        .file_name()
-        .ok_or_else(|| FetchError::Malformed(format!("{} is not a file name", dest.display())))?;
-    let parent = dest
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let io = |context: String| move |source| FetchError::Io { context, source };
-    let mut incoming = tempfile::Builder::new()
-        .prefix(name)
-        .suffix(".incoming")
-        .make_in(parent, |path| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-        })
-        .map_err(io(format!(
-            "creating temporary file beside {}",
-            dest.display()
-        )))?;
-    incoming
-        .write_all(content)
-        .map_err(io(format!("writing {}", incoming.path().display())))?;
-    incoming
-        .as_file()
-        .sync_all()
-        .map_err(io(format!("syncing {}", incoming.path().display())))?;
-    let incoming = incoming.into_temp_path();
-    std::fs::rename(&incoming, dest).map_err(io(format!("publishing {}", dest.display())))?;
-    let _published = incoming.keep();
-    Ok(())
-}
-
-/// Trims the leading offset and checks the result is the content that
-/// was asked for.
-///
-/// Separated from [`HfCas::fetch`] so it is reachable without a network:
-/// this is the check that stops a wrong or tampered response being
-/// written into the store under a name it does not own, and a check
-/// that only runs against production is a check nobody can regression-
-/// test.
-pub fn verified(id: XetHash, assembled: &[u8], offset: u64) -> Result<&[u8]> {
-    let start =
-        usize::try_from(offset).map_err(|_| FetchError::Malformed("absurd offset".into()))?;
-    let content = assembled
-        .get(start..)
-        .ok_or_else(|| FetchError::Malformed("offset past the assembled content".into()))?;
-
-    let mut hasher = XetFileHasher::new();
-    hasher.update(content);
-    let actual = hasher.finalize();
-    if actual != id {
-        return Err(FetchError::WrongContent {
-            expected: id,
-            actual,
-        });
-    }
-    Ok(content)
 }
 
 fn get(url: &str, bearer: Option<&str>, limit: u64) -> Result<Vec<u8>> {
     let (_, body) = read_body(authenticated_get(url, bearer), url, limit)?;
-    Ok(body)
-}
-
-/// Exactly the bytes that were asked for, or an error.
-///
-/// A range request is the one case where the length is known in advance,
-/// so it is the one case where "however much you send" is inexcusable.
-/// A 200 here would be the whole xorb — potentially gigabytes — in
-/// answer to a request for a few hundred kilobytes.
-fn get_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>> {
-    // Inclusive, matching the reconstruction response's own convention
-    // and the signed range on the URL.
-    let expected = end
-        .checked_sub(start)
-        .and_then(|span| span.checked_add(1))
-        .ok_or_else(|| FetchError::Malformed(format!("byte range {start}..={end}")))?;
-    let request = ureq::get(url).header("Range", &format!("bytes={start}-{end}"));
-    let (status, body) = read_body(request, url, expected)?;
-    if status != 206 || body.len() as u64 != expected {
-        return Err(FetchError::BadRange {
-            context: format!("GET {url}"),
-            status,
-            expected,
-            actual: body.len() as u64,
-        });
-    }
     Ok(body)
 }
 
@@ -562,16 +392,6 @@ fn read_body(
         });
     }
     Ok((status, body))
-}
-
-impl crate::Fetcher for HfCas {
-    fn name(&self) -> &str {
-        "huggingface"
-    }
-
-    fn fetch(&self, id: XetHash, dest: &Path, expected: Option<&[Chunk]>) -> Result<u64> {
-        Self::fetch(self, id, dest, expected)
-    }
 }
 
 impl std::fmt::Debug for XetToken {
