@@ -42,9 +42,10 @@ pub(crate) use transport::serve_validator_archive;
 /// Independently provisioned execution inputs. Peers supply blocks, never these pins.
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub genesis: hellas_genesis::Genesis,
-    pub threshold_identity: Vec<u8>,
-    pub genesis_payload: Digest,
+    genesis: hellas_genesis::Genesis,
+    threshold_identity: Vec<u8>,
+    /// Optional independently provisioned H0 pin; startup retains the locally derived value.
+    genesis_payload: Option<Digest>,
     pub storage_dir: PathBuf,
     /// Validator transaction ingress URLs; replication uses ChainSync peers.
     pub validators: Vec<String>,
@@ -77,6 +78,52 @@ pub enum Error {
 }
 
 impl Config {
+    pub fn genesis(&self) -> &hellas_genesis::Genesis {
+        &self.genesis
+    }
+
+    pub fn threshold_identity(&self) -> &[u8] {
+        &self.threshold_identity
+    }
+
+    pub fn genesis_payload(&self) -> Option<Digest> {
+        self.genesis_payload
+    }
+
+    pub fn for_profile(
+        profile: hellas_genesis::ChainProfile,
+        storage_dir: PathBuf,
+        peers: Vec<iroh::EndpointAddr>,
+        archive_blocks: Option<NonZeroU64>,
+    ) -> Result<Self, Error> {
+        profile
+            .static_threshold_identity()
+            .map_err(|error| Error::Config(error.to_string()))?;
+        Self::for_indexed_profile(profile, storage_dir, peers, archive_blocks)
+    }
+
+    pub(crate) fn for_indexed_profile(
+        profile: hellas_genesis::ChainProfile,
+        storage_dir: PathBuf,
+        peers: Vec<iroh::EndpointAddr>,
+        archive_blocks: Option<NonZeroU64>,
+    ) -> Result<Self, Error> {
+        let (genesis, genesis_payload) = profile
+            .execution()
+            .map_err(|error| Error::Config(error.to_string()))?;
+        let threshold_identity = hex::decode(&profile.trust().epochs[0].threshold_identity)
+            .map_err(|error| Error::Config(error.to_string()))?;
+        Ok(Self {
+            genesis: genesis.clone(),
+            threshold_identity,
+            genesis_payload: genesis_payload.map(Into::into),
+            storage_dir,
+            validators: profile.validators().to_vec(),
+            peers,
+            archive_blocks,
+        })
+    }
+
     fn info(&self) -> Result<ConsensusInfo, Error> {
         if self.peers.len() + self.validators.len() > 64 {
             return Err(Error::Config(
@@ -321,6 +368,7 @@ impl Drop for Tasks {
 
 pub(crate) struct Core {
     _lock: std::fs::File,
+    genesis_payload: Digest,
     indexer: ChainIndexer,
     client: LocalLightClient,
     #[cfg(feature = "indexer-api")]
@@ -377,14 +425,17 @@ impl Core {
         )
         .await;
         let genesis = application.genesis_block();
-        if genesis.digest() != config.genesis_payload {
+        if config
+            .genesis_payload
+            .is_some_and(|pin| genesis.digest() != pin)
+        {
             return Err(Error::Config("genesis payload differs from its pin".into()));
         }
         crate::execution::pipeline::pin(
             &config.storage_dir,
             &config.genesis,
             &config.threshold_identity,
-            config.genesis_payload,
+            genesis.digest(),
         )
         .map_err(storage)?;
         let owner = application.owner_index();
@@ -646,6 +697,7 @@ impl Core {
         );
         Ok(Arc::new(Self {
             _lock: lock,
+            genesis_payload: genesis.digest(),
             indexer,
             client,
             #[cfg(feature = "indexer-api")]

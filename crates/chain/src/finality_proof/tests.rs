@@ -214,7 +214,8 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
             },
         ],
     };
-    let verifier = ProofVerifier::new(trust.clone()).unwrap();
+    let verifier =
+        ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_1_JSON.as_bytes()).unwrap();
     let target = &blocks[1];
     let bundle = ProofBundle {
         schema_version: 1,
@@ -258,7 +259,8 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     assert!(verifier.verify(wrong_epoch, query).is_err());
     trust.epochs[0].end_height = Some(3);
     trust.epochs[1].start_height = 3;
-    let wrong_schedule = ProofVerifier::new(trust).unwrap();
+    let wrong_schedule =
+        ProofVerifier::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes()).unwrap();
     let mut wrong_bundle = bundle;
     wrong_bundle.trust_sha256 = wrong_schedule.trust_sha256().into();
     // The terminal certificate still belongs to epoch 1 at height 3, but the

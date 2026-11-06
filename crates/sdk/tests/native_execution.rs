@@ -64,7 +64,7 @@ use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
 use hellas_sdk::paid_client::{
     PaidWorkOptions, PaidWorkSession, SessionFundingOptions, SessionOpenMode, bind_paid_endpoint,
 };
-use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
+use hellas_sdk::work_config::WorkConfig;
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
@@ -183,7 +183,8 @@ async fn check_other_enrollment_refused(
     gateway.journal_root = options.journal_root.with_file_name("elsewhere-gateway");
     let error = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
-            providers: vec![gateway],
+            config: gateway.config.clone(),
+            providers: vec![gateway_provider(&gateway)],
             max_pending_requests: 1,
         },
         NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
@@ -201,7 +202,7 @@ async fn check_other_enrollment_refused(
     assert!(
         hellas_channel::work_store::discover_setups(
             &elsewhere.journal_root,
-            elsewhere.config.chain.network
+            elsewhere.config.network()
         )
         .await
         .unwrap()
@@ -285,17 +286,40 @@ fn work_policy() -> InvocationPolicy {
 }
 
 fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    use hellas_chain::genesis::{Chain, ChainProfile, CustomChainFile};
+    let genesis_json = serde_json::to_string(devnet.genesis()).unwrap();
+    let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+    trust.network_id = devnet.network().as_str().to_owned();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    trust.epochs[0].threshold_identity = hex::encode(&devnet.consensus_info().threshold_identity);
     WorkConfig {
-        chain: ChainCrossCheck {
-            network: devnet.network(),
-            genesis_payload_digest: devnet.genesis_payload().0.into(),
-            threshold_identity: devnet.consensus_info().threshold_identity.clone(),
-            genesis: Some(devnet.genesis().clone()),
-        },
-        validators: devnet.light_client_urls(),
+        chain: ChainProfile::custom(CustomChainFile {
+            consensus_digest: hex::encode(hellas_chain::genesis_digest(devnet.genesis()).0),
+            trust,
+            validators: devnet.light_client_urls(),
+            genesis_json: Some(genesis_json),
+            genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
+        })
+        .unwrap(),
         journal_root,
         poll: Duration::from_millis(20),
         max_observation_age: Duration::from_secs(60),
+    }
+}
+
+fn gateway_provider(options: &PaidWorkOptions) -> hellas_sdk::paid_gateway::GatewayProviderOptions {
+    hellas_sdk::paid_gateway::GatewayProviderOptions {
+        journal_root: options.journal_root.clone(),
+        provider: options.provider,
+        provider_addrs: options.provider_addrs.clone(),
+        apple_trust: options.apple_trust.clone(),
+        assurance: options.assurance,
+        expected_price: options.expected_price,
+        acceptance_blocks: options.acceptance_blocks,
+        terminal_blocks: options.terminal_blocks,
+        payment_blocks: options.payment_blocks,
+        timeout: options.timeout,
     }
 }
 
@@ -667,7 +691,8 @@ async fn check_gateway_quote(
     let journal = args.journal_root.clone();
     let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
-            providers: vec![args],
+            config: args.config.clone(),
+            providers: vec![gateway_provider(&args)],
             max_pending_requests: 1,
         },
         NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
@@ -901,7 +926,10 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     )
     .unwrap();
     let mut client_config = config;
-    client_config.validators = relays.urls.clone();
+    client_config.chain = client_config
+        .chain
+        .with_validators(relays.urls.clone())
+        .unwrap();
     let options = PaidWorkOptions {
         config: client_config,
         journal_root: root.path().join("client-journal"),
@@ -1199,7 +1227,11 @@ async fn paid_finish(case: PaidScenario) {
     // bounded error rather than wait for a proof read that cannot occur.
     let source_timeout = Duration::from_secs(1);
     let mut stale_options = options.clone();
-    stale_options.config.validators = stale_relays.urls.clone();
+    stale_options.config.chain = stale_options
+        .config
+        .chain
+        .with_validators(stale_relays.urls.clone())
+        .unwrap();
     stale_options.timeout = Some(source_timeout);
     let error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1585,7 +1617,7 @@ async fn paid_finish(case: PaidScenario) {
     drop(second);
     let retained = hellas_sdk::paid_client::retained_settlement_channels(
         &options.journal_root,
-        options.config.chain.network,
+        options.config.network(),
         options.provider,
         owner.principal(),
         owner.delegate(),

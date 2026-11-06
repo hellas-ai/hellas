@@ -407,7 +407,7 @@ impl Purchase {
         }
         let found = hellas_channel::work_store::discover_setups(
             &options.journal_root,
-            options.config.chain.network,
+            options.config.network(),
         )
         .await?;
         if !found.unidentified.is_empty()
@@ -419,7 +419,7 @@ impl Purchase {
         }
         let setup = SetupStore::open(
             &options.journal_root,
-            options.config.chain.network,
+            options.config.network(),
             EdgeId::from_bytes(record.bond),
             Role::Client,
             &Secp256k1Verifier::new(),

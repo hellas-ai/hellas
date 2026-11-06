@@ -39,7 +39,6 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
         &["--settle"][..],
         &["--buy-again"],
         &["--validator", "ws://localhost"],
-        &["--trust", "chain.json"],
         &["--address", "127.0.0.1:1"],
         &["--state-dir", "paid-state"],
         &["--acceptance-blocks", "300"],
@@ -61,8 +60,20 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
     let identity_path = root.path().join("identity");
     let identity = crate::identity::load_or_create(Some(&identity_path)).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
-    let owner = cli.owner.load().unwrap().unwrap();
-    let context = Context::new(&identity, Some(&owner), Some(&identity_path)).unwrap();
+    let owner = cli
+        .owner
+        .load(&hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::Devnet,
+        ))
+        .unwrap()
+        .unwrap();
+    let context = Context::new(
+        &identity,
+        Some(&owner),
+        Some(&identity_path),
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
     for (extra, expected) in [
         (vec![], (300, 3000, 600)),
         (
@@ -83,7 +94,13 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
                 &context,
                 20,
                 Assurance::ProducerSigned,
-                hellas_sdk::client_chain::devnet(root.path()).unwrap(),
+                hellas_sdk::work_config::WorkConfig::for_chain(
+                    hellas_chain::genesis::ChainProfile::known(
+                        hellas_chain::genesis::Chain::Devnet,
+                    ),
+                    root.path(),
+                )
+                .unwrap(),
             )
             .unwrap();
         assert_eq!(

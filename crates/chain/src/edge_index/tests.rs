@@ -27,9 +27,9 @@ use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
-use hellas_genesis::{
-    Genesis, GenesisAllocation, GenesisValidator, HELLAS_DEVNET_1_ID, TrustDocument, TrustEpoch,
-};
+use hellas_genesis::{Genesis, GenesisAllocation, GenesisValidator, TrustDocument, TrustEpoch};
+
+const EDGE_TEST_NETWORK_ID: &str = "edge-index-test-1";
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
     PartyAuth, PartyKeys, Payout, ProtocolCode, Secp256k1Signer, Terms, Tx,
@@ -112,11 +112,11 @@ impl Harness {
         allocations: Vec<(SettlementKey, u64)>,
         name: &'static str,
     ) -> Self {
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let committee = consensus_fixture(7191);
         let mut genesis = Genesis {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: EDGE_TEST_NETWORK_ID.into(),
             validators: committee
                 .leaders
                 .iter()
@@ -148,7 +148,7 @@ impl Harness {
         let genesis_json = serde_json::to_vec(&genesis).unwrap();
         let trust = TrustDocument {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: EDGE_TEST_NETWORK_ID.into(),
             genesis_sha256: hex::encode(Sha256::hash(&genesis_json)),
             epochs: vec![TrustEpoch {
                 epoch: 0,
@@ -166,30 +166,25 @@ impl Harness {
         )
         .await;
         let leader = committee.leaders.iter().min().unwrap().clone();
-        let head = HellasBlock::genesis(
-            leader,
-            root,
-            target.clone(),
-            crate::genesis_digest(&genesis),
-        );
-        let origin_genesis = HellasBlock::genesis(
-            crate::indexer_api::genesis_leader(&genesis).unwrap(),
-            root,
-            target,
-            crate::genesis_digest(&genesis),
-        );
+        let head = HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
         let allocations = crate::config::genesis_allocations(&genesis).unwrap();
         let directory = tempfile::tempdir().unwrap();
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+            consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
+            trust: trust.clone(),
+            validators: vec!["ws://unused.invalid".into()],
+            genesis_json: Some(String::from_utf8(genesis_json.clone()).unwrap()),
+            genesis_payload: Some(hex::encode(head.digest().0)),
+        })
+        .unwrap();
         let node = crate::node::FullNode::start_indexed(
-            crate::node::Config {
-                genesis: genesis.clone(),
-                threshold_identity: committee.assembler.identity().encode().to_vec(),
-                genesis_payload: origin_genesis.digest(),
-                storage_dir: directory.path().join("node"),
-                validators: Vec::new(),
-                peers: Vec::new(),
-                archive_blocks: None,
-            },
+            crate::node::Config::for_indexed_profile(
+                profile,
+                directory.path().join("node"),
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
             trust.clone(),
             genesis_json.clone(),
             "edge-test".into(),
@@ -274,7 +269,7 @@ impl Harness {
     fn certify(&self, block: &HellasBlock) -> ProofBundle {
         ProofBundle {
             schema_version: PROOF_SCHEMA_VERSION,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: self.network.as_str().into(),
             trust_sha256: self.verifier.trust_sha256().into(),
             height: block.height().get(),
             payload: hex::encode(block.digest()),
@@ -917,7 +912,7 @@ fn work_pair(
 #[test]
 fn native_edge_index_bond_reverse_link_requires_payment_opening_evidence() {
     run_qmdb(|runtime| async move {
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let allocations = vec![
             (SettlementKey::from(signer(31).party_key()), 100),
             (SettlementKey::from(signer(32).party_key()), 12),
@@ -981,7 +976,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             EarnedCertificate, Move, Party, PaymentCloseResponse, PaymentCloseStart, PendingSlot,
             Proof, RegistryChunk,
         };
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let allocations = vec![
             (SettlementKey::from(signer(31).party_key()), 100),
             (SettlementKey::from(signer(32).party_key()), 12),

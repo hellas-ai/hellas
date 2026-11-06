@@ -153,7 +153,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             let verifier = hellas_kernel::Secp256k1Verifier::new();
             let setup = hellas_channel::work_store::SetupStore::open_existing(
                 &case.options.journal_root,
-                case.options.config.chain.network,
+                case.options.config.network(),
                 bond,
                 hellas_channel::work_store::Role::Client,
                 &verifier,

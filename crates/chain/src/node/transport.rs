@@ -74,7 +74,7 @@ impl FullNode {
         config.info()?;
         let (started, ready) = oneshot::channel();
         let (stop, mut stopped) = oneshot::channel();
-        let retained_config = config.clone();
+        let mut retained_config = config.clone();
         let thread = std::thread::Builder::new()
             .name("hellas-chain".into())
             .spawn(move || {
@@ -137,6 +137,7 @@ impl FullNode {
         let (core, network, runtime) = ready
             .await
             .map_err(|_| storage("chain startup task stopped"))??;
+        retained_config.genesis_payload = Some(core.genesis_payload);
         Ok(Self(Arc::new(Lease {
             core,
             manager: network.manager(),

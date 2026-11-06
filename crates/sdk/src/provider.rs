@@ -115,7 +115,7 @@ impl<R> FetchProviderOptions<R> {
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
-                    network: config.chain.network,
+                    network: config.network(),
                     journal_root: config.journal_root,
                     poll: config.poll,
                     max_observation_age: config.max_observation_age,

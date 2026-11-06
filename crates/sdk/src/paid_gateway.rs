@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 mod config;
 mod error;
-pub use config::{PaidGatewayOptions, load_pool_options};
+pub use config::{GatewayProviderOptions, PaidGatewayOptions, load_pool_options};
 pub use error::PoolError;
 type Result<T, E = PoolError> = std::result::Result<T, E>;
 
@@ -173,9 +173,6 @@ impl PaidGateway {
         funding: crate::paid_client::SessionFundingOptions,
     ) -> Result<Arc<Self>> {
         options.validate()?;
-        for provider in &options.providers {
-            provider.config.clone().validate()?;
-        }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
         let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
@@ -185,12 +182,13 @@ impl PaidGateway {
             ));
         }
         let mut providers = Vec::with_capacity(options.providers.len());
-        for args in options.providers {
+        for provider in options.providers {
+            let args = provider.with_config(options.config.clone());
             // Retained policy journals can depend on a height behind a fast
             // validator; select a source that already serves it.
             let setups = crate::paid_client::offer::RetainedSetups::discover(
                 &args.journal_root,
-                args.config.chain.network,
+                args.config.network(),
                 args.provider,
             )
             .await?;
@@ -459,7 +457,7 @@ fn empty_content() -> InvocationContent {
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
     let found = hellas_channel::work_store::discover_setups(
         &options.journal_root,
-        options.config.chain.network,
+        options.config.network(),
     )
     .await?;
     // Counter files and other metadata alone must never trigger channel funding.
@@ -678,9 +676,9 @@ mod tests {
 
     fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
         PaidGatewayOptions {
+            config: fixture.config.clone(),
             max_pending_requests: 4,
-            providers: vec![PaidWorkOptions {
-                config: fixture.config.clone(),
+            providers: vec![GatewayProviderOptions {
                 journal_root: fixture.root.path().join("client"),
                 provider: crate::test_support::address(
                     iroh::SecretKey::from_bytes(&[3; 32]).public(),
@@ -731,7 +729,9 @@ mod tests {
         fixture: &crate::test_support::PaidFixture,
         policy: ProviderChannelPolicy,
     ) -> PaidPool {
-        let args = pool_options(fixture).providers.remove(0);
+        let mut options = pool_options(fixture);
+        let config = options.config.clone();
+        let args = options.providers.remove(0).with_config(config);
         PaidPool {
             funding: Default::default(),
             owner: Arc::new(
@@ -856,7 +856,9 @@ mod tests {
     async fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
         let fixture = crate::test_support::PaidFixture::new();
         let options = pool_options(&fixture);
-        let provider = &options.providers[0];
+        let provider = &options.providers[0]
+            .clone()
+            .with_config(options.config.clone());
         assert!(!has_retained_setup(provider).await.unwrap());
         std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
         std::fs::write(
@@ -869,7 +871,7 @@ mod tests {
         assert!(!has_retained_setup(provider).await.unwrap());
         let store = hellas_channel::work_store::SetupStore::open(
             &provider.journal_root,
-            provider.config.chain.network,
+            provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
@@ -883,7 +885,7 @@ mod tests {
         );
         let store = hellas_channel::work_store::SetupStore::open(
             &provider.journal_root,
-            provider.config.chain.network,
+            provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),

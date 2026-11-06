@@ -9,7 +9,7 @@ use hellas_sdk::{
 #[derive(Debug, Default, Args)]
 pub(super) struct GrantArgs {
     /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
-    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
+    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
     pub offer: Option<String>,
     /// Select a resource ID in an imported allowance containing several policies.
     #[arg(long, requires = "offer")]

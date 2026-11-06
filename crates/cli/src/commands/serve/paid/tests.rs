@@ -18,7 +18,14 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let mut paid = PaidWork::load(&example, root.path().join("provider"), None, None).unwrap();
+    let mut paid = PaidWork::load(
+        &example,
+        root.path().join("provider"),
+        None,
+        None,
+        hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
     let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);
     assert!(
         paid.prepare(&config, &identity.enrollment, &identity.node_key)
@@ -28,7 +35,12 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     assert!(!paid.root.join("bootstrap.json").exists());
 
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    paid.owner = cli.owner.load().unwrap();
+    paid.owner = cli
+        .owner
+        .load(&hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::Devnet,
+        ))
+        .unwrap();
     let credential = paid
         .prepare(&config, &identity.enrollment, &identity.node_key)
         .await
@@ -131,11 +143,24 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli.owner.load().unwrap().unwrap();
+    let owner = cli
+        .owner
+        .load(&hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::Devnet,
+        ))
+        .unwrap()
+        .unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
-    let paid = PaidWork::load(&example, root.path().join("provider"), Some(owner), None).unwrap();
-    assert_eq!(paid.chain.chain.network.as_str(), "hellas-devnet-1");
+    let paid = PaidWork::load(
+        &example,
+        root.path().join("provider"),
+        Some(owner),
+        None,
+        hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
+    assert_eq!(paid.chain.network().as_str(), "hellas-devnet-1");
     assert_eq!(paid.policy.payment_policy.fixed_price, 20);
     assert_eq!(paid.policy.expected_payment_values.value(), 401);
     let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);
@@ -232,7 +257,13 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
     use hellas_executor::FetchAdaptorFactory as _;
     let root = tempfile::tempdir().unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli.owner.load().unwrap().unwrap();
+    let owner = cli
+        .owner
+        .load(&hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::Devnet,
+        ))
+        .unwrap()
+        .unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let mut terms: toml::Value =
@@ -264,6 +295,7 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
         root.path().join("provider"),
         Some(owner),
         Some(&fetch_path),
+        hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
     let admission = paid

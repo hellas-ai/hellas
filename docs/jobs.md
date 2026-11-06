@@ -53,8 +53,10 @@ presents any other enrollment, before anything is signed or funded.
 `--faucet` only selects a key from the devnet genesis faucet allocation and
 retains it beside the identity; `--faucet-account N` selects one explicitly,
 and `--passkey FILE` uses your own owner key. Faucet keys are public
-development keys. The default chain is the shipped devnet. A custom chain uses `--trust FILE`, `--genesis FILE`, and six
-repeated `--validator URL` options. `--timeout 90s` bounds the whole operation;
+development keys. The default chain is the shipped devnet. Select a compiled chain with
+`--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
+The profile contains `consensus_digest`, `trust`, and a nonempty `validators` URL list;
+light clients need no full genesis allocation document. `--timeout 90s` bounds the whole operation;
 without it the command waits until the job is done. `--state-dir DIR` selects
 requester state.
 

@@ -1396,7 +1396,7 @@ mod tests {
         let config = &fixture.config;
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                network: config.chain.network,
+                network: config.network(),
                 journal_root: config.journal_root.clone(),
                 poll: Duration::ZERO,
                 max_observation_age: config.max_observation_age,

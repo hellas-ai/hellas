@@ -29,6 +29,7 @@ let
   ++ cfg.serve.contentRoots
   ++ lib.optional (cfg.serve.contentIndex != null) cfg.serve.contentIndex
   ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
+  ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.grantConfigFile != null) cfg.serve.grantConfigFile
   ++ lib.optional (cfg.serve.awaitOwner != null) cfg.serve.awaitOwner
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
@@ -154,6 +155,10 @@ in
         {
           assertion = hellas.extraArgsAreSafe lib hellas.protectedServeExtraArgs cfg.serve.extraArgs;
           message = "programs.hellas.serve.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
+        }
+        {
+          assertion = cfg.serve.chain == null || cfg.serve.chainConfig == null;
+          message = "programs.hellas.serve.chain and chainConfig are mutually exclusive.";
         }
         {
           assertion = lib.all outsideStoreString userEnvironmentStrings;

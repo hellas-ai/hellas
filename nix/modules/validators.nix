@@ -53,6 +53,7 @@ let
         validator.addresses != [ ]
       ) "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}";
       seedFlag = optionalString (validator.seed != null) "--seed ${toString validator.seed}";
+      networkIdFlag = optionalString (validator.networkId != null) "--network-id ${escapeShellArg validator.networkId}";
       genesisFlag = optionalString (
         validator.genesis != null
       ) "--genesis ${escapeShellArg validator.genesis}";
@@ -77,6 +78,7 @@ let
         --validator ${toString index} \
         --start-port ${toString validator.startPort} \
         ${seedFlag} \
+        ${networkIdFlag} \
         ${addressesFlag} \
         ${relayFlags} \
         --metrics-port ${toString (validator.metricsBasePort + index)} \
@@ -212,6 +214,11 @@ let
           default = null;
           description = "Canonical genesis JSON embedded in every validator config.";
         };
+        networkId = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Network ID for generated genesis when genesis is not supplied.";
+        };
         addresses = mkOption {
           type = types.listOf types.str;
           default = [ ];
@@ -262,6 +269,16 @@ let
             validator's state exactly once when it changes.
           '';
         };
+        chain = mkOption {
+          type = types.nullOr (types.enum [ "devnet" ]);
+          default = null;
+          description = "Compiled chain; null uses the binary default.";
+        };
+        chainConfig = mkOption {
+          type = types.nullOr (types.strMatching "/.*");
+          default = null;
+          description = "Authenticated custom chain profile outside the Nix store.";
+        };
         memoryMax = mkOption {
           type = types.nullOr types.str;
           default = null;
@@ -298,6 +315,18 @@ in
         {
           assertion = validator.genesis == null || validator.seed != null;
           message = "services.hellas-chain-validators.${name}.genesis requires a deterministic seed.";
+        }
+        {
+          assertion = validator.genesis == null || validator.networkId == null;
+          message = "services.hellas-chain-validators.${name}.networkId cannot be combined with genesis.";
+        }
+        {
+          assertion = validator.chain == null || validator.chainConfig == null;
+          message = "services.hellas-chain-validators.${name}.chain and chainConfig are mutually exclusive.";
+        }
+        {
+          assertion = validator.chainConfig == null || hellas.runtimePathIsOutsideStore lib validator.chainConfig;
+          message = "services.hellas-chain-validators.${name}.chainConfig must be runtime data outside the Nix store.";
         }
         {
           assertion = validator.genesis == null || validator.genesisAllocations == [ ];
@@ -403,6 +432,7 @@ in
               name = serviceName;
               value = {
                 description = "Hellas Validator ${name} Node ${toString index}";
+                unitConfig.RequiresMountsFor = lib.optional (validator.chainConfig != null) validator.chainConfig;
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network-online.target" ];
                 wants = [ "network-online.target" ];
@@ -410,7 +440,7 @@ in
                 startLimitBurst = 5;
                 startLimitIntervalSec = 60;
                 serviceConfig = {
-                  ExecStart = "${getExe validator.package} chain validator run --config ${configFile}";
+                  ExecStart = "${getExe validator.package} chain validator run --config ${configFile}${optionalString (validator.chain != null) " --chain ${escapeShellArg validator.chain}"}${optionalString (validator.chainConfig != null) " --chain-config ${escapeShellArg validator.chainConfig}"}";
                   Type = "simple";
                   Restart = "on-failure";
                   RestartSec = 5;

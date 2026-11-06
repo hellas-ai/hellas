@@ -148,7 +148,7 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             .unwrap();
             mismatch
                 .bind_target(hellas_sdk::execution::ExecutionTarget {
-                    network: case.options.config.chain.network,
+                    network: case.options.config.network(),
                     provider: case.options.provider,
                 })
                 .unwrap();
@@ -677,7 +677,7 @@ async fn record_unsigned_proposal(
     let verifier = hellas_kernel::Secp256k1Verifier::new();
     let setup = SetupStore::open_existing(
         &case.options.journal_root,
-        case.options.config.chain.network,
+        case.options.config.network(),
         bond,
         Role::Client,
         &verifier,

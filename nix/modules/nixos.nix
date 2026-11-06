@@ -109,6 +109,7 @@ let
   ++ cfg.contentRoots
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
+  ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
   ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
   ++ lib.optional (cfg.awaitOwner != null) cfg.awaitOwner
   ++ lib.optional (cfg.passkey != null) cfg.passkey
@@ -119,6 +120,7 @@ let
     ++ [ gateway.identityPath ]
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
+    ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
     ++ lib.optional (gateway.grantPoolConfig != null) gateway.grantPoolConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
     ++ lib.optional (gateway.workProfile != null) gateway.workProfile
@@ -249,6 +251,14 @@ in
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedServeExtraArgs cfg.extraArgs;
         message = "services.hellas.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
+      }
+      {
+        assertion = cfg.chain == null || cfg.chainConfig == null;
+        message = "services.hellas.chain and chainConfig are mutually exclusive.";
+      }
+      {
+        assertion = gateway.chain == null || gateway.chainConfig == null;
+        message = "services.hellas.gateway.chain and chainConfig are mutually exclusive.";
       }
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedGatewayExtraArgs gateway.extraArgs;

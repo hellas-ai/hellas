@@ -3,9 +3,8 @@
 # these terms at startup and delegates the stake its offers bond. Nothing
 # here has a built-in default; every field is required unless noted.
 
-# Omit to use the shipped devnet. Otherwise a JSON chain configuration,
-# relative to this file.
-# chain_config = "chain.json"
+# Omit to use the shipped devnet. Select a custom authenticated JSON chain
+# profile on the command line with --chain-config chain.json.
 
 jobs_per_channel = 10
 # Kernel minimum (MIN_OMIT_RESPONSE_BLOCKS).

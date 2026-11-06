@@ -294,7 +294,7 @@ fn spawn_observer(
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
                 finalized = None;
-                source_config.validators.rotate_left(1);
+                source_config.chain.rotate_validators();
                 match crate::client_chain::connect_at(
                     &source_config,
                     config.max_observation_age,
@@ -357,7 +357,7 @@ pub enum SessionOpenMode<'a> {
 impl PaidWorkSession {
     pub(crate) fn execution_target(&self) -> crate::execution::ExecutionTarget {
         crate::execution::ExecutionTarget {
-            network: self.args.config.chain.network,
+            network: self.args.config.network(),
             provider: self.args.provider,
         }
     }
@@ -471,12 +471,9 @@ impl PaidWorkSession {
         // Retained journals can already depend on a height a fast validator
         // has not reached. Establish that floor before a source is chosen;
         // recovery reads below it would only be refused by the same guard.
-        let setups = offer::RetainedSetups::discover(
-            &args.journal_root,
-            config.chain.network,
-            args.provider,
-        )
-        .await?;
+        let setups =
+            offer::RetainedSetups::discover(&args.journal_root, config.network(), args.provider)
+                .await?;
         let floor = setups.floor();
         let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
         let chain = WorkBlocks::new(remote.clone())
@@ -518,7 +515,7 @@ impl PaidWorkSession {
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,
-                    config.chain.network,
+                    config.network(),
                     signed.offer().proposal.bond_edge(),
                     Role::Client,
                     &Secp256k1Verifier::new(),
@@ -560,7 +557,7 @@ impl PaidWorkSession {
                 .await?;
         }
         owner
-            .claim(config.chain.network, args.provider.node, &payment_funding)
+            .claim(config.network(), args.provider.node, &payment_funding)
             .await?;
         let bundle = setup
             .state()
@@ -1431,7 +1428,7 @@ fn payment_terms(
         bond_edge: bundle.bond_edge(),
         bond_terms: bundle.bond_terms().clone(),
         private_policy_commitment: private_policy_commitment(
-            config.chain.network,
+            config.network(),
             &policy.policy_salt,
             &policy.channel_policy,
         ),

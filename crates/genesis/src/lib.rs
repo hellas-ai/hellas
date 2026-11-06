@@ -53,6 +53,47 @@ pub struct KnownNetwork {
     pub id: &'static str,
     /// The document itself.
     pub json: &'static str,
+    /// Independently authenticated finality trust for this immutable genesis.
+    pub trust_json: &'static str,
+    /// Genesis block payload for full-node execution.
+    pub genesis_payload_hex: &'static str,
+    /// Default transport routes. They convey no trust.
+    pub validators: &'static [&'static str],
+    /// Public faucet credentials, when this known chain has one.
+    pub faucet_json: Option<&'static str>,
+}
+
+/// Known chains in descending seniority. Only deployed chains are represented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Chain {
+    Devnet,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self::Devnet
+    }
+}
+
+impl Chain {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Devnet => "devnet",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(selector: &str) -> Option<Self> {
+        (selector == HELLAS_DEVNET_1_ID || selector == "devnet").then_some(Self::Devnet)
+    }
+
+    #[must_use]
+    pub fn network(self) -> &'static KnownNetwork {
+        match self {
+            Self::Devnet => &KNOWN_NETWORKS[0],
+        }
+    }
 }
 
 /// Every network this binary can join without being handed a file.
@@ -61,17 +102,24 @@ pub struct KnownNetwork {
 /// JSON around to talk to a network everyone already agrees on, and a
 /// document passed by path is a document that can be swapped.
 ///
-/// This is a *registry selected by name*, which is a different thing
-/// from the constant it replaced. That one presented itself as "the
-/// network", so editing one string silently re-domained every
-/// signature in the tree — a mistake this repository has already made
-/// once. Adding a network here adds an entry; it never moves an
-/// existing one. Nothing reads this list to decide what network it is
-/// on: a caller names one, or hands over a document.
+/// This registry supplies the default compiled Chain and explicit selection.
+/// Adding a chain adds an entry; it never edits an existing identity.
+/// Callers resolve one Chain or provide a custom profile.
 pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
     name: "devnet",
     id: HELLAS_DEVNET_1_ID,
     json: HELLAS_DEVNET_1_JSON,
+    trust_json: HELLAS_DEVNET_1_TRUST_JSON,
+    genesis_payload_hex: HELLAS_DEVNET_1_GENESIS_PAYLOAD,
+    validators: &[
+        "wss://devnet.hellas.ai/ws/validator-0",
+        "wss://devnet.hellas.ai/ws/validator-1",
+        "wss://devnet.hellas.ai/ws/validator-2",
+        "wss://devnet.hellas.ai/ws/validator-3",
+        "wss://devnet.hellas.ai/ws/validator-4",
+        "wss://devnet.hellas.ai/ws/validator-5",
+    ],
+    faucet_json: Some(HELLAS_DEVNET_1_FAUCET_JSON),
 }];
 
 /// Looks up a shipped network by its short name (`devnet`) or its full
@@ -219,3 +267,5 @@ mod tests;
 
 mod trust;
 pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
+mod profile;
+pub use profile::{ChainProfile, ChainProfileError, CustomChainFile};

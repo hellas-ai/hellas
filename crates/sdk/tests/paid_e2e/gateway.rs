@@ -13,7 +13,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             case.endpoint.close().await;
             let gateway = PaidGateway::open(
                 PaidGatewayOptions {
-                    providers: vec![case.options.clone()],
+                    config: case.options.config.clone(),
+                    providers: vec![gateway_provider(&case.options)],
                     max_pending_requests: 1,
                 },
                 NodeIdentity::from_secret_bytes(case.client_transport.to_bytes(), [0x21; 32])

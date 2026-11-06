@@ -1,7 +1,7 @@
 //! One software-passkey selection for the whole invocation.
 use anyhow::{Context as _, anyhow};
 use clap::Args;
-use hellas_chain::genesis::{FaucetAccount, HELLAS_DEVNET_1_FAUCET_JSON};
+use hellas_chain::genesis::{ChainProfile, FaucetAccount};
 use hellas_kernel::SoftPasskey;
 use std::path::PathBuf;
 
@@ -37,9 +37,10 @@ impl OwnerArgs {
     pub(crate) fn load_persistent(
         &self,
         identity: Option<&std::path::Path>,
+        chain: &ChainProfile,
     ) -> anyhow::Result<Option<SoftPasskey>> {
         if !self.is_faucet() {
-            return self.load();
+            return self.load(chain);
         }
         let root = Self::faucet_root(identity)?;
         hellas_private::create_dir_all_durable(&root)?;
@@ -64,7 +65,7 @@ impl OwnerArgs {
                 .is_none_or(|requested| requested == *index),
             "this provider already uses a different faucet account"
         );
-        let account = faucet_account(*index)?;
+        let account = faucet_account(chain, *index)?;
         eprintln!(
             "devnet faucet account {}: {}",
             account.index, account.address
@@ -72,12 +73,12 @@ impl OwnerArgs {
         Ok(Some(faucet_passkey(&account)?))
     }
 
-    pub(crate) fn load(&self) -> anyhow::Result<Option<SoftPasskey>> {
+    pub(crate) fn load(&self, chain: &ChainProfile) -> anyhow::Result<Option<SoftPasskey>> {
         let index = self
             .faucet_account
             .or_else(|| self.faucet.then(|| rand::random_range(0..100)));
         if let Some(index) = index {
-            let account = faucet_account(index)?;
+            let account = faucet_account(chain, index)?;
             let key = faucet_passkey(&account)?;
             eprintln!(
                 "devnet faucet account {}: {}",
@@ -93,8 +94,11 @@ impl OwnerArgs {
     }
 }
 
-fn faucet_account(index: u8) -> anyhow::Result<FaucetAccount> {
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON)?;
+fn faucet_account(chain: &ChainProfile, index: u8) -> anyhow::Result<FaucetAccount> {
+    let faucet_json = chain
+        .faucet_json()
+        .ok_or_else(|| anyhow!("selected chain has no faucet accounts"))?;
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(faucet_json)?;
     accounts
         .into_iter()
         .find(|account| account.index == index)
@@ -115,9 +119,11 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use hellas_chain::domain::SettlementKey;
+    use hellas_chain::genesis::Chain;
 
     #[test]
     fn every_selected_faucet_passkey_controls_its_genesis_allocation() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let genesis: hellas_chain::genesis::Genesis =
             serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
         for index in 0..100 {
@@ -125,7 +131,7 @@ mod tests {
                 faucet_account: Some(index),
                 ..Default::default()
             };
-            let key = options.load().unwrap().unwrap();
+            let key = options.load(&chain).unwrap().unwrap();
             let address = SettlementKey::from(key.party_key()).to_string();
             let allocation = genesis
                 .allocations
@@ -133,20 +139,21 @@ mod tests {
                 .find(|a| a.address == address)
                 .unwrap();
             assert_eq!(allocation.balance, 931_145);
-            assert_eq!(address, faucet_account(index).unwrap().address);
+            assert_eq!(address, faucet_account(&chain, index).unwrap().address);
         }
-        assert!(faucet_account(100).is_err());
+        assert!(faucet_account(&chain, 100).is_err());
     }
 
     #[test]
     fn a_selected_account_stays_with_its_identity() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let root = tempfile::tempdir().unwrap();
         let identity = root.path().join("identity");
         let load = |args: &[&str]| {
             crate::Cli::try_parse_from(args)
                 .unwrap()
                 .owner
-                .load_persistent(Some(&identity))
+                .load_persistent(Some(&identity), &chain)
         };
         let first = load(&["hellas", "serve", "--faucet-account", "7"])
             .unwrap()
@@ -158,13 +165,14 @@ mod tests {
 
     #[test]
     fn random_selection_is_funded_and_explicit_credentials_are_exclusive() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let options = OwnerArgs {
             faucet: true,
             ..Default::default()
         };
-        let key = options.load().unwrap().unwrap();
+        let key = options.load(&chain).unwrap().unwrap();
         let accounts: Vec<FaucetAccount> =
-            serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+            serde_json::from_str(chain.faucet_json().unwrap()).unwrap();
         assert!(
             accounts
                 .iter()

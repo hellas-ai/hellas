@@ -1,7 +1,7 @@
 //! Loopback read API over one full node and its atomic EdgeIndex publication.
 use crate::{
-    ChainIndexer, ConsensusInfo, FinalizedBlockQuery,
-    domain::{Digest, PublicKey},
+    ChainIndexer, FinalizedBlockQuery,
+    domain::Digest,
     proof_verify::{PROOF_SCHEMA_VERSION, ProofBundle, ProofQuery, ProofVerifier},
 };
 use axum::{
@@ -11,45 +11,20 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use commonware_codec::DecodeExt as _;
-use commonware_runtime::{Runner as _, Supervisor as _, tokio};
-use commonware_utils::ordered::Set;
-use hellas_genesis::{Genesis, HELLAS_DEVNET_1_JSON, TrustDocument};
+use commonware_runtime::{Runner as _, tokio};
+use hellas_genesis::ChainProfile;
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct OriginOptions {
-    pub rpc: Vec<String>,
+    pub profile: ChainProfile,
     pub peers: Vec<iroh::EndpointAddr>,
-    pub trust: TrustDocument,
-    /// Exact independently provisioned genesis JSON bytes; None uses the embedded devnet.
-    pub genesis_json: Option<Vec<u8>>,
     pub storage_dir: PathBuf,
     pub partition_prefix: String,
     pub listen: SocketAddr,
     pub archive_blocks: Option<std::num::NonZeroU64>,
-}
-
-pub(crate) fn genesis_leader(genesis: &Genesis) -> OriginResult<PublicKey> {
-    // Validators choose the first member of the canonical participant Set,
-    // independently of how the authenticated genesis JSON orders its entries.
-    let keys = genesis
-        .validators
-        .iter()
-        .map(|validator| {
-            Ok(PublicKey::decode(
-                hex::decode(&validator.public_key)?.as_slice(),
-            )?)
-        })
-        .collect::<OriginResult<Vec<_>>>()?;
-    let participants = Set::try_from(keys).map_err(|_| "duplicate genesis validators")?;
-    participants
-        .iter()
-        .next()
-        .cloned()
-        .ok_or_else(|| "empty genesis committee".into())
 }
 
 pub fn run(options: OriginOptions) -> OriginResult<()> {
@@ -57,43 +32,24 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         return Err("private indexer api must bind to loopback".into());
     }
     let genesis_json = options
-        .genesis_json
-        .unwrap_or_else(|| HELLAS_DEVNET_1_JSON.as_bytes().to_vec());
-    let genesis: Genesis = serde_json::from_slice(&genesis_json)?;
+        .profile
+        .genesis_json()
+        .ok_or("indexer requires full chain genesis")?
+        .as_bytes()
+        .to_vec();
+    let trust = options.profile.trust().clone();
     let runtime = tokio::Config::new()
         .with_storage_directory(&options.storage_dir)
         .with_tcp_nodelay(Some(true));
-    tokio::Runner::new(runtime).start(move |context| async move {
-        let info = ConsensusInfo {
-            network_id: genesis.network_id.clone(),
-            validators: genesis
-                .validators
-                .iter()
-                .map(|validator| validator.public_key.clone())
-                .collect(),
-            threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)?,
-        };
-        let leader = genesis_leader(&genesis)?;
-        let (root, target) = crate::execution::store::empty_state(
-            context.child("genesis"),
-            "indexer-genesis",
-            4096,
-            128,
-        )
-        .await;
-        let genesis_block =
-            crate::HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
+    tokio::Runner::new(runtime).start(move |_context| async move {
         let node = crate::node::FullNode::start_indexed(
-            crate::node::Config {
-                genesis: genesis.clone(),
-                threshold_identity: info.threshold_identity,
-                genesis_payload: commonware_cryptography::Digestible::digest(&genesis_block),
-                storage_dir: options.storage_dir.clone(),
-                validators: options.rpc,
-                peers: options.peers,
-                archive_blocks: options.archive_blocks,
-            },
-            options.trust,
+            crate::node::Config::for_indexed_profile(
+                options.profile,
+                options.storage_dir.clone(),
+                options.peers,
+                options.archive_blocks,
+            )?,
+            trust,
             genesis_json,
             options.partition_prefix,
         )
@@ -125,7 +81,7 @@ impl OriginState {
             edge_index: publication.index,
             indexer: publication.archive,
             verifier: publication.verifier,
-            network_id: node.config().genesis.network_id.clone(),
+            network_id: node.config().genesis().network_id.clone(),
             owner_proofs: node,
         })
     }
@@ -526,7 +482,7 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
 mod tests {
     use super::*;
     use commonware_cryptography::Digestible as _;
-    use hellas_genesis::HELLAS_DEVNET_1_ID;
+    use commonware_runtime::Supervisor as _;
     use tower::ServiceExt as _;
 
     async fn published_router(
@@ -891,7 +847,7 @@ mod tests {
                         .unwrap()
                     };
                     assert_eq!(error["schema_version"], PROOF_SCHEMA_VERSION);
-                    assert_eq!(error["network_id"], HELLAS_DEVNET_1_ID);
+                    assert_eq!(error["network_id"], h.network.as_str());
                     assert_eq!(
                         error["message"],
                         "The requested verified owner snapshot is unavailable. Request latest holdings explicitly."

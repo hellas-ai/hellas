@@ -196,6 +196,8 @@ rec {
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
     "--paid-work-config"
+    "--chain"
+    "--chain-config"
     "--grant-config"
     "--await-owner"
     "--passkey"
@@ -211,6 +213,8 @@ rec {
     "--metrics-port"
     "--metrics-addr"
     "--paid-work-config"
+    "--chain"
+    "--chain-config"
     "--grant-pool-config"
     "--local-grant"
     "--gateway-profile"
@@ -454,6 +458,16 @@ rec {
           work is sold only with this file. Keep it outside the Nix store.
         '';
       };
+      chain = mkOption {
+        type = types.nullOr (types.enum [ "devnet" ]);
+        default = null;
+        description = "Compiled chain selection; null uses the binary default.";
+      };
+      chainConfig = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Authenticated custom chain profile passed as --chain-config.";
+      };
       grantConfigFile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -545,6 +559,16 @@ rec {
         type = types.nullOr runtimePath;
         default = null;
         description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement.";
+      };
+      chain = mkOption {
+        type = types.nullOr (types.enum [ "devnet" ]);
+        default = null;
+        description = "Compiled chain selection; null uses the binary default.";
+      };
+      chainConfig = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Authenticated custom chain profile passed as --chain-config.";
       };
       grantPoolConfig = mkOption {
         type = types.nullOr runtimePath;
@@ -758,6 +782,8 @@ rec {
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--paid-work-config" serve.workConfigFile
+    ++ optArg "--chain" serve.chain
+    ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--grant-config" serve.grantConfigFile
     ++ optArg "--await-owner" serve.awaitOwner
     ++ optArg "--passkey" serve.passkey
@@ -808,6 +834,8 @@ rec {
     ++ optArg "--grant-policy" gateway.grantPolicy
     ++ optArg "--text-model" gateway.textModel
     ++ optArg "--paid-work-config" gateway.paidWorkConfig
+    ++ optArg "--chain" gateway.chain
+    ++ optArg "--chain-config" gateway.chainConfig
     ++ lib.optional gateway.allowRemote "--allow-remote"
     ++ optArg "--gateway-profile" gateway.gatewayProfile
     ++ [

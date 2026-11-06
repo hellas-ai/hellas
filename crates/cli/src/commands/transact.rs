@@ -112,15 +112,9 @@ pub struct ClientArgs {
     /// Deliberately purchase again after a paid result was lost.
     #[arg(long)]
     buy_again: bool,
-    /// Validator WebSocket URL; repeat exactly six times to override the devnet.
+    /// Validator WebSocket URL; repeat to override the selected chain defaults.
     #[arg(long = "validator")]
     validators: Vec<String>,
-    /// Independently authenticated chain trust document.
-    #[arg(long)]
-    trust: Option<PathBuf>,
-    /// Genesis document for a custom chain; requires --trust.
-    #[arg(long, requires = "trust")]
-    genesis: Option<PathBuf>,
     /// Independent Apple App Attest approval directory and policy.
     #[arg(long, requires = "trust_policy")]
     trust_store: Option<PathBuf>,
@@ -185,6 +179,7 @@ pub struct Context {
     pub producer: ProducerSigningKey,
     pub owner: hellas_kernel::SoftPasskey,
     pub root: PathBuf,
+    pub chain: hellas_chain::genesis::ChainProfile,
 }
 
 impl Context {
@@ -192,6 +187,7 @@ impl Context {
         identity: &crate::identity::LocalIdentity,
         owner: Option<&hellas_kernel::SoftPasskey>,
         path: Option<&Path>,
+        chain: &hellas_chain::genesis::ChainProfile,
     ) -> super::CliResult<Self> {
         Ok(Self {
             transport: identity.transport_key.clone(),
@@ -201,6 +197,7 @@ impl Context {
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
             root: crate::identity::funding_root(path)?,
+            chain: chain.clone(),
         })
     }
 }
@@ -241,8 +238,8 @@ impl ClientArgs {
                 hellas_auth::hash_tuple(
                     "hellas.job.chain.v1",
                     &[
-                        options.config.chain.network.as_str().as_bytes(),
-                        options.config.chain.genesis_payload_digest.as_bytes(),
+                        options.config.network().as_str().as_bytes(),
+                        options.config.chain.consensus_digest().as_slice(),
                     ],
                 )
                 .to_string(),
@@ -273,7 +270,7 @@ impl ClientArgs {
     ) -> super::CliResult<PaidWorkOptions> {
         self.paid_provider()?;
         let root = self.root(context);
-        let config = client::config(self, &root).await?;
+        let config = client::config(self, context, &root).await?;
         self.options_with_config(context, price, assurance, config)
     }
 
@@ -413,7 +410,7 @@ async fn execute(
 ) -> super::CliResult<PaidCompletion> {
     if let Some(result) = purchase.retained_paid_result()? {
         purchase.bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
+            network: options.config.network(),
             provider: options.provider,
         })?;
         return Ok(result);

@@ -660,6 +660,14 @@ let
 in
 {
   provider-content-index-eval =
+    assert lib.hasInfix "--chain devnet" (evalProvider { chain = "devnet"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalProvider { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/chain.json" (evalProvider { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--chain devnet" (evalGateway { chain = "devnet"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalGateway { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert lib.any (item: !item.assertion && lib.hasInfix "chain and chainConfig are mutually exclusive" item.message) (evalProvider { chain = "devnet"; chainConfig = "/run/hellas/chain.json"; }).config.assertions;
+    assert lib.hasInfix "--chain-config /run/hellas/chain.json" (evalValidators { chainConfig = "/run/hellas/chain.json"; networkId = "hellas-custom-1"; }).config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/chain.json" (evalValidators { chainConfig = "/run/hellas/chain.json"; }).config.systemd.services.hellas-validator-devnet-node0.unitConfig.RequiresMountsFor;
     assert service.environment ? ROCM_PATH;
     assert service.environment ? HIP_PATH;
     assert service.environment.TMPDIR == "/run/hellas";

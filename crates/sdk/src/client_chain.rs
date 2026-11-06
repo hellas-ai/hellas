@@ -1,78 +1,39 @@
-//! Verified remote chain access shared by requester commands and gateways.
-use crate::work_config::{ChainCrossCheck, WorkConfig};
+use crate::work_config::WorkConfig;
 use futures::StreamExt as _;
-use hellas_chain::genesis::{Genesis, TrustDocument};
+use hellas_chain::genesis::ChainProfile;
 use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, LightClient as _, QueryError, client::RemoteLightClient,
 };
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 fn invalid(error: impl std::fmt::Display) -> QueryError {
     QueryError::Remote(error.to_string())
 }
 
 pub fn pinned_consensus_verifier(
-    trust: &TrustDocument,
-    genesis_json: &[u8],
+    profile: &ChainProfile,
     reported: &ConsensusInfo,
 ) -> Result<ConsensusVerifier, QueryError> {
-    hellas_chain::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)
-        .map_err(invalid)?;
-    let [epoch] = trust.epochs.as_slice() else {
-        return Err(invalid("one initial trusted epoch is required"));
-    };
-    if epoch.epoch != 0 || epoch.start_height != 0 || epoch.end_height.is_some() {
-        return Err(invalid(
-            "one open trusted epoch starting at zero is required",
-        ));
-    }
-    let genesis: Genesis = serde_json::from_slice(genesis_json).map_err(invalid)?;
     let pinned = ConsensusInfo {
-        network_id: trust.network_id.clone(),
-        threshold_identity: hex::decode(&epoch.threshold_identity).map_err(invalid)?,
-        validators: genesis
-            .validators
-            .iter()
-            .map(|validator| validator.public_key.clone())
-            .collect(),
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().map_err(invalid)?,
+        validators: profile.validators().to_vec(),
     };
     if reported.network_id != pinned.network_id
         || reported.threshold_identity != pinned.threshold_identity
     {
-        return Err(invalid(
-            "endpoint consensus identity differs from the authenticated trust document",
-        ));
-    }
-    ConsensusVerifier::new(&pinned, hellas_chain::genesis_digest(&genesis)).map_err(invalid)
-}
-
-pub fn devnet(root: &Path) -> Result<WorkConfig, crate::work_config::WorkConfigError> {
-    use hellas_chain::genesis::*;
-    let trust: TrustDocument =
-        serde_json::from_str(HELLAS_DEVNET_1_TRUST_JSON).expect("embedded devnet trust is tested");
-    let epoch = &trust.epochs[0];
-    WorkConfig {
-        chain: ChainCrossCheck {
-            network: hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID)
-                .expect("embedded devnet network"),
-            genesis_payload_digest: hellas_auth::Digest::from_bytes(
-                hex::decode(HELLAS_DEVNET_1_GENESIS_PAYLOAD.trim())
-                    .expect("embedded genesis payload is hexadecimal")
-                    .try_into()
-                    .expect("embedded genesis payload has 32 bytes"),
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
             ),
-            threshold_identity: hex::decode(&epoch.threshold_identity)
-                .expect("embedded threshold is hexadecimal"),
-            genesis: None,
-        },
-        validators: (0..6)
-            .map(|index| format!("wss://devnet.hellas.ai/ws/validator-{index}"))
-            .collect(),
-        journal_root: root.join("channels"),
-        poll: Duration::from_millis(500),
-        max_observation_age: hellas_chain::node::RECOVERY_TIMEOUT,
+            None => {
+                "endpoint consensus identity differs from the authenticated trust document".into()
+            }
+        };
+        return Err(invalid(reason));
     }
-    .validate()
+    ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).map_err(invalid)
 }
 
 pub async fn connect(
@@ -95,22 +56,20 @@ pub async fn connect_at(
     timeout: Duration,
     min_height: u64,
 ) -> Result<RemoteLightClient, QueryError> {
-    let genesis = crate::work_config::chain_genesis(config.chain.network, &config.chain.genesis)
-        .map_err(invalid)?;
     let pinned = ConsensusInfo {
-        network_id: config.chain.network.as_str().into(),
-        threshold_identity: config.chain.threshold_identity.clone(),
-        validators: config.validators.clone(),
+        network_id: config.chain.network_id().to_owned(),
+        threshold_identity: config.threshold_identity().map_err(invalid)?,
+        validators: config.chain.validators().to_vec(),
     };
     let verifier =
-        ConsensusVerifier::new(&pinned, hellas_chain::genesis_digest(&genesis)).map_err(invalid)?;
+        ConsensusVerifier::new(&pinned, config.chain.consensus_digest().into()).map_err(invalid)?;
     let mut reason = "no finalized remote snapshot is available".to_owned();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(QueryError::ReadUnavailableTimeout { timeout, reason });
         }
-        let attempts = futures::stream::iter(config.validators.iter().cloned())
+        let attempts = futures::stream::iter(config.chain.validators().iter().cloned())
             .map(|url| {
                 let pinned = pinned.clone();
                 let verifier = verifier.clone();
@@ -121,9 +80,16 @@ pub async fn connect_at(
                         if reported.network_id != pinned.network_id
                             || reported.threshold_identity != pinned.threshold_identity
                         {
-                            return Err(invalid(
-                                "endpoint consensus identity differs from the configured chain",
-                            ));
+                            return Err(invalid(match config.chain.known_chain() {
+                                Some(chain) => format!(
+                                    "this binary is out of date for {}; please update",
+                                    chain.name()
+                                ),
+                                None => {
+                                    "endpoint consensus identity differs from the configured chain"
+                                        .into()
+                                }
+                            }));
                         }
                         let client = client.with_consensus_verifier(verifier);
                         let latest = client.get_latest_block().await?.ok_or_else(|| {

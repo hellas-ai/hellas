@@ -258,7 +258,7 @@ pub(super) async fn stale_source_selection(runtime: commonware_runtime::tokio::C
     devnet.seal().await;
     let mut relays = Relays::start(&devnet).await;
     let mut config = work_config(&devnet, root.path().join("journal"));
-    config.validators = relays.urls.clone();
+    config.chain = config.chain.with_validators(relays.urls.clone()).unwrap();
     let tip = devnet.height();
     assert!(tip > 1, "the fixture finalizes more than one block");
     let behind = tip - 1;
@@ -356,13 +356,19 @@ pub(super) async fn paid_startup_uses_the_retained_floor(
     let mut options = case.options.clone();
     // The configured committee is six validators: three fast stale ones
     // beside three slower current ones.
-    options.config.validators = stale
-        .urls
-        .iter()
-        .take(3)
-        .chain(current.urls.iter().take(3))
-        .cloned()
-        .collect();
+    options.config.chain = options
+        .config
+        .chain
+        .with_validators(
+            stale
+                .urls
+                .iter()
+                .take(3)
+                .chain(current.urls.iter().take(3))
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
     options.timeout = Some(Duration::from_secs(30));
     let mut session = sealing_while(
         &mut case.devnet,
@@ -406,7 +412,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     devnet.seal().await;
     let mut relays = Relays::start(&devnet).await;
     let mut config = work_config(&devnet, root.path().join("journal"));
-    config.validators = relays.urls.clone();
+    config.chain = config.chain.with_validators(relays.urls.clone()).unwrap();
     let client = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
         .await
         .unwrap();
@@ -611,7 +617,9 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     // One hanging relay must not discard an already verified healthy answer.
     let hanging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    config.validators[0] = format!("ws://{}", hanging.local_addr().unwrap());
+    let mut routes = config.chain.validators().to_vec();
+    routes[0] = format!("ws://{}", hanging.local_addr().unwrap());
+    config.chain = config.chain.with_validators(routes).unwrap();
     assert!(
         hellas_sdk::client_chain::connect(&config, Duration::from_millis(500))
             .await
@@ -620,7 +628,10 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     drop(hanging);
     // One source makes two refusals evidence of a retry, rather than two
     // concurrent source-selection requests. Observe requests, not elapsed time.
-    config.validators = vec![relays.urls[0].clone()];
+    config.chain = config
+        .chain
+        .with_validators(vec![relays.urls[0].clone()])
+        .unwrap();
     relays.source.tips_unavailable.store(true, Ordering::SeqCst);
     let connecting = hellas_sdk::client_chain::connect(&config, Duration::from_secs(2));
     tokio::pin!(connecting);

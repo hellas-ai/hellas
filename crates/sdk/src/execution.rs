@@ -344,7 +344,7 @@ impl ExecutionAttempt {
         self.matches(input, terms)?;
         let job = Job::from_input(options.expected_price, input.clone())?;
         let target = PurchaseTarget {
-            network: options.config.chain.network.as_str().into(),
+            network: options.config.network().as_str().into(),
             provider: options.provider,
         };
         let AttemptRecord::Paid(purchase) = &mut self.record else {

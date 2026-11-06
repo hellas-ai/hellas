@@ -417,7 +417,7 @@ impl Provider {
         let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                network: config.chain.network,
+                network: config.network(),
                 journal_root: config.journal_root,
                 poll: config.poll,
                 max_observation_age: config.max_observation_age,
@@ -864,7 +864,7 @@ async fn compute_and_settle_inner(
     .unwrap();
     attempt
         .bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
+            network: options.config.network(),
             provider: options.provider,
         })
         .unwrap();
@@ -1118,7 +1118,7 @@ async fn compute_and_settle_inner(
     .unwrap();
     second
         .bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
+            network: options.config.network(),
             provider: options.provider,
         })
         .unwrap();

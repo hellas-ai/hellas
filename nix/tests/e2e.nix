@@ -51,9 +51,11 @@ let
       import shlex
       import time
       import tomllib
+      import hashlib
+      import json
 
       cli = "${validatorPackage}/bin/hellas"
-      trust_args = "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json"
+      trust_args = "--chain-config ${homePrefix}/chain.json"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
       follower_api = "http://127.0.0.1:31247/api/v1/blocks"
       home = "HOME=${homePrefix}/client-home OTEL_SERVICE_NAME=hellas-test-client"
@@ -101,12 +103,10 @@ let
           "printf 'chain_sync_bind = \"127.0.0.1:31248\"\\n' > ${homePrefix}/validator.toml; "
           f"HOME=${homePrefix}/validator-home {cli} chain validator config "
           "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
+          "--network-id hellas-e2e-1 "
           "--light-client-bind 127.0.0.1:${toString chainRpcPort} "
           "--metrics-port ${toString metricsPort} ${allocationArgs} "
           ">> ${homePrefix}/validator.toml"
-      )
-      machine.succeed(
-          f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
       )
       config = tomllib.loads(machine.succeed("cat ${homePrefix}/validator.toml"))
       peer_id = config["genesis"]["validators"][0]["public_key"]
@@ -116,8 +116,22 @@ let
           f"{cli} chain validator export-trust --config ${homePrefix}/validator.toml "
           "--genesis ${homePrefix}/genesis.json > ${homePrefix}/trust.json"
       )
+      canonical = {key: config["genesis"][key] for key in (
+          "schema_version", "network_id", "validators", "allocations"
+      )}
+      digest = hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
+      profile = {
+          "consensus_digest": digest,
+          "trust": json.loads(machine.succeed("cat ${homePrefix}/trust.json")),
+          "validators": [rpc],
+          "genesis_json": machine.succeed("cat ${homePrefix}/genesis.json"),
+      }
+      machine.succeed(f"printf %s {shlex.quote(json.dumps(profile))} > ${homePrefix}/chain.json")
       machine.succeed(
-          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} chain validator run "
+          f"{cli} {trust_args} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
+      )
+      machine.succeed(
+          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} {trust_args} chain validator run "
           f"--config ${homePrefix}/validator.toml "
           f"> {validator_log} 2>&1 & echo $! > ${homePrefix}/validator.pid"
       )
@@ -127,11 +141,10 @@ let
           print(machine.succeed(f"cat {validator_log} || true"))
           raise
       machine.succeed(
-          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer serve "
+          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} {trust_args} chain indexer serve "
           f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
           f"--peer {peer_id}@127.0.0.1:31248 "
           "--partition-prefix ${followerPartitionPrefix} "
-          "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json "
           "--listen 127.0.0.1:31247 "
           f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
       )

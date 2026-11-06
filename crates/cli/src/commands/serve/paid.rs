@@ -27,8 +27,6 @@ use {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PaidWorkFile {
-    /// JSON chain configuration for a custom network; omit for the shipped devnet.
-    chain_config: Option<PathBuf>,
     jobs_per_channel: u64,
     min_omit_response_blocks: u64,
     payment: JobPaymentPolicyV2,
@@ -159,12 +157,10 @@ impl PaidWork {
         root: PathBuf,
         owner: Option<SoftPasskey>,
         fetch_config: Option<&Path>,
+        profile: hellas_chain::genesis::ChainProfile,
     ) -> CliResult<Self> {
         let file = PaidWorkFile::read(path)?;
-        let chain = match &file.chain_config {
-            Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
-            None => hellas_sdk::client_chain::devnet(&root)?,
-        };
+        let chain = WorkConfig::for_chain(profile, &root)?;
         let policy = file.checked_policy(path, fetch_config)?;
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
@@ -592,9 +588,15 @@ impl PaidWork {
             .context("stake delegation requires an owner passkey")?;
         let owner = signer.party_key();
         let path = self.root.join("delegation.json");
-        let mut pins = Vec::from(hellas_chain::genesis_digest(&chain.config().genesis).as_ref());
-        pins.extend_from_slice(chain.config().genesis_payload.as_ref());
-        pins.extend_from_slice(&chain.config().threshold_identity);
+        let mut pins = Vec::from(hellas_chain::genesis_digest(chain.config().genesis()).as_ref());
+        pins.extend_from_slice(
+            chain
+                .config()
+                .genesis_payload()
+                .expect("started node has H0")
+                .as_ref(),
+        );
+        pins.extend_from_slice(chain.config().threshold_identity());
         let genesis = hex::encode(Digest::hash(&pins).as_bytes());
         let mut receipt: Delegation = if path.try_exists()? {
             serde_json::from_slice(&hellas_private::read_bounded_regular_file(
@@ -627,7 +629,7 @@ impl PaidWork {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
             let input = CoinId::from_bytes(input.0);
-            let network = hellas_kernel::NetworkId::new(&chain.config().genesis.network_id)
+            let network = hellas_kernel::NetworkId::new(&chain.config().genesis().network_id)
                 .context("invalid chain network")?;
             let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
                 &client,

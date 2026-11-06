@@ -75,15 +75,25 @@ impl Fixture {
             target,
             crate::genesis_digest(&genesis),
         );
-        let config = Config {
-            genesis,
-            threshold_identity: committee.assembler.identity().encode().to_vec(),
-            genesis_payload: head.digest(),
-            storage_dir: directory.to_path_buf(),
-            validators: vec![],
-            peers: vec![],
-            archive_blocks: None,
-        };
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
+        let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+            .trust()
+            .clone();
+        trust.network_id = genesis.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+            consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
+            trust,
+            validators: vec!["ws://unused.invalid".into()],
+            genesis_json: Some(genesis_json),
+            genesis_payload: Some(hex::encode(head.digest().0)),
+        })
+        .unwrap();
+        let mut config =
+            Config::for_profile(profile, directory.to_path_buf(), vec![], None).unwrap();
+        config.validators.clear();
         let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(
             runtime.child("producer"),
             utxo_db_config(&runtime, "producer", 4096, 128),
@@ -471,7 +481,7 @@ fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;
         let mut wrong_genesis = fixture.config.clone();
-        wrong_genesis.genesis_payload = [0xff; 32].into();
+        wrong_genesis.genesis_payload = Some([0xff; 32].into());
         assert!(matches!(
             FullNode::start(wrong_genesis).await,
             Err(Error::Config(_))
@@ -933,7 +943,7 @@ fn provisioned_anchor_and_directory_identity_cannot_be_replaced_by_a_peer() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(runtime, directory.path()).await;
         let mut wrong = fixture.config.clone();
-        wrong.genesis_payload = Digest::from([99; 32]);
+        wrong.genesis_payload = Some(Digest::from([99; 32]));
         assert!(matches!(
             FullNode::start(wrong).await,
             Err(Error::Config(_))
@@ -1321,4 +1331,49 @@ fn genesis_payload_pin_distinguishes_allocations_and_networks() {
             assert_ne!(source.config.genesis_payload, target.config.genesis_payload);
         }
     });
+}
+
+#[test]
+fn full_node_derives_h0_when_custom_genesis_has_no_payload_pin() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let expected = fixture.config.genesis_payload;
+        let mut unpinned = fixture.config;
+        unpinned.genesis_payload = None;
+        let node = FullNode::start(unpinned).await.unwrap();
+        assert_eq!(node.config().genesis_payload, expected);
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let mut genesis: hellas_genesis::Genesis =
+        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_1_JSON).unwrap();
+    genesis.network_id = "custom-node-rotating-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+        .trust()
+        .clone();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    trust.epochs[0].end_height = Some(2);
+    let mut next = trust.epochs[0].clone();
+    next.epoch = 1;
+    next.start_height = 2;
+    next.end_height = None;
+    trust.epochs.push(next);
+    let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+        consensus_digest: hex::encode(crate::genesis_digest(&genesis).0),
+        trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json: Some(genesis_json),
+        genesis_payload: None,
+    })
+    .unwrap();
+    let error =
+        Config::for_profile(profile, std::path::PathBuf::from("unused"), vec![], None).unwrap_err();
+    assert!(error.to_string().contains("one open trusted epoch"));
 }

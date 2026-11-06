@@ -135,6 +135,7 @@ pub enum Command {
         output_dir: PathBuf,
     },
     Config {
+        network_id: Option<String>,
         validators: u32,
         validator: u32,
         start_port: u16,
@@ -151,6 +152,7 @@ pub enum Command {
     },
     Run {
         config: PathBuf,
+        profile: hellas_genesis::ChainProfile,
     },
     CheckConfig {
         config: PathBuf,
@@ -189,6 +191,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             output_dir,
         }),
         Command::Config {
+            network_id,
             validators,
             validator,
             start_port,
@@ -203,6 +206,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             genesis,
             genesis_allocations,
         } => setup(SetupArgs {
+            network_id,
             validators,
             validator,
             start_port,
@@ -217,12 +221,13 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             genesis,
             genesis_allocations,
         }),
-        Command::Run { config } => run(config),
+        Command::Run { config, profile } => run(config, profile),
         Command::CheckConfig { config } => check_config(config),
     }
 }
 
 struct SetupArgs {
+    network_id: Option<String>,
     validators: u32,
     validator: u32,
     start_port: u16,
@@ -394,6 +399,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
 
 fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
     let SetupArgs {
+        network_id,
         validators,
         validator,
         start_port,
@@ -498,7 +504,8 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         }
         None => Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
+            network_id: network_id
+                .unwrap_or_else(|| crate::genesis::Chain::default().network().id.to_string()),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()
@@ -770,9 +777,9 @@ pub fn export_trust(
     use commonware_cryptography::{Hasher as _, Sha256};
     let genesis: Genesis = serde_json::from_slice(genesis_json)?;
     config.validate_genesis()?;
-    if genesis != config.genesis || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID {
+    if genesis != config.genesis {
         return Err(ValidatorError::InvalidSetup(
-            "genesis file must match the validator's devnet genesis".into(),
+            "genesis file must match the validator's configured genesis".into(),
         ));
     }
     let scheme = Scheme::signer(
@@ -813,7 +820,7 @@ fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
     Ok(())
 }
 
-fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
+fn run(config_path: PathBuf, profile: hellas_genesis::ChainProfile) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
 
@@ -830,6 +837,23 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             config_path.display(),
         );
     }
+
+    let selected_genesis = profile.genesis().ok_or_else(|| {
+        ValidatorError::InvalidSetup("validator requires full chain genesis".into())
+    })?;
+    if &validator_config.genesis != selected_genesis {
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
+            ),
+            None => "validator genesis differs from the selected chain".into(),
+        };
+        return Err(ValidatorError::InvalidSetup(reason));
+    }
+    let expected_threshold_identity = profile
+        .static_threshold_identity()
+        .map_err(|error| ValidatorError::InvalidSetup(error.to_string()))?;
 
     let network_id = validator_config.network_id()?;
     let private_key = validator_config.decode_private_key()?;
@@ -864,6 +888,16 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ));
         }
     };
+    if scheme.identity().encode().as_ref() != expected_threshold_identity.as_slice() {
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
+            ),
+            None => "threshold identity differs from selected chain".into(),
+        };
+        return Err(ValidatorError::Scheme(reason));
+    }
     let consensus_info = ConsensusInfo {
         validators: scheme
             .participants()

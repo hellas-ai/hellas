@@ -16,12 +16,13 @@ impl ChainNodeArgs {
         &self,
         config: &hellas_sdk::work_config::WorkConfig,
     ) -> anyhow::Result<hellas_sdk::FullNode> {
-        let directory = self.chain_store_dir.clone().map(Ok).unwrap_or_else(|| {
-            crate::identity::default_chain_path(config.chain.network.as_str())
-        })?;
+        let directory =
+            self.chain_store_dir.clone().map(Ok).unwrap_or_else(|| {
+                crate::identity::default_chain_path(config.network().as_str())
+            })?;
         eprintln!(
             "Synchronizing {} chain state in {}",
-            config.chain.network,
+            config.network(),
             directory.display()
         );
         let started = std::time::Instant::now();

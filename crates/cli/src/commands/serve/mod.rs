@@ -17,9 +17,7 @@ pub mod bootstrap;
 mod codex_provider;
 mod configuration;
 pub mod paid;
-pub mod work_config;
-
-pub use work_config::{WorkConfig, load_work_config};
+pub use hellas_sdk::work_config::WorkConfig;
 
 pub struct ServeOptions {
     pub transport: Option<iroh::Endpoint>,
@@ -112,8 +110,8 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let mut work_runner = None;
     if let Some(work) = options.paid.as_ref().map(|paid| &paid.chain) {
         info!(
-            network = %work.chain.network,
-            validators = work.validators.len(),
+            network = %work.network(),
+            validators = work.chain.validators().len(),
             journal_root = %work.journal_root.display(),
             poll_ms = work.poll.as_millis(),
             // Said back because it is the party the chain will see: an
@@ -125,7 +123,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         let chain = options.chain_node.start(work).await?;
         work_runner = Some((
             hellas_sdk::paid_provider::WorkRunnerConfig {
-                network: work.chain.network,
+                network: work.network(),
                 journal_root: work.journal_root.clone(),
                 poll: work.poll,
                 max_observation_age: work.max_observation_age,

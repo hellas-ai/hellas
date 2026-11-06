@@ -50,31 +50,37 @@ only after deterministic replay matches the certified state and owner roots.
 
 ## Run the native origin
 
-For a disposable devnet, export the public epoch-zero trust from the generated
-validator configuration:
+For a disposable custom network, give generated genesis a fresh `--network-id`
+and export the public epoch-zero trust from the validator configuration. A
+registered network ID must keep its shipped genesis:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
-hellas chain indexer serve --rpc ws://127.0.0.1:8789 --genesis network/genesis.json --trust network/trust.json --storage-dir network/indexer
+hellas --chain-config network/chain.json chain indexer serve --rpc ws://127.0.0.1:8789 --storage-dir network/indexer
 ```
 
 The exporter checks the genesis against the validator configuration and emits
 public trust data. Authenticate `network/trust.json` and the exact genesis file
-separately from the RPC peer. Do not parse, reserialize, trim, or otherwise
-change the provisioned genesis bytes.
+separately from the RPC peer. Put the authenticated canonical consensus digest,
+trust document, validator URLs, and exact genesis JSON in `network/chain.json`
+before starting the indexer. Full Genesis is needed for execution; an optional
+genesis block payload checks the locally derived H0 against an additional pin.
+Do not parse, reserialize, trim, or otherwise change the
+provisioned genesis bytes when calculating its exact-file SHA-256.
 
-CLI chain queries and signing commands also require `--trust network/trust.json`.
-Pass `--genesis network/genesis.json` for a separately provisioned genesis. The
-RPC client authenticates snapshot height and roots by fetching the canonical
+CLI chain queries and signing commands for this custom network also require
+`--chain-config network/chain.json`. The RPC client authenticates snapshot
+height and roots by fetching the canonical
 block committed by its certificate. Coin and edge records remain unverified;
 the CLI labels them accordingly. RPC snapshot verification currently accepts
 one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
 
-`ProofVerifier::with_genesis(trust, genesis_bytes)` pins both inputs.
-`ProofVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
-the embedded devnet genesis.
+`ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
+`ProofVerifier::with_digest(trust, canonical_digest)` accepts authenticated
+light-client pins without allocations. Without `--chain-config`, CLI commands
+select the compiled Devnet profile.
 
-`hellas chain indexer serve --rpc wss://relay.example/ws --trust trust.json
+`hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
 --storage-dir /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
 origin over a full executing chain node. Repeat `--rpc` for multiple validator
 or relay seeds; the node also discovers iroh ChainSync peers from its provisioned

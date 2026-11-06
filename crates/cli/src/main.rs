@@ -113,6 +113,13 @@ impl RemoteTrustArgs {
 #[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
+    /// Select a compiled chain (default: the most senior compiled chain).
+    #[arg(long, global = true, conflicts_with = "chain_config")]
+    chain: Option<String>,
+
+    /// Complete independently authenticated custom chain profile.
+    #[arg(long, global = true, value_name = "FILE", conflicts_with = "chain")]
+    chain_config: Option<PathBuf>,
     /// Path to the versioned local identity for commands that use one
     /// (default: $HOME/.hellas/identity).
     #[arg(long = "identity", global = true)]
@@ -539,6 +546,31 @@ async fn async_main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
+    let selected_chain = match (&cli.chain, &cli.chain_config) {
+        (Some(name), None) => hellas_chain::genesis::Chain::parse(name)
+            .map(hellas_chain::genesis::ChainProfile::known)
+            .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}")),
+        (None, Some(path)) => {
+            hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
+        }
+        (None, None) => Ok(hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::default(),
+        )),
+        (Some(_), Some(_)) => unreachable!("clap rejects both chain selectors"),
+    };
+    let selected_chain = match selected_chain {
+        Ok(chain) => chain,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(2);
+        }
+    };
+    if cli.owner.is_faucet()
+        && selected_chain.known_chain() != Some(hellas_chain::genesis::Chain::Devnet)
+    {
+        eprintln!("error: --faucet and --faucet-account require the compiled devnet chain");
+        std::process::exit(2);
+    }
     if let Err(error) =
         validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root)
     {
@@ -634,9 +666,10 @@ async fn async_main() {
             }
     );
     let owner = match if persistent_owner {
-        cli.owner.load_persistent(cli.identity.as_deref())
+        cli.owner
+            .load_persistent(cli.identity.as_deref(), &selected_chain)
     } else {
-        cli.owner.load()
+        cli.owner.load(&selected_chain)
     } {
         Ok(owner) => owner,
         Err(error) => {
@@ -778,7 +811,7 @@ async fn async_main() {
 
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command, owner.as_ref()).await;
+            let result = commands::chain::run(command, owner.as_ref(), &selected_chain).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -851,6 +884,7 @@ async fn async_main() {
                         identity::provider_root(cli.identity.as_deref())?,
                         owner.clone(),
                         fetch_config_file.as_deref(),
+                        selected_chain.clone(),
                     )
                 })
                 .transpose()
@@ -1174,7 +1208,10 @@ async fn async_main() {
                     serve.http.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                     "token-native paid work uses producer-signed assurance"
                 );
-                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                let root = identity::funding_root(cli.identity.as_deref())?;
+                let config =
+                    hellas_sdk::work_config::WorkConfig::for_chain(selected_chain.clone(), &root)?;
+                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance, config)?;
                 let passkey = owner.clone().ok_or_else(|| {
                     anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
                 })?;
@@ -1219,6 +1256,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1233,6 +1271,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1247,6 +1286,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1261,6 +1301,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1275,6 +1316,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         cli.identity.as_deref(),
+                        &selected_chain,
                     )?,
                 )
                 .await

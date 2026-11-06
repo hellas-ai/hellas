@@ -50,6 +50,9 @@ are public development keys; the selected account is retained beside the
 identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
 work is sold only with `--paid-work-config FILE`: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
+The default chain is the compiled Devnet profile. `--chain devnet` selects it
+explicitly; `--chain-config FILE` selects an independently authenticated custom
+chain for the whole process. Each gateway pool also uses one selected chain.
 The example charges 20 per job, ten jobs per channel, and stops execution after
 90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
 content ID of A's enrollment and the node it binds. B learns it from A out of

@@ -189,11 +189,10 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
     let (mut policy, _, _) = fetch_request(Assurance::ProducerSigned);
     policy.expected_payment_values =
         hellas_kernel::EdgeValues::new(1000, 0, hellas_kernel::Fees::ZERO);
-    let fixture = crate::test_support::PaidFixture::new();
+    let fixture = crate::test_support::PaidFixture::on_network(policy.network);
     let root = tempfile::tempdir().unwrap();
     let journal_root = root.path().join("journal");
-    let mut config = fixture.config.clone();
-    config.chain.network = policy.network;
+    let config = fixture.config.clone();
     let args = PaidWorkOptions {
         config,
         journal_root: journal_root.clone(),
@@ -551,12 +550,12 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
         );
         let funding = fixture.proposal.bond_funding().clone();
         let hash = Tx::open_hash(
-            fixture.config.chain.network,
+            fixture.config.network(),
             &funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
         let proposal = WorkChannelSetupBundleV2::propose_bond(
-            fixture.config.chain.network,
+            fixture.config.network(),
             funding.clone(),
             bond_terms,
             PartyAuth::owner(Auth::native(provider.sign(hash))),
@@ -564,7 +563,7 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
         .unwrap();
         let store = SetupStore::open(
             &root.path().join(name),
-            fixture.config.chain.network,
+            fixture.config.network(),
             proposal.bond_edge(),
             Role::Client,
             &Secp256k1Verifier::new(),

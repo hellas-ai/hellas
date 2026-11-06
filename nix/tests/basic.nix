@@ -18,6 +18,8 @@
         ! ${package}/bin/hellas llm --help
         ${package}/bin/hellas --version
         ${package}/bin/hellas --help | grep -F "Hellas node CLI"
+        ${package}/bin/hellas --help | grep -F -- "--chain <CHAIN>"
+        ${package}/bin/hellas --help | grep -F -- "--chain-config <FILE>"
         ${package}/bin/hellas gateway --help | grep -F -- "--wrap"
         ${package}/bin/hellas gateway --help | grep -F -- "--text-model <FILE>"
         ${package}/bin/hellas gateway --help | grep -F -- "--responses-overrides"

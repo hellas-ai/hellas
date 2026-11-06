@@ -133,14 +133,23 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             );
             let first = quote_server(true).await;
             let second = quote_server(false).await;
+            use commonware_cryptography::{Hasher as _, Sha256};
+            use hellas_chain::genesis::{Chain, ChainProfile, CustomChainFile};
+            let genesis_json = serde_json::to_string(devnet.genesis()).unwrap();
+            let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+            trust.network_id = devnet.network().as_str().into();
+            trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+            trust.epochs[0].threshold_identity =
+                hex::encode(&devnet.consensus_info().threshold_identity);
             let config = crate::work_config::WorkConfig {
-                chain: crate::work_config::ChainCrossCheck {
-                    network: devnet.network(),
-                    genesis_payload_digest: devnet.genesis_payload().0.into(),
-                    threshold_identity: devnet.consensus_info().threshold_identity.clone(),
-                    genesis: Some(devnet.genesis().clone()),
-                },
-                validators: devnet.light_client_urls(),
+                chain: ChainProfile::custom(CustomChainFile {
+                    consensus_digest: hex::encode(hellas_chain::genesis_digest(devnet.genesis()).0),
+                    trust,
+                    validators: devnet.light_client_urls(),
+                    genesis_json: Some(genesis_json),
+                    genesis_payload: Some(hex::encode(devnet.genesis_payload().0)),
+                })
+                .unwrap(),
                 journal_root: fixture.root.path().join("provider"),
                 poll: Duration::from_millis(20),
                 max_observation_age: Duration::from_secs(30),
@@ -149,7 +158,9 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
             // not hold up another peer's already verified snapshot.
             let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut with_stalled = config.clone();
-            with_stalled.validators[0] = format!("ws://{}", stalled.local_addr().unwrap());
+            let mut routes = with_stalled.chain.validators().to_vec();
+            routes[0] = format!("ws://{}", stalled.local_addr().unwrap());
+            with_stalled.chain = with_stalled.chain.with_validators(routes).unwrap();
             tokio::time::timeout(
                 Duration::from_secs(2),
                 crate::client_chain::connect(&with_stalled, Duration::from_secs(30)),
