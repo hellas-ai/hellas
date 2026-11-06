@@ -20,14 +20,29 @@ pkgs.writeShellApplication {
     repository=''${HELLAS_GITHUB_REPOSITORY:-hellas-ai/hellas}
     dry_run=0
     revision=""
+    jobset=""
+    evaluation=""
+    dispatch=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --dry-run) dry_run=1 ;;
         --revision) revision=$2; shift ;;
-        *) echo "usage: hellas-publish [--dry-run] [--revision SHA]" >&2; exit 2 ;;
+        --jobset) jobset=$2; dispatch=1; shift ;;
+        --evaluation) evaluation=$2; dispatch=1; shift ;;
+        *) echo "usage: hellas-publish [--dry-run] [--revision SHA] [--jobset JOBSET --evaluation ID]" >&2; exit 2 ;;
       esac
       shift
     done
+
+    if [ -n "$revision" ] && ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "invalid revision" >&2; exit 2
+    fi
+    if [ "$dispatch" = 1 ]; then
+      if ! [[ "$revision" =~ ^[0-9a-f]{40}$ && "$evaluation" =~ ^[1-9][0-9]*$ ]] ||
+        ! [[ "$jobset" = hellas-cli || "$jobset" = hellas-gpu ]]; then
+        echo "dispatch requires a revision, release jobset, and evaluation ID" >&2; exit 2
+      fi
+    fi
 
     if [ -n "''${GHCR_TOKEN:-}" ]; then
       skopeo login "''${registry%%/*}" --username "''${GHCR_USER:?}" --password-stdin <<< "$GHCR_TOKEN"
@@ -50,6 +65,38 @@ pkgs.writeShellApplication {
     cli=$(green hellas-cli)
     gpu=$(green hellas-gpu)
     floating=0
+    cli_eval=""
+    gpu_eval=""
+    if [ -n "$evaluation" ]; then
+      # Validate the named evaluation directly, including its channel build;
+      # never substitute a different evaluation for the event's jobset.
+      component=''${jobset#hellas-}
+      api "/eval/$evaluation" | jq -e --arg rev "$revision" --arg component "$component" '
+        .jobsetevalinputs.hellasSrc.revision == $rev and
+        .jobsetevalinputs.component.value == $component
+      ' > /dev/null || { echo "evaluation does not match dispatch" >&2; exit 1; }
+      api "/eval/$evaluation/builds" | jq -e --arg jobset "$jobset" '
+        any(.[]; .project == "hellas" and .jobset == $jobset and
+          .job == "channel" and .finished == 1 and .buildstatus == 0)
+      ' > /dev/null || { echo "dispatch evaluation has no successful channel" >&2; exit 1; }
+      if [ "$jobset" = hellas-cli ]; then
+        cli_eval=$evaluation
+        gpu_eval=$(grep "^$revision " <<< "$gpu" | head -1 | cut -d' ' -f2 || true)
+      else
+        gpu_eval=$evaluation
+        cli_eval=$(grep "^$revision " <<< "$cli" | head -1 | cut -d' ' -f2 || true)
+      fi
+      if [ -z "$cli_eval" ] || [ -z "$gpu_eval" ]; then
+        echo "$revision is awaiting the other green channel"
+        exit 0
+      fi
+      # Old or delayed events may publish immutable artifacts, but must not
+      # move the floating tags backwards.
+      newest=$(while read -r rev _; do
+        if grep -q "^$rev " <<< "$gpu"; then echo "$rev"; break; fi
+      done <<< "$cli")
+      if [ "$revision" = "$newest" ]; then floating=1; fi
+    fi
     if [ -z "$revision" ]; then
       # The newest CLI-green revision that the GPU channel also passed.
       revision=$(while read -r rev _; do
@@ -58,12 +105,14 @@ pkgs.writeShellApplication {
       floating=1
     fi
     if [ -z "$revision" ]; then
-      # A scheduled run with nothing eligible has nothing to do.
+      # A manual run with nothing eligible has nothing to do.
       echo "no revision has both a green CLI and GPU channel yet"
       exit 0
     fi
-    cli_eval=$(grep "^$revision " <<< "$cli" | head -1 | cut -d' ' -f2)
-    gpu_eval=$(grep "^$revision " <<< "$gpu" | head -1 | cut -d' ' -f2)
+    if [ -z "$evaluation" ]; then
+      cli_eval=$(grep "^$revision " <<< "$cli" | head -1 | cut -d' ' -f2 || true)
+      gpu_eval=$(grep "^$revision " <<< "$gpu" | head -1 | cut -d' ' -f2 || true)
+    fi
     if [ -z "$cli_eval" ] || [ -z "$gpu_eval" ]; then
       echo "$revision lacks a green CLI or GPU channel among recent evaluations" >&2
       exit 1
@@ -72,23 +121,29 @@ pkgs.writeShellApplication {
 
     builds=$(jq -s 'add' <(api "/eval/$cli_eval/builds") <(api "/eval/$gpu_eval/builds"))
     output() {
-      jq -er --arg job "$1" '[.[] | select(.job == $job and .buildstatus == 0)][0].buildoutputs.out.path' <<< "$builds"
+      jq -er --arg job "$1" '[.[] | select(.job == $job and .buildstatus == 0)][0].buildoutputs.out.path // error("missing successful artifact job: \($job)")' <<< "$builds"
     }
     version=$(jq -er '[.[] | select(.job == "x86_64-linux.validation")][0].nixname | ltrimstr("hellas-cli-validation-")' <<< "$builds")
+    image_jobs=(network:x86_64-linux.artifacts.network-image hip:x86_64-linux.artifacts.hip-image cuda:x86_64-linux.artifacts.cuda-image)
+    archive_jobs=(x86_64-linux.artifacts.portable-x86_64 x86_64-linux.artifacts.portable-aarch64 aarch64-darwin.artifacts.portable-aarch64 x86_64-linux.artifacts.wasm)
+    # Resolve the complete release before changing any published tags.
+    for job in "''${image_jobs[@]#*:}" "''${archive_jobs[@]}" x86_64-linux.artifacts.installer; do
+      output "$job" > /dev/null
+    done
 
     # Fetching from the cache checks its signature; each artifact then
     # checks its own archive against the SHA256SUMS built beside it.
     fetch() {
       local path
-      path=$(output "$1")
-      nix copy --from "$cache" --option trusted-public-keys "$cache_key" "$path" >&2
-      (cd "$path" && sha256sum --check --quiet SHA256SUMS) >&2
+      path=$(output "$1") || return
+      nix copy --from "$cache" --option trusted-public-keys "$cache_key" "$path" >&2 || return
+      (cd "$path" && sha256sum --check --quiet SHA256SUMS) >&2 || return
       echo "$path"
     }
 
     config_digest() { skopeo inspect --raw --config "$1" | sha256sum | cut -d' ' -f1; }
     digests=""
-    for backend in network:x86_64-linux.artifacts.network-image hip:x86_64-linux.artifacts.hip-image cuda:x86_64-linux.artifacts.cuda-image; do
+    for backend in "''${image_jobs[@]}"; do
       name=''${backend%%:*}
       path=$(fetch "''${backend#*:}")
       archive="docker-archive:$path/hellas-$name-$revision.tar.gz"
@@ -123,11 +178,23 @@ pkgs.writeShellApplication {
     staged=$(mktemp -d --tmpdir="''${RUNNER_TEMP:-$PWD}" hellas-publish.XXXXXX)
     trap 'rm -rf "$staged"' EXIT
     sums=$staged/SHA256SUMS
-    for job in x86_64-linux.artifacts.static-x86_64 x86_64-linux.artifacts.static-aarch64 aarch64-darwin.artifacts.native x86_64-linux.artifacts.wasm; do
+    for job in "''${archive_jobs[@]}"; do
       path=$(fetch "$job")
       cat "$path/SHA256SUMS" >> "$sums"
       assets+=("$path"/*.tar.gz)
+      case "$job" in
+        *.portable-*) ;;
+        *) continue ;;
+      esac
+      archive=$(basename "$path"/*.tar.gz "-$revision.tar.gz").tar.gz
+      cp "$path"/*.tar.gz "$staged/$archive"
+      (cd "$staged" && sha256sum "$archive" > "$archive.sha256")
+      cat "$staged/$archive.sha256" >> "$sums"
+      assets+=("$staged/$archive" "$staged/$archive.sha256")
     done
+    installer=$(fetch x86_64-linux.artifacts.installer)
+    cat "$installer/SHA256SUMS" >> "$sums"
+    assets+=("$installer/install.sh")
     if existing=$(gh release download "$release" --repo "$repository" --pattern SHA256SUMS --output - 2> /dev/null); then
       if [ "$existing" != "$(cat "$sums")" ]; then
         echo "release $release already names different archives" >&2

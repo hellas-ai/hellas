@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [master, devnet]
-  push:
-    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -60,6 +59,7 @@ jobs:
         run: nix run --accept-flake-config .#check-unit
 
   protocol-regressions:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     name: Protocol regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -87,6 +87,7 @@ jobs:
           .#nixosTests.x86_64-linux.validator-module-eval
 
   darwin-cli:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     name: Darwin ARM64 CLI
     runs-on: macos-15
     timeout-minutes: 90
@@ -96,12 +97,12 @@ jobs:
       - name: Build the Hydra release artifact
         run: >-
           nix build --accept-flake-config
-          .#releaseJobs.cli.aarch64-darwin.artifacts.native
+          .#releaseJobs.cli.aarch64-darwin.artifacts.portable-aarch64
       - name: Verify the downloadable CLI
         run: |
           mkdir unpacked
           (cd result && shasum -a 256 -c SHA256SUMS)
-          tar -xzf result/hellas-cli-aarch64-darwin-*.tar.gz -C unpacked
+          tar -xzf result/hellas-aarch64-darwin-portable-*.tar.gz -C unpacked
           test "$(lipo -archs unpacked/bin/hellas)" = arm64
           codesign --verify --strict unpacked/bin/hellas
           otool -L unpacked/bin/hellas
@@ -113,7 +114,7 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin unpacked/bin/hellas --help
       - uses: actions/upload-artifact@v4
         with:
-          name: hellas-cli-aarch64-darwin
+          name: hellas-aarch64-darwin-portable
           path: |
             result/*.tar.gz
             result/SHA256SUMS

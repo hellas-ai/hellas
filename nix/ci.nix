@@ -79,10 +79,16 @@ let
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
-    actions = mk "check-actions" "actionlint .github/workflows/*.yml" [
-      pkgs.actionlint
-      pkgs.shellcheck
-    ];
+    actions =
+      mk "check-actions"
+        ''
+          actionlint .github/workflows/*.yml
+          shellcheck --shell=sh install.sh
+        ''
+        [
+          pkgs.actionlint
+          pkgs.shellcheck
+        ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
     regressions = mkCargo "check-regressions" ''
       cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api -- --test-threads=1
@@ -381,8 +387,8 @@ let
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";
-    static-x86_64 = "cross-x86_64-linux-musl-cli";
-    static-aarch64 = "cross-aarch64-linux-musl-cli";
+    portable-x86_64 = "cross-x86_64-linux-musl-cli";
+    portable-aarch64 = "cross-aarch64-linux-musl-cli";
     hellas-rpc-wasm = "hellas-rpc-wasm";
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

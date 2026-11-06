@@ -42,7 +42,7 @@ axum = "0.8"
 base64 = "0.23"
 bytes = "1"
 catena-lang = { git = "https://github.com/hellas-ai/catena-lang.git", branch = "master", default-features = false }
-catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "2c147f7" }
+catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "1fc1c9a40412ffd04bfe6dc51544e58c57fa21cb" }
 cc = "1"
 ciborium = "0.2"
 commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "51a917ec79063b5c9abdeb084243d398ecb23dae" }
@@ -139,3 +139,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 web-time = "1"
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
 x509-cert = { version = "0.3", default-features = false }
+
+# Keep cryptographic dependencies fast in test builds.
+[profile.test.package."*"]
+opt-level = 2
