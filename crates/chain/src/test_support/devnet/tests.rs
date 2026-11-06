@@ -275,3 +275,66 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
         devnet.shutdown().await;
     });
 }
+
+#[test]
+fn unwinding_keeps_fixture_storage_until_aborted_tasks_finish() {
+    use commonware_runtime::Spawner as _;
+    use futures::FutureExt as _;
+    use std::panic::AssertUnwindSafe;
+
+    run(|runtime| async move {
+        let mut devnet = Devnet::start(
+            runtime.child("fixture"),
+            DevnetConfig {
+                name: "unwind_storage",
+                owners: vec![GenesisOwner::faucet(0)],
+                full_nodes: 0,
+            },
+        )
+        .await;
+        let path = devnet.storage().to_owned();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, stopped) = tokio::sync::oneshot::channel();
+        struct CleanupProbe {
+            path: PathBuf,
+            released: std::sync::mpsc::Receiver<()>,
+            finished: Option<tokio::sync::oneshot::Sender<bool>>,
+        }
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                // Observe only after the primary fixture's Drop has returned.
+                let _ = self.released.recv();
+                let _ = self.finished.take().unwrap().send(self.path.exists());
+            }
+        }
+        let probe = runtime.child("cleanup_probe").spawn(move |_| async move {
+            let _probe = CleanupProbe {
+                path,
+                released,
+                finished: Some(finished),
+            };
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        let archive = std::mem::replace(&mut devnet.validators[0].task, probe);
+        archive.abort();
+        let _ = archive.await;
+        ready.await.unwrap();
+        let panic = AssertUnwindSafe(async move {
+            let _fixture = devnet;
+            panic!("intentional fixture unwind");
+        })
+        .catch_unwind()
+        .await;
+        assert!(panic.is_err());
+        release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+                .await
+                .unwrap()
+                .unwrap(),
+            "fixture storage was removed before task cleanup"
+        );
+    });
+}
