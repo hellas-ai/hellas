@@ -113,7 +113,7 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
         ChannelRecord::JobProposed {
             authorization,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: bundle_bytes(nonce),
+            prepared_input: bundle_bytes(nonce).into(),
 
             retained_tree: None,
         },
@@ -527,7 +527,7 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
         ChannelRecord::JobProposed {
             authorization,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: bundle_bytes(1),
+            prepared_input: bundle_bytes(1).into(),
 
             retained_tree: None,
         },
@@ -548,9 +548,16 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
     );
     assert_eq!(backend.calls(), 0);
 
-    // The control: the co-signature is the only thing missing.
+    // An unaccepted provider scope is discarded on restart. A retry stages
+    // the same declared closure before its co-signature authorizes execution.
     drop(service);
     let mut store = store_at(dir.path(), CURSOR).await;
+    hellas_channel::test_support::channel::seed_content(
+        &mut store,
+        authorization,
+        bundle_bytes(1).into(),
+    )
+    .await;
     commit(
         &mut store,
         ChannelRecord::JobAccepted {

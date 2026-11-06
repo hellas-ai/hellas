@@ -56,7 +56,13 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             prepared_input: input_with_assurance(Retention::Ephemeral, assurance),
             deadlines: deadlines(),
         };
-        let request = client.propose(&proposal).await.unwrap();
+        let request = client
+            .propose(
+                &proposal,
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let id = client
             .accepted(&accept_uploaded_client(&service, &client, &request).await)
             .await
@@ -161,7 +167,13 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
         let client_dir = temp();
         let service = service(provider_dir.path()).await;
         let mut client = client_endpoint(client_dir.path()).await;
-        let mut request = client.propose(&proposal()).await.unwrap();
+        let mut request = client
+            .propose(
+                &proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let mut authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
         match invalid {
             "price" => authorization.price += 1,
@@ -304,17 +316,19 @@ async fn metadata_store(root: &std::path::Path) -> ChannelStore {
 }
 
 async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> ChannelStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
     let mut store = ChannelStore::open(
         root,
         ready.channel().clone(),
         settlement(),
         role,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
     .unwrap();
+    content.finish_recovery().await.unwrap();
     advance(&mut store, CURSOR).await;
     store
 }
@@ -390,10 +404,17 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         .unwrap(),
     );
     let request = client
-        .propose(&JobProposal {
-            prepared_input: input_under(&profile, Retention::Ephemeral, Assurance::ProducerSigned),
-            deadlines: deadlines(),
-        })
+        .propose(
+            &JobProposal {
+                prepared_input: input_under(
+                    &profile,
+                    Retention::Ephemeral,
+                    Assurance::ProducerSigned,
+                ),
+                deadlines: deadlines(),
+            },
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
     let id = client
@@ -453,7 +474,13 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         let client_dir = temp();
         let mut client = client_endpoint(client_dir.path()).await;
         let service = service(provider_dir.path()).await;
-        let request = client.propose(&proposal()).await.unwrap();
+        let request = client
+            .propose(
+                &proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let id = client
             .accepted(&accept_uploaded_client(&service, &client, &request).await)
             .await
@@ -616,7 +643,13 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     let mut client = client_endpoint(client_dir.path()).await;
     let service = service(provider_dir.path()).await;
     let backend = FetchBackend::default();
-    let request = client.propose(&proposal()).await.unwrap();
+    let request = client
+        .propose(
+            &proposal(),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = client
         .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
@@ -694,7 +727,13 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
     let client_dir = temp();
     let mut client = client_endpoint(client_dir.path()).await;
     let service_before = service(provider_dir.path()).await;
-    let request = client.propose(&proposal()).await.unwrap();
+    let request = client
+        .propose(
+            &proposal(),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = client
         .accepted(&accept_uploaded_client(&service_before, &client, &request).await)
         .await
@@ -723,7 +762,15 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         prepared_input: input(Retention::Retain),
         deadlines: deadlines(),
     };
-    assert!(client.propose(&retained).await.is_err());
+    assert!(
+        client
+            .propose(
+                &retained,
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await
+            .is_err()
+    );
 
     // A peer bypassing the client API cannot obtain a provider acceptance either.
     let provider_dir = temp();
@@ -777,7 +824,13 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
     let client_dir = temp();
     let mut client = client_endpoint(client_dir.path()).await;
     let service = service(provider_dir.path()).await;
-    let request = client.propose(&proposal()).await.unwrap();
+    let request = client
+        .propose(
+            &proposal(),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = client
         .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
@@ -848,7 +901,13 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
         prepared_input: input_with_assurance(Retention::Ephemeral, Assurance::AppleAppAttest),
         deadlines: deadlines(),
     };
-    let request = client.propose(&proposal).await.unwrap();
+    let request = client
+        .propose(
+            &proposal,
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = client
         .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
@@ -880,21 +939,26 @@ use hellas_channel::test_support::test_responses_contract;
 
 #[tokio::test]
 async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_fetch() {
-    use hellas_channel::{
-        content::{EphemeralContent, InvocationContent},
-        work::propose_work,
-    };
+    use hellas_channel::work::propose_work;
+    use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
     for cached in [false, true] {
         let provider_dir = temp();
         let client_dir = temp();
         let service = service(provider_dir.path()).await;
         let mut client = client_endpoint(client_dir.path()).await;
-        let mut memory = EphemeralContent::default();
+        let memory = MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ));
         if cached {
-            let reference = memory.insert(test_responses_contract().canonical_bytes());
+            let reference = hellas_channel::content::upload_object(
+                &memory,
+                &test_responses_contract().canonical_bytes(),
+            )
+            .await
+            .unwrap();
             assert_eq!(reference.id(), test_responses_contract().manifest().root());
         }
-        let content = InvocationContent::Ephemeral(memory);
+        let content = (LocalStore::Memory(memory), Scope::Owner);
         let (transport, server) = transport::transport_pair();
         let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
         let id = propose_work(transport, &mut client, &proposal(), &content)

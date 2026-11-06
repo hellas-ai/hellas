@@ -3236,7 +3236,7 @@ async fn each_deadline_ends_its_own_job() {
                 authorization,
                 client_signature: client()
                     .sign(signing_hash(work_id(ready.channel(), &authorization))),
-                prepared_input,
+                prepared_input: prepared_input.into(),
 
                 retained_tree: None,
             },
@@ -3373,13 +3373,14 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
 /// close-only channel. Nothing here calls `check_ready`, and on these
 /// channels nothing could.
 async fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
     let mut store = match ChannelStore::open(
         root,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -3387,6 +3388,7 @@ async fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
         Ok(store) => store,
         Err(error) => panic!("the close-only store opens: {error}"),
     };
+    content.finish_recovery().await.unwrap();
     advance(&mut store, height).await;
     store
 }
@@ -4127,6 +4129,7 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
     let start = close_start(&channel, Party::Maker, CURSOR, None, &client()).unwrap();
     let id = hellas_kernel::start_id(start_body_digest(&channel, &start), inclusion);
     let verifier = Secp256k1Verifier::new();
+    let content = hellas_channel::test_support::channel::content_store(root.path()).await;
     let open = || {
         ChannelStore::open(
             root.path(),
@@ -4134,11 +4137,12 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
             settlement(),
             Role::Client,
             origin(),
-            hellas_store::ContentStore::new(),
+            content.clone(),
             &verifier,
         )
     };
     let mut store = open().await.unwrap();
+    content.finish_recovery().await.unwrap();
     advance(&mut store, CURSOR).await;
     commit(
         &mut store,
@@ -4186,6 +4190,7 @@ async fn delayed_contest_recovery_is_bounded_and_survives_cancellation() {
     let mut interruptions = 0;
     for _ in 0..200 {
         let mut store = open().await.unwrap();
+        content.finish_recovery().await.unwrap();
         let reached = store
             .state()
             .close_history()

@@ -357,11 +357,16 @@ pub async fn accept_uploaded(
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     let (wire, _) = fixture_uploads(endpoint.state().channel(), request);
     let reference = hellas_rpc::protocol::content::decode_reference(&wire.prepared_input);
-    let bytes = reference.and_then(|reference| {
-        (0..=u8::MAX)
-            .map(bundle_bytes)
-            .find(|bytes| hellas_rpc::ContentRef::for_bytes(bytes) == reference)
-    });
+    let bytes =
+        if hellas_rpc::protocol::content::decode_reference(&request.prepared_input).is_none() {
+            Some(request.prepared_input.clone())
+        } else {
+            reference.and_then(|reference| {
+                (0..=u8::MAX)
+                    .map(bundle_bytes)
+                    .find(|bytes| hellas_rpc::ContentRef::for_bytes(bytes) == reference)
+            })
+        };
     if let Some(bytes) = bytes
         && let Ok(authorization) =
             <PaidJobAuthorizationV2 as crate::model::work::PrivateRecord>::decode(
@@ -389,6 +394,14 @@ async fn send_frames(
     wire: &hellas_rpc::pb::work::AcceptWorkRequest,
     frames: Vec<hellas_rpc::pb::content::UploadRequest>,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    // Direct-service fixtures run sequentially; concurrent callers use serve_work.
+    assert_eq!(
+        service.content_upload_count().unwrap(),
+        0,
+        "acceptance fixture needs its own upload carrier"
+    );
+    let connection = crate::work::admission::Cancellation::new();
+    let _stop = crate::work::admission::CancelOnFailure(vec![connection.clone()]);
     if !frames.is_empty() {
         let stream = service
             .upload_stream(
@@ -397,14 +410,23 @@ async fn send_frames(
                     open_exporter: Some([7; 32]),
                     ..Default::default()
                 },
-                crate::work::admission::Cancellation::new(),
+                connection.clone(),
             )
             .await;
-        if let Some(refused) = super::upload_failure(super::drive_upload(stream).await) {
-            return refused;
-        }
+        // A durable acceptance, expiry or closed readiness can be answered even
+        // when this connection cannot open a fresh upload scope.
+        let _ = super::drive_upload(stream).await;
     }
-    service.accept(wire).await
+    let response = service.accept(wire).await;
+    connection.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while service.content_upload_count().unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fixture upload carrier releases its claims");
+    response
 }
 
 pub async fn seed_content(
@@ -412,6 +434,9 @@ pub async fn seed_content(
     authorization: PaidJobAuthorizationV2,
     input: bytes::Bytes,
 ) {
+    if hellas_rpc::ContentRef::for_bytes(&input) != authorization.input_content {
+        return;
+    }
     let Ok(prepared) =
         PreparedInvocation::from_canonical_bytes(&input, crate::content::MAX_CONTENT_BYTES)
     else {
@@ -484,13 +509,9 @@ pub fn transcript_for(request: &InvocationRequest, answer: &[u32]) -> Vec<Output
     )
 }
 
-pub async fn store_at(
-    root: &std::path::Path,
-    ready: &ReadyChannel,
-    role: Role,
-    height: u64,
-) -> ChannelStore {
-    let content = hellas_store::content::DiskStore::open(
+/// The host restores every journal before calling finish_recovery.
+pub async fn content_store(root: &std::path::Path) -> hellas_store::content::DiskStore {
+    hellas_store::content::DiskStore::open(
         root.join("content"),
         vec![],
         hellas_store::content::IndexMode::Resume,
@@ -498,7 +519,16 @@ pub async fn store_at(
         hellas_store::content::Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+pub async fn store_at(
+    root: &std::path::Path,
+    ready: &ReadyChannel,
+    role: Role,
+    height: u64,
+) -> ChannelStore {
+    let content = content_store(root).await;
     let mut store = match ChannelStore::open(
         root,
         ready.channel().clone(),
@@ -745,9 +775,29 @@ pub async fn stop(serving: tokio::task::JoinHandle<()>) {
 
 pub fn serve_work(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        use hellas_wire::MethodMarker;
+        let connection = crate::work::admission::Cancellation::new();
+        let _stop = crate::work::admission::CancelOnFailure(vec![connection.clone()]);
         let server = WorkServer(service);
         while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
+            if inbound.method_id == hellas_rpc::services::content::Upload::METHOD_ID {
+                let context = inbound.context.clone();
+                let (service, connection) = (server.0.clone(), connection.clone());
+                let _ = hellas_rpc::call::dispatch_bidi_streaming::<
+                    MuxTransport,
+                    hellas_rpc::services::content::Upload,
+                    _,
+                    _,
+                    _,
+                >(inbound, |requests| async move {
+                    service
+                        .upload_stream(Box::pin(requests), context, connection)
+                        .await
+                })
+                .await;
+            } else {
+                let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
+            }
         }
     })
 }

@@ -631,6 +631,8 @@ impl<F: Funding> JobState<F> {
     }
 
     /// Returns the prepared-input bundle this job executes from.
+    /// A retained job's replayed cache may be empty until the endpoint or
+    /// ChannelStore loads its retained content; the journal keeps its reference.
     ///
     /// Retained because the quote that carried it is transient. What
     /// makes it the right bundle is not that it was stored, but that it

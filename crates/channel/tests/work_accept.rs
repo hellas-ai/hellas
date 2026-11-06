@@ -43,9 +43,9 @@ use hellas_rpc::pb::work::{
 use hellas_rpc::protocol::invocation::{PreparedInvocation, compute};
 
 use hellas_rpc::ContentId;
-use hellas_rpc::services::work::{Work, WorkServer};
+use hellas_rpc::services::work::Work;
 use hellas_wire::mux::MuxTransport;
-use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+use hellas_wire::{ServiceMarker, StreamTransport};
 
 mod support;
 
@@ -73,20 +73,23 @@ async fn store_with(
     role: Role,
     settlement: WorkPaymentSettlement,
 ) -> ChannelStore {
-    match ChannelStore::open(
+    let content = hellas_channel::test_support::channel::content_store(root).await;
+    let store = match ChannelStore::open(
         root,
         ready().channel().clone(),
         settlement,
         role,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
     {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
-    }
+    };
+    content.finish_recovery().await.unwrap();
+    store
 }
 
 /// A store that has processed one finalized block, which is what lets
@@ -226,12 +229,7 @@ use transport::transport_pair;
 /// Serves one provider endpoint over one transport until the caller
 /// drops the returned handle.
 fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = WorkServer(service);
-        while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
-        }
-    })
+    hellas_channel::test_support::channel::serve_work(transport, service)
 }
 
 // ── The exchange, over a real transport ───────────────────────────────
@@ -249,7 +247,7 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
         client_transport,
         &mut endpoint,
         &proposal(1),
-        &hellas_channel::test_support::channel::program_content(),
+        &hellas_channel::test_support::channel::program_content().await,
     )
     .await;
     let Ok(work_id) = accepted else {
@@ -288,32 +286,33 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
 /// restart can send the same signed proposal again; one that never
 /// retained it is unresolved, not an empty program.
 #[tokio::test]
-async fn a_retained_compute_proposal_resumes_its_upload_after_a_restart() {
-    // Crash during upload: the proposal and its closure are durable, but
-    // the provider takes none of it.
+async fn a_retained_compute_proposal_resumes_after_an_interrupted_preacceptance_rpc() {
     let client_root = temp();
     let provider_root = temp();
     let service = WorkService::new(provider_endpoint(provider_root.path()).await);
-    service
-        .set_upload_quota(hellas_channel::content::UploadQuota::new(0))
-        .await
-        .unwrap();
     let (client_transport, server_transport) = transport_pair();
-    let serving = serve(server_transport, service.clone());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let seen = entered.clone();
+    let serving = tokio::spawn(async move {
+        let _inbound = server_transport.accept().await.unwrap().unwrap();
+        seen.notify_one();
+        std::future::pending::<()>().await;
+    });
     let mut endpoint = client_endpoint(client_root.path()).await;
-    let failed = propose_work(
-        client_transport,
-        &mut endpoint,
-        &proposal(1),
-        &hellas_channel::test_support::channel::program_content(),
-    )
-    .await;
+    let content = hellas_channel::test_support::channel::program_content().await;
+    let pending_proposal = proposal(1);
+    {
+        let sending = propose_work(client_transport, &mut endpoint, &pending_proposal, &content);
+        tokio::pin!(sending);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut sending => panic!("request completed before interruption: {result:?}"),
+                _ = entered.notified() => {},
+            }
+        }).await.unwrap();
+    }
     serving.abort();
     let _ = serving.await;
-    assert!(
-        matches!(failed, Err(ProposeError::Refused { .. })),
-        "the provider refuses the upload: {failed:?}",
-    );
     let id = endpoint.state().jobs().next().unwrap().work_id();
     assert_eq!(
         endpoint.state().job_by_id(id).unwrap().phase(),
@@ -330,13 +329,9 @@ async fn a_retained_compute_proposal_resumes_its_upload_after_a_restart() {
         .expect("the upload retained its closure");
     assert!(matches!(
         content,
-        hellas_channel::content::InvocationContent::Retained(_)
+        (hellas_store::content::LocalStore::Disk(_), _)
     ));
 
-    service
-        .set_upload_quota(hellas_channel::content::UploadQuota::default())
-        .await
-        .unwrap();
     let (client_transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service);
     let mut endpoint = ClientEndpoint::new(ready(), store, client()).unwrap();
@@ -355,28 +350,51 @@ async fn a_retained_compute_proposal_resumes_its_upload_after_a_restart() {
         JobPhase::Accepted,
     );
     assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+}
 
-    // A proposal journaled before its closure was retained is unresolved:
-    // recovery reports it, and the next proposal still takes a new nonce.
-    let unresolved_root = temp();
-    let mut endpoint = client_endpoint(unresolved_root.path()).await;
-    let request = endpoint.propose(&proposal(2)).await.unwrap();
-    let stalled = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
-    let stalled_id = work_id(ready().channel(), &stalled);
+#[tokio::test]
+async fn a_missing_retained_proposal_root_blocks_recovery_and_collection() {
+    use hellas_store::content::{ContentStore, Error, Scope};
+    let root = temp();
+    let mut endpoint = client_endpoint(root.path()).await;
+    let request = endpoint
+        .propose(
+            &proposal(2),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(ready().channel(), &authorization);
+    let missing = endpoint.state().retained_roots()[&id];
     drop(endpoint);
-    let store = store_at_cursor(unresolved_root.path(), Role::Client).await;
-    assert!(
-        store.recoverable_content(stalled_id).unwrap().is_none(),
-        "missing closure bytes are unresolved, never an empty root",
-    );
-    assert_eq!(store.state().job_book().pending_proposal(), None);
-    let mut endpoint = ClientEndpoint::new(ready(), store, client()).unwrap();
-    let request = endpoint.propose(&proposal(3)).await.unwrap();
-    let next = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
-    assert_eq!(
-        next.proposal_nonce, 2,
-        "the stalled proposal burned nonce 1"
-    );
+    std::fs::remove_file(
+        root.path()
+            .join("content/objects")
+            .join(missing.id().to_string()),
+    )
+    .unwrap();
+    let content = hellas_channel::test_support::channel::content_store(root.path()).await;
+    let recovered = ChannelStore::open(
+        root.path(),
+        ready().channel().clone(),
+        settlement(),
+        Role::Client,
+        origin(),
+        content.clone(),
+        &Secp256k1Verifier::new(),
+    )
+    .await;
+    assert!(matches!(
+        recovered,
+        Err(hellas_channel::work_store::WorkStoreError::Content(
+            Error::Missing
+        ))
+    ));
+    assert!(matches!(
+        content.collect(&Scope::Owner).await,
+        Err(Error::Denied)
+    ));
 }
 
 /// A journaled proposal whose body did not survive replay must not occupy
@@ -401,10 +419,13 @@ async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() 
     )
     .unwrap();
     let request = endpoint
-        .propose(&JobProposal {
-            prepared_input: hellas_channel::test_support::channel::fetch_bundle(1),
-            deadlines: deadlines(),
-        })
+        .propose(
+            &JobProposal {
+                prepared_input: hellas_channel::test_support::channel::fetch_bundle(1),
+                deadlines: deadlines(),
+            },
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
     let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
@@ -430,10 +451,13 @@ async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() 
 
     let mut endpoint = ClientEndpoint::new(ready.clone(), store, client()).unwrap();
     let request = endpoint
-        .propose(&JobProposal {
-            prepared_input: hellas_channel::test_support::channel::fetch_bundle(2),
-            deadlines: deadlines(),
-        })
+        .propose(
+            &JobProposal {
+                prepared_input: hellas_channel::test_support::channel::fetch_bundle(2),
+                deadlines: deadlines(),
+            },
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .expect("a fresh proposal is admitted after the release");
     let next = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
@@ -805,7 +829,7 @@ async fn terminated_provider(
         ChannelRecord::JobProposed {
             authorization,
             client_signature,
-            prepared_input: bundle_bytes(1),
+            prepared_input: bundle_bytes(1).into(),
 
             retained_tree: None,
         },
@@ -977,7 +1001,13 @@ fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
 async fn a_client_journals_its_signature_before_the_request_leaves() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(request) = endpoint.propose(&proposal(1)).await else {
+    let Ok(request) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the fixture proposal is accepted by its own rules");
     };
     drop(endpoint);
@@ -993,11 +1023,12 @@ async fn a_client_journals_its_signature_before_the_request_leaves() {
         "the signature on the disk is the signature on the wire",
     );
     assert_eq!(job.authorization().encode(), request.authorization);
+    assert!(
+        job.prepared_input().is_empty(),
+        "replay keeps only retained references until the body is used"
+    );
     assert_eq!(
-        hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::new(
-            ContentId::hash(job.prepared_input()),
-            job.prepared_input().len() as u64
-        )),
+        hellas_rpc::protocol::content::encode_reference(job.authorization().input_content),
         request.prepared_input
     );
 }
@@ -1016,7 +1047,12 @@ async fn a_proposal_refused_before_signing_leaves_no_job() {
             payment: 30,
         },
     };
-    let refused = endpoint.propose(&unreachable).await;
+    let refused = endpoint
+        .propose(
+            &unreachable,
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await;
     assert!(
         matches!(refused, Err(ProposeError::Setup(_))),
         "an unreachable terminal deadline is refused, got {refused:?}",
@@ -1037,10 +1073,22 @@ async fn a_proposal_refused_before_signing_leaves_no_job() {
 async fn a_repeat_proposal_returns_the_retained_request() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(first) = endpoint.propose(&proposal(1)).await else {
+    let Ok(first) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the first proposal is built");
     };
-    let Ok(second) = endpoint.propose(&proposal(1)).await else {
+    let Ok(second) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the same proposal is retained, not rebuilt");
     };
     assert_eq!(first, second, "the retained bytes come back unchanged");
@@ -1051,7 +1099,13 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let root = temp();
     let provider_root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let first = endpoint.propose(&proposal(1)).await.unwrap();
+    let first = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let work_id = endpoint.state().jobs().next().unwrap().work_id();
     let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
     let response = accept_uploaded(&mut provider_endpoint, &first).await;
@@ -1083,19 +1137,47 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
 async fn a_different_proposal_waits_for_the_outstanding_reply() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let first = endpoint.propose(&proposal(1)).await.unwrap();
+    let first = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     assert!(matches!(
-        endpoint.propose(&proposal(2)).await,
+        endpoint
+            .propose(
+                &proposal(2),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await,
         Err(ProposeError::Conflict)
     ));
     assert_eq!(endpoint.state().jobs().len(), 1);
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
-    assert_eq!(endpoint.propose(&proposal(1)).await.unwrap(), first);
+    assert_eq!(
+        endpoint
+            .propose(
+                &proposal(1),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await
+            .unwrap(),
+        first
+    );
     let provider_root = temp();
     let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
     let response = accept_uploaded(&mut provider_endpoint, &first).await;
     endpoint.accepted(&response).await.unwrap();
-    assert!(endpoint.propose(&proposal(2)).await.is_ok());
+    assert!(
+        endpoint
+            .propose(
+                &proposal(2),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await
+            .is_ok()
+    );
     assert_eq!(
         endpoint.state().jobs().len(),
         2,
@@ -1118,7 +1200,13 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
 async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let first = endpoint.propose(&proposal(1)).await.unwrap();
+    let first = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     let refused = AcceptWorkResponse {
         outcome: Some(Outcome::Refused(WorkRefused {
@@ -1142,11 +1230,24 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
     assert_eq!(reopened.resume_proposal(id).await.unwrap(), first);
     assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
     assert!(matches!(
-        reopened.propose(&proposal(2)).await,
+        reopened
+            .propose(
+                &proposal(2),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await,
         Err(ProposeError::Conflict)
     ));
     reopened.accepted(&refused).await.unwrap_err();
-    assert!(reopened.propose(&proposal(2)).await.is_ok());
+    assert!(
+        reopened
+            .propose(
+                &proposal(2),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await
+            .is_ok()
+    );
     assert_eq!(reopened.state().jobs().len(), 2);
 }
 
@@ -1154,20 +1255,29 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
 async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let request = endpoint.propose(&proposal(1)).await.unwrap();
+    let request = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+        .unwrap();
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     drop(endpoint);
     let mut reopened = client_endpoint(root.path()).await;
-    // The proposal was never sent, so its upload closure was never
-    // retained: recovery releases the slot instead of refusing every
-    // later proposal forever. The exact request is still retryable, and
-    // resuming it takes the slot back.
-    assert_eq!(reopened.state().job_book().pending_proposal(), None);
+    // The retained share is journaled before the request can leave; replay
+    // preserves the uncertain exchange until retry or a conclusive response.
+    assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
     assert_eq!(reopened.state().proposal_nonce_high_water(), 1);
     assert_eq!(reopened.resume_proposal(id).await.unwrap(), request);
     assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
     assert!(matches!(
-        reopened.propose(&proposal(2)).await,
+        reopened
+            .propose(
+                &proposal(2),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await,
         Err(ProposeError::Conflict)
     ));
     assert!(
@@ -1197,7 +1307,13 @@ async fn an_acceptance_with_no_proposal_has_nothing_to_answer() {
 async fn a_co_signature_from_another_key_is_not_an_acceptance() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(_) = endpoint.propose(&proposal(1)).await else {
+    let Ok(_) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the proposal is built");
     };
     let authorization = authorization(1, 1);
@@ -1218,7 +1334,13 @@ async fn a_co_signature_from_another_key_is_not_an_acceptance() {
 async fn a_refusal_is_read_back_as_the_refusal_it_names() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(_) = endpoint.propose(&proposal(1)).await else {
+    let Ok(_) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the proposal is built");
     };
     let response = AcceptWorkResponse {
@@ -1255,7 +1377,13 @@ async fn every_wire_code_reads_back_as_the_refusal_it_names() {
     ] {
         let root = temp();
         let mut endpoint = client_endpoint(root.path()).await;
-        let Ok(_) = endpoint.propose(&proposal(1)).await else {
+        let Ok(_) = endpoint
+            .propose(
+                &proposal(1),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+        else {
             panic!("the proposal is built");
         };
         let response = AcceptWorkResponse {
@@ -1277,7 +1405,13 @@ async fn every_wire_code_reads_back_as_the_refusal_it_names() {
 async fn a_response_this_service_does_not_define_is_malformed() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(_) = endpoint.propose(&proposal(1)).await else {
+    let Ok(_) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the proposal is built");
     };
     for (what, response) in [
@@ -1430,7 +1564,10 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
     let client_root = temp();
     let mut caller = client_endpoint(client_root.path()).await;
     let request = caller
-        .propose(&proposal(1))
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .expect("the client journals its proposal");
     let mut endpoint = provider_endpoint(root.path()).await;
@@ -1513,7 +1650,7 @@ async fn a_crash_between_the_two_commits_co_signs_on_retry() {
         ChannelRecord::JobProposed {
             authorization,
             client_signature: signature,
-            prepared_input: bundle_bytes(1),
+            prepared_input: bundle_bytes(1).into(),
 
             retained_tree: None,
         },
@@ -1911,7 +2048,7 @@ async fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
         settlement(),
         Role::Provider,
         other_origin,
-        hellas_store::ContentStore::new(),
+        hellas_channel::test_support::channel::content_store(fourth.path()).await,
         &Secp256k1Verifier::new(),
     )
     .await
@@ -1974,7 +2111,13 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
 async fn the_wire_carries_the_authorization_the_signature_covers() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path()).await;
-    let Ok(request) = endpoint.propose(&proposal(1)).await else {
+    let Ok(request) = endpoint
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
+        .await
+    else {
         panic!("the proposal is built");
     };
     let authorization = authorization(1, 1);
@@ -2038,7 +2181,10 @@ async fn client_observer_does_not_hold_the_journal_during_chain_io() {
         .client()
         .await
         .unwrap()
-        .propose(&proposal(1))
+        .propose(
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
     assert!(!request.client_signature.is_empty());
@@ -2076,7 +2222,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
             client_transport,
             &mut client,
             &proposal(1),
-            &hellas_channel::test_support::channel::program_content(),
+            &hellas_channel::test_support::channel::program_content().await,
         )
         .await
     });
@@ -2147,7 +2293,15 @@ async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readin
             .await
             .unwrap();
         assert!(matches!(
-            client.client().await.unwrap().propose(&proposal(1)).await,
+            client
+                .client()
+                .await
+                .unwrap()
+                .propose(
+                    &proposal(1),
+                    &hellas_channel::test_support::channel::program_content().await
+                )
+                .await,
             Err(ProposeError::Endpoint(EndpointError::ObservationStale))
         ));
         assert_eq!(
