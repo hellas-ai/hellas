@@ -60,6 +60,9 @@ impl Reservations {
             disk,
         })))
     }
+    pub(crate) fn limit(&self) -> u64 {
+        self.0.lock().unwrap().limit
+    }
     pub fn held(&self) -> u64 {
         self.0.lock().unwrap().held
     }

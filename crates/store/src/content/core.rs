@@ -1318,6 +1318,22 @@ impl Core {
 }
 
 impl Core {
+    pub(crate) fn target_present(&self, target: Target) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?;
+        let objects = match state.walk([target]) {
+            Ok(objects) => objects,
+            Err(Error::Missing) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(objects.into_iter().all(|object| {
+            state.objects.get(&object.id()).is_some_and(|stored| {
+                stored.data.len() == object.bytes() && stored.data.available()
+            })
+        }))
+    }
     pub(crate) fn check_acquisition(
         &self,
         pin: &PinTarget,

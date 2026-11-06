@@ -1,5 +1,6 @@
 //! Generic verified objects, trees, pins and scoped content operations.
 mod acquire;
+pub mod config;
 mod core;
 mod disk;
 mod local;

@@ -30,7 +30,8 @@ use std::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IndexMode {
     #[default]
     Resume,
