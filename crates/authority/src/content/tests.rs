@@ -41,6 +41,7 @@ impl Fixture {
             backend.clone(),
             vec![],
             clock.source(),
+            crate::test_support::content_store(directory.path()).await,
         )
         .unwrap();
         let admin = common::session(&service.node(), &secret).await;

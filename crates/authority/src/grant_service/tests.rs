@@ -1,5 +1,4 @@
 mod protocol;
-mod uploads;
 use super::*;
 use hellas_channel::work_store::journal::JournalError;
 
@@ -22,6 +21,7 @@ async fn start(directory: &std::path::Path, backend: Backend) -> (GrantService, 
         backend,
         vec![],
         Arc::new(|| UnixMillis(1000)),
+        crate::test_support::content_store(directory).await,
     )
     .unwrap();
     let (work_service, _) = common::common_node::execution(

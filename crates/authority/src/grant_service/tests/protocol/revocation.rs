@@ -10,7 +10,8 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
             queued: Some(Arc::new(Notify::new())),
             ..Backend::default()
         };
-        let (service, work_service, _credential) = service(store, backend.clone(), &secret).await;
+        let (service, work_service, _credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let wrong = service.for_caller(
             crate::test_support::session(&service.node(), &secret).await,
             common_node::EXECUTION_AUTHORIZATION,
@@ -63,7 +64,8 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             stop_on_cancel: true,
             ..Backend::default()
         };
-        let (service, work, credential) = service(store, backend.clone(), &secret).await;
+        let (service, work, credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work,
@@ -199,7 +201,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 stop_on_cancel: true,
                 ..Backend::default()
             };
-            let (service, work, credential) = service(store, backend.clone(), &secret).await;
+            let (service, work, credential) = service(dir.path(), store, backend.clone(), &secret).await;
             let id = accepted_id(crate::test_support::accept_grant(&work, &request, &hellas_channel::test_support::principal(1).1).await);
             within(backend.started.notified()).await;
             let cache = cache::cached(&service, id);
@@ -281,7 +283,8 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             reply: Reply::text("private-grant-result", prefixes),
             ..Backend::default()
         };
-        let (service, work_service, _credential) = service(store, backend.clone(), &secret).await;
+        let (service, work_service, _credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work_service,

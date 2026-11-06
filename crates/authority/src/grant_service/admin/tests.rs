@@ -8,13 +8,14 @@ use std::{num::NonZeroU64, sync::Arc};
 const ROOT: auth::GrantId = auth::GrantId([0; 16]);
 const ALLOWANCE: auth::GrantId = auth::GrantId([1; 16]);
 use crate::test_support::common_node::NoBackend;
-fn service(store: NodeStore) -> GrantService {
+async fn service(store: NodeStore, root: &std::path::Path) -> GrantService {
     GrantService::new(
         store,
         Arc::new(principal(2).1),
         NoBackend,
         vec![],
         Arc::new(|| UnixMillis(1000)),
+        crate::test_support::content_store(root).await,
     )
     .unwrap()
 }
@@ -64,6 +65,7 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
         NoBackend,
         vec![],
         clock.source(),
+        crate::test_support::content_store(root.path()).await,
     )
     .unwrap();
     let mut admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
@@ -191,6 +193,7 @@ async fn correcting_a_forward_clock_jump_restores_writes() {
         NoBackend,
         vec![],
         clock.source(),
+        crate::test_support::content_store(root.path()).await,
     )
     .unwrap();
     let admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
@@ -308,7 +311,7 @@ async fn checked_work_mutations_persist_the_verified_caller() {
     let (store, secret) = setup_with_credential(directory.path()).await;
     let authority = store.state().authority().clone();
     let expected = store.state().grant(ALLOWANCE).unwrap().revision;
-    let service = service(store);
+    let service = service(store, directory.path()).await;
     let admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
 
     admin
@@ -353,7 +356,7 @@ async fn control_commands_require_the_current_revision() {
     let directory = tempfile::tempdir().unwrap();
     let (store, secret) = setup_with_credential(directory.path()).await;
     let expected = store.state().grant(ALLOWANCE).unwrap().revision;
-    let service = service(store);
+    let service = service(store, directory.path()).await;
     let admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
     assert_err!(admin.command(WorkControlCommand::Revise { id: ALLOWANCE, expected_revision: auth::Revision(0), terms: terms() }).await,
         NodeStoreError::Grant(GrantError::Revision(actual)) if actual == expected);

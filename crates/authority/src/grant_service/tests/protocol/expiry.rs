@@ -28,6 +28,7 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                 backend.clone(),
                 vec![],
                 clock.source(),
+                crate::test_support::content_store(dir.path()).await,
             )
             .unwrap();
             let (work_service, _) =

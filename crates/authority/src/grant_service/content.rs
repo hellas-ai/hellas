@@ -131,6 +131,11 @@ impl GrantWork {
         let Ok(store) = self.service.node.writer().await else {
             return;
         };
+        // A failed append may have accepted this proposal without applying it
+        // in memory. Its cancelled stream cannot settle that uncertainty.
+        if store.check_authority().is_err() {
+            return;
+        }
         if store
             .state()
             .channel(ChannelId(job.channel))
@@ -199,17 +204,45 @@ impl GrantWork {
                     hellas_channel::job::opening_digest(&opening, &exporter),
                 )
                 .map_err(status)?;
-                if store
+                // A new, authenticated opening may retire only this carrier's
+                // completed pending proposal. An active or foreign upload keeps
+                // its original owner even if this request is refused.
+                let prior = {
+                    let held = work
+                        .service
+                        .inner
+                        .lock()
+                        .map_err(|_| status("service unavailable"))?;
+                    held.status.check().map_err(status)?;
+                    held.contents
+                        .get(&a.channel_id.0)
+                        .filter(|(job, owner, active)| {
+                            identity(job).0.id == id && *owner == exporter && !*active
+                        })
+                        .map(|(job, _, _)| job.clone())
+                };
+                let probe = store
                     .precheck_acceptance(&a, client, &client_signature, now)
-                    .await
-                    .map_err(status)?
-                    .is_some()
-                {
+                    .await;
+                let probe = if prior.is_some() {
+                    work.service
+                        .finish_proposal(
+                            a.channel_id,
+                            id,
+                            probe.map_err(|error| WorkRefused::from(&error)),
+                        )
+                        .await
+                        .map_err(|_| status("proposal refused"))?
+                } else {
+                    probe.map_err(status)?
+                };
+                if probe.is_some() {
                     return Err(WireStatus::new(
                         hellas_wire::WireCode::AlreadyExists,
                         "work is already accepted",
                     ));
                 }
+                let prior_cleanup = prior.as_ref().map(|job| work.pending_content_cleanup(job));
                 let policy = store
                     .state()
                     .policy_for(&a)
@@ -290,7 +323,7 @@ impl GrantWork {
                     .map_err(|_| status("service unavailable"))?
                     .contents
                     .insert(a.channel_id.0, (job.clone(), exporter, true));
-                let cleanup = work.pending_content_cleanup(&job);
+                let cleanup = prior_cleanup.unwrap_or_else(|| work.pending_content_cleanup(&job));
                 let (scope, writer) = work
                     .content_work_locked(&mut store, job.scope().clone(), a, parent)
                     .map_err(status)?;

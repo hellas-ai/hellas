@@ -63,7 +63,8 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
             let request = request(&store, 1);
             let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
             let backend = Backend::default();
-            let (service, work, credential) = service(store, backend.clone(), &secret).await;
+            let (service, work, credential) =
+                service(dir.path(), store, backend.clone(), &secret).await;
             let id = accepted_id(
                 crate::test_support::accept_grant(
                     &work,
@@ -164,6 +165,7 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
         backend.clone(),
         vec![],
         clock.source(),
+        crate::test_support::content_store(dir.path()).await,
     )
     .unwrap();
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
@@ -235,7 +237,8 @@ async fn discarded_prefix_still_verifies_usage_and_rejects_a_different_signed_co
             reply: Reply::usage(200, rewrite_prefix),
             ..Backend::default()
         };
-        let (service, work, credential) = service(store, backend.clone(), &secret).await;
+        let (service, work, credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work,
@@ -293,7 +296,7 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
         let request = request(&store, 1);
         let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
         let backend = Backend::default();
-        let (service, work, _) = service(store, backend.clone(), &secret).await;
+        let (service, work, _) = service(directory.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work,

@@ -721,7 +721,7 @@ impl State {
         self.prune();
         Ok(Applied::Changed)
     }
-    pub(super) fn check_terms(
+    pub(crate) fn check_terms(
         &self,
         a: &GrantJobAuthorizationV1,
         client: ChannelClient,

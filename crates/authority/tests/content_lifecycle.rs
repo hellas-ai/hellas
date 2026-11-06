@@ -33,6 +33,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_ram_capacity(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES).await
+    }
+    async fn with_ram_capacity(capacity: u64) -> Self {
         let root = tempfile::tempdir().unwrap();
         let (store, secret) = common::setup_with_credential(root.path()).await;
         let (authorization, signature, input) = common::proposal(&store, 1);
@@ -48,7 +51,16 @@ impl Fixture {
             common::network(),
             [7; 32],
         );
-        let node = common::content_store(root.path()).await;
+        let node = DiskStore::open(
+            root.path().join("content"),
+            vec![],
+            hellas_store::content::IndexMode::Resume,
+            None,
+            hellas_store::content::Reservations::ram(capacity),
+        )
+        .await
+        .unwrap();
+        node.finish_recovery().await.unwrap();
         let clock = common::TestClock::default();
         let backend = Backend::default();
         let service = GrantService::new(
@@ -149,19 +161,41 @@ async fn signed_generic_opening_checks_connection_before_reserving_and_cleans_in
 }
 
 #[tokio::test]
-async fn completed_unaccepted_content_is_released_on_connection_loss_or_deadline() {
-    for expire in [false, true] {
-        let f = Fixture::new().await;
-        let connection = Cancellation::new();
-        f.upload(connection.clone()).await.unwrap();
-        assert!(f.node.ram_pool().held() > 0);
-        if expire {
-            f.clock.set(f.authorization.acceptance_deadline_ms);
-        } else {
-            connection.cancel();
+async fn partial_and_completed_unaccepted_content_end_on_connection_loss_or_deadline() {
+    for partial in [false, true] {
+        for expire in [false, true] {
+            let f = Fixture::new().await;
+            let connection = Cancellation::new();
+            let held = if partial {
+                let (send, receive) = futures::channel::mpsc::unbounded();
+                send.unbounded_send(Ok(f.frames[0].clone())).unwrap();
+                let mut replies = f
+                    .work
+                    .upload_stream(Box::pin(receive), context(), connection.clone())
+                    .await
+                    .unwrap();
+                assert!(replies.next().await.unwrap().unwrap().missing);
+                Some((send, replies))
+            } else {
+                f.upload(connection.clone()).await.unwrap();
+                None
+            };
+            assert!(f.node.ram_pool().held() > 0);
+            if expire {
+                f.clock.set(f.authorization.acceptance_deadline_ms);
+            } else {
+                connection.cancel();
+            }
+            if let Some((send, mut replies)) = held {
+                assert!(matches!(
+                    common::within(replies.next()).await,
+                    Some(Err(_)) | None
+                ));
+                drop((send, replies));
+            }
+            f.clean().await;
+            assert_eq!(f.node.stats().unwrap().used, 0);
         }
-        f.clean().await;
-        assert_eq!(f.node.stats().unwrap().used, 0);
     }
 }
 
@@ -501,4 +535,107 @@ async fn grant_root_completion_consults_the_policy_with_full_reference_and_reque
     })
     .await;
     world.service.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn grant_and_paid_openings_share_the_node_ram_reservation_and_close_releases_it() {
+    use hellas_channel::{
+        model::work::{PrivateRecord as _, signing_hash, work_id},
+        test_support::channel as paid,
+        work::{ProviderEndpoint, WorkService},
+        work_store::{ChannelStore, Role},
+    };
+    let descriptor = paid::descriptor_with(paid::fetch_policy());
+    let ready = paid::ready_of(&descriptor, paid::CURSOR);
+    let prepared = paid::fetch_bundle(1);
+    let bytes = prepared.canonical_bytes().unwrap();
+    let authorization = hellas_channel::job::propose(
+        ready.channel(),
+        &paid::fetch_policy(),
+        &paid::payment_policy(),
+        &prepared,
+        1,
+        paid::deadlines(),
+    )
+    .unwrap();
+    let id = work_id(ready.channel(), &authorization);
+    let request = AcceptWorkRequest {
+        route: Some(WorkRoute::payment(authorization.channel_id)),
+        authorization: authorization.encode(),
+        client_signature: paid::client().sign(signing_hash(id)).as_bytes().to_vec(),
+        prepared_input: bytes.clone(),
+    };
+    let (_, frames) = paid::input_uploads(ready.channel(), &request, &bytes);
+    let first_bytes = |frame: &pb::UploadRequest| {
+        let Some(pb::upload_request::Part::Open(open)) = &frame.part else {
+            unreachable!()
+        };
+        open.object.as_ref().unwrap().bytes
+    };
+    let probe = Fixture::new().await;
+    let capacity = first_bytes(&frames[0]).max(first_bytes(&probe.frames[0]));
+    probe.node.close().await;
+    drop(probe);
+    let f = Fixture::with_ram_capacity(capacity).await;
+    let mut store = ChannelStore::open(
+        &f.root.path().join("paid"),
+        ready.channel().clone(),
+        paid::settlement(),
+        Role::Provider,
+        paid::origin(),
+        f.node.clone(),
+        &hellas_kernel::Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    paid::advance(&mut store, paid::CURSOR).await;
+    let paid = WorkService::new(ProviderEndpoint::new(ready, store, paid::provider()).unwrap());
+    let (send, receive) = futures::channel::mpsc::unbounded();
+    send.unbounded_send(Ok(frames[0].clone())).unwrap();
+    let mut pending = paid
+        .upload_stream(Box::pin(receive), context(), Cancellation::new())
+        .await
+        .unwrap();
+    assert!(pending.next().await.unwrap().unwrap().missing);
+    let held = f.node.ram_pool().held();
+    assert_eq!(held, first_bytes(&frames[0]));
+    assert!(held + first_bytes(&f.frames[0]) > capacity);
+    assert!(
+        f.work
+            .upload_stream(
+                Box::pin(futures::stream::iter([Ok(f.frames[0].clone())])),
+                context(),
+                Cancellation::new(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(f.node.ram_pool().held(), held);
+    paid.prepare_close().await.unwrap();
+    assert!(matches!(
+        common::within(pending.next()).await,
+        Some(Err(_)) | None
+    ));
+    drop((send, pending));
+    f.clean().await;
+    let mut grant = f
+        .work
+        .upload_stream(
+            Box::pin(futures::stream::iter([Ok(f.frames[0].clone())])),
+            context(),
+            Cancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert!(grant.next().await.unwrap().unwrap().missing);
+    assert_eq!(f.node.ram_pool().held(), first_bytes(&f.frames[0]));
+    f.service.drain().await.unwrap();
+    assert!(matches!(
+        common::within(grant.next()).await,
+        Some(Err(_)) | None
+    ));
+    drop(grant);
+    f.clean().await;
+    assert_eq!(f.node.ram_pool().held(), 0);
+    assert_eq!(f.node.stats().unwrap().used, 0);
 }

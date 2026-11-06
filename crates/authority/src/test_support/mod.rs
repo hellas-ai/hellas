@@ -412,25 +412,48 @@ pub async fn accept_grant(
     let exporter = [7; 32];
     let (wire, chunks) = grant_upload_requests(request, signer, network(), exporter);
     if !chunks.is_empty() {
-        let response = hellas_channel::test_support::drive_upload(
-            work.upload_stream(
-                Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))),
-                hellas_wire::TransportContext {
-                    open_exporter: Some(exporter),
-                    ..Default::default()
-                },
-                hellas_channel::work::admission::Cancellation::new(),
-            )
-            .await,
+        // These policy fixtures intentionally probe canonical acceptance even
+        // when upload is refused before content can be admitted.
+        let _ = upload_grant_frames(
+            work,
+            chunks,
+            hellas_wire::TransportContext {
+                open_exporter: Some(exporter),
+                ..Default::default()
+            },
+            hellas_channel::work::admission::Cancellation::new(),
         )
         .await;
-        if let Err(error) = response
-            && error.code != hellas_wire::WireCode::AlreadyExists
-        {
-            return upload_failure(Err(error)).unwrap();
-        }
     }
     work.accept(&wire).await
+}
+
+/// Drive the real generic upload stream one acknowledged frame at a time.
+/// Cached objects complete on Open and require no list or payload frames.
+pub async fn upload_grant_frames(
+    work: &crate::grant_service::GrantWork,
+    frames: Vec<hellas_rpc::pb::content::UploadRequest>,
+    context: hellas_wire::TransportContext,
+    cancellation: hellas_channel::work::admission::Cancellation,
+) -> Result<(), hellas_wire::WireStatus> {
+    use futures::StreamExt as _;
+    use hellas_rpc::pb::content::upload_request::Part;
+    let mut frames = frames.into_iter();
+    let (send, receive) = futures::channel::mpsc::unbounded();
+    send.unbounded_send(Ok(frames.next().unwrap())).unwrap();
+    let mut replies = work
+        .upload_stream(Box::pin(receive), context, cancellation)
+        .await?;
+    loop {
+        let reply = replies.next().await.expect("one answer per sent frame")?;
+        match frames.find(|frame| !reply.complete || matches!(frame.part, Some(Part::Open(_)))) {
+            Some(frame) => send.unbounded_send(Ok(frame)).unwrap(),
+            None => {
+                drop(send);
+                return hellas_channel::test_support::drive_upload(Ok(replies)).await;
+            }
+        }
+    }
 }
 
 /// Raw store operations used by accounting tests; preserve the caller and simulated time.

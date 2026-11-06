@@ -375,13 +375,14 @@ pub async fn provision(
     let now = store.state().now();
     let network = store.state().network();
     let provider = store.state().provider().unwrap().clone();
+    let content = super::content_store(path).await;
     let service = crate::grant_service::GrantService::new(
         store,
         std::sync::Arc::new(signer),
         NoBackend,
         vec![],
         std::sync::Arc::new(move || now),
-        super::content_store(path).await,
+        content.clone(),
     )
     .unwrap();
     let mut admin = WorkAdmin::new(service.clone(), secret, definition.policies.clone()).await;
@@ -392,6 +393,7 @@ pub async fn provision(
     admin.budgets(pool, subject, budget.0, budget.1).await;
     admin.create(definition).await;
     service.drain().await.unwrap();
+    content.close().await;
     drop(admin);
     drop(service);
     NodeStore::open(path, network, Some(provider), now)

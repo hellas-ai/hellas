@@ -5,22 +5,26 @@ struct Fixture {
     service: GrantService,
     work: crate::grant_service::GrantWork,
     request: AcceptWorkRequest,
-    chunks: Vec<UploadContentRequest>,
+    chunks: Vec<hellas_rpc::pb::content::UploadRequest>,
     clock: TestClock,
     secret: CredentialSecret,
     credential: CredentialSecret,
+    backend: Backend,
+    _connection: hellas_channel::work::admission::CancelOnFailure,
 }
 impl Fixture {
     async fn new(path: &std::path::Path) -> Self {
         let (store, secret) = setup_with_credential(path).await;
         let request = request(&store, 1);
         let clock = TestClock::default();
+        let backend = Backend::default();
         let service = GrantService::new(
             store,
             Arc::new(principal(2).1),
-            Backend::default(),
+            backend.clone(),
             vec![],
             clock.source(),
+            crate::test_support::content_store(path).await,
         )
         .unwrap();
         let (_, credential) =
@@ -28,15 +32,10 @@ impl Fixture {
         let work = Self::session(&service, &credential, Digest::hash(b"binding")).await;
         let (request, chunks) =
             grant_upload_requests(&request, &principal(1).1, network(), [7; 32]);
-        for chunk in &chunks {
-            assert!(
-                work.upload(chunk, &context())
-                    .await
-                    .unwrap()
-                    .refused
-                    .is_none()
-            );
-        }
+        let connection = hellas_channel::work::admission::Cancellation::new();
+        upload_grant_frames(&work, chunks.clone(), context(), connection.clone())
+            .await
+            .unwrap();
         Self {
             service,
             work,
@@ -45,6 +44,8 @@ impl Fixture {
             clock,
             secret,
             credential,
+            backend,
+            _connection: hellas_channel::work::admission::CancelOnFailure(vec![connection]),
         }
     }
     async fn session(
@@ -79,9 +80,10 @@ impl Fixture {
             .inner
             .lock()
             .unwrap()
-            .uploads
+            .contents
             .get(&a.channel_id.0)
-            .is_some_and(|uploads| uploads.has_stage(grant_work_id(network(), &a)))
+            .is_some_and(|(job, _, _)| matches!(job.scope().kind,
+                hellas_store::content::ScopeKind::Work { job, .. } if job.id == grant_work_id(network(), &a)))
     }
 }
 
@@ -176,26 +178,47 @@ async fn conclusive_accept_and_upload_refusals_release_the_authenticated_stage()
                 }
                 Denial::Malformed => {
                     if upload {
-                        f.chunks.last_mut().unwrap().program_manifest = vec![0];
+                        let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) =
+                            &mut f.chunks[0].part
+                        else {
+                            unreachable!()
+                        };
+                        let opening = open.work.as_mut().unwrap();
+                        opening.manifest = vec![0];
+                        opening.binding_signature = principal(1)
+                            .1
+                            .sign_digest(hellas_channel::job::opening_digest(opening, &[7; 32]))
+                            .unwrap()
+                            .bytes()
+                            .to_vec();
                     } else {
                         f.request.prepared_input = vec![0];
                     }
                     GrantRefusalCode::Malformed
                 }
             };
-            let refused = if upload {
-                f.work
-                    .upload(f.chunks.last().unwrap(), &context())
+            if upload {
+                assert!(
+                    upload_grant_frames(
+                        &f.work,
+                        f.chunks.clone(),
+                        context(),
+                        hellas_channel::work::admission::Cancellation::new(),
+                    )
                     .await
-                    .unwrap()
-                    .refused
-                    .unwrap()
-            } else {
-                let response = f.work.accept(&f.request).await;
-                let Some(accept_work_response::Outcome::Refused(refused)) = response.outcome else {
-                    panic!("{denial:?}");
-                };
-                refused
+                    .is_err(),
+                    "{denial:?}"
+                );
+                within(async {
+                    while f.staged() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+            }
+            let response = f.work.accept(&f.request).await;
+            let Some(accept_work_response::Outcome::Refused(refused)) = response.outcome else {
+                panic!("{denial:?}");
             };
             assert_eq!(
                 GrantRefusalCode::try_from(refused.grant.unwrap().code).unwrap(),
@@ -246,6 +269,9 @@ async fn quota_refusal_releases_staging_for_the_next_proposal_without_waiting() 
         request(&store, 2)
     };
     accepted_id(accept_grant(&f.work, &next, &principal(1).1).await);
+    within(f.backend.started.notified()).await;
+    assert_eq!(f.backend.calls.load(Ordering::SeqCst), 1);
+    f.backend.finish.release();
     within(f.service.drain()).await.unwrap();
 }
 
@@ -285,44 +311,51 @@ async fn unowned_and_uncertain_refusals_preserve_the_original_stage() {
         GrantRefusalCode::Unauthorized
     );
     assert!(f.staged());
-    let mut chunk = f.chunks.last().unwrap().clone();
-    chunk.chunk_signature = bad.client_signature.clone();
+    let mut forged = f.chunks.clone();
+    let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &mut forged[0].part
+    else {
+        unreachable!()
+    };
+    open.work.as_mut().unwrap().binding_signature = bad.client_signature.clone();
     assert!(
-        f.work
-            .upload(&chunk, &context())
-            .await
-            .unwrap()
-            .refused
-            .is_some()
+        upload_grant_frames(
+            &f.work,
+            forged,
+            context(),
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await
+        .is_err()
     );
     assert!(
         f.staged(),
-        "forged chunk cannot clear a valid signed proposal"
+        "a forged opening cannot clear another authenticated proposal"
     );
     assert!(
-        f.work
-            .upload(
-                f.chunks.last().unwrap(),
-                &TransportContext {
-                    open_exporter: Some([8; 32]),
-                    ..context()
-                }
-            )
-            .await
-            .unwrap()
-            .refused
-            .is_some()
+        upload_grant_frames(
+            &f.work,
+            f.chunks.clone(),
+            TransportContext {
+                open_exporter: Some([8; 32]),
+                ..context()
+            },
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await
+        .is_err()
     );
     assert!(f.staged());
     let other = request(&f.service.node().writer().await.unwrap(), 2);
     let (wire, chunks) = grant_upload_requests(&other, &principal(1).1, network(), [7; 32]);
     assert!(
-        f.work
-            .upload(&chunks[0], &context())
-            .await
-            .unwrap()
-            .refused
-            .is_some()
+        upload_grant_frames(
+            &f.work,
+            chunks,
+            context(),
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await
+        .is_err()
     );
     assert!(
         f.staged(),
@@ -341,20 +374,104 @@ async fn unowned_and_uncertain_refusals_preserve_the_original_stage() {
         GrantRefusalCode::StorageUnavailable
     );
     assert!(f.staged(), "uncertain acceptance remains recoverable");
-    assert_eq!(
-        GrantRefusalCode::try_from(
-            f.work
-                .upload(f.chunks.last().unwrap(), &context())
-                .await
-                .unwrap()
-                .refused
-                .unwrap()
-                .grant
-                .unwrap()
-                .code
+    assert!(
+        upload_grant_frames(
+            &f.work,
+            f.chunks.clone(),
+            context(),
+            hellas_channel::work::admission::Cancellation::new(),
         )
-        .unwrap(),
-        GrantRefusalCode::StorageUnavailable
+        .await
+        .is_err()
     );
     assert!(f.staged());
+}
+
+async fn pending_snapshot(f: &Fixture) -> (u64, bytes::Bytes, u64) {
+    let a = GrantJobAuthorizationV1::decode(&f.request.authorization).unwrap();
+    let job = f.service.inner.lock().unwrap().contents[&a.channel_id.0]
+        .0
+        .clone();
+    let scope = job.scope().clone();
+    let held = f.service.content.ram_pool().held();
+    let bytes = hellas_channel::content::read(
+        &hellas_store::content::LocalStore::Job(job),
+        &scope,
+        a.input_content,
+        hellas_channel::content::MAX_CONTENT_BYTES as u64,
+    )
+    .await
+    .unwrap();
+    let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind else {
+        unreachable!()
+    };
+    (reservation, bytes, held)
+}
+
+#[tokio::test]
+async fn a_failed_precheck_journal_append_preserves_the_completed_stage_and_its_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = Fixture::new(dir.path()).await;
+    let before = pending_snapshot(&f).await;
+    let node = f.service.node();
+    let rows = node.writer().await.unwrap().journal_len();
+    node.writer().await.unwrap().refuse_writes().await;
+    f.clock.set(UnixMillis(1001));
+    assert!(
+        upload_grant_frames(
+            &f.work,
+            f.chunks.clone(),
+            context(),
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(f.staged());
+    assert_eq!(pending_snapshot(&f).await, before);
+    // The clock append was attempted in SQLite, rather than bypassed by a
+    // failed runtime status. Its journal is now poisoned and no row committed.
+    let store = node.store.lock().await.unwrap();
+    assert_eq!(store.journal_len(), rows);
+    assert!(matches!(
+        store.check_authority(),
+        Err(NodeStoreError::Journal(
+            hellas_channel::work_store::journal::JournalError::Poisoned
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn a_valid_foreign_carrier_cannot_discard_a_completed_stage_with_a_malformed_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = Fixture::new(dir.path()).await;
+    let before = pending_snapshot(&f).await;
+    let mut frames = f.chunks.clone();
+    let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &mut frames[0].part
+    else {
+        unreachable!()
+    };
+    let opening = open.work.as_mut().unwrap();
+    opening.manifest = vec![0];
+    opening.binding_signature = principal(1)
+        .1
+        .sign_digest(hellas_channel::job::opening_digest(opening, &[8; 32]))
+        .unwrap()
+        .bytes()
+        .to_vec();
+    assert!(
+        upload_grant_frames(
+            &f.work,
+            frames,
+            TransportContext {
+                open_exporter: Some([8; 32]),
+                ..context()
+            },
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(f.staged());
+    assert_eq!(pending_snapshot(&f).await, before);
 }

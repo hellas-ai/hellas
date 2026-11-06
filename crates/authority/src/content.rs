@@ -63,6 +63,8 @@ impl ContentBinding {
                                 .is_some_and(|job| job.provider_signature().is_some())
                         }))?;
                     }
+                    let client =
+                        crate::model::grant::ChannelClient::of(self.access.caller(store, now)?)?;
                     let deadline = if let Some(accepted) = book
                         .and_then(|book| book.job_by_id(job.id))
                         .filter(|job| job.provider_signature().is_some())
@@ -73,13 +75,12 @@ impl ContentBinding {
                         store.state().check_resource(work)?;
                         work.terminal_deadline_ms
                     } else {
+                        store.state().check_terms(work, client, now)?;
                         work.acceptance_deadline_ms
                     };
                     if now >= deadline {
                         return Err(AuthorityError::Expired.into());
                     }
-                    let client =
-                        crate::model::grant::ChannelClient::of(self.access.caller(store, now)?)?;
                     let expires = if store.state().channel_binding(work.channel_id).is_some() {
                         self.access.authorize_channel(store, work.channel_id, now)?
                     } else {

@@ -117,7 +117,8 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
         .await
         .unwrap();
         let backend = Backend::default();
-        let (service, work_service, _credential) = service(store, backend.clone(), &secret).await;
+        let (service, work_service, _credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let delivery = delivery::delivery_request(&a, work);
         let mut forged = delivery.clone();
         forged.route = Some(WorkRoute::grant(

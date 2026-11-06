@@ -73,6 +73,7 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
         common::common_node::NoBackend,
         vec![],
         Arc::new(|| UnixMillis(1000)),
+        crate::test_support::content_store(directory.path()).await,
     )
     .unwrap();
     let admin =

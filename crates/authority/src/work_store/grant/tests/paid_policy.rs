@@ -76,6 +76,7 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
         NoBackend,
         vec![],
         Arc::new(|| UnixMillis(1000)),
+        crate::test_support::content_store(dir.path()).await,
     )
     .unwrap();
     let admin = WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
