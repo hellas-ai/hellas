@@ -158,17 +158,17 @@ async fn a_work_opening_uses_one_upload_stream_for_multiple_objects() {
         manifest: vec![2],
         root: Some(support::reference(ContentRef::for_bytes(b"root"))),
     });
-    let scope = Scope::Work {
-        job: JobId {
+    let scope = Scope::work(
+        JobId {
             channel: Digest::ZERO,
             id: Digest::ZERO,
         },
-        closure: vec![
+        vec![
             ContentRef::for_bytes(b"root"),
             ContentRef::for_bytes(b"next"),
         ],
-        reservation: 0,
-    };
+        0,
+    );
     for bytes in [b"root", b"next"] {
         let mut session = store
             .upload(&scope, ContentRef::for_bytes(bytes), None)

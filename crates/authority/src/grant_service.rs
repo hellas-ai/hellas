@@ -44,7 +44,7 @@ use {
 };
 mod access;
 mod cache;
-mod delivery;
+pub(crate) mod delivery;
 pub(crate) use access::Access;
 mod upload;
 pub use access::{GrantWork, WORK_EXECUTE, allowance_resource};

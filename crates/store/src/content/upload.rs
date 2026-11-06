@@ -105,10 +105,15 @@ impl UploadSession {
         result
     }
     async fn declare_checked(&mut self, chunks: &[Chunk], complete: bool) -> Result<()> {
-        if let Destination::Local(local) = &self.destination {
+        let gate = if let Destination::Local(local) = &self.destination {
+            let gate = local.store.effect_gate(&local.scope).await?;
             local.store.check(&local.scope)?;
-        }
+            Some(gate)
+        } else {
+            None
+        };
         self.declare_inner(chunks, complete)?;
+        drop(gate);
         let verified = self.verified();
         if let Destination::Remote(remote) = &mut self.destination {
             // Cancellation leaves this verifier terminal, so a lost acknowledgement
@@ -199,9 +204,13 @@ impl UploadSession {
         result
     }
     async fn accept_checked(&mut self, bytes: &[u8]) -> Result<()> {
-        if let Destination::Local(local) = &self.destination {
+        let gate = if let Destination::Local(local) = &self.destination {
+            let gate = local.store.effect_gate(&local.scope).await?;
             local.store.check(&local.scope)?;
-        }
+            Some(gate)
+        } else {
+            None
+        };
         self.accept_inner(bytes)?;
         let verified = self.verified();
         match &mut self.destination {
@@ -214,6 +223,7 @@ impl UploadSession {
                     .write_all(bytes)?;
             }
             Destination::Local(_) => {
+                drop(gate);
                 let Destination::Local(local) =
                     std::mem::replace(&mut self.destination, Destination::Verify)
                 else {
@@ -226,6 +236,7 @@ impl UploadSession {
                 self.destination =
                     Destination::Local(Box::new(core.write_local(*local, bytes).await?));
                 self.failed = false;
+                return self.publish().await;
             }
             Destination::Remote(remote) => {
                 self.failed = true;
@@ -234,6 +245,7 @@ impl UploadSession {
             }
             _ => {}
         }
+        drop(gate);
         self.publish().await
     }
     async fn publish(&mut self) -> Result<()> {
@@ -251,7 +263,9 @@ impl UploadSession {
             local
                 .store
                 .clone()
-                .effect(move |core| core.publish(&mut local, chunks))
+                .effect(&local.scope.clone(), move |core| {
+                    core.publish(&mut local, chunks)
+                })
                 .await?;
             self.failed = false;
         }

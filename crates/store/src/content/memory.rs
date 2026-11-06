@@ -22,7 +22,9 @@ impl MemoryStore {
         max_upload_bytes: u64,
     ) -> Result<Scope> {
         self.core
-            .admit(move |core| core.open_work(job, closure.clone(), max_upload_bytes))
+            .admit(&Scope::Owner, move |core| {
+                core.open_work(job, closure.clone(), max_upload_bytes)
+            })
             .await
     }
     pub async fn widen_work(
@@ -33,21 +35,32 @@ impl MemoryStore {
     ) -> Result<Scope> {
         let scope = scope.clone();
         self.core
-            .admit(move |core| core.widen_work(&scope, closure.clone(), max_upload_bytes))
+            .admit(&scope.clone(), move |core| {
+                core.widen_work(&scope, closure.clone(), max_upload_bytes)
+            })
             .await
     }
-    pub fn accept_work(&self, scope: &Scope) -> Result<()> {
-        self.core.accept_work(scope)
+    pub async fn accept_work(&self, scope: &Scope) -> Result<()> {
+        let scope = scope.clone();
+        self.core
+            .access(&scope.clone(), move |core| core.accept_work(&scope))
+            .await
     }
-    pub fn end_work(&self, scope: &Scope) -> Result<()> {
-        self.core.end_work(scope)
+    pub async fn end_work(&self, scope: &Scope) -> Result<()> {
+        let scope = scope.clone();
+        self.core
+            .access(&Scope::Owner, move |core| core.end_work(&scope))
+            .await
     }
-    pub fn own_bytes(
+    pub async fn own_bytes(
         &self,
         scope: &Scope,
         object: hellas_rpc::ContentRef,
     ) -> Result<Option<bytes::Bytes>> {
-        self.core.own_bytes(scope, object)
+        let scope = scope.clone();
+        self.core
+            .access(&scope.clone(), move |core| core.own_bytes(&scope, object))
+            .await
     }
     pub async fn resolve_hf(
         &self,

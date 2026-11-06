@@ -144,7 +144,12 @@ async fn private_objects_and_other_scopes_progress_do_not_count_as_missing_answe
     one.accept_chunk(payload).await.unwrap();
     assert!(one.complete());
     assert_eq!(
-        store.own_bytes(&first, object).unwrap().unwrap().as_ref(),
+        store
+            .own_bytes(&first, object)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         payload
     );
     let two = store.upload(&second, object, None).await.unwrap();
@@ -167,8 +172,8 @@ async fn private_objects_and_other_scopes_progress_do_not_count_as_missing_answe
     assert_eq!(pool.held(), object.bytes() * 3);
     drop(two);
     drop(one);
-    store.end_work(&first).unwrap();
-    store.end_work(&second).unwrap();
+    store.end_work(&first).await.unwrap();
+    store.end_work(&second).await.unwrap();
     assert_eq!(pool.held(), object.bytes());
 }
 
@@ -307,18 +312,23 @@ async fn acceptance_transfers_staging_charge_to_live_ram_without_losing_bytes() 
             .await,
         Err(Error::Capacity)
     ));
-    store.accept_work(&scope).unwrap();
+    store.accept_work(&scope).await.unwrap();
     assert_eq!(pool.held(), 0);
     assert_eq!(
-        store.own_bytes(&scope, object).unwrap().unwrap().as_ref(),
+        store
+            .own_bytes(&scope, object)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         bytes
     );
     store
         .open_work(job(2, 1), vec![ContentRef::for_bytes(&vec![1; 600])], 600)
         .await
         .unwrap();
-    store.end_work(&scope).unwrap();
-    assert!(store.own_bytes(&scope, object).is_err());
+    store.end_work(&scope).await.unwrap();
+    assert!(store.own_bytes(&scope, object).await.is_err());
 }
 
 #[tokio::test]
@@ -464,7 +474,7 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
         )
         .await
         .unwrap();
-    store.end_work(&scope).unwrap();
+    store.end_work(&scope).await.unwrap();
     assert!(matches!(
         work_watch.next().await.unwrap(),
         Err(Error::Denied)
@@ -500,8 +510,8 @@ async fn retained_read_and_upper_handles_keep_their_ram_charge_until_drop() {
         .unwrap();
     session.accept_chunk(&vec![5; 512]).await.unwrap();
     drop(session);
-    let held = store.own_bytes(&scope, object).unwrap().unwrap();
-    store.end_work(&scope).unwrap();
+    let held = store.own_bytes(&scope, object).await.unwrap().unwrap();
+    store.end_work(&scope).await.unwrap();
     assert_eq!(pool.held(), 512);
     drop(held);
     assert_eq!(pool.held(), 0);
@@ -527,7 +537,7 @@ async fn own_progress_retries_do_not_allocate_again_and_undeclared_metadata_is_h
     drop(first);
     assert!(store.upload(&scope, object, None).await.unwrap().complete());
     assert_eq!(pool.held(), 512);
-    store.end_work(&scope).unwrap();
+    store.end_work(&scope).await.unwrap();
     assert_eq!(pool.held(), 0);
     let served = put(&store, "undeclared", b"secret id", PinPolicy::Jobs).await;
     let scope = store
@@ -630,10 +640,10 @@ async fn globally_pinning_a_private_copy_cannot_reuse_its_ram_for_another_object
     ));
     assert_eq!(pool.held(), 12);
     assert_eq!(
-        store.own_bytes(&scope, a).unwrap().unwrap().as_ref(),
+        store.own_bytes(&scope, a).await.unwrap().unwrap().as_ref(),
         b"aaaa"
     );
-    store.end_work(&scope).unwrap();
+    store.end_work(&scope).await.unwrap();
     drop(session);
     assert_eq!(pool.held(), 8);
 }

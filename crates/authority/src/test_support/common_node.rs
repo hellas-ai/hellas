@@ -67,7 +67,7 @@ pub async fn bootstrap_node_with_credential(
         &extra,
         (now, auth::UnixMillis(u64::MAX)),
         (u64::MAX, auth::MAX_DELEGATION_DEPTH),
-        &[crate::grant_service::WORK_EXECUTE],
+        &[crate::grant_service::WORK_EXECUTE, crate::content::READ],
     );
     let root = auth::GrantId([0; 16]);
     NodeStore::bootstrap(

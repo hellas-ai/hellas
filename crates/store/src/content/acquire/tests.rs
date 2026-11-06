@@ -16,7 +16,7 @@ fn pin(name: &str) -> PinTarget {
 fn path(name: &str) -> Path {
     Path::new(PinName::new(name.into()).unwrap(), String::new()).unwrap()
 }
-fn https(body: &'static [u8]) -> (url::Url, ureq::Agent, std::thread::JoinHandle<()>) {
+pub(crate) fn https(body: &'static [u8]) -> (url::Url, ureq::Agent, std::thread::JoinHandle<()>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = certified.cert.der().clone();
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -206,7 +206,7 @@ async fn cancellation_keeps_the_worker_charge_until_the_blocking_reader_stops() 
     assert!(pool.reserve(1).is_ok());
 }
 
-fn framed(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn framed(bytes: &[u8]) -> Vec<u8> {
     let mut frame = vec![0];
     frame.extend_from_slice(&bytes.len().to_le_bytes()[..3]);
     frame.push(0);
@@ -214,7 +214,7 @@ fn framed(bytes: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(bytes);
     frame
 }
-fn hub(
+pub(crate) fn hub(
     responses: impl FnOnce(&str) -> Vec<(String, u16, Vec<u8>)>,
 ) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -366,7 +366,7 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());
-    publish(&store.core, stages, root, pin("resolved"))
+    publish(&store.core, &Scope::Owner, stages, root, pin("resolved"))
         .await
         .unwrap();
     assert_eq!(pool.held(), root.object().bytes() + 2);
@@ -469,4 +469,96 @@ async fn disk_cold_https_streams_an_object_larger_than_any_tree_without_ram_mate
         actual.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(actual, data[120_000..140_000]);
+}
+
+#[tokio::test]
+async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let tokenizer = ContentRef::for_bytes(b"{}");
+    let tree = Tree::new(vec![("tokenizer.json".into(), Target::Object(tokenizer))]).unwrap();
+    let capacity = tree.bytes().len() as u64 + tokenizer.bytes();
+    let mut store = DiskStore::open(
+        directory.path().into(),
+        vec![],
+        IndexMode::Resume,
+        Some(capacity),
+        Reservations::ram(32 << 20),
+    )
+    .await
+    .unwrap();
+    store.core.hf_hub = Some("http://127.0.0.1:1".into());
+    let repo = crate::hf::Repo::from_uri("hf://org/repo").unwrap();
+    assert!(matches!(
+        store.resolve_hf(&Scope::Owner, repo.clone()).await,
+        Err(Error::Denied)
+    ));
+    store.finish_recovery().await.unwrap();
+    let cached = vec![17; capacity as usize];
+    let mut upload = store
+        .upload(
+            &Scope::Owner,
+            ContentRef::for_bytes(&cached),
+            Some(pin("cached")),
+        )
+        .await
+        .unwrap();
+    upload
+        .declare(&hellas_xet::chunk(&cached), true)
+        .await
+        .unwrap();
+    upload.accept_chunk(&cached).await.unwrap();
+    let value = store
+        .pins(&Scope::Owner, "cached", Cursor::default())
+        .await
+        .unwrap()
+        .pins
+        .remove(0)
+        .1;
+    store
+        .set_pin(&Scope::Owner, &pin("cached").name, Some(&value), None)
+        .await
+        .unwrap();
+    let sha = "a".repeat(40);
+    let (base, serving) = hub(|_| {
+        let listing = serde_json::json!([{"type":"file","path":"tokenizer.json","size":2}])
+            .to_string()
+            .into_bytes();
+        vec![
+            (
+                "/api/models/org/repo/revision/main".into(),
+                200,
+                serde_json::json!({"sha":sha}).to_string().into_bytes(),
+            ),
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                listing.clone(),
+            ),
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                listing,
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/tokenizer.json"),
+                200,
+                b"{}".to_vec(),
+            ),
+        ]
+    });
+    store.core.hf_hub = Some(base);
+    let (resolved, object) = store.resolve_hf(&Scope::Owner, repo).await.unwrap();
+    serving.join().unwrap();
+    assert_eq!(resolved, sha);
+    assert_eq!(object, ContentRef::for_bytes(&tree.bytes()));
+    assert_eq!(store.stats().unwrap().used, capacity);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    assert!(
+        !directory
+            .path()
+            .join("objects")
+            .join(ContentRef::for_bytes(&cached).id().to_string())
+            .exists()
+    );
+    store.close().await;
 }

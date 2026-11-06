@@ -43,7 +43,7 @@ pub struct NodeStore {
     journal: Journal,
     pub(super) state: State,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
-    pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
+    pub(super) deliveries: Vec<super::delivery::DeliveryEntry>,
 }
 impl NodeStore {
     pub async fn open(

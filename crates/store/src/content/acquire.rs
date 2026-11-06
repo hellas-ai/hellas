@@ -38,13 +38,14 @@ fn hf_error(error: crate::hf::FetchError) -> Error {
 }
 async fn publish(
     store: &Core,
+    scope: &Scope,
     stages: BTreeMap<ContentId, Staged>,
     target: Target,
     pin: PinTarget,
 ) -> Result<Acquisition> {
     let object = target.object();
     store
-        .effect(move |store| {
+        .effect(scope, move |store| {
             store.publish_acquired(
                 stages
                     .into_values()
@@ -59,6 +60,7 @@ async fn publish(
 }
 pub(crate) async fn memory(
     store: &Core,
+    scope: &Scope,
     source: Source,
     expect: Option<ContentRef>,
     pin: PinTarget,
@@ -97,6 +99,7 @@ pub(crate) async fn memory(
             let target = Target::Object(stage.object);
             publish(
                 store,
+                scope,
                 BTreeMap::from([(stage.object.id(), stage)]),
                 target,
                 pin,
@@ -179,7 +182,7 @@ pub(crate) async fn memory(
                     }
                 }
             }
-            publish(store, stages, root, pin).await
+            publish(store, scope, stages, root, pin).await
         }
         Source::HfXet { repo, commit, path } => {
             repo.validate().map_err(hf_error)?;
@@ -191,12 +194,12 @@ pub(crate) async fn memory(
             }
             let core = store.clone();
             let (stages, root) = tokio::task::spawn_blocking(move || {
-                let cas = crate::hf::HfCas::new(repo);
+                let cas = core.hf(repo);
                 hf_stages(&cas, &core, path.as_deref(), expect, true)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            publish(store, stages, root, pin).await
+            publish(store, scope, stages, root, pin).await
         }
     }
 }
@@ -355,21 +358,52 @@ impl Core {
         scope: &Scope,
         repo: crate::hf::Repo,
     ) -> Result<(String, ContentRef)> {
-        if !matches!(scope, Scope::Owner) {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
+        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
+            return Err(Error::Denied);
+        }
+        self.access(scope, |_| Ok(())).await?;
+        let core = self.clone();
+        let resolving = repo.clone();
+        let sha = tokio::task::spawn_blocking(move || {
+            core.hf(resolving)
+                .resolve_revision(&core.pool)
+                .map_err(hf_error)
+        })
+        .await
+        .map_err(|_| Error::Invalid("resolve worker failed"))??;
+        let repo = crate::hf::Repo {
+            revision: sha.clone(),
+            ..repo
+        };
+        loop {
+            let result = self.resolve_hf_once(scope, repo.clone()).await;
+            if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
+                return result;
+            }
+            if self
+                .access(scope, |core| core.collect_sync(&Scope::Owner, true))
+                .await?
+                .objects
+                == 0
+            {
+                return result;
+            }
+        }
+    }
+    async fn resolve_hf_once(
+        &self,
+        scope: &Scope,
+        repo: crate::hf::Repo,
+    ) -> Result<(String, ContentRef)> {
+        self.access(scope, |_| Ok(())).await?;
         let core = self.clone();
         let id = repo.id.clone();
-        let (sha, stages, root) = tokio::task::spawn_blocking(move || {
-            let sha = crate::hf::HfCas::new(repo.clone())
-                .resolve_revision(&core.pool)
-                .map_err(hf_error)?;
-            let repo = crate::hf::Repo {
-                revision: sha.clone(),
-                ..repo
-            };
-            let (stages, root) = hf_stages(&crate::hf::HfCas::new(repo), &core, None, None, false)?;
-            Ok::<_, Error>((sha, stages, root))
+        let sha = repo.revision.clone();
+        let (stages, root) = tokio::task::spawn_blocking(move || {
+            hf_stages(&core.hf(repo), &core, None, None, false)
         })
         .await
         .map_err(|_| Error::Invalid("resolve worker failed"))??;
@@ -377,10 +411,10 @@ impl Core {
             name: PinName::new(format!("hf/{id}@{sha}"))?,
             policy: PinPolicy::Owner,
         };
-        let object = publish(self, stages, root, pin).await?.object;
+        let object = publish(self, scope, stages, root, pin).await?.object;
         Ok((sha, object))
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

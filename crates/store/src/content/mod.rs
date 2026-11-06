@@ -8,12 +8,13 @@ mod page;
 mod policy;
 mod remote;
 pub(crate) mod reservation;
+mod server;
 mod storage;
 mod tree;
 mod upload;
 mod wire;
 
-use std::{ops::Range, pin::Pin};
+use std::{ops::Range, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -33,6 +34,7 @@ pub use policy::{
 };
 pub use remote::RemoteStore;
 pub use reservation::Reservations;
+pub use server::ContentService;
 pub use tree::{MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_TREE_BYTES, MAX_TREE_ENTRIES, PinName, Tree};
 pub use upload::UploadSession;
 
@@ -118,8 +120,84 @@ pub struct GrantHandle {
 pub type Closure = Vec<ContentRef>;
 pub type ReservationId = u64;
 
+type AuthorityGuard = Box<dyn Fn() -> Result<()> + Send>;
+struct LiveAuthority {
+    acquire:
+        Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<AuthorityGuard>> + Send + Sync>,
+    ended: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+#[derive(Clone)]
+pub struct Scope {
+    pub kind: ScopeKind,
+    live: Option<Arc<LiveAuthority>>,
+}
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("kind", &self.kind)
+            .field("bound", &self.live.is_some())
+            .finish()
+    }
+}
+impl Scope {
+    #[allow(non_upper_case_globals)]
+    pub const Owner: Self = Self {
+        kind: ScopeKind::Owner,
+        live: None,
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Public: Self = Self {
+        kind: ScopeKind::Public,
+        live: None,
+    };
+    pub fn grant(handle: GrantHandle) -> Self {
+        Self {
+            kind: ScopeKind::Grant(handle),
+            live: None,
+        }
+    }
+    pub fn work(job: JobId, closure: Closure, reservation: ReservationId) -> Self {
+        Self {
+            kind: ScopeKind::Work {
+                job,
+                closure,
+                reservation,
+            },
+            live: None,
+        }
+    }
+    /// The concrete host returns a fresh-check closure owning its authority writer.
+    /// Keeping that closure alive keeps the writer alive through the local commit.
+    pub fn bind<F, Fut, G>(
+        mut self,
+        acquire: F,
+        ended: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<G>> + Send + 'static,
+        G: Fn() -> Result<()> + Send + 'static,
+    {
+        use futures::FutureExt;
+        self.live = Some(Arc::new(LiveAuthority {
+            acquire: Box::new(move || {
+                let future = acquire();
+                Box::pin(async move { Ok(Box::new(future.await?) as AuthorityGuard) })
+            }),
+            ended: ended.boxed().shared(),
+        }));
+        self
+    }
+    async fn ended(&self) {
+        match &self.live {
+            Some(live) => live.ended.clone().await,
+            None => std::future::pending().await,
+        }
+    }
+}
 #[derive(Clone, Debug)]
-pub enum Scope {
+pub enum ScopeKind {
     Owner,
     Grant(GrantHandle),
     Work {
@@ -288,3 +366,6 @@ macro_rules! impl_local_content {
 impl_local_content!(MemoryStore);
 
 impl_local_content!(DiskStore);
+
+#[cfg(test)]
+mod conformance;

@@ -49,6 +49,7 @@ url = "2"
 zstd = "0.14"
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["tls-ring"] }
 bytes.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-wire = { workspace = true, features = ["mux"] }

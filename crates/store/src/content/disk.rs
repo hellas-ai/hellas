@@ -626,7 +626,7 @@ impl Drop for FileObject {
 impl DiskStore {
     pub async fn rescan(&self, lower: Vec<PathBuf>, mode: IndexMode) -> Result<()> {
         self.core
-            .access(move |core| {
+            .access(&Scope::Owner, move |core| {
                 let objects = core.disk.as_ref().unwrap().scan(&lower, mode)?;
                 core.state.lock().unwrap().reload(objects);
                 Ok(())
@@ -640,7 +640,9 @@ impl DiskStore {
         max_upload_bytes: u64,
     ) -> Result<Scope> {
         self.core
-            .admit(move |core| core.open_work(job, closure.clone(), max_upload_bytes))
+            .admit(&Scope::Owner, move |core| {
+                core.open_work(job, closure.clone(), max_upload_bytes)
+            })
             .await
     }
     pub async fn widen_work(
@@ -651,17 +653,23 @@ impl DiskStore {
     ) -> Result<Scope> {
         let scope = scope.clone();
         self.core
-            .admit(move |core| core.widen_work(&scope, closure.clone(), max_upload_bytes))
+            .admit(&scope.clone(), move |core| {
+                core.widen_work(&scope, closure.clone(), max_upload_bytes)
+            })
             .await
     }
     pub async fn end_work(&self, scope: &Scope) -> Result<()> {
         let scope = scope.clone();
-        self.core.effect(move |core| core.end_work(&scope)).await
+        self.core
+            .effect(&Scope::Owner, move |core| core.end_work(&scope))
+            .await
     }
     pub async fn reserve_output(&self, scope: &Scope, bytes: u64) -> Result<()> {
         let scope = scope.clone();
         self.core
-            .admit(move |core| core.reserve_output(&scope, bytes))
+            .admit(&scope.clone(), move |core| {
+                core.reserve_output(&scope, bytes)
+            })
             .await
     }
     pub async fn resolve_hf(
@@ -677,7 +685,9 @@ impl DiskStore {
     pub async fn stage_output(&self, scope: &Scope, object: ContentRef) -> Result<UploadSession> {
         let scope = scope.clone();
         self.core
-            .effect(move |core| core.stage_output(&scope, object))
+            .effect(&scope.clone(), move |core| {
+                core.stage_output(&scope, object)
+            })
             .await
     }
 }
@@ -817,7 +827,9 @@ impl DiskStore {
     pub async fn promote_work(&self, scope: &Scope, target: Target, pin: PinTarget) -> Result<()> {
         let scope = scope.clone();
         self.core
-            .effect(move |core| core.promote_work(&scope, target, pin))
+            .effect(&scope.clone(), move |core| {
+                core.promote_work(&scope, target, pin)
+            })
             .await
     }
 }
@@ -843,7 +855,9 @@ impl DiskStore {
     ) -> Result<Option<super::local::VerifiedReader>> {
         let scope = scope.clone();
         self.core
-            .access(move |core| core.verified(&scope, object, None, true))
+            .access(&scope.clone(), move |core| {
+                core.verified(&scope, object, None, true)
+            })
             .await
     }
 }

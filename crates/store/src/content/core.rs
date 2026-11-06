@@ -15,6 +15,8 @@ pub(crate) struct Core {
     pub(crate) changed: Arc<tokio::sync::Notify>,
     pub(crate) peers: Option<hellas_wire::iroh::Pool>,
     pub(crate) http: ureq::Agent,
+    #[cfg(test)]
+    pub(crate) hf_hub: Option<String>,
     pub(crate) disk: Option<Arc<super::disk::Disk>>,
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) lower: Option<(Box<Core>, BTreeMap<ContentId, Path>)>,
@@ -62,6 +64,8 @@ impl Core {
             lower: None,
             peers: None,
             http: ureq::Agent::new_with_defaults(),
+            #[cfg(test)]
+            hf_hub: None,
             changed: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(Mutex::new(State {
                 objects: BTreeMap::new(),
@@ -101,18 +105,10 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         if let Some((id, work)) = state.work.iter().find(|(_, work)| work.job == job) {
-            return Ok(Scope::Work {
-                job,
-                closure: work.closure.clone(),
-                reservation: *id,
-            });
+            return Ok(Scope::work(job, work.closure.clone(), *id));
         }
         let closure = canonical_closure(closure)?;
-        let scope = Scope::Work {
-            job,
-            closure: closure.clone(),
-            reservation: 0,
-        };
+        let scope = Scope::work(job, closure.clone(), 0);
         let mut missing = self.missing(&state, &scope, &closure)?;
         let staged = match &self.disk {
             Some(disk) => disk.recover_staged(job)?,
@@ -152,11 +148,7 @@ impl Core {
                 staged,
             },
         );
-        Ok(Scope::Work {
-            job,
-            closure,
-            reservation,
-        })
+        Ok(Scope::work(job, closure, reservation))
     }
     /// Widen only after the application has verified and parsed the root.
     pub fn widen_work(
@@ -170,9 +162,9 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work {
+        let ScopeKind::Work {
             job, reservation, ..
-        } = scope
+        } = &scope.kind
         else {
             return Err(Error::Denied);
         };
@@ -184,11 +176,8 @@ impl Core {
         if work.closure.iter().any(|object| !closure.contains(object)) {
             return Err(Error::Invalid("closure cannot narrow"));
         }
-        let new_scope = Scope::Work {
-            job: *job,
-            closure: closure.clone(),
-            reservation: *reservation,
-        };
+        let mut new_scope = Scope::work(*job, closure.clone(), *reservation);
+        new_scope.live = scope.live.clone();
         let missing = self.missing(&state, &new_scope, &closure)?;
         if missing > max_upload_bytes {
             return Err(Error::Capacity);
@@ -220,7 +209,7 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work { reservation, .. } = scope else {
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
         };
         state
@@ -232,9 +221,9 @@ impl Core {
         Ok(())
     }
     pub fn end_work(&self, scope: &Scope) -> Result<()> {
-        let Scope::Work {
+        let ScopeKind::Work {
             job, reservation, ..
-        } = scope
+        } = &scope.kind
         else {
             return Err(Error::Denied);
         };
@@ -276,8 +265,8 @@ impl Core {
         pin: Option<PinTarget>,
     ) -> Result<super::upload::LocalSession> {
         state.check(scope)?;
-        let (reservation, charge) = match scope {
-            Scope::Owner => {
+        let (reservation, charge) = match &scope.kind {
+            ScopeKind::Owner => {
                 if pin.is_none() {
                     return Err(Error::Invalid("owner upload requires pin"));
                 }
@@ -290,7 +279,7 @@ impl Core {
                     self.data_pool().reserve(object.bytes())?,
                 )
             }
-            Scope::Work {
+            ScopeKind::Work {
                 reservation,
                 closure,
                 ..
@@ -358,17 +347,17 @@ impl Core {
                 pin.clone(),
             )?;
             self.changed.notify_waiters();
-        } else if let Scope::Work { reservation, .. } = session.scope {
+        } else if let ScopeKind::Work { reservation, .. } = &session.scope.kind {
             // Completed disk staging has a durable canonical name before the
             // application can journal its reference. Scope protection stays live.
-            if let (Some(_), Scope::Work { job, .. }) = (&self.disk, &session.scope)
+            if let (Some(_), ScopeKind::Work { job, .. }) = (&self.disk, &session.scope.kind)
                 && let super::storage::Data::File(file) = &stored.data
             {
                 file.stage(*job)?;
             }
             state
                 .work
-                .get_mut(&reservation)
+                .get_mut(reservation)
                 .ok_or(Error::Denied)?
                 .staged
                 .insert(session.object.id(), stored);
@@ -396,11 +385,11 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work {
+        let ScopeKind::Work {
             reservation,
             closure,
             ..
-        } = scope
+        } = &scope.kind
         else {
             return Err(Error::Denied);
         };
@@ -448,30 +437,31 @@ fn readable(scope: &Scope, name: &PinName, pin: &PinValue) -> bool {
     if !live(pin) {
         return false;
     }
-    matches!(scope, Scope::Owner)
-        || match (&pin.policy, scope) {
+    matches!(scope.kind, ScopeKind::Owner)
+        || match (&pin.policy, &scope.kind) {
+            (PinPolicy::Public, ScopeKind::Work { .. }) => false,
             (PinPolicy::Public, _) => true,
-            (PinPolicy::Jobs, Scope::Work { .. }) => true,
-            (PinPolicy::Channel(channel), Scope::Work { job, .. }) => *channel == job.channel,
-            (PinPolicy::Granted, Scope::Grant(grant)) => grant.pin == *name,
+            (PinPolicy::Jobs, ScopeKind::Work { .. }) => true,
+            (PinPolicy::Channel(channel), ScopeKind::Work { job, .. }) => *channel == job.channel,
+            (PinPolicy::Granted, ScopeKind::Grant(grant)) => grant.pin == *name,
             _ => false,
         }
 }
 fn metadata_readable(scope: &Scope, name: &PinName, pin: &PinValue) -> bool {
     readable(scope, name, pin)
-        && match scope {
-            Scope::Work { closure, .. } => closure.contains(&pin.target.object()),
+        && match &scope.kind {
+            ScopeKind::Work { closure, .. } => closure.contains(&pin.target.object()),
             _ => true,
         }
 }
 
 impl State {
     fn check(&self, scope: &Scope) -> Result<()> {
-        if let Scope::Work {
+        if let ScopeKind::Work {
             job,
             reservation,
             closure,
-        } = scope
+        } = &scope.kind
             && self
                 .work
                 .get(reservation)
@@ -550,7 +540,7 @@ impl State {
         closure
             .iter()
             .filter(|object| {
-                let owned = if let Scope::Work { reservation, .. } = scope {
+                let owned = if let ScopeKind::Work { reservation, .. } = &scope.kind {
                     self.work
                         .get(reservation)
                         .is_some_and(|work| work.staged.contains_key(&object.id()))
@@ -597,7 +587,7 @@ impl State {
                 target = *child;
             }
         }
-        if let Scope::Work { closure, .. } = scope
+        if let ScopeKind::Work { closure, .. } = &scope.kind
             && !closure.contains(&target.object())
         {
             return Ok(None);
@@ -682,7 +672,7 @@ impl Core {
                     return Ok(None);
                 };
                 {
-                    let _gate = store.gate.lock().await;
+                    let _gate = store.effect_gate(&scope).await?;
                     let state = store
                         .state
                         .lock()
@@ -716,13 +706,13 @@ impl Core {
                 .lock()
                 .map_err(|_| Error::Invalid("store lock"))?;
             state.check(scope)?;
-            match scope {
-                Scope::Owner if pin.is_some() => {}
-                Scope::Work { closure, .. } if pin.is_none() && closure.contains(&object) => {}
+            match &scope.kind {
+                ScopeKind::Owner if pin.is_some() => {}
+                ScopeKind::Work { closure, .. } if pin.is_none() && closure.contains(&object) => {}
                 _ => return Err(Error::Denied),
             }
-            let own = match scope {
-                Scope::Work { reservation, .. } => state
+            let own = match &scope.kind {
+                ScopeKind::Work { reservation, .. } => state
                     .work
                     .get(reservation)
                     .and_then(|work| work.staged.get(&object.id()))
@@ -761,7 +751,7 @@ impl Core {
         expected: Option<&PinValue>,
         new: Option<PinValue>,
     ) -> Result<()> {
-        if !matches!(scope, Scope::Owner) {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         PinName::new(name.as_str().to_owned())?;
@@ -857,7 +847,12 @@ impl Core {
                     tokio::pin!(wake);
                     wake.as_mut().enable();
                     let next = {
-                        let _gate = store.gate.lock().await;
+                        let _gate = match store.effect_gate(&scope).await {
+                            Ok(gate) => gate,
+                            Err(error) => {
+                                return Some((Err(error), (store.clone(), scope, prefix, None)));
+                            }
+                        };
                         let state = store.state.lock().unwrap();
                         if let Err(error) = state.check(&scope) {
                             return Some((Err(error), (store.clone(), scope, prefix, None)));
@@ -935,8 +930,8 @@ impl Core {
             },
         )))
     }
-    fn collect_sync(&self, scope: &Scope, one: bool) -> Result<Collected> {
-        if !matches!(scope, Scope::Owner) {
+    pub(crate) fn collect_sync(&self, scope: &Scope, one: bool) -> Result<Collected> {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         let mut state = self
@@ -1010,31 +1005,42 @@ impl Core {
         &self,
         f: impl FnOnce(Core) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let lower_gate = match &self.lower {
-            Some((lower, _)) => Some(lower.gate.clone().lock_owned().await),
-            None => None,
-        };
         let core = self.clone();
         if self.disk.is_some() || self.lower.is_some() {
-            tokio::task::spawn_blocking(move || {
-                let _lower_gate = lower_gate;
-                f(core)
-            })
-            .await
-            .map_err(|_| Error::Invalid("content worker"))?
+            tokio::task::spawn_blocking(move || f(core))
+                .await
+                .map_err(|_| Error::Invalid("content worker"))?
         } else {
             f(core)
         }
     }
+    pub(crate) async fn effect_gate(&self, scope: &Scope) -> Result<EffectGate> {
+        // Lock order: authority writer, Core gate, fresh time check, local effect/commit.
+        let authority = match &scope.live {
+            Some(live) => Some((live.acquire)().await?),
+            None => None,
+        };
+        let gate = self.gate.clone().lock_owned().await;
+        let lower = match &self.lower {
+            Some((lower, _)) => Some(lower.gate.clone().lock_owned().await),
+            None => None,
+        };
+        if let Some(check) = &authority {
+            check()?;
+        }
+        Ok((gate, lower, authority))
+    }
     pub(crate) async fn effect<T: Send + 'static>(
         &self,
+        scope: &Scope,
         f: impl FnOnce(Core) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let core = self.clone();
+        let scope = scope.clone();
         // The effect owns its serialization and database commit independently of
         // the request future. Cancellation cannot undo RAM after SQLite commits.
         tokio::spawn(async move {
-            let gate = core.gate.clone().lock_owned().await;
+            let gate = core.effect_gate(&scope).await?;
             let before = {
                 let state = core
                     .state
@@ -1074,9 +1080,10 @@ impl Core {
     }
     pub(crate) async fn access<T: Send + 'static>(
         &self,
+        scope: &Scope,
         f: impl FnOnce(Core) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let gate = self.gate.clone().lock_owned().await;
+        let gate = self.effect_gate(scope).await?;
         self.run(move |core| {
             let _gate = gate;
             f(core)
@@ -1084,6 +1091,11 @@ impl Core {
         .await
     }
 }
+type EffectGate = (
+    tokio::sync::OwnedMutexGuard<()>,
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+    Option<AuthorityGuard>,
+);
 type PinSnapshot = (
     BTreeMap<PinName, PinValue>,
     u64,
@@ -1093,7 +1105,7 @@ type PinSnapshot = (
 struct PinCommit {
     core: Core,
     before: Option<PinSnapshot>,
-    _gate: tokio::sync::OwnedMutexGuard<()>,
+    _gate: EffectGate,
 }
 impl Drop for PinCommit {
     fn drop(&mut self) {
@@ -1110,15 +1122,17 @@ impl Drop for PinCommit {
 impl ContentStore for Core {
     async fn stat(&self, s: &Scope, at: &Path) -> Result<Option<Stat>> {
         let (s, at) = (s.clone(), at.clone());
-        self.access(move |c| c.stat_sync(&s, &at)).await
+        self.access(&s.clone(), move |c| c.stat_sync(&s, &at)).await
     }
     async fn chunks(&self, s: &Scope, at: &Path, page: Cursor) -> Result<ChunkPage> {
         let (s, at) = (s.clone(), at.clone());
-        self.access(move |c| c.chunks_sync(&s, &at, page)).await
+        self.access(&s.clone(), move |c| c.chunks_sync(&s, &at, page))
+            .await
     }
     async fn read(&self, s: &Scope, at: &Path, range: std::ops::Range<u64>) -> Result<ByteStream> {
         let (s, at) = (s.clone(), at.clone());
-        self.access(move |c| c.read_sync(&s, &at, range)).await
+        self.access(&s.clone(), move |c| c.read_sync(&s, &at, range))
+            .await
     }
     async fn upload(
         &self,
@@ -1130,8 +1144,10 @@ impl ContentStore for Core {
             return Err(Error::Denied);
         }
         let scope = s.clone();
-        self.admit(move |core| core.upload_sync(&scope, object, pin.clone()))
-            .await
+        self.admit(&scope.clone(), move |core| {
+            core.upload_sync(&scope, object, pin.clone())
+        })
+        .await
     }
     async fn acquire(
         &self,
@@ -1140,19 +1156,20 @@ impl ContentStore for Core {
         expect: Option<ContentRef>,
         pin: PinTarget,
     ) -> Result<Acquisition> {
-        if !matches!(s, Scope::Owner) {
+        if !matches!(s.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
             return Err(Error::Denied);
         }
         loop {
-            let result = super::acquire::memory(self, source.clone(), expect, pin.clone()).await;
+            self.access(s, |_| Ok(())).await?;
+            let result = super::acquire::memory(self, s, source.clone(), expect, pin.clone()).await;
             if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
                 return result;
             }
             if self
-                .access(|core| core.collect_sync(&Scope::Owner, true))
+                .access(s, |core| core.collect_sync(&Scope::Owner, true))
                 .await?
                 .objects
                 == 0
@@ -1169,20 +1186,25 @@ impl ContentStore for Core {
         new: Option<PinValue>,
     ) -> Result<()> {
         let (s, name, expected) = (s.clone(), name.clone(), expected.cloned());
-        self.effect(move |c| c.set_pin_sync(&s, &name, expected.as_ref(), new))
-            .await
+        self.effect(&s.clone(), move |c| {
+            c.set_pin_sync(&s, &name, expected.as_ref(), new)
+        })
+        .await
     }
     async fn pins(&self, s: &Scope, prefix: &str, page: Cursor) -> Result<PinPage> {
         let (s, prefix) = (s.clone(), prefix.to_owned());
-        self.access(move |c| c.pins_sync(&s, &prefix, page)).await
+        self.access(&s.clone(), move |c| c.pins_sync(&s, &prefix, page))
+            .await
     }
     async fn watch(&self, s: &Scope, prefix: &str, from: Cursor) -> Result<PinEvents> {
         let (s, prefix) = (s.clone(), prefix.to_owned());
-        self.access(move |c| c.watch_sync(&s, &prefix, from)).await
+        self.access(&s.clone(), move |c| c.watch_sync(&s, &prefix, from))
+            .await
     }
     async fn collect(&self, s: &Scope) -> Result<Collected> {
         let s = s.clone();
-        self.access(move |c| c.collect_sync(&s, false)).await
+        self.access(&s.clone(), move |c| c.collect_sync(&s, false))
+            .await
     }
 }
 
@@ -1193,7 +1215,7 @@ impl Core {
         bytes: Bytes,
     ) -> Result<super::upload::LocalSession> {
         use std::io::Write;
-        self.run(move |core| {
+        self.access(&local.scope.clone(), move |core| {
             core.check(&local.scope)?;
             local
                 .bytes
@@ -1213,7 +1235,7 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work { reservation, .. } = scope else {
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
         };
         let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
@@ -1266,11 +1288,11 @@ impl Core {
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
         if job_upper
-            && let Scope::Work {
+            && let ScopeKind::Work {
                 reservation,
                 closure,
                 ..
-            } = scope
+            } = &scope.kind
         {
             if !closure.contains(&object) {
                 return Err(Error::Denied);
@@ -1324,7 +1346,7 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work { reservation, .. } = scope else {
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
         };
         let work = state.work.get(reservation).ok_or(Error::Denied)?;
@@ -1364,7 +1386,7 @@ impl Core {
             .lock()
             .map_err(|_| Error::Invalid("store lock"))?;
         state.check(scope)?;
-        let Scope::Work { reservation, .. } = scope else {
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
         };
         let staged = state
@@ -1391,17 +1413,18 @@ impl Core {
 impl Core {
     pub(crate) async fn admit<T: Send + 'static>(
         &self,
+        scope: &Scope,
         f: impl Fn(Core) -> Result<T> + Clone + Send + 'static,
     ) -> Result<T> {
         loop {
-            let result = self.effect(f.clone()).await;
+            let result = self.effect(scope, f.clone()).await;
             if !matches!(result, Err(Error::Capacity))
                 || self.disk.as_ref().is_none_or(|disk| !disk.ready())
             {
                 return result;
             }
             if self
-                .access(|core| core.collect_sync(&Scope::Owner, true))
+                .access(scope, |core| core.collect_sync(&Scope::Owner, true))
                 .await?
                 .objects
                 == 0
@@ -1499,3 +1522,17 @@ impl State {
         self.objects = objects;
     }
 }
+
+impl Core {
+    pub(crate) fn hf(&self, repo: crate::hf::Repo) -> crate::hf::HfCas {
+        let cas = crate::hf::HfCas::new(repo);
+        #[cfg(test)]
+        if let Some(hub) = &self.hf_hub {
+            return cas.with_hub(hub.clone());
+        }
+        cas
+    }
+}
+
+#[cfg(test)]
+mod tests;

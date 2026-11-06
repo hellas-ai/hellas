@@ -359,13 +359,15 @@ where
         object: ContentRef,
         pin: Option<PinTarget>,
     ) -> Result<UploadSession> {
-        match scope {
-            Scope::Owner if pin.is_some() => {}
-            Scope::Work { closure, .. } if pin.is_none() && closure.contains(&object) => {}
+        match &scope.kind {
+            ScopeKind::Owner if pin.is_some() => {}
+            ScopeKind::Work { closure, .. } if pin.is_none() && closure.contains(&object) => {}
             _ => return Err(Error::Denied),
         }
-        let mut remote =
-            RemoteSession::begin(self.upload.clone(), matches!(scope, Scope::Work { .. }))?;
+        let mut remote = RemoteSession::begin(
+            self.upload.clone(),
+            matches!(scope.kind, ScopeKind::Work { .. }),
+        )?;
         let opening = if remote.call.is_none() {
             remote.call = Some(self.client.upload().await.map_err(w::error)?);
             self.opening.clone()
@@ -408,7 +410,7 @@ where
         expect: Option<ContentRef>,
         pin: PinTarget,
     ) -> Result<Acquisition> {
-        if !matches!(scope, Scope::Owner) {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         let mut call = self
@@ -444,7 +446,7 @@ where
         expected: Option<&PinValue>,
         new: Option<PinValue>,
     ) -> Result<()> {
-        if !matches!(scope, Scope::Owner) {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         self.client
@@ -498,7 +500,7 @@ where
         }))
     }
     async fn collect(&self, scope: &Scope) -> Result<Collected> {
-        if !matches!(scope, Scope::Owner) {
+        if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
         let response = self

@@ -187,3 +187,49 @@ pub(crate) fn error(status: hellas_wire::WireStatus) -> Error {
         _ => Error::Invalid("remote content operation failed"),
     }
 }
+
+pub(crate) fn path_from(at: pb::Path) -> Result<Path> {
+    Path::new(PinName::new(at.pin)?, at.path)
+}
+pub(crate) fn pin_target_from(pin: pb::PinTarget) -> Result<PinTarget> {
+    Ok(PinTarget {
+        name: PinName::new(pin.name)?,
+        policy: policy_from(pin.policy.ok_or(Error::Invalid("missing pin policy"))?)?,
+    })
+}
+pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
+    use pb::source::Kind;
+    Ok(match source.kind.ok_or(Error::Invalid("missing source"))? {
+        Kind::Peer(peer) => Source::Peer {
+            node: peer
+                .node
+                .try_into()
+                .map_err(|_| Error::Invalid("peer id"))?,
+            at: path_from(peer.at.ok_or(Error::Invalid("missing peer path"))?)?,
+        },
+        Kind::Https(source) => Source::Https {
+            url: source
+                .url
+                .parse()
+                .map_err(|_| Error::Invalid("HTTPS source"))?,
+            bytes: source.bytes,
+            sha256: source
+                .sha256
+                .map(|sha| sha.try_into().map_err(|_| Error::Invalid("SHA-256")))
+                .transpose()?,
+        },
+        Kind::HfXet(source) => Source::HfXet {
+            repo: crate::hf::Repo {
+                id: source.repo,
+                revision: source.commit.clone(),
+                kind: if source.dataset {
+                    crate::hf::RepoKind::Dataset
+                } else {
+                    crate::hf::RepoKind::Model
+                },
+            },
+            commit: source.commit,
+            path: source.path,
+        },
+    })
+}

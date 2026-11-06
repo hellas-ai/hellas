@@ -4,6 +4,7 @@
 extern crate self as hellas_authority;
 mod audit;
 pub mod authenticator;
+pub mod content;
 pub mod grant_service;
 pub mod model;
 pub mod node;

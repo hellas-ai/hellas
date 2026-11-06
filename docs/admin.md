@@ -127,6 +127,12 @@ table below is checked against the implementation by the Work tests.
 <!-- operations:start -->
 | Required operation | Resource | Mounted service |
 | --- | --- | --- |
+| `content.read` | Exact content pin; Host for owner | Host |
+| `content.upload` | Host | Host |
+| `content.acquire` | Host | Host |
+| `content.pin.set` | Host | Host |
+| `content.collect` | Host | Host |
+| `content.resolve` | Host | Host |
 | `host.status` | Host | Host |
 | `host.provider.configure` | Host | Host |
 | `host.provider.bind` | Host | Host |

@@ -55,7 +55,9 @@ impl JobContent {
         core.lower = Some((Box::new(node.core.clone()), bindings));
         let scope = core
             .clone()
-            .run(move |core| core.open_work(job, closure, max_upload_bytes))
+            .access(&Scope::Owner, move |core| {
+                core.open_work(job, closure, max_upload_bytes)
+            })
             .await?;
         Ok(Self {
             upper: MemoryStore { core },
@@ -72,7 +74,7 @@ impl JobContent {
         let scope = self.scope.clone();
         self.upper
             .core
-            .access(move |core| core.end_work(&scope))
+            .access(&Scope::Owner, move |core| core.end_work(&scope))
             .await
     }
 }
@@ -92,17 +94,17 @@ impl LocalStore {
             Self::Disk(store) => (store.core.clone(), false),
             Self::Job(job) => {
                 if let (
-                    Scope::Work {
+                    ScopeKind::Work {
                         job: a,
                         reservation: ar,
                         ..
                     },
-                    Scope::Work {
+                    ScopeKind::Work {
                         job: b,
                         reservation: br,
                         ..
                     },
-                ) = (scope, &job.scope)
+                ) = (&scope.kind, &job.scope.kind)
                 {
                     if a != b || ar != br {
                         return Err(Error::Denied);
@@ -114,7 +116,9 @@ impl LocalStore {
             }
         };
         let (scope, at) = (scope.clone(), at.cloned());
-        core.access(move |core| core.verified(&scope, object, at.as_ref(), job))
-            .await
+        core.access(&scope.clone(), move |core| {
+            core.verified(&scope, object, at.as_ref(), job)
+        })
+        .await
     }
 }

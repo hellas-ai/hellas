@@ -10,6 +10,9 @@ pub enum Scope {
     Host,
     Machine,
     Allowance,
+    // Exact pin resources are opaque hashes; accepting a grant may precede pin creation.
+    // Runtime content access still derives the exact name and checks its current policy.
+    Pin,
 }
 #[derive(Clone, Copy)]
 pub enum Mount {
@@ -25,6 +28,12 @@ pub struct Operation {
 }
 
 pub const OPERATIONS: &[Operation] = &[
+    Operation::new(crate::content::READ, Scope::Pin, Mount::Host),
+    Operation::new(crate::content::UPLOAD, Scope::Host, Mount::Host),
+    Operation::new(crate::content::ACQUIRE, Scope::Host, Mount::Host),
+    Operation::new(crate::content::SET_PIN, Scope::Host, Mount::Host),
+    Operation::new(crate::content::COLLECT, Scope::Host, Mount::Host),
+    Operation::new(crate::content::RESOLVE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_STATUS, Scope::Host, Mount::Host),
     Operation::new(node::HOST_PROVIDER_CONFIGURE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_PROVIDER_BIND, Scope::Host, Mount::Host),
@@ -61,6 +70,7 @@ impl Operation {
     ) -> Result<Permission, AuthorityError> {
         let resource = match self.scope {
             Scope::Host => node::host_resource(authority),
+            Scope::Pin => node::host_resource(authority),
             Scope::Machine => node::machine_resource(authority),
             Scope::Allowance => grant_service::allowance_resource(
                 authority,
@@ -115,7 +125,9 @@ pub(crate) fn validate_scope(state: &State, scope: &GrantSpec) -> Result<(), Aut
     let valid = |p: &Permission| {
         (authority_operations.contains(&p.operation.as_str()) && p.resource == authority.resource())
             || mounted().any(|op| {
-                op.name == p.operation.as_str() && op.resources(state).any(|r| r == p.resource)
+                op.name == p.operation.as_str()
+                    && (matches!(op.scope, Scope::Pin)
+                        || op.resources(state).any(|r| r == p.resource))
             })
     };
     let known_resource = |id: &ResourceId| {
@@ -127,7 +139,13 @@ pub(crate) fn validate_scope(state: &State, scope: &GrantSpec) -> Result<(), Aut
     if let Some(ceiling) = &scope.issuance {
         let known_resources = match &ceiling.resources {
             CeilingResources::Authority => true,
-            CeilingResources::Named(ids) => ids.iter().all(known_resource),
+            CeilingResources::Named(ids) => {
+                ids.iter().all(known_resource)
+                    || ceiling
+                        .operations
+                        .iter()
+                        .any(|op| op.as_str() == crate::content::READ)
+            }
         };
         if !known_resources
             || ceiling.operations.iter().any(|op| {

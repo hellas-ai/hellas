@@ -111,11 +111,26 @@ async fn cancelling_the_caller_during_sqlite_wait_still_commits_before_watch_and
     // Keep the sole connection occupied while the effect updates its pending
     // state. Its returned watcher must remain behind the shared commit gate.
     let tx = disk.db.begin().await.unwrap();
+    let authority = Arc::new(tokio::sync::Mutex::new(()));
+    let acquiring = authority.clone();
+    let scope = Scope::Owner.bind(
+        move || {
+            let acquiring = acquiring.clone();
+            async move {
+                let writer = acquiring.lock_owned().await;
+                Ok(move || {
+                    let _held = &writer;
+                    Ok(())
+                })
+            }
+        },
+        std::future::pending(),
+    );
     let applying = store.clone();
     let caller = tokio::spawn(async move {
         applying
             .set_pin(
-                &Scope::Owner,
+                &scope,
                 &pin("new").name,
                 None,
                 Some(PinValue {
@@ -130,8 +145,10 @@ async fn cancelling_the_caller_during_sqlite_wait_still_commits_before_watch_and
         tokio::task::yield_now().await;
     }
     assert!(watch.next().now_or_never().is_none());
+    assert!(authority.try_lock().is_err());
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(authority.try_lock().is_err());
     tx.rollback().await.unwrap();
     assert!(
         matches!(watch.next().await.unwrap().unwrap(),PinEvent::Set{name,..}if name.as_str()=="new")
@@ -143,6 +160,7 @@ async fn cancelling_the_caller_during_sqlite_wait_still_commits_before_watch_and
             .unwrap()
             .is_some()
     );
+    assert!(authority.try_lock().is_ok());
     drop(watch);
     store.close().await;
     drop(disk);
@@ -228,7 +246,7 @@ async fn invalid_acquired_tree_drops_private_files_and_cannot_fill_an_existing_p
     let before = store.stats().unwrap().used;
     let core = store.core.clone();
     let result = core
-        .effect(move |core| {
+        .effect(&Scope::Owner, move |core| {
             let charge = core.data_pool().reserve(object.bytes())?;
             let mut buffer = super::super::storage::Buffer::new(&core, object.bytes(), charge)?;
             buffer.write_all(b"not a tree")?;

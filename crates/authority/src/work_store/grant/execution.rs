@@ -74,8 +74,7 @@ impl NodeStore {
                 .chain(
                     self.deliveries
                         .iter()
-                        .filter_map(std::sync::Weak::upgrade)
-                        .map(|delivery| delivery.cancellation().clone()),
+                        .filter_map(super::delivery::DeliveryEntry::cancellation),
                 )
                 .collect(),
         )

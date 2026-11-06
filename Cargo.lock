@@ -3054,6 +3054,7 @@ dependencies = [
  "hellas-wire",
  "hellas-xet",
  "hex",
+ "iroh",
  "k256",
  "proptest",
  "prost",
