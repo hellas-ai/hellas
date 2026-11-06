@@ -708,18 +708,7 @@ where
         .ok_or(SetupDriveError::CloseNotArmed)?;
     if !channel.state().origin_observed() {
         let block = history_block(blocks, origin.height).await?;
-        if block.payload != origin.payload
-            || block.parent != origin.parent
-            || !block.txs.iter().any(|tx| opens(tx, origin.payment_edge))
-        {
-            return Err(SetupDriveError::OriginNotContiguous {
-                height: origin.height,
-            });
-        }
-        apply_finalized_txs(channel, &block, verifier).await?;
-        channel
-            .commit(ChannelRecord::OriginObserved, verifier)
-            .await?;
+        observe_origin(channel, origin, &block, verifier).await?;
     }
     for height in channel.state().cursor().0.saturating_add(1)..=through {
         let block = history_block(blocks, height).await?;
@@ -729,6 +718,33 @@ where
         *settled = channel.state().close_settled().is_some();
     }
     Ok(advance)
+}
+
+/// Finish the opening block on an already recovered channel, before successors
+/// or fresh readiness. Fetch the block before taking a shared channel writer.
+pub async fn observe_origin<V: SigVerifier>(
+    channel: &mut ChannelStore,
+    origin: SetupOrigin,
+    block: &FinalizedWork,
+    verifier: &V,
+) -> Result<(), SetupDriveError> {
+    if channel.state().origin_observed() {
+        return Ok(());
+    }
+    if block.height != origin.height
+        || block.payload != origin.payload
+        || block.parent != origin.parent
+        || !block.txs.iter().any(|tx| opens(tx, origin.payment_edge))
+    {
+        return Err(SetupDriveError::OriginNotContiguous {
+            height: origin.height,
+        });
+    }
+    apply_finalized_txs(channel, block, verifier).await?;
+    channel
+        .commit(ChannelRecord::OriginObserved, verifier)
+        .await?;
+    Ok(())
 }
 
 /// Returns what to read for this setup, once it names a payment edge.

@@ -1131,3 +1131,130 @@ async fn paid_root_completion_consults_the_policy_with_the_full_missing_referenc
     connection.cancel();
     wait_for_pending_cleanup(&node).await;
 }
+
+#[tokio::test]
+async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial_checkpoint() {
+    use hellas_channel::work_store::{
+        ChannelStateError, WorkStoreError,
+        journal::{Journal, JournalId, JournalKind},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let ready = fixture::ready();
+    let key = ChannelStore::journal_key(ready.channel());
+    let stem = format!("channel-{}", hex::encode(key));
+    let identity = JournalId {
+        kind: JournalKind::Channel,
+        role: Role::Provider,
+        key,
+    };
+    let (mut journal, _) = Journal::open_latest(root.path(), &stem, identity)
+        .await
+        .unwrap();
+    journal.close().await;
+    drop(journal);
+    let node = fixture::content_store(root.path()).await;
+    assert!(
+        ChannelStore::recover(
+            root.path(),
+            ready.channel().clone(),
+            Role::Provider,
+            node.clone(),
+            &Secp256k1Verifier::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    let (mut journal, _) = Journal::open_existing(root.path(), &stem, identity)
+        .await
+        .unwrap();
+    journal
+        .append(&ChannelRecord::OriginObserved.encode())
+        .await
+        .unwrap();
+    journal.close().await;
+    drop(journal);
+    assert!(matches!(
+        ChannelStore::recover(
+            root.path(),
+            ready.channel().clone(),
+            Role::Provider,
+            node.clone(),
+            &Secp256k1Verifier::new()
+        )
+        .await,
+        Err(WorkStoreError::Channel(ChannelStateError::Malformed))
+    ));
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    node.close().await;
+}
+
+#[tokio::test]
+async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond() {
+    use hellas_channel::work_store::{
+        ChannelStateError, WorkStoreError,
+        journal::{Journal, JournalId, JournalKind},
+    };
+    for wrong_bond in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let settlement = fixture::settlement();
+        let node = fixture::content_store(root.path()).await;
+        let store = ChannelStore::open(
+            root.path(),
+            ready.channel().clone(),
+            settlement,
+            Role::Provider,
+            fixture::origin(),
+            node.clone(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        let mut checkpoint = store.state().checkpoint();
+        drop(store);
+        // The existing checkpoint starts with channel id and the four funding
+        // totals. Keep arithmetic coherent in the signed-bond negative control.
+        let capacity = if wrong_bond {
+            checkpoint[56..64].copy_from_slice(&(settlement.omission_bond() + 1).to_be_bytes());
+            settlement.capacity() - 1
+        } else {
+            settlement.capacity() + 1
+        };
+        checkpoint[48..56].copy_from_slice(&capacity.to_be_bytes());
+        let key = ChannelStore::journal_key(ready.channel());
+        let (mut journal, _) = Journal::open_existing(
+            root.path(),
+            &format!("channel-{}", hex::encode(key)),
+            JournalId {
+                kind: JournalKind::Channel,
+                role: Role::Provider,
+                key,
+            },
+        )
+        .await
+        .unwrap();
+        journal.rotate(&checkpoint).await.unwrap();
+        journal.close().await;
+        drop(journal);
+        let error = ChannelStore::recover(
+            root.path(),
+            ready.channel().clone(),
+            Role::Provider,
+            node.clone(),
+            &Secp256k1Verifier::new(),
+        )
+        .await;
+        assert!(matches!(
+            error,
+            Err(WorkStoreError::Channel(ref cause)) if *cause == if wrong_bond {
+                ChannelStateError::WrongChannel { field: "omission_bond" }
+            } else {
+                ChannelStateError::Malformed
+            }
+        ));
+        assert!(node.collect(&Scope::Owner).await.is_err());
+        node.close().await;
+    }
+}

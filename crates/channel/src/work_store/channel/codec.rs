@@ -569,6 +569,28 @@ impl Channel<PaymentFunding> {
         out
     }
 
+    pub(super) fn checkpoint_settlement(
+        bytes: &[u8],
+        channel: &PaidChannel,
+    ) -> Result<WorkPaymentSettlement, ChannelStateError> {
+        let mut cursor = Cursor::new(bytes);
+        if digest(&mut cursor)? != channel.id() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "checkpoint channel_id",
+            });
+        }
+        let mut total = || cursor.u64().ok_or(ChannelStateError::Malformed);
+        let settlement =
+            WorkPaymentSettlement::from_checkpoint(total()?, total()?, total()?, total()?)
+                .ok_or(ChannelStateError::Malformed)?;
+        if settlement.omission_bond() != channel.payment_terms().omission_bond {
+            return Err(ChannelStateError::WrongChannel {
+                field: "omission_bond",
+            });
+        }
+        Ok(settlement)
+    }
+
     /// Reads a checkpoint back into the state it was written from.
     ///
     /// The channel and the settlement are the opener's, and the two

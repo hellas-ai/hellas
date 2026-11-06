@@ -62,9 +62,17 @@ impl ChannelStore {
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
         Self::open_inner(
-            root, channel, settlement, role, origin, content, verifier, false,
+            root,
+            channel,
+            Some(settlement),
+            role,
+            Some(origin),
+            content,
+            verifier,
+            false,
         )
-        .await
+        .await?
+        .ok_or_else(|| ChannelStateError::Malformed.into())
     }
 
     /// Replays an initialized channel without creating an empty replacement.
@@ -79,23 +87,50 @@ impl ChannelStore {
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
         Self::open_inner(
-            root, channel, settlement, role, origin, content, verifier, true,
+            root,
+            channel,
+            Some(settlement),
+            role,
+            Some(origin),
+            content,
+            verifier,
+            true,
         )
-        .await
+        .await?
+        .ok_or_else(|| ChannelStateError::Malformed.into())
+    }
+
+    /// Recover the journal's initialized funding binding without a chain read.
+    /// Missing journals and empty pre-initialization headers carry no channel effects.
+    pub async fn recover<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        role: Role,
+        content: hellas_store::content::DiskStore,
+        verifier: &V,
+    ) -> Result<Option<Self>, WorkStoreError> {
+        match Self::open_inner(root, channel, None, role, None, content, verifier, true).await {
+            Err(WorkStoreError::Journal(JournalError::Missing { .. })) => Ok(None),
+            result => result,
+        }
+    }
+
+    pub fn journal_key(channel: &PaidChannel) -> [u8; 32] {
+        channel_key(channel).into_bytes()
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn open_inner<V: SigVerifier>(
         root: &Path,
         channel: PaidChannel,
-        settlement: WorkPaymentSettlement,
+        settlement: Option<WorkPaymentSettlement>,
         role: Role,
-        origin: SetupOrigin,
+        origin: Option<SetupOrigin>,
         content: hellas_store::content::DiskStore,
         verifier: &V,
         existing: bool,
-    ) -> Result<Self, WorkStoreError> {
-        if origin.payment_edge != channel.payment_edge() {
+    ) -> Result<Option<Self>, WorkStoreError> {
+        if origin.is_some_and(|origin| origin.payment_edge != channel.payment_edge()) {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",
             }
@@ -109,14 +144,30 @@ impl ChannelStore {
             role,
             key,
         };
-        let (journal, replay) = if existing {
+        let (mut journal, replay) = if existing {
             Journal::open_existing(root, &stem, id).await?
         } else {
             Journal::open_latest(root, &stem, id).await?
         };
         let mut state = match &replay.checkpoint {
-            Some(bytes) => Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?,
-            None => Channel::new(channel, settlement, role, origin),
+            Some(bytes) => {
+                let settlement = match settlement {
+                    Some(settlement) => settlement,
+                    None => Channel::checkpoint_settlement(bytes, &channel)?,
+                };
+                Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?
+            }
+            None if !replay.records.is_empty() => return Err(ChannelStateError::Malformed.into()),
+            None => {
+                let Some(settlement) = settlement else {
+                    return Ok(None);
+                };
+                let origin = origin.ok_or(ChannelStateError::Malformed)?;
+                let state = Channel::new(channel, settlement, role, origin);
+                // Persist the actual funding binding before any channel effect.
+                journal.rotate(&state.checkpoint_for_storage()).await?;
+                state
+            }
         };
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
@@ -151,7 +202,7 @@ impl ChannelStore {
         store.restore_content().await?;
         store.release_unresumable_proposal(verifier).await?;
         store.reconcile_content().await?;
-        Ok(store)
+        Ok(Some(store))
     }
 
     /// Releases a pending proposal this journal can no longer send.
