@@ -47,9 +47,15 @@ async fn the_authority_clock_floor_survives_reopening_at_an_older_time() {
     store.commit(UnixMillis(6), change, true).await.unwrap();
     let before = store.state().clone();
     drop(store);
-    let mut store = NodeStore::open(directory.path(), network(), None, UnixMillis(1))
-        .await
-        .unwrap();
+    let mut store = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(1),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(store.state(), &before);
     assert_eq!(store.state().authority().now(), UnixMillis(6));
     assert_err!(
@@ -113,6 +119,7 @@ async fn bootstrap(path: &Path) -> (NodeStore, CredentialSecret) {
         ),
         None,
         UnixMillis(1),
+        Default::default(),
     )
     .await
     .unwrap()
@@ -169,7 +176,14 @@ fn machine() -> Change {
 async fn uninitialized_open_does_not_create_authority() {
     let directory = tempfile::tempdir().unwrap();
     assert_err!(
-        NodeStore::open(directory.path(), network(), None, UnixMillis(1)).await,
+        NodeStore::open(
+            directory.path(),
+            network(),
+            None,
+            UnixMillis(1),
+            Default::default(),
+        )
+        .await,
         NodeStoreError::Uninitialized
     );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -194,7 +208,8 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
                 scope
             ),
             None,
-            UnixMillis(1)
+            UnixMillis(1),
+            Default::default(),
         )
         .await,
         NodeStoreError::Authority(auth::AuthorityError::Invalid)
@@ -211,9 +226,15 @@ async fn a_providerless_authority_survives_reopen() {
     assert_eq!(store.state().authority().authority(), admin().authority);
     assert_err!(store.state().provider(), NodeStoreError::MissingProvider);
     drop(store);
-    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(2))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(2),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));
     crate::test_support::passkey_caller(reopened.state().authority(), &secret, UnixMillis(2));
     reopened
@@ -249,7 +270,8 @@ async fn an_existing_authority_cannot_be_bootstrapped_again() {
                 admin()
             ),
             None,
-            UnixMillis(2)
+            UnixMillis(2),
+            Default::default(),
         )
         .await,
         NodeStoreError::AlreadyInitialized
@@ -290,9 +312,15 @@ async fn a_refused_composite_frame_is_atomic_on_disk() {
     );
     assert_eq!(store.state(), &before);
     drop(store);
-    let store = NodeStore::open(directory.path(), network(), None, UnixMillis(1))
-        .await
-        .unwrap();
+    let store = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(1),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(store.state(), &before);
 }
 
@@ -336,7 +364,14 @@ async fn the_identity_lock_excludes_another_writer_across_rotation() {
     let (mut store, _secret) = bootstrap(directory.path()).await;
     for _ in 0..2 {
         assert_err!(
-            NodeStore::open(directory.path(), network(), None, UnixMillis(1)).await,
+            NodeStore::open(
+                directory.path(),
+                network(),
+                None,
+                UnixMillis(1),
+                Default::default(),
+            )
+            .await,
             NodeStoreError::Journal(
                 hellas_channel::work_store::journal::JournalError::Locked { .. }
             )
@@ -344,9 +379,15 @@ async fn the_identity_lock_excludes_another_writer_across_rotation() {
         store.rotate().await.unwrap();
     }
     drop(store);
-    NodeStore::open(directory.path(), network(), None, UnixMillis(2))
-        .await
-        .unwrap();
+    NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(2),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -354,12 +395,24 @@ async fn inherited_identity_descriptors_cannot_outlive_the_writer() {
     let directory = tempfile::tempdir().unwrap();
     let (store, _secret) = bootstrap(directory.path()).await;
     // A concurrent fork retains this open file description until its exec.
-    let inherited = store._identity_lock.0.try_clone().unwrap();
+    let inherited = store
+        ._identity_lock
+        .as_ref()
+        .unwrap()
+        .0
+        .try_clone()
+        .unwrap();
     let before = store.state().clone();
     drop(store);
-    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(1))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(1),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.state(), &before);
     drop(inherited);
 }
@@ -389,7 +442,14 @@ async fn damaged_initialization_never_opens_as_empty() {
                 std::fs::write(directory.path().join(MARKER), b"broken").unwrap()
             }
         }
-        let result = NodeStore::open(directory.path(), network(), None, UnixMillis(2)).await;
+        let result = NodeStore::open(
+            directory.path(),
+            network(),
+            None,
+            UnixMillis(2),
+            Default::default(),
+        )
+        .await;
         match damage {
             Damage::MissingMarker => assert_err!(result, NodeStoreError::Uninitialized),
             Damage::MissingJournal => assert_err!(
@@ -414,7 +474,8 @@ async fn damaged_initialization_never_opens_as_empty() {
                     admin()
                 ),
                 None,
-                UnixMillis(2)
+                UnixMillis(2),
+                Default::default(),
             )
             .await,
             NodeStoreError::AlreadyInitialized
@@ -441,6 +502,7 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
                 replacement.clone(),
             ),
             UnixMillis(2),
+            Default::default(),
         )
         .await
     };
@@ -457,14 +519,14 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
         recover(Revision(2)).await,
         NodeStoreError::Authority(auth::AuthorityError::Revision)
     );
-    let store = NodeStore::open_initialized(directory.path(), network())
+    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     assert_eq!(store.state(), &before);
     drop(store);
     let (receipt, _) = recover(Revision(1)).await.unwrap();
     assert_eq!(receipt.generation, 2);
-    let store = NodeStore::open_initialized(directory.path(), network())
+    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     assert_eq!(store.state().authority().last_recovery(), Some(&receipt));
@@ -504,6 +566,7 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         ),
         None,
         UnixMillis(1),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -548,10 +611,11 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
             replacement,
         ),
         UnixMillis(2),
+        Default::default(),
     )
     .await
     .unwrap();
-    let mut store = NodeStore::open_initialized(directory.path(), network())
+    let mut store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     assert_eq!(store.state().ledger(), before.ledger());
@@ -571,7 +635,7 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
     store.rotate().await.unwrap();
     let after = store.state().clone();
     drop(store);
-    let store = NodeStore::open_initialized(directory.path(), network())
+    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     assert_eq!(store.state(), &after);
@@ -595,6 +659,7 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         ),
         None,
         UnixMillis(1),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -629,10 +694,11 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
             replacement,
         ),
         UnixMillis(3),
+        Default::default(),
     )
     .await
     .unwrap();
-    let store = NodeStore::open_initialized(directory.path(), network())
+    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     let authority = store.state().authority();
@@ -708,7 +774,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     assert!(records.iter().any(|c| c.id == secret.id()));
     assert_eq!(inspection_files(directory.path()), before);
     // Opening the live store after inspection still sees the exact same revision.
-    let store = NodeStore::open_initialized(directory.path(), network())
+    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
         .await
         .unwrap();
     assert_eq!(store.state().authority().revision(), expected_revision);
@@ -736,6 +802,7 @@ async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt(
                     admin(),
                 ),
                 UnixMillis(generation),
+                Default::default(),
             )
             .await
             .unwrap(),
@@ -908,6 +975,7 @@ async fn client_prepared_bootstrap_survives_a_lost_reply() {
             request.clone(),
             None,
             UnixMillis(1),
+            Default::default(),
         )
         .await
         .unwrap(),
@@ -920,13 +988,20 @@ async fn client_prepared_bootstrap_survives_a_lost_reply() {
             request,
             None,
             UnixMillis(2),
+            Default::default(),
         )
         .await,
         NodeStoreError::AlreadyInitialized
     );
-    let store = NodeStore::open(directory.path(), network(), None, UnixMillis(2))
-        .await
-        .unwrap();
+    let store = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(2),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(2));
 }
 
@@ -939,14 +1014,27 @@ async fn abandoned_staging_store_does_not_initialize_the_destination() {
     let staging = parent.path().join(".bootstrap-interrupted");
     drop(bootstrap(&staging).await);
     assert_err!(
-        NodeStore::open(&destination, network(), None, UnixMillis(2)).await,
+        NodeStore::open(
+            &destination,
+            network(),
+            None,
+            UnixMillis(2),
+            Default::default(),
+        )
+        .await,
         NodeStoreError::Uninitialized
     );
     drop(bootstrap(&destination).await);
     assert!(
-        NodeStore::open(&destination, network(), None, UnixMillis(2))
-            .await
-            .is_ok()
+        NodeStore::open(
+            &destination,
+            network(),
+            None,
+            UnixMillis(2),
+            Default::default(),
+        )
+        .await
+        .is_ok()
     );
     assert!(!staging.exists());
 }
@@ -977,15 +1065,28 @@ async fn process_death_before_and_after_publication_never_exposes_partial_author
         assert_eq!(status.code(), Some(73));
         if phase == "staged" {
             assert_err!(
-                NodeStore::open(&destination, network(), None, UnixMillis(2)).await,
+                NodeStore::open(
+                    &destination,
+                    network(),
+                    None,
+                    UnixMillis(2),
+                    Default::default(),
+                )
+                .await,
                 NodeStoreError::Uninitialized
             );
             drop(bootstrap(&destination).await);
             assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
         }
-        let store = NodeStore::open(&destination, network(), None, UnixMillis(2))
-            .await
-            .unwrap();
+        let store = NodeStore::open(
+            &destination,
+            network(),
+            None,
+            UnixMillis(2),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(store.state().authority().revision(), Revision(1));
     }
 }
@@ -1022,6 +1123,7 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
             ),
             None,
             UnixMillis(1),
+            Default::default(),
         )
     };
     let (first, second) = tokio::join!(initialize(), initialize());
@@ -1034,7 +1136,7 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
         _ => panic!("one initialization must commit"),
     };
     assert!(matches!(error, NodeStoreError::AlreadyInitialized));
-    let reopened = NodeStore::open(&path, network(), None, UnixMillis(2))
+    let reopened = NodeStore::open(&path, network(), None, UnixMillis(2), Default::default())
         .await
         .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));

@@ -199,6 +199,7 @@ impl PaidWork {
                 &grants,
                 provider.open_identity.enrollment(),
                 &provider.executor.producer_key,
+                provider.content.durability(),
             )
             .await?;
         let admits_fetch = self
@@ -317,6 +318,7 @@ impl PaidWork {
         config: &hellas_sdk::grant_config::GrantConfig,
         enrollment: &hellas_rpc::ProviderEnrollmentBundle,
         producer: &ProducerSigningKey,
+        durability: hellas_private::Durability,
     ) -> CliResult<Option<CredentialSecret>> {
         let now = UnixMillis::now()?;
         let network = hellas_authority::model::grant::grant_network();
@@ -326,6 +328,7 @@ impl PaidWork {
             network,
             Some(enrollment.clone()),
             now,
+            durability,
         )
         .await
         {
@@ -451,6 +454,7 @@ impl PaidWork {
                     data.approval,
                     Some(enrollment.clone()),
                     now,
+                    durability,
                 )
                 .await?
             }

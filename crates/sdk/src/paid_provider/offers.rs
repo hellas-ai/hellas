@@ -428,6 +428,7 @@ impl OfferAllocator {
             &self.authority,
             &held,
             &self.needs_restart,
+            self.config.durability,
         )
         .await
         .map_err(unavailable)?;
@@ -437,6 +438,7 @@ impl OfferAllocator {
             provisioned.bond_edge,
             Role::Provider,
             &Secp256k1Verifier::new(),
+            self.config.durability,
         )
         .await
         .map_err(unavailable)?;
@@ -493,6 +495,7 @@ async fn provision_offer(
     authority: &hellas_authority::node::NodeCoordinator,
     held: &[SetupState],
     write_started: &std::sync::atomic::AtomicBool,
+    durability: hellas_private::Durability,
 ) -> Result<Provisioned> {
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
@@ -503,7 +506,7 @@ async fn provision_offer(
     let floor = floor_of(&WorkBlocks::new(view.client()))
         .await?
         .ok_or(ProvisionError::NoFinalizedBlock)?;
-    offer.journal(floor, write_started).await
+    offer.journal(floor, write_started, durability).await
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -631,6 +634,7 @@ impl Offer {
         self,
         floor: SetupScan,
         write_started: &std::sync::atomic::AtomicBool,
+        durability: hellas_private::Durability,
     ) -> Result<Provisioned> {
         let timeout = self.candidate.bond_terms.timeout.get();
         if timeout <= floor.height {
@@ -681,7 +685,8 @@ impl Offer {
         // Preflight reads and signatures above this boundary cannot do so.
         write_started.store(true, std::sync::atomic::Ordering::Release);
         {
-            let mut store = open_provider_journal(&journal_root, network, bond_edge).await?;
+            let mut store =
+                open_provider_journal(&journal_root, network, bond_edge, durability).await?;
             store
                 .commit(
                     SetupRecord::Offer {
@@ -695,7 +700,7 @@ impl Offer {
         }
 
         // Reopen with the same replay and signature checks used at startup.
-        let reopened = open_provider_journal(&journal_root, network, bond_edge).await?;
+        let reopened = open_provider_journal(&journal_root, network, bond_edge, durability).await?;
         let state = reopened.state();
         let (Some(1), Some(floor)) = (state.revision(), state.scan_armed()) else {
             return Err(ProvisionError::JournalReplay {
@@ -720,6 +725,7 @@ async fn open_provider_journal(
     root: &Path,
     network: NetworkId,
     bond_edge: EdgeId,
+    durability: hellas_private::Durability,
 ) -> Result<SetupStore> {
     SetupStore::open(
         root,
@@ -727,6 +733,7 @@ async fn open_provider_journal(
         bond_edge,
         Role::Provider,
         &Secp256k1Verifier::new(),
+        durability,
     )
     .await
     .map_err(|source| ProvisionError::Journal {

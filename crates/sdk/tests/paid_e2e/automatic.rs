@@ -385,6 +385,7 @@ impl Provider {
             hellas_authority::model::grant::grant_network(),
             Some(enrollment.clone()),
             UnixMillis(1),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -435,6 +436,7 @@ impl Provider {
         let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
+                durability: Default::default(),
                 network: config.chain.network,
                 journal_root: config.journal_root,
                 poll: config.poll,
@@ -741,6 +743,7 @@ async fn compute_and_settle_inner(
         original.offer().proposal.bond_edge(),
         Role::Client,
         &hellas_kernel::Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -1980,6 +1983,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         third.offer().proposal.bond_edge(),
         Role::Client,
         &hellas_kernel::Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -2452,6 +2456,7 @@ async fn finish(case: Box<Case>) {
         third.offer().proposal.bond_edge(),
         Role::Provider,
         &hellas_kernel::Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .unwrap();

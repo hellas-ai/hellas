@@ -198,6 +198,7 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
             2, [2; 32],
         )),
         UnixMillis(1100),
+        Default::default(),
     )
     .await
     .unwrap();

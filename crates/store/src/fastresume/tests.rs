@@ -84,6 +84,7 @@ async fn forged_persisted_identity_cannot_supply_content_or_chunks() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();

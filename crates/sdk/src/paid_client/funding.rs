@@ -75,6 +75,7 @@ async fn recover_funding_channels_inner(
             setup.bond_edge,
             Role::Client,
             &verifier,
+            args.content.durability(),
         )
         .await?;
         let Some((_, signed)) = store.state().offer() else {

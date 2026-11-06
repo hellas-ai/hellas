@@ -5,7 +5,7 @@
 //!
 //! [`crate::model::bundle`] is the artifact, and it says of
 //! itself that "somebody has to carry half-signed bytes between the two
-//! processes". [`crate::work_store::setup`] is the journal that fsyncs
+//! processes". [`crate::work_store::setup`] is the journal that commits
 //! each revision before the signature it carries is exported. This is
 //! the carrier those two were written for, and it adds no rule to
 //! either: every check here is one of theirs, run by
@@ -550,7 +550,7 @@ impl SetupEndpoint {
     }
 
     /// Journals an executable revision and its close-only recovery data in
-    /// one fsynced record.
+    /// one committed record.
     async fn commit_armed(
         &mut self,
         bundle: &WorkChannelSetupBundleV2,

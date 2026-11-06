@@ -590,6 +590,7 @@ async fn record_unsigned_proposal(
         bond,
         Role::Client,
         &verifier,
+        Default::default(),
     )
     .await
     .unwrap();

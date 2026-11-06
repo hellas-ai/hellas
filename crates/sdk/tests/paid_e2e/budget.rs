@@ -157,6 +157,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 bond,
                 hellas_channel::work_store::Role::Client,
                 &verifier,
+                Default::default(),
             )
             .await
             .unwrap();

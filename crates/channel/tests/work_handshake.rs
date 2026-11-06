@@ -187,6 +187,7 @@ async fn endpoint(
         bond_edge(),
         role,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {
@@ -252,6 +253,7 @@ async fn reopen(root: &std::path::Path, role: Role) -> SetupStore {
         bond_edge(),
         role,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {

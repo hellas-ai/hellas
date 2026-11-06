@@ -118,6 +118,7 @@ impl<R> FetchProviderOptions<R> {
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
+                    durability: options.content.durability(),
                     network: config.chain.network,
                     journal_root: config.journal_root,
                     poll: config.poll,
@@ -192,6 +193,7 @@ impl ProviderGrants {
         &self,
         resources: crate::grant_provider::ProviderResources<'_>,
         provider: &ProviderEnrollmentBundle,
+        durability: hellas_private::Durability,
     ) -> Result<hellas_authority::node::NodeCoordinator, ProviderError> {
         resources.validate(self.config.configuration.resources())?;
         match &self.authority {
@@ -202,6 +204,7 @@ impl ProviderGrants {
                         hellas_authority::model::grant::grant_network(),
                         Some(provider.clone()),
                         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+                        durability,
                     )
                     .await?,
                     Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
@@ -308,6 +311,7 @@ pub struct ProviderHandle {
     owns_endpoint: bool,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
+    owned_authority: Option<hellas_authority::node::NodeCoordinator>,
 }
 
 impl ProviderHandle {
@@ -376,6 +380,9 @@ impl ProviderHandle {
         if self.owns_endpoint {
             self.endpoint.close().await;
         }
+        if let Some(node) = self.owned_authority.take() {
+            result = result.and(node.close().await.map_err(ProviderError::from));
+        }
         result
     }
 }
@@ -427,6 +434,11 @@ where
 {
     if let Some((work, _)) = &config.work {
         work.validate()?;
+        if config.content.durability() == hellas_private::Durability::Crash {
+            tracing::warn!(
+                "paid channel state may be lost on power failure; set durability = \"power\""
+            );
+        }
     }
     let enrollment = &config.open_identity.enrollment;
     check_grant_provider(enrollment)?;
@@ -445,11 +457,16 @@ where
             } else {
                 crate::grant_provider::ProviderResources::Fetch(&config.executor.fetch_routes)
             };
-            let store = grants.open(resources, enrollment).await?;
+            let store = grants
+                .open(resources, enrollment, config.content.durability())
+                .await?;
             Some((grants, store))
         }
         None => None,
     };
+    let owned_authority = prepared_grants.as_ref().and_then(|(grants, node)| {
+        matches!(grants.authority, ProviderAuthority::Journal { .. }).then(|| node.clone())
+    });
     let signer = config.executor.producer_key.clone();
     let content = config.content.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
@@ -679,6 +696,7 @@ where
         endpoint,
         owns_endpoint,
         work,
+        owned_authority,
     })
 }
 

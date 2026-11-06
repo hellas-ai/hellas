@@ -135,6 +135,7 @@ pub(super) async fn content(
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await?;
     let restored: CliResult<()> = async {
@@ -184,6 +185,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         provider.address,
         owner,
         context.settlement.party_key(),
+        Default::default(),
     )
     .await?;
     let content = content(args, context, config.chain.network).await?;

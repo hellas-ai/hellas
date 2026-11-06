@@ -225,9 +225,10 @@ mod tests {
         let loaded = ContentConfiguration::load(Some(path.clone()), None).unwrap();
         let store = loaded
             .config
-            .open(Reservations::ram(
-                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-            ))
+            .open(
+                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                Default::default(),
+            )
             .await
             .unwrap();
         store.finish_recovery().await.unwrap();
@@ -275,9 +276,10 @@ mod tests {
         let mut observed = loaded.changes.clone();
         let store = loaded
             .config
-            .open(Reservations::ram(
-                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-            ))
+            .open(
+                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                Default::default(),
+            )
             .await
             .unwrap();
         store.finish_recovery().await.unwrap();
@@ -366,9 +368,10 @@ mod tests {
         let loaded = ContentConfiguration::load(Some(path.clone()), None).unwrap();
         let store = loaded
             .config
-            .open(Reservations::ram(
-                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-            ))
+            .open(
+                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                Default::default(),
+            )
             .await
             .unwrap();
         store.finish_recovery().await.unwrap();

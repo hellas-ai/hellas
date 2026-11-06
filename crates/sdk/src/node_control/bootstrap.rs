@@ -61,6 +61,7 @@ pub async fn accept(
     directory: &Path,
     network: hellas_kernel::NetworkId,
     provider: Option<ProviderEnrollmentBundle>,
+    durability: hellas_private::Durability,
 ) -> Result<(), WireStatus> {
     let now = UnixMillis::now().map_err(|_| unavailable())?;
     let remaining = invitation.expires.0.checked_sub(now.0).ok_or_else(denied)?;
@@ -146,6 +147,7 @@ pub async fn accept(
             request.approval,
             provider.clone(),
             now,
+            durability,
         )
         .await
         .map_err(node_error)?;
@@ -350,6 +352,7 @@ mod tests {
                     directory.path(),
                     hellas_channel::test_support::network(),
                     None,
+                    Default::default(),
                 ),
             ),
             async {
@@ -382,6 +385,7 @@ mod tests {
                 hellas_channel::test_support::network(),
                 None,
                 UnixMillis::now().unwrap(),
+                Default::default(),
             )
             .await
             .unwrap(),
@@ -482,7 +486,8 @@ mod tests {
                 &invitation,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             ),
             connect(&client, &invitation, root, approval),
         );
@@ -506,7 +511,8 @@ mod tests {
                 root,
                 approval,
                 None,
-                UnixMillis::now().unwrap()
+                UnixMillis::now().unwrap(),
+                Default::default(),
             )
             .await
             .is_err()
@@ -532,7 +538,8 @@ mod tests {
                 &invitation,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             ),
             async {
                 let stalled = staller
@@ -595,7 +602,8 @@ mod tests {
                 &invitation,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             )
             .await
             .is_err()
@@ -617,7 +625,8 @@ mod tests {
                 &invitation,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             ),
             connect(&client, &invitation, root, approval.clone()),
         );
@@ -629,6 +638,7 @@ mod tests {
                 hellas_channel::test_support::network(),
                 None,
                 UnixMillis::now().unwrap(),
+                Default::default(),
             )
             .await
             .unwrap(),
@@ -645,7 +655,8 @@ mod tests {
                 root,
                 approval,
                 None,
-                UnixMillis::now().unwrap()
+                UnixMillis::now().unwrap(),
+                Default::default(),
             )
             .await
             .is_err()
@@ -668,7 +679,8 @@ mod tests {
                 &invitation,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             ),
             async {
                 for _ in 0..MAX_PAIRING_ATTEMPTS {
@@ -705,7 +717,8 @@ mod tests {
                 &current,
                 directory.path(),
                 hellas_channel::test_support::network(),
-                None
+                None,
+                Default::default(),
             ),
             async {
                 assert!(

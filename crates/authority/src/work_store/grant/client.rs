@@ -145,6 +145,7 @@ impl GrantClientStore {
         provider: ProviderEnrollmentBundle,
         channel: GrantChannelState,
         now: UnixMillis,
+        durability: hellas_private::Durability,
     ) -> Result<Self, NodeStoreError> {
         check_grant_provider(&provider)?;
         if channel.id
@@ -165,7 +166,7 @@ impl GrantClientStore {
             provider: grant_producer(&provider)?,
         };
         let (journal, replay) =
-            Journal::open_latest(directory, JOURNAL_STEM, journal_id(&channel)).await?;
+            Journal::open_latest(directory, JOURNAL_STEM, journal_id(&channel), durability).await?;
         let mut store = Self {
             journal,
             directory: directory.into(),
@@ -185,9 +186,15 @@ impl GrantClientStore {
         if self.journal.check_authority().is_ok() {
             return Ok(());
         }
+        let durability = self.journal.durability();
         self.journal.close().await;
-        let (journal, replay) =
-            Journal::open_latest(&self.directory, JOURNAL_STEM, journal_id(&self.channel)).await?;
+        let (journal, replay) = Journal::open_latest(
+            &self.directory,
+            JOURNAL_STEM,
+            journal_id(&self.channel),
+            durability,
+        )
+        .await?;
         self.state = self.replayer().replay(replay)?;
         self.journal = journal;
         Ok(())

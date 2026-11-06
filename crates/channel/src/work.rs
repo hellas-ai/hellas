@@ -11,8 +11,8 @@
 //! # The order
 //!
 //! Both endpoints obey the same rule, which is [`crate::work_store`]'s:
-//! **the state that authorises a signature is fsynced before the
-//! signature leaves the process.**
+//! **the state that authorises a signature is committed before the
+//! signature leaves the process.** Power mode also flushes the commit.
 //!
 //! The client reserves its nonce, builds and signs the authorization,
 //! and journals the signature — all before the request is handed to a
@@ -40,7 +40,7 @@
 //! # Running what was accepted
 //!
 //! [`run_accepted_work`] is the second half, and it obeys the same rule
-//! in the one place it matters most: the running marker is fsynced
+//! in the one place it matters most: the running marker is committed
 //! before the backend is called. It is not a wire exchange — there is no
 //! Run RPC here — but it is the same journal, the same channel, and the
 //! same `work_id`, so it lives beside the acceptance that authorised it.
@@ -84,11 +84,11 @@
 //!
 //! The client derives the amount itself — its own credited total plus
 //! the price its own authorization fixed — signs the certificate and the
-//! binding that says what that certificate bought, and fsyncs both
+//! binding that says what that certificate bought, and commits both
 //! before either leaves the process, through the ledger that says this
 //! job has not been paid for before.
 //!
-//! Then the provider fsyncs the same pair before it acknowledges
+//! Then the provider commits the same pair before it acknowledges
 //! anything, deriving the same amount from its own ledger, and that same
 //! record is what retires the job's compute and delivery credit. There
 //! is no moment at which this client is owed service for a payment the
@@ -1351,7 +1351,7 @@ async fn retain_close_start(
     store: &mut ChannelStore,
     start: &PaymentCloseStart,
 ) -> Result<(), WorkStoreError> {
-    let fsynced = Timing::start();
+    let committed = Timing::start();
     store
         .commit(
             ChannelRecord::ClosePrepared {
@@ -1360,7 +1360,7 @@ async fn retain_close_start(
             &Secp256k1Verifier::new(),
         )
         .await?;
-    if let Some(ms) = fsynced.ms() {
+    if let Some(ms) = committed.ms() {
         tracing::event!(
             name: "close_prepared_fsync_ms",
             target: TARGET,
@@ -2993,7 +2993,7 @@ impl WorkService {
     /// Admits one payment, or says why not.
     ///
     /// The answer is produced after [`ProviderEndpoint::admit`] returns,
-    /// which is after its record is fsynced. Nothing on this path can
+    /// which is after its record is committed. Nothing on this path can
     /// acknowledge a payment the disk does not hold.
     async fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
         let outcome = match self.endpoint().await {
@@ -3856,8 +3856,8 @@ impl ClientEndpoint {
 /// transport.
 ///
 /// The order is the durability rule at its last step: the certificate
-/// is fsynced by [`ClientEndpoint::pay`] before the request is built,
-/// and the provider fsyncs its own copy before the answer this reads is
+/// is committed by [`ClientEndpoint::pay`] before the request is built,
+/// and the provider commits its own copy before the answer this reads is
 /// produced. A transport fault leaves a durable, unsent payment;
 /// calling this again re-sends exactly those bytes.
 ///

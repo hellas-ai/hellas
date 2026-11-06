@@ -690,6 +690,7 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         ),
         None,
         now,
+        Default::default(),
     )
     .await
     .unwrap();

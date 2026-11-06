@@ -29,8 +29,9 @@ impl SetupStore {
         bond_edge: EdgeId,
         role: Role,
         verifier: &V,
+        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, network, bond_edge, role, verifier, false).await
+        Self::open_inner(root, network, bond_edge, role, verifier, false, durability).await
     }
 
     /// Reopen an existing setup without creating a replacement journal.
@@ -40,8 +41,9 @@ impl SetupStore {
         bond_edge: EdgeId,
         role: Role,
         verifier: &V,
+        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, network, bond_edge, role, verifier, true).await
+        Self::open_inner(root, network, bond_edge, role, verifier, true, durability).await
     }
 
     async fn open_inner<V: SigVerifier>(
@@ -51,6 +53,7 @@ impl SetupStore {
         role: Role,
         verifier: &V,
         existing: bool,
+        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
         let key = setup_key(network, bond_edge);
         let id = JournalId {
@@ -60,9 +63,9 @@ impl SetupStore {
         };
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = if existing {
-            Journal::open_existing(root, &setup_stem(key), id).await?
+            Journal::open_existing(root, &setup_stem(key), id, durability).await?
         } else {
-            Journal::open_latest(root, &setup_stem(key), id).await?
+            Journal::open_latest(root, &setup_stem(key), id, durability).await?
         };
         let mut state = match &replay.checkpoint {
             Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
@@ -110,7 +113,7 @@ impl SetupStore {
         self.state.role
     }
 
-    /// Journals one step, and returns only once it is on the disk.
+    /// Journals one committed step under the configured durability policy.
     ///
     /// The rule this exists to enforce: call it *before* exporting the
     /// revision's signature, and before broadcasting a transaction. A

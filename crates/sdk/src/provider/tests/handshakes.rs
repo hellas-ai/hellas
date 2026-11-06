@@ -293,3 +293,102 @@ async fn held_connections_from_one_identity_are_capped_across_source_ips() {
     honest.close().await;
     provider.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_alive() {
+    use hellas_auth::{
+        authority::{GrantId, UnixMillis},
+        test_support::actors::ROOT,
+    };
+    use hellas_authority::{
+        node::SessionKey, test_support::common_node, work_store::grant::NodeStore,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let content = hellas_authority::test_support::content_store(root.path()).await;
+    let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
+    let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
+    let signer = Arc::new(signer);
+    let journals = root.path().join("provider");
+    let (store, secret) = common_node::bootstrap_node_with_credential(
+        &journals,
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let authority = store.state().authority().authority();
+    drop(store);
+    let options = ProviderOptions {
+        content: content.clone(),
+        executor: ExecutorSpawnConfig::new(
+            signer.clone(),
+            Assurance::ProducerSigned,
+            FetchRouteRegistry::new(),
+        ),
+        grants: Some(ProviderGrants {
+            config: crate::GrantProviderOptions {
+                configuration: Default::default(),
+                max_job_millis: std::num::NonZeroU64::MIN,
+            },
+            authority: ProviderAuthority::Journal {
+                root: journals.clone(),
+            },
+        }),
+        port: Some(0),
+        build: String::new(),
+        graffiti: Vec::new(),
+        discovery: false,
+        work: None,
+        secret_key,
+        open_identity: Arc::new(
+            ProviderOpen::<UnusedRoot>::new(signer, enrollment.clone(), None).unwrap(),
+        ),
+    };
+    let handle = start_fetch_provider(options.clone()).await.unwrap();
+    let service = handle
+        .router
+        .as_ref()
+        .unwrap()
+        .grant_service()
+        .unwrap()
+        .clone();
+    let old_node = service.node();
+    let caller = old_node
+        .authenticate_session(&secret, SessionKey::Passkey(&ROOT.passkey()))
+        .await
+        .unwrap();
+    let held_work = service.for_caller(caller, GrantId([0; 16]));
+    handle.shutdown().await.unwrap();
+    // The old GrantWork still owns the old service/coordinator. Both physical
+    // locks must already be released, independently of their eventual Drop.
+    let reopened = NodeStore::open(
+        &journals,
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment),
+        UnixMillis::now().unwrap(),
+        content.durability(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.state().authority().authority(), authority);
+    assert!(old_node.owner().await.is_err());
+    drop(reopened);
+    let restarted = start_fetch_provider(options).await.unwrap();
+    assert_eq!(
+        restarted
+            .router
+            .as_ref()
+            .unwrap()
+            .grant_service()
+            .unwrap()
+            .node()
+            .owner()
+            .await
+            .unwrap(),
+        ROOT.principal()
+    );
+    drop(held_work);
+    restarted.shutdown().await.unwrap();
+    content.close().await;
+}

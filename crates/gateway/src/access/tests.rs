@@ -48,6 +48,7 @@ impl Fixture {
             ),
             None,
             now,
+            Default::default(),
         )
         .await
         .unwrap();

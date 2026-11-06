@@ -483,6 +483,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let setup_mount = MountedSetup::with_content_store(content.clone());
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
 
             journal_root: dir.path().to_path_buf(),
@@ -616,6 +617,7 @@ async fn discover_two_route_runner(
 ) -> WorkRunner {
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
 
             journal_root: root.to_path_buf(),
@@ -1525,7 +1527,9 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
 /// durable acceptance and the detached backend task's first poll.
 async fn write_accepted_channel(root: &Path) -> Digest {
     let mut store = open_channel(root).await;
-    propose_and_accept(&mut store).await
+    let work = propose_and_accept(&mut store).await;
+    store.content_store().close().await;
+    work
 }
 
 /// The channel journal a restarted provider finds: one job it
@@ -1609,6 +1613,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
         },
     )
     .await;
+    store.content_store().close().await;
     start_id
 }
 
@@ -2286,6 +2291,7 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
     let content = hellas_channel::test_support::channel::content_store(root).await;
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
 
             journal_root: root.to_path_buf(),
@@ -2347,6 +2353,7 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -2499,13 +2506,19 @@ impl OfferFixture {
     /// The same journal, routed to `peer`.
     async fn write_completed_setup_for(self, root: &Path, peer: PeerId) {
         let verifier = Secp256k1Verifier::new();
-        let mut store =
-            match SetupStore::open(root, network(), self.bond_edge(), Role::Provider, &verifier)
-                .await
-            {
-                Ok(store) => store,
-                Err(error) => panic!("the routed setup journal opens: {error}"),
-            };
+        let mut store = match SetupStore::open(
+            root,
+            network(),
+            self.bond_edge(),
+            Role::Provider,
+            &verifier,
+            Default::default(),
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(error) => panic!("the routed setup journal opens: {error}"),
+        };
         let one = self.proposed();
         let two = self.countersigned(one.clone());
         let three = self.completed(two.clone());
@@ -2538,10 +2551,16 @@ impl OfferFixture {
 
     async fn write_completed_client_setup(self, root: &Path) {
         let verifier = Secp256k1Verifier::new();
-        let mut store =
-            SetupStore::open(root, network(), self.bond_edge(), Role::Client, &verifier)
-                .await
-                .unwrap();
+        let mut store = SetupStore::open(
+            root,
+            network(),
+            self.bond_edge(),
+            Role::Client,
+            &verifier,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let one = self.proposed();
         let two = self.countersigned(one.clone());
         let three = self.completed(two.clone());
@@ -2750,6 +2769,7 @@ impl OfferFixture {
             self.bond_edge(),
             Role::Provider,
             &Secp256k1Verifier::new(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -2770,6 +2790,7 @@ async fn client_setup(root: &Path, policy: ProviderChannelPolicy) -> SetupEndpoi
         bond_edge(),
         Role::Client,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {
@@ -2827,6 +2848,7 @@ impl RunningPaidNode {
         });
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
+                durability: Default::default(),
                 network: network(),
 
                 journal_root: root.to_path_buf(),
@@ -3460,7 +3482,7 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
             .await
             .unwrap_or_else(|error| panic!("the mounted channel is readable: {error}")),
         Some(start_id),
-        "the response is chosen and fsynced locally",
+        "the response is chosen and committed locally",
     );
 
     assert!(
@@ -3675,6 +3697,18 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             )
             .unwrap()
             .unwrap();
+        {
+            use hellas_channel::work_close::CloseChannel as _;
+            retained
+                .drive()
+                .unwrap()
+                .store()
+                .await
+                .unwrap()
+                .content_store()
+                .close()
+                .await;
+        }
         tokio::spawn(async move {
             std::future::pending::<()>().await;
             drop(retained);
@@ -3942,6 +3976,22 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     let start_id = write_contested_channel(dir.path()).await;
     let mount = MountedWork::default();
     let runner = runner(dir.path(), provider_policy(), &mount).await;
+    let content = {
+        use hellas_channel::work_close::CloseChannel as _;
+        mount
+            .service(
+                &vouched_context(default_route_peer()),
+                descriptor().channel().id(),
+            )
+            .unwrap()
+            .unwrap()
+            .drive()
+            .unwrap()
+            .store()
+            .await
+            .unwrap()
+            .content_store()
+    };
     let chain = Chain::single();
     let (stop, stopped) = oneshot::channel();
     let task = {
@@ -3987,14 +4037,17 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
         "a stopped clock serves no channel",
     );
 
-    // Both files are released, and both replay to what the clock
-    // left in them.
+    // The fixture owns the content pool; the production clock reuses its
+    // caller's pool across restarts. Finish this fixture's physical handoff.
+    content.close().await;
+    // Both files are released, and both replay to what the clock left in them.
     let setup = match SetupStore::open(
         dir.path(),
         network(),
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {
@@ -4324,7 +4377,11 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         hellas_authority::test_support::content_store(&root.path().join("grant-content")).await;
     for options in [config(), changed, config()] {
         let node = options
-            .open(ProviderResources::ComputeAndFetch(&routes), &provider)
+            .open(
+                ProviderResources::ComputeAndFetch(&routes),
+                &provider,
+                Default::default(),
+            )
             .await
             .unwrap();
         let caller = hellas_authority::test_support::session(&node, &secret).await;
@@ -4668,6 +4725,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
         offer.bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -4769,6 +4827,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
             role: Role::Provider,
             key,
         },
+        Default::default(),
     )
     .await
     .unwrap();
@@ -4791,6 +4850,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -4801,6 +4861,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     // already be restored while every service still lacks fresh readiness.
     let mut runner = WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
             journal_root: root.path().to_owned(),
             poll: Duration::from_millis(1),
@@ -4899,6 +4960,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let node = hellas_channel::test_support::channel::content_store(root.path()).await;
     let duplicate_result = WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
             journal_root: root.path().to_owned(),
             poll: Duration::from_millis(1),
@@ -4928,6 +4990,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let node = hellas_channel::test_support::channel::content_store(root.path()).await;
     let recovered = WorkRunner::discover(
         WorkRunnerConfig {
+            durability: Default::default(),
             network: network(),
             journal_root: root.path().to_owned(),
             poll: Duration::from_millis(1),
@@ -4963,6 +5026,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -4970,10 +5034,16 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     let verifier = Secp256k1Verifier::new();
     for (offer, path) in offers.into_iter().zip(&paths) {
         offer.write_completed_client_setup(path).await;
-        let setup =
-            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
-                .await
-                .unwrap();
+        let setup = SetupStore::open_existing(
+            path,
+            network(),
+            offer.bond_edge(),
+            Role::Client,
+            &verifier,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let origin = setup.state().origin().unwrap();
         drop(setup);
         let mut journal = ChannelStore::open(
@@ -5027,6 +5097,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -5054,10 +5125,16 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     // Offline handles are gone. Canonical online reopening reuses reservations
     // rather than doubling them; no chain source was contacted to reach this gate.
     for (offer, path) in offers.into_iter().zip(&paths) {
-        let setup =
-            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
-                .await
-                .unwrap();
+        let setup = SetupStore::open_existing(
+            path,
+            network(),
+            offer.bond_edge(),
+            Role::Client,
+            &verifier,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let journal = ChannelStore::open_existing(
             path,
             offer.descriptor().channel().clone(),
@@ -5089,6 +5166,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -5118,4 +5196,154 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     ));
     assert!(node.collect(&Scope::Owner).await.is_err());
     node.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handlers_alive() {
+    use hellas_store::content::{ContentStore as _, Error, PinName, Scope};
+    let dir = temp();
+    write_setup_journal(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let mount = MountedWork::default();
+    let setup = MountedSetup::with_content_store(content.clone());
+    let runner = discover_two_route_runner(dir.path(), &mount, &setup, &content).await;
+    let source = Chain::single();
+    source.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    let (stop, stopped) = oneshot::channel();
+    let running = {
+        let source = source.clone();
+        tokio::spawn(async move {
+            runner
+                .run_over(stopped, move || {
+                    let source = source.clone();
+                    async move { Some(source) }
+                })
+                .await
+        })
+    };
+    let held = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some(service) = mount
+                .service(
+                    &vouched_context(default_route_peer()),
+                    descriptor().channel().id(),
+                )
+                .unwrap()
+                && service.readiness().await.is_ok()
+            {
+                break service;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (request, frames) = upload_messages(signed_accept_request(), [7; 32]);
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(descriptor().channel(), &authorization);
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let mut context = vouched_context(default_route_peer());
+    context.open_exporter = Some([7; 32]);
+    crate::test_support::upload_frames(frames, async |requests| {
+        mount
+            .upload_stream(requests, context.clone(), connection.clone())
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(held.completed_content_upload(id).unwrap());
+    assert!(
+        held.with_state(|state| state.job_by_id(id).is_none())
+            .await
+            .unwrap()
+    );
+    assert!(content.stats().unwrap().outstanding > 0 || content.ram_pool().held() > 0);
+
+    // Hold the real Core effect gate, using the existing live-scope binding.
+    let (entered, started) = oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered)));
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocked = Arc::new(Mutex::new(blocked));
+    let gate_scope = Scope::Owner.bind(
+        move || {
+            let (entered, blocked) = (entered.clone(), blocked.clone());
+            async move {
+                Ok(move || {
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                    }
+                    blocked.lock().unwrap().recv().map_err(|_| Error::Denied)?;
+                    Ok(())
+                })
+            }
+        },
+        std::future::pending,
+    );
+    let blocker = {
+        let content = content.clone();
+        tokio::spawn(async move {
+            content
+                .set_pin(
+                    &gate_scope,
+                    &PinName::new("stop-gate".into()).unwrap(),
+                    None,
+                    None,
+                )
+                .await
+        })
+    };
+    started.await.unwrap();
+    stop.send(()).unwrap();
+    let mut stopping = running;
+    let result = tokio::time::timeout(Duration::from_millis(250), &mut stopping).await;
+    let waited = result.is_err();
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    match result {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(TEST_TIMEOUT, stopping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    }
+    assert!(
+        waited,
+        "provider shutdown must finish local content cleanup before returning"
+    );
+    assert_eq!(content.stats().unwrap().outstanding, 0);
+    assert_eq!(content.ram_pool().held(), 0);
+
+    let next = MountedWork::default();
+    let setup = MountedSetup::with_content_store(content.clone());
+    let mut restarted = discover_two_route_runner(dir.path(), &next, &setup, &content).await;
+    assert!(restarted.tick(&source).await);
+    let reopened = next
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        reopened
+            .with_state(|state| state.job_by_id(id).is_none())
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        held.accept(&request).await.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    connection.cancel();
+    let (stop, stopped) = oneshot::channel();
+    stop.send(()).unwrap();
+    restarted
+        .run_over(stopped, move || {
+            let source = source.clone();
+            async move { Some(source) }
+        })
+        .await
+        .unwrap();
+    content.close().await;
 }

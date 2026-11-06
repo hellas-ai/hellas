@@ -364,7 +364,7 @@ impl Config {
             })
             .transpose()
     }
-    pub async fn open(&self, ram: Reservations) -> Result<DiskStore> {
+    pub async fn open(&self, ram: Reservations, durability: Durability) -> Result<DiskStore> {
         self.validate()?;
         DiskStore::open(
             self.upper()?,
@@ -372,10 +372,11 @@ impl Config {
             self.index,
             self.capacity.map(|bytes| bytes.0),
             ram,
+            durability,
         )
         .await
     }
-    pub async fn open_owner(&self, ram: Reservations) -> Result<DiskStore> {
+    pub async fn open_owner(&self, ram: Reservations, durability: Durability) -> Result<DiskStore> {
         self.validate()?;
         DiskStore::open_owner(
             self.upper()?,
@@ -383,6 +384,7 @@ impl Config {
             self.index,
             self.capacity.map(|bytes| bytes.0),
             ram,
+            durability,
         )
         .await
     }
@@ -603,7 +605,10 @@ mod tests {
         }
     }
     async fn node(config: &Config) -> DiskStore {
-        config.open(Reservations::ram(16 << 20)).await.unwrap()
+        config
+            .open(Reservations::ram(16 << 20), Default::default())
+            .await
+            .unwrap()
     }
     async fn owner(store: &DiskStore, key: &str, bytes: &[u8]) {
         let object = ContentRef::for_bytes(bytes);

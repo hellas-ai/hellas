@@ -16,10 +16,11 @@ const MEASURED_CHECKPOINT: &[u8] = b"the state the predecessor reached";
 /// with an observer and without one" is the same call and not two
 /// hand-copied ones.
 async fn measured_run(dir: &std::path::Path) {
-    let (mut journal, _) = match Journal::open_latest(dir, "duty", measured_id()).await {
-        Ok(opened) => opened,
-        Err(error) => panic!("the journal opens: {error}"),
-    };
+    let (mut journal, _) =
+        match Journal::open_latest(dir, "duty", measured_id(), Default::default()).await {
+            Ok(opened) => opened,
+            Err(error) => panic!("the journal opens: {error}"),
+        };
     for record in MEASURED {
         if let Err(error) = journal.append(record).await {
             panic!("the record appends: {error}");
@@ -117,10 +118,12 @@ async fn work_that_was_not_done_is_not_sampled() {
     };
     let samples = std::sync::Arc::new(Samples::new());
     async {
-        let (mut journal, _) = match Journal::open_latest(dir.path(), "idle", measured_id()).await {
-            Ok(opened) => opened,
-            Err(error) => panic!("the journal opens: {error}"),
-        };
+        let (mut journal, _) =
+            match Journal::open_latest(dir.path(), "idle", measured_id(), Default::default()).await
+            {
+                Ok(opened) => opened,
+                Err(error) => panic!("the journal opens: {error}"),
+            };
         assert!(
             samples.all().is_empty(),
             "opening an empty journal is not an append and not a rotation",

@@ -569,6 +569,7 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
             proposal.bond_edge(),
             Role::Client,
             &Secp256k1Verifier::new(),
+            Default::default(),
         )
         .await
         .unwrap();

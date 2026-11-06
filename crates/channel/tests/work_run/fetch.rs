@@ -729,6 +729,19 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     assert_no_bodies(provider_dir.path());
     assert_no_bodies(client_dir.path());
     let payment = client.client().await.unwrap().pay(id).await.unwrap();
+    {
+        use hellas_channel::work_close::CloseChannel as _;
+        client
+            .client()
+            .await
+            .unwrap()
+            .store()
+            .await
+            .unwrap()
+            .content_store()
+            .close()
+            .await;
+    }
     drop(client);
     let mut client = client_endpoint(client_dir.path()).await;
     assert_eq!(
@@ -738,6 +751,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     assert_no_bodies(client_dir.path());
 
     // A delivery already happened: restart loses bodies but can still bank the signed payment.
+    close_content(&service).await;
     drop(service);
     let store = metadata_store(provider_dir.path()).await;
     assert!(
@@ -773,6 +787,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(_))
     ));
     drop(frames);
+    close_content(&recovered).await;
     drop(recovered);
     let mut recovered = ProviderEndpoint::new(
         fetch_ready(),
@@ -804,6 +819,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
         client.client().await.unwrap().accepted(&response).await
     }
     .unwrap();
+    close_content(&service_before).await;
     drop(service_before);
     let backend = FetchBackend::default();
     let recovered = service(provider_dir.path()).await;

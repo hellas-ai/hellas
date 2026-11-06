@@ -723,3 +723,11 @@ the committed revision; credential publication failures report it too.
 An authorized stale revision returns `FailedPrecondition`, requiring inspection
 before retrying. Invalid authority records and invalid Work limits return
 `InvalidArgument`; authorization failures remain non-disclosing.
+
+Node hot journals and content default to `serve --durability crash`: SQLite WAL
+uses `synchronous=NORMAL`, with no content-publication fsync. This protects
+process-crash recovery; a power failure may lose recent state. For paid work,
+use `--durability power` (Nix `durability = "power"`) to flush journal commits and
+published content; macOS also enables SQLite `fullfsync`. Identity, key, profile
+and configuration files always keep their durable writes. Another process
+holding a journal or content database is refused immediately.

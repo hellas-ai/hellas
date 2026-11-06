@@ -50,6 +50,7 @@ async fn a_poisoned_writer_refuses_new_acceptance_until_reopen() {
         hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -75,8 +76,12 @@ async fn old_checkpoint_cannot_bypass_the_journal_format_boundary() {
         .unwrap();
     drop(store);
     assert!(matches!(
-        NodeStore::open_initialized(directory.path(), hellas_channel::test_support::network())
-            .await,
+        NodeStore::open_initialized(
+            directory.path(),
+            hellas_channel::test_support::network(),
+            Default::default(),
+        )
+        .await,
         Err(NodeStoreError::Malformed)
     ));
 }

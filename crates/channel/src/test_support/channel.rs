@@ -539,6 +539,7 @@ pub async fn content_store(root: &std::path::Path) -> hellas_store::content::Dis
         hellas_store::content::IndexMode::Resume,
         None,
         hellas_store::content::Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap()
@@ -1018,9 +1019,16 @@ pub async fn open_setup_store(
     bond: EdgeId,
     role: Role,
 ) -> crate::work_store::SetupStore {
-    crate::work_store::SetupStore::open(root, network, bond, role, &Secp256k1Verifier::new())
-        .await
-        .expect("the setup journal opens")
+    crate::work_store::SetupStore::open(
+        root,
+        network,
+        bond,
+        role,
+        &Secp256k1Verifier::new(),
+        Default::default(),
+    )
+    .await
+    .expect("the setup journal opens")
 }
 
 /// Drive the same three signed revisions while each caller keeps its own terms and scan.

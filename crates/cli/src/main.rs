@@ -206,6 +206,9 @@ enum Commands {
     Admin(commands::admin::AdminArgs),
     /// Run the RPC server
     Serve {
+        /// Crash consistency by default; power also flushes hot journals and content.
+        #[arg(long, default_value = "crash")]
+        durability: hellas_private::Durability,
         #[command(flatten)]
         native: compute::ServeArgs,
         /// Assurance offered by this provider.
@@ -822,6 +825,7 @@ async fn async_main() {
         Commands::Store(args) => commands::store::run(args, Some(&local_identity), passkey).await,
 
         Commands::Serve {
+            durability,
             mut native,
             assurance,
             port,
@@ -907,6 +911,7 @@ async fn async_main() {
                                     &local_identity,
                                     port,
                                     grants,
+                                    durability,
                                 )
                                 .await?;
                                 (Some(grants), transport)
@@ -929,6 +934,7 @@ async fn async_main() {
                             (None, None) => None,
                         };
                         commands::serve::run(commands::serve::ServeOptions {
+                            durability,
                             transport,
                             port,
                             discovery: !no_discovery,
@@ -1190,6 +1196,7 @@ async fn async_main() {
                     hellas_store::content::Reservations::ram(
                         hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
                     ),
+                    Default::default(),
                 )
                 .await?;
                 let options =

@@ -167,6 +167,7 @@ impl Node {
             ),
             Some(provider.clone()),
             self.clock.now(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -223,9 +224,15 @@ impl Node {
         service.drain().await.unwrap();
         drop(admin);
         drop(service);
-        let store = NodeStore::open(&self.path, self.network, Some(provider), self.clock.now())
-            .await
-            .unwrap();
+        let store = NodeStore::open(
+            &self.path,
+            self.network,
+            Some(provider),
+            self.clock.now(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         TestNode {
             store,
             content,
@@ -397,9 +404,15 @@ impl TestNode {
         let provider = store.state().provider().unwrap().clone();
         let network = store.state().network();
         drop(store);
-        let store = NodeStore::open(&path, network, Some(provider), clock.now())
-            .await
-            .unwrap();
+        let store = NodeStore::open(
+            &path,
+            network,
+            Some(provider),
+            clock.now(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         Self {
             store,
             content,

@@ -212,6 +212,7 @@ impl PaidGateway {
                 &args.journal_root,
                 args.config.chain.network,
                 args.provider,
+                args.content.durability(),
             )
             .await?;
             let floor = setups.floor();
@@ -849,6 +850,7 @@ mod tests {
         let input = admitted(pool.request(fetch(&pool, "responses")));
         assert_eq!(input.manifest().unwrap(), contract.manifest());
         pool.endpoint.close().await;
+        pool.providers[0].args.content.close().await;
         drop(pool);
 
         let Admission::Fetch { admission } = &mut quoted.invocation_policy.admissions[0] else {
@@ -914,6 +916,7 @@ mod tests {
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -928,6 +931,7 @@ mod tests {
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
+            Default::default(),
         )
         .await
         .unwrap();

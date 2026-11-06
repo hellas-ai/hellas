@@ -243,6 +243,41 @@ impl Drop for PaidWorkSession {
     }
 }
 
+async fn observe_client(
+    client: &ClientObserver,
+    descriptor: &WorkChannelDescriptor,
+    config: &WorkConfig,
+    remote: &RemoteLightClient,
+    floor: u64,
+) -> Result<()> {
+    let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
+    let started = hellas_channel::work::ObservationTime::now();
+    let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
+    tokio::time::timeout(
+        config.max_observation_age,
+        async {
+            let mut driver = client.drive()?;
+            driver.advance_close(&chain, &chain).await?;
+            let ready = ready_channel(descriptor, &chain).await?;
+            if ready
+                .check_caught_up(client.with_state(|state| state.cursor().0).await?)
+                .is_err()
+            {
+                driver.catch_up_to(&chain, ready.finalized_height()).await?;
+            }
+            client
+                .observe_ready(ready, started, config.max_observation_age)
+                .await?;
+            Ok::<_, PaidClientError>(())
+        }
+        .instrument(span),
+    )
+    .await
+    .unwrap_or(Err(PaidClientError::Timeout {
+        stage: "channel observer",
+    }))
+}
+
 fn spawn_observer(
     client: ClientObserver,
     descriptor: WorkChannelDescriptor,
@@ -267,32 +302,7 @@ fn spawn_observer(
                 let _ = client.suspend().await;
                 break;
             };
-            let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
-            let started = hellas_channel::work::ObservationTime::now();
-            let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
-            let result = tokio::time::timeout(
-                config.max_observation_age,
-                async {
-                    let mut driver = client.drive()?;
-                    driver.advance_close(&chain, &chain).await?;
-                    let ready = ready_channel(&descriptor, &chain).await?;
-                    if ready
-                        .check_caught_up(client.with_state(|state| state.cursor().0).await?)
-                        .is_err()
-                    {
-                        driver.catch_up_to(&chain, ready.finalized_height()).await?;
-                    }
-                    client
-                        .observe_ready(ready, started, config.max_observation_age)
-                        .await?;
-                    Ok::<_, PaidClientError>(())
-                }
-                .instrument(span),
-            )
-            .await
-            .unwrap_or(Err(PaidClientError::Timeout {
-                stage: "channel observer",
-            }));
+            let result = observe_client(&client, &descriptor, &config, &remote, floor).await;
             if let Err(error) = result {
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
@@ -482,6 +492,7 @@ impl PaidWorkSession {
             &args.journal_root,
             config.chain.network,
             args.provider,
+            args.content.durability(),
         )
         .await?;
         let floor = setups.floor();
@@ -529,6 +540,7 @@ impl PaidWorkSession {
                     signed.offer().proposal.bond_edge(),
                     Role::Client,
                     &Secp256k1Verifier::new(),
+                    args.content.durability(),
                 )
                 .await?;
                 (store, signed)
@@ -628,7 +640,7 @@ impl PaidWorkSession {
         // refused by the journal's own height guard, and waiting for the
         // same fast source to catch up would never mount.
         let channel_floor = mounted.state().cursor().0;
-        let (remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
+        let (mut remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
             let remote =
                 crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
             let chain = WorkBlocks::new(remote.clone())
@@ -654,14 +666,43 @@ impl PaidWorkSession {
                 .observe_ready(ready, started, config.max_observation_age)
                 .await?;
         }
+        if initially_ready {
+            // Keep initial observation in the opening future. Cancellation must
+            // release this journal before a caller can immediately reopen it.
+            let mut source_config = config.clone();
+            within(args.timeout, "initial channel observation", async {
+                while client.readiness().await.is_err()
+                    && !client.with_state(|state| state.is_closing()).await?
+                {
+                    let floor = client.with_state(|state| state.cursor().0).await?;
+                    if let Err(error) = observe_client(
+                        &client.observer(), &descriptor, config, &remote, floor,
+                    ).await {
+                        client.observer().suspend().await?;
+                        tracing::debug!(%error, "paid client observation unavailable");
+                        source_config.validators.rotate_left(1);
+                        match crate::client_chain::connect_at(
+                            &source_config, config.max_observation_age, floor,
+                        ).await {
+                            Ok(next) => remote = next,
+                            Err(error) => tracing::debug!(%error, "waiting for a verified remote chain source"),
+                        }
+                    }
+                    if client.readiness().await.is_err() {
+                        tokio::time::sleep(config.poll).await;
+                    }
+                }
+                Ok(())
+            }).await?;
+        }
         let observer = spawn_observer(
             client.observer(),
             descriptor.clone(),
             config.clone(),
             remote,
         );
-
-        let session = Self {
+        // No suspension between giving the observer ownership and returning it.
+        Ok(Self {
             args,
             descriptor,
             policy,
@@ -669,25 +710,7 @@ impl PaidWorkSession {
             client,
             observer: Some(observer),
             needs_recovery: true,
-        };
-        if initially_ready {
-            // A long restart catch-up may outlive the first observation. Wait
-            // during channel opening; requests never perform this catch-up.
-            // The session already owns the task, so cancellation aborts it.
-            within(session.args.timeout, "initial channel observation", async {
-                while session.client.readiness().await.is_err()
-                    && !session
-                        .client
-                        .with_state(|state| state.is_closing())
-                        .await?
-                {
-                    tokio::time::sleep(session.args.config.poll).await;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(session)
+        })
     }
 
     /// Stops observation and joins the task before releasing the journal.

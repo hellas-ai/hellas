@@ -22,6 +22,7 @@ pub mod work_config;
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
+    pub durability: hellas_private::Durability,
     pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
@@ -108,9 +109,15 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
     );
     let content = if options.paid.is_some() {
-        content_configuration.config().open(ram).await?
+        content_configuration
+            .config()
+            .open(ram, options.durability)
+            .await?
     } else {
-        content_configuration.config().open_owner(ram).await?
+        content_configuration
+            .config()
+            .open_owner(ram, options.durability)
+            .await?
     };
 
     // What the operator configured, said back once. A node with a
@@ -133,6 +140,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         let chain = options.chain_node.start(work).await?;
         work_runner = Some((
             hellas_sdk::paid_provider::WorkRunnerConfig {
+                durability: options.durability,
                 network: work.chain.network,
                 journal_root: work.journal_root.clone(),
                 poll: work.poll,

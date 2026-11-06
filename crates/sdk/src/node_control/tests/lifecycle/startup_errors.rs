@@ -55,6 +55,7 @@ async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
         hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .err()
@@ -70,6 +71,7 @@ async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
                     hellas_channel::test_support::network(),
                     None,
                     UnixMillis(1000),
+                    Default::default(),
                 )
                 .await?;
                 panic!("the existing authority still owns its writer lock")

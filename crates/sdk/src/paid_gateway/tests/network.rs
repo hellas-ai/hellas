@@ -53,6 +53,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 signed.offer().proposal.bond_edge(),
                 Role::Client,
                 &hellas_kernel::Secp256k1Verifier::new(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -83,6 +84,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                         &args.journal_root,
                         args.config.chain.network,
                         args.provider,
+                        Default::default(),
                     )
                     .await
                     .unwrap(),
@@ -112,6 +114,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                         &args.journal_root,
                         args.config.chain.network,
                         args.provider,
+                        Default::default(),
                     )
                     .await
                     .unwrap(),

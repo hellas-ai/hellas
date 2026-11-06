@@ -188,9 +188,15 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
     .unwrap();
     store.rotate().await.unwrap();
     drop(store);
-    let mut store = NodeStore::open(dir.path(), network(), None, UnixMillis(1003))
-        .await
-        .unwrap();
+    let mut store = NodeStore::open(
+        dir.path(),
+        network(),
+        None,
+        UnixMillis(1003),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(store.state().admission(a.channel_id, work), Some(&running));
     assert_eq!(
         store

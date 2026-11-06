@@ -1,8 +1,9 @@
 //! The bilateral acceptance exchange: what each side has on its disk
 //! before it releases a signature, and what it answers when it will not.
 //!
-//! Every crash here is a real one — the store is dropped and reopened
-//! over its own files — and the happy path runs over a real multiplexed
+//! Replay reopens the actual journals after releasing their writers;
+//! abrupt process-loss coverage is in the SDK lifecycle target. The happy
+//! path runs over a real multiplexed
 //! transport, so the request is framed, routed by method id, decoded,
 //! and answered rather than handed to a function.
 
@@ -28,7 +29,9 @@ use hellas_channel::work::{
     ClientChannel as _, ClientEndpoint, ClientService, CloseEndpoint, EndpointError, JobProposal,
     ProposeError, ProviderEndpoint, WorkRefusal, WorkService, propose_work,
 };
-use hellas_channel::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
+use hellas_channel::work_close::{
+    BlockSourceError, CatchUpError, CloseChannel as _, FinalizedBlocks, FinalizedWork,
+};
 use hellas_channel::work_store::{
     Channel, ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
 };
@@ -124,6 +127,33 @@ async fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
         Ok(endpoint) => endpoint,
         Err(error) => panic!("the fixture provider endpoint binds: {error}"),
     }
+}
+
+// In-process replay must finish SQLite pool shutdown before opening another
+// writer. This changes no journal records; process-loss tests use SIGKILL.
+async fn close_client(endpoint: &mut impl hellas_channel::work::ClientChannel) {
+    endpoint
+        .client()
+        .await
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
+}
+async fn close_provider(endpoint: ProviderEndpoint) {
+    let service = WorkService::new(endpoint);
+    service
+        .drive()
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
 }
 
 // ── The prepared inputs a job executes from ───────────────────────────
@@ -262,9 +292,19 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
     // Both endpoints let go of their journals before anything reopens
     // them: the exclusive lock is the store's, and a live server still
     // holds one.
+    close_client(&mut endpoint).await;
     drop(endpoint);
     serving.abort();
     let _ = serving.await;
+    service
+        .drive()
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
     drop(service);
 
     // Reopened from the files, not read from the objects that wrote
@@ -338,6 +378,7 @@ async fn a_retained_compute_proposal_resumes_after_an_interrupted_preacceptance_
             .phase(),
         JobPhase::HalfSigned,
     );
+    close_client(&mut endpoint).await;
     drop(endpoint);
 
     // The reopened journal can rebuild the exact upload closure from its
@@ -403,6 +444,7 @@ async fn a_missing_retained_proposal_root_blocks_recovery_and_collection() {
     let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     let id = work_id(ready().channel(), &authorization);
     let missing = endpoint.client().await.unwrap().state().retained_roots()[&id];
+    close_client(&mut endpoint).await;
     drop(endpoint);
     std::fs::remove_file(
         root.path()
@@ -485,6 +527,7 @@ async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() 
             .pending_proposal(),
         Some(id)
     );
+    close_client(&mut endpoint).await;
     drop(endpoint);
 
     // Metadata-only replay: the authorization survives, the body does not.
@@ -906,6 +949,7 @@ async fn terminated_provider(
             panic!("the fixture reaches its terminal: {error}");
         }
     }
+    store.content_store().close().await;
     drop(store);
 
     let service = WorkService::new(provider_endpoint(root).await);
@@ -1074,6 +1118,7 @@ async fn a_client_journals_its_signature_before_the_request_leaves() {
     else {
         panic!("the fixture proposal is accepted by its own rules");
     };
+    close_client(&mut endpoint).await;
     drop(endpoint);
 
     let reopened = store(root.path(), Role::Client).await;
@@ -1131,6 +1176,7 @@ async fn a_proposal_refused_before_signing_leaves_no_job() {
             .next()
             .is_none()
     );
+    close_client(&mut endpoint).await;
     drop(endpoint);
     assert!(
         store(root.path(), Role::Client)
@@ -1190,6 +1236,19 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
         .work_id();
     let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
     let response = accept_uploaded(&mut provider_endpoint, &first).await;
+    {
+        let mut client = endpoint.client().await.unwrap();
+        let mut journal = client.store().await.unwrap();
+        let content = journal.content_store();
+        let before = content.stats().unwrap();
+        journal.close().await.unwrap();
+        assert_eq!(
+            content.stats().unwrap().outstanding,
+            before.outstanding,
+            "closing a client writer must retain its half-signed output obligation"
+        );
+    }
+    close_client(&mut endpoint).await;
     drop(endpoint); // The provider response was lost before journaling.
 
     let mut policy = work_policy();
@@ -1385,6 +1444,7 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
             .phase(),
         JobPhase::HalfSigned
     );
+    close_client(&mut endpoint).await;
     drop(endpoint);
     let mut reopened = client_endpoint(root.path()).await;
     assert_eq!(
@@ -1464,6 +1524,7 @@ async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
         .job_book()
         .pending_proposal()
         .unwrap();
+    close_client(&mut endpoint).await;
     drop(endpoint);
     let mut reopened = client_endpoint(root.path()).await;
     // The retained share is journaled before the request can leave; replay
@@ -1731,7 +1792,7 @@ async fn the_co_signature_is_on_the_disk_before_it_is_answered() {
     let mut endpoint = provider_endpoint(root.path()).await;
     let response = accept_uploaded(&mut endpoint, &signed_request(1, 1)).await;
     let signature = accepted_signature(&response);
-    drop(endpoint);
+    close_provider(endpoint).await;
 
     let reopened = store(root.path(), Role::Provider).await;
     let Some(job) = reopened.state().jobs().next() else {
@@ -1755,7 +1816,7 @@ async fn nothing_is_journaled_for_a_proposal_that_is_refused() {
 
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(before && endpoint.state().jobs().next().is_none());
-    drop(endpoint);
+    close_provider(endpoint).await;
     assert!(
         store(root.path(), Role::Provider)
             .await
@@ -1791,7 +1852,7 @@ async fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled
         refusal_text(&response),
     );
     assert!(endpoint.state().jobs().next().is_none());
-    drop(endpoint);
+    close_provider(endpoint).await;
     assert!(
         store(root.path(), Role::Provider)
             .await
@@ -1825,7 +1886,8 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         .expect("the client journals its proposal");
     let mut endpoint = provider_endpoint(root.path()).await;
     let first = accepted_signature(&accept_uploaded(&mut endpoint, &request).await);
-    drop(endpoint);
+    close_provider(endpoint).await;
+    close_client(&mut caller).await;
     drop(caller); // The acceptance acknowledgement never reached the client.
 
     // Both sides restart. The provider is past acceptance and close-only,
@@ -1884,6 +1946,15 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
     );
 
     // A terminal is also an authenticated, permanent answer without readiness.
+    service
+        .drive()
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
     drop(service);
     let mut ended = store(root.path(), Role::Provider).await;
     ended
@@ -1930,6 +2001,7 @@ async fn a_crash_between_the_two_commits_co_signs_on_retry() {
         },
     )
     .await;
+    store.content_store().close().await;
     drop(store);
 
     let mut endpoint = provider_endpoint(root.path()).await;
@@ -2103,7 +2175,7 @@ async fn an_authorization_past_its_acceptance_deadline_expires() {
     let response = accept_uploaded(&mut endpoint, &signed_request(1, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(!WorkRefusal::Expired.is_retryable());
-    drop(endpoint);
+    close_provider(endpoint).await;
 
     let service = WorkService::close_only(
         CloseEndpoint::new(store(root.path(), Role::Provider).await, provider()).unwrap(),

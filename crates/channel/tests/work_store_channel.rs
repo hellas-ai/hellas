@@ -746,6 +746,7 @@ async fn a_restart_finds_the_transcript_the_result_was_derived_from() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &provider_sequence(&channel, &job).await[..4]).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
@@ -1207,6 +1208,7 @@ async fn re_sending_a_retained_payment_is_idempotent() {
     {
         let mut store = open(dir.path(), Role::Client).await;
         commit_all(&mut store, &client_sequence(&channel, &job).await).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Client).await;
@@ -1296,6 +1298,7 @@ async fn a_half_signed_job_keeps_its_bytes() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed()]).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
@@ -1369,6 +1372,7 @@ async fn an_interrupted_invocation_stays_indeterminate() {
             ],
         )
         .await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
@@ -2257,6 +2261,7 @@ async fn replay_checks_the_signatures_again() {
         if let Err(error) = commit_with_content(&mut credulous, forged, &AcceptAll).await {
             panic!("a credulous verifier accepts it: {error}");
         }
+        credulous.content_store().close().await;
     }
     let error = ChannelStore::open(
         dir.path(),
@@ -2340,6 +2345,7 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
@@ -2438,6 +2444,7 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             hellas_store::content::Reservations::ram(
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
+            Default::default(),
         )
         .await;
         if !readable {
@@ -3085,7 +3092,9 @@ async fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
         drop(store);
         let stem = channel_stem(dir.path());
         let (id, _) = Journal::inspect(dir.path(), &stem).await.unwrap();
-        let (mut journal, _) = Journal::open_existing(dir.path(), &stem, id).await.unwrap();
+        let (mut journal, _) = Journal::open_existing(dir.path(), &stem, id, Default::default())
+            .await
+            .unwrap();
         journal.rotate(&bytes).await.unwrap();
         drop(journal);
         assert!(matches!(
@@ -3130,6 +3139,7 @@ async fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
                 0,
                 "{label}: a fresh generation holds its checkpoint and nothing else",
             );
+            store.content_store().close().await;
         }
         let reopened = open(rotated.path(), Role::Provider).await;
         assert_eq!(
@@ -3198,6 +3208,7 @@ async fn a_duty_survives_repeated_rotation() {
             before.terminals().next(),
             "rotation moves bytes and not facts",
         );
+        store.content_store().close().await;
         store.state().clone()
     };
 

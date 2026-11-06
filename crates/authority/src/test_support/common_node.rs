@@ -79,6 +79,7 @@ pub async fn bootstrap_node_with_credential(
         ),
         provider,
         now,
+        Default::default(),
     )
     .await
 }
@@ -396,7 +397,7 @@ pub async fn provision(
     content.close().await;
     drop(admin);
     drop(service);
-    NodeStore::open(path, network, Some(provider), now)
+    NodeStore::open(path, network, Some(provider), now, Default::default())
         .await
         .unwrap()
 }

@@ -15,6 +15,7 @@ async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
+            Default::default(),
         )
         .await
         .unwrap();

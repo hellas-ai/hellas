@@ -43,9 +43,15 @@ pub async fn recover_content(root: &Path, network: NetworkId, content: &DiskStor
         .into_iter()
         .filter(|entry| entry.role == Role::Client)
     {
-        let setup =
-            SetupStore::open_existing(root, network, entry.bond_edge, Role::Client, &verifier)
-                .await?;
+        let setup = SetupStore::open_existing(
+            root,
+            network,
+            entry.bond_edge,
+            Role::Client,
+            &verifier,
+            content.durability(),
+        )
+        .await?;
         if let Some(descriptor) = setup.state().close_descriptor() {
             let recovered = ChannelStore::recover(
                 root,

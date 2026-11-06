@@ -73,6 +73,7 @@ pub async fn retained_settlement_channels(
     provider: hellas_client::ProviderAddress,
     owner: PrincipalId,
     delegate: Key,
+    durability: hellas_private::Durability,
 ) -> Result<Vec<RetainedSettlementChannel>> {
     let found = hellas_channel::work_store::discover_setups(root, network).await?;
     if !found.unidentified.is_empty() {
@@ -81,9 +82,15 @@ pub async fn retained_settlement_channels(
     let verifier = Secp256k1Verifier::new();
     let mut channels = Vec::new();
     for entry in found.setups.into_iter().filter(|s| s.role == Role::Client) {
-        let setup =
-            SetupStore::open_existing(root, network, entry.bond_edge, Role::Client, &verifier)
-                .await?;
+        let setup = SetupStore::open_existing(
+            root,
+            network,
+            entry.bond_edge,
+            Role::Client,
+            &verifier,
+            durability,
+        )
+        .await?;
         let (_, signed) = setup
             .state()
             .offer()
@@ -247,6 +254,7 @@ async fn open_settlement(
         bond,
         Role::Client,
         &verifier,
+        args.content.durability(),
     )
     .await?;
     let (_, signed) = setup

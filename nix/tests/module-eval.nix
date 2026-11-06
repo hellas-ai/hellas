@@ -651,6 +651,7 @@ let
           # An operator explicitly enables arbitrary locally satisfiable
           # Evaluate work, including restart from an already-populated index.
           identityPath = "/var/lib/hellas/.hellas/identity-v3";
+          durability = "power";
           content = {
             lower = [ "/srv/hellas/content" ];
             upper = "/srv/hellas-upper";
@@ -750,6 +751,8 @@ in
     assert lib.hasInfix "--identity /var/lib/hellas/.hellas/identity"
       defaultIdentityProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert lib.hasInfix "--queue-size 0" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--durability power" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--durability crash" defaultProviderService.serviceConfig.ExecStart;
     assert lib.hasInfix
       "--content-config ${builtins.unsafeDiscardStringContext (toString providerContentFile)}"
       service.serviceConfig.ExecStart;
@@ -1023,6 +1026,8 @@ in
         "serve"
         "--identity"
         "/Users/hellas/Library/Application Support/Hellas/identity"
+        "--durability"
+        "crash"
         "--port"
         "31145"
         "--assurance"
@@ -1038,6 +1043,8 @@ in
         "serve"
         "--identity"
         "/Users/hellas/.hellas/identity"
+        "--durability"
+        "crash"
         "--port"
         "31145"
         "--assurance"

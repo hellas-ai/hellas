@@ -1,5 +1,6 @@
 //! Node authority and Work accounting share one durable writer. Every exported
-//! acceptance is backed by one fsynced frame covering its entire budget path.
+//! acceptance is backed by one committed frame covering its entire budget path;
+//! power mode also flushes that commit before export.
 use super::state::{Change, Frame, JOURNAL_NAMESPACE, Snapshot, State};
 use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
@@ -39,7 +40,7 @@ const DUTY_FRAMES: u64 = 2 * MAX_OPEN_JOBS as u64 + 1;
 /// Both profiles deliberately keep bodies outside this store.
 pub struct NodeStore {
     clock: super::clock::ClockBound,
-    _identity_lock: bootstrap::IdentityLock,
+    _identity_lock: Option<bootstrap::IdentityLock>,
     journal: Journal,
     pub(super) state: State,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
@@ -51,8 +52,9 @@ impl NodeStore {
         network: NetworkId,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
+        durability: hellas_private::Durability,
     ) -> Result<Self, NodeStoreError> {
-        let mut store = Self::open_initialized(directory, network).await?;
+        let mut store = Self::open_initialized(directory, network, durability).await?;
         if provider
             .as_ref()
             .is_some_and(|expected| store.state.provider.as_ref() != Some(expected))
@@ -103,6 +105,11 @@ impl NodeStore {
         let now = now.max(self.state.now());
         self.clock.check(now)?;
         Ok(now)
+    }
+    pub(crate) async fn close(&mut self) {
+        self.journal.close().await;
+        // Late service handles must retain neither SQLite nor identity ownership.
+        self._identity_lock.take();
     }
     pub(crate) fn check_authority(&self) -> Result<(), NodeStoreError> {
         self.journal.check_authority()?;

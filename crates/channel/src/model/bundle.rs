@@ -44,7 +44,7 @@
 //! immediately before broadcasting, not a property of these bytes.
 //!
 //! That any of this survives a crash. A bundle is a value; the journal
-//! that fsyncs each revision before its next signature is exported is
+//! that commits each revision before its next signature is exported is
 //! durable endpoint state, and durable endpoint state is P3's.
 
 use hellas_kernel::{

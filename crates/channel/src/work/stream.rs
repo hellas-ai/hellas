@@ -612,6 +612,7 @@ mod tests {
                 IndexMode::Resume,
                 None,
                 Reservations::ram(bytes),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1177,6 +1178,16 @@ mod tests {
         })
         .await
         .expect("the detached durable append finishes and the journal remains writable");
+        // Finish the content pool's asynchronous close before reopening its upper.
+        service
+            .endpoint()
+            .await
+            .unwrap()
+            .close
+            .store
+            .content_store()
+            .close()
+            .await;
         drop(service);
         let store = fixture::store_at(
             provider_root.path(),

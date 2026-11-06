@@ -83,6 +83,7 @@ async fn backend_panic_finishes_the_job_and_does_not_strand_shutdown() {
             2, [2; 32],
         )),
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .unwrap();

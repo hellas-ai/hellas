@@ -4,8 +4,8 @@
 //!
 //! One call, over a real multiplexed transport, so the request is
 //! framed, routed by method id, decoded and answered rather than handed
-//! to a function. Every crash is a real one: the endpoints are dropped
-//! and their stores reopened over their own files.
+//! to a function. Replay closes the in-process writers before reopening
+//! their files; the SDK process tests separately exercise abrupt loss.
 //!
 //! What is not re-proved here. The transition rules themselves belong to
 //! the journal and are pinned in `work_store_channel.rs` — that a
@@ -44,6 +44,32 @@ mod support;
 use hellas_channel::test_support::channel::{
     accept, checked_job, ready, serve_work as serve, stop,
 };
+
+async fn close_client_content(endpoint: &mut ClientEndpoint) {
+    use hellas_channel::{work::ClientChannel as _, work_close::CloseChannel as _};
+    endpoint
+        .client()
+        .await
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
+}
+async fn close_provider_content(service: &WorkService) {
+    use hellas_channel::work_close::CloseChannel as _;
+    service
+        .drive()
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
+}
 
 // ── Driving the call ──────────────────────────────────────────────────
 
@@ -169,7 +195,9 @@ async fn one_certificate_pays_for_one_job() {
         "another job's payment is not this one's: {elsewhere:?}",
     );
 
+    close_client_content(&mut fixture.client).await;
     drop(fixture.client);
+    close_provider_content(&fixture.service).await;
     drop(fixture.service);
     let client_store = store_at(
         fixture.client_root.path(),
@@ -745,6 +773,7 @@ async fn client_close_recovery_does_not_require_new_work_readiness() {
     let mut fixture = checked_job().await;
     fixture.client.pay(fixture.id).await.unwrap();
     let start = fixture.client.prepare_close().await.unwrap();
+    close_client_content(&mut fixture.client).await;
     drop(fixture.client);
     let recovered_store = store_at(
         fixture.client_root.path(),

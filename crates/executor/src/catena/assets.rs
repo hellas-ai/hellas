@@ -203,6 +203,7 @@ mod tests {
             IndexMode::Resume,
             None,
             Reservations::ram(1 << 20),
+            Default::default(),
         )
         .await
         .unwrap();

@@ -32,6 +32,7 @@ async fn fixture(path: &std::path::Path, admin: GrantSpec) -> (NodeCoordinator, 
         ),
         None,
         UnixMillis(1),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -114,9 +115,15 @@ async fn checked_administration_persists_caller_audit_and_rechecks_sessions_afte
     );
     node.store.lock().await.unwrap().rotate().await.unwrap();
     drop(node);
-    let store = NodeStore::open(directory.path(), network(), None, UnixMillis(11))
-        .await
-        .unwrap();
+    let store = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(11),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(store.state().last_administration(), Some(&revoked));
     assert!(store.state().authority().grant(ids::FRIEND_GRANT).is_some());
     assert!(store.state().authority().grant(ids::AGENT_GRANT).is_none());
@@ -165,9 +172,15 @@ async fn unmounted_operations_cannot_be_issued() {
     );
     assert_eq!(node.store.lock().await.unwrap().state(), &before);
     drop(node);
-    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(10))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(10),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.state().authority(), before.authority());
     assert!(reopened.state().last_administration().is_none());
 }
@@ -221,7 +234,7 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 );
                 node.store.lock().await.unwrap().resume_statements(release).await;
                 drop(node);
-                let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11))
+                let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11), Default::default(),)
                     .await
                     .unwrap();
                 crate::test_support::passkey_caller(
@@ -355,9 +368,15 @@ async fn an_owner_binds_one_verified_provider_and_may_retry_it() {
     );
     node.check_provider(&provider).await.unwrap();
     drop((node, root, gateway));
-    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(10))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(10),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.state().provider().unwrap(), &provider);
 }
 

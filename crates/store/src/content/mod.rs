@@ -1,4 +1,6 @@
 //! Generic verified objects, trees, pins and scoped content operations.
+pub use hellas_private::Durability;
+
 mod acquire;
 pub mod config;
 mod core;
@@ -43,6 +45,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("another process holds the content database")]
+    Locked,
     #[error("invalid content: {0}")]
     Invalid(&'static str),
     #[error("content access denied")]

@@ -565,6 +565,7 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
         ),
         None,
         now,
+        Default::default(),
     )
     .await
     .unwrap();

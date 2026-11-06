@@ -119,6 +119,7 @@ async fn fetches_the_reference_file_and_verifies_it() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();

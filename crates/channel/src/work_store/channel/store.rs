@@ -24,6 +24,29 @@ impl std::fmt::Debug for ChannelStore {
 }
 
 impl ChannelStore {
+    /// Finish provider unaccepted content cleanup and release the journal writer.
+    /// The host must first stop observers and execution; retained roots stay pinned.
+    pub async fn close(&mut self) -> Result<(), WorkStoreError> {
+        let pending = self
+            .contents
+            .iter()
+            .filter(|_| self.state.role == Role::Provider)
+            .filter_map(|(work, (_, scope))| {
+                if let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind {
+                    Some((*work, reservation))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut result = Ok(());
+        for (work, reservation) in pending {
+            result = result.and(self.discard_unaccepted_content(work, reservation).await);
+        }
+        self.journal.close().await;
+        result
+    }
+
     pub(crate) fn check_authority(&self) -> Result<(), WorkStoreError> {
         self.journal.check_authority()?;
         Ok(())
@@ -151,9 +174,9 @@ impl ChannelStore {
             key,
         };
         let (mut journal, replay) = if existing {
-            Journal::open_existing(root, &stem, id).await?
+            Journal::open_existing(root, &stem, id, content.durability()).await?
         } else {
-            Journal::open_latest(root, &stem, id).await?
+            Journal::open_latest(root, &stem, id, content.durability()).await?
         };
         let mut state = match &replay.checkpoint {
             Some(bytes) => {
@@ -279,7 +302,7 @@ impl ChannelStore {
         self.journal.pause_next_statement().await
     }
 
-    /// Journals one step, and returns only once it is on the disk.
+    /// Journals one committed step under the configured durability policy.
     ///
     /// The rule this exists to enforce: call it *before* the bytes it
     /// records leave the process, and before the side effect it

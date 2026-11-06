@@ -123,8 +123,14 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
     drop(admin);
     drop(service);
     drop(node);
-    let reopened = NodeStore::open(dir.path(), network(), None, UnixMillis(1000))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        dir.path(),
+        network(),
+        None,
+        UnixMillis(1000),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(reopened.state().paid_policy(), Some(&current));
 }

@@ -107,6 +107,10 @@ impl<S> ContentService<S> {
 }
 fn status(error: Error) -> WireStatus {
     let (code, message) = match error {
+        Error::Locked => (
+            WireCode::Unavailable,
+            "another process holds the content database",
+        ),
         Error::Denied => (WireCode::PermissionDenied, "content access denied"),
         Error::WorkOwned => (
             WireCode::FailedPrecondition,

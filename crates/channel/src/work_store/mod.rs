@@ -1,6 +1,7 @@
 //! Durable, append-only endpoint state for setup and paid channels.
 //!
-//! Each transition is fsynced before its signature or result is released.
+//! Each transition is committed before its signature or result is released;
+//! power mode also flushes the commit.
 //! Replay validates transition order; journal ownership is exclusive.
 //! The store does not prevent a caller from sending before committing, nor
 //! protect against rollback of its backing storage.

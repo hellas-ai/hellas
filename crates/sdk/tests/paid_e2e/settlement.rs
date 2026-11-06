@@ -43,6 +43,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 case.options.provider,
                 case.owner.principal(),
                 case.owner.delegate(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -57,6 +58,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.options.provider,
                     ROOT.principal(),
                     case.owner.delegate(),
+                    Default::default(),
                 )
                 .await
                 .is_err()
@@ -68,6 +70,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.options.provider,
                     case.owner.principal(),
                     provider_settlement().party_key(),
+                    Default::default(),
                 )
                 .await
                 .is_err()
@@ -79,6 +82,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     other_provider(&case.options).provider,
                     case.owner.principal(),
                     case.owner.delegate(),
+                    Default::default(),
                 )
                 .await
                 .is_err()
@@ -90,6 +94,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.options.provider,
                     case.owner.principal(),
                     case.owner.delegate(),
+                    Default::default(),
                 )
                 .await
                 .unwrap()
@@ -102,6 +107,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.options.provider,
                     case.owner.principal(),
                     case.owner.delegate(),
+                    Default::default(),
                 )
                 .await
                 .is_err()
@@ -122,6 +128,7 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                     case.options.provider,
                     case.owner.principal(),
                     case.owner.delegate(),
+                    Default::default(),
                 )
                 .await
                 .is_err()

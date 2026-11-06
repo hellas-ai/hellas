@@ -731,7 +731,7 @@ async fn durable_expiry_before_cleanup_releases_unaccepted_payloads_on_reopen() 
     drop(node);
     let stem = Journal::stems(root.path()).unwrap().pop().unwrap();
     let (header, _) = Journal::inspect(root.path(), &stem).await.unwrap();
-    let (mut journal, _) = Journal::open_existing(root.path(), &stem, header)
+    let (mut journal, _) = Journal::open_existing(root.path(), &stem, header, Default::default())
         .await
         .unwrap();
     let expired = authorization.acceptance_deadline + 1;

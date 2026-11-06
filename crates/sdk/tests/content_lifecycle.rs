@@ -114,6 +114,7 @@ async fn recover(root: &Path, role: Role) -> (ChannelStore, DiskStore) {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();

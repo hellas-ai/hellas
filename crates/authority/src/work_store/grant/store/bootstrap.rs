@@ -83,15 +83,17 @@ impl NodeStore {
     /// Only execution-only authority grants survive; mixed, administrative and
     /// unknown service rights require explicit regrant by the recovered owner.
     /// The replacement credential's verifier is part of the same commit. Its
-    /// secret is returned only after sync; lost output requires another recovery.
+    /// secret is returned only after commit under the configured durability
+    /// policy; lost output requires another recovery.
     pub async fn recover_offline(
         directory: &Path,
         network: NetworkId,
         expected: Revision,
         approval: OwnerApproval,
         now: UnixMillis,
+        durability: hellas_private::Durability,
     ) -> Result<(RecoveryRecord, CredentialSecret), NodeStoreError> {
-        let mut store = Self::open_initialized(directory, network).await?;
+        let mut store = Self::open_initialized(directory, network, durability).await?;
         let generation = store
             .state
             .authority
@@ -147,11 +149,13 @@ impl NodeStore {
         approval: OwnerApproval,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
+        durability: hellas_private::Durability,
     ) -> Result<(Self, CredentialSecret), NodeStoreError> {
         let (approval, secret) = approval.prepare(None)?;
-        let store =
-            Self::bootstrap_prepared(directory, network, root_grant, approval, provider, now)
-                .await?;
+        let store = Self::bootstrap_prepared(
+            directory, network, root_grant, approval, provider, now, durability,
+        )
+        .await?;
         Ok((store, secret))
     }
 
@@ -164,6 +168,7 @@ impl NodeStore {
         approval: PreparedBootstrap,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
+        durability: hellas_private::Durability,
     ) -> Result<Self, NodeStoreError> {
         let clock = super::super::clock::ClockBound::new();
         clock.check(now)?;
@@ -218,8 +223,15 @@ impl NodeStore {
             .map_err(|error| NodeStoreError::Io(error.error))?;
         identity_lock.0.write_all(&encode(&marker)?)?;
         identity_lock.0.sync_all()?;
-        let (mut journal, _) =
-            Journal::open_latest(staging.path(), "grants", marker.journal_id()).await?;
+        // Initial authority publication remains power-durable; subsequent hot
+        // journal writes use the node's selected mode after reopening below.
+        let (mut journal, _) = Journal::open_latest(
+            staging.path(),
+            "grants",
+            marker.journal_id(),
+            hellas_private::Durability::Power,
+        )
+        .await?;
         journal.append(&bytes).await?;
         // Close SQLite before moving its directory: subsequent connections and
         // WAL recovery must use the published path, never the temporary name.
@@ -249,10 +261,11 @@ impl NodeStore {
         hellas_private::sync_directory(parent)?;
         #[cfg(test)]
         bootstrap_crash_point("published");
-        let (journal, _) = Journal::open_existing(directory, "grants", marker.journal_id()).await?;
+        let (journal, _) =
+            Journal::open_existing(directory, "grants", marker.journal_id(), durability).await?;
         Ok(Self {
             clock,
-            _identity_lock: identity_lock,
+            _identity_lock: Some(identity_lock),
             journal,
             state,
             executions: Default::default(),
@@ -280,15 +293,16 @@ impl NodeStore {
     pub(super) async fn open_initialized(
         directory: &Path,
         network: NetworkId,
+        durability: hellas_private::Durability,
     ) -> Result<Self, NodeStoreError> {
         let clock = super::super::clock::ClockBound::new();
         let (identity_lock, marker) = read_marker(directory, network)?;
         let (journal, replay) =
-            Journal::open_existing(directory, "grants", marker.journal_id()).await?;
+            Journal::open_existing(directory, "grants", marker.journal_id(), durability).await?;
         let state = restore_replay(replay, network, marker.authority)?;
         Ok(Self {
             clock,
-            _identity_lock: identity_lock,
+            _identity_lock: Some(identity_lock),
             journal,
             state,
             executions: Default::default(),

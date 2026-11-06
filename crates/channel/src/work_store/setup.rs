@@ -1,6 +1,7 @@
 //! Durable state for the channel-opening handshake.
 //!
-//! Each signed revision is fsynced before export; recovery resumes from the
+//! Each signed revision is committed before export (flushed in power mode);
+//! recovery resumes from the
 //! retained revision and decides from one coherent observed chain state.
 
 use hellas_kernel::Cursor;
@@ -250,7 +251,7 @@ pub enum SetupRecord {
         payload: [u8; 32],
     },
     /// An executable revision and everything close-only recovery needs,
-    /// fsynced together before that revision is returned to the peer.
+    /// committed together under the configured durability policy before export.
     ArmedBundle {
         /// The revision's exact canonical bytes.
         bundle: Vec<u8>,

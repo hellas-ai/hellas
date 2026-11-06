@@ -269,6 +269,7 @@ impl RetainedSetups {
         journal_root: &std::path::Path,
         network: hellas_kernel::NetworkId,
         provider: hellas_client::ProviderAddress,
+        durability: hellas_private::Durability,
     ) -> Result<Self> {
         let found = hellas_channel::work_store::discover_setups(journal_root, network).await?;
         if !found.unidentified.is_empty() {
@@ -286,6 +287,7 @@ impl RetainedSetups {
                 setup.bond_edge,
                 Role::Client,
                 &Secp256k1Verifier::new(),
+                durability,
             )
             .await?;
             let Some((_, offer)) = store.state().offer() else {

@@ -57,6 +57,7 @@ impl Fixture {
             hellas_store::content::IndexMode::Resume,
             None,
             hellas_store::content::Reservations::ram(capacity),
+            Default::default(),
         )
         .await
         .unwrap();

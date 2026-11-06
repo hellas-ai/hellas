@@ -854,7 +854,11 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
             crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
         };
         let node = grants
-            .open(resources, &provider.open_identity.enrollment)
+            .open(
+                resources,
+                &provider.open_identity.enrollment,
+                provider.content.durability(),
+            )
             .await?;
         provider.grants = Some(grants);
         Some((

@@ -358,6 +358,14 @@ rec {
         default = hellasLib.executorPort;
         description = "Port for the Hellas node to listen on. Null lets the CLI auto-select.";
       };
+      durability = mkOption {
+        type = types.enum [
+          "crash"
+          "power"
+        ];
+        default = "crash";
+        description = "Hot node journals and content publication: crash protects process loss; power also flushes against power failure.";
+      };
       identityPath = mkOption {
         type = runtimePath;
         default = "${hellasLib.defaultStateDir}/.hellas/identity";
@@ -719,6 +727,8 @@ rec {
       "serve"
       "--identity"
       serve.identityPath
+      "--durability"
+      serve.durability
     ]
     ++ optArg "--port" serve.port
     ++ optArg "--queue-size" serve.queueSize

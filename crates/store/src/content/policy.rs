@@ -75,6 +75,7 @@ mod tests {
             IndexMode::Resume,
             None,
             Reservations::ram(8 << 20),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -334,6 +335,7 @@ mod tests {
                 IndexMode::Resume,
                 None,
                 Reservations::ram(8 << 20),
+                Default::default(),
             )
             .await
             .unwrap();

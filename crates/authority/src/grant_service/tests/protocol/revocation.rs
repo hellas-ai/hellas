@@ -244,7 +244,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 network(),
                 Some(hellas_channel::test_support::software_enrollment(2, [2; 32])),
                 UnixMillis(1000),
-            )
+             Default::default(),)
             .await
             .unwrap();
             assert_eq!(

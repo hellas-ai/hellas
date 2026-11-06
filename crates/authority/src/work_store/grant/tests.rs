@@ -194,6 +194,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
         UnixMillis(1_000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -230,6 +231,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(3_000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -289,6 +291,7 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(1_000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -346,6 +349,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
         UnixMillis(1_000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -366,6 +370,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
         UnixMillis(1),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -868,6 +873,7 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
             replacement,
         ),
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -928,9 +934,15 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
     store.rotate().await.unwrap();
     let before = store.state().clone();
     drop(store);
-    let store = NodeStore::open(dir.path(), network(), None, UnixMillis(1001))
-        .await
-        .unwrap();
+    let store = NodeStore::open(
+        dir.path(),
+        network(),
+        None,
+        UnixMillis(1001),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         store.state(),
         &before,

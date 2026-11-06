@@ -21,6 +21,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
             client: hellas_channel::test_support::channel_client(principal(1).0),
         },
         now,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -122,6 +123,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
             2, [2; 32],
         )),
         now,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -252,6 +254,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
             2, [2; 32],
         )),
         now,
+        Default::default(),
     )
     .await
     .unwrap();

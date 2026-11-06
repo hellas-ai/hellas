@@ -210,6 +210,7 @@ impl Daemon {
                 hellas_store::content::Reservations::ram(
                     hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
                 ),
+                Default::default(),
             )
             .await
             .unwrap()
@@ -402,6 +403,7 @@ impl Daemon {
             hellas_authority::model::grant::grant_network(),
             Some(self.provider_identity.enrollment.clone()),
             auth::UnixMillis::now().unwrap_or_default(),
+            Default::default(),
         )
         .await
         .unwrap()
@@ -689,6 +691,7 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
         hellas_authority::model::grant::grant_network(),
         None,
         now,
+        Default::default(),
     )
     .await
     .unwrap();

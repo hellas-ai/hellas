@@ -30,6 +30,23 @@ use prost::Message as _;
 use std::{sync::Arc, time::Duration};
 mod support;
 use support::temp;
+// In-process replay closes both SQLite writers before opening the same paths.
+async fn close_service(service: &WorkService) {
+    use hellas_channel::work_close::CloseChannel as _;
+    let mut driver = service.drive().unwrap();
+    let mut store = driver.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
+async fn close_client(mut endpoint: impl hellas_channel::work::ClientChannel) {
+    use hellas_channel::work_close::CloseChannel as _;
+    let mut client = endpoint.client().await.unwrap();
+    let mut store = client.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
 const EXPORTER: [u8; 32] = [0x5e; 32];
 const LAST_RELEASE: u64 = deadlines().terminal - 2;
 fn ready_at(height: u64) -> ReadyChannel {
@@ -220,7 +237,8 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     );
     serving.abort();
     let _ = serving.await;
-    drop(endpoint);
+    close_client(endpoint).await;
+    close_service(&service).await;
     drop(service);
     let mut recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     assert!(
@@ -238,7 +256,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     assert_eq!(job.transcript(), delivered.transcript);
     let mut endpoint = ClientEndpoint::new(ready.clone(), recovered, client()).unwrap();
     endpoint.verified(id, &bundle(1)).await.unwrap();
-    drop(endpoint);
+    close_client(endpoint).await;
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     assert_eq!(
         recovered.state().job_by_id(id).unwrap().phase(),
@@ -258,6 +276,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         let service =
             WorkService::new(ProviderEndpoint::new(early.clone(), ps, provider()).unwrap());
         run_to_result(&service, &early, id).await;
+        close_service(&service).await;
         drop(service);
         let ready = ready_at(height);
         let mut ps = store_at(root.path(), &ready, Role::Provider, height).await;
@@ -362,6 +381,7 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
         run_accepted_work(&service, &ready, &FailingBackend, id).await,
         Err(RunError::Backend(_))
     ));
+    close_service(&service).await;
     drop(service);
     let recovered = store_at(root.path(), &ready, Role::Provider, CURSOR).await;
     assert!(recovered.state().job_by_id(id).is_none());
@@ -869,8 +889,9 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     );
     serving.abort();
     let _ = serving.await;
+    close_service(&service).await;
     drop(service);
-    drop(endpoint);
+    close_client(endpoint).await;
     let mut recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     assert!(
         recovered
@@ -1034,8 +1055,9 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
     }
     serving.abort();
     let _ = serving.await;
+    close_service(&service).await;
     drop(service);
-    drop(client_endpoint);
+    close_client(client_endpoint).await;
     for (root, role) in [(pr.path(), Role::Provider), (cr.path(), Role::Client)] {
         let recovered = store_at(root, &ready, role, CURSOR).await;
         assert!(recovered.state().jobs().next().is_none());

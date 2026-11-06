@@ -1,21 +1,22 @@
 //! Append-only, durable journal with exclusive ownership, one SQLite
 //! database per journal.
 //!
-//! An append returns only once its transaction is committed and synced, so
-//! a record a caller has acted on is never lost on replay. Replay hands
+//! An append returns after commit. Crash mode preserves consistency after
+//! process loss; power mode also flushes each commit before returning.
+//! Power loss in crash mode may lose recent commits. Replay hands
 //! back the checkpoint and then every later record in the order it was
 //! appended. Rotation stores the checkpoint and deletes the records it
 //! replaces in one transaction, so a crash leaves either the generation
 //! before it or the one after it, never a mix of the two.
 
+pub use hellas_private::Durability;
 use hex::encode as hex;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::Connection as _;
 use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteLockingMode,
-    SqlitePoolOptions, SqliteSynchronous,
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteLockingMode, SqliteSynchronous,
 };
 
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
@@ -151,7 +152,7 @@ pub struct Replay {
 
 /// How long an open waits on another connection's lock before reporting
 /// [`JournalError::Locked`].
-const OPEN_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const OPEN_BUSY_TIMEOUT: Duration = Duration::ZERO;
 
 /// One append-only durable journal, exclusively held by its host.
 #[derive(Debug)]
@@ -163,6 +164,7 @@ pub struct Journal {
     records: u64,
     bytes: u64,
     poisoned: bool,
+    durability: Durability,
 }
 
 impl Drop for Journal {
@@ -178,6 +180,9 @@ impl Drop for Journal {
 }
 
 impl Journal {
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
     /// Returns where the journal named `stem` lives under `directory`.
     #[must_use]
     pub fn path(directory: &Path, stem: &str) -> PathBuf {
@@ -210,8 +215,9 @@ impl Journal {
         directory: &Path,
         stem: &str,
         id: JournalId,
+        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
-        Self::open_owned(directory, stem, id, true).await
+        Self::open_owned(directory, stem, id, true, durability).await
     }
 
     /// Recovers an initialized journal without creating an empty replacement.
@@ -219,8 +225,9 @@ impl Journal {
         directory: &Path,
         stem: &str,
         id: JournalId,
+        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
-        Self::open_owned(directory, stem, id, false).await
+        Self::open_owned(directory, stem, id, false, durability).await
     }
 
     async fn open_owned(
@@ -228,6 +235,7 @@ impl Journal {
         stem: &str,
         id: JournalId,
         create: bool,
+        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
         if !valid_stem(stem) {
             let invalid = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid stem");
@@ -247,86 +255,101 @@ impl Journal {
             .create_if_missing(create)
             .locking_mode(SqliteLockingMode::Exclusive)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
+            .synchronous(match durability {
+                Durability::Crash => SqliteSynchronous::Normal,
+                Durability::Power => SqliteSynchronous::Full,
+            })
+            .pragma(
+                "fullfsync",
+                if cfg!(target_os = "macos") && durability == Durability::Power {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+            )
             // A rotation deletes records a channel journal may hold payloads
             // in; zero them rather than leave them in free pages.
             .pragma("secure_delete", "ON")
-            // Long enough to wait out a racing opener's transient lock, short
-            // enough that a journal held by its owner is reported promptly.
+            // Another writer is refused immediately; no dormant busy wait.
             .busy_timeout(OPEN_BUSY_TIMEOUT);
         let sqlx_error = |error| JournalError::from_sqlx(error, &path);
-        // Take the exclusive writer before inspecting or initializing schema.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            // EXCLUSIVE mode keeps the lock of the first write until the
-            // connection closes, so a second opener is refused at connect.
-            .after_connect(|connection, _| {
-                let lock = sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT");
-                Box::pin(async move { lock.execute(connection).await.map(drop) })
-            })
-            .connect_with(options)
+        // Acquire ownership directly: a pool's after_connect error is retried.
+        let mut connection = SqliteConnection::connect_with(&options)
             .await
             .map_err(sqlx_error)?;
-        // A new database's directory entry must outlive a power cut too.
-        hellas_private::sync_directory(&directory.join(PARTITION))?;
-        let mut connection = pool.acquire().await.map_err(sqlx_error)?.leak();
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&mut connection)
-            .await
-            .map_err(sqlx_error)?;
-        if version == 0 && create {
-            let tables: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='table'")
-                    .fetch_one(&mut connection)
-                    .await
-                    .map_err(sqlx_error)?;
-            if tables != 0 {
-                connection.close().await.map_err(sqlx_error)?;
-                return Err(JournalError::Version { found: version });
-            }
-            let mut transaction = connection.begin().await.map_err(sqlx_error)?;
-            sqlx::raw_sql(include_str!("journal/schema.sql"))
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_error)?;
-            sqlx::raw_sql("PRAGMA user_version = 1")
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_error)?;
-            transaction.commit().await.map_err(sqlx_error)?;
-        } else if version != SCHEMA_VERSION {
-            connection.close().await.map_err(sqlx_error)?;
-            return Err(JournalError::Version { found: version });
-        }
-        let (found, generation, checkpoint) = match read_head(&mut connection, &path).await? {
-            Some(head) => head,
-            None if create => {
-                let (key, kind, role) = (&id.key[..], id.kind as i64, id.role as i64);
-                sqlx::query!(
-                    "INSERT INTO journal (key, kind, role, generation) VALUES (?, ?, ?, 0)",
-                    key,
-                    kind,
-                    role,
-                )
+        let opened = async {
+            sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT")
                 .execute(&mut connection)
                 .await
                 .map_err(sqlx_error)?;
-                (id, 0, None)
+            // A new database's directory entry must outlive a power cut too.
+            hellas_private::sync_directory(&directory.join(PARTITION))?;
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(sqlx_error)?;
+            if version == 0 && create {
+                let tables: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='table'")
+                        .fetch_one(&mut connection)
+                        .await
+                        .map_err(sqlx_error)?;
+                if tables != 0 {
+                    return Err(JournalError::Version { found: version });
+                }
+                let mut transaction = connection.begin().await.map_err(sqlx_error)?;
+                sqlx::raw_sql(include_str!("journal/schema.sql"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_error)?;
+                sqlx::raw_sql("PRAGMA user_version = 1")
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_error)?;
+                transaction.commit().await.map_err(sqlx_error)?;
+            } else if version != SCHEMA_VERSION {
+                return Err(JournalError::Version { found: version });
             }
-            None => return Err(missing()),
-        };
-        if found != id {
-            return Err(JournalError::HeaderMismatch {
-                path,
-                kind: id.kind,
-            });
+            let (found, generation, checkpoint) = match read_head(&mut connection, &path).await? {
+                Some(head) => head,
+                None if create => {
+                    let (key, kind, role) = (&id.key[..], id.kind as i64, id.role as i64);
+                    sqlx::query!(
+                        "INSERT INTO journal (key, kind, role, generation) VALUES (?, ?, ?, 0)",
+                        key,
+                        kind,
+                        role,
+                    )
+                    .execute(&mut connection)
+                    .await
+                    .map_err(sqlx_error)?;
+                    (id, 0, None)
+                }
+                None => return Err(missing()),
+            };
+            if found != id {
+                return Err(JournalError::HeaderMismatch {
+                    path: path.clone(),
+                    kind: id.kind,
+                });
+            }
+            let records = read_records(&mut connection, &path).await?;
+            let bytes = checkpoint
+                .iter()
+                .chain(&records)
+                .map(|r| r.len() as u64)
+                .sum();
+
+            Ok::<_, JournalError>((generation, records, bytes, checkpoint))
         }
-        let records = read_records(&mut connection, &path).await?;
-        let bytes = checkpoint
-            .iter()
-            .chain(&records)
-            .map(|r| r.len() as u64)
-            .sum();
+        .await;
+        let (generation, records, bytes, checkpoint) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = connection.close().await;
+                return Err(error);
+            }
+        };
         let (connection, records_len) = (Some(connection), records.len() as u64);
         let journal = Self {
             connection,
@@ -335,6 +358,7 @@ impl Journal {
             records: records_len,
             bytes,
             poisoned: false,
+            durability,
         };
         Ok((
             journal,
@@ -358,23 +382,36 @@ impl Journal {
                 directory: directory.into(),
             });
         }
-        let options = SqliteConnectOptions::new().filename(&path).read_only(true);
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .busy_timeout(Duration::ZERO);
         let sqlx_error = |error| JournalError::from_sqlx(error, &path);
         let mut connection = SqliteConnection::connect_with(&options)
             .await
             .map_err(sqlx_error)?;
-        let Some((id, _, checkpoint)) = read_head(&mut connection, &path).await? else {
-            return Err(JournalError::NotAJournal { path });
-        };
-        let records = read_records(&mut connection, &path).await?;
-        connection.close().await.map_err(sqlx_error)?;
-        Ok((
-            id,
-            Replay {
-                checkpoint,
-                records,
-            },
-        ))
+        let inspected = async {
+            let Some((id, _, checkpoint)) = read_head(&mut connection, &path).await? else {
+                return Err(JournalError::NotAJournal { path: path.clone() });
+            };
+            let records = read_records(&mut connection, &path).await?;
+            Ok((
+                id,
+                Replay {
+                    checkpoint,
+                    records,
+                },
+            ))
+        }
+        .await;
+        let closed = connection.close().await.map_err(sqlx_error);
+        match inspected {
+            Ok(value) => {
+                closed?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns how many rotations this journal has been through.
@@ -485,7 +522,8 @@ impl Journal {
         Ok(())
     }
 
-    /// Appends one record and returns only once it is committed and synced.
+    /// Appends one committed record, protected against process loss in crash
+    /// mode and flushed against power loss in power mode.
     ///
     /// A write that fails poisons this handle: whether it committed is not
     /// something this process can tell, so every later call is refused

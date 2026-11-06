@@ -15,36 +15,51 @@ const CHECKPOINT: &[u8] = b"the state the predecessor reached";
 
 #[tokio::test]
 async fn the_durability_configuration_is_pinned() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
-        .await
-        .unwrap();
-    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
-        .fetch_one(journal.connection.as_mut().unwrap())
-        .await
-        .unwrap();
-    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
-        .fetch_one(journal.connection.as_mut().unwrap())
-        .await
-        .unwrap();
-    let locking_mode: String = sqlx::query_scalar("PRAGMA locking_mode")
-        .fetch_one(journal.connection.as_mut().unwrap())
-        .await
-        .unwrap();
-    let secure_delete: i64 = sqlx::query_scalar("PRAGMA secure_delete")
-        .fetch_one(journal.connection.as_mut().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(journal_mode, "wal");
-    assert_eq!(synchronous, 2, "FULL");
-    assert_eq!(locking_mode, "exclusive");
-    assert_eq!(secure_delete, 1);
+    for (durability, expected) in [(Durability::default(), 1), (Durability::Power, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), durability)
+            .await
+            .unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(journal.connection.as_mut().unwrap())
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(journal.connection.as_mut().unwrap())
+            .await
+            .unwrap();
+        let locking_mode: String = sqlx::query_scalar("PRAGMA locking_mode")
+            .fetch_one(journal.connection.as_mut().unwrap())
+            .await
+            .unwrap();
+        let secure_delete: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+            .fetch_one(journal.connection.as_mut().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, expected);
+        let busy: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(journal.connection.as_mut().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(busy, 0);
+        #[cfg(target_os = "macos")]
+        {
+            let fullfsync: i64 = sqlx::query_scalar("PRAGMA fullfsync")
+                .fetch_one(journal.connection.as_mut().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fullfsync, i64::from(durability == Durability::Power));
+        }
+        assert_eq!(locking_mode, "exclusive");
+        assert_eq!(secure_delete, 1);
+    }
 }
 
 #[tokio::test]
 async fn a_rotation_replays_as_its_checkpoint_and_what_followed() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     for record in PREDECESSOR {
@@ -55,7 +70,7 @@ async fn a_rotation_replays_as_its_checkpoint_and_what_followed() {
     assert!(journal.is_empty());
     journal.append(b"after").await.unwrap();
     drop(journal);
-    let (reopened, replay) = Journal::open_latest(dir.path(), "duty", id())
+    let (reopened, replay) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_eq!(reopened.generation(), 1);
@@ -67,7 +82,7 @@ async fn a_rotation_replays_as_its_checkpoint_and_what_followed() {
 #[tokio::test]
 async fn a_rotation_that_cannot_commit_leaves_its_predecessor() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     for record in PREDECESSOR {
@@ -81,7 +96,7 @@ async fn a_rotation_that_cannot_commit_leaves_its_predecessor() {
     assert_err!(journal.append(b"four").await, JournalError::Poisoned);
     assert_err!(journal.rotate(CHECKPOINT).await, JournalError::Poisoned);
     drop(journal);
-    let (mut reopened, replay) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut reopened, replay) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_eq!(reopened.generation(), 0);
@@ -89,7 +104,7 @@ async fn a_rotation_that_cannot_commit_leaves_its_predecessor() {
     assert_eq!(replay.records, PREDECESSOR);
     reopened.append(b"four").await.unwrap();
     drop(reopened);
-    let (_, replay) = Journal::open_latest(dir.path(), "duty", id())
+    let (_, replay) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_eq!(replay.records.len(), 4);
@@ -98,7 +113,7 @@ async fn a_rotation_that_cannot_commit_leaves_its_predecessor() {
 #[tokio::test]
 async fn the_reserve_outlives_a_rotation_that_cannot_complete() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     for _ in 0..MAX_ACTIVE_FRAMES - DUTY_RESERVE_FRAMES {
@@ -121,7 +136,7 @@ async fn the_reserve_outlives_a_rotation_that_cannot_complete() {
 #[tokio::test]
 async fn a_failed_append_poisons_the_journal() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     journal.refuse("INSERT", "record").await;
@@ -135,7 +150,7 @@ async fn a_failed_append_poisons_the_journal() {
 #[tokio::test]
 async fn a_lost_write_acknowledgement_requires_replay() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     let (started, release) = journal.pause_next_statement().await;
@@ -153,7 +168,7 @@ async fn a_lost_write_acknowledgement_requires_replay() {
     );
     journal.resume_statements(release).await;
     drop(journal);
-    let (mut journal, replay) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, replay) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_eq!(replay.records, vec![b"uncertain append".to_vec()]);
@@ -163,7 +178,7 @@ async fn a_lost_write_acknowledgement_requires_replay() {
 #[tokio::test]
 async fn an_oversized_record_does_not_poison_the_journal() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_err!(
@@ -178,7 +193,7 @@ async fn an_oversized_record_does_not_poison_the_journal() {
 async fn a_rotation_leaves_no_deleted_record_on_disk() {
     const SENTINEL: &[u8] = b"rotated-away-payload-sentinel";
     let dir = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     journal.append(&SENTINEL.repeat(64)).await.unwrap();
@@ -214,11 +229,11 @@ async fn pre_cutover_journals_are_refused_without_migration_or_legacy_replay() {
         .unwrap();
     connection.close().await.unwrap();
     assert!(matches!(
-        Journal::open_latest(directory.path(), "old", id()).await,
+        Journal::open_latest(directory.path(), "old", id(), Default::default(),).await,
         Err(JournalError::Version { found: 0 })
     ));
     assert!(matches!(
-        Journal::open_existing(directory.path(), "old", id()).await,
+        Journal::open_existing(directory.path(), "old", id(), Default::default(),).await,
         Err(JournalError::Version { found: 0 })
     ));
     assert!(matches!(
@@ -237,4 +252,28 @@ async fn pre_cutover_journals_are_refused_without_migration_or_legacy_replay() {
         .unwrap();
     assert_eq!(version, 0);
     connection.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_header_validation_releases_the_writer_before_returning() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut original, _) = Journal::open_latest(root.path(), "duty", id(), Durability::default())
+        .await
+        .unwrap();
+    original.append(b"authoritative").await.unwrap();
+    original.close().await;
+    let wrong = JournalId {
+        role: Role::Provider,
+        ..id()
+    };
+    assert!(matches!(
+        Journal::open_existing(root.path(), "duty", wrong, Durability::default()).await,
+        Err(JournalError::HeaderMismatch { .. })
+    ));
+    let (mut reopened, replay) =
+        Journal::open_existing(root.path(), "duty", id(), Durability::default())
+            .await
+            .unwrap();
+    assert_eq!(replay.records, vec![b"authoritative".to_vec()]);
+    reopened.close().await;
 }

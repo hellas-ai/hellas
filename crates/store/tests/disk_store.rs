@@ -27,9 +27,16 @@ async fn open(
     mode: IndexMode,
     capacity: Option<u64>,
 ) -> DiskStore {
-    DiskStore::open(root, lower, mode, capacity, Reservations::ram(32 << 20))
-        .await
-        .unwrap()
+    DiskStore::open(
+        root,
+        lower,
+        mode,
+        capacity,
+        Reservations::ram(32 << 20),
+        Default::default(),
+    )
+    .await
+    .unwrap()
 }
 async fn fill(mut session: UploadSession, bytes: &[u8]) {
     if session.complete() {
@@ -233,7 +240,8 @@ async fn require_uses_only_explicit_records_until_reload() {
             vec![lower.clone()],
             IndexMode::Require,
             None,
-            Reservations::ram(32 << 20)
+            Reservations::ram(32 << 20),
+            Default::default(),
         )
         .await
         .is_err()

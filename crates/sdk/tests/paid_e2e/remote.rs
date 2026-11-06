@@ -22,6 +22,18 @@ pub(super) struct Source {
     pub connections: Arc<AtomicUsize>,
     /// Latency injected into source selection only.
     pub delay: std::time::Duration,
+    observation_gate: Arc<std::sync::Mutex<Option<ObservationGate>>>,
+}
+
+// The retained, single-source opener reads applied Latest for selection,
+// setup, mounted floor, readiness, catch-up, then initial observation.
+#[derive(Clone)]
+struct ObservationGate {
+    reads: Arc<AtomicUsize>,
+    first_blocked: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    delay: Duration,
 }
 
 macro_rules! forward {
@@ -91,6 +103,25 @@ impl hellas_chain::LightClient for Source {
         &self,
         query: FinalizedBlockQuery,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
+        let gate = self.observation_gate.lock().unwrap().clone();
+        if query == FinalizedBlockQuery::Latest
+            && let Some(gate) = gate
+        {
+            let read = gate.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if read == 5 {
+                tokio::time::sleep(gate.delay).await;
+            }
+            if read >= 6 {
+                let _ = gate.first_blocked.compare_exchange(
+                    0,
+                    read,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                gate.entered.add_permits(1);
+                let _ = gate.release.acquire().await;
+            }
+        }
         if self.tips_unavailable.load(Ordering::SeqCst) {
             self.tip_refusals.add_permits(1);
             return Err(QueryError::Remote("injected RPC Unavailable".into()));
@@ -173,6 +204,7 @@ impl Relays {
             stale: Arc::new(std::sync::Mutex::new(None)),
             connections: Arc::new(AtomicUsize::new(0)),
             delay,
+            observation_gate: Default::default(),
         };
         let (disconnect, _) = tokio::sync::watch::channel(0);
         let mut urls = Vec::new();
@@ -681,4 +713,140 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     relays.shutdown().await;
     devnet.shutdown().await;
+}
+
+pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
+    runtime: commonware_runtime::tokio::Context,
+) {
+    use hellas_channel::work_store::{ChannelStore, Role, WorkStoreError, journal::JournalError};
+    let mut case = paid_fixture(runtime).await;
+    let mut session = sealing_while(
+        &mut case.devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let descriptor = session.descriptor().clone();
+    let height = case.devnet.height();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while session.with_state(|state| state.cursor().0).await.unwrap() < height {
+            tokio::time::sleep(case.options.config.poll).await;
+        }
+    })
+    .await
+    .unwrap();
+    let expected = session
+        .with_state(|state| state.checkpoint())
+        .await
+        .unwrap();
+    session.shutdown().await;
+    drop(session);
+    case.relays.source.replay.store(height, Ordering::SeqCst);
+    for expires in [false, true] {
+        let mut options = case.options.clone();
+        options.config.max_observation_age = options.config.poll * 2;
+        options.timeout = case.options.timeout;
+        let gate = ObservationGate {
+            reads: Arc::new(AtomicUsize::new(0)),
+            first_blocked: Arc::new(AtomicUsize::new(0)),
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            delay: options.config.max_observation_age + options.config.poll,
+        };
+        *case.relays.source.observation_gate.lock().unwrap() = Some(gate.clone());
+        let mut opening = Box::pin(PaidWorkSession::open(
+            options,
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Retained,
+            SessionFundingOptions::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = &mut opening => panic!("opening ended before initial observation: {:?}; applied reads {}, first blocked {}", result.err(), gate.reads.load(Ordering::SeqCst), gate.first_blocked.load(Ordering::SeqCst)),
+                permit = gate.entered.acquire() => permit.unwrap().forget(),
+            }
+        }).await.unwrap();
+        assert_eq!(
+            gate.first_blocked.load(Ordering::SeqCst),
+            6,
+            "the controlled sixth applied read is initial observation"
+        );
+        assert!(matches!(
+            ChannelStore::recover(
+                &case.options.journal_root,
+                descriptor.channel().clone(),
+                Role::Client,
+                case.options.content.clone(),
+                &hellas_kernel::Secp256k1Verifier::new()
+            )
+            .await,
+            Err(WorkStoreError::Journal(JournalError::Locked { .. }))
+        ));
+        if expires {
+            let error = opening
+                .await
+                .err()
+                .expect("the configured opening deadline expires");
+            assert!(
+                matches!(
+                    error,
+                    hellas_sdk::paid_client::PaidClientError::Timeout { .. }
+                ),
+                "{error}"
+            );
+        } else {
+            drop(opening);
+        }
+        let mut recovered = ChannelStore::recover(
+            &case.options.journal_root,
+            descriptor.channel().clone(),
+            Role::Client,
+            case.options.content.clone(),
+            &hellas_kernel::Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.state().checkpoint(), expected);
+        assert_eq!(
+            gate.release.available_permits(),
+            0,
+            "the network gate is still blocked during canonical reopen"
+        );
+        recovered.close().await.unwrap();
+        drop(recovered);
+        *case.relays.source.observation_gate.lock().unwrap() = None;
+        gate.release.close();
+        let mut reopened = PaidWorkSession::open(
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionOpenMode::Retained,
+            SessionFundingOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.descriptor().channel().id(),
+            descriptor.channel().id()
+        );
+        reopened.shutdown().await;
+        drop(reopened);
+    }
+    case.endpoint.close().await;
+    case.provider.shutdown().await.unwrap();
+    case.provider_content.close().await;
+    case.relays.shutdown().await;
+    case.devnet.shutdown().await;
 }

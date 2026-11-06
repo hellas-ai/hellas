@@ -397,6 +397,7 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                             2, [2; 32],
                         )),
                         UnixMillis(1000),
+                        Default::default(),
                     )
                     .await
                     .unwrap();

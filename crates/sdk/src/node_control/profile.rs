@@ -319,6 +319,7 @@ impl GatewayProfile {
             hellas_authority::model::grant::grant_network(),
             None,
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+            Default::default(),
         )
         .await?;
         if store.state().authority().authority() != profile.authority {

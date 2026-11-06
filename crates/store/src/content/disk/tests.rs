@@ -17,6 +17,7 @@ async fn open(root: &FsPath) -> DiskStore {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -193,6 +194,7 @@ async fn tree_bytes_modified_after_verified_open_are_rejected_and_only_that_back
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -328,6 +330,7 @@ async fn failed_promotion_remains_scope_protected_until_retry_or_journal_recover
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -490,6 +493,7 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -784,6 +788,7 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -830,6 +835,7 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await;
     assert!(matches!(result, Err(Error::WorkOwned)));
@@ -891,8 +897,120 @@ async fn a_failed_ownership_commit_cannot_open_a_work_scope_or_reserve_content()
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
     ordinary.close().await;
+}
+
+#[tokio::test]
+async fn durability_modes_apply_real_sqlite_pragmas() {
+    for (durability, expected) in [(Durability::default(), 1), (Durability::Power, 2)] {
+        let root = tempfile::tempdir().unwrap();
+        let store = DiskStore::open(
+            root.path().into(),
+            vec![],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(32 << 20),
+            durability,
+        )
+        .await
+        .unwrap();
+        let db = &store.core.disk.as_ref().unwrap().db;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let busy: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(synchronous, expected);
+        assert_eq!(busy, 0);
+        #[cfg(target_os = "macos")]
+        {
+            let fullfsync: i64 = sqlx::query_scalar("PRAGMA fullfsync")
+                .fetch_one(db)
+                .await
+                .unwrap();
+            assert_eq!(fullfsync, i64::from(durability == Durability::Power));
+        }
+        store.close().await;
+    }
+}
+#[tokio::test]
+async fn content_ownership_probe() {
+    let Some(root) = std::env::var_os("HELLAS_CONTENT_OWNERSHIP_PROBE") else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let result = DiskStore::open(
+        root.into(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+        Durability::default(),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Locked)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "must refuse before the former busy wait"
+    );
+}
+#[tokio::test]
+async fn a_second_process_cannot_open_the_content_database() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "content::disk::tests::content_ownership_probe"])
+        .env("HELLAS_CONTENT_OWNERSHIP_PROBE", root.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    store.close().await;
+}
+
+#[tokio::test]
+async fn failed_lower_initialization_releases_the_writer_before_returning() {
+    let root = tempfile::tempdir().unwrap();
+    let upper = root.path().join("upper");
+    assert!(
+        DiskStore::open(
+            upper.clone(),
+            vec![root.path().join("missing-lower")],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(32 << 20),
+            Durability::default()
+        )
+        .await
+        .is_err()
+    );
+    let reopened = DiskStore::open(
+        upper,
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+        Durability::default(),
+    )
+    .await
+    .unwrap();
+    reopened.close().await;
 }

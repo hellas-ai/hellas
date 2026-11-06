@@ -397,6 +397,7 @@ pub async fn content_store(root: &std::path::Path) -> hellas_store::content::Dis
         hellas_store::content::Reservations::ram(
             hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
         ),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -528,6 +529,7 @@ pub async fn reopen(
             2, [2; 32],
         )),
         UnixMillis(now),
+        Default::default(),
     )
     .await
 }

@@ -1622,6 +1622,7 @@ async fn paid_finish(case: PaidScenario) {
         options.provider,
         owner.principal(),
         owner.delegate(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -1862,4 +1863,11 @@ fn a_responsive_source_below_the_journal_height_is_not_selected() {
 #[test]
 fn paid_startup_selects_a_source_at_the_retained_journal_floor() {
     run(remote::paid_startup_uses_the_retained_floor);
+}
+
+#[test]
+fn cancelled_initial_observation_releases_its_journal_before_a_retry() {
+    run(|runtime| {
+        Box::pin(remote::opening_cancellation_releases_the_mounted_client_journal(runtime))
+    });
 }

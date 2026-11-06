@@ -34,6 +34,56 @@ pub mod windows;
 #[cfg(windows)]
 use windows as imp;
 
+/// Durability of hot node journals and content publication. Identity, key and
+/// configuration helpers always retain their existing durable writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Consistent after process loss; power loss may lose recent commits.
+    #[default]
+    Crash,
+    /// Flush transactions and published content before returning.
+    Power,
+}
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Crash => "crash",
+            Self::Power => "power",
+        })
+    }
+}
+impl std::str::FromStr for Durability {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "crash" => Ok(Self::Crash),
+            "power" => Ok(Self::Power),
+            _ => Err("durability must be crash or power"),
+        }
+    }
+}
+impl Durability {
+    pub fn sync_file(self, file: &File) -> io::Result<()> {
+        match self {
+            Self::Crash => Ok(()),
+            Self::Power => file.sync_all(),
+        }
+    }
+    pub fn sync_directory(self, path: &Path) -> io::Result<()> {
+        match self {
+            Self::Crash => Ok(()),
+            Self::Power => sync_directory(path),
+        }
+    }
+    pub fn create_dir_all(self, path: &Path) -> io::Result<()> {
+        match self {
+            Self::Crash => imp::create_dir_all(path),
+            Self::Power => create_dir_all_durable(path).map(drop),
+        }
+    }
+}
+
 /// Opens `path` for reading without following a final symlink (Unix) or
 /// reparse point (Windows). `NotFound` passes through unchanged.
 pub fn open_nofollow(path: &Path) -> io::Result<File> {

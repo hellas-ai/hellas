@@ -61,6 +61,7 @@ async fn invalid_result_leaves_exact_retained_allowance_available_for_valid_deli
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -460,6 +461,7 @@ async fn a_durable_unaccepted_proposal_can_reupload_and_accept_after_reopening_w
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -823,6 +825,7 @@ async fn owner_lifecycle_pin_policy_survives_acceptance_pin_move_and_boot_recove
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1041,6 +1044,7 @@ async fn recovering_many_retained_jobs_loads_bodies_only_when_each_job_is_used()
         IndexMode::Resume,
         None,
         Reservations::ram(ram_limit),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -1147,7 +1151,7 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
         role: Role::Provider,
         key,
     };
-    let (mut journal, _) = Journal::open_latest(root.path(), &stem, identity)
+    let (mut journal, _) = Journal::open_latest(root.path(), &stem, identity, Default::default())
         .await
         .unwrap();
     journal.close().await;
@@ -1166,7 +1170,7 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
         .is_none()
     );
     assert!(node.collect(&Scope::Owner).await.is_err());
-    let (mut journal, _) = Journal::open_existing(root.path(), &stem, identity)
+    let (mut journal, _) = Journal::open_existing(root.path(), &stem, identity, Default::default())
         .await
         .unwrap();
     journal
@@ -1232,6 +1236,7 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
                 role: Role::Provider,
                 key,
             },
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1269,6 +1274,7 @@ async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -1301,7 +1307,8 @@ async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
             vec![],
             IndexMode::Resume,
             None,
-            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES)
+            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            Default::default(),
         )
         .await,
         Err(Error::WorkOwned)

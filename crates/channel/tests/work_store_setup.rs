@@ -252,6 +252,7 @@ async fn store(root: &std::path::Path, role: Role) -> SetupStore {
         bond_edge(),
         role,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {
@@ -788,8 +789,15 @@ async fn a_journal_belongs_to_one_network_and_one_bond() {
         // A different key is a different file name, so this is a fresh
         // empty journal rather than this one misread — which is the
         // point: no state crosses over.
-        let Ok(other) =
-            SetupStore::open(dir.path(), network, bond, Role::Provider, &verifier).await
+        let Ok(other) = SetupStore::open(
+            dir.path(),
+            network,
+            bond,
+            Role::Provider,
+            &verifier,
+            Default::default(),
+        )
+        .await
         else {
             panic!("a fresh journal opens");
         };
@@ -807,9 +815,16 @@ async fn a_journal_belongs_to_one_network_and_one_bond() {
     if let Err(error) = std::fs::copy(journal_path(dir.path(), network(), bond_edge()), &theirs) {
         panic!("the copy succeeds: {error}");
     }
-    let error = SetupStore::open(dir.path(), network(), elsewhere, Role::Provider, &verifier)
-        .await
-        .expect_err("this file is not that channel's journal");
+    let error = SetupStore::open(
+        dir.path(),
+        network(),
+        elsewhere,
+        Role::Provider,
+        &verifier,
+        Default::default(),
+    )
+    .await
+    .expect_err("this file is not that channel's journal");
     assert!(
         matches!(
             error,
@@ -835,6 +850,7 @@ async fn a_second_holder_is_refused() {
         bond_edge(),
         Role::Provider,
         &verifier,
+        Default::default(),
     )
     .await
     .expect_err("the journal is already held");
@@ -849,7 +865,8 @@ async fn a_second_holder_is_refused() {
             network(),
             bond_edge(),
             Role::Provider,
-            &verifier
+            &verifier,
+            Default::default(),
         )
         .await
         .is_ok(),
@@ -901,6 +918,7 @@ async fn a_restart_finds_every_journal_its_root_holds() {
             funded.bond_edge(),
             Role::Client,
             &verifier,
+            Default::default(),
         )
         .await
         {
@@ -938,6 +956,7 @@ async fn a_restart_finds_every_journal_its_root_holds() {
             expected.bond_edge,
             expected.role,
             &verifier,
+            Default::default(),
         )
         .await
         {
@@ -969,6 +988,7 @@ async fn a_root_holding_no_journals_yields_none() {
                 role: Role::Provider,
                 key: [0; 32],
             },
+            Default::default(),
         )
         .await
         .unwrap(),
@@ -1012,6 +1032,7 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
             armed.bond_edge(),
             Role::Provider,
             &verifier,
+            Default::default(),
         )
         .await
         {
@@ -1102,6 +1123,7 @@ async fn a_revision_that_is_not_this_journals_bond_is_refused() {
                 role: Role::Provider,
                 key: key.into_bytes(),
             },
+            Default::default(),
         )
         .await
         {
@@ -2278,6 +2300,7 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     {
@@ -2987,6 +3010,7 @@ async fn replay_checks_the_signatures_again() {
             bond_edge(),
             Role::Provider,
             &AcceptAll,
+            Default::default(),
         )
         .await
         else {
@@ -3005,6 +3029,7 @@ async fn replay_checks_the_signatures_again() {
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .expect_err("the provider never signed that");
@@ -3333,6 +3358,7 @@ async fn existing_only_setup_never_creates_a_missing_journal() {
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
+        Default::default(),
     )
     .await
     .expect_err("missing setup cannot be recreated for recovery");

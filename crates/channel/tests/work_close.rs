@@ -750,7 +750,19 @@ struct Watcher {
 async fn close_content(service: &WorkService) {
     use hellas_channel::work_close::CloseChannel as _;
     let mut driver = service.drive().unwrap();
-    driver.store().await.unwrap().content_store().close().await;
+    let mut store = driver.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
+async fn close_endpoint(mut endpoint: impl hellas_channel::work_close::CloseChannel) {
+    let mut store = endpoint.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
+async fn close_provider(endpoint: ProviderEndpoint) {
+    close_content(&WorkService::new(endpoint)).await;
 }
 
 async fn restarted(fixture: Checked) -> Watcher {
@@ -1074,7 +1086,7 @@ async fn restart_services_the_response_before_its_deadline() {
         endpoint.state().close_opened(),
         Some((expected, Party::Maker))
     );
-    drop(endpoint);
+    close_provider(endpoint).await;
 
     let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let mut provider = ProviderEndpoint::new(ready.clone(), store, provider())
@@ -1275,7 +1287,7 @@ async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
         failed.is_err(),
         "the sink refused, and the step says so: {failed:?}",
     );
-    drop(endpoint);
+    close_provider(endpoint).await;
     let written = journal_records(_provider_root.path()).await;
 
     // The crash: the state the retry runs against is replayed from the
@@ -1314,7 +1326,7 @@ async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
         Some(responded),
         "and it is not counted twice",
     );
-    drop(endpoint);
+    close_provider(endpoint).await;
     assert_eq!(
         journal_records(_provider_root.path()).await,
         written,
@@ -1372,7 +1384,7 @@ async fn a_crashed_answer_is_offered_before_any_successor_block() {
         .state()
         .close_responded()
         .expect("the answer is on the disk");
-    drop(dying);
+    close_provider(dying).await;
 
     // The restart, against a backlog that runs past the deadline.
     let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
@@ -2024,7 +2036,7 @@ async fn a_client_ends_a_verified_unpaid_job_its_payment_deadline_has_passed() {
         endpoint.state().job_by_id(id).map(JobState::phase),
         Some(JobPhase::Verified),
     );
-    drop(endpoint);
+    close_endpoint(endpoint).await;
     drop(service);
 
     let mut store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
@@ -2075,7 +2087,7 @@ async fn a_client_ends_a_verified_unpaid_job_its_payment_deadline_has_passed() {
         endpoint.state().payment(id).is_some(),
         "the fixture job is paid",
     );
-    drop(endpoint);
+    close_endpoint(endpoint).await;
     drop(service);
     let mut store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     advance(&mut store, deadlines().payment + 1).await;
@@ -3971,7 +3983,7 @@ async fn client_replays_contest_history_and_waits_for_finalized_close() {
             hellas_kernel::Tx::move_action(hellas_kernel::Move::RespondPaymentClose(response)),
         ],
     );
-    drop(fixture.client);
+    close_endpoint(fixture.client).await;
     let mut store = store_at(
         fixture.client_root.path(),
         &fixture.ready,
@@ -3999,6 +4011,7 @@ async fn client_replays_contest_history_and_waits_for_finalized_close() {
     )
     .await;
     store.rotate().await.unwrap(); // pre-extension checkpoint, no history field
+    store.content_store().close().await;
     drop(store);
     let store = store_at(
         fixture.client_root.path(),
@@ -4279,7 +4292,7 @@ async fn recovered_provider_rereads_a_partial_open_before_adjudicating_a_rejecte
         _provider_root,
         _client_root,
     } = restarted(fixture).await;
-    drop(endpoint);
+    close_provider(endpoint).await;
     let inclusion = CURSOR + 1;
     let deadline = inclusion + payment_terms().omit_response_blocks;
     let start = close_start(ready.channel(), Party::Maker, CURSOR, None, &client()).unwrap();
@@ -4305,6 +4318,7 @@ async fn recovered_provider_rereads_a_partial_open_before_adjudicating_a_rejecte
         },
     )
     .await;
+    store.content_store().close().await;
     drop(store);
     let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let mut endpoint = ProviderEndpoint::new(ready, store, provider()).unwrap();
@@ -4519,6 +4533,7 @@ async fn verified_history_rejects_gaps_identity_changes_and_impossible_responses
             .is_err()
     );
     store.rotate().await.unwrap();
+    store.content_store().close().await;
     drop(store);
     let store = store_at(root.path(), &ready, Role::Client, CURSOR).await;
     assert_eq!(store.state().close_history(), final_history);

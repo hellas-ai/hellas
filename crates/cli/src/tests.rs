@@ -659,3 +659,21 @@ fn grant_pool_gateway_flags_enforce_source_exclusivity() {
     }
     assert!(parse_gateway(&["--check-config"]).is_err());
 }
+
+#[test]
+fn node_durability_is_closed_and_defaults_to_crash() {
+    for (args, expected) in [
+        (vec!["hellas", "serve"], hellas_private::Durability::Crash),
+        (
+            vec!["hellas", "serve", "--durability", "power"],
+            hellas_private::Durability::Power,
+        ),
+    ] {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Commands::Serve { durability, .. } = parsed.command else {
+            panic!("serve")
+        };
+        assert_eq!(durability, expected);
+    }
+    assert!(Cli::try_parse_from(["hellas", "serve", "--durability", "off"]).is_err());
+}

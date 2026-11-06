@@ -66,14 +66,22 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
     let options = options(&dir.path().join("journal"));
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(
+            floor(),
+            &std::sync::atomic::AtomicBool::new(false),
+            Default::default(),
+        )
         .await
         .unwrap();
     offered.offer.check().unwrap();
-    let mut store =
-        open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
-            .await
-            .unwrap();
+    let mut store = open_provider_journal(
+        &options.journal_root,
+        options.network,
+        offered.bond_edge,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         store.len(),
         1,
@@ -109,9 +117,14 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
     );
     store.rotate().await.unwrap();
     drop(store);
-    let reopened = open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
-        .await
-        .unwrap();
+    let reopened = open_provider_journal(
+        &options.journal_root,
+        options.network,
+        offered.bond_edge,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         reopened.state().offer().unwrap().1.encode().unwrap(),
         offered.offer.encode().unwrap()
@@ -134,12 +147,21 @@ async fn every_unanswered_offer_reserves_its_coins_before_another_offer_is_signe
     let first = options(dir.path());
     let offered = planned(&first, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(
+            floor(),
+            &std::sync::atomic::AtomicBool::new(false),
+            Default::default(),
+        )
         .await
         .unwrap();
-    let store = open_provider_journal(dir.path(), first.network, offered.bond_edge)
-        .await
-        .unwrap();
+    let store = open_provider_journal(
+        dir.path(),
+        first.network,
+        offered.bond_edge,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let held = store.state().clone();
     let mut second = options(dir.path());
     second.client_node = signer(0x23).party_key();
@@ -163,7 +185,7 @@ async fn expired_or_excessive_lifetime_offers_leave_no_journal_or_signature() {
         assert!(matches!(
             planned(&options, &[])
                 .unwrap()
-                .journal(floor(), &write_started)
+                .journal(floor(), &write_started, Default::default())
                 .await,
             Err(ProvisionError::ExpiredBond { .. } | ProvisionError::BondLifetime)
         ));
@@ -181,15 +203,24 @@ async fn a_crash_after_creating_an_unsigned_header_does_not_block_discovery_or_r
     let options = options(dir.path());
     let candidate = BondCandidate::plan(&options, ROOT.principal()).unwrap();
     drop(
-        open_provider_journal(dir.path(), options.network, candidate.bond_edge)
-            .await
-            .unwrap(),
+        open_provider_journal(
+            dir.path(),
+            options.network,
+            candidate.bond_edge,
+            Default::default(),
+        )
+        .await
+        .unwrap(),
     );
     let found = discover_setups(dir.path(), options.network).await.unwrap();
     assert!(found.setups.is_empty() && found.unidentified.is_empty());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(
+            floor(),
+            &std::sync::atomic::AtomicBool::new(false),
+            Default::default(),
+        )
         .await
         .unwrap();
     assert_eq!(offered.bond_edge, candidate.bond_edge);
@@ -222,7 +253,11 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
     let options = options(dir.path());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(
+            floor(),
+            &std::sync::atomic::AtomicBool::new(false),
+            Default::default(),
+        )
         .await
         .unwrap();
     let original = serde_json::to_value(&offered.offer).unwrap();

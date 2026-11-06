@@ -488,6 +488,7 @@ async fn offline(
                 approve(Ownership::Bootstrap { root, target: None }).await?,
                 Some(identity.enrollment.clone()),
                 now,
+                Default::default(),
             )
             .await?;
             let mut revision = store.state().authority().revision();
@@ -519,6 +520,7 @@ async fn offline(
                 expected,
                 approve(Ownership::Recover { expected }).await?,
                 now,
+                Default::default(),
             )
             .await?;
             (secret, record.revision)

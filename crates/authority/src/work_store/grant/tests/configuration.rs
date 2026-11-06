@@ -92,9 +92,15 @@ async fn the_configuration_builds_the_tree_once_and_replays() {
     };
     let after = owned(store.state());
     drop(store);
-    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(1004))
-        .await
-        .unwrap();
+    let reopened = NodeStore::open(
+        directory.path(),
+        network(),
+        None,
+        UnixMillis(1004),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(owned(reopened.state()), after);
 }
 

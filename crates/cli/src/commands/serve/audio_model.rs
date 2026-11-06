@@ -137,9 +137,10 @@ mod tests {
         let mut config = loaded.config().clone();
         config.index = IndexMode::Resume;
         let store = config
-            .open(Reservations::ram(
-                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-            ))
+            .open(
+                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                Default::default(),
+            )
             .await
             .unwrap();
         store.close().await;

@@ -6,18 +6,21 @@ use std::{
 };
 
 async fn assert_locked(directory: &Path) {
+    let started = std::time::Instant::now();
     assert_err!(
-        Journal::open_latest(directory, "duty", id()).await,
+        Journal::open_latest(directory, "duty", id(), Default::default(),).await,
         JournalError::Locked { .. }
     );
     assert_err!(
-        Journal::open_existing(directory, "duty", id()).await,
+        Journal::open_existing(directory, "duty", id(), Default::default(),).await,
         JournalError::Locked { .. }
     );
     assert_err!(
         Journal::inspect(directory, "duty").await,
         JournalError::Locked { .. }
     );
+    // All three refusals together must finish before the former busy wait.
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
 }
 
 #[tokio::test]
@@ -31,13 +34,13 @@ async fn ownership_probe() {
 #[tokio::test]
 async fn a_journal_keeps_one_owner_across_rotation_and_processes() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut journal, _) = Journal::open_latest(directory.path(), "duty", id())
+    let (mut journal, _) = Journal::open_latest(directory.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     journal.append(b"accepted").await.unwrap();
     assert_locked(directory.path()).await;
     // A separate journal in this directory does not share the lock.
-    let other = Journal::open_latest(directory.path(), "independent", id())
+    let other = Journal::open_latest(directory.path(), "independent", id(), Default::default())
         .await
         .unwrap();
     drop(other);
@@ -60,7 +63,7 @@ async fn a_journal_keeps_one_owner_across_rotation_and_processes() {
     let (_, replay) = Journal::inspect(directory.path(), "duty").await.unwrap();
     assert_eq!(replay.checkpoint.as_deref(), Some(CHECKPOINT));
     assert_eq!(replay.records, vec![b"completed".to_vec()]);
-    let (_, replay) = Journal::open_existing(directory.path(), "duty", id())
+    let (_, replay) = Journal::open_existing(directory.path(), "duty", id(), Default::default())
         .await
         .unwrap();
     assert_eq!(replay.records, vec![b"completed".to_vec()]);
@@ -85,7 +88,12 @@ async fn racing_creators_leave_one_owner() {
                     .build()
                     .unwrap();
                 sender
-                    .send(runtime.block_on(Journal::open_latest(path, "duty", id())))
+                    .send(runtime.block_on(Journal::open_latest(
+                        path,
+                        "duty",
+                        id(),
+                        Default::default(),
+                    )))
                     .unwrap();
             });
         }
@@ -104,7 +112,7 @@ async fn racing_creators_leave_one_owner() {
     assert_locked(directory.path()).await;
     drop(outcomes);
     assert!(
-        Journal::open_existing(directory.path(), "duty", id())
+        Journal::open_existing(directory.path(), "duty", id(), Default::default(),)
             .await
             .is_ok()
     );
@@ -115,7 +123,7 @@ async fn invalid_stems_cannot_create_a_file_outside_the_directory() {
     let directory = tempfile::tempdir().unwrap();
     for stem in ["", "..", "../outside", "nested/name", "nested\\name"] {
         assert!(
-            Journal::open_latest(directory.path(), stem, id())
+            Journal::open_latest(directory.path(), stem, id(), Default::default(),)
                 .await
                 .is_err()
         );

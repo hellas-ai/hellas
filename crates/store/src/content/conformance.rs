@@ -912,6 +912,7 @@ async fn disk() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -931,6 +932,7 @@ async fn rpc_disk() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap();

@@ -224,6 +224,7 @@ async fn unbound_fixture() -> Fixture {
         ),
         None,
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -522,7 +523,8 @@ async fn provider_restart_retains_the_host_control_writer() {
                 h.fixture.directory.path(),
                 hellas_channel::test_support::network(),
                 Some(crate::test_support::provider_enrollment()),
-                UnixMillis(1000)
+                UnixMillis(1000),
+                Default::default(),
             )
             .await,
             hellas_authority::work_store::grant::NodeStoreError::Journal(
@@ -544,6 +546,7 @@ async fn provider_restart_retains_the_host_control_writer() {
         hellas_channel::test_support::network(),
         Some(crate::test_support::provider_enrollment()),
         UnixMillis(1000),
+        Default::default(),
     )
     .await
     .unwrap();

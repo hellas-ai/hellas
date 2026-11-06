@@ -183,6 +183,7 @@ impl LocalCompute {
             grant_network(),
             Some(self.enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -295,7 +296,7 @@ async fn local_model_fixture_indexes_the_whole_lower_and_declares_only_requested
     let value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let config: Config = value.get("content").unwrap().clone().try_into().unwrap();
     let store = config
-        .open_owner(Reservations::ram(32 << 20))
+        .open_owner(Reservations::ram(32 << 20), Default::default())
         .await
         .unwrap();
     store.finish_recovery().await.unwrap();

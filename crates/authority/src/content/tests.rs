@@ -582,6 +582,7 @@ async fn revoked_owner_cannot_publish_an_acquisition_that_finishes_after_revocat
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        Default::default(),
     )
     .await
     .unwrap()

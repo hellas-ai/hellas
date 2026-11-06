@@ -340,7 +340,11 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
     let routes = FetchRouteRegistry::default();
     assert!(matches!(
         options
-            .open(ProviderResources::Fetch(&routes), &provider)
+            .open(
+                ProviderResources::Fetch(&routes),
+                &provider,
+                Default::default()
+            )
             .await,
         Err(ProviderError::GrantConfig(
             GrantProviderError::MissingRoute(_)
@@ -350,7 +354,11 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
     options.config.configuration = Default::default();
     assert!(matches!(
         options
-            .open(ProviderResources::Fetch(&routes), &provider)
+            .open(
+                ProviderResources::Fetch(&routes),
+                &provider,
+                Default::default()
+            )
             .await,
         Err(ProviderError::NodeStore(NodeStoreError::Uninitialized))
     ));

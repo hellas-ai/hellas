@@ -49,6 +49,7 @@ pub(crate) struct Disk {
     db: sqlx::SqlitePool,
     recovered: AtomicBool,
     work_owned: AtomicBool,
+    durability: Durability,
 }
 pub(crate) struct FileObject {
     pub object: ContentRef,
@@ -57,8 +58,15 @@ pub(crate) struct FileObject {
     staged: Mutex<Option<(tempfile::NamedTempFile, Arc<Reservation>)>>,
     private: Mutex<Option<PathBuf>>,
 }
-fn database(_: sqlx::Error) -> Error {
-    Error::Invalid("content database")
+fn database(error: sqlx::Error) -> Error {
+    let code = error
+        .as_database_error()
+        .and_then(|error| error.code()?.parse::<i32>().ok());
+    if code.is_some_and(|code| matches!(code & 0xff, 5 | 6)) {
+        Error::Locked
+    } else {
+        Error::Invalid("content database")
+    }
 }
 impl Disk {
     async fn open(
@@ -66,10 +74,11 @@ impl Disk {
         capacity: Option<u64>,
         ram: Reservations,
         owner_only: bool,
+        durability: Durability,
     ) -> Result<Arc<Self>> {
         let directory = root.clone();
         tokio::task::spawn_blocking(move || {
-            hellas_private::create_dir_all_durable(&directory)?;
+            durability.create_dir_all(&directory)?;
             Ok::<_, Error>(())
         })
         .await
@@ -78,67 +87,93 @@ impl Disk {
             .filename(root.join("content.sqlite"))
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
+            .synchronous(match durability {
+                Durability::Crash => SqliteSynchronous::Normal,
+                Durability::Power => SqliteSynchronous::Full,
+            })
+            .pragma(
+                "fullfsync",
+                if cfg!(target_os = "macos") && durability == Durability::Power {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+            )
             .locking_mode(SqliteLockingMode::Exclusive)
-            .busy_timeout(std::time::Duration::from_millis(250));
+            .busy_timeout(std::time::Duration::ZERO);
         let db = SqlitePoolOptions::new()
             .max_connections(1)
-            .after_connect(|connection, _| {
-                Box::pin(async move {
-                    sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT")
-                        .execute(connection)
-                        .await
-                        .map(drop)
-                })
-            })
+            .max_lifetime(None)
+            .idle_timeout(None)
             .connect_with(options)
             .await
             .map_err(database)?;
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&db)
-            .await
-            .map_err(database)?;
-        if version != 0 && version != 1 {
-            return Err(Error::Invalid("unsupported content database version"));
-        }
-        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
-        let work_owned: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_owned WHERE id=1)")
+        let opened = async {
+            // Ownership is checked outside after_connect, whose failures SQLx retries.
+            // Keep this one connection until close so its EXCLUSIVE lock stays live.
+            let mut connection = db.acquire().await.map_err(database)?;
+            if let Err(error) = sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT")
+                .execute(&mut *connection)
+                .await
+            {
+                drop(connection);
+                db.close().await;
+                return Err(database(error));
+            }
+            drop(connection);
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
                 .fetch_one(&db)
                 .await
                 .map_err(database)?;
-        if owner_only && work_owned {
-            db.close().await;
-            return Err(Error::WorkOwned);
-        }
-        hellas_private::sync_directory(&root)?;
-        let records = Arc::new(Records::default());
-        let _ = records.load(&root.join("fastresume.bin"));
-        let cleanup = root.clone();
-        tokio::task::spawn_blocking(move || {
-            hellas_private::create_dir_all_durable(&cleanup.join("objects"))?;
-            hellas_private::create_dir_all_durable(&cleanup.join("staging"))?;
-            for entry in fs::read_dir(cleanup.join("staging"))? {
-                let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    fs::remove_file(entry.path())?;
-                }
+            if version != 0 && version != 1 {
+                return Err(Error::Invalid("unsupported content database version"));
             }
-            hellas_private::sync_directory(&cleanup.join("staging"))?;
-            Ok::<_, Error>(())
-        })
-        .await
-        .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
-        let used = Self::owned_bytes(&root)?;
-        Ok(Arc::new(Self {
-            quota: Reservations::disk(root.clone(), capacity, used),
-            root,
-            ram,
-            records,
-            db,
-            recovered: AtomicBool::new(false),
-            work_owned: AtomicBool::new(work_owned),
-        }))
+            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
+            let work_owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_owned WHERE id=1)")
+                    .fetch_one(&db)
+                    .await
+                    .map_err(database)?;
+            if owner_only && work_owned {
+                db.close().await;
+                return Err(Error::WorkOwned);
+            }
+            durability.sync_directory(&root)?;
+            let records = Arc::new(Records::default());
+            let _ = records.load(&root.join("fastresume.bin"));
+            let cleanup = root.clone();
+            tokio::task::spawn_blocking(move || {
+                durability.create_dir_all(&cleanup.join("objects"))?;
+                durability.create_dir_all(&cleanup.join("staging"))?;
+                for entry in fs::read_dir(cleanup.join("staging"))? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        fs::remove_file(entry.path())?;
+                    }
+                }
+                durability.sync_directory(&cleanup.join("staging"))?;
+                Ok::<_, Error>(())
+            })
+            .await
+            .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
+            let used = Self::owned_bytes(&root)?;
+            Ok(Arc::new(Self {
+                quota: Reservations::disk(root.clone(), capacity, used),
+                root,
+                ram,
+                records,
+                db: db.clone(),
+                recovered: AtomicBool::new(false),
+                work_owned: AtomicBool::new(work_owned),
+                durability,
+            }))
+
+        }
+        .await;
+        if opened.is_err() {
+            db.close().await;
+        }
+        opened
     }
     pub(crate) fn ready(&self) -> bool {
         self.recovered.load(Ordering::Acquire)
@@ -259,7 +294,7 @@ impl FileObject {
         chunks: Vec<hellas_xet::Chunk>,
         charge: Arc<Reservation>,
     ) -> Result<Self> {
-        file.as_file().sync_all()?;
+        disk.durability.sync_file(file.as_file())?;
         let entry = Entry {
             path: file.path().to_owned(),
             identity: FileIdentity::of(&file.as_file().metadata()?),
@@ -449,7 +484,9 @@ impl FileObject {
                     chunks,
                 }
             };
-            hellas_private::sync_directory(destination.parent().unwrap())?;
+            self.disk
+                .durability
+                .sync_directory(destination.parent().unwrap())?;
             let private_entry = Entry {
                 path: path.clone(),
                 identity: FileIdentity::of(&crate::open_regular_file(&path)?.metadata()?),
@@ -474,7 +511,7 @@ impl FileObject {
         Ok(Some(entry))
     }
     fn link_temp(&self, directory: &FsPath) -> Result<()> {
-        hellas_private::create_dir_all_durable(directory)?;
+        self.disk.durability.create_dir_all(directory)?;
         let path = directory.join(self.object.id().to_string());
         let mut staged = self
             .staged
@@ -506,8 +543,10 @@ impl FileObject {
         entries.retain(|old| old.path != temp_path && old.path != entry.path);
         entries.push(entry);
         drop(entries);
-        hellas_private::sync_directory(directory)?;
-        hellas_private::sync_directory(&self.disk.root.join("staging"))?;
+        self.disk.durability.sync_directory(directory)?;
+        self.disk
+            .durability
+            .sync_directory(&self.disk.root.join("staging"))?;
         Ok(())
     }
     pub(crate) fn owned(&self) -> bool {
@@ -545,19 +584,25 @@ impl FileObject {
             .unwrap()
             .retain(|entry| entry.path != path);
         self.disk.quota.remove_owned(self.object.bytes());
-        hellas_private::sync_directory(path.parent().unwrap())?;
+        self.disk
+            .durability
+            .sync_directory(path.parent().unwrap())?;
         Ok(self.object.bytes())
     }
 }
 impl DiskStore {
+    pub fn durability(&self) -> Durability {
+        self.core.disk.as_ref().unwrap().durability
+    }
     pub async fn open(
         upper: PathBuf,
         lower: Vec<PathBuf>,
         mode: IndexMode,
         capacity: Option<u64>,
         ram: Reservations,
+        durability: Durability,
     ) -> Result<Self> {
-        Self::open_inner(upper, lower, mode, capacity, ram, false).await
+        Self::open_inner(upper, lower, mode, capacity, ram, false, durability).await
     }
     /// In-process owner commands have no authoritative work-journal census.
     /// Check the durable monotone ownership fact before scanning or cleanup.
@@ -567,8 +612,9 @@ impl DiskStore {
         mode: IndexMode,
         capacity: Option<u64>,
         ram: Reservations,
+        durability: Durability,
     ) -> Result<Self> {
-        Self::open_inner(upper, lower, mode, capacity, ram, true).await
+        Self::open_inner(upper, lower, mode, capacity, ram, true, durability).await
     }
     async fn open_inner(
         upper: PathBuf,
@@ -577,23 +623,31 @@ impl DiskStore {
         capacity: Option<u64>,
         ram: Reservations,
         owner_only: bool,
+        durability: Durability,
     ) -> Result<Self> {
-        let disk = Disk::open(upper, capacity, ram.clone(), owner_only).await?;
-        let core = Core::new(ram);
-        let (generation, pins) = disk.pins().await?;
-        let scanning = disk.clone();
-        let objects = tokio::task::spawn_blocking(move || scanning.scan(&lower, mode))
-            .await
-            .map_err(|_| Error::Invalid("lower scan worker"))??;
-        {
-            let mut state = core.state.lock().unwrap();
-            state.objects = objects;
-            state.pins = pins;
-            state.generation = generation;
+        let disk = Disk::open(upper, capacity, ram.clone(), owner_only, durability).await?;
+        let opened = async {
+            let core = Core::new(ram);
+            let (generation, pins) = disk.pins().await?;
+            let scanning = disk.clone();
+            let objects = tokio::task::spawn_blocking(move || scanning.scan(&lower, mode))
+                .await
+                .map_err(|_| Error::Invalid("lower scan worker"))??;
+            {
+                let mut state = core.state.lock().unwrap();
+                state.objects = objects;
+                state.pins = pins;
+                state.generation = generation;
+            }
+            let mut core = core;
+            core.disk = Some(disk.clone());
+            Ok(Self { core })
         }
-        let mut core = core;
-        core.disk = Some(disk);
-        Ok(Self { core })
+        .await;
+        if opened.is_err() {
+            disk.db.close().await;
+        }
+        opened
     }
     /// A channel claims the upper before any of its content scopes or bytes.
     /// The only row is monotone; pin changes and collection never clear it.
@@ -645,7 +699,7 @@ impl DiskStore {
                     disk.discard_directory(&entry.path(), false)?;
                 }
             }
-            hellas_private::sync_directory(&disk.root.join("staging"))?;
+            disk.durability.sync_directory(&disk.root.join("staging"))?;
             disk.quota.reconcile_used(Disk::owned_bytes(&disk.root)?);
             // All journal roots and obligations now exist. Keep admission behind
             // this held gate while reclaiming only the cache needed to fit them.
@@ -835,7 +889,7 @@ impl Disk {
         let directory = self.root.join("staging").join(Self::job_name(job));
         if directory.exists() {
             self.discard_directory(&directory, true)?;
-            hellas_private::sync_directory(&self.root.join("staging"))?;
+            self.durability.sync_directory(&self.root.join("staging"))?;
         }
         Ok(())
     }
@@ -904,7 +958,9 @@ impl FileObject {
                         FileIdentity::of(&crate::open_regular_file(&global)?.metadata()?);
                 }
             }
-            hellas_private::sync_directory(path.parent().unwrap())?;
+            self.disk
+                .durability
+                .sync_directory(path.parent().unwrap())?;
         }
         Ok(())
     }

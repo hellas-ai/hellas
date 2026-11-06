@@ -412,6 +412,7 @@ impl Purchase {
             EdgeId::from_bytes(record.bond),
             Role::Client,
             &Secp256k1Verifier::new(),
+            options.content.durability(),
         )
         .await?;
         let descriptor = setup

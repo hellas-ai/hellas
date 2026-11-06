@@ -86,6 +86,7 @@ pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
 #[derive(Clone)]
 pub struct WorkRunnerConfig {
+    pub durability: hellas_private::Durability,
     /// The network the journals are keyed and the signatures bound to.
     pub network: NetworkId,
     /// The configured root the setup journals live under.
@@ -154,6 +155,8 @@ impl Drop for WorkWatcher {
 /// Mount failures are distinct from a valid route with no matching channel.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
+    #[error(transparent)]
+    Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error("offer worker failed")]
     OfferWorker(#[source] tokio::task::JoinError),
     #[error("payment mount lock is poisoned")]
@@ -512,7 +515,19 @@ impl MountedWork {
         };
         for service in channels {
             let stopped = service.stop().await.map_err(MountError::from);
-            result = result.and(stopped);
+            let closed = async {
+                use hellas_channel::work_close::CloseChannel as _;
+                let mut driver = service.drive()?;
+                driver
+                    .store()
+                    .await
+                    .map_err(|_| MountError::Poisoned)?
+                    .close()
+                    .await?;
+                Ok::<_, MountError>(())
+            }
+            .await;
+            result = result.and(stopped).and(closed);
         }
         let mut held = match self.mounted.lock() {
             Ok(held) => held,
@@ -1063,6 +1078,7 @@ impl WorkRunner {
                 setup.bond_edge,
                 Role::Provider,
                 &Secp256k1Verifier::new(),
+                config.durability,
             )
             .await?;
             let recovered = match (
@@ -1483,6 +1499,7 @@ mod tests {
         let config = &fixture.config;
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
+                durability: Default::default(),
                 network: config.chain.network,
                 journal_root: config.journal_root.clone(),
                 poll: Duration::ZERO,

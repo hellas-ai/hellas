@@ -1849,6 +1849,7 @@ mod tests {
             .await
             .unwrap();
         store.rotate().await.unwrap();
+        store.content_store().close().await;
         drop(store);
         let mut store = fixture::store_at(root.path(), &ready, Role::Client, fixture::CURSOR).await;
         assert_eq!(

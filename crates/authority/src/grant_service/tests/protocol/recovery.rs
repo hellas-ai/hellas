@@ -113,6 +113,7 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                 2, [2; 32],
             )),
             UnixMillis(1003),
+            Default::default(),
         )
         .await
         .unwrap();

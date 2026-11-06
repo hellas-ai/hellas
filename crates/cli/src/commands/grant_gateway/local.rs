@@ -29,6 +29,7 @@ pub async fn prepare(
         grant_network(),
         Some(identity.enrollment.clone()),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+        Default::default(),
     )
     .await?;
     let generation = store
@@ -100,9 +101,12 @@ async fn prepare_content(
         .with_default_upper(root.join("provider/content"));
     let content = configuration
         .config()
-        .open_owner(hellas_store::content::Reservations::ram(
-            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-        ))
+        .open_owner(
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+            Default::default(),
+        )
         .await?;
     // Grant jobs are ephemeral; this host has no paid channel journals.
     content.finish_recovery().await?;

@@ -12,6 +12,7 @@ pub async fn prepare(
     identity: &LocalIdentity,
     port: Option<u16>,
     configured: Option<GrantConfig>,
+    durability: hellas_private::Durability,
 ) -> Result<(GrantConfig, Option<iroh::Endpoint>)> {
     let root = std::path::absolute(root)?;
     let mut config = configured.unwrap_or_else(|| GrantConfig::unconfigured(&root));
@@ -26,6 +27,7 @@ pub async fn prepare(
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         now,
+        durability,
     )
     .await
     {
@@ -70,6 +72,7 @@ pub async fn prepare(
         &config.journal_root,
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
+        durability,
     )
     .await;
     result.context(
