@@ -49,6 +49,7 @@ struct Daemon {
     socket: PathBuf,
     journal: PathBuf,
     handle: Option<node_control::host::HostHandle>,
+    content: hellas_store::content::DiskStore,
 }
 /// One admin invocation: its arguments and the global `--passkey` file.
 struct Invocation(AdminArgs, Option<PathBuf>);
@@ -83,6 +84,9 @@ fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> Invocation {
 }
 impl Daemon {
     async fn start() -> Self {
+        Self::start_with_content(false).await
+    }
+    async fn start_with_content(include_content: bool) -> Self {
         // Keep Unix socket paths below the platform length limit.
         let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/t");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -102,10 +106,24 @@ impl Daemon {
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
         let (passkey, owner) = self::passkey(root.path(), "admin.passkey", 0x31);
         let admin_holder = holder(root.path(), "admin-holder.json", &identity);
+        let mut permissions = vec![(HOST_STATUS, host_resource(authority))];
+        if include_content {
+            permissions.extend(
+                [
+                    hellas_authority::content::READ,
+                    hellas_authority::content::UPLOAD,
+                    hellas_authority::content::ACQUIRE,
+                    hellas_authority::content::SET_PIN,
+                    hellas_authority::content::COLLECT,
+                    hellas_authority::content::RESOLVE,
+                ]
+                .map(|operation| (operation, host_resource(authority))),
+            );
+        }
         let scope = common_node::admin_spec(
             authority,
             owner,
-            &[(HOST_STATUS, host_resource(authority))],
+            &permissions,
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
             &[],
@@ -180,13 +198,28 @@ impl Daemon {
         executor.queue_capacity = 4;
         executor.fetch_max_in_flight = 1;
         executor.fetch_queue_capacity = 1;
+        let content = if include_content {
+            let lower = root.path().join("lower");
+            std::fs::create_dir(&lower).unwrap();
+            std::fs::write(lower.join("weights"), b"cli daemon data").unwrap();
+            hellas_store::content::DiskStore::open(
+                root.path().join("content/content"),
+                vec![lower],
+                hellas_store::content::IndexMode::Resume,
+                None,
+                hellas_store::content::Reservations::ram(
+                    hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                ),
+            )
+            .await
+            .unwrap()
+        } else {
+            hellas_authority::test_support::content_store(&root.path().join("content")).await
+        };
         let daemon = super::super::configuration::start_host(
             hellas_sdk::ProviderOptions {
                 executor,
-                content: hellas_authority::test_support::content_store(
-                    &root.path().join("content"),
-                )
-                .await,
+                content: content.clone(),
                 grants: None,
                 discovery: false,
                 port: Some(0),
@@ -216,6 +249,7 @@ impl Daemon {
             socket,
             journal,
             handle: Some(daemon),
+            content,
         }
     }
     /// The administrator's passkey session over the local socket.
@@ -360,6 +394,7 @@ impl Daemon {
             .unwrap()
             .unwrap();
         assert!(!self.socket.exists(), "shutdown removes the control socket");
+        self.content.close().await;
     }
     async fn store(&self) -> hellas_authority::work_store::grant::NodeStore {
         hellas_authority::work_store::grant::NodeStore::open(
@@ -674,4 +709,188 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
         .await
         .unwrap();
     assert!(node.authenticate(&admin).await.is_err());
+}
+
+#[tokio::test]
+async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_after_refusal() {
+    use crate::commands::store::{PinCommand, StoreArgs, StoreCommand};
+    let mut daemon = Daemon::start_with_content(true).await;
+    let object = hellas_rpc::ContentRef::for_bytes(b"cli daemon data");
+    let args = |command| StoreArgs {
+        profile: Some(daemon.profile_path.clone()),
+        control_socket: Some(daemon.socket.clone()),
+        addresses: vec![],
+        content_config: None,
+        command,
+    };
+    crate::commands::store::run(
+        args(StoreCommand::Pin {
+            command: PinCommand::Set {
+                name: "operator/weights".into(),
+                id: object.id().to_string(),
+                bytes: object.bytes(),
+                tree: false,
+                policy: "owner".into(),
+                expires_ms: None,
+            },
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    let output = daemon.root.path().join("read");
+    crate::commands::store::run(
+        args(StoreCommand::Read {
+            pin: "operator/weights".into(),
+            path: String::new(),
+            start: 2,
+            end: Some(9),
+            out: Some(output.clone()),
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), &b"cli daemon data"[2..9]);
+    let refused = daemon.root.path().join("refused");
+    assert!(
+        crate::commands::store::run(
+            args(StoreCommand::Read {
+                pin: "operator/weights".into(),
+                path: String::new(),
+                start: 0,
+                end: None,
+                out: Some(refused.clone())
+            }),
+            Some(&daemon.wrong_identity),
+            None
+        )
+        .await
+        .is_err()
+    );
+    assert!(!refused.exists());
+    // A cold peer acquisition goes through this same authenticated Owner
+    // carrier; the source serves only Public content through the real adapter.
+    use hellas_rpc::services::content::{Content, ContentServer};
+    use hellas_store::content::{
+        ContentService, MemoryStore, PinName, PinPolicy, PinTarget, Reservations, Scope,
+    };
+    use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+    let peer_body = b"cold public peer download";
+    let source = Arc::new(MemoryStore::new(Reservations::ram(
+        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+    )));
+    let peer_ref = hellas_channel::content::upload_bytes(
+        source.as_ref(),
+        &Scope::Owner,
+        peer_body,
+        Some(PinTarget {
+            name: PinName::new("public/source".into()).unwrap(),
+            policy: PinPolicy::Public,
+        }),
+    )
+    .await
+    .unwrap();
+    let peer = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .alpns(vec![Content::ALPN.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let listening = peer.clone();
+    let serving = tokio::spawn(async move {
+        while let Some(incoming) = listening.accept().await {
+            let source = source.clone();
+            tokio::spawn(async move {
+                let connection = incoming.await.unwrap();
+                let transport = hellas_wire::iroh::IrohTransport::new(connection);
+                while let Ok(Some(inbound)) = transport.accept().await {
+                    let service = ContentService::new(source.clone(), Scope::Public);
+                    tokio::spawn(async move {
+                        let _ = <ContentServer<ContentService<MemoryStore>> as Dispatcher<
+                            hellas_wire::iroh::IrohTransport,
+                        >>::dispatch(
+                            &ContentServer(service), inbound
+                        )
+                        .await;
+                    });
+                }
+            });
+        }
+    });
+    let endpoint = daemon
+        .handle
+        .as_ref()
+        .unwrap()
+        .provider_endpoint()
+        .borrow()
+        .clone()
+        .unwrap();
+    let pool = hellas_wire::iroh::Pool::for_service::<Content>(endpoint, Default::default());
+    pool.connection(peer.addr()).await.unwrap();
+    daemon.content.clone().with_peers(pool);
+    crate::commands::store::run(
+        args(StoreCommand::Acquire {
+            source: format!("peer://{}", peer.id()),
+            pin: "operator/from-peer".into(),
+            policy: "owner".into(),
+            expect: Some(peer_ref.id().to_string()),
+            bytes: Some(peer_ref.bytes()),
+            sha256: None,
+            path: None,
+            source_pin: Some("public/source".into()),
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    let peer_output = daemon.root.path().join("peer-read");
+    crate::commands::store::run(
+        args(StoreCommand::Read {
+            pin: "operator/from-peer".into(),
+            path: String::new(),
+            start: 0,
+            end: None,
+            out: Some(peer_output.clone()),
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&peer_output).unwrap(), peer_body);
+    assert_eq!(daemon.content.stats().unwrap().used, peer_body.len() as u64);
+    crate::commands::store::run(
+        args(StoreCommand::Pin {
+            command: PinCommand::Rm {
+                name: "operator/from-peer".into(),
+            },
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    peer.close().await;
+    serving.await.unwrap();
+    crate::commands::store::run(
+        args(StoreCommand::Pin {
+            command: PinCommand::Rm {
+                name: "operator/weights".into(),
+            },
+        }),
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
+    crate::commands::store::run(args(StoreCommand::Collect), Some(&daemon.identity), None)
+        .await
+        .unwrap();
+    daemon.stop().await;
 }

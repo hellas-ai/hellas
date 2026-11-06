@@ -1,9 +1,7 @@
-//! Provider content indexing and GPU session configuration.
+//! Node content configuration carrier and GPU session configuration.
 use crate::{commands::CliResult, parsers::*};
-use anyhow::Context as _;
 use clap::Args;
 use hellas_executor::{ExecutorSpawnConfig, GpuConfig, GpuDialect};
-use hellas_store::ContentStore;
 use std::path::{Path, PathBuf};
 
 #[derive(Args)]
@@ -47,46 +45,4 @@ fn parse_gpu_backend(value: &str) -> Result<GpuDialect, String> {
         "auto" => Ok(GpuDialect::Hip),
         _ => Err("GPU runtime must be auto, hip, or cuda".into()),
     }
-}
-
-pub(crate) enum IndexMode {
-    Resume,
-    Recheck,
-}
-
-pub(crate) fn index_content(
-    paths: &[PathBuf],
-    roots: &[PathBuf],
-    index_path: &Path,
-    mode: IndexMode,
-) -> CliResult<ContentStore> {
-    let store = ContentStore::new();
-    let remembered = if matches!(mode, IndexMode::Recheck) {
-        0
-    } else {
-        store.records().load(index_path)
-    };
-    for path in paths {
-        store
-            .index(path)
-            .with_context(|| format!("failed to index local content {}", path.display()))?;
-    }
-    let mut adopted = 0usize;
-    for root in roots {
-        adopted += store
-            .adopt(root)
-            .with_context(|| format!("failed to adopt local content root {}", root.display()))?
-            .len();
-    }
-    store
-        .records()
-        .save(index_path)
-        .with_context(|| format!("failed to save content index {}", index_path.display()))?;
-    info!(
-        remembered,
-        indexed = store.len(),
-        adopted,
-        "indexed local content"
-    );
-    Ok(store)
 }

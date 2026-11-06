@@ -134,7 +134,7 @@ pub async fn run(
                 args.addresses.into_iter().map(iroh::TransportAddr::Ip),
             );
             let connection = tokio::time::timeout(
-                Duration::from_secs(15),
+                super::CONTROL_CONNECT_TIMEOUT,
                 endpoint.connect(
                     address,
                     hellas_rpc::services::host_control::HostControl::ALPN.as_bytes(),

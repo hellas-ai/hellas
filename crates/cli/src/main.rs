@@ -49,6 +49,7 @@ fn load_command_identity(
     let grant_identity = matches!(
         command,
         Commands::Admin(_)
+            | Commands::Store(_)
             | Commands::Gateway { offer: Some(_), .. }
             | Commands::Gateway {
                 local_grant: Some(_),
@@ -402,14 +403,8 @@ enum Commands {
     },
     /// Generate one PNG with a client-rendered Flux job on a paid provider.
     Image(commands::transact::ImageArgs),
-    /// Inspect and fill the content store
-    Store {
-        /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
-        #[arg(long, global = true)]
-        store_dir: Option<PathBuf>,
-        #[command(subcommand)]
-        command: commands::store::StoreCommand,
-    },
+    /// Inspect and manage node content with Owner authority.
+    Store(commands::store::StoreArgs),
     /// Query or run Hellas chain components
     Chain {
         #[command(subcommand)]
@@ -770,8 +765,8 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Store { command, store_dir } => {
-            let result = commands::store::run(command, store_dir).await;
+        Commands::Store(args) if args.profile.is_none() => {
+            let result = commands::store::run(args, None, passkey).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -824,6 +819,7 @@ async fn async_main() {
             unreachable!("contact commands handled before identity load")
         }
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
+        Commands::Store(args) => commands::store::run(args, Some(&local_identity), passkey).await,
 
         Commands::Serve {
             mut native,
@@ -1318,7 +1314,6 @@ async fn async_main() {
         }
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
-        Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(unix)]
         Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")

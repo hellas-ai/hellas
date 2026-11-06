@@ -3,6 +3,7 @@ use std::path::PathBuf;
 mod node;
 mod owner_scope;
 pub use node::{inspect_offline, run};
+pub(crate) const CONTROL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(clap::Args)]
 pub struct AdminArgs {

@@ -140,6 +140,56 @@ pub struct Records {
 }
 
 impl Records {
+    /// Explicit owner indexing for lower files. Uses the same verified identity
+    /// and bounded hashing path as the DiskStore scanner.
+    pub fn index_file(
+        &self,
+        path: &Path,
+        ram: &crate::content::Reservations,
+    ) -> crate::content::Result<Indexed> {
+        self.index_entry(path, crate::content::IndexMode::Resume, ram)
+            .map(|(indexed, _)| indexed)
+    }
+    pub(crate) fn index_entry(
+        &self,
+        path: &Path,
+        mode: crate::content::IndexMode,
+        ram: &crate::content::Reservations,
+    ) -> crate::content::Result<(Indexed, crate::Entry)> {
+        use crate::{
+            Entry,
+            content::{Error, IndexMode},
+        };
+        if is_cache_debris(path) {
+            return Err(Error::Invalid("cache debris is not lower content"));
+        }
+        let mut file = crate::open_regular_file(path)?;
+        let metadata = file.metadata()?;
+        let identity = FileIdentity::of(&metadata);
+        let indexed = match self.get(&metadata) {
+            Some(indexed) => indexed,
+            None if matches!(mode, IndexMode::Require) => {
+                return Err(Error::Invalid("lower file requires an index record"));
+            }
+            None => {
+                let _scratch = ram.reserve(crate::STREAM_BUFFER as u64)?;
+                crate::hash_exact_length(&mut file, metadata.len())?
+                    .ok_or(Error::Invalid("file changed during indexing"))?
+            }
+        };
+        crate::still_the_file_that_was_read(path, identity, &file)
+            .map_err(|_| Error::Invalid("file replaced during indexing"))?;
+        self.put(&metadata, &indexed);
+        Ok((
+            indexed.clone(),
+            Entry {
+                path: path.to_owned(),
+                identity,
+                chunks: indexed.chunks,
+            },
+        ))
+    }
+
     /// What indexing this file produced last time, if it still looks
     /// exactly the same.
     ///

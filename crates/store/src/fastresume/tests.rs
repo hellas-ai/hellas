@@ -364,3 +364,29 @@ fn save_rejects_parent_components_before_creating_directories() {
     assert!(!existing_parent.join("content-index.bin").exists());
     std::fs::remove_dir(existing_parent).expect("remove existing parent");
 }
+
+#[test]
+fn explicit_lower_index_reuses_verified_identity_and_refuses_debris() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("weights");
+    std::fs::write(&path, b"weights one").unwrap();
+    let records = Records::default();
+    let ram = crate::content::Reservations::ram(32 << 20);
+    crate::HASH_CALLS.with(|calls| calls.set(0));
+    let original = records.index_file(&path, &ram).unwrap();
+    assert_eq!(original.id, hellas_xet::XetHash::hash(b"weights one"));
+    assert_eq!(records.index_file(&path, &ram).unwrap(), original);
+    crate::HASH_CALLS
+        .with(|calls| assert_eq!(calls.get(), if FileIdentity::REMEMBERS { 1 } else { 2 }));
+    let replacement = root.path().join("replacement");
+    std::fs::write(&replacement, b"weights two").unwrap();
+    std::fs::rename(replacement, &path).unwrap();
+    let changed = records.index_file(&path, &ram).unwrap();
+    assert_eq!(changed.id, hellas_xet::XetHash::hash(b"weights two"));
+    assert_ne!(changed.id, original.id);
+    let debris = root.path().join("weights.lock");
+    std::fs::write(&debris, b"lock bytes").unwrap();
+    assert!(records.index_file(&debris, &ram).is_err());
+    assert!(records.get(&std::fs::metadata(&debris).unwrap()).is_none());
+    assert_eq!(ram.held(), 0);
+}

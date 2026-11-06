@@ -193,31 +193,7 @@ impl Disk {
         tx.commit().await.map_err(database)
     }
     fn index(&self, path: &FsPath, mode: IndexMode) -> Result<(Indexed, Entry)> {
-        let mut file = crate::open_regular_file(path)?;
-        let metadata = file.metadata()?;
-        let identity = FileIdentity::of(&metadata);
-        let indexed = match self.records.get(&metadata) {
-            Some(indexed) => indexed,
-            None if matches!(mode, IndexMode::Require) => {
-                return Err(Error::Invalid("lower file requires an index record"));
-            }
-            None => {
-                let _scratch = self.ram.reserve(crate::STREAM_BUFFER as u64)?;
-                crate::hash_exact_length(&mut file, metadata.len())?
-                    .ok_or(Error::Invalid("file changed during indexing"))?
-            }
-        };
-        crate::still_the_file_that_was_read(path, identity, &file)
-            .map_err(|_| Error::Invalid("file replaced during indexing"))?;
-        self.records.put(&metadata, &indexed);
-        Ok((
-            indexed.clone(),
-            Entry {
-                path: path.to_owned(),
-                identity,
-                chunks: indexed.chunks,
-            },
-        ))
+        self.records.index_entry(path, mode, &self.ram)
     }
     pub(crate) fn scan(
         self: &Arc<Self>,
