@@ -477,11 +477,10 @@ impl Provider {
                                 hellas_rpc::services::work_setup::Open,
                             >::new(WorkSetupServer(setup), open);
                         while let Ok(Some(inbound)) = transport.accept().await {
-                            if Dispatcher::<IrohTransport>::dispatch(&dispatcher, inbound)
-                                .await
-                                .is_err()
+                            if let Err(error) =
+                                Dispatcher::<IrohTransport>::dispatch(&dispatcher, inbound).await
                             {
-                                break;
+                                eprintln!("fixture WorkSetup dispatch failed: {error}");
                             }
                         }
                     } else {
@@ -490,8 +489,7 @@ impl Provider {
                         };
                         while let Ok(Some(inbound)) = transport.accept().await {
                             if let Err(error) = dispatcher.dispatch(inbound).await {
-                                eprintln!("fixture Work dispatcher stopped: {error}");
-                                break;
+                                eprintln!("fixture Work dispatch failed: {error}");
                             }
                         }
                     }
