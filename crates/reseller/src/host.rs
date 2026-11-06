@@ -27,6 +27,7 @@ pub struct OpenAiProviderOptions<R> {
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,
+    pub content: hellas_store::content::DiskStore,
     pub service: String,
     pub method: String,
     pub bearer_token: String,
@@ -75,6 +76,7 @@ where
         enrollment: options.enrollment.clone(),
         root: options.root.clone(),
         state_directory: options.state_directory.clone(),
+        content: options.content.clone(),
         routes,
         grants: Some(GrantProviderOptions {
             configuration: hellas_authority::model::grant::configuration::NodeConfiguration::new(

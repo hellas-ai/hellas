@@ -80,9 +80,16 @@ impl<S> ContentService<S> {
                     _ = scope.ended() => Err(status(Error::Denied)),
                     next = stream.next() => Ok(next),
                 };
-                match next? {
-                    Some(item) => yield item?,
-                    None => break,
+                match next {
+                    Err(error) | Ok(Some(Err(error))) => {
+                        // A terminal yield can suspend until the carrier writes its
+                        // trailer. Release any queued inner effect before that handoff.
+                        drop(stream);
+                        Err::<(), _>(error)?;
+                        return;
+                    }
+                    Ok(Some(Ok(item))) => yield item,
+                    Ok(None) => break,
                 }
             }
         });
@@ -512,5 +519,66 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
             objects: collected.objects,
             bytes: collected.bytes,
         }))
+    }
+}
+
+#[cfg(test)]
+mod waiter_tests {
+    use super::*;
+    use std::task::{Context, Poll};
+
+    #[tokio::test]
+    async fn terminal_scope_drops_queued_watch_effect_before_yielding_its_error() {
+        let authority = Arc::new(tokio::sync::Mutex::new(()));
+        let (ended, _) = tokio::sync::watch::channel(false);
+        let acquire = authority.clone();
+        let end = ended.clone();
+        let scope = Scope::Owner.bind(
+            move || {
+                let acquire = acquire.clone();
+                async move {
+                    let held = acquire.lock_owned().await;
+                    Ok(move || {
+                        let _ = &held;
+                        Ok(())
+                    })
+                }
+            },
+            move || {
+                let mut end = end.subscribe();
+                async move {
+                    let _ = end.wait_for(|ended| *ended).await;
+                }
+            },
+        );
+        let store = MemoryStore::new(Reservations::ram(1 << 20));
+        let service = ContentService::new(Arc::new(store), scope);
+        let mut response = service
+            .watch_pins(
+                pb::WatchPinsRequest {
+                    prefix: String::new(),
+                    from: None,
+                },
+                TransportContext::default(),
+            )
+            .await
+            .unwrap();
+        let held = authority.clone().lock_owned().await;
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            std::pin::Pin::new(&mut response).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        // The watch's actual Core effect is queued for this host writer.
+        drop(held);
+        ended.send_replace(true);
+        assert!(response.next().await.unwrap().is_err());
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), authority.lock()).await;
+        assert!(
+            next.is_ok(),
+            "terminal response retained the queued Core effect"
+        );
+        drop(response);
     }
 }

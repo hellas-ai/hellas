@@ -13,7 +13,7 @@ use hellas_channel::test_support::channel::{
     store_at,
 };
 
-use hellas_channel::work::{ClientEndpoint, ProviderEndpoint, WorkService};
+use hellas_channel::work::{ClientChannel as _, ClientEndpoint, ProviderEndpoint, WorkService};
 use hellas_channel::work_close::{
     BlockSourceError, CloseChannel as _, FinalizedBlocks, FinalizedWork,
 };
@@ -41,10 +41,7 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_channel::test_support::transport::transport_pair_without_write_authority(
-        session(),
-        session(),
-    )
+    hellas_channel::test_support::transport::transport_pair_with_context(session(), session())
 }
 
 /// A finalized-block source over the same synthetic empty chain the
@@ -114,7 +111,7 @@ async fn an_authenticated_answer_is_paid_without_reexecution() {
         "ordinary collection does not claim an independent match",
     );
     endpoint
-        .verified(id)
+        .verified(id, &hellas_channel::test_support::channel::bundle(1))
         .await
         .expect("the client records its result check");
 
@@ -192,7 +189,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
         "the answer is collected: {collected:?}",
     );
     endpoint
-        .verified(id)
+        .verified(id, &hellas_channel::test_support::channel::bundle(1))
         .await
         .expect("the client records its result check");
 
@@ -471,12 +468,16 @@ async fn model_job_restart_inner(provider_held: bool) {
         ProviderEndpoint::new(ready.clone(), provider_store, provider())
             .expect("the provider endpoint binds"),
     );
-    let mut endpoint = ClientEndpoint::new(
+    let mut endpoint = hellas_channel::test_support::channel::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(client_root.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .expect("the client endpoint binds"),
         ready.clone(),
-        store_at(client_root.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .expect("the client endpoint binds");
+    .await;
     let (transport, server_transport) = transport_pair();
     let probes = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -551,13 +552,22 @@ async fn model_job_restart_inner(provider_held: bool) {
         "retaining client content must not probe assets a second time"
     );
     let id = endpoint
+        .client()
+        .await
+        .unwrap()
         .state()
         .jobs()
         .next()
         .expect("the proposal is journaled")
         .work_id();
     assert_eq!(
-        endpoint.state().job_by_id(id).map(JobState::phase),
+        endpoint
+            .client()
+            .await
+            .unwrap()
+            .state()
+            .job_by_id(id)
+            .map(JobState::phase),
         Some(JobPhase::HalfSigned),
     );
     assert_eq!(
@@ -568,7 +578,14 @@ async fn model_job_restart_inner(provider_held: bool) {
         provider_held.then_some(JobPhase::Accepted),
         "the failure is after acceptance only for the provider-held case",
     );
-    let client_node = endpoint.store().await.unwrap().content_store();
+    let client_node = endpoint
+        .client()
+        .await
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store();
     client_node.close().await;
     drop(endpoint);
     weights_store.close().await;
@@ -653,8 +670,23 @@ async fn model_job_restart_inner(provider_held: bool) {
     let _ = serving.await;
     assert_eq!(resumed.expect("the retained proposal is accepted"), id);
     assert_eq!(
-        endpoint.state().job_by_id(id).map(JobState::phase),
+        endpoint
+            .client()
+            .await
+            .unwrap()
+            .state()
+            .job_by_id(id)
+            .map(JobState::phase),
         Some(JobPhase::Accepted),
     );
-    assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+    assert_eq!(
+        endpoint
+            .client()
+            .await
+            .unwrap()
+            .state()
+            .job_book()
+            .pending_proposal(),
+        None
+    );
 }

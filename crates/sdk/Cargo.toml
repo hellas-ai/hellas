@@ -70,6 +70,7 @@ url = { version = "2" }
 zeroize = { version = "1.9" }
 
 [dev-dependencies]
+sqlx.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 bytes.workspace = true
@@ -99,4 +100,12 @@ tracing-subscriber.workspace = true
 
 [[test]]
 name = "native_execution"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "content_lifecycle"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "content_zdr"
 required-features = ["integration-tests"]

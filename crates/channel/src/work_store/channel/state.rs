@@ -23,6 +23,7 @@ impl Channel<PaymentFunding> {
         result: &PaidJobResultV1,
         transcript: &[u8],
         replaying: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<(), ChannelStateError> {
         if result.work_id != job.work_id {
             return Err(ChannelStateError::WrongChannel {
@@ -36,18 +37,25 @@ impl Channel<PaymentFunding> {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let input = PreparedInvocation::from_canonical_bytes(
-            &job.prepared_input,
-            crate::content::MAX_CONTENT_BYTES,
-        )
-        .map_err(PaidWorkError::from)?;
+        let decoded;
+        let input = match supplied {
+            Some(input) => input,
+            None => {
+                decoded = PreparedInvocation::from_canonical_bytes(
+                    &job.prepared_input,
+                    crate::content::MAX_CONTENT_BYTES,
+                )
+                .map_err(PaidWorkError::from)?;
+                &decoded
+            }
+        };
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
             .map_err(PaidWorkError::from)?;
         let facts = crate::job::check_paid_input(
             &self.funding.channel,
             &job.authorization,
             &policy,
-            &input,
+            input,
         )?;
         let events = decode_transcript(
             transcript,
@@ -57,7 +65,7 @@ impl Channel<PaymentFunding> {
             &self.funding.channel,
             &job.authorization,
             &policy,
-            &input,
+            input,
             &events,
         )? != *result
         {
@@ -192,7 +200,7 @@ impl Channel<PaymentFunding> {
                         field: "verified failed result",
                     });
                 }
-                self.check_result_payload(job, result, &job.transcript, metadata_only)?;
+                self.check_result_payload(job, result, &job.transcript, metadata_only, None)?;
                 if !verifier.verify_sig(
                     *provider_signature,
                     self.provider_key(),
@@ -714,6 +722,16 @@ impl Channel<PaymentFunding> {
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
+        self.apply_with_input(record, verifier, metadata_only, None)
+    }
+
+    pub(super) fn apply_with_input<V: SigVerifier>(
+        &mut self,
+        record: &ChannelRecord,
+        verifier: &V,
+        metadata_only: bool,
+        supplied: Option<&PreparedInvocation>,
+    ) -> Result<Applied, ChannelStateError> {
         match record {
             ChannelRecord::OriginObserved => {
                 if self.funding.origin_observed {
@@ -788,11 +806,11 @@ impl Channel<PaymentFunding> {
                 let Some(job) = self.book.jobs.get(work_id) else {
                     return self.apply_result(
                         *work_id,
-                        result,
-                        *provider_signature,
+                        (result, *provider_signature),
                         transcript,
                         verifier,
                         metadata_only,
+                        supplied,
                     );
                 };
                 self.validate_root(
@@ -803,17 +821,17 @@ impl Channel<PaymentFunding> {
                 )?;
                 let applied = self.apply_result(
                     *work_id,
-                    result,
-                    *provider_signature,
+                    (result, *provider_signature),
                     transcript,
                     verifier,
                     metadata_only,
+                    supplied,
                 )?;
                 Ok(self.record_root(*work_id, *retained_tree, applied))
             }
             ChannelRecord::PlaintextReleased { work_id } => self.apply_plaintext(*work_id),
             ChannelRecord::ResultVerified { work_id } => {
-                self.apply_verified(*work_id, metadata_only)
+                self.apply_verified(*work_id, metadata_only, supplied)
             }
             ChannelRecord::JobTerminated { work_id, outcome } => {
                 let unaccepted = self
@@ -1403,12 +1421,13 @@ impl Channel<PaymentFunding> {
     fn apply_result<V: SigVerifier>(
         &mut self,
         work_id: Digest,
-        result: &PaidJobResultV1,
-        provider_signature: Sig,
+        signed: (&PaidJobResultV1, Sig),
         transcript: &bytes::Bytes,
         verifier: &V,
         metadata_only: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<Applied, ChannelStateError> {
+        let (result, provider_signature) = signed;
         let job = self.book.open_job(work_id, "recording a result")?;
         if let Some((held, signature)) = &job.result {
             if held == result && *signature == provider_signature && job.transcript == transcript {
@@ -1420,7 +1439,7 @@ impl Channel<PaymentFunding> {
                 && *signature == provider_signature
                 && job.transcript.is_empty()
             {
-                self.check_result_payload(&job, result, transcript, false)?;
+                self.check_result_payload(&job, result, transcript, false, supplied)?;
                 self.book
                     .jobs
                     .get_mut(&work_id)
@@ -1475,7 +1494,7 @@ impl Channel<PaymentFunding> {
             });
         }
 
-        self.check_result_payload(&job, result, transcript, metadata_only)?;
+        self.check_result_payload(&job, result, transcript, metadata_only, supplied)?;
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
@@ -1495,6 +1514,7 @@ impl Channel<PaymentFunding> {
         &mut self,
         work_id: Digest,
         replaying: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<Applied, ChannelStateError> {
         self.require_role("recording a verified result", Role::Client)?;
         let job = self.book.open_job(work_id, "recording a verified result")?;
@@ -1513,7 +1533,7 @@ impl Channel<PaymentFunding> {
             return Ok(Applied::Redundant);
         }
         if !replaying {
-            self.check_result_payload(&job, result, &job.transcript, false)?;
+            self.check_result_payload(&job, result, &job.transcript, false, supplied)?;
         }
         self.book.mark_verified(work_id)
     }

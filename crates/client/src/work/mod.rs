@@ -2,7 +2,7 @@
 pub mod payment;
 use hellas_channel::model::setup::ReadyChannel;
 use hellas_channel::model::work::PaidJobResultV1;
-use hellas_channel::work::{ClientEndpoint, DeliverError, fetch_result_stream};
+use hellas_channel::work::{ClientChannel, DeliverError, fetch_result_stream};
 use hellas_wire::StreamTransport;
 
 /// One provider-authenticated answer, durably recorded and still inside
@@ -64,7 +64,7 @@ pub enum CollectResultError {
 /// pass the returned result directly to [`payment::pay_for_result`], after it passes the invocation result checks.
 pub async fn collect_result<T, C>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     ready: &ReadyChannel,
     source: &C,
     work_id: hellas_auth::Digest,
@@ -73,7 +73,7 @@ where
     T: StreamTransport + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
-    C: hellas_channel::work_close::FinalizedBlocks + ?Sized,
+    C: hellas_channel::work_close::FinalizedBlocks + Sync + ?Sized,
 {
     let delivery = match fetch_result_stream(transport, endpoint, ready, work_id, |_| Ok(())).await
     {
@@ -85,19 +85,21 @@ where
     };
 
     let deadline = endpoint
+        .client()
+        .await
+        .map_err(DeliverError::from)?
         .state()
         .job_by_id(work_id)
         .ok_or(DeliverError::NoSuchJob)?
         .authorization()
         .payment_deadline;
-    endpoint.catch_up(source).await?;
-    let height = endpoint.state().cursor().0;
+    let height = endpoint.catch_up(source).await?;
     if height > deadline {
         return Err(CollectResultError::Stale { height, deadline });
     }
 
     Ok(CollectResultOutcome::Collected(CollectedResult {
         result: delivery.result,
-        transcript: delivery.transcript,
+        transcript: delivery.transcript.to_vec(),
     }))
 }

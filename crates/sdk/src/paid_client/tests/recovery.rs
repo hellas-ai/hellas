@@ -85,7 +85,7 @@ fn assert_no_payloads(root: &std::path::Path) {
 async fn accept_uploaded_fetch(
     fixture: &PaidFixture,
     provider: &hellas_channel::work::WorkService,
-    client: &hellas_channel::work::ClientEndpoint,
+    client: &hellas_channel::work::ClientService,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     crate::test_support::accept_uploaded(fixture, provider, client, request).await
@@ -105,16 +105,29 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .await
             .unwrap();
         let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
-        let lost = client.accepted(&response).await.unwrap();
+        let lost = client
+            .client()
+            .await
+            .unwrap()
+            .accepted(&response)
+            .await
+            .unwrap();
+        let delivered_proposal = fixture.proposal();
         let request = client
             .propose(
-                &fixture.proposal(),
+                &delivered_proposal,
                 &hellas_channel::test_support::channel::program_content().await,
             )
             .await
             .unwrap();
         let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
-        let delivered = client.accepted(&response).await.unwrap();
+        let delivered = client
+            .client()
+            .await
+            .unwrap()
+            .accepted(&response)
+            .await
+            .unwrap();
         assert_ne!(lost, delivered);
         let backend = Backend::default();
         run_accepted_work(&provider, &fixture.ready, &backend, delivered)
@@ -142,11 +155,34 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         .await
         .unwrap();
         serving.abort();
-        client.verified(delivered).await.unwrap();
+        client
+            .client()
+            .await
+            .unwrap()
+            .verified(delivered, &delivered_proposal.prepared_input)
+            .await
+            .unwrap();
         // Crash after verified delivery, before creating any payment certificate.
-        assert!(client.state().last_payment().is_none());
+        assert!(
+            client
+                .client()
+                .await
+                .unwrap()
+                .state()
+                .last_payment()
+                .is_none()
+        );
         assert_no_payloads(fixture.root.path());
-        client.store().await.unwrap().content_store().close().await;
+        client
+            .client()
+            .await
+            .unwrap()
+            .store()
+            .await
+            .unwrap()
+            .content_store()
+            .close()
+            .await;
         drop(client);
 
         let server = Endpoint::builder(presets::Minimal)

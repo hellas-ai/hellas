@@ -104,12 +104,14 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;
     let content_configuration = options.native.configure(&mut executor)?;
-    let content = content_configuration
-        .config()
-        .open(hellas_store::content::Reservations::ram(
-            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-        ))
-        .await?;
+    let ram = hellas_store::content::Reservations::ram(
+        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+    );
+    let content = if options.paid.is_some() {
+        content_configuration.config().open(ram).await?
+    } else {
+        content_configuration.config().open_owner(ram).await?
+    };
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every

@@ -24,6 +24,11 @@ impl std::fmt::Debug for ChannelStore {
 }
 
 impl ChannelStore {
+    pub(crate) fn check_authority(&self) -> Result<(), WorkStoreError> {
+        self.journal.check_authority()?;
+        Ok(())
+    }
+
     /// Opens one channel's journal, replaying and re-checking every
     /// record it holds.
     ///
@@ -289,16 +294,53 @@ impl ChannelStore {
     /// [`WorkStoreError::Journal`] when an append or its sync fails.
     pub fn commit<'a, V: SigVerifier>(
         &'a mut self,
+        record: ChannelRecord,
+        verifier: &V,
+    ) -> impl std::future::Future<Output = Result<&'a Channel, WorkStoreError>> {
+        self.commit_with_input(record, None, verifier)
+    }
+
+    pub(crate) fn commit_with_input<'a, V: SigVerifier>(
+        &'a mut self,
         mut record: ChannelRecord,
+        supplied: Option<&'a PreparedInvocation>,
         verifier: &V,
     ) -> impl std::future::Future<Output = Result<&'a Channel, WorkStoreError>> {
         // Like SetupStore::commit, own the validated candidate and content I/O
         // in this journal boundary rather than every setup/settlement poll frame.
         Box::pin(async move {
+            self.check_authority()?;
             if let ChannelRecord::JobResult { work_id, .. }
             | ChannelRecord::ResultVerified { work_id } = &record
             {
-                self.load_retained_content(*work_id).await?;
+                if let Some(input) = supplied {
+                    let job = self
+                        .state()
+                        .job_by_id(*work_id)
+                        .ok_or(ChannelStateError::Malformed)?;
+                    let policy =
+                        InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+                            .map_err(PaidWorkError::from)
+                            .map_err(ChannelStateError::from)?;
+                    let facts = crate::job::check_paid_input(
+                        self.state().channel(),
+                        job.authorization(),
+                        &policy,
+                        input,
+                    )
+                    .map_err(ChannelStateError::from)?;
+                    if self.state().retained_roots().contains_key(work_id)
+                        && let Some(job) = self.state.book.jobs.get_mut(work_id)
+                    {
+                        job.prepared_input = bytes::Bytes::new();
+                    }
+                    if matches!(record, ChannelRecord::ResultVerified { .. }) {
+                        self.load_retained_transcript(*work_id, facts.max_spool_bytes)
+                            .await?;
+                    }
+                } else {
+                    self.load_retained_content(*work_id).await?;
+                }
             }
             self.reconcile_content().await?;
             let staged = self.prepare_record(&mut record)?;
@@ -316,7 +358,7 @@ impl ChannelStore {
             // transcript-to-result authentication — before they are stripped
             // from the bytes written. Only replay and checkpoint validation
             // downgrade for body-less records.
-            if next.apply(&record, verifier, false)? == Applied::Changed {
+            if next.apply_with_input(&record, verifier, false, supplied)? == Applied::Changed {
                 // The signature this record carries leaves after this
                 // returns, so the state that authorises it has to be one a
                 // rotation can still carry. The proposed job is charged the

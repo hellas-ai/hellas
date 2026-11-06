@@ -32,7 +32,6 @@ impl WorkExecutionBackend for Fake {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         assert_eq!(job.environment.sources.len(), 1);
-        assert!(job.content.read(job.environment.sources[0]).unwrap().len() > 500_000);
         assert_eq!(job.plan.calls.len(), 3);
         assert_eq!(job.inputs.len(), 2);
         let OutputKind::Buffer { max_bytes } = job.plan.outputs[0].kind else {
@@ -72,6 +71,10 @@ impl WorkExecutionBackend for Fake {
         }
         let delay = self.delay;
         Ok(Box::pin(async_stream::stream! {
+            let source = job.environment.sources[0];
+            let reader = job.content.0.open_verified(&job.content.1, source, None).await.unwrap().unwrap();
+            let bytes = reader.read_all(source, &job.content.0.ram_pool()).await.unwrap();
+            assert!(bytes.len() > 500_000);
             yield Ok(WorkEvent::Accepted(hellas_rpc::provenance::ExecutionProvenance {
                 commitment_id:[0xab;32],
                 provider:hellas_auth::ProducerSigningKey::from_secret_bytes([9;32]).unwrap().public_key(),

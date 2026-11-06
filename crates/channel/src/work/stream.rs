@@ -117,7 +117,7 @@ fn prefix_batches(
     })
 }
 impl ProviderEndpoint {
-    fn job_facts(&self, work_id: Digest) -> Result<AdmissionFacts, DeliverError> {
+    pub(super) fn job_facts(&self, work_id: Digest) -> Result<AdmissionFacts, DeliverError> {
         let job = self
             .state()
             .job_by_id(work_id)
@@ -181,7 +181,7 @@ impl ProviderEndpoint {
         )?;
         let terminal_deadline = job.authorization().terminal_deadline;
         ready.check_releasable(self.state().cursor().0, terminal_deadline)?;
-        self.close.store.load_retained_content(work_id).await?;
+        self.close.store.load_retained_input(work_id).await?;
         self.job_facts(work_id)?;
         self.close
             .store
@@ -198,7 +198,7 @@ impl WorkService {
         &self,
         request: &StreamResultRequest,
         exporter: &[u8; 32],
-    ) -> Result<AdmissionFacts, DeliverError> {
+    ) -> Result<crate::endpoint_lock::OwnedEndpointGuard<ProviderEndpoint>, DeliverError> {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -212,9 +212,7 @@ impl WorkService {
             // A started SQLite append outlives its RPC. Acquire first to bound detached tasks.
             let reserved = tokio::spawn(async move {
                 endpoint.reserve_stream(&request, &exporter).await?;
-                let work_id =
-                    work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
-                endpoint.job_facts(work_id)
+                Ok(endpoint)
             })
             .await
             .map_err(|_| DeliverError::Endpoint(EndpointError::Poisoned))?;
@@ -285,7 +283,12 @@ impl WorkService {
             let mut position = 0;
             loop {
                 let changed = service.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
-                let facts = match service.reserve_stream_durably(&request, &exporter).await {
+                let reserved = async {
+                    let mut endpoint = service.reserve_stream_durably(&request, &exporter).await?;
+                    endpoint.close.store.load_retained_input(work_id).await?;
+                    endpoint.job_facts(work_id)
+                }.await;
+                let facts = match reserved {
                     Ok(facts) => facts,
                     Err(DeliverError::NoResult { phase: JobPhase::HalfSigned | JobPhase::Accepted | JobPhase::Running | JobPhase::Streaming }) => {
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), changed).await;
@@ -366,7 +369,7 @@ where
         .ok_or(DeliverError::Unbindable)?;
     let (request, prepared, facts) = {
         let mut endpoint = endpoint.client().await?;
-        endpoint.load_retained_content(work_id).await?;
+        endpoint.load_retained_input(work_id).await?;
         let job = endpoint
             .state()
             .job_by_id(work_id)
@@ -465,7 +468,7 @@ where
             return endpoint
                 .client()
                 .await?
-                .receive_stream(work_id, ready, &delivered)
+                .receive_stream(work_id, ready, &delivered, &prepared)
                 .await;
         }
     }
@@ -589,6 +592,328 @@ mod tests {
             let body = input.canonical_bytes().unwrap();
             assert!(!bytes.windows(body.len()).any(|window| window == body));
         }
+    }
+
+    #[tokio::test]
+    async fn retained_restart_delivers_and_verifies_when_input_plus_transcript_exceeds_ram() {
+        use crate::test_support::channel as fixture;
+        use hellas_rpc::protocol::invocation::{Artifact, InvocationInput, compute, output};
+        use hellas_store::content::{DiskStore, IndexMode, Reservations};
+
+        async fn reopen(
+            root: &std::path::Path,
+            ready: &ReadyChannel,
+            role: Role,
+            bytes: u64,
+        ) -> ChannelStore {
+            let content = DiskStore::open(
+                root.join("content"),
+                vec![],
+                IndexMode::Resume,
+                None,
+                Reservations::ram(bytes),
+            )
+            .await
+            .unwrap();
+            let store = ChannelStore::open(
+                root,
+                ready.channel().clone(),
+                fixture::settlement(),
+                role,
+                fixture::origin(),
+                content.clone(),
+                &Secp256k1Verifier::new(),
+            )
+            .await
+            .unwrap();
+            content.finish_recovery().await.unwrap();
+            store
+        }
+
+        let provider_root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let policy = fixture::work_policy();
+        let ready = fixture::ready_of(&fixture::descriptor_with(policy.clone()), fixture::CURSOR);
+        let mut plan = fixture::plan();
+        plan.calls[0].args.push(compute::Arg::Input {
+            object: "prompt".into(),
+        });
+        plan.outputs[0].kind = compute::OutputKind::Buffer {
+            max_bytes: 768 << 10,
+        };
+        let invocation = InvocationInput {
+            artifacts: vec![Artifact::new(
+                "prompt",
+                "catena.bytes.v1",
+                vec![3; 768 << 10],
+            )],
+            parameters: hellas_rpc::JsonBytes(plan.canonical_bytes().unwrap()),
+        };
+        let mut request = fixture::invocation_request(1);
+        request.input = invocation.content_id().unwrap();
+        let input = PreparedInvocation::new(
+            request,
+            &fixture::manifest(),
+            invocation,
+            policy.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let input_len = input.canonical_bytes().unwrap().len() as u64;
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let mut provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(
+                provider_root.path(),
+                &ready,
+                Role::Provider,
+                fixture::CURSOR,
+            )
+            .await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let request = client
+            .propose(
+                &JobProposal {
+                    prepared_input: input.clone(),
+                    deadlines: fixture::deadlines(),
+                },
+                &fixture::program_content().await,
+            )
+            .await
+            .unwrap();
+        let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+        fixture::seed_content(
+            provider.fixture_store(),
+            authorization,
+            input.canonical_bytes().unwrap().into(),
+        )
+        .await;
+        let reply = provider.accept(&request).await;
+        let work = client.accepted(&reply).await.unwrap();
+        provider.begin_run(work, &ready).await.unwrap();
+        let transcript = output::InvocationOutput {
+            outcome: output::Outcome::Succeeded,
+            artifacts: vec![Artifact::new(
+                "answer",
+                "catena.bytes.v1",
+                vec![7; 768 << 10],
+            )],
+            metadata: hellas_rpc::JsonBytes(
+                hellas_rpc::value::canonical_dag_cbor(&compute::RunMetadata {
+                    steps: 0,
+                    stop: None,
+                })
+                .unwrap(),
+            ),
+        }
+        .sign(&input.request, &fixture::provider_producer(), 16 << 10)
+        .unwrap();
+        let transcript_len = encode_transcript(&transcript).unwrap().len() as u64;
+        provider.record_result(work, &transcript).await.unwrap();
+        let pool_bytes = input_len + transcript_len - 1;
+        assert!(input_len < pool_bytes && transcript_len < pool_bytes);
+        let provider_node = provider.close.store.content_store();
+        let client_node = client.store.content_store();
+        drop(provider);
+        drop(client);
+        provider_node.close().await;
+        client_node.close().await;
+        drop(provider_node);
+        drop(client_node);
+
+        let provider = reopen(provider_root.path(), &ready, Role::Provider, pool_bytes).await;
+        let node = provider.content_store();
+        let service = WorkService::new(
+            ProviderEndpoint::new(ready.clone(), provider, fixture::provider()).unwrap(),
+        );
+        let client_store = reopen(client_root.path(), &ready, Role::Client, pool_bytes).await;
+        let client_node = client_store.content_store();
+        let mut client =
+            ClientEndpoint::new(ready.clone(), client_store, fixture::client()).unwrap();
+        let (transport, server) = crate::test_support::transport::transport_pair();
+        let serving = fixture::serve_work(server, service.clone());
+        let delivery =
+            fetch_result_stream(transport.clone(), &mut client, &ready, work, |_| Ok(()))
+                .await
+                .unwrap();
+        assert_eq!(delivery.transcript.len() as u64, transcript_len);
+        assert_eq!(node.ram_pool().held(), transcript_len);
+        drop(delivery);
+        drop(client);
+        client_node.close().await;
+        drop(client_node);
+
+        // Ready recovery validates against the caller's original input while
+        // a charged transcript snapshot outlives the endpoint's cache changes.
+        let client_store = reopen(client_root.path(), &ready, Role::Client, pool_bytes).await;
+        let client_node = client_store.content_store();
+        let mut client =
+            ClientEndpoint::new(ready.clone(), client_store, fixture::client()).unwrap();
+        client.load_retained_transcript(work, &input).await.unwrap();
+        let retained = client.state().job_by_id(work).unwrap().transcript.clone();
+        assert_eq!(client_node.ram_pool().held(), transcript_len);
+        let records = client.store.len();
+        let roots = client.state().retained_roots().clone();
+        let mut wrong = input.clone();
+        wrong.request.nonce = [2; 32];
+        assert!(client.verified(work, &wrong).await.is_err());
+        assert_eq!(client.store.len(), records);
+        assert_eq!(client.state().retained_roots(), &roots);
+        assert_eq!(
+            client.state().job_by_id(work).unwrap().phase(),
+            JobPhase::Ready
+        );
+        client.verified(work, &input).await.unwrap();
+        assert_eq!(client_node.ram_pool().held(), transcript_len);
+        assert_eq!(
+            ContentRef::for_bytes(&retained),
+            client
+                .state()
+                .job_by_id(work)
+                .unwrap()
+                .result()
+                .unwrap()
+                .0
+                .transcript_content
+        );
+        let payment = client.pay(work).await.unwrap();
+        let credited = service.credit(&payment).await;
+        assert_eq!(
+            client.acknowledged(work, &credited).unwrap(),
+            fixture::PRICE
+        );
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_hydration_preserves_ephemeral_bodies_until_their_terminal() {
+        use crate::test_support::channel as fixture;
+        use base64::Engine as _;
+        use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+        let provider_root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let mut policy = fixture::work_policy();
+        policy.admissions.extend(fixture::fetch_policy().admissions);
+        let ready = fixture::ready_of(&fixture::descriptor_with(policy.clone()), fixture::CURSOR);
+        let mut provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(
+                provider_root.path(),
+                &ready,
+                Role::Provider,
+                fixture::CURSOR,
+            )
+            .await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let mut retained = fixture::bundle(1);
+        retained.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
+        let mut ephemeral = fixture::fetch_bundle(2);
+        ephemeral.application_policy = retained.application_policy.clone();
+        let content = fixture::program_content().await;
+        let mut ids = Vec::new();
+        for input in [&retained, &ephemeral] {
+            let proposal = client
+                .propose(
+                    &JobProposal {
+                        prepared_input: input.clone(),
+                        deadlines: fixture::deadlines(),
+                    },
+                    &content,
+                )
+                .await
+                .unwrap();
+            let authorization = PaidJobAuthorizationV2::decode(&proposal.authorization).unwrap();
+            fixture::seed_content(
+                provider.fixture_store(),
+                authorization,
+                input.canonical_bytes().unwrap().into(),
+            )
+            .await;
+            let reply = provider.accept(&proposal).await;
+            ids.push(client.accepted(&reply).await.unwrap());
+        }
+        provider.begin_run(ids[0], &ready).await.unwrap();
+        provider
+            .record_result(
+                ids[0],
+                &fixture::transcript_for(&retained.request, &[9, 10]),
+            )
+            .await
+            .unwrap();
+        provider
+            .close
+            .store
+            .load_retained_input(ids[0])
+            .await
+            .unwrap();
+        let facts = provider.job_facts(ids[0]).unwrap();
+        provider
+            .close
+            .store
+            .load_retained_transcript(ids[0], facts.max_spool_bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.state().job_by_id(ids[1]).unwrap().prepared_input(),
+            ephemeral.canonical_bytes().unwrap()
+        );
+        provider.begin_run(ids[1], &ready).await.unwrap();
+        let payloads = [
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                status: 200,
+                headers: vec![],
+            })),
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body {
+                base64: base64::engine::general_purpose::STANDARD.encode([11, 12]),
+            })),
+        ]
+        .iter()
+        .map(|event| hellas_rpc::fetch::encode_fetch_event_payload(event).unwrap())
+        .collect::<Vec<_>>();
+        let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
+            stop_reason: StopReason::EndOfText,
+            usage: None,
+        })
+        .unwrap();
+        let output = hellas_rpc::protocol::invocation::fetch::output(&payloads, &terminal)
+            .unwrap()
+            .sign(&ephemeral.request, &fixture::provider_producer(), 1024)
+            .unwrap();
+        provider.record_result(ids[1], &output).await.unwrap();
+        let service = WorkService::new(provider);
+        let (transport, server) = crate::test_support::transport::transport_pair();
+        let serving = fixture::serve_work(server, service);
+        fetch_result_stream(transport, &mut client, &ready, ids[1], |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.state().job_by_id(ids[1]).unwrap().prepared_input(),
+            ephemeral.canonical_bytes().unwrap()
+        );
+        client.verified(ids[1], &ephemeral).await.unwrap();
+        assert!(
+            !client
+                .state()
+                .job_by_id(ids[1])
+                .unwrap()
+                .prepared_input()
+                .is_empty()
+        );
+        serving.abort();
     }
 
     #[tokio::test]
@@ -729,11 +1054,18 @@ mod tests {
         );
         let request = client.request_delivery(jobs[0], &[7; 32]).unwrap();
         let service = WorkService::new(provider);
-        let facts = service
+        let mut reserved = service
             .reserve_stream_durably(&request, &[7; 32])
             .await
             .unwrap();
-        assert!(facts.max_spool_bytes > 0);
+        reserved
+            .close
+            .store
+            .load_retained_input(jobs[0])
+            .await
+            .unwrap();
+        assert!(reserved.job_facts(jobs[0]).unwrap().max_spool_bytes > 0);
+        drop(reserved);
         let endpoint = service.endpoint().await.unwrap();
         assert_eq!(
             endpoint.state().job_by_id(jobs[0]).unwrap().phase(),
@@ -818,7 +1150,7 @@ mod tests {
             let reserve = service.reserve_stream_durably(&request, &[7; 32]);
             tokio::pin!(reserve);
             tokio::select! {
-                result = &mut reserve => panic!("append completed before cancellation: {result:?}"),
+                result = &mut reserve => panic!("append completed before cancellation: {:?}", result.err()),
                 result = entered => result.unwrap(),
             }
         }
@@ -904,12 +1236,16 @@ mod tests {
             fixture::provider(),
         )
         .unwrap();
-        let mut client = ClientEndpoint::new(
+        let mut client = fixture::client_service(
+            ClientEndpoint::new(
+                ready.clone(),
+                fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+                fixture::client(),
+            )
+            .unwrap(),
             ready.clone(),
-            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
-            fixture::client(),
         )
-        .unwrap();
+        .await;
         let proposal = client
             .propose(
                 &JobProposal {
@@ -922,7 +1258,13 @@ mod tests {
             .unwrap();
         let service = WorkService::new(provider);
         let response = fixture::accept_uploaded_client(&service, &client, &proposal).await;
-        let work = client.accepted(&response).await.unwrap();
+        let work = client
+            .client()
+            .await
+            .unwrap()
+            .accepted(&response)
+            .await
+            .unwrap();
         service.begin_run(work, &ready).await.unwrap();
         let facts = service.endpoint().await.unwrap().job_facts(work).unwrap();
         service
@@ -974,7 +1316,12 @@ mod tests {
             }
         }
         let mut stream = service.result_stream(
-            client.request_delivery(work, &[7; 32]).unwrap(),
+            client
+                .client()
+                .await
+                .unwrap()
+                .request_delivery(work, &[7; 32])
+                .unwrap(),
             TransportContext {
                 open_exporter: Some([7; 32]),
                 ..Default::default()
@@ -1118,6 +1465,9 @@ mod tests {
         assert_eq!(received, transcript, "no skipped or replayed envelopes");
         let completed = completed.expect("exactly one terminal");
         client
+            .client()
+            .await
+            .unwrap()
             .receive_stream(
                 work,
                 &ready,
@@ -1126,14 +1476,26 @@ mod tests {
                     provider_signature: completed.provider_signature,
                     transcript: encode_transcript(&received).unwrap(),
                 },
+                &input,
             )
             .await
             .unwrap();
-        client.verified(work).await.unwrap();
-        let payment = client.pay(work).await.unwrap();
+        client
+            .client()
+            .await
+            .unwrap()
+            .verified(work, &input)
+            .await
+            .unwrap();
+        let payment = client.client().await.unwrap().pay(work).await.unwrap();
         let credited = service.credit(&payment).await;
         assert_eq!(
-            client.acknowledged(work, &credited).unwrap(),
+            client
+                .client()
+                .await
+                .unwrap()
+                .acknowledged(work, &credited)
+                .unwrap(),
             fixture::PRICE
         );
         assert_eq!(
@@ -1153,7 +1515,14 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            client.state().terminal_by_id(work).unwrap().outcome,
+            client
+                .client()
+                .await
+                .unwrap()
+                .state()
+                .terminal_by_id(work)
+                .unwrap()
+                .outcome,
             TerminalOutcome::Certified { .. }
         ));
     }

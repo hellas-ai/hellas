@@ -5,7 +5,7 @@
 //!
 //! Canonical private records and content references. `AcceptWorkRequest`
 //! carries canonical [`PaidJobAuthorizationV2`] bytes and a content reference
-//! to the prepared input transferred by UploadContent. Signatures cover the
+//! to the prepared input transferred by scoped Content.Upload. Signatures cover the
 //! canonical authorization and its exact input commitment.
 //!
 //! # The order
@@ -1182,7 +1182,6 @@ impl ProviderEndpoint {
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
-        self.close.store.load_retained_content(work_id).await?;
         self.close
             .store
             .commit(
@@ -2045,7 +2044,7 @@ pub struct Delivery {
     /// The provider's signature over its digest.
     pub signature: Sig,
     /// The encoded transcript, as [`decode_transcript`](crate::model::work::decode_transcript) reads it.
-    pub transcript: Vec<u8>,
+    pub transcript: bytes::Bytes,
 }
 
 /// Why one delivery did not happen.
@@ -2963,6 +2962,19 @@ impl WorkService {
             .reserve_ready_release(request, &exporter)
             .await
             .map_err(Refusal::from)?;
+        endpoint
+            .close
+            .store
+            .load_retained_input(work_id)
+            .await
+            .map_err(|e| Refusal::from(DeliverError::from(e)))?;
+        let facts = endpoint.job_facts(work_id).map_err(Refusal::from)?;
+        endpoint
+            .close
+            .store
+            .load_retained_transcript(work_id, facts.max_spool_bytes)
+            .await
+            .map_err(|e| Refusal::from(DeliverError::from(e)))?;
         // The endpoint remains locked from authorization through this snapshot.
         let job = endpoint
             .state()
@@ -2974,7 +2986,7 @@ impl WorkService {
         Ok(Delivery {
             result: *result,
             signature: *signature,
-            transcript: job.transcript().to_vec(),
+            transcript: job.transcript.clone(),
         })
     }
 
@@ -3221,14 +3233,16 @@ impl ClientEndpoint {
     /// proposal, [`ProposeError::Conflict`] when a different proposal is
     /// outstanding, and the record, readiness, and journal errors the
     /// proposal itself raises.
-    pub async fn propose(
+    async fn propose_owned(
         &mut self,
         proposal: &JobProposal,
         content: &(
             hellas_store::content::LocalStore,
             hellas_store::content::Scope,
         ),
+        cancellation: &admission::Cancellation,
     ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.store.check_authority()?;
         if let Some(observation) = &self.observation {
             observation.check()?;
         }
@@ -3302,27 +3316,87 @@ impl ClientEndpoint {
             .map_err(PaidWorkError::from)?;
         let work_id = work_id(self.state().channel(), &authorization);
 
-        self.retain_proposal(work_id, &authorization, &proposal.prepared_input, content)
-            .await?;
-        let signature = self.signer.sign(signing_hash(work_id));
-        self.store
-            .commit(
-                ChannelRecord::JobProposed {
-                    authorization,
-                    client_signature: signature,
-                    prepared_input: prepared_input.clone().into(),
-
-                    retained_tree: None,
-                },
-                &Secp256k1Verifier::new(),
-            )
-            .await?;
-        Ok(wire_request(&authorization, signature, prepared_input))
+        let result = async {
+            // Keep this preparation polled until its Core effects have handed
+            // ownership back, then cancel before creating a signed proposal.
+            self.retain_proposal(work_id, &authorization, &proposal.prepared_input, content)
+                .await?;
+            if cancellation.is_cancelled() {
+                return Err(ProposeError::Content(hellas_store::content::Error::Denied));
+            }
+            let signature = self.signer.sign(signing_hash(work_id));
+            self.store
+                .commit(
+                    ChannelRecord::JobProposed {
+                        authorization,
+                        client_signature: signature,
+                        prepared_input: prepared_input.clone().into(),
+                        retained_tree: None,
+                    },
+                    &Secp256k1Verifier::new(),
+                )
+                .await?;
+            Ok(wire_request(&authorization, signature, prepared_input))
+        }
+        .await;
+        if result.is_err()
+            && self.store.check_authority().is_ok()
+            && self.state().job_by_id(work_id).is_none()
+            && let Ok((_, scope)) = self.store.invocation_content(work_id)
+            && let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind
+        {
+            // The owned endpoint writer excludes any successor until cleanup
+            // finishes. An ambiguous journal write instead stays for replay.
+            self.store
+                .discard_unaccepted_content(work_id, reservation)
+                .await?;
+        }
+        result
     }
 
-    /// Load a retained job's bodies for recovery without caching other jobs.
-    pub async fn load_retained_content(&mut self, work: Digest) -> Result<(), WorkStoreError> {
-        self.store.load_retained_content(work).await
+    #[cfg(test)]
+    async fn propose(
+        &mut self,
+        proposal: &JobProposal,
+        content: &(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
+    ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.propose_owned(proposal, content, &admission::Cancellation::new())
+            .await
+    }
+
+    /// Load a retained input without retaining its encoded transcript as well.
+    pub async fn load_retained_input(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        self.store.load_retained_input(work).await
+    }
+
+    /// Load a retained transcript after rechecking the caller's original input.
+    pub async fn load_retained_transcript(
+        &mut self,
+        work: Digest,
+        input: &PreparedInvocation,
+    ) -> Result<(), WorkStoreError> {
+        let job = self
+            .state()
+            .job_by_id(work)
+            .ok_or(ChannelStateError::Malformed)?;
+        let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+            input.application_policy.as_bytes(),
+        )
+        .map_err(PaidWorkError::from)
+        .map_err(ChannelStateError::from)?;
+        let facts = crate::job::check_paid_input(
+            self.state().channel(),
+            job.authorization(),
+            &policy,
+            input,
+        )
+        .map_err(ChannelStateError::from)?;
+        self.store
+            .load_retained_transcript(work, facts.max_spool_bytes)
+            .await
     }
 
     /// Resend a half-signed proposal exactly as journaled, including the
@@ -3516,6 +3590,7 @@ impl ClientEndpoint {
         work_id: Digest,
         ready: &ReadyChannel,
         delivered: &ResultTranscript,
+        input: &PreparedInvocation,
     ) -> Result<Delivery, DeliverError> {
         bind(ready, &self.store, &self.signer, Role::Client)?;
         let job = self
@@ -3541,7 +3616,7 @@ impl ClientEndpoint {
         let signature = signature(&delivered.provider_signature)
             .ok_or(DeliverError::Malformed("provider signature"))?;
         self.store
-            .commit(
+            .commit_with_input(
                 ChannelRecord::JobResult {
                     work_id,
                     result,
@@ -3550,13 +3625,14 @@ impl ClientEndpoint {
 
                     retained_tree: None,
                 },
+                Some(input),
                 &Secp256k1Verifier::new(),
             )
             .await?;
         Ok(Delivery {
             result,
             signature,
-            transcript: delivered.transcript.clone(),
+            transcript: delivered.transcript.clone().into(),
         })
     }
 
@@ -3597,13 +3673,18 @@ impl ClientEndpoint {
 
     /// Durably records authenticated invocation verification before payment.
     /// The store rechecks the exact input, signed output and stop rule.
-    pub async fn verified(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+    pub async fn verified(
+        &mut self,
+        work_id: Digest,
+        input: &PreparedInvocation,
+    ) -> Result<(), DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
         self.store
-            .commit(
+            .commit_with_input(
                 ChannelRecord::ResultVerified { work_id },
+                Some(input),
                 &Secp256k1Verifier::new(),
             )
             .await?;
@@ -3810,11 +3891,11 @@ where
 /// # Errors
 ///
 /// [`ProposeError::Transport`] when the call does not complete, and
-/// whatever [`ClientEndpoint::propose`] or [`ClientEndpoint::accepted`]
+/// whatever [`ClientService::propose`] or [`ClientEndpoint::accepted`]
 /// raises.
 pub async fn propose_work<T>(
     transport: T,
-    endpoint: &mut impl ClientChannel,
+    endpoint: &mut ClientService,
     proposal: &JobProposal,
     content: &(
         hellas_store::content::LocalStore,
@@ -3826,7 +3907,7 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.client().await?.propose(proposal, content).await?;
+    let request = endpoint.propose(proposal, content).await?;
     content::transfer_proposal(transport, endpoint, request, content).await
 }
 

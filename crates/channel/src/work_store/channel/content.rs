@@ -11,6 +11,7 @@ impl ChannelStore {
         work: Digest,
         reservation: u64,
     ) -> Result<(), WorkStoreError> {
+        self.check_authority()?;
         if !self.has_content_scope(work, reservation) {
             return Ok(());
         }
@@ -38,6 +39,7 @@ impl ChannelStore {
         work: Digest,
         input: bytes::Bytes,
     ) -> Result<(), WorkStoreError> {
+        self.check_authority()?;
         self.state.restore_input(work, input)?;
         Ok(())
     }
@@ -61,6 +63,7 @@ impl ChannelStore {
         &self,
         work: Digest,
     ) -> Result<(LocalStore, Scope), WorkStoreError> {
+        self.check_authority()?;
         self.contents
             .get(&work)
             .cloned()
@@ -71,6 +74,7 @@ impl ChannelStore {
         &self,
         work: Digest,
     ) -> Result<Option<(LocalStore, Scope)>, WorkStoreError> {
+        self.check_authority()?;
         Ok(self
             .state()
             .retained_roots()
@@ -86,6 +90,7 @@ impl ChannelStore {
         closure: Vec<ContentRef>,
         max_upload_bytes: u64,
     ) -> Result<(LocalStore, Scope), WorkStoreError> {
+        self.check_authority()?;
         if let Some(content) = self.contents.get(&work) {
             if content.0.retention() != retention {
                 return Err(Error::Denied.into());
@@ -120,6 +125,7 @@ impl ChannelStore {
         closure: Vec<ContentRef>,
         max_upload_bytes: u64,
     ) -> Result<(LocalStore, Scope), WorkStoreError> {
+        self.check_authority()?;
         let (store, scope) = self.invocation_content(work)?;
         let content = match store {
             LocalStore::Disk(node) => {
@@ -297,6 +303,7 @@ impl ChannelStore {
     }
 
     pub(crate) async fn reconcile_content(&mut self) -> Result<(), WorkStoreError> {
+        self.check_authority()?;
         let channel = self.state().channel().id();
         let mut cursor = Cursor::default();
         let mut existing = BTreeMap::new();
@@ -478,7 +485,8 @@ impl ChannelStore {
     /// Load one retained job only when a caller needs its authenticated bodies.
     /// Recovery keeps references and reservations, rather than retaining every
     /// input and transcript in the node's staging/scratch RAM pool.
-    pub async fn load_retained_content(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+    pub async fn load_retained_input(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        self.check_authority()?;
         if !self.state().retained_roots().contains_key(&work) {
             return Ok(());
         }
@@ -495,6 +503,9 @@ impl ChannelStore {
                 job.transcript = bytes::Bytes::new();
             }
         }
+        if let Some(job) = self.state.book.jobs.get_mut(&work) {
+            job.transcript = bytes::Bytes::new();
+        }
         let Some(job) = self.state().job_by_id(work) else {
             return Ok(());
         };
@@ -510,6 +521,20 @@ impl ChannelStore {
             .await?;
             self.state.restore_input(work, input)?;
         }
+        Ok(())
+    }
+
+    /// Ordinary direct commits may need both caches when no input was supplied.
+    pub async fn load_retained_content(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        self.load_retained_input(work).await?;
+        if !self.state().retained_roots().contains_key(&work) {
+            return Ok(());
+        }
+        let Some(job) = self.state().job_by_id(work) else {
+            return Ok(());
+        };
+        let authorization = *job.authorization();
+        let store = LocalStore::Disk(self.content.clone());
         let job = self
             .state()
             .job_by_id(work)
@@ -548,6 +573,55 @@ impl ChannelStore {
                 .ok_or(ChannelStateError::Malformed)?
                 .transcript = transcript;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn load_retained_transcript(
+        &mut self,
+        work: Digest,
+        maximum: u64,
+    ) -> Result<(), WorkStoreError> {
+        self.check_authority()?;
+        if !self.state().retained_roots().contains_key(&work) {
+            return Ok(());
+        }
+        let retained = self
+            .state()
+            .retained_roots()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in retained {
+            if let Some(job) = self.state.book.jobs.get_mut(&id) {
+                if id != work {
+                    job.transcript = bytes::Bytes::new();
+                }
+                job.prepared_input = bytes::Bytes::new();
+            }
+        }
+        let Some(job) = self.state().job_by_id(work) else {
+            return Ok(());
+        };
+        if !job.transcript().is_empty() {
+            return Ok(());
+        }
+        let Some((result, _)) = job.result() else {
+            return Ok(());
+        };
+        let reference = result.transcript_content;
+        let transcript = read(
+            &LocalStore::Disk(self.content.clone()),
+            &Scope::Owner,
+            reference,
+            maximum,
+        )
+        .await?;
+        self.state
+            .book
+            .jobs
+            .get_mut(&work)
+            .ok_or(ChannelStateError::Malformed)?
+            .transcript = transcript;
         Ok(())
     }
 

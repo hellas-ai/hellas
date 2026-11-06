@@ -1,4 +1,7 @@
 //! Real owner authentication, generic content framing and concurrent watch delivery.
+// Match the CLI compiler query budget for the same generic native host.
+// This changes compilation depth, not runtime stack size.
+#![recursion_limit = "256"]
 use futures::StreamExt;
 use hellas_auth::authority::GrantId;
 use hellas_authority::{

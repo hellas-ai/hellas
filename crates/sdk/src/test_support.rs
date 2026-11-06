@@ -7,7 +7,9 @@ use hellas_channel::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
 use hellas_channel::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_channel::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
+use hellas_channel::work::{
+    ClientEndpoint, ClientService, JobProposal, ProviderEndpoint, WorkService,
+};
 use hellas_channel::work_store::{ChannelStore, Role, SetupOrigin};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
@@ -291,13 +293,17 @@ impl PaidFixture {
         store
     }
 
-    pub async fn client(&self) -> ClientEndpoint {
-        ClientEndpoint::new(
+    pub async fn client(&self) -> ClientService {
+        hellas_channel::test_support::channel::client_service(
+            ClientEndpoint::new(
+                self.ready.clone(),
+                self.store(Role::Client).await,
+                signer(1),
+            )
+            .unwrap(),
             self.ready.clone(),
-            self.store(Role::Client).await,
-            signer(1),
         )
-        .unwrap()
+        .await
     }
 
     pub async fn provider(&self) -> WorkService {
@@ -403,7 +409,7 @@ use hellas_channel::test_support::test_responses_contract;
 pub async fn accept_uploaded(
     fixture: &PaidFixture,
     service: &hellas_channel::work::WorkService,
-    client: &hellas_channel::work::ClientEndpoint,
+    client: &hellas_channel::work::ClientService,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     use hellas_channel::model::work::{
@@ -411,11 +417,14 @@ pub async fn accept_uploaded(
     };
     let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     let id = work_id(fixture.ready.channel(), &authorization);
-    let bytes = client.state().job_by_id(id).unwrap().prepared_input();
+    let bytes = client
+        .with_state(|state| state.job_by_id(id).unwrap().prepared_input().to_vec())
+        .await
+        .unwrap();
     let (wire, mut frames) = hellas_channel::test_support::channel::input_uploads(
         fixture.ready.channel(),
         request,
-        bytes,
+        &bytes,
     );
     if let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &mut frames[0].part {
         let opening = open.work.as_mut().unwrap();

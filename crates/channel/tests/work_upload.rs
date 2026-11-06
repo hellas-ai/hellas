@@ -8,8 +8,8 @@ use hellas_channel::{
     },
     test_support::{channel::*, drive_upload, upload_frames},
     work::{
-        ClientEndpoint, JobProposal, ProviderEndpoint, RunAdmission, WorkService,
-        admission::Cancellation,
+        ClientChannel as _, ClientEndpoint, ClientService, JobProposal, ProviderEndpoint,
+        RunAdmission, WorkService, admission::Cancellation,
     },
     work_store::{ChannelRecord, ChannelStore, Role},
 };
@@ -39,13 +39,14 @@ async fn proposal(
     ready: &ReadyChannel,
     mut input: PreparedInvocation,
     source: &(LocalStore, Scope),
-) -> (ClientEndpoint, AcceptWorkRequest, Vec<u8>) {
-    let mut endpoint = ClientEndpoint::new(
+) -> (ClientService, AcceptWorkRequest, Vec<u8>) {
+    let endpoint = ClientEndpoint::new(
         ready.clone(),
         store_at(root, ready, Role::Client, CURSOR).await,
         client(),
     )
     .unwrap();
+    let mut endpoint = client_service(endpoint, ready.clone()).await;
     input.application_policy =
         hellas_rpc::JsonBytes(ready.invocation_policy().canonical_bytes().unwrap());
     let bytes = input.canonical_bytes().unwrap();
@@ -272,6 +273,15 @@ async fn failed_cosign_journal_append_never_pins_and_reupload_after_restart_reco
     let (_, frames) = input_uploads(ready.channel(), &request, &bytes);
     let connection = Cancellation::new();
     upload(&service, frames.clone(), &connection).await.unwrap();
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let job = JobId {
+        channel: ready.channel().id(),
+        id: work_id(ready.channel(), &authorization),
+    };
+    let scope = node.open_work(job, vec![], 0).await.unwrap();
+    let ScopeKind::Work { reservation, .. } = scope.kind else {
+        panic!("work scope")
+    };
     assert!(matches!(
         service.accept(&request).await.outcome,
         Some(accept_work_response::Outcome::Refused(_))
@@ -292,8 +302,64 @@ async fn failed_cosign_journal_append_never_pins_and_reupload_after_restart_reco
             .await
             .unwrap()
     );
+    let held = node.stats().unwrap();
+    let ram = node.ram_pool().held();
+    let files = hellas_channel::test_support::all_files(&provider_root.join("content"));
+    let staged: Vec<_> = files
+        .into_iter()
+        .filter(|path| path.components().any(|part| part.as_os_str() == "staging"))
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert!(
+        !staged.is_empty(),
+        "uncertain acceptance has real staged bytes"
+    );
     connection.cancel();
     claims_released(&service).await;
+    let ScopeKind::Work {
+        reservation: current,
+        ..
+    } = node.open_work(job, vec![], 0).await.unwrap().kind
+    else {
+        panic!("work scope")
+    };
+    assert_eq!(current, reservation);
+    assert_eq!(node.stats().unwrap().used, held.used);
+    assert_eq!(node.stats().unwrap().outstanding, held.outstanding);
+    assert_eq!(node.ram_pool().held(), ram);
+    for (path, bytes) in &staged {
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+    }
+    assert!(
+        upload(&service, frames.clone(), &Cancellation::new())
+            .await
+            .is_err()
+    );
+    {
+        use hellas_channel::work_close::CloseChannel as _;
+        let mut driver = service.drive().unwrap();
+        let mut store = driver.store().await.unwrap();
+        let result = store
+            .commit(
+                ChannelRecord::JobAccepted {
+                    work_id: job.id,
+                    provider_signature: Sig::from_bytes([0; 64]),
+                    retained_tree: None,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(hellas_channel::work_store::WorkStoreError::Journal(
+                hellas_channel::work_store::journal::JournalError::Poisoned
+            ))
+        ));
+    }
+    assert_eq!(node.stats().unwrap().outstanding, held.outstanding);
     shutdown(service, node).await;
     let mut database = sqlx::SqliteConnection::connect_with(&options)
         .await
@@ -304,10 +370,24 @@ async fn failed_cosign_journal_append_never_pins_and_reupload_after_restart_reco
         .unwrap();
     database.close().await.unwrap();
     let (service, node) = self::service(&provider_root, &ready).await;
+    assert_eq!(
+        node.stats().unwrap().outstanding,
+        0,
+        "canonical reopen discards the proposal that never cosigned"
+    );
+    for (path, _) in &staged {
+        assert!(!path.exists());
+    }
     let connection = Cancellation::new();
     upload(&service, frames, &connection).await.unwrap();
     let response = service.accept(&request).await;
-    caller.accepted(&response).await.unwrap();
+    caller
+        .client()
+        .await
+        .unwrap()
+        .accepted(&response)
+        .await
+        .unwrap();
     assert_eq!(
         node.pins(&Scope::Owner, "channel/", Cursor::default())
             .await
@@ -387,7 +467,13 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
             .is_empty()
     );
     let response = service.accept(&request).await;
-    let work = caller.accepted(&response).await.unwrap();
+    let work = caller
+        .client()
+        .await
+        .unwrap()
+        .accepted(&response)
+        .await
+        .unwrap();
     connection.cancel();
     claims_released(&service).await;
     shutdown(service, node).await;
@@ -753,6 +839,9 @@ async fn a_valid_second_proposal_cannot_replace_the_first_completed_unaccepted_s
         (before.used, before.outstanding)
     );
     let work = caller
+        .client()
+        .await
+        .unwrap()
         .accepted(&service.accept(&first).await)
         .await
         .unwrap();
@@ -785,4 +874,103 @@ async fn a_valid_second_proposal_cannot_replace_the_first_completed_unaccepted_s
     );
     drop(input);
     service.end_run(work).await.unwrap();
+}
+
+#[tokio::test]
+async fn paid_upload_termination_cancels_a_blocked_ack_and_releases_its_ram() {
+    use futures::StreamExt as _;
+    use hellas_channel::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
+    use hellas_rpc::services::content::{ContentClientImpl, Upload};
+    use hellas_wire::{StreamTransport as _, mux::MuxTransport};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for end in ["close", "cancel", "deadline"] {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let root = tempfile::tempdir().unwrap();
+            let ready = ready_of(&descriptor_with(fetch_policy()), CURSOR);
+            let (service, node) = service(&root.path().join("provider"), &ready).await;
+            let (_, request, bytes) = proposal(
+                &root.path().join("client"),
+                &ready,
+                fetch_bundle(1),
+                &program_content().await,
+            )
+            .await;
+            let (_, frames) = input_uploads(ready.channel(), &request, &bytes);
+            let gate = Arc::new(CarrierGate {
+                remaining: AtomicUsize::new(0),
+                sent: AtomicUsize::new(0),
+                blocked: tokio::sync::Notify::new(),
+                ready: Default::default(),
+            });
+            let (transport, server) = transport_pair_with_server_gate(
+                TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                gate.clone(),
+            );
+            let connection = Cancellation::new();
+            let serving = tokio::spawn({
+                let service = service.clone();
+                let connection = connection.clone();
+                async move {
+                    let inbound = server.accept().await.unwrap().unwrap();
+                    let context = inbound.context.clone();
+                    hellas_rpc::call::dispatch_bidi_streaming::<MuxTransport, Upload, _, _, _>(
+                        inbound,
+                        |requests| async move {
+                            service
+                                .upload_stream(Box::pin(requests), context, connection)
+                                .await
+                        },
+                    )
+                    .await
+                }
+            });
+            let mut call = ContentClientImpl::new(transport).upload().await.unwrap();
+            call.send(frames.into_iter().next().unwrap()).await.unwrap();
+            gate.blocked.notified().await;
+            assert!(
+                node.ram_pool().held() > 0,
+                "the suspended session owns its input allowance"
+            );
+            assert_eq!(gate.sent.load(Ordering::SeqCst), 0);
+            match end {
+                "cancel" => connection.cancel(),
+                "close" => {
+                    service.prepare_close().await.unwrap();
+                }
+                "deadline" => {
+                    let mut driver = service.drive().unwrap();
+                    for height in CURSOR + 1..=deadlines().acceptance + 1 {
+                        driver
+                            .observe_finalized(&hellas_channel::work_close::FinalizedWork {
+                                height,
+                                parent: payload_at(height - 1),
+                                payload: payload_at(height),
+                                txs: vec![],
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // No carrier credit or readiness notification is supplied here.
+            assert!(serving.await.unwrap().is_err());
+            while let Some(reply) = call.next().await {
+                assert!(reply.is_err());
+            }
+            assert!(call.finish().is_err());
+            claims_released(&service).await;
+            assert_eq!(node.ram_pool().held(), 0);
+            assert_eq!(node.stats().unwrap().outstanding, 0);
+            assert_eq!(gate.sent.load(Ordering::SeqCst), 0);
+        })
+        .await
+        .unwrap();
+    }
 }

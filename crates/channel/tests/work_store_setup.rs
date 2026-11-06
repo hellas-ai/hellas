@@ -2043,6 +2043,8 @@ async fn setup_completes_without_waiting_for_a_quiet_chain() {
 
     let dir = temp();
     let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
     let payment_open = completed(countersigned(proposed()))
         .payment_open()
         .expect("the signed payment Open");
@@ -2100,6 +2102,8 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2173,6 +2177,8 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2205,6 +2211,7 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     drop(journal);
 
     let mut restarted = store(dir.path(), Role::Provider).await;
+    restarted.set_content_store(content.clone());
     assert_eq!(restarted.state().end(), Some(SetupEnd::Complete));
     let before = view.reads();
     let blocks = Blocks { blocks: Vec::new() }; // The origin has been pruned.
@@ -2259,7 +2266,9 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
     let dir = temp();
-    let journal = completed_store(dir.path()).await;
+    let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     // Why this has to go through the service at all: the journal is
     // held, and a runner cannot open a second one to drive from.
@@ -2652,6 +2661,8 @@ async fn a_mount_replays_a_same_block_contest() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2721,6 +2732,8 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = client_completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2795,6 +2808,8 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = completed_store(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    journal.set_content_store(content.clone());
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2855,6 +2870,7 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     // the same step to the same answer.
     drop(journal);
     let mut restarted = store(dir.path(), Role::Provider).await;
+    restarted.set_content_store(content.clone());
     match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
         Ok(advance) => match advance.progress {
             SetupProgress::CloseOnly {

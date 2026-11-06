@@ -512,6 +512,25 @@ pub fn transcript_for(request: &InvocationRequest, answer: &[u32]) -> Vec<Output
     )
 }
 
+/// Observe the fixture's fixed finalized snapshot through the real shared client.
+/// Expiry tests supply their own bounded observation instead.
+pub async fn client_service(
+    endpoint: crate::work::ClientEndpoint,
+    ready: ReadyChannel,
+) -> crate::work::ClientService {
+    let service = crate::work::ClientService::new(endpoint);
+    service
+        .observer()
+        .observe_ready(
+            ready,
+            crate::work::ObservationTime::now(),
+            std::time::Duration::MAX,
+        )
+        .await
+        .unwrap();
+    service
+}
+
 /// The host restores every journal before calling finish_recovery.
 pub async fn content_store(root: &std::path::Path) -> hellas_store::content::DiskStore {
     hellas_store::content::DiskStore::open(
@@ -634,19 +653,26 @@ pub fn descriptor_with(policy: InvocationPolicy) -> WorkChannelDescriptor {
 
 pub async fn accept_uploaded_client(
     service: &crate::work::WorkService,
-    client: &crate::work::ClientEndpoint,
+    client: &crate::work::ClientService,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
     let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
         return service.accept(request).await;
     };
-    let id = work_id(client.state().channel(), &a);
-    let Some(job) = client.state().job_by_id(id) else {
-        return service.accept(request).await;
-    };
-    let (wire, frames) = input_uploads(client.state().channel(), request, job.prepared_input());
-    send_frames(service, &wire, frames).await
+    let frames = client
+        .with_state(|state| {
+            let id = work_id(state.channel(), &a);
+            state
+                .job_by_id(id)
+                .map(|job| input_uploads(state.channel(), request, job.prepared_input()))
+        })
+        .await
+        .unwrap();
+    match frames {
+        Some((wire, frames)) => send_frames(service, &wire, frames).await,
+        None => service.accept(request).await,
+    }
 }
 
 pub const NONCE: u8 = 1;
@@ -849,7 +875,7 @@ pub async fn checked_job() -> Checked {
         panic!("the fixture delivery completes: {error}");
     }
     // The client journals authenticated verification before signing payment.
-    if let Err(error) = client.verified(id).await {
+    if let Err(error) = client.verified(id, &bundle(NONCE)).await {
         panic!("the fixture verification records: {error}");
     }
     Checked {

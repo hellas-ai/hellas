@@ -1235,11 +1235,9 @@ async fn re_sending_a_retained_payment_is_idempotent() {
 
 // ── Crash points ──────────────────────────────────────────────────────
 
-/// A crash after every write boundary, and what the next process holds.
-///
-/// The prefix is committed, the store is dropped without ceremony, and
-/// a new one is opened over the same files. What is asserted is the
-/// exact state — not that recovery "works".
+/// Replay each complete record prefix to its exact state. Close the SQLite
+/// pool explicitly so reopening cannot race its asynchronous Drop cleanup.
+/// Abrupt process loss is exercised separately by the SDK lifecycle target.
 #[tokio::test]
 async fn every_provider_write_boundary_recovers_to_one_state() {
     let channel = channel();
@@ -1261,6 +1259,7 @@ async fn every_provider_write_boundary_recovers_to_one_state() {
         {
             let mut store = open(dir.path(), Role::Provider).await;
             commit_all(&mut store, &sequence[..=index]).await;
+            store.content_store().close().await;
         }
         let recovered = open(dir.path(), Role::Provider).await;
         let state = recovered.state();

@@ -34,6 +34,116 @@ fn set_scope(shared: &std::sync::Mutex<Scope>, scope: Scope) -> Result<(), WireS
     *shared.lock().map_err(|_| status(Error::Denied))? = scope;
     Ok(())
 }
+// The existing carrier callback checks paid rights under the endpoint writer,
+// releasing that writer on Pending. Scope's effect binding is still called only by Core.
+struct ContentWrite {
+    endpoint: Arc<crate::endpoint_lock::EndpointLock<ProviderEndpoint>>,
+    authorization: PaidJobAuthorizationV2,
+    connection: admission::Cancellation,
+    denied: bool,
+    work: Digest,
+    reservation: u64,
+    changes: Arc<tokio::sync::Notify>,
+    changed: futures::future::BoxFuture<'static, ()>,
+    cancelled: futures::future::BoxFuture<'static, ()>,
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    waiting: Option<
+        futures::future::BoxFuture<
+            'static,
+            Result<crate::endpoint_lock::OwnedEndpointGuard<ProviderEndpoint>, ()>,
+        >,
+    >,
+}
+impl ContentWrite {
+    fn new(
+        host: &WorkService,
+        scope: &Scope,
+        authorization: PaidJobAuthorizationV2,
+        connection: admission::Cancellation,
+    ) -> Self {
+        let ScopeKind::Work {
+            job, reservation, ..
+        } = scope.kind
+        else {
+            unreachable!()
+        };
+        let cancellation = connection.clone();
+        Self {
+            endpoint: host.endpoint.clone(),
+            authorization,
+            connection,
+            denied: false,
+            work: job.id,
+            reservation,
+            changes: host.changed.clone(),
+            changed: Box::pin(host.changed.clone().notified_owned()),
+            cancelled: Box::pin(async move { cancellation.cancelled().await }),
+            timer: None,
+            waiting: None,
+        }
+    }
+}
+impl hellas_wire::WriteAuthorization for ContentWrite {
+    fn poll_write(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        write: &mut dyn FnMut(
+            &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<usize>>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "paid content scope ended",
+            )
+        };
+        if self.denied || self.cancelled.as_mut().poll(cx).is_ready() {
+            self.denied = true;
+            self.waiting = None;
+            return Poll::Ready(Err(denied()));
+        }
+        while self.changed.as_mut().poll(cx).is_ready() {
+            self.changed = Box::pin(self.changes.clone().notified_owned());
+        }
+        let waiting = self.waiting.get_or_insert_with(|| {
+            let endpoint = self.endpoint.clone();
+            Box::pin(async move { endpoint.lock_owned().await })
+        });
+        let held = match waiting.as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(held)) => held,
+            Poll::Ready(Err(())) => {
+                self.denied = true;
+                self.waiting = None;
+                return Poll::Ready(Err(denied()));
+            }
+        };
+        self.waiting = None;
+        if self.connection.is_cancelled()
+            || !held
+                .close
+                .store
+                .has_content_scope(self.work, self.reservation)
+            || held.check_content_authority(&self.authorization).is_err()
+        {
+            self.denied = true;
+            return Poll::Ready(Err(denied()));
+        }
+        if let Some(remaining) = held.observation.as_ref().and_then(Observation::remaining) {
+            let timer = self
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(remaining)));
+            timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + remaining);
+            let _ = timer.as_mut().poll(cx);
+        } else {
+            self.timer = None;
+        }
+        write(cx)
+    }
+}
 impl ClientEndpoint {
     pub(super) async fn retain_proposal(
         &mut self,
@@ -68,6 +178,8 @@ impl ClientEndpoint {
                 readers.push((reference, reader));
             }
         }
+        let facts =
+            crate::job::check_paid_input(self.state().channel(), authorization, &policy, prepared)?;
         let (store, scope) = self
             .store
             .open_content(
@@ -77,8 +189,6 @@ impl ClientEndpoint {
                 policy.limits.max_upload_bytes,
             )
             .await?;
-        let facts =
-            crate::job::check_paid_input(self.state().channel(), authorization, &policy, prepared)?;
         self.store
             .reserve_retained(work, facts.max_spool_bytes)
             .await?;
@@ -120,7 +230,7 @@ where
     let (work, prepared, pool, retained) = {
         let mut client = endpoint.client().await?;
         let work = work_id(client.state().channel(), &authorization);
-        client.load_retained_content(work).await?;
+        client.load_retained_input(work).await?;
         let job = client
             .state()
             .job_by_id(work)
@@ -246,6 +356,10 @@ where
 
 impl ProviderEndpoint {
     fn check_content_authority(&self, authorization: &PaidJobAuthorizationV2) -> Result<(), Error> {
+        self.close
+            .store
+            .check_authority()
+            .map_err(|_| Error::Denied)?;
         let work = work_id(self.state().channel(), authorization);
         if self.state().terminal_by_id(work).is_some() || self.state().close_settled().is_some() {
             return Err(Error::Denied);
@@ -569,7 +683,14 @@ impl WorkService {
                 host.discard_pending_content(id, reservation).await;
             });
         }
-        let service = ContentService::new(Arc::new(store), scope);
+        let writer = hellas_wire::WriteAuthority::new(ContentWrite::new(
+            self,
+            &scope,
+            authorization,
+            connection.clone(),
+        ));
+        let service =
+            ContentService::new(Arc::new(store), scope).with_write_authority(writer.clone());
         let shared = service.scope.clone();
         let requests = requests.map(|request| request.and_then(|request| {
             if matches!(&request.part, Some(pb::upload_request::Part::Open(open)) if open.work.is_some()) {
@@ -615,6 +736,73 @@ impl WorkService {
             }
             host.complete_content_upload(id, reservation)?;
             cleanup.0.clear();
-        }))
+        }).with_write_authority(writer))
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+    use crate::test_support::channel as fixture;
+    use hellas_wire::WriteAuthorization as _;
+    use std::{
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn a_successful_carrier_write_leaves_no_dormant_authority_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let endpoint = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let service = WorkService::new(endpoint);
+        let authorization = fixture::authorization();
+        let work = work_id(ready.channel(), &authorization);
+        let scope = service
+            .endpoint()
+            .await
+            .unwrap()
+            .close
+            .store
+            .open_content(work, authorization.retention, vec![], 0)
+            .await
+            .unwrap()
+            .1;
+        let connection = admission::Cancellation::new();
+        let scope = service.bound_content_scope(scope, authorization, Some(connection.clone()));
+        let mut writer = ContentWrite::new(&service, &scope, authorization, connection);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            writer.poll_write(&mut cx, &mut |_| Poll::Ready(Ok(0))),
+            Poll::Ready(Ok(0))
+        ));
+        let held = service.endpoint().await.unwrap();
+        assert!(
+            writer
+                .poll_write(&mut cx, &mut |_| panic!("writer held"))
+                .is_pending()
+        );
+        service.changed.notify_waiters();
+        assert!(
+            writer
+                .poll_write(&mut cx, &mut |_| panic!("writer still held"))
+                .is_pending()
+        );
+        drop(held);
+        assert!(matches!(
+            writer.poll_write(&mut cx, &mut |_| Poll::Ready(Ok(1))),
+            Poll::Ready(Ok(1))
+        ));
+        // A native carrier need not poll this callback again until its next ACK.
+        // Producing that ACK must be able to acquire the same actual writer.
+        let next = tokio::time::timeout(Duration::from_secs(1), service.endpoint()).await;
+        assert!(next.is_ok(), "a dormant callback owns the endpoint permit");
+        drop(writer);
     }
 }

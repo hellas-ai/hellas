@@ -1348,6 +1348,7 @@ mod tests {
     async fn restart_dispatches_every_accepted_job() {
         let fixture = PaidFixture::new();
         let service = fixture.provider().await;
+        use hellas_channel::work::ClientChannel as _;
         let mut client = fixture.client().await;
         let mut accepted = Vec::new();
         for _ in 0..2 {
@@ -1359,7 +1360,15 @@ mod tests {
                 .await
                 .unwrap();
             let response = accept_uploaded(&fixture, &service, &client, &request).await;
-            accepted.push(client.accepted(&response).await.unwrap());
+            accepted.push(
+                client
+                    .client()
+                    .await
+                    .unwrap()
+                    .accepted(&response)
+                    .await
+                    .unwrap(),
+            );
         }
         assert_eq!(
             service

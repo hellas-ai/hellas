@@ -194,6 +194,8 @@ impl ResellerBuilder {
         let client_identity =
             NodeIdentity::from_secret_bytes([3; 32], FRIEND.node_key().to_secret_bytes()).unwrap();
         let upstream = tls_fixture(self.upstream).await;
+        let content = hellas_channel::test_support::channel::content_store(root.path()).await;
+        content.finish_recovery().await.unwrap();
         let options = || {
             let mut routes = FetchRouteRegistry::new();
             routes
@@ -213,6 +215,7 @@ impl ResellerBuilder {
                 enrollment: provider_bundle.clone(),
                 root: Arc::new(UnusedRoot),
                 state_directory: root.path().join("provider"),
+                content: content.clone(),
                 routes,
                 fetch_max_in_flight: 2,
                 fetch_queue_capacity: 2,
@@ -483,7 +486,7 @@ impl OpenAiFixture {
             enrollment,
         }
     }
-    fn options(&self) -> OpenAiProviderOptions<UnusedRoot> {
+    async fn options(&self) -> OpenAiProviderOptions<UnusedRoot> {
         use hellas_auth::authority::ResourceId;
         let root = self.root.path();
         let identity = &self.identity;
@@ -494,6 +497,11 @@ impl OpenAiFixture {
             enrollment: enrollment.clone(),
             root: Arc::new(UnusedRoot),
             state_directory: root.join("provider"),
+            content: {
+                let content = hellas_channel::test_support::channel::content_store(root).await;
+                content.finish_recovery().await.unwrap();
+                content
+            },
             service: "openai".into(),
             method: "responses".into(),
             bearer_token: "fixture".into(),
@@ -516,7 +524,7 @@ impl OpenAiFixture {
 #[tokio::test]
 async fn openai_host_refuses_an_empty_upstream_key() {
     let fixture = OpenAiFixture::new();
-    let mut options = fixture.options();
+    let mut options = fixture.options().await;
     options.bearer_token.clear();
     hellas_auth::assert_err!(
         start_openai_provider(&options, None).await,
@@ -539,12 +547,15 @@ async fn host_control_starts_the_openai_reseller_factory() {
         world.store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
+    let options = fixture.options().await;
+    let content = options.content.clone();
     let (host, control) = controlled_host(
         fixture.root.path(),
         node,
         &secret,
-        Some(fixture.options().into_factory()),
+        Some(options.into_factory()),
         None,
+        content,
     )
     .await;
     let reply = control
@@ -601,6 +612,7 @@ async fn controlled_host(
         hellas_sdk::gateway::GatewayAccess,
         hellas_sdk::node_control::host::GatewayFactory,
     )>,
+    content: hellas_store::content::DiskStore,
 ) -> (hellas_sdk::node_control::host::HostHandle, TestControl) {
     use hellas_sdk::wire::ServiceMarker;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -633,6 +645,7 @@ async fn controlled_host(
     let socket = root.join("control/host.socket");
     let host = hellas_sdk::node_control::host::HostHandle::start(
         hellas_sdk::node_control::host::HostOptions {
+            content,
             transport: None,
             start_provider: false,
             provider,
@@ -673,6 +686,8 @@ async fn controlled_gateway(
     node: hellas_authority::node::NodeCoordinator,
     secret: &hellas_auth::authority::CredentialSecret,
 ) -> ControlledGateway {
+    let content = hellas_channel::test_support::channel::content_store(&root.join("host")).await;
+    content.finish_recovery().await.unwrap();
     let (host, control) = controlled_host(
         root,
         node,
@@ -682,6 +697,7 @@ async fn controlled_gateway(
             gateway.serve.server.access.clone(),
             gateway.into_factory(key),
         )),
+        content,
     )
     .await;
     let status = control

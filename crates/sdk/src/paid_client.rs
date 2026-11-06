@@ -931,7 +931,7 @@ impl PaidWorkSession {
                             })
                     });
                     if !settled {
-                        endpoint.load_retained_content(work).await?;
+                        endpoint.load_retained_input(work).await?;
                     }
                     let job = endpoint
                         .state()
@@ -1287,7 +1287,9 @@ async fn execute_paid_job(
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
         | Some((work_id, hellas_channel::work_store::JobPhase::Verified, _)) => {
             let mut endpoint = client.client().await?;
-            endpoint.load_retained_content(work_id).await?;
+            endpoint
+                .load_retained_transcript(work_id, &proposal.prepared_input)
+                .await?;
             let retained = endpoint
                 .state()
                 .job_by_id(work_id)
@@ -1366,7 +1368,7 @@ async fn execute_paid_job(
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
         check_payment_window(client, work_id).await?;
-        delivery.transcript.into()
+        delivery.transcript
     };
     let verified = verify_transcript(
         &proposal.prepared_input,
@@ -1387,7 +1389,11 @@ async fn execute_paid_job(
         }
         return Err(PaidClientError::InvocationFailed { work_id, reason });
     }
-    client.client().await?.verified(work_id).await?;
+    client
+        .client()
+        .await?
+        .verified(work_id, &proposal.prepared_input)
+        .await?;
     if let Some(purchase) = purchase.as_deref_mut() {
         purchase.paying(work_id)?;
     }

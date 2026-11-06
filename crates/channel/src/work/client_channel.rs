@@ -12,11 +12,24 @@ pub trait ClientChannel: Send {
     ) -> impl core::future::Future<
         Output = Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError>,
     > + Send;
+
+    /// Advance verified history without holding shared request authority over I/O.
+    fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> impl core::future::Future<Output = Result<u64, CatchUpError>> + Send;
 }
 
 impl ClientChannel for ClientEndpoint {
     async fn client(&mut self) -> Result<impl DerefMut<Target = Self> + Send, EndpointError> {
         Ok(self)
+    }
+
+    async fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<u64, CatchUpError> {
+        ClientEndpoint::catch_up(self, source).await
     }
 }
 
@@ -38,6 +51,36 @@ impl ClientService {
                 driving: Arc::new(AtomicBool::new(false)),
             },
         }
+    }
+
+    /// Own preparation and its journal decision even if the requesting future ends.
+    pub async fn propose(
+        &mut self,
+        proposal: &JobProposal,
+        content: &(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
+    ) -> Result<AcceptWorkRequest, ProposeError> {
+        let mut endpoint = self
+            .observer
+            .endpoint
+            .lock_owned()
+            .await
+            .map_err(|_| EndpointError::Poisoned)?;
+        let cancellation = admission::Cancellation::new();
+        let mut guard = admission::CancelOnFailure(vec![cancellation.clone()]);
+        let proposal = proposal.clone();
+        let content = content.clone();
+        let result = tokio::spawn(async move {
+            endpoint
+                .propose_owned(&proposal, &content, &cancellation)
+                .await
+        })
+        .await
+        .map_err(|_| EndpointError::Poisoned)?;
+        guard.0.clear();
+        result
     }
 
     /// Gives the chain task observation authority, never payment authority.
@@ -174,6 +217,17 @@ impl ClientChannel for ClientService {
     ) -> Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError> {
         self.observer.endpoint().await
     }
+
+    async fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<u64, CatchUpError> {
+        self.observer
+            .drive()
+            .map_err(|_| CatchUpError::Busy)?
+            .catch_up(source)
+            .await
+    }
 }
 
 /// The client's one chain driver. Dropping it releases driving authority.
@@ -244,5 +298,217 @@ impl ClientDriver<'_> {
         T: TxSink + ?Sized,
     {
         advance_close(source, sink, self, &Secp256k1Verifier::new()).await
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+    use crate::test_support::channel as fixture;
+    use hellas_store::content::{ContentStore as _, *};
+
+    async fn service(root: &std::path::Path) -> (ClientService, DiskStore, u64) {
+        let ready = fixture::ready();
+        let input = fixture::bundle(1);
+        let bytes = input.canonical_bytes().unwrap();
+        let root_bytes = fixture::environment().canonical_bytes().unwrap();
+        let authorization = crate::job::propose(
+            ready.channel(),
+            ready.invocation_policy(),
+            ready.payment_policy(),
+            &input,
+            1,
+            fixture::deadlines(),
+        )
+        .unwrap();
+        let facts = crate::job::check_paid_input(
+            ready.channel(),
+            &authorization,
+            ready.invocation_policy(),
+            &input,
+        )
+        .unwrap();
+        let closure = vec![
+            ContentRef::for_bytes(&bytes),
+            ContentRef::for_bytes(&root_bytes),
+        ];
+        let capacity = closure.iter().map(|object| object.bytes()).sum::<u64>()
+            + facts.max_spool_bytes
+            + crate::content::tree_reservation(&closure, facts.max_spool_bytes).unwrap();
+        let content = DiskStore::open(
+            root.join("content"),
+            vec![],
+            IndexMode::Resume,
+            Some(capacity),
+            Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
+        )
+        .await
+        .unwrap();
+        let mut store = ChannelStore::open(
+            root,
+            ready.channel().clone(),
+            fixture::settlement(),
+            Role::Client,
+            fixture::origin(),
+            content.clone(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        content.finish_recovery().await.unwrap();
+        fixture::advance(&mut store, fixture::CURSOR).await;
+        let service = ClientService::new(
+            ClientEndpoint::new(ready.clone(), store, fixture::client()).unwrap(),
+        );
+        service
+            .observer()
+            .observe_ready(
+                ready,
+                ObservationTime::now(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        (service, content, capacity)
+    }
+
+    #[tokio::test]
+    async fn failed_retained_output_admission_releases_input_before_the_next_proposal() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, node, capacity) = service(root.path()).await;
+        let input = fixture::bundle(1);
+        let input_bytes = input.canonical_bytes().unwrap().len() as u64
+            + fixture::environment().canonical_bytes().unwrap().len() as u64;
+        let foreign = node
+            .open_work(
+                JobId {
+                    channel: Digest::hash(b"other channel"),
+                    id: Digest::hash(b"other job"),
+                },
+                vec![],
+                0,
+            )
+            .await
+            .unwrap();
+        node.reserve_output(&foreign, capacity - input_bytes)
+            .await
+            .unwrap();
+        let prior = node.stats().unwrap();
+        let ram = node.ram_pool().held();
+        let source = fixture::program_content().await;
+        let error = client
+            .propose(
+                &JobProposal {
+                    prepared_input: input,
+                    deadlines: fixture::deadlines(),
+                },
+                &source,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProposeError::Store(WorkStoreError::Content(Error::Capacity))
+        ));
+        assert_eq!(node.stats().unwrap().used, prior.used);
+        assert_eq!(node.stats().unwrap().outstanding, prior.outstanding);
+        assert_eq!(node.ram_pool().held(), ram);
+        assert_eq!(
+            client
+                .with_state(|state| state.jobs().count())
+                .await
+                .unwrap(),
+            0
+        );
+        node.end_work(&foreign).await.unwrap();
+        client
+            .propose(
+                &JobProposal {
+                    prepared_input: fixture::bundle(2),
+                    deadlines: fixture::deadlines(),
+                },
+                &source,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .with_state(|state| state.jobs().count())
+                .await
+                .unwrap(),
+            1
+        );
+        node.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_proposal_keeps_owning_admission_until_exact_cleanup_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, node, _) = service(root.path()).await;
+        let source = fixture::program_content().await;
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = Arc::new(std::sync::Mutex::new(blocked));
+        let once = Arc::new(AtomicBool::new(true));
+        let bound = Scope::Owner.bind(
+            move || {
+                let blocked = blocked.clone();
+                let entered = entered.clone();
+                let once = once.clone();
+                async move {
+                    Ok(move || {
+                        if once.swap(false, Ordering::AcqRel) {
+                            entered.send(()).unwrap();
+                            blocked.lock().unwrap().recv().unwrap();
+                        }
+                        Ok(())
+                    })
+                }
+            },
+            std::future::pending,
+        );
+        let holding = node.clone();
+        let hold = tokio::spawn(async move {
+            holding.pins(&bound, "", Cursor::default()).await.unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let observer = client.observer();
+        let proposal = JobProposal {
+            prepared_input: fixture::bundle(1),
+            deadlines: fixture::deadlines(),
+        };
+        let mut request = Box::pin(client.propose(&proposal, &source));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        drop(request);
+        let mut observed = Box::pin(observer.with_state(|state| state.jobs().count()));
+        assert!(
+            futures::poll!(observed.as_mut()).is_pending(),
+            "owned proposal still holds the writer"
+        );
+        release.send(()).unwrap();
+        hold.await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), observed)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(node.stats().unwrap().used, 0);
+        assert_eq!(node.stats().unwrap().outstanding, 0);
+        assert_eq!(node.ram_pool().held(), 0);
+        client
+            .propose(
+                &JobProposal {
+                    prepared_input: fixture::bundle(2),
+                    deadlines: fixture::deadlines(),
+                },
+                &source,
+            )
+            .await
+            .unwrap();
+        node.close().await;
     }
 }

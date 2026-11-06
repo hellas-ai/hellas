@@ -13,8 +13,9 @@ use hellas_channel::{
     },
     test_support::channel::{self as fixture, *},
     work::{
-        Admitted, BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint,
-        RunError, RunOutcome, WorkBackend, WorkService, fetch_result_stream, run_accepted_work,
+        Admitted, BackendFault, ClientChannel as _, ClientEndpoint, CloseEndpoint, DeliverError,
+        ProviderEndpoint, RunError, RunOutcome, WorkBackend, WorkService, fetch_result_stream,
+        run_accepted_work,
     },
     work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome},
 };
@@ -236,7 +237,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     assert_eq!(job.result().map(|(r, _)| *r), Some(delivered.result));
     assert_eq!(job.transcript(), delivered.transcript);
     let mut endpoint = ClientEndpoint::new(ready.clone(), recovered, client()).unwrap();
-    endpoint.verified(id).await.unwrap();
+    endpoint.verified(id, &bundle(1)).await.unwrap();
     drop(endpoint);
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     assert_eq!(
@@ -660,12 +661,16 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
         )
         .unwrap(),
     );
-    let mut endpoint = ClientEndpoint::new(
+    let mut endpoint = fixture::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(cr.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .unwrap(),
         ready.clone(),
-        store_at(cr.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .unwrap();
+    .await;
     let mut input = fetch_bundle(1);
     input.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
     let request = endpoint
@@ -679,7 +684,13 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
         .await
         .unwrap();
     let response = accept_uploaded_client(&service, &endpoint, &request).await;
-    let id = endpoint.accepted(&response).await.unwrap();
+    let id = endpoint
+        .client()
+        .await
+        .unwrap()
+        .accepted(&response)
+        .await
+        .unwrap();
     let result = run_accepted_work(&service, &ready, &FetchBackend, id).await;
     // RPC's shared result check enforces the signed frame ceiling before a receipt is made.
     assert!(
@@ -924,12 +935,16 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
     let mut policy = work_policy();
     policy.admissions.extend(fetch_policy().admissions);
     let ready = ready_of(&descriptor_with(policy.clone()), CURSOR);
-    let mut client_endpoint = ClientEndpoint::new(
+    let mut client_endpoint = fixture::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(cr.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .unwrap(),
         ready.clone(),
-        store_at(cr.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .unwrap();
+    .await;
     let service = WorkService::new(
         ProviderEndpoint::new(
             ready.clone(),
@@ -959,7 +974,13 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             .await
             .unwrap();
         let reply = accept_uploaded_client(&service, &client_endpoint, &proposal).await;
-        let id = client_endpoint.accepted(&reply).await.unwrap();
+        let id = client_endpoint
+            .client()
+            .await
+            .unwrap()
+            .accepted(&reply)
+            .await
+            .unwrap();
         run_accepted_work(&service, &ready, &Backend, id)
             .await
             .unwrap();
@@ -969,8 +990,22 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             })
             .await
             .unwrap();
-        assert!(client_endpoint.pay(id).await.is_err());
-        client_endpoint.verified(id).await.unwrap();
+        assert!(
+            client_endpoint
+                .client()
+                .await
+                .unwrap()
+                .pay(id)
+                .await
+                .is_err()
+        );
+        client_endpoint
+            .client()
+            .await
+            .unwrap()
+            .verified(id, &input)
+            .await
+            .unwrap();
         assert_eq!(
             admit_payment(
                 &WorkClientImpl::new(transport.clone()),
@@ -982,7 +1017,7 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             (index as u64 + 1) * PRICE
         );
         if is_fetch {
-            private_needles.push(delivered.transcript);
+            private_needles.push(delivered.transcript.to_vec());
             for root in [pr.path(), cr.path()] {
                 assert_eq!(
                     std::fs::read_dir(root.join("content/objects"))
