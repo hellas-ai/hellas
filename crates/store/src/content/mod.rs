@@ -47,6 +47,8 @@ pub enum Error {
     Invalid(&'static str),
     #[error("content access denied")]
     Denied,
+    #[error("this store is owned by a node with paid work; run the command against the daemon")]
+    WorkOwned,
     #[error("content is missing")]
     Missing,
     #[error("pin or cursor changed")]

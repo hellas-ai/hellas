@@ -54,6 +54,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
         NoBackend,
         vec![],
         Arc::new(|| UnixMillis::now().unwrap()),
+        hellas_authority::test_support::content_store(&config.journal_root).await,
     )
     .unwrap();
     let admin = WorkAdministration::new(
@@ -169,18 +170,22 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     assert_eq!(std::fs::read(&config.control_private_key).unwrap(), key);
 }
 
-#[test]
-fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
-    use hellas_channel::content::{EphemeralContent, InvocationContent};
+#[tokio::test]
+async fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
     use hellas_client::model::{ModelPackage, ModelRequest};
+    use hellas_store::content::{
+        ContentStore as _, DiskStore, IndexMode, JobId, PinName, PinPolicy, PinValue, Reservations,
+        Scope, Target,
+    };
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-    let model = ModelPackage::open(&fixture).unwrap();
+    let model = ModelPackage::open(&fixture).await.unwrap();
     let job = model
         .render_job(&ModelRequest::Transcription {
             samples: &[0.; 400],
             language: Some("en"),
             max_new_tokens: 4,
         })
+        .await
         .unwrap();
     let example: toml::Value = toml::from_str(include_str!(
         "../../../../../../docs/examples/faucet-provider.toml"
@@ -198,33 +203,56 @@ fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
             )
         })
         .collect();
-    let mut held = EphemeralContent::default();
-    held.insert(std::fs::read(fixture.join("weights.bf16")).unwrap());
-    let held = InvocationContent::Ephemeral(held);
-    // Only ordinary weights are held. The source and all four inputs must fit
-    // as newly uploaded objects, even on the first request to this provider.
-    hellas_executor::catena::validate::preflight(
-        &job.environment,
-        &inputs,
-        &job.plan,
-        &limits,
-        &held,
+    let root = tempfile::tempdir().unwrap();
+    let node = DiskStore::open(
+        root.path().join("content"),
+        vec![fixture],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
     )
+    .await
     .unwrap();
-    let too_small = hellas_rpc::protocol::invocation::Limits {
-        max_upload_bytes: 1 << 20,
-        ..limits
-    };
-    assert!(
-        hellas_executor::catena::validate::preflight(
-            &job.environment,
-            &inputs,
-            &job.plan,
-            &too_small,
-            &held
+    node.finish_recovery().await.unwrap();
+    for asset in &job.environment.assets {
+        node.set_pin(
+            &Scope::Owner,
+            &PinName::new(format!("config/{}", asset.name)).unwrap(),
+            None,
+            Some(PinValue {
+                target: Target::Object(asset.object),
+                policy: PinPolicy::Jobs,
+                expires: None,
+            }),
         )
-        .is_err()
-    );
+        .await
+        .unwrap();
+    }
+    let mut closure = vec![hellas_rpc::ContentRef::for_bytes(
+        &job.environment.canonical_bytes().unwrap(),
+    )];
+    closure.extend(job.environment.sources.iter().copied());
+    closure.extend(job.environment.assets.iter().map(|asset| asset.object));
+    let inputs: std::collections::BTreeMap<_, _> = inputs;
+    closure.extend(inputs.values().copied());
+    hellas_executor::catena::validate::preflight(&job.environment, &inputs, &job.plan, &limits)
+        .unwrap();
+    let id = JobId {
+        channel: hellas_auth::Digest::hash(b"faucet channel"),
+        id: hellas_auth::Digest::hash(b"faucet job"),
+    };
+    // The real reservation charges fresh program/root/features, while a
+    // readable Jobs pin supplies provider-held weights without charging uploads.
+    let scope = node
+        .open_work(id, closure.clone(), limits.max_upload_bytes)
+        .await
+        .unwrap();
+    node.end_work(&scope).await.unwrap();
+    assert!(matches!(
+        node.open_work(id, closure, 1 << 20).await,
+        Err(hellas_store::content::Error::Capacity)
+    ));
+    node.close().await;
 }
 
 #[test]

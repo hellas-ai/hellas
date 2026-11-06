@@ -4,12 +4,12 @@
 use super::{ClientArgs, Context, TransactArgs};
 use anyhow::Context as _;
 use clap::Args;
-use hellas_channel::content::{EphemeralContent, InvocationContent};
 use hellas_rpc::protocol::invocation::{
     Artifact, MAX_INVOCATION_BYTES,
     compute::{self, Arg, Bind, Call, Declared, OutputKind, Plan, ValueKind},
 };
 use hellas_sdk::job::Job;
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use std::path::PathBuf;
 
 const BYTES_FORMAT: &str = "catena.bytes.v1";
@@ -85,23 +85,31 @@ fn parse_returns(value: &str) -> Result<OutputKind, String> {
 }
 
 impl RunArgs {
-    pub(super) fn job(&self) -> super::super::CliResult<Job> {
+    pub(super) async fn job(&self) -> super::super::CliResult<Job> {
         let read = |path: &PathBuf, label, limit| {
             super::super::read_bounded_regular_file(path, label, limit)
         };
-        let mut content = EphemeralContent::default();
-        let sources = self
-            .sources
-            .iter()
-            .map(|path| {
-                Ok(content.insert(read(path, "source", compute::MAX_SOURCE_BYTES as usize)?))
-            })
-            .collect::<super::super::CliResult<_>>()?;
+        let content = (
+            LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ))),
+            Scope::Owner,
+        );
+        let mut sources = Vec::new();
+        for path in &self.sources {
+            sources.push(
+                hellas_channel::content::upload_object(
+                    &content.0,
+                    &read(path, "source", compute::MAX_SOURCE_BYTES as usize)?,
+                )
+                .await?,
+            );
+        }
         let environment = compute::Environment {
             sources,
             assets: Vec::new(),
         };
-        content.insert(environment.canonical_bytes()?);
+        hellas_channel::content::upload_object(&content.0, &environment.canonical_bytes()?).await?;
         let inputs = self
             .inputs
             .iter()
@@ -142,20 +150,21 @@ impl RunArgs {
             environment,
             plan,
             inputs,
-            InvocationContent::Ephemeral(content),
-        )?)
+            content,
+        )
+        .await?)
     }
 }
 
 pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()> {
-    let job = args.job()?;
+    let job = args.job().await?;
     let directory = args.save_job.clone().unwrap_or_else(|| {
         args.client
             .root(&context)
             .join("jobs")
             .join(job.digest().to_string())
     });
-    job.save(&directory)?;
+    job.save(&directory).await?;
     eprintln!("job: {}", directory.display());
     super::run(
         TransactArgs {

@@ -130,6 +130,7 @@ impl ChannelStore {
         verifier: &V,
         existing: bool,
     ) -> Result<Option<Self>, WorkStoreError> {
+        content.claim_work().await?;
         if origin.is_some_and(|origin| origin.payment_edge != channel.payment_edge()) {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",

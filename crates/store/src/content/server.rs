@@ -101,6 +101,10 @@ impl<S> ContentService<S> {
 fn status(error: Error) -> WireStatus {
     let (code, message) = match error {
         Error::Denied => (WireCode::PermissionDenied, "content access denied"),
+        Error::WorkOwned => (
+            WireCode::FailedPrecondition,
+            "this store is owned by a node with paid work; run the command against the daemon",
+        ),
         Error::Missing => (WireCode::NotFound, "content is missing"),
         Error::Conflict => (WireCode::Aborted, "pin or cursor changed"),
         Error::Capacity => (WireCode::ResourceExhausted, "content reservation exhausted"),

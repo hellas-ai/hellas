@@ -48,6 +48,7 @@ pub(crate) struct Disk {
     records: Arc<Records>,
     db: sqlx::SqlitePool,
     recovered: AtomicBool,
+    work_owned: AtomicBool,
 }
 pub(crate) struct FileObject {
     pub object: ContentRef,
@@ -60,11 +61,15 @@ fn database(_: sqlx::Error) -> Error {
     Error::Invalid("content database")
 }
 impl Disk {
-    async fn open(root: PathBuf, capacity: Option<u64>, ram: Reservations) -> Result<Arc<Self>> {
+    async fn open(
+        root: PathBuf,
+        capacity: Option<u64>,
+        ram: Reservations,
+        owner_only: bool,
+    ) -> Result<Arc<Self>> {
         let directory = root.clone();
         tokio::task::spawn_blocking(move || {
-            hellas_private::create_dir_all_durable(&directory.join("objects"))?;
-            hellas_private::create_dir_all_durable(&directory.join("staging"))?;
+            hellas_private::create_dir_all_durable(&directory)?;
             Ok::<_, Error>(())
         })
         .await
@@ -96,12 +101,23 @@ impl Disk {
         if version != 0 && version != 1 {
             return Err(Error::Invalid("unsupported content database version"));
         }
-        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
+        let work_owned: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_owned WHERE id=1)")
+                .fetch_one(&db)
+                .await
+                .map_err(database)?;
+        if owner_only && work_owned {
+            db.close().await;
+            return Err(Error::WorkOwned);
+        }
         hellas_private::sync_directory(&root)?;
         let records = Arc::new(Records::default());
         let _ = records.load(&root.join("fastresume.bin"));
         let cleanup = root.clone();
         tokio::task::spawn_blocking(move || {
+            hellas_private::create_dir_all_durable(&cleanup.join("objects"))?;
+            hellas_private::create_dir_all_durable(&cleanup.join("staging"))?;
             for entry in fs::read_dir(cleanup.join("staging"))? {
                 let entry = entry?;
                 if entry.file_type()?.is_file() {
@@ -121,6 +137,7 @@ impl Disk {
             records,
             db,
             recovered: AtomicBool::new(false),
+            work_owned: AtomicBool::new(work_owned),
         }))
     }
     pub(crate) fn ready(&self) -> bool {
@@ -570,7 +587,28 @@ impl DiskStore {
         capacity: Option<u64>,
         ram: Reservations,
     ) -> Result<Self> {
-        let disk = Disk::open(upper, capacity, ram.clone()).await?;
+        Self::open_inner(upper, lower, mode, capacity, ram, false).await
+    }
+    /// In-process owner commands have no authoritative work-journal census.
+    /// Check the durable monotone ownership fact before scanning or cleanup.
+    pub async fn open_owner(
+        upper: PathBuf,
+        lower: Vec<PathBuf>,
+        mode: IndexMode,
+        capacity: Option<u64>,
+        ram: Reservations,
+    ) -> Result<Self> {
+        Self::open_inner(upper, lower, mode, capacity, ram, true).await
+    }
+    async fn open_inner(
+        upper: PathBuf,
+        lower: Vec<PathBuf>,
+        mode: IndexMode,
+        capacity: Option<u64>,
+        ram: Reservations,
+        owner_only: bool,
+    ) -> Result<Self> {
+        let disk = Disk::open(upper, capacity, ram.clone(), owner_only).await?;
         let core = Core::new(ram);
         let (generation, pins) = disk.pins().await?;
         let scanning = disk.clone();
@@ -586,6 +624,25 @@ impl DiskStore {
         let mut core = core;
         core.disk = Some(disk);
         Ok(Self { core })
+    }
+    /// A channel claims the upper before any of its content scopes or bytes.
+    /// The only row is monotone; pin changes and collection never clear it.
+    pub async fn claim_work(&self) -> Result<()> {
+        let core = self.core.clone();
+        tokio::spawn(async move {
+            let _gate = core.effect_gate(&Scope::Owner).await?;
+            let disk = core.disk.as_ref().unwrap();
+            if !disk.work_owned.load(Ordering::Acquire) {
+                sqlx::query("INSERT OR IGNORE INTO work_owned(id) VALUES(1)")
+                    .execute(&disk.db)
+                    .await
+                    .map_err(database)?;
+                disk.work_owned.store(true, Ordering::Release);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Invalid("work ownership task"))?
     }
     /// The host calls this only after every channel has restored retained roots
     /// and outstanding output reservations. Admission and collection share it.
@@ -683,6 +740,7 @@ impl DiskStore {
         closure: Closure,
         max_upload_bytes: u64,
     ) -> Result<Scope> {
+        self.claim_work().await?;
         self.core
             .admit(&Scope::Owner, move |core| {
                 core.open_work(job, closure.clone(), max_upload_bytes)
@@ -892,6 +950,7 @@ impl DiskStore {
         pin: PinTarget,
         previous: Option<PinName>,
     ) -> Result<()> {
+        self.claim_work().await?;
         let core = self.core.clone();
         tokio::spawn(async move {
             let temporary = core

@@ -183,6 +183,10 @@ impl Daemon {
         let daemon = super::super::configuration::start_host(
             hellas_sdk::ProviderOptions {
                 executor,
+                content: hellas_authority::test_support::content_store(
+                    &root.path().join("content"),
+                )
+                .await,
                 grants: None,
                 discovery: false,
                 port: Some(0),

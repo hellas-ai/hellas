@@ -29,8 +29,8 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     assert!(parse(&["--provider", &provider]).is_ok());
 }
 
-#[test]
-fn paid_deadline_options_reach_the_signed_job_configuration() {
+#[tokio::test]
+async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
     let identity = crate::identity::load_or_create(Some(&identity_path)).unwrap();
@@ -52,12 +52,23 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
         ),
     ] {
         let args = fetch_args(&extra).client;
+        let content = client::content(
+            &args,
+            &context,
+            hellas_sdk::client_chain::devnet(root.path())
+                .unwrap()
+                .chain
+                .network,
+        )
+        .await
+        .unwrap();
         let options = args
             .options_with_config(
                 &context,
                 20,
                 Assurance::ProducerSigned,
                 hellas_sdk::client_chain::devnet(root.path()).unwrap(),
+                content.clone(),
             )
             .unwrap();
         assert_eq!(
@@ -68,6 +79,7 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
             ),
             expected
         );
+        content.close().await;
     }
 }
 
@@ -288,8 +300,8 @@ fn fetch_runs_only_under_a_contract_the_buyer_names() {
     assert!(fetch_args(&["--contract", &missing]).contract().is_err());
 }
 
-#[test]
-fn helper_and_hand_written_folder_produce_identical_signed_input() {
+#[tokio::test]
+async fn helper_and_hand_written_folder_produce_identical_signed_input() {
     let args = fetch_args(&[]);
     let request = args.request().unwrap();
     let contract = hellas_rpc::FetchContract::http().unwrap();
@@ -335,7 +347,7 @@ assurance = "producer-signed"
         ),
     )
     .unwrap();
-    let raw = Job::load(root.path()).unwrap();
+    let raw = Job::load(root.path()).await.unwrap();
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     assert_eq!(raw.digest(), helper.digest());
     let runner = ProducerSigningKey::from_secret_bytes([0x22; 32])
@@ -452,8 +464,8 @@ fn output_claims_only_provider_signature_and_job_binding() {
     }
 }
 
-#[test]
-fn run_writes_one_call_job_that_transact_loads_unchanged() {
+#[tokio::test]
+async fn run_writes_one_call_job_that_transact_loads_unchanged() {
     use hellas_rpc::protocol::invocation::compute::*;
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("increment.hex");
@@ -493,10 +505,10 @@ fn run_writes_one_call_job_that_transact_loads_unchanged() {
         panic!("run");
     };
     assert!(args.client.timeout.is_none());
-    let job = args.job().unwrap();
+    let job = args.job().await.unwrap();
     let folder = root.path().join("job");
-    job.save(&folder).unwrap();
-    let loaded = Job::load(&folder).unwrap();
+    job.save(&folder).await.unwrap();
+    let loaded = Job::load(&folder).await.unwrap();
     assert_eq!(loaded.digest(), job.digest());
     let JobInput::Compute {
         plan,

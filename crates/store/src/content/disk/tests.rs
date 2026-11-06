@@ -653,6 +653,9 @@ async fn an_opener_cannot_adopt_the_temporary_root_scope_while_its_pin_is_commit
     let root = tempfile::tempdir().unwrap();
     let store = open(root.path()).await;
     let object = put(&store, "base", b"root").await;
+    // Claim ownership before deliberately occupying the connection: this test
+    // pauses pin commit, rather than the preceding durable ownership claim.
+    store.claim_work().await.unwrap();
     let disk = store.core.disk.as_ref().unwrap();
     let tx = disk.db.begin().await.unwrap();
     let generation = store.core.state.lock().unwrap().generation;
@@ -667,9 +670,13 @@ async fn an_opener_cannot_adopt_the_temporary_root_scope_while_its_pin_is_commit
             )
             .await
     });
-    while store.core.state.lock().unwrap().generation == generation {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while store.core.state.lock().unwrap().generation == generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let adopting = store.open_work(recovery_job(), vec![object], object.bytes());
     tokio::pin!(adopting);
     assert!(adopting.as_mut().now_or_never().is_none());
@@ -762,4 +769,130 @@ async fn acquired_pin_deletion_can_retry_after_sql_failure_even_when_work_has_en
         );
         assert_eq!(store.stats().unwrap().outstanding, 0);
     }
+}
+
+#[tokio::test]
+async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    put(&store, "ordinary", b"ordinary owner content").await;
+    store.close().await;
+    drop(store);
+    let store = DiskStore::open_owner(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    let scope = store
+        .open_work(
+            JobId {
+                channel: Digest::hash(b"channel"),
+                id: Digest::hash(b"work"),
+            },
+            vec![],
+            0,
+        )
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_owned")
+        .fetch_one(&store.core.disk.as_ref().unwrap().db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    store.end_work(&scope).await.unwrap();
+    let page = store
+        .pins(&Scope::Owner, "", Cursor::default())
+        .await
+        .unwrap();
+    for (name, value) in page.pins {
+        store
+            .set_pin(&Scope::Owner, &name, Some(&value), None)
+            .await
+            .unwrap();
+    }
+    assert!(store.collect(&Scope::Owner).await.unwrap().bytes > 0);
+    assert_eq!(store.stats().unwrap().used, 0);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    store.close().await;
+    drop(store);
+    // Refusal must precede startup cleanup, even when an owner removed every
+    // lifecycle pin and only the monotone database fact identifies ownership.
+    let incomplete = root.path().join("staging/incomplete");
+    fs::write(&incomplete, b"do not clean a work-owned upper").unwrap();
+    let result = DiskStore::open_owner(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::WorkOwned)));
+    assert_eq!(
+        fs::read(&incomplete).unwrap(),
+        b"do not clean a work-owned upper"
+    );
+    let daemon = open(root.path()).await;
+    daemon.claim_work().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_owned")
+        .fetch_one(&daemon.core.disk.as_ref().unwrap().db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    daemon.close().await;
+}
+
+#[tokio::test]
+async fn a_failed_ownership_commit_cannot_open_a_work_scope_or_reserve_content() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(root.path()).await;
+    sqlx::raw_sql("CREATE TRIGGER refuse_work_owned BEFORE INSERT ON work_owned BEGIN SELECT RAISE(FAIL, 'ownership write refused'); END;")
+        .execute(&store.core.disk.as_ref().unwrap().db).await.unwrap();
+    let job = JobId {
+        channel: Digest::hash(b"channel"),
+        id: Digest::hash(b"work"),
+    };
+    assert!(
+        store
+            .open_work(job, vec![ContentRef::for_bytes(b"not written")], 100)
+            .await
+            .is_err()
+    );
+    assert!(store.core.live_jobs().unwrap().is_empty());
+    assert_eq!(store.stats().unwrap().used, 0);
+    assert_eq!(store.stats().unwrap().outstanding, 0);
+    assert!(
+        store
+            .pins(&Scope::Owner, "", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .is_empty()
+    );
+    assert!(
+        !store
+            .core
+            .disk
+            .as_ref()
+            .unwrap()
+            .work_owned
+            .load(Ordering::Acquire)
+    );
+    store.close().await;
+    drop(store);
+    let ordinary = DiskStore::open_owner(
+        root.path().into(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+    )
+    .await
+    .unwrap();
+    ordinary.close().await;
 }

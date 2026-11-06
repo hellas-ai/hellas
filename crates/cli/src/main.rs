@@ -9,6 +9,7 @@ use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 mod compute;
+mod content_configuration;
 
 mod commands;
 mod identity;
@@ -596,21 +597,26 @@ async fn async_main() {
         grant_config_file,
         audio_model,
         await_owner,
+        native,
         ..
     } = &cli.command
     {
-        let result = if let Some(model) = audio_model {
+        let result = async {
+            anyhow::ensure!(fetch_config_file.is_some() || grant_config_file.is_some() || audio_model.is_some() || native.content_config.is_some(), "--check-config requires --content-config, --fetch-config, --grant-config or --audio-model");
+            if let Some(model) = audio_model {
+            commands::serve::audio_model::precheck(native.content_config.as_deref(), model)?;
             commands::serve::audio_model::configure(
                 model,
                 await_owner.as_deref().unwrap_or(Path::new(".")),
             )
-            .map(|_| ())
-        } else {
+            .await?;
+            }
             commands::serve::validate_provider_config(
                 fetch_config_file.as_deref(),
                 grant_config_file.as_deref(),
+                native.content_config.as_deref(),
             )
-        };
+        }.await;
         tracer_provider.shutdown();
         if let Err(error) = result {
             eprintln!("error: {error:#}");
@@ -886,10 +892,14 @@ async fn async_main() {
                                     .as_ref()
                                     .context("--audio-model requires --await-owner")?,
                             )?;
-                            native
-                                .content_paths
-                                .push(model.join(hellas_client::model::whisper::WEIGHTS_FILE));
-                            Some(commands::serve::audio_model::configure(model, &root)?)
+                            commands::serve::audio_model::precheck(
+                                native.content_config.as_deref(),
+                                model,
+                            )?;
+                            let (grants, weights) =
+                                commands::serve::audio_model::configure(model, &root).await?;
+                            native.audio_content = Some((std::path::absolute(model)?, weights));
+                            Some(grants)
                         } else {
                             None
                         };
@@ -1020,6 +1030,7 @@ async fn async_main() {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
             };
+            let mut local_content = None;
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
                 let offer = commands::contributions::load_offer(&client, name)?;
@@ -1048,17 +1059,17 @@ async fn async_main() {
                     assurance == hellas_rpc::Assurance::ProducerSigned,
                     "local Work requires producer-signed assurance"
                 );
-                Some(
-                    commands::grant_gateway::local::prepare(
-                        grant,
-                        native,
-                        &local_identity,
-                        commands::contributions::require_principal(passkey)?,
-                        work_application()?,
-                        remote_trust.load()?,
-                    )
-                    .await?,
+                let (source, reload) = commands::grant_gateway::local::prepare(
+                    grant,
+                    native,
+                    &local_identity,
+                    commands::contributions::require_principal(passkey)?,
+                    work_application()?,
+                    remote_trust.load()?,
                 )
+                .await?;
+                local_content = Some(reload);
+                Some(source)
             } else {
                 None
             };
@@ -1153,6 +1164,7 @@ async fn async_main() {
             if let Some((address, bundle)) = metrics {
                 metrics::spawn_metrics_server(address, bundle).await?;
             }
+            let mut paid_content = None;
             let gateway = if let Some(pool) = pool_options {
                 let endpoint = hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
                 let transports = (0..pool.channels.len())
@@ -1174,7 +1186,19 @@ async fn async_main() {
                     serve.http.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                     "token-native paid work uses producer-signed assurance"
                 );
-                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                let content = hellas_store::content::DiskStore::open(
+                    path.with_extension("content"),
+                    vec![],
+                    hellas_store::content::IndexMode::Resume,
+                    None,
+                    hellas_store::content::Reservations::ram(
+                        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                    ),
+                )
+                .await?;
+                let options =
+                    hellas_sdk::paid_gateway::load_pool_options(path, assurance, &content)?;
+                paid_content = Some(content);
                 let passkey = owner.clone().ok_or_else(|| {
                     anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
                 })?;
@@ -1201,6 +1225,14 @@ async fn async_main() {
             let served = hellas_gateway::wait_for_shutdown(gateway)
                 .await
                 .map_err(anyhow::Error::from);
+            if let Some(content) = paid_content {
+                content.close().await;
+            }
+            let served = if let Some(content) = local_content {
+                served.and(content.shutdown().await)
+            } else {
+                served
+            };
             match control {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,

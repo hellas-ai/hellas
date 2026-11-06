@@ -272,7 +272,8 @@ impl ClientArgs {
         self.paid_provider()?;
         let root = self.root(context);
         let config = client::config(self, &root).await?;
-        self.options_with_config(context, price, assurance, config)
+        let content = client::content(self, context, config.chain.network).await?;
+        self.options_with_config(context, price, assurance, config, content)
     }
 
     fn options_with_config(
@@ -281,6 +282,7 @@ impl ClientArgs {
         price: u64,
         assurance: Assurance,
         config: hellas_sdk::work_config::WorkConfig,
+        content: hellas_store::content::DiskStore,
     ) -> super::CliResult<PaidWorkOptions> {
         let provider = self.paid_provider()?;
         let root = self.root(context);
@@ -296,6 +298,7 @@ impl ClientArgs {
             _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
         Ok(PaidWorkOptions {
+            content,
             journal_root: self.journals(&root)?,
             config,
             provider: provider.address,
@@ -470,16 +473,21 @@ async fn purchase_and_execute(
         "paid execution requires a positive job payment; select --offer for grant work"
     );
     let options = args.options(context, job.price(), job.assurance()).await?;
+    let content = options.content.clone();
     let mut purchase = args.purchase(context, job, &options).await?;
     let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
     let result = execute(args, context, job, options, endpoint.clone(), &mut purchase).await;
     endpoint.close().await;
+    content.close().await;
     Ok((purchase, result?))
 }
 
 pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     // Load every input before network activity or an owner approval.
-    let job = args.job.as_deref().map(Job::load).transpose()?;
+    let job = match args.job.as_deref() {
+        Some(path) => Some(Job::load(path).await?),
+        None => None,
+    };
     bounded(args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
         if args.grant.offer.is_some() {
@@ -511,6 +519,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 .client
                 .options(&context, args.payment, args.assurance())
                 .await?;
+            let content = options.content.clone();
             let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
             let result = async {
                 let quote = request_paid_quote(
@@ -564,7 +573,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                         .join("jobs")
                         .join(job.digest().to_string())
                 });
-                job.save(&directory)?;
+                job.save(&directory).await?;
                 eprintln!("job: {}", directory.display());
                 let mut purchase = args.client.purchase(&context, &job, &options).await?;
                 let result = execute(
@@ -590,6 +599,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             }
             .await;
             endpoint.close().await;
+            content.close().await;
             result
         },
         |timeout| {

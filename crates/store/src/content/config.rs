@@ -375,6 +375,17 @@ impl Config {
         )
         .await
     }
+    pub async fn open_owner(&self, ram: Reservations) -> Result<DiskStore> {
+        self.validate()?;
+        DiskStore::open_owner(
+            self.upper()?,
+            self.lower.clone(),
+            self.index,
+            self.capacity.map(|bytes| bytes.0),
+            ram,
+        )
+        .await
+    }
 }
 
 /// One node's serialized reconciler. An application owns its cleanup even if

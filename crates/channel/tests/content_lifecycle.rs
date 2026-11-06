@@ -1258,3 +1258,52 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
         node.close().await;
     }
 }
+
+#[tokio::test]
+async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
+    let root = tempfile::tempdir().unwrap();
+    let upper = root.path().join("content");
+    let node = DiskStore::open_owner(
+        upper.clone(),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+    )
+    .await
+    .unwrap();
+    let channel = ChannelStore::open(
+        root.path(),
+        fixture::ready().channel().clone(),
+        fixture::settlement(),
+        Role::Provider,
+        fixture::origin(),
+        node.clone(),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(node.stats().unwrap().used, 0);
+    assert_eq!(node.stats().unwrap().outstanding, 0);
+    assert!(
+        node.pins(&Scope::Owner, "", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .is_empty()
+    );
+    drop(channel);
+    node.close().await;
+    drop(node);
+    assert!(matches!(
+        DiskStore::open_owner(
+            upper,
+            vec![],
+            IndexMode::Resume,
+            None,
+            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES)
+        )
+        .await,
+        Err(Error::WorkOwned)
+    ));
+}
