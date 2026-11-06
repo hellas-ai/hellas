@@ -252,6 +252,9 @@ impl ProviderEndpoint {
                 return Err(Error::Denied);
             }
         } else {
+            if self.state().close_prepared().is_some() || self.state().close_opened().is_some() {
+                return Err(Error::Denied);
+            }
             let ready = self.admitting().map_err(|_| Error::Denied)?;
             crate::job::check_authorization(
                 ready.channel(),

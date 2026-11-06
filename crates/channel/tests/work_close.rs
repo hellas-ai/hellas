@@ -747,6 +747,12 @@ struct Watcher {
     _provider_root: tempfile::TempDir,
 }
 
+async fn close_content(service: &WorkService) {
+    use hellas_channel::work_close::CloseChannel as _;
+    let mut driver = service.drive().unwrap();
+    driver.store().await.unwrap().content_store().close().await;
+}
+
 async fn restarted(fixture: Checked) -> Watcher {
     let Checked {
         client_root,
@@ -756,6 +762,7 @@ async fn restarted(fixture: Checked) -> Watcher {
         client,
         ..
     } = fixture;
+    close_content(&service).await;
     drop(service);
     drop(client);
     let store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
@@ -3409,6 +3416,7 @@ async fn close_only_restart(fixture: Checked, height: u64) -> CloseWatcher {
         client,
         ..
     } = fixture;
+    close_content(&service).await;
     drop(service);
     drop(client);
     let store = close_only_store(provider_root.path(), height).await;

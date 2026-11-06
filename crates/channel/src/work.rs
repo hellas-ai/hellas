@@ -2749,7 +2749,9 @@ impl WorkService {
     /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::prepare_close`] raises otherwise.
     pub async fn prepare_close(&self) -> Result<PaymentCloseStart, CloseError> {
-        self.endpoint().await?.prepare_close().await
+        let result = self.endpoint().await?.prepare_close().await;
+        self.changed.notify_waiters();
+        result
     }
 
     /// Builds the close that ends this endpoint's contest, from one
