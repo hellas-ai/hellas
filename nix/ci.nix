@@ -1,5 +1,6 @@
 {
   bufLintCommand,
+  clippyArgs,
   denyCommand,
   cargoDeps,
   pkgs,
@@ -99,10 +100,7 @@ let
       mkCargo "check-cargo-sources" "cargo metadata --locked --format-version 1 > /dev/null"
         [ rustToolchain ];
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
-    clippy =
-      mkCargo "check-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames"
-        (cargoEnv rustToolchain);
+    clippy = mkCargo "check-clippy" "cargo clippy ${clippyArgs}" (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.
     clippy-features = mkCargo "check-clippy-features" (builtins.concatStringsSep " && " (

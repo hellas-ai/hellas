@@ -9,8 +9,15 @@
   };
 
   inputs = {
+    # Downstream repositories share these pins instead of keeping their own:
+    #   inputs.nixpkgs.follows = "hellas/nixpkgs";
+    #   inputs.rust-overlay.follows = "hellas/rust-overlay";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    crane.url = "github:ipetkov/crane";
     # Public, pinned HIP 7.15+ ROCm package set.
     nix-strix-halo = {
       url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
@@ -23,6 +30,8 @@
       nixpkgs,
       rust-overlay,
       nix-strix-halo,
+      # crane is used through self.inputs in nix/package.nix.
+      ...
     }:
     let
       systems = [
@@ -46,12 +55,20 @@
       );
     in
     {
+      # Flake plumbing shared with downstream repositories.
+      lib = { inherit systems forAllSystems; };
+
       packages = forAllSystems (system: perSystem.${system}.packages);
       apps = forAllSystems (system: perSystem.${system}.apps);
       devShells = forAllSystems (system: perSystem.${system}.devShells);
       checks = forAllSystems (system: perSystem.${system}.checks);
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
+      # The `hellas` Hydra jobset builds these from master only. They are the
+      # compiled dependencies, which GitHub-hosted checks substitute from
+      # cache.hellas.ai; the checks themselves run on GitHub. A PR that changes
+      # dependencies or the toolchain builds its own until it merges.
+      hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
       # Selected explicitly by the component's Hydra jobset, never by PR CI.
       releaseJobs =
         builtins.mapAttrs

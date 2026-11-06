@@ -33,26 +33,11 @@ use quote::{format_ident, quote};
 mod edge_index_codegen;
 
 fn main() {
-    emit_git_rev();
+    // GIT_REV is read with `option_env!` (see src/lib.rs); Cargo tracks that
+    // read itself. Do not query git here: worktrees and Nix sources have no
+    // `.git` directory, and a missing rerun-if-changed path reruns this
+    // script, and so recompiles every dependent crate, on each build.
     regenerate();
-}
-
-fn emit_git_rev() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let rev = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&manifest_dir)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    if let Some(rev) = rev {
-        println!("cargo:rustc-env=GIT_REV={rev}");
-    } else if let Ok(rev) = std::env::var("GIT_REV") {
-        println!("cargo:rustc-env=GIT_REV={rev}");
-    }
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs");
 }
 
 // =============================================================================
