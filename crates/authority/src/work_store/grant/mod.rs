@@ -3,6 +3,7 @@ mod administration;
 mod admission;
 pub use admission::{AdmissionRecord, ExecutionRecord};
 mod catalogue;
+mod checkpoint;
 mod client;
 mod codec;
 mod delivery;
