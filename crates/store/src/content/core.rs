@@ -54,7 +54,6 @@ pub(crate) struct State {
     tree_reads: std::sync::atomic::AtomicU64,
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
     pub(crate) pins: BTreeMap<PinName, PinValue>,
-    pub(crate) declarations: BTreeMap<PinName, Digest>,
     acquired: AcquiredOwners,
     pub(crate) on_miss: Arc<dyn OnMiss>,
     work: BTreeMap<ReservationId, Work>,
@@ -86,7 +85,6 @@ impl Core {
                 tree_reads: std::sync::atomic::AtomicU64::new(0),
                 objects: BTreeMap::new(),
                 pins: BTreeMap::new(),
-                declarations: BTreeMap::new(),
                 acquired: BTreeMap::new(),
                 on_miss: Arc::new(Refuse),
                 work: BTreeMap::new(),
@@ -722,7 +720,6 @@ impl State {
     }
     fn change_pin(&mut self, name: PinName, value: Option<PinValue>) -> Result<()> {
         let generation = self.generation.checked_add(1).ok_or(Error::Capacity)?;
-        self.declarations.remove(&name);
         let old = match &value {
             Some(value) => self.pins.insert(name.clone(), value.clone()),
             None => self.pins.remove(&name),
@@ -1184,6 +1181,14 @@ impl Core {
         scope: &Scope,
         f: impl FnOnce(Core) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.effect_with_declaration(scope, None, f).await
+    }
+    pub(crate) async fn effect_with_declaration<T: Send + 'static>(
+        &self,
+        scope: &Scope,
+        declaration: Option<(PinName, Digest)>,
+        f: impl FnOnce(Core) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let core = self.clone();
         let scope = scope.clone();
         // The effect owns its serialization and database commit independently of
@@ -1198,7 +1203,6 @@ impl Core {
                     state.events.clone(),
                     state.event_bytes,
                     state.acquired.clone(),
-                    state.declarations.clone(),
                 )
             };
             let rollback = PinCommit {
@@ -1214,7 +1218,7 @@ impl Core {
                 let pending = {
                     let state = core.state.lock().unwrap();
                     let before = rollback.before.as_ref().unwrap();
-                    if state.generation == before.1 && state.declarations == before.5 {
+                    if state.generation == before.1 {
                         None
                     } else {
                         let mut changes: Vec<_> = state
@@ -1230,24 +1234,11 @@ impl Core {
                                 .filter(|name| !state.pins.contains_key(*name))
                                 .map(|name| (name.clone(), None)),
                         );
-                        let mut declarations: Vec<_> = state
-                            .declarations
-                            .iter()
-                            .filter(|(name, digest)| before.5.get(*name) != Some(*digest))
-                            .map(|(name, digest)| (name.clone(), Some(*digest)))
-                            .collect();
-                        declarations.extend(
-                            before
-                                .5
-                                .keys()
-                                .filter(|name| !state.declarations.contains_key(*name))
-                                .map(|name| (name.clone(), None)),
-                        );
-                        Some((state.generation, changes, declarations))
+                        Some((state.generation, changes))
                     }
                 };
-                if let Some((generation, changes, declarations)) = pending {
-                    disk.persist(generation, changes, declarations).await?;
+                if let Some((generation, changes)) = pending {
+                    disk.persist(generation, changes, declaration).await?;
                 }
             }
             rollback.before = None;
@@ -1281,7 +1272,6 @@ type PinSnapshot = (
     VecDeque<(PinEvent, Option<PinValue>, usize)>,
     usize,
     AcquiredOwners,
-    BTreeMap<PinName, Digest>,
 );
 struct PinCommit {
     core: Core,
@@ -1290,16 +1280,13 @@ struct PinCommit {
 }
 impl Drop for PinCommit {
     fn drop(&mut self) {
-        if let Some((pins, generation, events, event_bytes, acquired, declarations)) =
-            self.before.take()
-        {
+        if let Some((pins, generation, events, event_bytes, acquired)) = self.before.take() {
             let mut state = self.core.state.lock().unwrap();
             state.pins = pins;
             state.generation = generation;
             state.events = events;
             state.event_bytes = event_bytes;
             state.acquired = acquired;
-            state.declarations = declarations;
         }
     }
 }
@@ -1394,6 +1381,27 @@ impl Core {
 }
 
 impl Core {
+    pub(crate) async fn declaration_applied(&self, name: PinName, digest: Digest) -> Result<bool> {
+        let gate = self.effect_gate(&Scope::Owner).await?;
+        if !self
+            .disk
+            .as_ref()
+            .ok_or(Error::Denied)?
+            .declaration_matches(&name, digest)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.run(move |core| {
+            let _gate = gate;
+            let target = core.state()?.pins.get(&name).map(|pin| pin.target);
+            match target {
+                Some(target) => core.target_present(target),
+                None => Ok(false),
+            }
+        })
+        .await
+    }
     pub(crate) fn target_present(&self, target: Target) -> Result<bool> {
         let state = self.state()?;
         let objects = match state.walk([target]) {

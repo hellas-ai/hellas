@@ -198,9 +198,7 @@ impl Disk {
     pub(crate) fn ready(&self) -> bool {
         self.recovered.load(Ordering::Acquire)
     }
-    pub(crate) async fn pins(
-        &self,
-    ) -> Result<(u64, BTreeMap<PinName, PinValue>, BTreeMap<PinName, Digest>)> {
+    pub(crate) async fn pins(&self) -> Result<(u64, BTreeMap<PinName, PinValue>)> {
         let generation: Vec<u8> = sqlx::query_scalar("SELECT generation FROM head WHERE id=1")
             .fetch_one(&self.db)
             .await
@@ -222,33 +220,29 @@ impl Disk {
                 .map_err(|_| Error::Invalid("stored pin"))?;
             pins.insert(PinName::new(name)?, super::wire::value_from(value)?);
         }
-        let mut declarations = BTreeMap::new();
-        for row in sqlx::query("SELECT name,digest FROM declarations")
-            .fetch_all(&self.db)
+        Ok((generation, pins))
+    }
+    pub(crate) async fn declaration_matches(&self, name: &PinName, digest: Digest) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM declarations WHERE name=? AND digest=?)")
+            .bind(name.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .fetch_one(&self.db)
             .await
-            .map_err(database)?
-        {
-            let name: String = row.try_get(0).map_err(database)?;
-            let digest: Vec<u8> = row.try_get(1).map_err(database)?;
-            declarations.insert(
-                PinName::new(name)?,
-                Digest::from_bytes(
-                    digest
-                        .try_into()
-                        .map_err(|_| Error::Invalid("stored declaration digest"))?,
-                ),
-            );
-        }
-        Ok((generation, pins, declarations))
+            .map_err(database)
     }
     pub(crate) async fn persist(
         &self,
         generation: u64,
         changes: Vec<(PinName, Option<PinValue>)>,
-        declarations: Vec<(PinName, Option<Digest>)>,
+        declaration: Option<(PinName, Digest)>,
     ) -> Result<()> {
         let mut tx = self.db.begin().await.map_err(database)?;
         for (name, value) in changes {
+            sqlx::query("DELETE FROM declarations WHERE name=?")
+                .bind(name.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(database)?;
             if let Some(value) = value {
                 sqlx::query("INSERT INTO pins(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
                     .bind(name.as_str())
@@ -264,16 +258,8 @@ impl Disk {
                     .map_err(database)?;
             }
         }
-        for (name, digest) in declarations {
-            if let Some(digest) = digest {
-                sqlx::query("INSERT INTO declarations(name,digest) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest").bind(name.as_str()).bind(digest.as_bytes().as_slice()).execute(&mut *tx).await.map_err(database)?;
-            } else {
-                sqlx::query("DELETE FROM declarations WHERE name=?")
-                    .bind(name.as_str())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(database)?;
-            }
+        if let Some((name, digest)) = declaration {
+            sqlx::query("INSERT INTO declarations(name,digest) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest").bind(name.as_str()).bind(digest.as_bytes().as_slice()).execute(&mut *tx).await.map_err(database)?;
         }
         sqlx::query("UPDATE head SET generation=? WHERE id=1")
             .bind(generation.to_be_bytes().as_slice())
@@ -778,7 +764,7 @@ impl DiskStore {
         let disk = Disk::open(upper, capacity, ram.clone(), owner_only, durability).await?;
         let opened = async {
             let core = Core::new(ram);
-            let (generation, pins, declarations) = disk.pins().await?;
+            let (generation, pins) = disk.pins().await?;
             let scanning = disk.clone();
             let objects = tokio::task::spawn_blocking(move || {
                 let objects = scanning.scan(&lower, mode)?;
@@ -794,7 +780,6 @@ impl DiskStore {
                 let mut state = core.state.lock().unwrap();
                 state.objects = objects;
                 state.pins = pins;
-                state.declarations = declarations;
                 state.generation = generation;
             }
             let mut core = core;

@@ -352,26 +352,7 @@ impl Reconciler {
                     &serde_ipld_dagcbor::to_vec(declaration)
                         .map_err(|_| Error::Invalid("canonical declaration"))?,
                 );
-                let checking = name.clone();
-                if store
-                    .core
-                    .access(&Scope::Owner, move |core| {
-                        let target = {
-                            let state = core
-                                .state
-                                .lock()
-                                .map_err(|_| Error::Invalid("store lock"))?;
-                            (state.declarations.get(&checking) == Some(&digest))
-                                .then(|| state.pins.get(&checking).map(|pin| pin.target))
-                                .flatten()
-                        };
-                        match target {
-                            Some(target) => core.target_present(target),
-                            None => Ok(false),
-                        }
-                    })
-                    .await?
-                {
+                if store.core.declaration_applied(name.clone(), digest).await? {
                     continue;
                 }
                 let target = expected.map(|object| match &source {
@@ -433,15 +414,18 @@ impl Reconciler {
                     let name = name.clone();
                     store
                         .core
-                        .effect(&Scope::Owner, move |core| {
-                            core.set_pin_sync(&Scope::Owner, &name, previous.as_ref(), Some(next))?;
-                            core.state
-                                .lock()
-                                .map_err(|_| Error::Invalid("store lock"))?
-                                .declarations
-                                .insert(name, digest);
-                            Ok(())
-                        })
+                        .effect_with_declaration(
+                            &Scope::Owner,
+                            Some((name.clone(), digest)),
+                            move |core| {
+                                core.set_pin_sync(
+                                    &Scope::Owner,
+                                    &name,
+                                    previous.as_ref(),
+                                    Some(next),
+                                )
+                            },
+                        )
                         .await?;
                     Ok(())
                 }
