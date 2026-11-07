@@ -165,37 +165,6 @@ fn request(fields: &[(&str, &[u8])]) -> Request {
         .unwrap()
 }
 #[tokio::test]
-async fn multipart_wav_returns_json_or_text_through_compute() {
-    let fake = Arc::new(Fake::default());
-    let app = app(&["tiny"], fake.clone()).await;
-    let wav = wav(48000, 480);
-    for format in ["json", "text"] {
-        let response = app
-            .clone()
-            .oneshot(request(&[
-                ("file", &wav),
-                ("model", b"tiny"),
-                ("language", b"en"),
-                ("response_format", format.as_bytes()),
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        if format == "json" {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-                serde_json::json!({"text":"hi there"})
-            );
-        } else {
-            assert_eq!(&bytes[..], b"hi there");
-        }
-    }
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
-}
-#[tokio::test]
 async fn transcriptions_carry_provenance_through_archive_in_both_formats() {
     use base64::Engine as _;
     use hellas_rpc::provenance::{
@@ -232,6 +201,7 @@ async fn transcriptions_carry_provenance_through_archive_in_both_formats() {
                 .oneshot(request(&[
                     ("model", b"tiny"),
                     ("file", &wav(16000, 160)),
+                    ("language", b"en"),
                     ("response_format", format.as_bytes()),
                 ]))
                 .await
@@ -372,13 +342,7 @@ async fn malformed_audio_and_unsupported_options_never_reach_work() {
     let app = app(&["tiny"], fake.clone()).await;
     let wav = wav(16000, 400);
     for fields in [
-        vec![("model", &b"tiny"[..])],
         vec![("model", &b"tiny"[..]), ("file", &b"not wav"[..])],
-        vec![
-            ("model", &b"tiny"[..]),
-            ("file", &wav[..]),
-            ("response_format", &b"srt"[..]),
-        ],
         vec![
             ("model", &b"tiny"[..]),
             ("file", &wav[..]),
