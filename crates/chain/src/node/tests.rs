@@ -1074,9 +1074,10 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         // the full node's directory. Feed a committee certificate without
         // starting a second consensus network inside this storage-role test.
         tokio::task::spawn_blocking(move || {
-            let _lock = pipeline::lock(&config.storage_dir()).unwrap();
+            let _lock = pipeline::lock(&config.chain().node()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(config.storage_dir().into_path_buf()),
+                runtime::Config::new()
+                    .with_storage_directory(config.chain().node().into_path_buf()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
@@ -1286,10 +1287,10 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
         requested.requested.notified().await;
-        assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
+        assert!(crate::execution::pipeline::lock(&config.chain().node()).is_err());
         starting.abort();
         let _ = starting.await;
-        let lock = hellas_private::open_lock_beside(&config.storage_dir().join("node")).unwrap();
+        let lock = hellas_private::open_lock_beside(&config.chain().node().join("node")).unwrap();
         tokio::task::spawn_blocking(move || lock.lock().unwrap())
             .await
             .unwrap();
@@ -1480,7 +1481,7 @@ fn one_home_keeps_each_chains_state_across_a_switch_and_back() {
 
         // A different genesis under the same home gets its own, empty state.
         let b = Fixture::new_in(runtime.child("b"), home.path(), domain::TEST_NETWORK, 6000).await;
-        assert_ne!(a.config.storage_dir(), b.config.storage_dir());
+        assert_ne!(a.config.chain().node(), b.config.chain().node());
         let node = FullNode::start(b.config.clone()).await.unwrap();
         assert_eq!(node.status().executed_height(), 0);
         assert!(apply(&node, second.clone()).await.is_err());

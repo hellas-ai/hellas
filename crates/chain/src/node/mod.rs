@@ -37,7 +37,6 @@ pub(crate) use transport::serve_validator_archive;
 #[derive(Clone, Debug)]
 pub struct Config {
     chain: crate::chain_dir::ChainDir,
-    indexed: bool,
     /// Validator transaction ingress URLs; replication uses ChainSync peers.
     pub validators: Vec<String>,
     /// Additional untrusted sources discovered or configured by the host.
@@ -52,6 +51,17 @@ pub(crate) enum Indexing {
     On {
         partition: String,
     },
+}
+
+impl Indexing {
+    /// An indexed node keeps its execution store apart from a plain node's.
+    fn storage(&self, chain: &crate::chain_dir::ChainDir) -> hellas_private::StoreLocation {
+        match self {
+            Self::Off => chain.node(),
+            #[cfg(feature = "indexer-api")]
+            Self::On { .. } => chain.indexer(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,7 +98,7 @@ impl Config {
         chain
             .static_threshold_identity()
             .map_err(|error| Error::Config(error.to_string()))?;
-        Ok(Self::from_profile(chain, peers, archive_blocks, false))
+        Ok(Self::from_profile(chain, peers, archive_blocks))
     }
 
     #[cfg(feature = "indexer-api")]
@@ -97,30 +107,20 @@ impl Config {
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
-        Ok(Self::from_profile(chain, peers, archive_blocks, true))
+        Ok(Self::from_profile(chain, peers, archive_blocks))
     }
 
     fn from_profile(
         chain: crate::chain_dir::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
-        indexed: bool,
     ) -> Self {
         let validators = chain.validators().to_vec();
         Self {
             chain,
-            indexed,
             validators,
             peers,
             archive_blocks,
-        }
-    }
-
-    pub fn storage_dir(&self) -> hellas_private::StoreLocation {
-        if self.indexed {
-            self.chain.indexer()
-        } else {
-            self.chain.node()
         }
     }
 
@@ -431,7 +431,7 @@ impl Core {
         use commonware_glue::stateful::SyncPlan;
         use commonware_resolver::opaque;
         use commonware_utils::NZUsize;
-        let storage_dir = config.storage_dir();
+        let storage_dir = indexing.storage(&config.chain);
         let lock = crate::execution::pipeline::lock(&storage_dir).map_err(storage)?;
         let info = config.info()?;
         let chain_config = ArchiveConfig::default();

@@ -294,7 +294,7 @@ impl Harness {
     }
 
     fn index_path(&self) -> std::path::PathBuf {
-        let mut paths = std::fs::read_dir(self.node.config().storage_dir())
+        let mut paths = std::fs::read_dir(self.node.config().chain().indexer())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "redb"));

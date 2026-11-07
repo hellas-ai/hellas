@@ -57,7 +57,7 @@ impl FullNode {
         let thread = std::thread::Builder::new()
             .name("hellas-chain".into())
             .spawn(move || {
-                let runtime = runtime::Config::new().with_storage_directory(config.storage_dir().into_path_buf());
+                let runtime = runtime::Config::new().with_storage_directory(indexing.storage(&config.chain).into_path_buf());
                 runtime::Runner::new(runtime).start(move |context| async move {
                     let mut serving = tokio::task::JoinSet::new();
                     let opened = async {
