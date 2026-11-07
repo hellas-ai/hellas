@@ -1,5 +1,6 @@
 use super::*;
-use crate::test_support::{accept, proposal, setup};
+use crate::model::grant::budget::Usage;
+use crate::test_support::{accept, dispatch, finish, principal, proposal, setup};
 use hellas_auth::assert_err;
 
 impl NodeStore {
@@ -79,4 +80,104 @@ async fn old_checkpoint_cannot_bypass_the_journal_format_boundary() {
             .await,
         Err(NodeStoreError::Malformed)
     ));
+}
+
+/// Commits no longer serialize the whole state. The running bound that
+/// replaces it must never under-count, and replay from any crash point between
+/// appends or around a rotation must reach exactly the live state.
+#[tokio::test]
+async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, caller) = setup(directory.path()).await;
+    // Lift the fixture's quotas; concurrency stays bounded.
+    let grant = store.state().grant(GrantId([1; 16])).unwrap();
+    let mut budget = store.state().ledger().definition(grant.budget).unwrap();
+    budget.revision = budget.revision.next().unwrap();
+    budget.limits.clear();
+    budget.max_in_flight = std::num::NonZeroU16::new(8).unwrap();
+    let machine = Change::Machine {
+        limits: vec![],
+        concurrent: 8,
+    };
+    for change in [machine, Change::Budget(budget)] {
+        store.commit(UnixMillis(1000), change, true).await.unwrap();
+    }
+    let (mut seed, mut now) = (0x9e37_79b9_7f4a_7c15_u64, 1000);
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    // (channel, work, dispatched)
+    let mut open: Vec<(ChannelId, Digest, bool)> = Vec::new();
+    for nonce in 1..=400 {
+        let step = next(8);
+        match step {
+            0 | 1 => {
+                let (mut a, _, input) = proposal(&store, nonce);
+                // Deadlines follow the clock so terminals are pruned as it advances.
+                a.acceptance_deadline_ms = UnixMillis(now + 1000);
+                a.terminal_deadline_ms = UnixMillis(now + 3000);
+                a.delivery_deadline_ms = UnixMillis(now + 4000);
+                let work = grant_work_id(store.state().network(), &a);
+                let signature = principal(1).1.sign_digest(work).unwrap();
+                match accept(&mut store, &caller, (a, signature, &input), now).await {
+                    Ok(_) => open.push((a.channel_id, work, false)),
+                    Err(NodeStoreError::Ledger(ledger::LedgerError::Concurrent(_))) => {}
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+            2 | 3 if !open.is_empty() => {
+                let index = next(open.len() as u64) as usize;
+                let job = &mut open[index];
+                if !job.2 {
+                    dispatch(&mut store, &caller, (job.0, job.1), now)
+                        .await
+                        .unwrap();
+                    job.2 = true;
+                }
+            }
+            4 | 5 if !open.is_empty() => {
+                let index = next(open.len() as u64) as usize;
+                let (channel, work, dispatched) = open.remove(index);
+                if !dispatched {
+                    store.release(channel, work, UnixMillis(now)).await.unwrap();
+                } else {
+                    let (outcome, usage) = if next(2) == 0 {
+                        let usage = Usage::Observed(Charge([1, 0, 2, 0, 0]));
+                        (GrantOutcome::Failed, usage)
+                    } else {
+                        (GrantOutcome::Indeterminate, Usage::Unknown)
+                    };
+                    let job = (channel, work);
+                    finish(&mut store, job, outcome, usage, false, now)
+                        .await
+                        .unwrap();
+                }
+            }
+            6 => {
+                now += next(400);
+                store.tick(UnixMillis(now)).await.unwrap();
+            }
+            7 => store.rotate().await.unwrap(),
+            _ => {}
+        }
+        let cost = encode(&store.state.snapshot().unwrap()).unwrap().len()
+            + store.state.ledger.clock_headroom();
+        assert!(
+            cost <= store.checkpoint_bound,
+            "{cost} > {}",
+            store.checkpoint_bound
+        );
+        if step == 7 || next(16) == 0 {
+            let live = store.state.clone();
+            drop(store);
+            let network = hellas_channel::test_support::network();
+            store = NodeStore::open_initialized(directory.path(), network)
+                .await
+                .unwrap();
+            assert_eq!(store.state, live);
+        }
+    }
 }
