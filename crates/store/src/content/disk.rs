@@ -58,6 +58,26 @@ pub(crate) struct FileObject {
     staged: Mutex<Option<(tempfile::NamedTempFile, Arc<Reservation>)>>,
     private: Mutex<Option<PathBuf>>,
 }
+#[derive(thiserror::Error)]
+#[error("backing chunk changed")]
+pub(crate) struct BadBacking {
+    pub file: Arc<FileObject>,
+    pub entry: Entry,
+    pub binding: Option<(Core, Scope)>,
+}
+impl std::fmt::Debug for BadBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.entry.fmt(f)
+    }
+}
+impl BadBacking {
+    pub fn from_error(error: &Error) -> Option<Arc<Self>> {
+        let Error::Io(error) = error else {
+            return None;
+        };
+        error.get_ref()?.downcast_ref::<Arc<Self>>().cloned()
+    }
+}
 fn database(error: sqlx::Error) -> Error {
     let code = error
         .as_database_error()
@@ -402,7 +422,7 @@ impl FileObject {
     pub(crate) fn open(&self) -> Result<crate::VerifiedFile> {
         self.open_location().map(|(file, _)| file)
     }
-    fn open_location(&self) -> Result<(crate::VerifiedFile, Entry)> {
+    pub(crate) fn open_location(&self) -> Result<(crate::VerifiedFile, Entry)> {
         let upper = self
             .disk
             .root
@@ -466,7 +486,7 @@ impl FileObject {
         chunks: &[hellas_xet::Chunk],
         range: std::ops::Range<u64>,
     ) -> Result<std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Bytes>> + Send>>> {
-        let (file, _) = self.open_location()?;
+        let (file, entry) = self.open_location()?;
         let file = file.into_file();
         let mut selected = Vec::new();
         let mut offset = 0;
@@ -482,7 +502,14 @@ impl FileObject {
             offset = end;
         }
         let ram = self.disk.ram.clone();
-        let backing = self.clone();
+        let backing = Arc::new(BadBacking {
+            file: self.clone(),
+            entry: Entry {
+                chunks: Vec::new(),
+                ..entry
+            },
+            binding: None,
+        });
         Ok(Box::pin(futures::stream::try_unfold(
             (file, selected.into_iter(), ram, range, descriptors, backing),
             |(mut file, mut chunks, ram, range, descriptors, backing)| async move {
@@ -495,10 +522,15 @@ impl FileObject {
                     let _reader = reader;
                     file.seek(std::io::SeekFrom::Start(offset))?;
                     let mut bytes = vec![0; chunk.data_len as usize];
-                    if file.read_exact(&mut bytes).is_err()
-                        || hellas_xet::chunk(&bytes).as_slice() != [chunk]
-                    {
-                        return Err(Error::Invalid("backing chunk changed"));
+                    let changed = match file.read_exact(&mut bytes) {
+                        Ok(()) => hellas_xet::chunk(&bytes).as_slice() != [chunk],
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => true,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if changed {
+                        return Err(
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, _reader).into(),
+                        );
                     }
                     Ok::<_, Error>((file, charged(Bytes::from(bytes), charge)))
                 })
@@ -521,21 +553,29 @@ impl FileObject {
         let (file, entry) = self.open_location()?;
         self.load_opened(file, entry, charge)
     }
-    fn invalidate(&self, entry: &Entry) -> Result<()> {
+    pub(crate) fn invalidate(&self, entry: &Entry) -> Result<()> {
+        // Revoke the proven-bad identity even if its former name was replaced.
+        self.disk.records.forget(entry.identity);
         let upper = entry.path.parent() == Some(self.disk.root.join("objects").as_path());
-        let refreshed = if upper {
+        let same = if upper {
+            match fs::metadata(&entry.path) {
+                Ok(metadata) => FileIdentity::of(&metadata) == entry.identity,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            false
+        };
+        let refreshed = if same {
             self.verify_upper(&entry.path)?
         } else {
             None
         };
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|other| {
-            other.path != entry.path || (!upper && other.identity != entry.identity)
-        });
+        entries.retain(|other| other.path != entry.path || other.identity != entry.identity);
         if let Some(refreshed) = refreshed {
             entries.push(refreshed);
         }
-        self.disk.records.forget(entry.identity);
         self.disk
             .records
             .save(&self.disk.root.join("fastresume.bin"))?;

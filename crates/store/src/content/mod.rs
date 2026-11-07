@@ -28,6 +28,7 @@ use hellas_auth::{
 use hellas_rpc::ContentRef;
 use hellas_xet::Chunk;
 
+pub(crate) use disk::BadBacking;
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
 pub use memory::MemoryStore;

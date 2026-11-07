@@ -83,6 +83,7 @@ pub struct VerifiedFile {
     file: std::fs::File,
     id: XetHash,
     len: u64,
+    backing: Option<Box<content::BadBacking>>,
 }
 
 impl VerifiedFile {
@@ -202,6 +203,7 @@ fn verify_opened_indexed_file(
         file,
         id,
         len: actual,
+        backing: None,
     }))
 }
 

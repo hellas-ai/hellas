@@ -765,7 +765,7 @@ impl Core {
                 };
                 {
                     let gate = store.effect_gate(&scope).await?;
-                    let damaged = {
+                    {
                         let state = store.state()?;
                         state.check(&scope)?;
                         if state
@@ -775,24 +775,15 @@ impl Core {
                         {
                             return Err(Error::Denied);
                         }
-                        if bytes.is_err() {
-                            state.objects.get(&object.id()).cloned()
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(stored) = damaged {
-                        // Keep current-state repair and its authority guard owned through IO.
+                    }
+                    let damaged = bytes.as_ref().err().and_then(BadBacking::from_error);
+                    if let Some(backing) = damaged {
+                        let checking = scope.clone();
+                        // Keep repair and its authority guard owned through IO.
                         store
-                            .run(move |_| {
+                            .run(move |core| {
                                 let _gate = gate;
-                                if let super::storage::Data::File(file) = &stored.data {
-                                    match file.open() {
-                                        Ok(_) | Err(Error::Missing) => {}
-                                        Err(error) => return Err(error),
-                                    }
-                                }
-                                Ok(())
+                                core.repair_backing(&checking, &backing)
                             })
                             .await?;
                     }
@@ -1579,6 +1570,14 @@ impl Core {
             None => Ok(BTreeSet::new()),
         }
     }
+    pub(crate) fn repair_backing(&self, scope: &Scope, backing: &BadBacking) -> Result<()> {
+        // Recheck through current state before retiring the failed entry: any
+        // replacement verification uses its own FileObject and quota accounting.
+        match self.verified(scope, backing.file.object, None, true) {
+            Ok(_) | Err(Error::Missing) => backing.file.invalidate(&backing.entry),
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) fn verified(
         &self,
         scope: &Scope,
@@ -1603,7 +1602,7 @@ impl Core {
                     .get(reservation)
                     .and_then(|work| work.staged.get(&object.id()))
             {
-                let reader = super::local::reader(&stored.data, object)?;
+                let reader = super::local::reader(&stored.data, object, self, scope)?;
                 state.touch(stored);
                 return Ok(Some(reader));
             }
@@ -1615,7 +1614,7 @@ impl Core {
             None => state.verified_present(scope, object)?,
         };
         if readable && let Some(stored) = state.objects.get(&object.id()) {
-            let reader = super::local::reader(&stored.data, object)?;
+            let reader = super::local::reader(&stored.data, object, self, scope)?;
             state.touch(stored);
             return Ok(Some(reader));
         }
@@ -1631,7 +1630,7 @@ impl Core {
                 None => lower.verified_present(scope, object)?,
             };
             if readable && let Some(stored) = lower.objects.get(&object.id()) {
-                let reader = super::local::reader(&stored.data, object)?;
+                let reader = super::local::reader(&stored.data, object, self, scope)?;
                 lower.touch(stored);
                 return Ok(Some(reader));
             }

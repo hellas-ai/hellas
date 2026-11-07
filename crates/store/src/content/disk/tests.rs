@@ -1089,3 +1089,109 @@ async fn corrupt_upper_is_removed_without_losing_pins_and_can_be_uploaded_again(
         store.close().await;
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_reads_retire_only_the_bad_backing_and_preserve_replacements() {
+    for local in [false, true] {
+        for replacement in ["none", "healthy", "corrupt"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = open(root.path()).await;
+            let bytes = b"verified owned bytes";
+            let object = put(&store, "kept", bytes).await;
+            let lower = root.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            fs::write(lower.join("healthy"), bytes).unwrap();
+            store
+                .rescan(vec![lower.clone()], IndexMode::Resume)
+                .await
+                .unwrap();
+            let path = root.path().join("objects").join(object.id().to_string());
+            fs::write(&path, vec![0xff; bytes.len()]).unwrap();
+            let stored = store.core.state.lock().unwrap().objects[&object.id()].clone();
+            let Data::File(file) = &stored.data else {
+                unreachable!()
+            };
+            let metadata = fs::metadata(&path).unwrap();
+            // Inject a stale resume record for the current identity: this models
+            // bit rot whose metadata still matches the previously verified bytes.
+            file.entries
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .identity = FileIdentity::of(&metadata);
+            file.disk.records.put(
+                &metadata,
+                &Indexed {
+                    id: object.id().digest(),
+                    len: object.bytes(),
+                    chunks: hellas_xet::chunk(bytes),
+                },
+            );
+            let reader = LocalStore::Disk(store.clone())
+                .open_verified(&Scope::Owner, object, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut stream = store
+                .read(&Scope::Owner, &at("kept"), 0..object.bytes())
+                .await
+                .unwrap();
+            if replacement != "none" {
+                let previous = store
+                    .pins(&Scope::Owner, "kept", Cursor::default())
+                    .await
+                    .unwrap()
+                    .pins[0]
+                    .1
+                    .clone();
+                store
+                    .set_pin(&Scope::Owner, &pin("kept").name, Some(&previous), None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store.collect(&Scope::Owner).await.unwrap().bytes,
+                    object.bytes()
+                );
+                assert_eq!(put(&store, "kept", bytes).await, object);
+                if replacement == "corrupt" {
+                    fs::write(&path, vec![0xfe; bytes.len()]).unwrap();
+                }
+            }
+            if local {
+                assert!(reader.read_all(object, &store.ram_pool()).await.is_err());
+            } else {
+                assert!(stream.bytes.next().await.unwrap().is_err());
+            }
+            drop(stream);
+            assert_eq!(path.exists(), replacement == "healthy");
+            assert_eq!(
+                store.stats().unwrap().used,
+                if replacement == "healthy" {
+                    object.bytes()
+                } else {
+                    0
+                }
+            );
+            let mut read = store
+                .read(&Scope::Owner, &at("kept"), 0..object.bytes())
+                .await
+                .unwrap();
+            assert_eq!(read.bytes.next().await.unwrap().unwrap().as_ref(), bytes);
+            assert_eq!(
+                store
+                    .pins(&Scope::Owner, "kept", Cursor::default())
+                    .await
+                    .unwrap()
+                    .pins[0]
+                    .1
+                    .target
+                    .object(),
+                object
+            );
+            store.close().await;
+        }
+    }
+}

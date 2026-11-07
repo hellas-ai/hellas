@@ -22,20 +22,44 @@ impl VerifiedReader {
                 }
                 Ok(bytes)
             }
-            Self::File(reader) => {
+            Self::File(mut reader) => {
+                if reader.id() != object.id().digest() || reader.len() != object.bytes() {
+                    return Err(Error::Invalid("reader content reference"));
+                }
+                let backing = reader.backing.take();
                 let charge = pool.reserve(object.bytes())?;
-                tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     let mut reader = reader.into_file();
+                    reader.rewind()?;
                     let mut bytes =
                         vec![0; usize::try_from(object.bytes()).map_err(|_| Error::Capacity)?];
-                    reader.read_exact(&mut bytes)?;
+                    if let Err(error) = reader.read_exact(&mut bytes) {
+                        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                            return Err(Error::Invalid("application content changed"));
+                        }
+                        return Err(error.into());
+                    }
                     if reader.read(&mut [0])? != 0 || ContentRef::for_bytes(&bytes) != object {
                         return Err(Error::Invalid("application content changed"));
                     }
                     Ok(super::storage::charged(bytes.into(), charge))
                 })
                 .await
-                .map_err(|_| Error::Invalid("application content reader"))?
+                .map_err(|_| Error::Invalid("application content reader"))?;
+                if matches!(&result, Err(Error::Invalid("application content changed")))
+                    && let Some(backing) = backing
+                {
+                    let (core, scope) = backing
+                        .binding
+                        .clone()
+                        .ok_or(Error::Invalid("reader binding"))?;
+                    core.access(&scope.clone(), move |core| {
+                        core.check(&scope)?;
+                        core.repair_backing(&scope, &backing)
+                    })
+                    .await?;
+                }
+                result
             }
         }
     }
@@ -56,13 +80,29 @@ impl Seek for VerifiedReader {
         }
     }
 }
-pub(crate) fn reader(data: &Data, object: ContentRef) -> Result<VerifiedReader> {
+pub(crate) fn reader(
+    data: &Data,
+    object: ContentRef,
+    core: &Core,
+    scope: &Scope,
+) -> Result<VerifiedReader> {
     if data.len() != object.bytes() {
         return Err(Error::Invalid("content length contract"));
     }
     Ok(match data {
         Data::Ram(bytes) => VerifiedReader::Memory(Cursor::new(bytes.clone())),
-        Data::File(file) => VerifiedReader::File(file.open()?),
+        Data::File(file) => {
+            let (mut reader, entry) = file.open_location()?;
+            reader.backing = Some(Box::new(BadBacking {
+                file: file.clone(),
+                entry: crate::Entry {
+                    chunks: Vec::new(),
+                    ..entry
+                },
+                binding: Some((core.clone(), scope.clone())),
+            }));
+            VerifiedReader::File(reader)
+        }
     })
 }
 #[derive(Clone)]
