@@ -20,6 +20,10 @@ use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
 use std::time::Duration;
 
+// A hang guard, not a speed requirement: these waits observe events that must
+// happen, and a loaded builder (one Hydra run took 949 s) can be slow.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
 struct Fixture {
     committee: ConsensusFixture,
     database: UtxoDatabase<runtime::Context>,
@@ -259,7 +263,7 @@ fn recovery_finds_the_first_committed_block_before_its_archive_acknowledgment() 
         let block = fixture.next().await;
         let input = input::FinalizedInput::new(archive.clone(), Arc::default(), trust);
         input.accept(&block).await.unwrap();
-        let acknowledgment = tokio::time::timeout(Duration::from_secs(10), async {
+        let acknowledgment = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let update = receive.recv().await.expect("archive remained open");
                 if matches!(update, Update::Block(..)) {
@@ -348,12 +352,12 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
         let a = FullNode::start(config).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), a.wait_ready())
+        tokio::time::timeout(HANG_GUARD, a.wait_ready())
             .await
             .unwrap()
             .unwrap();
         apply(&seed, block2.clone()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while a.status().executed_height() != 2 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -368,7 +372,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
         let b = FullNode::start(config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), b.wait_ready())
+        let view = tokio::time::timeout(HANG_GUARD, b.wait_ready())
             .await
             .unwrap()
             .unwrap();
@@ -382,7 +386,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         assert_eq!(coins.coins[0].1, 5000);
         assert_eq!(coins.snapshot.payload, block2.snapshot.payload);
         let mut progress = b.finalized();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while *progress.borrow_and_update() < 2 {
                 progress.changed().await.unwrap();
             }
@@ -396,7 +400,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         assert!(!archived(&b, 1).await);
         let local = b.view().unwrap().client();
         let historical = tokio::time::timeout(
-            Duration::from_secs(15),
+            HANG_GUARD,
             local.get_finalized_block(FinalizedBlockQuery::Height(1)),
         )
         .await
@@ -495,7 +499,7 @@ fn pruned_archive_restarts_with_live_owner_state() {
             apply(&node, last.clone()).await.unwrap();
         }
         // Marshal's pruning request is processed asynchronously.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while archived(&node, 1).await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -686,7 +690,7 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
             let node = FullNode::start(fixture.config.clone()).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::time::timeout(HANG_GUARD, async {
                 while node.peer_ids().contains(&endpoint.id()) {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -836,7 +840,7 @@ fn validator_archive_seeds_execution_over_iroh() {
             .await
             .unwrap();
         let node = FullNode::start(fixture.config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), node.wait_ready())
+        let view = tokio::time::timeout(HANG_GUARD, node.wait_ready())
             .await
             .unwrap()
             .unwrap();
@@ -858,7 +862,7 @@ fn validator_archive_seeds_execution_over_iroh() {
 // its published read view; they never execute or finalize the consumer database.
 async fn apply(node: &FullNode, incoming: FinalizedBlock) -> Result<(), Error> {
     node.accept_finalized(&incoming).await?;
-    tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
+    tokio::time::timeout(HANG_GUARD, node.wait_ready())
         .await
         .expect("node execution is bounded")?;
     Ok(())
@@ -897,7 +901,7 @@ fn current_state_root_and_operation_sync_target_survive_node_restart() {
         node.accept_finalized(&finalized).await.unwrap();
         // Acceptance queues the block; the published watch marks executed state.
         let mut executed = node.finalized();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             executed
                 .wait_for(|height| *height >= block.height().get())
                 .await
@@ -957,12 +961,12 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
         let starting = tokio::spawn(FullNode::start(config));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
+        tokio::time::timeout(HANG_GUARD, requested.requested.notified())
             .await
             .unwrap();
         let block = fixture.next().await;
         apply(&seed, block.clone()).await.unwrap();
-        let node = tokio::time::timeout(Duration::from_secs(30), starting)
+        let node = tokio::time::timeout(HANG_GUARD, starting)
             .await
             .unwrap()
             .unwrap()
@@ -1129,7 +1133,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let database = mailbox.subscribe_databases().await;
                 // Database attachment precedes replay of blocks whose execution
                 // was committed before shutdown but not yet acknowledged.
-                let restored = tokio::time::timeout(Duration::from_secs(10), async {
+                let restored = tokio::time::timeout(HANG_GUARD, async {
                     loop {
                         let height = pipeline::restore(
                             &indexer,
@@ -1176,7 +1180,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                             .certificate,
                     ),
                 );
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(HANG_GUARD, async {
                     while owner.cursor().height < 2 {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
@@ -1198,7 +1202,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         .unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.accept_finalized(&second).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
+        let view = tokio::time::timeout(HANG_GUARD, node.wait_ready())
             .await
             .unwrap()
             .unwrap();
@@ -1265,13 +1269,13 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         .unwrap();
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
+        tokio::time::timeout(HANG_GUARD, requested.requested.notified())
             .await
             .unwrap();
         assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
         starting.abort();
         let _ = starting.await;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while crate::execution::pipeline::lock(&config.storage_dir()).is_err() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1279,7 +1283,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         .await
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
-        let node = tokio::time::timeout(Duration::from_secs(20), FullNode::start(config))
+        let node = tokio::time::timeout(HANG_GUARD, FullNode::start(config))
             .await
             .unwrap()
             .unwrap();
