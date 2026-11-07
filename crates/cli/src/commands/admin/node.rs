@@ -121,68 +121,94 @@ pub async fn run(
         "a remote profile cannot use --control-socket"
     );
     if let Some(node) = remote {
-        // The application identity is proved inside the authenticated session.
-        // A stable endpoint key permits explicit remote ingress admission; use
-        // local control to administer a node using this same transport identity.
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(identity.transport_key.clone())
-            .bind()
-            .await?;
-        let result = async {
-            let address = iroh::EndpointAddr::from_parts(
-                node,
-                args.addresses.into_iter().map(iroh::TransportAddr::Ip),
-            );
-            let connection = tokio::time::timeout(
-                super::CONTROL_CONNECT_TIMEOUT,
-                endpoint.connect(
-                    address,
-                    hellas_rpc::services::host_control::HostControl::ALPN.as_bytes(),
-                ),
-            )
-            .await??;
-            let (client, challenge) =
-                node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
-                    .await?;
-            command(
-                args.command,
-                client,
-                profile.authorization,
-                challenge.generation,
-            )
-            .await
-        }
-        .await;
-        endpoint.close().await;
-        result
-    } else {
-        let (tls, server_name) = profile
-            .local
-            .context("profile requires local server trust")?;
-        let socket = match args.control_socket {
-            Some(path) => path,
-            None => data_root(&principal(passkey.context(
-                "the default control socket is the principal's; pass --passkey or --control-socket",
-            )?)?)?
-            .join("control.sock"),
-        };
-        let (client, challenge) = node_control::connect_local(
-            &socket,
-            tls,
-            server_name,
-            profile.authority,
-            &profile.credential,
-            key,
-        )
-        .await?;
-        command(
+        let (endpoint, client, challenge) =
+            connect_remote(identity, node, args.addresses, &profile, key).await?;
+        let result = command(
             args.command,
             client,
             profile.authorization,
             challenge.generation,
         )
-        .await
+        .await;
+        endpoint.close().await;
+        result
+    } else {
+        let authorization = profile.authorization;
+        let (client, challenge) = connect_local(profile, args.control_socket, passkey, key).await?;
+        command(args.command, client, authorization, challenge.generation).await
     }
+}
+
+pub(in crate::commands) async fn connect_remote(
+    identity: &LocalIdentity,
+    node: iroh::EndpointId,
+    addresses: Vec<std::net::SocketAddr>,
+    profile: &profile::ClientProfile,
+    key: SessionKey<'_>,
+) -> Result<(
+    iroh::Endpoint,
+    HostControlClientImpl<hellas_wire::iroh::IrohTransport>,
+    hellas_auth::authority::SessionChallenge,
+)> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(identity.transport_key.clone())
+        .bind()
+        .await?;
+    let result = async {
+        let address = iroh::EndpointAddr::from_parts(
+            node,
+            addresses.into_iter().map(iroh::TransportAddr::Ip),
+        );
+        let connection = tokio::time::timeout(
+            super::CONTROL_CONNECT_TIMEOUT,
+            endpoint.connect(
+                address,
+                hellas_rpc::services::host_control::HostControl::ALPN.as_bytes(),
+            ),
+        )
+        .await??;
+        Ok::<_, anyhow::Error>(
+            node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
+                .await?,
+        )
+    }
+    .await;
+    match result {
+        Ok((client, challenge)) => Ok((endpoint, client, challenge)),
+        Err(error) => {
+            endpoint.close().await;
+            Err(error)
+        }
+    }
+}
+pub(in crate::commands) async fn connect_local(
+    profile: profile::ClientProfile,
+    socket: Option<std::path::PathBuf>,
+    passkey: Option<&dyn Authenticator>,
+    key: SessionKey<'_>,
+) -> Result<(
+    HostControlClientImpl<hellas_wire::mux::MuxTransport>,
+    hellas_auth::authority::SessionChallenge,
+)> {
+    let (tls, server) = profile
+        .local
+        .context("profile requires local daemon trust")?;
+    let socket = match socket {
+        Some(socket) => socket,
+        None => data_root(&principal(passkey.context(
+            "default control socket requires --passkey; otherwise use --control-socket",
+        )?)?)?
+        .join("control.sock"),
+    };
+    Ok(node_control::connect_local(
+        socket,
+        tls,
+        server,
+        profile.authority,
+        &profile.credential,
+        key,
+    )
+    .await?)
 }
 
 async fn command<T>(

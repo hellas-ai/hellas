@@ -5,9 +5,9 @@ use clap::{Args, Subcommand};
 use futures::StreamExt as _;
 use hellas_authority::{authenticator::Authenticator, node::SessionKey};
 use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
-use hellas_sdk::node_control::{self, profile::ClientProfile};
+use hellas_sdk::node_control::profile::ClientProfile;
 use hellas_store::content::{self, config::Reconciler, *};
-use hellas_wire::{ServiceMarker, StreamTransport};
+use hellas_wire::StreamTransport;
 use std::{future::Future, io::Write as _, net::SocketAddr, path::PathBuf};
 
 #[derive(Args)]
@@ -202,29 +202,10 @@ pub async fn run(
             args.control_socket.is_none(),
             "a paired remote profile cannot use --control-socket"
         );
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(identity.transport_key.clone())
-            .bind()
-            .await?;
-        let result = async {
-            let address = iroh::EndpointAddr::from_parts(
-                node,
-                args.addresses.into_iter().map(iroh::TransportAddr::Ip),
-            );
-            let connection = tokio::time::timeout(
-                crate::commands::admin::CONTROL_CONNECT_TIMEOUT,
-                endpoint.connect(
-                    address,
-                    hellas_rpc::services::host_control::HostControl::ALPN.as_bytes(),
-                ),
-            )
-            .await??;
-            let (client, _) =
-                node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
-                    .await?;
-            remote(client.transport().clone(), args.command).await
-        }
-        .await;
+        let (endpoint, client, _) =
+            crate::commands::admin::connect_remote(identity, node, args.addresses, &profile, key)
+                .await?;
+        let result = remote(client.transport().clone(), args.command).await;
         endpoint.close().await;
         result
     } else {
@@ -232,27 +213,9 @@ pub async fn run(
             args.addresses.is_empty(),
             "--address requires a profile paired with a remote node"
         );
-        let (tls, server) = profile
-            .local
-            .context("profile requires local daemon trust")?;
-        let socket = match args.control_socket {
-            Some(socket) => socket,
-            None => crate::commands::contributions::data_root(
-                &crate::commands::contributions::principal(passkey.context(
-                    "default control socket requires --passkey; otherwise use --control-socket",
-                )?)?,
-            )?
-            .join("control.sock"),
-        };
-        let (client, _) = node_control::connect_local(
-            socket,
-            tls,
-            server,
-            profile.authority,
-            &profile.credential,
-            key,
-        )
-        .await?;
+        let (client, _) =
+            crate::commands::admin::connect_local(profile, args.control_socket, passkey, key)
+                .await?;
         // A failed connection or authentication never falls back to local Owner.
         remote(client.transport().clone(), args.command).await
     }
