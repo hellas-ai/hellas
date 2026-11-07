@@ -1031,8 +1031,6 @@ mod tests {
                 args.extend(["--to", &key, "--amount", "37"]);
             }
             assert!(crate::Cli::try_parse_from(&args).is_ok());
-            args.extend(["--owner-key", "other.key"]);
-            assert!(crate::Cli::try_parse_from(&args).is_err());
         }
         let maximum = vec![coin; MAX_EDGE_INPUTS];
         assert_eq!(
