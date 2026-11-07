@@ -170,10 +170,10 @@ const ROOT_GRANT: GrantId = ids::ROOT_GRANT;
 const ALLOWANCE: GrantId = GrantId([7; 16]);
 
 #[derive(Default)]
-struct ResellerBuilder {
+struct ShareFixtureBuilder {
     upstream: UpstreamMode,
 }
-struct Reseller {
+struct ShareFixture {
     _root: tempfile::TempDir,
     upstream: TlsFixture,
     provider: ProviderHandle,
@@ -181,12 +181,12 @@ struct Reseller {
     administrator: CredentialSecret,
     application: Arc<hellas_sdk::node_control::profile::ClientProfile>,
 }
-impl ResellerBuilder {
+impl ShareFixtureBuilder {
     fn with_held_upstream(mut self, held: HeldUpstream) -> Self {
         self.upstream = UpstreamMode::Held(held);
         self
     }
-    async fn start(self) -> Reseller {
+    async fn start(self) -> ShareFixture {
         let root = tempfile::tempdir().unwrap();
         let provider_identity =
             NodeIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
@@ -385,7 +385,7 @@ impl ResellerBuilder {
             &secret,
         )
         .await;
-        Reseller {
+        ShareFixture {
             _root: root,
             upstream,
             provider,
@@ -395,7 +395,7 @@ impl ResellerBuilder {
         }
     }
 }
-impl Reseller {
+impl ShareFixture {
     fn request(&self) -> reqwest::RequestBuilder {
         reqwest::Client::new().post(format!("http://{}/v1/responses", self.gateway.address()))
             .bearer_auth(self.gateway.bearer())
@@ -420,8 +420,8 @@ impl Reseller {
 }
 
 #[tokio::test]
-async fn controlled_gateway_projects_the_reseller_tls_response() {
-    let fixture = ResellerBuilder::default().start().await;
+async fn controlled_gateway_projects_the_shared_tls_response() {
+    let fixture = ShareFixtureBuilder::default().start().await;
     let before = fixture.upstream.calls.load(Ordering::SeqCst);
     let response = tokio::time::timeout(HANG_GUARD, fixture.request().send())
         .await
@@ -438,7 +438,7 @@ async fn controlled_gateway_projects_the_reseller_tls_response() {
 #[tokio::test]
 async fn credential_revocation_closes_the_real_upstream_tls_body() {
     let held = HeldUpstream::default();
-    let fixture = ResellerBuilder::default()
+    let fixture = ShareFixtureBuilder::default()
         .with_held_upstream(held.clone())
         .start()
         .await;
@@ -531,7 +531,7 @@ async fn openai_host_refuses_an_empty_upstream_key() {
     );
 }
 #[tokio::test]
-async fn host_control_starts_the_openai_reseller_factory() {
+async fn host_control_starts_the_shared_openai_factory() {
     let fixture = OpenAiFixture::new();
     let location = StoreLocation::for_test(fixture.root.path());
     let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
