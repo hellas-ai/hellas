@@ -575,7 +575,8 @@ fn hip_unseen_program_and_kill_respawn() {
     assert_eq!(lease.pid(), Some(first), "spin ran on the warm worker");
     let error = spun.unwrap_err();
     drop(lease);
-    assert!(elapsed < Duration::from_secs(5), "cancel took {elapsed:?}");
+    // Cancellation, not the execution timeout, ended the endless spin.
+    assert!(elapsed < timeout, "cancel took {elapsed:?}");
     assert!(
         !std::path::Path::new(&format!("/proc/{first}")).exists(),
         "cancelled worker {first} survived"

@@ -10,6 +10,10 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 use hellas_store::{ContentStore, StoreError, Substituter};
 use hellas_xet::{XetHash, file_hash};
 
@@ -155,7 +159,7 @@ fn adoption_indexes_regular_files_and_nothing_else() {
         let _ = sender.send(walker.adopt(&blobs).map(|found| found.len()));
     });
     let adopted = receiver
-        .recv_timeout(std::time::Duration::from_secs(20))
+        .recv_timeout(HANG_GUARD)
         .expect("adoption blocked on something that is not a regular file")
         .expect("adopt");
 
@@ -197,7 +201,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
         let _ = sender.send(ContentStore::new().index(&fifo_link));
     });
     let error = receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("indexing blocked while opening a FIFO")
         .expect_err("a FIFO is not content");
     assert!(
@@ -212,7 +216,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
         let _ = sender.send(store.open_verified(indexed.id, indexed.len));
     });
     let error = receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("opening an indexed path blocked on its FIFO replacement")
         .expect_err("a FIFO replacement is not verified content");
     assert!(

@@ -1,5 +1,6 @@
 use super::*;
 use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, OwnerKind, run};
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::{Payout, Secp256k1Signer, SoftPasskey};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -132,16 +133,20 @@ fn owner_state_uses_the_consensus_digest() {
     assert_eq!(a.chain().as_path(), first.as_path());
     assert_eq!(b.chain().as_path(), second.as_path());
 }
+// Unbounded: `run` guards the whole fixture, and a per-phase deadline would
+// drop a seal mid-commit.
 async fn sealing<T>(devnet: &mut Devnet, work: impl Future<Output = T>) -> T {
-    tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(2), async {
-        tokio::pin!(work);
-        loop {
-            tokio::select! { output = &mut work => return output, () = tokio::time::sleep(Duration::from_millis(500)) => {} }
-            let seal = devnet.seal(); tokio::pin!(seal);
-            tokio::select! { output = &mut work => { seal.await; return output }, _ = &mut seal => {} }
-        }
-    }).await.unwrap()
+    tokio::pin!(work);
+    loop {
+        tokio::select! { output = &mut work => return output, () = tokio::time::sleep(Duration::from_millis(500)) => {} }
+        let seal = devnet.seal();
+        tokio::pin!(seal);
+        tokio::select! { output = &mut work => { seal.await; return output }, _ = &mut seal => {} }
+    }
 }
+// Funding waits for finality the test drives; how long that takes under load
+// is not the property, so the deadline is the hang guard, not RECOVERY_TIMEOUT.
+const FUNDING_DEADLINE: Duration = HANG_GUARD;
 #[test]
 fn durable_funding_retries_one_signature_and_reserves_other_providers() {
     run(|runtime| {
@@ -177,7 +182,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                         200,
                         FundingControls {
                             poll: Duration::from_millis(10),
-                            timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                            timeout: FUNDING_DEADLINE,
                             approval: Some(&Deny),
                             before_sign: None,
                         },
@@ -195,7 +200,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     200,
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -216,41 +221,34 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     200,
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     },
                 );
                 tokio::pin!(funding);
-                tokio::time::timeout(Duration::from_secs(10), async {
+                // The signed approval reaches durable storage before cancellation.
                 tokio::select! {
                     result = &mut funding => panic!("funding completed before a block was sealed: {result:?}"),
                     () = async { while owner.records().unwrap().is_empty() { tokio::task::yield_now().await; } } => {},
                 }
-            }).await.expect("the signed approval reaches durable storage before cancellation");
                 // Let the original signed intent reach the validator, then
                 // finalize it without polling the caller's response.
                 tokio::select! {
                     result = &mut funding => panic!("funding completed without finality: {result:?}"),
-                    () = tokio::time::sleep(Duration::from_millis(300)) => {},
+                    () = async { while !devnet.has_pending_transactions().await { tokio::task::yield_now().await; } } => {},
                 }
                 let (_, _, reshape) = owner.records().unwrap().remove(0);
                 let output =
                     Reshape::output_ids(devnet.network(), reshape.inputs(), reshape.outputs())
                         .as_slice()[0];
-                tokio::time::timeout(Duration::from_secs(20), devnet.seal())
+                devnet.seal().await;
+                let snapshot = devnet
+                    .validator_light_client(0)
+                    .get_objects(vec![coin_object_id(output)])
                     .await
-                    .expect("funding block finalized");
-                let snapshot = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    devnet
-                        .validator_light_client(0)
-                        .get_objects(vec![coin_object_id(output)]),
-                )
-                .await
-                .expect("funding proof returned")
-                .unwrap()
-                .unwrap();
+                    .unwrap()
+                    .unwrap();
                 assert!(
                     snapshot.objects.contains_key(&coin_object_id(output)),
                     "original funding was finalized before the response was lost"
@@ -274,7 +272,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     200,
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -304,7 +302,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     [7; 16],
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -322,7 +320,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     200,
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     }
@@ -333,7 +331,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     200,
                     FundingControls {
                         poll: Duration::from_millis(10),
-                        timeout: hellas_chain::node::RECOVERY_TIMEOUT,
+                        timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
                     }
@@ -351,14 +349,14 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                         provider(4),
                         200,
                         Duration::from_millis(10),
-                        hellas_chain::node::RECOVERY_TIMEOUT
+                        FUNDING_DEADLINE
                     ),
                     owner.fund(
                         &chain,
                         provider(5),
                         200,
                         Duration::from_millis(10),
-                        hellas_chain::node::RECOVERY_TIMEOUT
+                        FUNDING_DEADLINE
                     )
                 )
             })
@@ -438,7 +436,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                 provider(3),
                 300,
                 Duration::from_millis(10),
-                hellas_chain::node::RECOVERY_TIMEOUT,
+                FUNDING_DEADLINE,
             );
             tokio::pin!(funding);
             tokio::select! { result = &mut funding => panic!("approval was not held: {result:?}"), () = approval.entered.notified() => {} }
@@ -468,9 +466,10 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             devnet.seal().await;
             approval.pause.store(false, Ordering::SeqCst);
             approval.release.add_permits(1);
+            let funded = funding.await;
             assert!(
-                matches!(funding.await, Err(ClientOwnerError::InputsSpent)),
-                "missing inputs cannot imply successful funding"
+                matches!(funded, Err(ClientOwnerError::InputsSpent)),
+                "missing inputs cannot imply successful funding: {funded:?}"
             );
             assert!(
                 owner
@@ -486,7 +485,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                     provider(4),
                     100,
                     Duration::from_millis(10),
-                    hellas_chain::node::RECOVERY_TIMEOUT,
+                    FUNDING_DEADLINE,
                 ),
             )
             .await
@@ -509,7 +508,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                     provider(3),
                     100,
                     Duration::from_millis(10),
-                    hellas_chain::node::RECOVERY_TIMEOUT,
+                    FUNDING_DEADLINE,
                 ),
             )
             .await

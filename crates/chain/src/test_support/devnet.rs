@@ -723,6 +723,24 @@ impl Devnet {
         })
     }
 
+    /// Whether any validator's mempool holds a transaction no sealed block
+    /// has included yet: the event a test awaits instead of sleeping until
+    /// a submission has probably arrived.
+    pub async fn has_pending_transactions(&self) -> bool {
+        for validator in &self.validators {
+            for transaction in validator.mempool.test_transactions().await {
+                let digest =
+                    <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
+                        &commonware_codec::Encode::encode(&transaction),
+                    );
+                if !self.included.contains(&digest) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub async fn seal_through(&mut self, height: u64) {
         while self.height < height {
             self.seal().await;

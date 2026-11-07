@@ -66,8 +66,7 @@ use super::super::*;
 use iroh::SecretKey;
 use tokio::task::JoinHandle;
 
-// Bound hangs without making journal I/O and scheduling part of the assertion.
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+use hellas_channel::test_support::HANG_GUARD;
 
 fn assert_retryable_not_ready(refusal: WorkRefused) {
     assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
@@ -326,7 +325,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(TEST_TIMEOUT, first_entered.notified())
+    tokio::time::timeout(HANG_GUARD, first_entered.notified())
         .await
         .expect("the first handler starts");
 
@@ -339,7 +338,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(TEST_TIMEOUT, second_entered.notified())
+    tokio::time::timeout(HANG_GUARD, second_entered.notified())
         .await
         .expect("the second handler starts while the first is blocked");
     release_first.notify_one();
@@ -353,7 +352,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         .expect("the second RPC succeeds");
 
     connection.close(0_u32.into(), b"concurrency test complete");
-    tokio::time::timeout(TEST_TIMEOUT, serving)
+    tokio::time::timeout(HANG_GUARD, serving)
         .await
         .expect("the server observes connection close")
         .expect("the server task does not panic");
@@ -480,7 +479,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             chain: crate::test_support::chain_dir(dir.path(), network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -607,7 +606,7 @@ async fn discover_two_route_runner(
             chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         work_mount.clone(),
@@ -878,7 +877,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     let observing = tokio::spawn(async move { runner.tick(&observer_source).await });
     entered.acquire().await.unwrap().forget();
     let repeated = tokio::time::timeout(
-        TEST_TIMEOUT,
+        HANG_GUARD,
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()),
     )
     .await
@@ -905,7 +904,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
         prepared_input: first_request.prepared_input.clone(),
     };
     let response = tokio::time::timeout(
-        TEST_TIMEOUT,
+        HANG_GUARD,
         accept_mounted_route(&work_mount, first_route_peer(), expired),
     )
     .await
@@ -2314,7 +2313,7 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
             chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         mount.clone(),
@@ -2805,7 +2804,7 @@ impl RunningPaidNode {
                 chain: crate::test_support::chain_dir(root, network()),
 
                 poll: Duration::from_millis(1),
-                max_observation_age: TEST_TIMEOUT,
+                max_observation_age: HANG_GUARD,
                 settlement_key: provider(),
             },
             work_mount.clone(),
@@ -2945,7 +2944,7 @@ impl RunningPaidNode {
 
     async fn connect(&self, alpn: &[u8]) -> (IrohTransport, Connection) {
         let connecting = self.client.connect(self.target.clone(), alpn);
-        let connection = match tokio::time::timeout(TEST_TIMEOUT, connecting).await {
+        let connection = match tokio::time::timeout(HANG_GUARD, connecting).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => panic!("the advertised ALPN is dialable: {error}"),
             Err(_) => panic!("the advertised ALPN dial timed out"),
@@ -3073,7 +3072,7 @@ impl RunningPaidNode {
     /// Polls through the wire's retryable `NotReady` until the detached
     /// invocation has made its signed terminal durable.
     async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
-        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+        let delivered = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if let Some(delivered) = self.stream_result(work_id).await {
                     break delivered;
@@ -3114,7 +3113,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_mount(&self) {
-        let mounted = tokio::time::timeout(TEST_TIMEOUT, async {
+        let mounted = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if self
                     .work_mount
@@ -3139,7 +3138,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_cursor(&self, height: u64) {
-        let caught_up = tokio::time::timeout(TEST_TIMEOUT, async {
+        let caught_up = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let cursor = match self
                     .work_mount
@@ -3240,7 +3239,7 @@ async fn run_advertised_paid_exchange(
 
     // The observer must publish readiness before the first request. Request
     // handling itself has no validator connection and cannot refresh it.
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Some(service) = node
                 .work_mount
@@ -3575,7 +3574,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
 
         assert!(runner.tick(&chain).await, "the recovery read answers");
 
-        let finished = tokio::time::timeout(TEST_TIMEOUT, async {
+        let finished = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let phase = match mount
                     .service(
@@ -3667,7 +3666,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .handler(&context, request.route.as_ref())
             .unwrap()
             .expect("restarted channel is mounted");
-        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+        let delivered = tokio::time::timeout(HANG_GUARD, async {
             let mut stream = handler
                 .stream_result(request.clone(), context.clone())
                 .await
@@ -3700,7 +3699,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .expect("refusal is answered");
         let Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
             outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)),
-        })) = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+        })) = tokio::time::timeout(HANG_GUARD, stream.next())
             .await
             .expect("a finalized contest terminates delivery")
         else {
@@ -3758,7 +3757,7 @@ async fn open_result_stream_stops(shutdown: bool) {
         .stream_result(request, context.clone())
         .await
         .unwrap();
-    let first = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+    let first = tokio::time::timeout(HANG_GUARD, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -3790,7 +3789,7 @@ async fn open_result_stream_stops(shutdown: bool) {
         assert!(runner.tick(&chain).await);
     }
     backend.finish();
-    let next = tokio::time::timeout(TEST_TIMEOUT, &mut next)
+    let next = tokio::time::timeout(HANG_GUARD, &mut next)
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");
@@ -3842,7 +3841,7 @@ async fn the_clock_does_not_starve_the_request_path() {
     ) else {
         panic!("the channel is mounted before the chain is read")
     };
-    let answered = tokio::time::timeout(TEST_TIMEOUT, async move {
+    let answered = tokio::time::timeout(HANG_GUARD, async move {
         let context = TransportContext {
             open_exporter: Some([7; 32]),
             ..Default::default()
@@ -3876,7 +3875,7 @@ async fn the_clock_does_not_starve_the_request_path() {
         Ok(Err(error)) => panic!("the request path is reachable: {error}"),
         Err(_) => panic!("an inbound request waited on the clock's chain read"),
     }
-    let entered = tokio::time::timeout(TEST_TIMEOUT, backend.wait_for_call()).await;
+    let entered = tokio::time::timeout(HANG_GUARD, backend.wait_for_call()).await;
     assert!(
         entered.is_ok(),
         "the accepted job reaches its executor without joining the close clock",
@@ -4002,12 +4001,12 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
             .await
             .unwrap();
     });
-    tokio::time::timeout(TEST_TIMEOUT, entered.acquire())
+    tokio::time::timeout(HANG_GUARD, entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Some(service) = mount
                 .service(
@@ -4038,7 +4037,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
         .unwrap()
         .unwrap();
     stop.send(()).unwrap();
-    tokio::time::timeout(TEST_TIMEOUT, observing)
+    tokio::time::timeout(HANG_GUARD, observing)
         .await
         .expect("shutdown cancels the blocked read")
         .unwrap();
@@ -4510,7 +4509,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         response.outcome,
         Some(accept_work_response::Outcome::Accepted(_))
     ));
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !paid
             .with_state(|state| state.jobs().any(|job| job.phase() == JobPhase::Ready))
             .await
@@ -4551,7 +4550,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         response.response.outcome,
         Some(accept_work_response::Outcome::Accepted(_))
     ));
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         while admin.used(id, BudgetNode::Machine, Meter::Requests).await == 0 {
             tokio::task::yield_now().await;
         }

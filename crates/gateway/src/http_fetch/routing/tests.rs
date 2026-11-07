@@ -163,8 +163,9 @@ fn models_admission_and_cooldowns_do_not_move_existing_sessions() {
         HeaderValue::from_static("60"),
     )]);
     routing.observe(0, 429, &rate_limit);
+    let stale = Instant::now() - SESSION_IDLE / 2;
     for binding in routing.state.lock().unwrap().bindings.values_mut() {
-        binding.touched = Instant::now() - SESSION_IDLE / 2;
+        binding.touched = stale;
     }
     let pinned = select(&routing, "k3", "first").err().unwrap();
     assert!(
@@ -174,7 +175,7 @@ fn models_admission_and_cooldowns_do_not_move_existing_sessions() {
             .unwrap()
             .bindings
             .values()
-            .any(|b| b.backend == Some(0) && b.touched.elapsed() < Duration::from_secs(1)),
+            .any(|b| b.backend == Some(0) && b.touched > stale),
         "rate-limited retries still keep a session active"
     );
     assert_eq!(pinned.status, StatusCode::TOO_MANY_REQUESTS);

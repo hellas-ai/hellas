@@ -225,7 +225,7 @@ async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
     ready.wait().await;
     // Probe runtime progress while a refresh holds the file lock. Finishing
     // all sixteen reads and the durable token write is not a liveness clock.
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, started.notified())
         .await
         .expect("file-lock contention must not block Tokio workers");
     finish.add_permits(1);

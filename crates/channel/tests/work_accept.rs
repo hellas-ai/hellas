@@ -6,6 +6,7 @@
 //! transport, so the request is framed, routed by method id, decoded,
 //! and answered rather than handed to a function.
 
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_private::StoreLocation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -547,7 +548,7 @@ impl FinalizedBlocks for HeldChain {
 
 /// Waits until `count` reaches `wanted`, or gives up rather than hang.
 async fn reaches(count: &AtomicUsize, wanted: usize) {
-    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let waited = tokio::time::timeout(HANG_GUARD, async {
         while count.load(Ordering::SeqCst) < wanted {
             tokio::task::yield_now().await;
         }
@@ -583,11 +584,7 @@ async fn one_job_has_one_cursor_driver_while_a_drive_is_in_flight() {
     // the chain. Bounded, because the failure this is about is a second
     // driver that joins the drive instead of being turned away, and that
     // one would never return.
-    let second = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        service.catch_up_job(chain.as_ref(), id),
-    )
-    .await;
+    let second = tokio::time::timeout(HANG_GUARD, service.catch_up_job(chain.as_ref(), id)).await;
     let Ok(second) = second else {
         panic!("a second driver of one job is turned away, not admitted to the drive");
     };
@@ -649,7 +646,7 @@ async fn a_second_driver_naming_another_job_is_refused_and_reads_nothing() {
     reaches(&fetches, 1).await;
 
     let second = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        HANG_GUARD,
         service.catch_up_job(chain.as_ref(), Digest::from_bytes([0x56; 32])),
     )
     .await;
@@ -860,7 +857,7 @@ async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
         let service = service.clone();
         async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
     });
-    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
     let Ok(Ok(response)) = answered else {
         panic!("the request path does not queue behind the drive: {answered:?}");
     };
@@ -903,7 +900,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
         let service = service.clone();
         async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
     });
-    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
     let Ok(Ok(response)) = answered else {
         panic!("the request path does not queue behind the close drive: {answered:?}");
     };
@@ -2080,7 +2077,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
         .await
     });
     // No server is running yet, so the request must wait for its response.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while observer
             .with_state(|state| state.proposal_nonce_high_water())
             .await

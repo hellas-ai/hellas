@@ -2,6 +2,7 @@
 use fixture::serve_work as serve;
 use futures::StreamExt as _;
 use hellas_auth::Digest;
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_channel::{
     job,
     model::{
@@ -107,7 +108,7 @@ async fn collect(
         .await
         .unwrap();
     let mut frames = Vec::new();
-    while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+    while let Some(frame) = tokio::time::timeout(HANG_GUARD, stream.next())
         .await
         .unwrap()
     {
@@ -309,7 +310,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     );
     run_to_result(&service, &ready, id).await;
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), stream.next())
+        tokio::time::timeout(HANG_GUARD, stream.next())
             .await
             .unwrap()
             .unwrap()
@@ -797,7 +798,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client()).unwrap();
     let mut prefixes = 0;
     let prefix_seen = tokio::sync::Notify::new();
-    let (delivery, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (delivery, ()) = tokio::time::timeout(HANG_GUARD, async {
         tokio::join!(
             fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
                 assert!(

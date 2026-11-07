@@ -1700,19 +1700,16 @@ fn indexed_restart_replays_published_unacknowledged_checkpoint_before_backlog() 
         let mut h = Harness::new(runtime, Vec::new(), "published-before-ack").await;
         h.append(Vec::new()).await;
         let archive = h.node.publication().unwrap().archive;
-        ::tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while archive
-                .marshal
-                .get_processed_height()
-                .await
-                .map_or(0, |height| height.get())
-                < 1
-            {
-                ::tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // `run_qmdb` bounds a hang for the whole fixture.
+        while archive
+            .marshal
+            .get_processed_height()
+            .await
+            .map_or(0, |height| height.get())
+            < 1
+        {
+            ::tokio::task::yield_now().await;
+        }
         let mut acknowledged = Vec::new();
         let mut sync_metadata = Vec::new();
         h = h

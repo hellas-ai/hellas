@@ -1,5 +1,6 @@
 use super::*;
 use hellas_channel::model::work::PrivateRecord as _;
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_channel::test_support::channel::accept_uploaded_client;
 use hellas_channel::work::{Admitted, ClientEndpoint, JobProposal, fetch_result_stream};
 use hellas_private::StoreLocation;
@@ -83,7 +84,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
         let mut prefixes = 0;
         let prefix_seen = tokio::sync::Notify::new();
         let ready = fetch_ready();
-        let (delivery, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (delivery, ()) = tokio::time::timeout(HANG_GUARD, async {
             tokio::join!(
                 fetch_result_stream(transport.clone(), &mut client, &ready, id, |event| {
                     assert!(!worker.is_finished());
@@ -414,7 +415,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     });
     let mut received = 0;
     let delivered = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
+        HANG_GUARD,
         fetch_result_stream(transport.clone(), &mut client, &ready, id, |_| {
             received += 1;
             Ok(())
@@ -667,7 +668,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         )
         .await
         .unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+    let first = tokio::time::timeout(HANG_GUARD, frames.next())
         .await
         .expect("a restarted ephemeral result promptly refuses missing bodies")
         .unwrap()

@@ -1,5 +1,6 @@
 {
   bufLintCommand,
+  cargoLlvmCov,
   clippyArgs,
   denyCommand,
   cargoDeps,
@@ -91,8 +92,10 @@ let
           pkgs.shellcheck
         ];
     unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
+    # Tests wait on events and fail only on a documented hang guard, so they
+    # run with libtest's default parallelism rather than one at a time.
     regressions = mkCargo "check-regressions" ''
-      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api -- --test-threads=1
+      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api
     '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
@@ -226,7 +229,7 @@ let
         (cargoEnv rustToolchain);
     validator =
       mkCargo "check-validator"
-        "cargo test -p hellas-chain --no-default-features --features validator,integration-tests -- --test-threads=1"
+        "cargo test -p hellas-chain --no-default-features --features validator,integration-tests"
         (cargoEnv rustToolchain);
     # `check-validator` above runs tests, where `dead_code` is only a
     # warning, so the two feature sets a node actually ships in were the
@@ -265,12 +268,10 @@ let
     # `work-watcher` for the journal and the driver — and neither of the
     # two dimensions above runs a test with the other's code compiled
     # in. This is the only line that runs a paid channel being opened
-    # against real finalized blocks. Each paid scenario owns six validators and
-    # two full nodes; run the opted-in suite serially to avoid competing runtimes
-    # during its bounded readiness wait.
+    # against real finalized blocks.
     chain-setup =
       mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,indexer-api,integration-tests -- --test-threads=1"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,indexer-api,integration-tests"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
@@ -319,6 +320,31 @@ let
       cargoEnv rustToolchain
     );
   };
+
+  # Line coverage of the regression feature set, with a per-crate ratchet.
+  # Deliberately not a check: it is in neither `nix run .#check` nor any
+  # release validation, so it adds no time to either. Writes lcov.info,
+  # summary.json and summary.txt to $COVERAGE_DIR (default
+  # $CARGO_TARGET_DIR/coverage); pass --update to rewrite the floors.
+  coverage =
+    mkCargo "check-coverage"
+      ''
+        out="''${COVERAGE_DIR:-$CARGO_TARGET_DIR/coverage}"
+        mkdir -p "$out"
+        cargo llvm-cov nextest --locked --workspace --features integration-tests,hellas-chain/indexer-api --no-report
+        cargo llvm-cov report --lcov --output-path "$out/lcov.info"
+        cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
+        cargo llvm-cov report --summary-only | tee "$out/summary.txt"
+        python3 ${./coverage-ratchet.py} "$out/summary.json" nix/coverage-floor.json "$@"
+      ''
+      (
+        cargoEnv rustToolchain
+        ++ [
+          cargoLlvmCov
+          pkgs.cargo-nextest
+          pkgs.python3
+        ]
+      );
 
   checks =
     (
@@ -401,6 +427,7 @@ in
 {
   inherit
     checks
+    coverage
     fixes
     mergeChecks
     ;

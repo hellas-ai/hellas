@@ -484,7 +484,7 @@ pub mod ids {
 }
 mod node;
 pub use node::{
-    Allowance, Capacity, Node, Proposal, TestClock, TestNode, TestService, WAIT, authority,
+    Allowance, Capacity, HANG_GUARD, Node, Proposal, TestClock, TestNode, TestService, authority,
     provider_enrollment, within,
 };
 

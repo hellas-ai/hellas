@@ -75,7 +75,7 @@ fn known_chain_rejects_generated_validator_outside_genesis_before_state() {
         .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
     let mut child = OwnedChild(run.spawn().unwrap());
     let state = home.path().join(".hellas/chains");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + hellas_channel::test_support::HANG_GUARD;
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break Some(status);

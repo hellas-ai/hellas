@@ -275,7 +275,7 @@ async fn extending_expired_authority_does_not_revive_an_unpolled_response() {
             .await
             .unwrap();
         if !completed {
-            tokio::time::timeout(WAIT, backend.cancelled.notified())
+            tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                 .await
                 .expect("the expired execution cannot revive after extension");
             assert_eq!(backend.slots.available_permits(), 0);
@@ -342,7 +342,7 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
         .await
         .unwrap();
         let count = calls.load(Ordering::SeqCst);
-        let error = tokio::time::timeout(WAIT, waiting)
+        let error = tokio::time::timeout(HANG_GUARD, waiting)
             .await
             .unwrap()
             .unwrap()

@@ -5,6 +5,7 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_channel::test_support::channel::{client, network, provider};
 use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::InvocationPolicy;
@@ -2353,7 +2354,7 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
                 .await
         }
     });
-    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let waited = tokio::time::timeout(HANG_GUARD, async {
         while view.reached.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
@@ -2366,7 +2367,7 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
         let service = service.clone();
         async move { exchange(&service, Vec::new()).await }
     });
-    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
     let Ok(Ok(offered)) = answered else {
         panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
     };
@@ -2525,7 +2526,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
                 .await
         }
     });
-    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let waited = tokio::time::timeout(HANG_GUARD, async {
         while view.asked().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -2538,7 +2539,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
         let service = service.clone();
         async move { exchange(&service, countersigned(proposed()).encode()).await }
     });
-    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
+    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
     let Ok(Ok(offered)) = answered else {
         panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
     };

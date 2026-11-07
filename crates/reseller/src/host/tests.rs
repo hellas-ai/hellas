@@ -100,7 +100,7 @@ async fn tls_fixture(mode: UpstreamMode) -> TlsFixture {
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_der(ca.as_ref().der()).unwrap())
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(WAIT * 6)
+        .timeout(HANG_GUARD)
         .build()
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -160,8 +160,8 @@ use hellas_auth::authority::{CredentialSecret, GrantId, Revision};
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use {
     hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
-    hellas_authority::test_support::Node, hellas_authority::test_support::TestClock,
-    hellas_authority::test_support::WAIT, hellas_authority::test_support::authority,
+    hellas_authority::test_support::HANG_GUARD, hellas_authority::test_support::Node,
+    hellas_authority::test_support::TestClock, hellas_authority::test_support::authority,
     hellas_authority::test_support::ids, hellas_channel::test_support::Rights,
     hellas_channel::test_support::actors::FRIEND, hellas_channel::test_support::actors::PROVIDER,
     hellas_channel::test_support::actors::ROOT,
@@ -423,7 +423,7 @@ impl Reseller {
 async fn controlled_gateway_projects_the_reseller_tls_response() {
     let fixture = ResellerBuilder::default().start().await;
     let before = fixture.upstream.calls.load(Ordering::SeqCst);
-    let response = tokio::time::timeout(WAIT, fixture.request().send())
+    let response = tokio::time::timeout(HANG_GUARD, fixture.request().send())
         .await
         .unwrap()
         .unwrap();
@@ -443,14 +443,14 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
         .start()
         .await;
     let pending = tokio::spawn(fixture.request().send());
-    tokio::time::timeout(WAIT, held.started.notified())
+    tokio::time::timeout(HANG_GUARD, held.started.notified())
         .await
         .unwrap();
     fixture.revoke_application().await;
-    tokio::time::timeout(WAIT, held.dropped.notified())
+    tokio::time::timeout(HANG_GUARD, held.dropped.notified())
         .await
         .expect("revocation closes the upstream body");
-    let response = tokio::time::timeout(WAIT, pending)
+    let response = tokio::time::timeout(HANG_GUARD, pending)
         .await
         .unwrap()
         .unwrap()

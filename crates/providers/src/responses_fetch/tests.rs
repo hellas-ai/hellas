@@ -180,9 +180,12 @@ async fn an_unsuccessful_fetch_does_not_wait_for_an_error_body() {
         "/responses",
     )
     .await;
-    let result = tokio::time::timeout(Duration::from_secs(2), execute_test_request(endpoint))
-        .await
-        .expect("the response body must not be polled");
+    let result = tokio::time::timeout(
+        crate::test_support::HANG_GUARD,
+        execute_test_request(endpoint),
+    )
+    .await
+    .expect("the response body must not be polled");
     let Err(error) = result else {
         panic!("HTTP error unexpectedly passed");
     };

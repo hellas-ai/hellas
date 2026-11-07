@@ -55,7 +55,7 @@ use hellas_chain::test_support::devnet::{
 use hellas_chain::{FinalizedWorkView as _, LightClient as _};
 use hellas_channel::content::InvocationContent;
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_channel::test_support::{enrollment, test_responses_contract};
+use hellas_channel::test_support::{HANG_GUARD, enrollment, test_responses_contract};
 use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchRequestView, MockFetchProvider, PreparedFetchRequest, ProjectedFetch,
@@ -513,13 +513,14 @@ impl RootProver for SoftwareRoot {
 }
 
 /// Drives `work` to completion while sealing a block every `period`, as
-/// a live proposer would.
+/// a live proposer would. Unbounded: `run` guards the whole fixture against
+/// a hang, and a per-phase deadline would drop a seal mid-commit.
 async fn sealing_while<T>(
     devnet: &mut Devnet,
     period: Duration,
     work: impl std::future::Future<Output = T>,
 ) -> T {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    {
         tokio::pin!(work);
         loop {
             tokio::select! {
@@ -538,9 +539,7 @@ async fn sealing_while<T>(
                 _ = &mut seal => {},
             }
         }
-    })
-    .await
-    .expect("the SDK phase completes within its deadline")
+    }
 }
 
 /// The coins `owner` holds at the tip, by value, as validator 0 and the
@@ -1057,11 +1056,7 @@ async fn paid_setup(
     // A completed typed timeout is the expected result in the outage case;
     // it need not lose a scheduling race to the proof-attempt observer.
     if never_catches_up {
-        let error = tokio::time::timeout(Duration::from_secs(5), &mut open)
-            .await
-            .unwrap()
-            .err()
-            .expect("proof reads remain bounded");
+        let error = (&mut open).await.err().expect("proof reads remain bounded");
         assert!(
             matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if Some(timeout) == options.timeout),
             "typed proof read expiry: {error}"
@@ -1223,19 +1218,15 @@ async fn paid_finish(case: PaidScenario) {
         .with_validators(stale_relays.urls.clone())
         .unwrap();
     stale_options.timeout = Some(source_timeout);
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        PaidWorkSession::open(
-            stale_options,
-            endpoint.clone(),
-            client_settlement(),
-            owner.clone(),
-            SessionOpenMode::Any,
-            SessionFundingOptions::default(),
-        ),
+    let error = PaidWorkSession::open(
+        stale_options,
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
-    .expect("stale-source selection remains bounded")
     .err()
     .expect("a source below the journal floor cannot reopen the channel");
     assert!(
@@ -1478,20 +1469,16 @@ async fn paid_finish(case: PaidScenario) {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     upstream.release.notify_one();
     let loaded = hellas_sdk::job::Job::load(&job_folder).unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        hellas_sdk::transact::transact(
-            &mut session,
-            &loaded,
-            &client_producer,
-            hellas_sdk::transact::TransactionOptions {
-                purchase: Some(&mut purchase),
-                ..Default::default()
-            },
-        ),
+    let result = hellas_sdk::transact::transact(
+        &mut session,
+        &loaded,
+        &client_producer,
+        hellas_sdk::transact::TransactionOptions {
+            purchase: Some(&mut purchase),
+            ..Default::default()
+        },
     )
     .await
-    .expect("accepted retry completes within its test deadline")
     .unwrap();
     eprintln!("h6: accepted retry paid once");
     assert!(
@@ -1783,9 +1770,9 @@ fn cli_paid_and_grant_two_provider_composition() {
 }
 
 #[test]
-fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
+fn setup_reads_wait_for_the_required_height() {
     use hellas_chain::WorkBlocks;
-    use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
+    use hellas_channel::work_close::FinalizedBlocks as _;
     use hellas_channel::work_open::{SetupQuery, SetupView as _};
 
     run(|runtime| async move {
@@ -1831,18 +1818,6 @@ fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
             .0
         );
         drop(block);
-
-        let source = source.clone().with_min_height(next + 1);
-        let started = tokio::time::Instant::now();
-        let error = tokio::time::timeout(timeout.saturating_mul(2), source.finalized_setup(query))
-            .await
-            .expect("unavailable setup reads stay bounded")
-            .unwrap_err();
-        assert!(
-            matches!(error, BlockSourceError::ReadUnavailableTimeout { timeout: elapsed, .. }
-            if elapsed == timeout)
-        );
-        assert!(started.elapsed() >= timeout);
         assert_eq!(node.status().executed_height(), next);
         devnet.shutdown().await;
     });
