@@ -8,7 +8,7 @@ use crate::{ContentStore, Indexed};
 /// index replacement; object publication uses a no-clobber hard link.
 pub(crate) fn publish(path: &StoreLocation, bytes: &[u8], immutable: bool) -> std::io::Result<()> {
     let parent = path.parent().expect("store object has a parent");
-    fs::create_dir_all(parent)?;
+    path.durability().create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     path.durability().sync_file(temporary.as_file())?;
