@@ -20,7 +20,7 @@ impl PinName {
     }
 }
 
-pub(super) fn validate_path(path: &str, empty: bool) -> Result<()> {
+pub(crate) fn validate_path(path: &str, empty: bool) -> Result<()> {
     if path.len() > MAX_PATH_BYTES || (!empty && path.is_empty()) {
         return Err(Error::Invalid("path length"));
     }

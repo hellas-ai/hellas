@@ -4,9 +4,7 @@ use prost::Message;
 
 use super::{ChunkPage, Cursor, Error, Result};
 
-pub fn body_limit() -> usize {
-    hellas_wire::transport::body_limit()
-}
+pub use hellas_wire::transport::body_limit;
 
 pub(crate) fn wire_ref(object: ContentRef) -> pb::ContentRef {
     pb::ContentRef {

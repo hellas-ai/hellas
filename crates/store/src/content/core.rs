@@ -165,7 +165,7 @@ impl Core {
         self.lower
             .as_deref()
             .unwrap_or(self)
-            .protect_acquired(self, reservation, acquired)?;
+            .protect_acquired((Arc::downgrade(&self.state), reservation), acquired)?;
         self.state()?.work.insert(
             reservation,
             Work {
@@ -238,7 +238,7 @@ impl Core {
         self.lower
             .as_deref()
             .unwrap_or(self)
-            .protect_acquired(self, *reservation, acquired)?;
+            .protect_acquired((Arc::downgrade(&self.state), *reservation), acquired)?;
         self.state()?
             .work
             .get_mut(reservation)
@@ -1471,15 +1471,10 @@ impl Core {
         })
     }
 
-    fn protect_acquired(
-        &self,
-        requester: &Core,
-        reservation: ReservationId,
-        names: Vec<PinName>,
-    ) -> Result<()> {
+    fn protect_acquired(&self, owner: AcquiredOwner, names: Vec<PinName>) -> Result<()> {
         let mut state = self.state()?;
         for name in names {
-            state.add_acquired(name, (Arc::downgrade(&requester.state), reservation));
+            state.add_acquired(name, owner.clone());
         }
         Ok(())
     }

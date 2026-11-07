@@ -618,12 +618,8 @@ impl HfCas {
             }) {
                 let file: RepoFile = serde_json::from_value(value)
                     .map_err(|_| FetchError::Malformed("Hub file metadata".into()))?;
-                crate::content::Path::new(
-                    crate::content::PinName::new("hf".into())
-                        .map_err(|_| FetchError::Malformed("pin".into()))?,
-                    file.path.clone(),
-                )
-                .map_err(|_| FetchError::Malformed("Hub file path".into()))?;
+                crate::content::tree::validate_path(&file.path, true)
+                    .map_err(|_| FetchError::Malformed("Hub file path".into()))?;
                 files.push(file);
             }
             charges.push(charge);
