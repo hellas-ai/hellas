@@ -84,6 +84,25 @@ pub enum PinPolicy {
     Public,
 }
 
+impl std::str::FromStr for PinPolicy {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self> {
+        Ok(match value {
+            "owner" => Self::Owner,
+            "jobs" => Self::Jobs,
+            "granted" => Self::Granted,
+            "public" => Self::Public,
+            other => Self::Channel(
+                other
+                    .strip_prefix("channel:")
+                    .ok_or(Error::Invalid("pin policy"))?
+                    .parse()
+                    .map_err(|_| Error::Invalid("channel pin policy"))?,
+            ),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinValue {
     pub target: Target,

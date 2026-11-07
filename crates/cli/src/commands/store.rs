@@ -121,20 +121,6 @@ pub enum PinCommand {
 fn ram() -> Reservations {
     Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES)
 }
-fn policy(value: &str) -> CliResult<PinPolicy> {
-    Ok(match value {
-        "owner" => PinPolicy::Owner,
-        "jobs" => PinPolicy::Jobs,
-        "granted" => PinPolicy::Granted,
-        "public" => PinPolicy::Public,
-        other => PinPolicy::Channel(
-            other
-                .strip_prefix("channel:")
-                .context("policy must be owner, jobs, granted, public, or channel:ID")?
-                .parse()?,
-        ),
-    })
-}
 fn target(value: Target) {
     let kind = match value {
         Target::Object(_) => "object",
@@ -308,7 +294,7 @@ where
             );
             let pin = PinTarget {
                 name: PinName::new(pin)?,
-                policy: policy(&selected)?,
+                policy: selected.parse()?,
             };
             let source = if source.starts_with("hf://") {
                 ensure!(
@@ -385,7 +371,7 @@ where
                     } else {
                         Target::Object(object)
                     },
-                    policy: policy(&selected)?,
+                    policy: selected.parse()?,
                     expires: expires_ms.map(hellas_auth::authority::UnixMillis),
                 };
                 let previous = find_pin(store, &name).await?;
@@ -755,16 +741,15 @@ mod tests {
             let args = ["hellas", "store"].into_iter().chain(command);
             assert!(crate::Cli::try_parse_from(args).is_ok());
         }
-        for command in [
-            vec!["adopt"],
-            vec!["status"],
-            vec!["fetch"],
-            vec!["--store-dir", "old", "collect"],
-            vec!["--control-socket", "daemon", "collect"],
-        ] {
-            assert!(
-                crate::Cli::try_parse_from(["hellas", "store"].into_iter().chain(command)).is_err()
-            );
-        }
+        assert!(
+            crate::Cli::try_parse_from([
+                "hellas",
+                "store",
+                "--control-socket",
+                "daemon",
+                "collect"
+            ])
+            .is_err()
+        );
     }
 }

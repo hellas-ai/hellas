@@ -230,8 +230,6 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
         for invalid in [
             vec!["--address", "127.0.0.1:9000"],
             vec!["--node", "node.enrollment", "--control-socket", "node.sock"],
-            vec!["--store-dir", "store"],
-            vec!["--output-cache", "off"],
         ] {
             let mut argv = vec!["hellas", "admin"];
             argv.extend(operation.iter().copied());

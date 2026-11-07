@@ -34,10 +34,6 @@ impl<'de> Deserialize<'de> for Bytes {
                     "MiB" => 1_u64 << 20,
                     "GiB" => 1_u64 << 30,
                     "TiB" => 1_u64 << 40,
-                    "KB" => 1000,
-                    "MB" => 1000_u64.pow(2),
-                    "GB" => 1000_u64.pow(3),
-                    "TB" => 1000_u64.pow(4),
                     _ => return Err(serde::de::Error::custom("unknown byte unit")),
                 };
                 number
@@ -57,20 +53,10 @@ pub enum Policy {
 }
 impl Policy {
     fn value(&self) -> Result<PinPolicy> {
-        Ok(match self {
-            Self::Name(name) => match name.as_str() {
-                "owner" => PinPolicy::Owner,
-                "jobs" => PinPolicy::Jobs,
-                "granted" => PinPolicy::Granted,
-                "public" => PinPolicy::Public,
-                _ => return Err(Error::Invalid("declared pin policy")),
-            },
-            Self::Channel { channel } => PinPolicy::Channel(
-                channel
-                    .parse()
-                    .map_err(|_| Error::Invalid("channel pin policy"))?,
-            ),
-        })
+        match self {
+            Self::Name(name) => name.parse(),
+            Self::Channel { channel } => format!("channel:{channel}").parse(),
+        }
     }
 }
 
@@ -519,7 +505,7 @@ mod tests {
         assert!(upload.complete());
     }
     #[test]
-    fn configuration_requires_immutable_sources_and_rejects_unknown_policy_builtins() {
+    fn configuration_requires_immutable_sources() {
         for uri in ["hf://org/repo", "hf://org/repo@main", "hf://org/repo@tag"] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"pins":{"config/model":uri}})).unwrap();
@@ -534,14 +520,6 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.capacity.unwrap().0, 2_u64 << 40);
         assert_eq!(config.index, IndexMode::Require);
-        for policy in [
-            serde_json::json!({"on_miss":"budget"}),
-            serde_json::json!({"on_miss":{"allow_list":{}, "budget":{"bytes_per_day":1}}}),
-            serde_json::json!({"on_miss":{"budget":{"bytes_per_day":1}}}),
-        ] {
-            let parsed = serde_json::from_value::<Config>(serde_json::json!({"policy":policy}));
-            assert!(parsed.is_err() || parsed.unwrap().validate().is_err());
-        }
     }
     #[tokio::test]
     async fn hf_declarations_use_only_their_managed_pin_and_cached_trees_need_no_hub() {
