@@ -154,7 +154,7 @@ pub enum Command {
     Run {
         config: PathBuf,
         profile: hellas_genesis::ChainProfile,
-        home: PathBuf,
+        home: hellas_private::StoreLocation,
     },
     CheckConfig {
         config: PathBuf,
@@ -842,7 +842,7 @@ fn check_config(
 fn run(
     config_path: PathBuf,
     profile: hellas_genesis::ChainProfile,
-    home: PathBuf,
+    home: hellas_private::StoreLocation,
 ) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
@@ -920,8 +920,7 @@ fn run(
     };
 
     // Configure tokio runtime
-    let storage_dir =
-        crate::chain_dir::ChainDir::open(&home, &profile, Default::default())?.validator();
+    let storage_dir = crate::chain_dir::ChainDir::open(&home, &profile)?.validator();
     let _directory_lock = crate::execution::pipeline::lock(&storage_dir)?;
     let storage_dir_utf8 = storage_dir.to_str().ok_or_else(|| {
         ValidatorError::NonUtf8StorageDirectory(storage_dir.clone().into_path_buf())

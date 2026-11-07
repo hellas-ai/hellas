@@ -140,6 +140,23 @@ fn paid_compute_program_selection_survives_config_parsing() {
     assert!(toml::from_str::<PaidWorkFile>(&ambiguous).is_err());
 }
 
+#[test]
+fn power_durability_reaches_paid_chain_journals() {
+    use hellas_private::Durability::Power;
+    let root = tempfile::tempdir().unwrap();
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let paid = PaidWork::load(
+        &example,
+        StoreLocation::for_test(root.path()).with_durability(Power),
+        None,
+        None,
+        hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
+    assert_eq!(paid.chain.chain.provider_journals().durability(), Power);
+}
+
 #[tokio::test]
 async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls() {
     let root = tempfile::tempdir().unwrap();

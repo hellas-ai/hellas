@@ -13,7 +13,11 @@ pub(crate) fn chain_dir(
 ) -> hellas_chain::chain_dir::ChainDir {
     let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     if network.as_str() == known.network_id() {
-        return hellas_chain::chain_dir::ChainDir::open(home, &known, Crash).unwrap();
+        return hellas_chain::chain_dir::ChainDir::open(
+            &StoreLocation::from_home(home, Crash),
+            &known,
+        )
+        .unwrap();
     }
     let mut genesis = known.genesis().clone();
     genesis.network_id = network.as_str().into();
@@ -36,7 +40,8 @@ pub(crate) fn chain_dir_with_genesis(
         genesis_json,
     })
     .unwrap();
-    hellas_chain::chain_dir::ChainDir::open(home, &profile, Crash).unwrap()
+    hellas_chain::chain_dir::ChainDir::open(&StoreLocation::from_home(home, Crash), &profile)
+        .unwrap()
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
@@ -139,8 +144,11 @@ impl PaidFixture {
             genesis_json,
         })
         .unwrap();
-        self.config.chain =
-            hellas_chain::chain_dir::ChainDir::open(self.root.path(), &profile, Crash).unwrap();
+        self.config.chain = hellas_chain::chain_dir::ChainDir::open(
+            &StoreLocation::from_home(self.root.path(), Crash),
+            &profile,
+        )
+        .unwrap();
         let mut config = self.config.node_config(None).unwrap();
         config.validators.clear();
         crate::FullNode::start(config).await.unwrap()

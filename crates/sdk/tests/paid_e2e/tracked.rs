@@ -1,6 +1,5 @@
 use super::*;
 use commonware_cryptography::{Hasher as _, Sha256};
-use hellas_private::Durability::Crash;
 use hellas_sdk::execution::{
     Acceptance, ExecutionAttempt, ExecutionError, ExecutionObservers, ExecutionResult,
     ExecutionSession, ExecutionTerms, Payment, Terminal,
@@ -29,7 +28,7 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             )
             .unwrap();
             let a_chain =
-                hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile, Crash).unwrap();
+                hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile).unwrap();
             assert_eq!(a_chain.network_id(), b_chain.network_id());
             assert_ne!(a_chain.state_key(), b_chain.state_key());
             let path = hellas_sdk::transact::PaidAttemptPath::new(

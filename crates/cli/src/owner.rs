@@ -26,14 +26,13 @@ impl OwnerArgs {
     /// Keep the selected public owner with this identity across restarts.
     pub(crate) fn load_persistent(
         &self,
-        home: &std::path::Path,
+        home: &hellas_private::StoreLocation,
         chain: &ChainProfile,
     ) -> anyhow::Result<Option<SoftPasskey>> {
         if !self.is_faucet() {
             return self.load(chain);
         }
-        let path = hellas_chain::chain_dir::ChainDir::open(home, chain, Default::default())?
-            .faucet_account();
+        let path = hellas_chain::chain_dir::ChainDir::open(home, chain)?.faucet_account();
         let root = path.parent().expect("faucet account has a chain directory");
         if !path.try_exists()? {
             let index = self
@@ -142,7 +141,10 @@ mod tests {
             crate::Cli::try_parse_from(args)
                 .unwrap()
                 .owner
-                .load_persistent(root.path(), &chain)
+                .load_persistent(
+                    &hellas_private::StoreLocation::for_test(root.path()),
+                    &chain,
+                )
         };
         let first = load(&["hellas", "serve", "--faucet-account", "7"])
             .unwrap()

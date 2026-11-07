@@ -58,7 +58,11 @@ fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
             profile.known_genesis_payload_pin().unwrap()
         );
         let home = tempfile::tempdir().unwrap();
-        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+        let chain = crate::chain_dir::ChainDir::open(
+            &hellas_private::StoreLocation::from_home(home.path(), Crash),
+            &profile,
+        )
+        .unwrap();
         let mut config = Config::for_profile(chain, vec![], None).unwrap();
         config.validators.clear();
         let node = FullNode::start(config).await.unwrap();
@@ -128,7 +132,11 @@ impl Fixture {
         })
         .unwrap();
         let mut config = Config::for_profile(
-            crate::chain_dir::ChainDir::open(directory, &profile, Crash).unwrap(),
+            crate::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(directory, Crash),
+                &profile,
+            )
+            .unwrap(),
             vec![],
             None,
         )
@@ -339,9 +347,8 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("relay"),
+            &hellas_private::StoreLocation::from_home(&directory.path().join("relay"), Crash),
             config.chain.profile(),
-            Crash,
         )
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
@@ -359,9 +366,8 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("b"),
+            &hellas_private::StoreLocation::from_home(&directory.path().join("b"), Crash),
             config.chain.profile(),
-            Crash,
         )
         .unwrap();
         config.peers = vec![a.endpoint_addr()];
@@ -703,13 +709,15 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             );
             let (endpoint, serving) = serve_source(server).await;
             fixture.config.chain = crate::chain_dir::ChainDir::open(
-                &directory.path().join(if corrupt_certificate {
-                    "bad-certificate"
-                } else {
-                    "bad-block"
-                }),
+                &hellas_private::StoreLocation::from_home(
+                    &directory.path().join(if corrupt_certificate {
+                        "bad-certificate"
+                    } else {
+                        "bad-block"
+                    }),
+                    Crash,
+                ),
                 fixture.config.chain.profile(),
-                Crash,
             )
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
@@ -982,9 +990,8 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         }
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("replica"),
+            &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
             config.chain.profile(),
-            Crash,
         )
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
@@ -1272,9 +1279,8 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         .await;
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("replica"),
+            &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
             config.chain.profile(),
-            Crash,
         )
         .unwrap();
         config.peers = vec![endpoint.addr()];
@@ -1450,7 +1456,11 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     })
     .unwrap();
     let home = tempfile::tempdir().unwrap();
-    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+    let chain = crate::chain_dir::ChainDir::open(
+        &hellas_private::StoreLocation::from_home(home.path(), Crash),
+        &profile,
+    )
+    .unwrap();
     let error = Config::for_profile(chain, vec![], None).unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }

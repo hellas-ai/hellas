@@ -12,16 +12,12 @@ pub struct ChainDir {
 }
 
 impl ChainDir {
-    pub fn open(
-        home: &Path,
-        profile: &ChainProfile,
-        durability: hellas_private::Durability,
-    ) -> io::Result<Self> {
-        let home = StoreLocation::from_home(home, durability);
+    /// Chain stores inherit `home`'s durability.
+    pub fn open(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
         let root = home.child("chains").child(profile.state_key());
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
-            home,
+            home: home.clone(),
             root,
             profile: profile.clone(),
         })
@@ -94,7 +90,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let profile = ChainProfile::known(Chain::Devnet);
         for durability in [Durability::Crash, Durability::Power] {
-            let chain = ChainDir::open(home.path(), &profile, durability).unwrap();
+            let home = StoreLocation::from_home(home.path(), durability);
+            let chain = ChainDir::open(&home, &profile).unwrap();
             for location in [
                 chain.home().clone(),
                 chain.node(),
@@ -111,7 +108,8 @@ mod tests {
 
     #[test]
     fn same_genesis_with_another_initial_authority_cannot_read_state() {
-        let home = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let home = StoreLocation::from_home(directory.path(), Crash);
         let known = ChainProfile::known(Chain::Devnet);
         let mut genesis: Genesis = known.genesis().clone();
         genesis.network_id = "custom-1".into();
@@ -128,7 +126,7 @@ mod tests {
             .unwrap()
         };
         let first = make(trust.clone());
-        let a = ChainDir::open(home.path(), &first, Crash).unwrap();
+        let a = ChainDir::open(&home, &first).unwrap();
         std::fs::create_dir_all(a.client()).unwrap();
         std::fs::write(a.client().join("wallet.json"), b"a-only").unwrap();
 
@@ -136,7 +134,7 @@ mod tests {
         let mut key = hex::decode(&changed.epochs[0].threshold_identity).unwrap();
         key[0] ^= 1;
         changed.epochs[0].threshold_identity = hex::encode(key);
-        let b = ChainDir::open(home.path(), &make(changed), Crash).unwrap();
+        let b = ChainDir::open(&home, &make(changed)).unwrap();
         assert_ne!(a.as_path(), b.as_path());
         assert!(!b.client().join("wallet.json").exists());
 
@@ -146,7 +144,7 @@ mod tests {
         next.start_height = 10;
         next.end_height = None;
         trust.epochs.push(next);
-        let resumed = ChainDir::open(home.path(), &make(trust), Crash).unwrap();
+        let resumed = ChainDir::open(&home, &make(trust)).unwrap();
         assert_eq!(resumed.as_path(), a.as_path());
         assert_eq!(
             std::fs::read(resumed.client().join("wallet.json")).unwrap(),

@@ -27,7 +27,7 @@ impl WorkConfig {
         self.max_observation_age
     }
     pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
-        Self::from_chain_dir(ChainDir::open(root, &chain, Default::default())?)
+        Self::from_chain_dir(ChainDir::open(root, &chain)?)
     }
 
     pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {

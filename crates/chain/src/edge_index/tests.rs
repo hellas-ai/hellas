@@ -176,7 +176,11 @@ impl Harness {
         .unwrap();
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config::for_indexed_profile(
-                crate::chain_dir::ChainDir::open(directory.path(), &profile, Crash).unwrap(),
+                crate::chain_dir::ChainDir::open(
+                    &hellas_private::StoreLocation::from_home(directory.path(), Crash),
+                    &profile,
+                )
+                .unwrap(),
                 Vec::new(),
                 None,
             )
