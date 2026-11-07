@@ -302,6 +302,10 @@ where
                     ))
                 })
                 .transpose()?;
+            ensure!(
+                !pin.starts_with("config/"),
+                "config/ pins belong to content configuration"
+            );
             let pin = PinTarget {
                 name: PinName::new(pin)?,
                 policy: policy(&selected)?,
@@ -369,6 +373,10 @@ where
                 policy: selected,
                 expires_ms,
             } => {
+                ensure!(
+                    !name.starts_with("config/"),
+                    "config/ pins belong to content configuration"
+                );
                 let name = PinName::new(name)?;
                 let object = ContentRef::new(id.parse()?, bytes);
                 let value = PinValue {

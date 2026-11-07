@@ -292,7 +292,7 @@ impl Core {
         {
             return Err(Error::Denied);
         }
-        if let Some(work) = state.work.remove(reservation)
+        if let Some(work) = state.work.get(reservation)
             && let Some(disk) = &self.disk
         {
             for stored in work.staged.values() {
@@ -305,6 +305,7 @@ impl Core {
         if self.disk.is_some() {
             state.unpin_acquired(&(Arc::downgrade(&self.state), *reservation))?;
         }
+        state.work.remove(reservation);
         self.changed.notify_waiters();
         Ok(())
     }

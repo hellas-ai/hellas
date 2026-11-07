@@ -390,6 +390,9 @@ impl ChannelStore {
             .map(|job| (job.work_id(), *job.authorization(), job.result().is_some()))
             .collect::<Vec<_>>();
         for (work, authorization, result) in jobs {
+            if result {
+                continue;
+            }
             let store = LocalStore::Disk(self.content.clone());
             let input = read(
                 &store,
@@ -441,24 +444,22 @@ impl ChannelStore {
                 &prepared,
             )
             .map_err(ChannelStateError::from)?;
-            if !result {
-                let (_, scope) = self
-                    .open_content(
-                        work,
-                        authorization.retention,
-                        closure.clone(),
-                        policy.limits.max_upload_bytes,
-                    )
-                    .await?;
-                let initial = job_tree(&closure, None)?;
-                let total = facts
-                    .max_spool_bytes
-                    .checked_add(tree_reservation(&closure, facts.max_spool_bytes)?)
-                    .ok_or(Error::Capacity)?;
-                self.content
-                    .restore_output(&scope, total, initial.bytes().ok_or(Error::Capacity)?)
-                    .await?;
-            }
+            let (_, scope) = self
+                .open_content(
+                    work,
+                    authorization.retention,
+                    closure.clone(),
+                    policy.limits.max_upload_bytes,
+                )
+                .await?;
+            let initial = job_tree(&closure, None)?;
+            let total = facts
+                .max_spool_bytes
+                .checked_add(tree_reservation(&closure, facts.max_spool_bytes)?)
+                .ok_or(Error::Capacity)?;
+            self.content
+                .restore_output(&scope, total, initial.bytes().ok_or(Error::Capacity)?)
+                .await?;
         }
         Ok(())
     }

@@ -388,14 +388,13 @@ rec {
         example = {
           upper = "/var/lib/hellas/content-store";
           lower = [ "/srv/models" ];
-          index = "require";
+          index = "resume";
         };
         description = ''
           The [content] declaration: upper, lower, index, capacity, pins and
           policy. Rendered as one TOML file passed through --content-config.
           Model bytes stay in runtime lower directories; use absolute string
-          paths outside the Nix store. Prepare Require indexes as the service
-          user with hellas store index before startup. Pins default to Jobs.
+          paths outside the Nix store. Pins default to Jobs.
         '';
       };
       gpuBackend = mkOption {
