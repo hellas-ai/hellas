@@ -20,7 +20,6 @@ pub async fn recover_funding_intent(
     approval: Option<&dyn FundingApproval>,
 ) -> Result<Funding> {
     args.validate()?;
-    args.config.clone().validate()?;
     let timeout = read_timeout(args.timeout);
     let chain = crate::client_chain::connect(&args.config, timeout).await?;
     owner

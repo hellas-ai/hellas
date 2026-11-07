@@ -111,7 +111,7 @@ impl Publication {
 }
 
 /// All execution roles share the directory lock and provisioned chain identity.
-pub(crate) fn lock(directory: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn lock(directory: &hellas_private::StoreLocation) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(directory)?;
     let file = hellas_private::open_lock_beside(&directory.join("node"))?;
     file.try_lock().map_err(std::io::Error::other)?;

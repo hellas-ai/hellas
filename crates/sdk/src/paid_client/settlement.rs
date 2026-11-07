@@ -242,7 +242,6 @@ async fn open_settlement(
     delegate: Key,
 ) -> Result<SettlementRecovery> {
     args.validate()?;
-    args.config.clone().validate()?;
     let found =
         hellas_channel::work_store::discover_setups(&args.journal_root(), args.config.network())
             .await?;

@@ -197,7 +197,7 @@ impl Context {
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
             home: home.clone(),
-            chain: hellas_chain::chain_dir::ChainDir::open(home, chain, home.durability())?,
+            chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
         })
     }
 }

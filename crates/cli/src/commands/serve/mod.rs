@@ -114,7 +114,6 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         info!(
             network = %work.network(),
             validators = work.chain.validators().len(),
-            journal_root = %work.chain.provider_journals().display(),
             poll_ms = work.poll().as_millis(),
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node

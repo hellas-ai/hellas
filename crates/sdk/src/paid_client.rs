@@ -488,7 +488,6 @@ impl PaidWorkSession {
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
-        config.clone().validate()?;
         if owner.chain().as_path() != config.chain.as_path() {
             return Err(PaidClientError::InvalidOptions(
                 "funding owner belongs to another chain directory",
@@ -501,12 +500,13 @@ impl PaidWorkSession {
         }
         let read_timeout = read_timeout(args.timeout);
         let journal_root = args.journal_root();
-        std::fs::create_dir_all(&journal_root).map_err(|source| {
-            PaidClientError::JournalDirectory {
+        journal_root
+            .durability()
+            .create_dir_all(&journal_root)
+            .map_err(|source| PaidClientError::JournalDirectory {
                 path: journal_root.clone().into_path_buf(),
                 source,
-            }
-        })?;
+            })?;
         // Retained journals can already depend on a height a fast validator
         // has not reached. Establish that floor before a source is chosen;
         // recovery reads below it would only be refused by the same guard.

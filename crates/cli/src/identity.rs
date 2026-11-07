@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const IDENTITY_DIR: &str = ".hellas";
-const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
 const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
 
@@ -110,9 +109,7 @@ pub(crate) fn grant_data_path(home: &Path) -> PathBuf {
 pub(crate) fn assertion_counters(
     home: &Path,
 ) -> anyhow::Result<Arc<dyn AssertionCounterStore + Send + Sync>> {
-    Ok(Arc::new(FilesystemAssertionCounterStore::new(
-        home.join(APPLE_OPEN_COUNTER_STORE_DIR),
-    )))
+    Ok(Arc::new(FilesystemAssertionCounterStore::in_home(home)))
 }
 
 fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {

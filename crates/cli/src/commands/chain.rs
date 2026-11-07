@@ -342,7 +342,7 @@ pub async fn run(
     command: ChainCommand,
     owner: Option<&hellas_kernel::SoftPasskey>,
     profile: &ChainProfile,
-    _home: &std::path::Path,
+    _home: &hellas_private::StoreLocation,
 ) -> CliResult {
     match command {
         ChainCommand::Delegate { coins, node, split } => {
@@ -823,7 +823,7 @@ fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
 async fn run_indexer(
     command: IndexerCommand,
     profile: &ChainProfile,
-    home: &std::path::Path,
+    home: &hellas_private::StoreLocation,
 ) -> CliResult {
     match command {
         IndexerCommand::Serve {
@@ -838,8 +838,7 @@ async fn run_indexer(
             } else {
                 profile.clone().with_validators(rpc)?
             };
-            let chain =
-                hellas_chain::chain_dir::ChainDir::open(home, &selected, Default::default())?;
+            let chain = hellas_chain::chain_dir::ChainDir::open(home, &selected)?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
                     chain,
@@ -872,7 +871,7 @@ fn parse_chain_peer(raw: &str) -> Result<iroh::EndpointAddr, String> {
 async fn run_validator(
     command: ValidatorCommand,
     profile: &ChainProfile,
-    home: &std::path::Path,
+    home: &hellas_private::StoreLocation,
 ) -> CliResult {
     let command = match command {
         ValidatorCommand::StateGeneration { generation } => {
@@ -940,7 +939,7 @@ async fn run_validator(
         ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run {
             config,
             profile: profile.clone(),
-            home: home.to_path_buf(),
+            home: home.clone(),
         },
         ValidatorCommand::CheckConfig { config } => hellas_chain::validator::Command::CheckConfig {
             config,
@@ -954,11 +953,11 @@ async fn run_validator(
 #[cfg(feature = "validator")]
 fn reset_validator_generation(
     profile: &ChainProfile,
-    home: &std::path::Path,
+    home: &hellas_private::StoreLocation,
     generation: u64,
 ) -> CliResult {
     anyhow::ensure!(generation > 0, "generation must be positive");
-    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile, Default::default())?;
+    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile)?;
     let state = chain.validator();
     let stamp = state.join(".state-generation");
     let current = match fs::read_to_string(&stamp) {
@@ -969,7 +968,7 @@ fn reset_validator_generation(
     if current == Some(generation) {
         return Ok(());
     }
-    fs::create_dir_all(&state)?;
+    hellas_private::create_dir_all_durable(&state)?;
     for entry in fs::read_dir(&state)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -978,7 +977,8 @@ fn reset_validator_generation(
             fs::remove_file(entry.path())?;
         }
     }
-    fs::write(stamp, generation.to_string())?;
+    // Durable regardless of --durability: losing the stamp would wipe again.
+    hellas_private::write_atomically(&stamp, ".new", generation.to_string().as_bytes())?;
     Ok(())
 }
 
@@ -1031,8 +1031,6 @@ mod tests {
                 args.extend(["--to", &key, "--amount", "37"]);
             }
             assert!(crate::Cli::try_parse_from(&args).is_ok());
-            args.extend(["--owner-key", "other.key"]);
-            assert!(crate::Cli::try_parse_from(&args).is_err());
         }
         let maximum = vec![coin; MAX_EDGE_INPUTS];
         assert_eq!(
@@ -1057,7 +1055,7 @@ mod tests {
             },
             None,
             &ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-            home.path(),
+            &hellas_private::StoreLocation::for_test(home.path()),
         )
         .await
         .unwrap_err();

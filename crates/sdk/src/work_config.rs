@@ -27,7 +27,7 @@ impl WorkConfig {
         self.max_observation_age
     }
     pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
-        Self::from_chain_dir(ChainDir::open(root, &chain, Default::default())?)
+        Self::from_chain_dir(ChainDir::open(root, &chain)?)
     }
 
     pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {
@@ -40,14 +40,10 @@ impl WorkConfig {
     }
 
     pub fn network(&self) -> hellas_kernel::NetworkId {
-        hellas_kernel::NetworkId::new(self.chain.network_id()).expect("validated chain profile")
+        self.chain.network()
     }
 
-    pub fn threshold_identity(&self) -> Result<Vec<u8>> {
-        Ok(self.chain.static_threshold_identity()?)
-    }
-
-    pub fn validate(self) -> Result<Self> {
+    fn validate(self) -> Result<Self> {
         hellas_chain::proof_verify::ProofVerifier::with_digest(
             self.chain.trust().clone(),
             self.chain.consensus_digest(),

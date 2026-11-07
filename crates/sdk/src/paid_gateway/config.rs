@@ -65,7 +65,6 @@ impl PaidGatewayOptions {
                 "max_pending_requests must be a positive supported semaphore capacity",
             ));
         }
-        self.config.clone().validate()?;
         let mut endpoints = BTreeSet::new();
         for provider in &self.providers {
             provider
@@ -117,8 +116,8 @@ pub fn load_pool_options(
                     Some(TrustPolicyStore::new(directory).resolve(
                         id,
                         assurance,
-                        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-                            config.chain.home().join("apple-app-attest-open-counters"),
+                        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::in_home(
+                            config.chain.home(),
                         )),
                     )?)
                 }

@@ -118,7 +118,7 @@ impl ClientOwner {
         reservation: [u8; 16],
         controls: FundingControls<'_>,
     ) -> Result<Funding, ClientOwnerError> {
-        let network = self.network();
+        let network = self.chain.network();
         let FundingControls {
             poll,
             timeout,
@@ -250,10 +250,6 @@ impl ClientOwner {
         &self.chain
     }
 
-    fn network(&self) -> NetworkId {
-        NetworkId::new(self.chain.network_id()).expect("validated chain profile")
-    }
-
     fn path(&self, provider: iroh::EndpointId) -> PathBuf {
         self.root
             .join(format!("{}.json", hex::encode(provider.as_bytes())))
@@ -264,7 +260,7 @@ impl ClientOwner {
         record: &Record,
     ) -> Result<(NetworkId, iroh::EndpointId, Reshape), ClientOwnerError> {
         let network = NetworkId::new(&record.network).ok_or(ClientOwnerError::Record("network"))?;
-        if network != self.network() {
+        if network != self.chain.network() {
             return Err(ClientOwnerError::Record(
                 "funding network differs from selected chain",
             ));
@@ -328,7 +324,7 @@ impl ClientOwner {
         provider: iroh::EndpointId,
         funding: &Funding,
     ) -> Result<(), ClientOwnerError> {
-        let network = self.network();
+        let network = self.chain.network();
         let _serial = self.serial.lock().await;
         let path = self.path(provider);
         for (found, mut record, reshape) in self.records()? {
@@ -388,7 +384,7 @@ impl ClientOwner {
         need: u64,
         controls: FundingControls<'_>,
     ) -> Result<Funding, ClientOwnerError> {
-        let network = self.network();
+        let network = self.chain.network();
         let FundingControls {
             poll,
             timeout,

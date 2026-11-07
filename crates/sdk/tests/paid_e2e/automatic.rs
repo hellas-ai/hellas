@@ -1413,7 +1413,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     .await;
     devnet.seal().await;
     let trust_config = work_config(&devnet, root.path().join("paid"));
-    let profile = trust_config.chain.profile();
+    let profile = &trust_config.chain;
     let verifier = std::sync::Arc::new(
         hellas_chain::proof_verify::ProofVerifier::with_digest(
             profile.trust().clone(),

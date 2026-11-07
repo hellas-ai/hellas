@@ -58,7 +58,11 @@ fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
             profile.known_genesis_payload_pin().unwrap()
         );
         let home = tempfile::tempdir().unwrap();
-        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+        let chain = crate::chain_dir::ChainDir::open(
+            &hellas_private::StoreLocation::from_home(home.path(), Crash),
+            &profile,
+        )
+        .unwrap();
         let mut config = Config::for_profile(chain, vec![], None).unwrap();
         config.validators.clear();
         let node = FullNode::start(config).await.unwrap();
@@ -128,7 +132,11 @@ impl Fixture {
         })
         .unwrap();
         let mut config = Config::for_profile(
-            crate::chain_dir::ChainDir::open(directory, &profile, Crash).unwrap(),
+            crate::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(directory, Crash),
+                &profile,
+            )
+            .unwrap(),
             vec![],
             None,
         )
@@ -339,9 +347,8 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("relay"),
-            config.chain.profile(),
-            Crash,
+            &hellas_private::StoreLocation::from_home(&directory.path().join("relay"), Crash),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
@@ -359,9 +366,8 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("b"),
-            config.chain.profile(),
-            Crash,
+            &hellas_private::StoreLocation::from_home(&directory.path().join("b"), Crash),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![a.endpoint_addr()];
@@ -703,13 +709,15 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             );
             let (endpoint, serving) = serve_source(server).await;
             fixture.config.chain = crate::chain_dir::ChainDir::open(
-                &directory.path().join(if corrupt_certificate {
-                    "bad-certificate"
-                } else {
-                    "bad-block"
-                }),
-                fixture.config.chain.profile(),
-                Crash,
+                &hellas_private::StoreLocation::from_home(
+                    &directory.path().join(if corrupt_certificate {
+                        "bad-certificate"
+                    } else {
+                        "bad-block"
+                    }),
+                    Crash,
+                ),
+                &fixture.config.chain,
             )
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
@@ -982,9 +990,8 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         }
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("replica"),
-            config.chain.profile(),
-            Crash,
+            &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
+            &config.chain,
         )
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
@@ -1067,9 +1074,10 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         // the full node's directory. Feed a committee certificate without
         // starting a second consensus network inside this storage-role test.
         tokio::task::spawn_blocking(move || {
-            let _lock = pipeline::lock(&config.storage_dir()).unwrap();
+            let _lock = pipeline::lock(&config.chain().node()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(config.storage_dir()),
+                runtime::Config::new()
+                    .with_storage_directory(config.chain().node().into_path_buf()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
@@ -1272,18 +1280,17 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         .await;
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
-            &directory.path().join("replica"),
-            config.chain.profile(),
-            Crash,
+            &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
         requested.requested.notified().await;
-        assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
+        assert!(crate::execution::pipeline::lock(&config.chain().node()).is_err());
         starting.abort();
         let _ = starting.await;
-        let lock = hellas_private::open_lock_beside(&config.storage_dir().join("node")).unwrap();
+        let lock = hellas_private::open_lock_beside(&config.chain().node().join("node")).unwrap();
         tokio::task::spawn_blocking(move || lock.lock().unwrap())
             .await
             .unwrap();
@@ -1450,7 +1457,11 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     })
     .unwrap();
     let home = tempfile::tempdir().unwrap();
-    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+    let chain = crate::chain_dir::ChainDir::open(
+        &hellas_private::StoreLocation::from_home(home.path(), Crash),
+        &profile,
+    )
+    .unwrap();
     let error = Config::for_profile(chain, vec![], None).unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }
@@ -1470,7 +1481,7 @@ fn one_home_keeps_each_chains_state_across_a_switch_and_back() {
 
         // A different genesis under the same home gets its own, empty state.
         let b = Fixture::new_in(runtime.child("b"), home.path(), domain::TEST_NETWORK, 6000).await;
-        assert_ne!(a.config.storage_dir(), b.config.storage_dir());
+        assert_ne!(a.config.chain().node(), b.config.chain().node());
         let node = FullNode::start(b.config.clone()).await.unwrap();
         assert_eq!(node.status().executed_height(), 0);
         assert!(apply(&node, second.clone()).await.is_err());

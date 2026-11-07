@@ -57,7 +57,7 @@ impl FullNode {
         let thread = std::thread::Builder::new()
             .name("hellas-chain".into())
             .spawn(move || {
-                let runtime = runtime::Config::new().with_storage_directory(config.storage_dir());
+                let runtime = runtime::Config::new().with_storage_directory(indexing.storage(&config.chain).into_path_buf());
                 runtime::Runner::new(runtime).start(move |context| async move {
                     let mut serving = tokio::task::JoinSet::new();
                     let opened = async {
@@ -68,9 +68,8 @@ impl FullNode {
                             Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(config.genesis())).map_err(invalid)?)),
                             #[cfg(feature = "indexer-api")]
                             Indexing::On { .. } => {
-                                let profile = config.chain.profile();
-                                let trust = profile.trust().clone();
-                                let genesis_json = profile.genesis_json().as_bytes();
+                                let trust = config.chain.trust().clone();
+                                let genesis_json = config.chain.genesis_json().as_bytes();
                                 Trust::Schedule(crate::indexer::trusted_epochs::TrustedEpochs::with_genesis(trust.clone(), genesis_json).map_err(invalid)?, Arc::new(crate::proof_verify::ProofVerifier::with_genesis(trust, genesis_json).map_err(invalid)?))
                             }
                         };

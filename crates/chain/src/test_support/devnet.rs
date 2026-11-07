@@ -544,7 +544,11 @@ impl Devnet {
         home: &std::path::Path,
         validator: usize,
     ) -> crate::chain_dir::ChainDir {
-        crate::chain_dir::ChainDir::open(home, &self.profile(validator), Crash).unwrap()
+        crate::chain_dir::ChainDir::open(
+            &hellas_private::StoreLocation::from_home(home, Crash),
+            &self.profile(validator),
+        )
+        .unwrap()
     }
 
     pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {

@@ -131,9 +131,8 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     .unwrap();
     let root = tempfile::tempdir().unwrap();
     let chain = hellas_chain::chain_dir::ChainDir::open(
-        root.path(),
+        &StoreLocation::from_home(root.path(), Crash),
         &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-        Crash,
     )
     .unwrap();
     let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();

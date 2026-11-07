@@ -176,7 +176,11 @@ impl Harness {
         .unwrap();
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config::for_indexed_profile(
-                crate::chain_dir::ChainDir::open(directory.path(), &profile, Crash).unwrap(),
+                crate::chain_dir::ChainDir::open(
+                    &hellas_private::StoreLocation::from_home(directory.path(), Crash),
+                    &profile,
+                )
+                .unwrap(),
                 Vec::new(),
                 None,
             )
@@ -290,7 +294,7 @@ impl Harness {
     }
 
     fn index_path(&self) -> std::path::PathBuf {
-        let mut paths = std::fs::read_dir(self.node.config().storage_dir())
+        let mut paths = std::fs::read_dir(self.node.config().chain().indexer())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "redb"));
@@ -1534,7 +1538,7 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         std::fs::copy(h.index_path(), &snapshot).unwrap();
         let identity = &h.index.store.identity;
         publication.index = EdgeIndex::open(
-            &snapshot,
+            &hellas_private::StoreLocation::for_test(&snapshot),
             identity.network_id.clone(),
             identity.genesis_sha256.clone(),
             identity.trust_sha256.clone(),

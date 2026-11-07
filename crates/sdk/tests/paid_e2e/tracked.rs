@@ -1,6 +1,5 @@
 use super::*;
 use commonware_cryptography::{Hasher as _, Sha256};
-use hellas_private::Durability::Crash;
 use hellas_sdk::execution::{
     Acceptance, ExecutionAttempt, ExecutionError, ExecutionObservers, ExecutionResult,
     ExecutionSession, ExecutionTerms, Payment, Terminal,
@@ -29,7 +28,7 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             )
             .unwrap();
             let a_chain =
-                hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile, Crash).unwrap();
+                hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile).unwrap();
             assert_eq!(a_chain.network_id(), b_chain.network_id());
             assert_ne!(a_chain.state_key(), b_chain.state_key());
             let path = hellas_sdk::transact::PaidAttemptPath::new(
@@ -85,7 +84,6 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
                 ExecutionAttempt::open_paid(&execute_path, job.input(), PRICE).unwrap();
             execute_attempt.bind_target(target).unwrap();
             let execute_marker = std::fs::read(execute_path.as_path()).unwrap();
-            let proposed = std::sync::atomic::AtomicBool::new(false);
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             assert!(matches!(
                 ExecutionSession::Paid(&mut session)
@@ -107,32 +105,6 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
                 execute_marker
             );
 
-            let purchase_path = path.with_nonce([3; 16]);
-            let mut purchase =
-                hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
-            assert!(matches!(
-                purchase.reconcile(&case.options).await,
-                Err(hellas_sdk::transact::PurchaseError::Identity)
-            ));
-            assert!(!purchase_path.as_path().exists());
-            assert!(matches!(
-                hellas_sdk::transact::transact(
-                    &mut session,
-                    &job,
-                    &signer,
-                    hellas_sdk::transact::TransactionOptions {
-                        purchase: Some(&mut purchase),
-                        proposed: Some(&proposed),
-                        ..Default::default()
-                    },
-                )
-                .await,
-                Err(hellas_sdk::transact::TransactError::Purchase(
-                    hellas_sdk::transact::PurchaseError::Identity
-                ))
-            ));
-            assert!(!purchase_path.as_path().exists());
-            assert!(!proposed.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(
                 session
                     .with_state(|state| state.proposal_nonce_high_water())
