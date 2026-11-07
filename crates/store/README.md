@@ -35,7 +35,7 @@ Keep the upper and its ancestors private and stable. Lower files are assumed
 immutable: an independent writer holding the same inode can change its bytes.
 
 The upper defaults to `$HOME/.hellas/store`; capacity defaults to available
-physical free space. No background eviction or network-on-miss runs by default.
+physical free space. Admission collects unpinned cache on demand; network-on-miss is refused by default.
 Declared pins must live under `config/` and default to `Jobs`. They can explicitly
 select `owner`, `jobs`, `granted` or `public`; Channel policy uses
 `policy = { channel = "ID" }`. A job reads only its

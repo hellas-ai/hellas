@@ -36,27 +36,6 @@ impl OnMiss for AllowList {
             })
     }
 }
-pub struct Unpinned {
-    pub id: ContentId,
-    pub bytes: u64,
-    pub last_read: u64,
-}
-pub trait Eviction: Send + Sync {
-    fn order(&self, unpinned: &[Unpinned], stats: &StoreStats) -> Vec<ContentId>;
-}
-/// Least-recently read first, with byte thresholds for the host eviction loop.
-pub struct Lru {
-    pub high_water: u64,
-    pub low_water: u64,
-}
-impl Eviction for Lru {
-    fn order(&self, unpinned: &[Unpinned], _: &StoreStats) -> Vec<ContentId> {
-        let mut objects: Vec<_> = unpinned.iter().collect();
-        objects.sort_by_key(|object| (object.last_read, object.id));
-        objects.into_iter().map(|object| object.id).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

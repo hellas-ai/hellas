@@ -243,47 +243,11 @@ impl MissPolicy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub enum Watermark {
-    Bytes(Bytes),
-    Percent(String),
-}
-impl Watermark {
-    fn bytes(&self, capacity: u64) -> Result<u64> {
-        match self {
-            Self::Bytes(bytes) => Ok(bytes.0),
-            Self::Percent(value) => {
-                let percent: u64 = value
-                    .strip_suffix('%')
-                    .ok_or(Error::Invalid("eviction percentage"))?
-                    .parse()
-                    .map_err(|_| Error::Invalid("eviction percentage"))?;
-                if percent > 100 {
-                    return Err(Error::Invalid("eviction percentage"));
-                }
-                Ok((u128::from(capacity) * u128::from(percent) / 100) as u64)
-            }
-        }
-    }
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LruConfig {
-    pub high_water: Watermark,
-    pub low_water: Watermark,
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvictionConfig {
-    pub lru: LruConfig,
-}
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policies {
     #[serde(default)]
     pub on_miss: MissPolicy,
-    pub eviction: Option<EvictionConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -321,48 +285,7 @@ impl Config {
             declaration.specification()?;
         }
         self.policy.on_miss.policy()?;
-        if let Some(eviction) = &self.policy.eviction {
-            let (high, low) = match (&eviction.lru.high_water, &eviction.lru.low_water) {
-                (Watermark::Bytes(high), Watermark::Bytes(low)) => (high.0, low.0),
-                (high @ Watermark::Percent(_), low @ Watermark::Percent(_)) => {
-                    (high.bytes(100)?, low.bytes(100)?)
-                }
-                _ => {
-                    return Err(Error::Invalid(
-                        "eviction watermarks must use the same units",
-                    ));
-                }
-            };
-            if low >= high {
-                return Err(Error::Invalid(
-                    "eviction low_water must be below high_water",
-                ));
-            }
-        }
         Ok(())
-    }
-    pub fn lru(&self, stats: &StoreStats) -> Result<Option<Lru>> {
-        self.policy
-            .eviction
-            .as_ref()
-            .map(|config| {
-                let capacity = self
-                    .capacity
-                    .map(|bytes| bytes.0)
-                    .unwrap_or_else(|| stats.used.saturating_add(stats.free));
-                let high_water = config.lru.high_water.bytes(capacity)?;
-                let low_water = config.lru.low_water.bytes(capacity)?;
-                if low_water >= high_water && capacity != 0 {
-                    return Err(Error::Invalid(
-                        "eviction low_water must be below high_water",
-                    ));
-                }
-                Ok(Lru {
-                    high_water,
-                    low_water,
-                })
-            })
-            .transpose()
     }
     pub async fn open(&self, ram: Reservations, durability: Durability) -> Result<DiskStore> {
         self.validate()?;
@@ -402,33 +325,6 @@ impl Reconciler {
     pub async fn current(&self) -> Config {
         self.0.lock().await.clone()
     }
-    /// Run opt-in background LRU on store changes, without a polling interval.
-    /// A host owns this future and drops it before closing its shared store.
-    pub async fn evict(&self, store: &DiskStore) -> Result<()> {
-        loop {
-            let changed = store.core.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            {
-                let config = self.0.lock().await;
-                let stats = store.stats()?;
-                if let Some(lru) = config.lru(&stats)?
-                    && stats.used > lru.high_water
-                {
-                    while store.stats()?.used > lru.low_water {
-                        let collected = store
-                            .core
-                            .access(&Scope::Owner, |core| core.collect_sync(&Scope::Owner, true))
-                            .await?;
-                        if collected.objects == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
-            changed.await;
-        }
-    }
     pub async fn apply(&self, store: &DiskStore, config: Config) -> Result<()> {
         config.validate()?;
         let current = self.0.clone();
@@ -449,7 +345,6 @@ impl Reconciler {
                 .core
                 .access(&Scope::Owner, |core| core.require_ready())
                 .await?;
-            config.lru(&store.stats()?)?;
             store.rescan(config.lower.clone(), config.index).await?;
             remove(&store, snapshot(&store, STAGING).await?).await?;
             for (name, declaration) in &config.pins {
@@ -542,7 +437,6 @@ impl Reconciler {
             remove(&store, stale).await?;
             store.set_on_miss(config.policy.on_miss.policy()?)?;
             *current = config;
-            store.core.changed.notify_waiters();
             Ok(())
         })
         .await
@@ -642,21 +536,16 @@ mod tests {
         let config: Config = serde_json::from_value(serde_json::json!({
             "pins":{"config/model":format!("hf://org/repo@{}", "f".repeat(40))},
             "capacity":"2 TiB", "index":"require",
-            "policy":{"on_miss":"refuse", "eviction":{"lru":{"high_water":"90%", "low_water":"80%"}}}
-        })).unwrap();
+            "policy":{"on_miss":"refuse"}
+        }))
+        .unwrap();
         config.validate().unwrap();
         assert_eq!(config.capacity.unwrap().0, 2_u64 << 40);
         assert_eq!(config.index, IndexMode::Require);
-        let lru = config.lru(&StoreStats::default()).unwrap().unwrap();
-        assert_eq!(
-            lru.high_water,
-            ((u128::from(2_u64 << 40) * 90) / 100) as u64
-        );
         for policy in [
             serde_json::json!({"on_miss":"budget"}),
             serde_json::json!({"on_miss":{"allow_list":{}, "budget":{"bytes_per_day":1}}}),
             serde_json::json!({"on_miss":{"budget":{"bytes_per_day":1}}}),
-            serde_json::json!({"eviction":{"lru":{"high_water":"80%", "low_water":"90%"}}}),
         ] {
             let parsed = serde_json::from_value::<Config>(serde_json::json!({"policy":policy}));
             assert!(parsed.is_err() || parsed.unwrap().validate().is_err());
@@ -736,103 +625,6 @@ mod tests {
             previous.target.object().bytes()
         );
         assert!(snapshot(&store, STAGING).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn background_eviction_is_opt_in_and_stops_at_low_water_preserving_pins() {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = config(root.path());
-        config.lower.clear();
-        let store = node(&config).await;
-        store.finish_recovery().await.unwrap();
-        let len = 64 * 1024;
-        for value in 1..=4 {
-            owner(&store, &format!("private/{value}"), &vec![value; len]).await;
-        }
-        owner(&store, "private/empty", b"").await;
-        let empty = pin(&store, &name("private/empty")).await.unwrap().unwrap();
-        store
-            .set_pin(&Scope::Owner, &name("private/empty"), Some(&empty), None)
-            .await
-            .unwrap();
-        // Protect the fourth object and make the third the most recently read.
-        for value in 1..=2 {
-            let object = ContentRef::for_bytes(&vec![value; len]);
-            drop(
-                LocalStore::Disk(store.clone())
-                    .open_verified(&Scope::Owner, object, None)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            );
-        }
-        let newest = ContentRef::for_bytes(&vec![3; len]);
-        drop(
-            LocalStore::Disk(store.clone())
-                .open_verified(&Scope::Owner, newest, None)
-                .await
-                .unwrap()
-                .unwrap(),
-        );
-        for value in 1..=3 {
-            let key = name(&format!("private/{value}"));
-            let previous = pin(&store, &key).await.unwrap().unwrap();
-            store
-                .set_pin(&Scope::Owner, &key, Some(&previous), None)
-                .await
-                .unwrap();
-        }
-        let reconciler = Reconciler::new(config.clone()).unwrap();
-        let eviction = reconciler.evict(&store);
-        tokio::pin!(eviction);
-        assert!(futures::poll!(eviction.as_mut()).is_pending());
-        assert_eq!(store.stats().unwrap().used, 4 * len as u64);
-        config.policy.eviction = Some(EvictionConfig {
-            lru: LruConfig {
-                high_water: Watermark::Bytes(Bytes(3 * len as u64)),
-                low_water: Watermark::Bytes(Bytes(2 * len as u64)),
-            },
-        });
-        reconciler.apply(&store, config).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                tokio::select! {
-                    result = &mut eviction => panic!("eviction ended: {result:?}"),
-                    _ = tokio::task::yield_now() => {
-                        if store.stats().unwrap().used == 2 * len as u64 { break; }
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            store
-                .core
-                .access(&Scope::Owner, move |core| core
-                    .target_present(Target::Object(newest)))
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .stat(
-                    &Scope::Owner,
-                    &Path::new(name("private/4"), String::new()).unwrap()
-                )
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let oldest = ContentRef::for_bytes(&vec![1; len]);
-        assert!(
-            !store
-                .core
-                .access(&Scope::Owner, move |core| core
-                    .target_present(Target::Object(oldest)))
-                .await
-                .unwrap()
-        );
     }
 
     #[tokio::test]

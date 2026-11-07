@@ -88,41 +88,22 @@ impl ContentConfiguration {
     ) {
         let _watcher = self.watcher;
         let mut changes = self.changes;
-        let eviction = reconciler.evict(&store);
-        tokio::pin!(eviction);
-        let mut eviction_running = true;
-        let mut reload_running = self.path.is_some();
         loop {
             tokio::select! {
                 _ = stopped.changed() => break,
-                result = &mut eviction, if eviction_running => {
-                    eviction_running = false;
-                    if let Err(error) = result { tracing::warn!(%error, "content eviction failed"); }
+                changed = changes.changed() => if changed.is_err() { break; },
+            }
+            let result = async {
+                let mut config = read(self.path.as_deref(), self.audio.as_ref())?;
+                if config.upper.is_none() {
+                    config.upper = self.default_upper.clone();
                 }
-                result = changes.changed(), if reload_running => {
-                    if result.is_err() { reload_running = false; continue; }
-                    let applying = async {
-                        let mut config = read(self.path.as_deref(), self.audio.as_ref())?;
-                        if config.upper.is_none() { config.upper = self.default_upper.clone(); }
-                        reconciler.apply(&store, config).await?;
-                        Ok::<_, anyhow::Error>(())
-                    };
-                    tokio::pin!(applying);
-                    // Eviction may own a queued gate or the config mutex. Keep
-                    // polling it while application waits for those same locks.
-                    loop {
-                        tokio::select! {
-                            result = &mut applying => {
-                                if let Err(error) = result { tracing::warn!(%error, "content configuration reload failed"); }
-                                break;
-                            }
-                            result = &mut eviction, if eviction_running => {
-                                eviction_running = false;
-                                if let Err(error) = result { tracing::warn!(%error, "content eviction failed"); }
-                            }
-                        }
-                    }
-                }
+                reconciler.apply(&store, config).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "content configuration reload failed");
             }
         }
     }
@@ -256,103 +237,6 @@ mod tests {
             .unwrap();
         }
         reload.shutdown().await.unwrap();
-        store.close().await;
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reload_keeps_eviction_polled_while_it_waits_for_a_real_effect_gate() {
-        use hellas_store::content::{PinValue, Target};
-        use std::sync::{Arc, Mutex};
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("content.toml");
-        std::fs::create_dir(root.path().join("lower")).unwrap();
-        let text = |pin| {
-            format!(
-                "{}[content.policy]\neviction = {{ lru = {{ high_water = 1, low_water = 0 }} }}\n",
-                document(pin)
-            )
-        };
-        std::fs::write(&path, text("before")).unwrap();
-        let loaded = ContentConfiguration::load(Some(path.clone()), None).unwrap();
-        let mut observed = loaded.changes.clone();
-        let store = loaded
-            .config
-            .open(
-                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        store.finish_recovery().await.unwrap();
-        hellas_channel::content::upload_object(&store, b"weights")
-            .await
-            .unwrap();
-        let reconciler = Reconciler::new(loaded.config.clone()).unwrap();
-        let (entered, received) = tokio::sync::oneshot::channel();
-        let entered = Arc::new(Mutex::new(Some(entered)));
-        let (release, wait) = std::sync::mpsc::sync_channel(0);
-        let wait = Arc::new(Mutex::new(wait));
-        let scope = Scope::Owner.bind(
-            move || {
-                let entered = entered.clone();
-                let wait = wait.clone();
-                async move {
-                    Ok(move || {
-                        if let Some(entered) = entered.lock().unwrap().take() {
-                            entered.send(()).unwrap();
-                            wait.lock().unwrap().recv().unwrap();
-                        }
-                        Ok(())
-                    })
-                }
-            },
-            std::future::pending,
-        );
-        let held_store = store.clone();
-        let writer = tokio::spawn(async move {
-            held_store
-                .set_pin(
-                    &scope,
-                    &PinName::new("private/gate".into()).unwrap(),
-                    None,
-                    Some(PinValue {
-                        target: Target::Object(hellas_rpc::ContentRef::for_bytes(b"weights")),
-                        policy: PinPolicy::Owner,
-                        expires: None,
-                    }),
-                )
-                .await
-                .unwrap();
-        });
-        received.await.unwrap();
-        let (stop, stopped) = watch::channel(false);
-        let running = loaded.run(store.clone(), reconciler, stopped);
-        tokio::pin!(running);
-        // This polls the actual task loop, leaving eviction queued behind the
-        // bound local effect. No test-only store gate or alternate loop is used.
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        let replacement = root.path().join("replacement.toml");
-        std::fs::write(&replacement, text("after")).unwrap();
-        std::fs::rename(replacement, path).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), observed.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                tokio::select! {
-                    _ = &mut running => panic!("reload task ended"),
-                    page = store.pins(&Scope::Owner, "config/", Cursor::default()) => {
-                        let page = page.unwrap();
-                        if page.pins.len() == 1 && page.pins[0].0.as_str() == "config/after" { break; }
-                    }
-                }
-            }
-        }).await.unwrap();
-        writer.await.unwrap();
-        stop.send_replace(true);
-        running.await;
         store.close().await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

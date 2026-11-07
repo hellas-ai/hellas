@@ -32,9 +32,7 @@ pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
 pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
-pub use policy::{
-    AllowList, Eviction, Lru, Miss, MissDecision, OnMiss, Refuse, StoreStats, Unpinned,
-};
+pub use policy::{AllowList, Miss, MissDecision, OnMiss, Refuse, StoreStats};
 pub use remote::RemoteStore;
 pub use reservation::Reservations;
 pub use server::ContentService;

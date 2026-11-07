@@ -1039,20 +1039,14 @@ impl Core {
             {
                 continue;
             }
-            candidates.push(Unpinned {
-                id: *id,
-                bytes: object.data.len(),
-                last_read: object.last_read.load(std::sync::atomic::Ordering::Relaxed),
-            });
+            candidates.push((
+                object.last_read.load(std::sync::atomic::Ordering::Relaxed),
+                *id,
+            ));
         }
-        let stats = self.data_pool().stats()?;
-        let order = Lru {
-            high_water: stats.used,
-            low_water: stats.used,
-        }
-        .order(&candidates, &stats);
+        candidates.sort_unstable();
         let mut collected = Collected::default();
-        for id in order {
+        for (_, id) in candidates {
             let object = state.objects.get(&id).unwrap().clone();
             let bytes = match &object.data {
                 super::storage::Data::Ram(_) => {
