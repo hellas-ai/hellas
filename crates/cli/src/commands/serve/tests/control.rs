@@ -210,6 +210,7 @@ impl Daemon {
                 hellas_store::content::Reservations::ram(
                     hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
                 ),
+                false,
                 Default::default(),
             )
             .await

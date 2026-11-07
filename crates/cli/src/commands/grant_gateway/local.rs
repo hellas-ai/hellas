@@ -101,10 +101,11 @@ async fn prepare_content(
         .with_default_upper(root.join("provider/content"));
     let content = configuration
         .config()
-        .open_owner(
+        .open(
             hellas_store::content::Reservations::ram(
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
+            true,
             Default::default(),
         )
         .await?;

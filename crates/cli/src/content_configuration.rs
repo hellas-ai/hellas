@@ -208,6 +208,7 @@ mod tests {
             .config
             .open(
                 Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                false,
                 Default::default(),
             )
             .await
@@ -254,6 +255,7 @@ mod tests {
             .config
             .open(
                 Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+                false,
                 Default::default(),
             )
             .await

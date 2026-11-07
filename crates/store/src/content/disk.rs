@@ -723,29 +723,9 @@ impl DiskStore {
     pub fn durability(&self) -> Durability {
         self.core.disk.as_ref().unwrap().durability
     }
+    /// Set owner_only for callers without an authoritative work-journal census.
+    /// The monotone ownership fact is checked before scanning or cleanup.
     pub async fn open(
-        upper: PathBuf,
-        lower: Vec<PathBuf>,
-        mode: IndexMode,
-        capacity: Option<u64>,
-        ram: Reservations,
-        durability: Durability,
-    ) -> Result<Self> {
-        Self::open_inner(upper, lower, mode, capacity, ram, false, durability).await
-    }
-    /// In-process owner commands have no authoritative work-journal census.
-    /// Check the durable monotone ownership fact before scanning or cleanup.
-    pub async fn open_owner(
-        upper: PathBuf,
-        lower: Vec<PathBuf>,
-        mode: IndexMode,
-        capacity: Option<u64>,
-        ram: Reservations,
-        durability: Durability,
-    ) -> Result<Self> {
-        Self::open_inner(upper, lower, mode, capacity, ram, true, durability).await
-    }
-    async fn open_inner(
         upper: PathBuf,
         lower: Vec<PathBuf>,
         mode: IndexMode,

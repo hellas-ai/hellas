@@ -271,7 +271,12 @@ impl Config {
         self.policy.on_miss.policy()?;
         Ok(())
     }
-    pub async fn open(&self, ram: Reservations, durability: Durability) -> Result<DiskStore> {
+    pub async fn open(
+        &self,
+        ram: Reservations,
+        owner_only: bool,
+        durability: Durability,
+    ) -> Result<DiskStore> {
         self.validate()?;
         DiskStore::open(
             self.upper()?,
@@ -279,18 +284,7 @@ impl Config {
             self.index,
             self.capacity.map(|bytes| bytes.0),
             ram,
-            durability,
-        )
-        .await
-    }
-    pub async fn open_owner(&self, ram: Reservations, durability: Durability) -> Result<DiskStore> {
-        self.validate()?;
-        DiskStore::open_owner(
-            self.upper()?,
-            self.lower.clone(),
-            self.index,
-            self.capacity.map(|bytes| bytes.0),
-            ram,
+            owner_only,
             durability,
         )
         .await
@@ -478,7 +472,7 @@ mod tests {
     }
     async fn node(config: &Config) -> DiskStore {
         config
-            .open(Reservations::ram(16 << 20), Default::default())
+            .open(Reservations::ram(16 << 20), false, Default::default())
             .await
             .unwrap()
     }

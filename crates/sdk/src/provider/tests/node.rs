@@ -4850,6 +4850,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -5026,6 +5027,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -5097,6 +5099,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -5166,6 +5169,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await

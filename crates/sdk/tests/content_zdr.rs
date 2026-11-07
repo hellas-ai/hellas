@@ -540,7 +540,7 @@ async fn ephemeral_process_loss_keeps_large_paid_and_grant_payloads_out_of_every
                     let channel = fixture::ready_of(&fixture::descriptor_with(policy), fixture::CURSOR);
                     for (name, role) in [("provider",Role::Provider),("client",Role::Client)] {
                         let node_root = root.path().join(name);
-                        let content = DiskStore::open(node_root.join("content"),vec![],IndexMode::Resume,None,Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES), Default::default(),).await.unwrap();
+                        let content = DiskStore::open(node_root.join("content"),vec![],IndexMode::Resume,None,Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES), false, Default::default(),).await.unwrap();
                         assert!(content.collect(&Scope::Owner).await.is_err());
                         let journal = ChannelStore::recover(&node_root,channel.channel().clone(),role,content.clone(),&Secp256k1Verifier::new()).await.unwrap().unwrap();
                         for job in journal.state().jobs() {assert!(job.prepared_input().is_empty() && job.transcript().is_empty());}

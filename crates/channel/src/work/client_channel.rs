@@ -341,6 +341,7 @@ mod proposal_tests {
             IndexMode::Resume,
             Some(capacity),
             Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
+            false,
             Default::default(),
         )
         .await

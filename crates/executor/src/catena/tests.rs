@@ -581,6 +581,7 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await

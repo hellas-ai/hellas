@@ -539,6 +539,7 @@ pub async fn content_store(root: &std::path::Path) -> hellas_store::content::Dis
         hellas_store::content::IndexMode::Resume,
         None,
         hellas_store::content::Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await

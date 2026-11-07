@@ -612,6 +612,7 @@ mod tests {
                 IndexMode::Resume,
                 None,
                 Reservations::ram(bytes),
+                false,
                 Default::default(),
             )
             .await

@@ -17,6 +17,7 @@ async fn open(root: &FsPath) -> DiskStore {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -201,6 +202,7 @@ async fn tree_bytes_modified_after_verified_open_are_rejected_and_only_that_back
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -337,6 +339,7 @@ async fn failed_promotion_remains_scope_protected_until_retry_or_journal_recover
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -495,6 +498,7 @@ async fn corrupt_existing_destination_is_replaced_from_verified_private_staging(
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -784,12 +788,13 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
     put(&store, "ordinary", b"ordinary owner content").await;
     store.close().await;
     drop(store);
-    let store = DiskStore::open_owner(
+    let store = DiskStore::open(
         root.path().into(),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        true,
         Default::default(),
     )
     .await
@@ -831,12 +836,13 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
     // lifecycle pin and only the monotone database fact identifies ownership.
     let incomplete = root.path().join("staging/incomplete");
     fs::write(&incomplete, b"do not clean a work-owned upper").unwrap();
-    let result = DiskStore::open_owner(
+    let result = DiskStore::open(
         root.path().into(),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        true,
         Default::default(),
     )
     .await;
@@ -893,12 +899,13 @@ async fn a_failed_ownership_commit_cannot_open_a_work_scope_or_reserve_content()
     );
     store.close().await;
     drop(store);
-    let ordinary = DiskStore::open_owner(
+    let ordinary = DiskStore::open(
         root.path().into(),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        true,
         Default::default(),
     )
     .await
@@ -916,6 +923,7 @@ async fn durability_modes_apply_real_sqlite_pragmas() {
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
+            false,
             durability,
         )
         .await
@@ -959,6 +967,7 @@ async fn content_ownership_probe() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Durability::default(),
     )
     .await;
@@ -999,6 +1008,7 @@ async fn failed_lower_initialization_releases_the_writer_before_returning() {
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
+            false,
             Durability::default()
         )
         .await
@@ -1010,6 +1020,7 @@ async fn failed_lower_initialization_releases_the_writer_before_returning() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Durability::default(),
     )
     .await

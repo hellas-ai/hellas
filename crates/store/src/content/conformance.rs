@@ -915,6 +915,7 @@ async fn disk() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -935,6 +936,7 @@ async fn rpc_disk() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await

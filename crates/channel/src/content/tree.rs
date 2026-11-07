@@ -172,6 +172,7 @@ async fn metadata_reservation_fits_real_input_and_transcript_publications_at_exa
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(1 << 20),
+        false,
         Default::default(),
     )
     .await

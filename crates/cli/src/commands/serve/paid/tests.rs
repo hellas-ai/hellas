@@ -246,6 +246,7 @@ async fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await

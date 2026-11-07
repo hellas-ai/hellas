@@ -444,6 +444,7 @@ async fn disk_cold_https_streams_an_object_larger_than_any_tree_without_ram_mate
         IndexMode::Resume,
         Some(data.len() as u64),
         ram.clone(),
+        false,
         Default::default(),
     )
     .await
@@ -491,6 +492,7 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await

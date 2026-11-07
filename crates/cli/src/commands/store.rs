@@ -150,7 +150,7 @@ pub async fn run(
         if let StoreCommand::Index { paths, recheck } = args.command {
             return index(&config, paths, recheck).await;
         }
-        let store = config.open_owner(ram(), Default::default()).await.context(
+        let store = config.open(ram(), true, Default::default()).await.context(
             "opening the local upper; use --profile for an authenticated daemon connection",
         )?;
         let result = async {
@@ -571,6 +571,7 @@ mod tests {
             IndexMode::Require,
             None,
             ram(),
+            false,
             Default::default(),
         )
         .await

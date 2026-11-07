@@ -323,6 +323,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -630,6 +631,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await

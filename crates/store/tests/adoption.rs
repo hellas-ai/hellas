@@ -104,6 +104,7 @@ async fn an_hf_cache_is_an_ordinary_read_only_lower() {
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await

@@ -108,17 +108,10 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let ram = hellas_store::content::Reservations::ram(
         hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
     );
-    let content = if options.paid.is_some() {
-        content_configuration
-            .config()
-            .open(ram, options.durability)
-            .await?
-    } else {
-        content_configuration
-            .config()
-            .open_owner(ram, options.durability)
-            .await?
-    };
+    let content = content_configuration
+        .config()
+        .open(ram, options.paid.is_none(), options.durability)
+        .await?;
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every

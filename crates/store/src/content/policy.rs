@@ -54,6 +54,7 @@ mod tests {
             IndexMode::Resume,
             None,
             Reservations::ram(8 << 20),
+            false,
             Default::default(),
         )
         .await
@@ -374,6 +375,7 @@ mod tests {
                 IndexMode::Resume,
                 None,
                 Reservations::ram(8 << 20),
+                false,
                 Default::default(),
             )
             .await

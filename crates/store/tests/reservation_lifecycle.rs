@@ -20,6 +20,7 @@ async fn store(root: &std::path::Path, capacity: u64) -> DiskStore {
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(8 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -210,6 +211,7 @@ fn durable_private_output_survives_actual_process_exit_before_pin() {
             IndexMode::Resume,
             Some(64),
             Reservations::ram(8 << 20),
+            false,
             Default::default(),
         )
         .await
@@ -327,6 +329,7 @@ async fn reopening_root_only_then_widening_does_not_reserve_recovered_inputs_twi
         IndexMode::Resume,
         Some(16),
         Reservations::ram(8 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -444,6 +447,7 @@ fn authoritative_root_recovery_discards_unjournaled_output_before_restoring_exac
             IndexMode::Resume,
             Some(capacity),
             Reservations::ram(8 << 20),
+            false,
             Default::default(),
         )
         .await

@@ -61,6 +61,7 @@ async fn invalid_result_leaves_exact_retained_allowance_available_for_valid_deli
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -461,6 +462,7 @@ async fn a_durable_unaccepted_proposal_can_reupload_and_accept_after_reopening_w
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
         Default::default(),
     )
     .await
@@ -825,6 +827,7 @@ async fn owner_lifecycle_pin_policy_survives_acceptance_pin_move_and_boot_recove
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            false,
             Default::default(),
         )
         .await
@@ -1044,6 +1047,7 @@ async fn recovering_many_retained_jobs_loads_bodies_only_when_each_job_is_used()
         IndexMode::Resume,
         None,
         Reservations::ram(ram_limit),
+        false,
         Default::default(),
     )
     .await
@@ -1268,12 +1272,13 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
 async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
     let root = tempfile::tempdir().unwrap();
     let upper = root.path().join("content");
-    let node = DiskStore::open_owner(
+    let node = DiskStore::open(
         upper.clone(),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        true,
         Default::default(),
     )
     .await
@@ -1302,12 +1307,13 @@ async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
     node.close().await;
     drop(node);
     assert!(matches!(
-        DiskStore::open_owner(
+        DiskStore::open(
             upper,
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            true,
             Default::default(),
         )
         .await,

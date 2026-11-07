@@ -33,6 +33,7 @@ async fn open(
         mode,
         capacity,
         Reservations::ram(32 << 20),
+        false,
         Default::default(),
     )
     .await
@@ -241,6 +242,7 @@ async fn require_uses_only_explicit_records_until_reload() {
             IndexMode::Require,
             None,
             Reservations::ram(32 << 20),
+            false,
             Default::default(),
         )
         .await

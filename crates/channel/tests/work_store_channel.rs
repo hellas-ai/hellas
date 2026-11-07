@@ -2444,6 +2444,7 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             hellas_store::content::Reservations::ram(
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
+            false,
             Default::default(),
         )
         .await;

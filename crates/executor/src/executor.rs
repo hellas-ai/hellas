@@ -593,6 +593,7 @@ mod content_tests {
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            false,
             Default::default(),
         )
         .await
