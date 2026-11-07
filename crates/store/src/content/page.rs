@@ -39,6 +39,7 @@ pub fn chunk_page(object: ContentRef, chunks: &[Chunk], cursor: Cursor) -> Resul
             offset: u64::MAX,
             object: Some(wire_ref(object)),
             generation: u64::MAX,
+            after: String::new(),
         }),
     };
     let mut size = base.encoded_len();
@@ -62,6 +63,7 @@ pub fn chunk_page(object: ContentRef, chunks: &[Chunk], cursor: Cursor) -> Resul
         offset: end as u64,
         object: Some(object),
         generation: cursor.generation,
+        after: None,
     });
     Ok(ChunkPage {
         object,

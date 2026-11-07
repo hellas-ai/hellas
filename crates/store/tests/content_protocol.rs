@@ -164,11 +164,12 @@ async fn chunk_pages_fit_real_protobuf_envelopes_and_bind_the_object() {
                 id: object.id().as_bytes().to_vec(),
                 bytes: object.bytes(),
             }),
+            after: String::new(),
         }),
     };
     assert!(encoded.encoded_len() <= hellas_wire::mux::DEFAULT_STREAM_WINDOW as usize);
     assert!(encoded.encoded_len() <= body_limit());
-    assert!(chunk_page(ContentRef::for_bytes(b"moved"), &descriptors, next).is_err());
+    assert!(chunk_page(ContentRef::for_bytes(b"moved"), &descriptors, next.clone()).is_err());
     let rest = chunk_page(object, &descriptors, next).unwrap();
     assert_eq!(page.chunks.len() + rest.chunks.len(), descriptors.len());
     assert!(rest.next.is_none());

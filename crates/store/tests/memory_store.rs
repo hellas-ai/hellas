@@ -389,7 +389,10 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
         .await
         .unwrap()
         .cursor;
-    let mut watch = store.watch(&Scope::Public, "", cursor).await.unwrap();
+    let mut watch = store
+        .watch(&Scope::Public, "", cursor.clone())
+        .await
+        .unwrap();
     let value = PinValue {
         target: Target::Object(object),
         policy: PinPolicy::Owner,

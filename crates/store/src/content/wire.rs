@@ -85,11 +85,16 @@ pub(crate) fn pin_from(pin: pb::Pin) -> Result<(PinName, PinValue)> {
         value_from(pin.value.ok_or(Error::Invalid("missing pin"))?)?,
     ))
 }
-pub(crate) fn cursor(cursor: Cursor) -> pb::Cursor {
+pub(crate) fn cursor(cursor: &Cursor) -> pb::Cursor {
     pb::Cursor {
         offset: cursor.offset,
         generation: cursor.generation,
         object: cursor.object.map(super::page::wire_ref),
+        after: cursor
+            .after
+            .as_ref()
+            .map(|name| name.as_str().to_owned())
+            .unwrap_or_default(),
     }
 }
 pub(crate) fn cursor_from(cursor: pb::Cursor) -> Result<Cursor> {
@@ -97,6 +102,9 @@ pub(crate) fn cursor_from(cursor: pb::Cursor) -> Result<Cursor> {
         offset: cursor.offset,
         generation: cursor.generation,
         object: cursor.object.as_ref().map(object).transpose()?,
+        after: (!cursor.after.is_empty())
+            .then(|| PinName::new(cursor.after))
+            .transpose()?,
     })
 }
 pub(crate) fn path(path: &Path) -> pb::Path {
@@ -116,7 +124,7 @@ pub(crate) fn pin_target(pin: &PinTarget) -> pb::PinTarget {
 pub(crate) fn event(event: &PinEvent) -> pb::WatchPinsResponse {
     match event {
         PinEvent::Resync { cursor: c } => pb::WatchPinsResponse {
-            cursor: Some(cursor(*c)),
+            cursor: Some(cursor(c)),
             pin: None,
             removed: false,
             resync: true,
@@ -126,7 +134,7 @@ pub(crate) fn event(event: &PinEvent) -> pb::WatchPinsResponse {
             name,
             value,
         } => pb::WatchPinsResponse {
-            cursor: Some(cursor(*c)),
+            cursor: Some(cursor(c)),
             pin: Some(pb::Pin {
                 name: name.as_str().into(),
                 value: value.as_ref().map(pin_value),

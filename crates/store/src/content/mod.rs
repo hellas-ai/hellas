@@ -232,11 +232,12 @@ pub enum Source {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     pub offset: u64,
     pub object: Option<ContentRef>,
     pub generation: u64,
+    pub after: Option<PinName>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

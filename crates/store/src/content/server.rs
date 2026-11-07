@@ -163,13 +163,13 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
             .unwrap_or_default();
         let page = self
             .store
-            .chunks(&self.scope()?, &at, cursor)
+            .chunks(&self.scope()?, &at, cursor.clone())
             .await
             .map_err(status)?;
         Ok(self.reply(pb::ChunksResponse {
             object: Some(super::page::wire_ref(page.object)),
             chunks: page.chunks.iter().map(super::page::wire_chunk).collect(),
-            next: page.next.map(w::cursor),
+            next: page.next.as_ref().map(w::cursor),
         }))
     }
     async fn read(
@@ -210,7 +210,7 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
             'pages: loop {
                 let page = self
                     .store
-                    .chunks(&self.scope()?, &at, cursor)
+                    .chunks(&self.scope()?, &at, cursor.clone())
                     .await
                     .map_err(status)?;
                 if page.object != object {
@@ -267,7 +267,7 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
                 while offset < end {
                     let page = service
                         .store
-                        .chunks(&service.scope()?, &at, cursor)
+                        .chunks(&service.scope()?, &at, cursor.clone())
                         .await
                         .map_err(status)?;
                     if page.object != object {
@@ -484,8 +484,8 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
                 .iter()
                 .map(|(name, value)| w::pin(name, value))
                 .collect(),
-            next: page.next.map(w::cursor),
-            cursor: Some(w::cursor(page.cursor)),
+            next: page.next.as_ref().map(w::cursor),
+            cursor: Some(w::cursor(&page.cursor)),
         }))
     }
     async fn watch_pins(

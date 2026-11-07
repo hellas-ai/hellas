@@ -913,57 +913,65 @@ impl Core {
     fn pins_sync(&self, scope: &Scope, prefix: &str, cursor: Cursor) -> Result<PinPage> {
         let state = self.state()?;
         state.check(scope)?;
-        if cursor.offset != 0 && cursor.generation != state.generation {
-            return Err(Error::Conflict);
-        }
         let visible: Vec<_> = state
             .pins
             .iter()
             .filter(|(name, pin)| {
-                name.as_str().starts_with(prefix) && metadata_readable(scope, name, pin)
+                name.as_str().starts_with(prefix)
+                    && metadata_readable(scope, name, pin)
+                    && cursor.after.as_ref().is_none_or(|after| *name > after)
             })
             .collect();
-        let start = usize::try_from(cursor.offset).map_err(|_| Error::Invalid("pin cursor"))?;
-        if start > visible.len() {
-            return Err(Error::Invalid("pin cursor"));
-        }
+        // Owner snapshots can resume the existing watch; other scopes start a
+        // bounded replay/resync without disclosing node activity in ListPins.
+        let current = Cursor {
+            generation: if matches!(scope.kind, ScopeKind::Owner) {
+                if cursor.after.is_some() {
+                    cursor.generation
+                } else {
+                    state.generation
+                }
+            } else {
+                0
+            },
+            ..Default::default()
+        };
         let mut pins = Vec::new();
-        let mut encoded = hellas_rpc::pb::content::ListPinsResponse {
-            pins: Vec::new(),
-            next: Some(super::wire::cursor(Cursor {
-                offset: u64::MAX,
-                generation: u64::MAX,
-                object: None,
-            })),
-            cursor: Some(super::wire::cursor(Cursor {
-                generation: state.generation,
-                ..Default::default()
-            })),
-        }
-        .encoded_len();
-        for (name, pin) in &visible[start..] {
+        let mut encoded = 0;
+        for (name, pin) in &visible {
             let item = hellas_rpc::pb::content::ListPinsResponse {
                 pins: vec![super::wire::pin(name, pin)],
                 ..Default::default()
             }
             .encoded_len();
-            if encoded + item > body_limit() {
+            let envelope = hellas_rpc::pb::content::ListPinsResponse {
+                pins: vec![],
+                next: Some(super::wire::cursor(&Cursor {
+                    after: Some((*name).clone()),
+                    generation: current.generation,
+                    ..Default::default()
+                })),
+                cursor: Some(super::wire::cursor(&current)),
+            }
+            .encoded_len();
+            if encoded + item + envelope > body_limit() {
                 break;
             }
             encoded += item;
             pins.push(((*name).clone(), (*pin).clone()));
         }
-        let end = start + pins.len();
-        let current = Cursor {
-            generation: state.generation,
-            ..Default::default()
+        let next = if pins.len() < visible.len() {
+            Some(Cursor {
+                after: Some(pins.last().ok_or(Error::Capacity)?.0.clone()),
+                generation: current.generation,
+                ..Default::default()
+            })
+        } else {
+            None
         };
         Ok(PinPage {
             pins,
-            next: (end < visible.len()).then_some(Cursor {
-                offset: end as u64,
-                ..current
-            }),
+            next,
             cursor: current,
         })
     }

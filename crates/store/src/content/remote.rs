@@ -204,7 +204,7 @@ where
         loop {
             // Reserve a transport window before accepting the next metadata page.
             let page_buffer = self.pool.reserve(body_limit() as u64)?;
-            let page = self.chunks(scope, at, cursor).await?;
+            let page = self.chunks(scope, at, cursor.clone()).await?;
             if page.object != object {
                 return Err(Error::Conflict);
             }
@@ -278,7 +278,7 @@ where
             .client
             .chunks(pb::ChunksRequest {
                 at: Some(w::path(at)),
-                cursor: Some(w::cursor(cursor)),
+                cursor: Some(w::cursor(&cursor)),
             })
             .await
             .map_err(w::error)?;
@@ -481,7 +481,7 @@ where
             .client
             .list_pins(pb::ListPinsRequest {
                 prefix: prefix.into(),
-                cursor: Some(w::cursor(cursor)),
+                cursor: Some(w::cursor(&cursor)),
             })
             .await
             .map_err(w::error)?;
@@ -507,7 +507,7 @@ where
             .client
             .watch_pins(pb::WatchPinsRequest {
                 prefix: prefix.into(),
-                from: Some(w::cursor(from)),
+                from: Some(w::cursor(&from)),
             })
             .await
             .map_err(w::error)?;

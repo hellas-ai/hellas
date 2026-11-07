@@ -25,7 +25,7 @@ message PinValue { Target target = 1; PinPolicy policy = 2; optional uint64 expi
 message Pin { string name = 1; PinValue value = 2; }
 message Path { string pin = 1; string path = 2; }
 // Opaque to callers; chunk cursors are bound to a single resolved reference.
-message Cursor { uint64 offset = 1; ContentRef object = 2; uint64 generation = 3; }
+message Cursor { uint64 offset = 1; ContentRef object = 2; uint64 generation = 3; string after = 4; }
 message Chunk { bytes hash = 1; uint64 bytes = 2; }
 message StatRequest { Path at = 1; }
 message StatResponse { Target target = 1; }

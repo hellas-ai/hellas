@@ -688,7 +688,10 @@ async fn suite(mut case: Case) {
     let next = first
         .next
         .expect("the actual encoded list exceeds one body");
-    let rest = public.pins(&Scope::Public, "watch/", next).await.unwrap();
+    let rest = public
+        .pins(&Scope::Public, "watch/", next.clone())
+        .await
+        .unwrap();
     assert_eq!(first.pins.len() + rest.pins.len(), watch_names.len());
     assert!(rest.next.is_none());
     let changed = PinValue {
@@ -701,7 +704,7 @@ async fn suite(mut case: Case) {
         .await
         .unwrap();
     watch_names.push("watch/new".into());
-    assert!(public.pins(&Scope::Public, "watch/", next).await.is_err());
+    assert!(public.pins(&Scope::Public, "watch/", next).await.is_ok());
     let mut events = public.watch(&Scope::Public, "watch/", from).await.unwrap();
     assert!(matches!(
         events.next().await.unwrap().unwrap(),
