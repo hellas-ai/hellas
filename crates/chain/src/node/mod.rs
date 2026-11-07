@@ -475,14 +475,13 @@ impl Core {
         .await;
         // Historical indexes need every object transition. Ordinary full nodes
         // may bootstrap their authenticated live state at a certified floor.
-        if matches!(indexing, Indexing::Off) && plan.should_state_sync(true) {
-            network.discover_all().await;
-            if let Some(head) = network.fetch(FinalizedBlockQuery::Latest).await {
-                let proof =
-                    crate::finality_proof::FinalityProof::decode(&head.snapshot.finalization)
-                        .map_err(invalid)?;
-                plan = plan.with_floor(proof.certificate);
-            }
+        if matches!(indexing, Indexing::Off)
+            && plan.should_state_sync(true)
+            && let Some(head) = network.fetch(FinalizedBlockQuery::Latest).await
+        {
+            let proof = crate::finality_proof::FinalityProof::decode(&head.snapshot.finalization)
+                .map_err(invalid)?;
+            plan = plan.with_floor(proof.certificate);
         }
         crate::execution::pipeline::verify_floor(&plan, &network.trust)?;
         let startup = plan.sync_height();
