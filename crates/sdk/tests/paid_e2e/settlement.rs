@@ -544,7 +544,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    SETTLE_CANCEL_AFTER,
                     hellas_sdk::paid_client::settle_channel(
                         &case.options,
                         bond,
@@ -905,7 +905,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    SETTLE_CANCEL_AFTER,
                     hellas_sdk::paid_client::settle_channel(
                         &case.options,
                         bond,
@@ -1187,3 +1187,9 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
         })
     });
 }
+
+/// When the settlement-cancellation tests drop an in-flight settlement. It
+/// journals its prepared close within about a second on an idle machine and
+/// cannot finish with its object-proof source down (its read timeout is 60 s);
+/// 20 s falls between the two even on a loaded machine.
+const SETTLE_CANCEL_AFTER: Duration = Duration::from_secs(20);
