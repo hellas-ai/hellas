@@ -129,6 +129,7 @@ impl Disk {
                 return Err(Error::Invalid("unsupported content database version"));
             }
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS declarations (name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)").execute(&db).await.map_err(database)?;
             let work_owned: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_owned WHERE id=1)")
                     .fetch_one(&db)
@@ -177,7 +178,9 @@ impl Disk {
     pub(crate) fn ready(&self) -> bool {
         self.recovered.load(Ordering::Acquire)
     }
-    pub(crate) async fn pins(&self) -> Result<(u64, BTreeMap<PinName, PinValue>)> {
+    pub(crate) async fn pins(
+        &self,
+    ) -> Result<(u64, BTreeMap<PinName, PinValue>, BTreeMap<PinName, Digest>)> {
         let generation: Vec<u8> = sqlx::query_scalar("SELECT generation FROM head WHERE id=1")
             .fetch_one(&self.db)
             .await
@@ -199,12 +202,30 @@ impl Disk {
                 .map_err(|_| Error::Invalid("stored pin"))?;
             pins.insert(PinName::new(name)?, super::wire::value_from(value)?);
         }
-        Ok((generation, pins))
+        let mut declarations = BTreeMap::new();
+        for row in sqlx::query("SELECT name,digest FROM declarations")
+            .fetch_all(&self.db)
+            .await
+            .map_err(database)?
+        {
+            let name: String = row.try_get(0).map_err(database)?;
+            let digest: Vec<u8> = row.try_get(1).map_err(database)?;
+            declarations.insert(
+                PinName::new(name)?,
+                Digest::from_bytes(
+                    digest
+                        .try_into()
+                        .map_err(|_| Error::Invalid("stored declaration digest"))?,
+                ),
+            );
+        }
+        Ok((generation, pins, declarations))
     }
     pub(crate) async fn persist(
         &self,
         generation: u64,
         changes: Vec<(PinName, Option<PinValue>)>,
+        declarations: Vec<(PinName, Option<Digest>)>,
     ) -> Result<()> {
         let mut tx = self.db.begin().await.map_err(database)?;
         for (name, value) in changes {
@@ -217,6 +238,17 @@ impl Disk {
                     .map_err(database)?;
             } else {
                 sqlx::query("DELETE FROM pins WHERE name=?")
+                    .bind(name.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(database)?;
+            }
+        }
+        for (name, digest) in declarations {
+            if let Some(digest) = digest {
+                sqlx::query("INSERT INTO declarations(name,digest) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest").bind(name.as_str()).bind(digest.as_bytes().as_slice()).execute(&mut *tx).await.map_err(database)?;
+            } else {
+                sqlx::query("DELETE FROM declarations WHERE name=?")
                     .bind(name.as_str())
                     .execute(&mut *tx)
                     .await
@@ -703,7 +735,7 @@ impl DiskStore {
         let disk = Disk::open(upper, capacity, ram.clone(), owner_only, durability).await?;
         let opened = async {
             let core = Core::new(ram);
-            let (generation, pins) = disk.pins().await?;
+            let (generation, pins, declarations) = disk.pins().await?;
             let scanning = disk.clone();
             let objects = tokio::task::spawn_blocking(move || {
                 let objects = scanning.scan(&lower, mode)?;
@@ -719,6 +751,7 @@ impl DiskStore {
                 let mut state = core.state.lock().unwrap();
                 state.objects = objects;
                 state.pins = pins;
+                state.declarations = declarations;
                 state.generation = generation;
             }
             let mut core = core;

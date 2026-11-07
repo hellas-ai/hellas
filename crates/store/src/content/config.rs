@@ -1,6 +1,6 @@
 //! Declared node content, reconciled through the ordinary scoped store operations.
 use super::{owner_pin as pin, owner_pins as snapshot, *};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
 const MANAGED: &str = "config/";
@@ -49,7 +49,7 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Policy {
     Name(String),
@@ -74,14 +74,14 @@ impl Policy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Declaration {
     Hf(String),
     Object(Object),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Object {
     pub url: Option<String>,
@@ -312,7 +312,7 @@ impl Config {
 }
 
 /// One node's serialized reconciler. An application owns its cleanup even if
-/// the requesting future is dropped; no additional durable ownership is needed.
+/// the requesting future is dropped. Applied declaration digests follow pin commits.
 #[derive(Clone)]
 pub struct Reconciler(Arc<tokio::sync::Mutex<Config>>);
 impl Reconciler {
@@ -348,22 +348,29 @@ impl Reconciler {
             for (name, declaration) in &config.pins {
                 let name = PinName::new(name.clone())?;
                 let (source, expected) = declaration.specification()?;
-                let declared_policy = declaration.policy()?;
-                let policy_changed = current
-                    .pins
-                    .get(name.as_str())
-                    .map(Declaration::policy)
-                    .transpose()?
-                    != Some(declared_policy.clone());
-                if expected.is_none()
-                    && current.pins.get(name.as_str()) == Some(declaration)
-                    && let Some(previous) = pin(&store, &name).await?
-                    && store
-                        .core
-                        .access(&Scope::Owner, move |core| {
-                            core.target_present(previous.target)
-                        })
-                        .await?
+                let digest = Digest::hash(
+                    &serde_ipld_dagcbor::to_vec(declaration)
+                        .map_err(|_| Error::Invalid("canonical declaration"))?,
+                );
+                let checking = name.clone();
+                if store
+                    .core
+                    .access(&Scope::Owner, move |core| {
+                        let target = {
+                            let state = core
+                                .state
+                                .lock()
+                                .map_err(|_| Error::Invalid("store lock"))?;
+                            (state.declarations.get(&checking) == Some(&digest))
+                                .then(|| state.pins.get(&checking).map(|pin| pin.target))
+                                .flatten()
+                        };
+                        match target {
+                            Some(target) => core.target_present(target),
+                            None => Ok(false),
+                        }
+                    })
+                    .await?
                 {
                     continue;
                 }
@@ -420,21 +427,22 @@ impl Reconciler {
                     let previous = pin(&store, &name).await?;
                     let next = PinValue {
                         target,
-                        policy: if policy_changed {
-                            declared_policy
-                        } else {
-                            previous
-                                .as_ref()
-                                .map(|pin| pin.policy.clone())
-                                .unwrap_or(declared_policy)
-                        },
-                        expires: previous.as_ref().and_then(|pin| pin.expires),
+                        policy: declaration.policy()?,
+                        expires: None,
                     };
-                    if previous.as_ref() != Some(&next) {
-                        store
-                            .set_pin(&Scope::Owner, &name, previous.as_ref(), Some(next))
-                            .await?;
-                    }
+                    let name = name.clone();
+                    store
+                        .core
+                        .effect(&Scope::Owner, move |core| {
+                            core.set_pin_sync(&Scope::Owner, &name, previous.as_ref(), Some(next))?;
+                            core.state
+                                .lock()
+                                .map_err(|_| Error::Invalid("store lock"))?
+                                .declarations
+                                .insert(name, digest);
+                            Ok(())
+                        })
+                        .await?;
                     Ok(())
                 }
                 .await;
@@ -613,6 +621,33 @@ mod tests {
             .apply(&store, config.clone())
             .await
             .unwrap();
+        // A stopped-node edit must consult the persisted declaration, not new current config.
+        store.close().await;
+        let changed_sha = "b".repeat(40);
+        config.pins.insert(
+            "config/model".into(),
+            Declaration::Hf(format!("hf://org/repo@{changed_sha}")),
+        );
+        store = node(&config).await;
+        store.finish_recovery().await.unwrap();
+        let changed_weights = b"changed configured weights";
+        let (base, serving) = super::super::acquire::tests::hub(|_| {
+            vec![
+            (format!("/api/models/org/repo/tree/{changed_sha}?recursive=true"), 200, serde_json::json!([{"type":"file","path":"weights.bin","size":changed_weights.len()}]).to_string().into_bytes()),
+            (format!("/org/repo/resolve/{changed_sha}/weights.bin"),200,changed_weights.to_vec()),
+        ]
+        });
+        store.core.hf_hub = Some(base);
+        let reconciler = Reconciler::new(config.clone()).unwrap();
+        reconciler.apply(&store, config.clone()).await.unwrap();
+        let changed = pin(&store, &name("config/model"))
+            .await
+            .unwrap()
+            .unwrap()
+            .target
+            .object();
+        assert_ne!(changed, object);
+        serving.join().unwrap();
         config.pins.insert(
             "config/model".into(),
             Declaration::Object(Object {
@@ -630,7 +665,10 @@ mod tests {
         reconciler.apply(&store, config).await.unwrap();
         assert_eq!(pin(&store, &name(&hf_name)).await.unwrap(), Some(protected));
         let collected = store.collect(&Scope::Owner).await.unwrap();
-        assert_eq!(collected.bytes, object.bytes() + weights.len() as u64);
+        assert_eq!(
+            collected.bytes,
+            object.bytes() + weights.len() as u64 + changed.bytes() + changed_weights.len() as u64
+        );
         assert_eq!(
             store.stats().unwrap().used,
             previous.target.object().bytes()
@@ -639,7 +677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lower_reconciliation_defaults_to_jobs_and_preserves_live_owner_overrides() {
+    async fn lower_reconciliation_defaults_to_jobs_and_config_wins_over_owner_edits() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("lower")).unwrap();
         let bytes = b"converted model weights";
@@ -648,7 +686,7 @@ mod tests {
         config
             .pins
             .insert("config/model".into(), declaration(bytes, None));
-        let store = node(&config).await;
+        let mut store = node(&config).await;
         let reconciler = Reconciler::new(config.clone()).unwrap();
         assert!(matches!(
             reconciler.apply(&store, config.clone()).await,
@@ -675,13 +713,17 @@ mod tests {
         reconciler.apply(&store, config.clone()).await.unwrap();
         assert_eq!(
             pin(&store, &name("config/model")).await.unwrap(),
-            Some(private)
+            Some(initial)
         );
         assert!(snapshot(&store, STAGING).await.unwrap().is_empty());
         config.pins.insert(
             "config/model".into(),
             declaration(bytes, Some(Policy::Name("public".into()))),
         );
+        store.close().await;
+        store = node(&config).await;
+        store.finish_recovery().await.unwrap();
+        let reconciler = Reconciler::new(config.clone()).unwrap();
         reconciler.apply(&store, config.clone()).await.unwrap();
         assert_eq!(
             pin(&store, &name("config/model"))
@@ -816,7 +858,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(value.target, Target::Object(ContentRef::for_bytes(bytes)));
-        assert_eq!(value.policy, PinPolicy::Owner);
+        assert_eq!(value.policy, PinPolicy::Jobs);
         assert!(snapshot(&store, STAGING).await.unwrap().is_empty());
         serving.join().unwrap();
         // The HTTP fixture is gone. A successful second pass proves verified

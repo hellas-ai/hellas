@@ -40,8 +40,7 @@ Declared pins must live under `config/` and default to `Jobs`. They can explicit
 select `owner`, `jobs`, `granted` or `public`; Channel policy uses
 `policy = { channel = "ID" }`. A job reads only its
 declared closure through Jobs or its own Channel pins. Public visibility alone
-does not grant job access. Configuration changes reconcile managed pins; Owner
-CAS policy overrides survive unchanged declarations; editing a declared policy applies the new policy, while expiry overrides remain.
+does not grant job access. Config owns the targets and policies of `config/*` pins; every apply restores their declared values.
 
 HF files using legacy (pre-2026) Xet chunking are refused; content identity stays canonical CDC.
 

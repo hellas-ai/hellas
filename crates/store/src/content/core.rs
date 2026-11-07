@@ -53,6 +53,7 @@ pub(crate) struct State {
     tree_reads: std::sync::atomic::AtomicU64,
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
     pub(crate) pins: BTreeMap<PinName, PinValue>,
+    pub(crate) declarations: BTreeMap<PinName, Digest>,
     acquired: AcquiredOwners,
     pub(crate) on_miss: Arc<dyn OnMiss>,
     work: BTreeMap<ReservationId, Work>,
@@ -83,6 +84,7 @@ impl Core {
                 tree_reads: std::sync::atomic::AtomicU64::new(0),
                 objects: BTreeMap::new(),
                 pins: BTreeMap::new(),
+                declarations: BTreeMap::new(),
                 acquired: BTreeMap::new(),
                 on_miss: Arc::new(Refuse),
                 work: BTreeMap::new(),
@@ -694,6 +696,7 @@ impl State {
     }
     fn change_pin(&mut self, name: PinName, value: Option<PinValue>) -> Result<()> {
         let generation = self.generation.checked_add(1).ok_or(Error::Capacity)?;
+        self.declarations.remove(&name);
         let old = match &value {
             Some(value) => self.pins.insert(name.clone(), value.clone()),
             None => self.pins.remove(&name),
@@ -850,7 +853,7 @@ impl Core {
         };
         Ok(UploadSession::local(object, local))
     }
-    fn set_pin_sync(
+    pub(crate) fn set_pin_sync(
         &self,
         scope: &Scope,
         name: &PinName,
@@ -1154,6 +1157,7 @@ impl Core {
                     state.events.clone(),
                     state.event_bytes,
                     state.acquired.clone(),
+                    state.declarations.clone(),
                 )
             };
             let rollback = PinCommit {
@@ -1169,7 +1173,7 @@ impl Core {
                 let pending = {
                     let state = core.state.lock().unwrap();
                     let before = rollback.before.as_ref().unwrap();
-                    if state.generation == before.1 {
+                    if state.generation == before.1 && state.declarations == before.5 {
                         None
                     } else {
                         let mut changes: Vec<_> = state
@@ -1185,11 +1189,24 @@ impl Core {
                                 .filter(|name| !state.pins.contains_key(*name))
                                 .map(|name| (name.clone(), None)),
                         );
-                        Some((state.generation, changes))
+                        let mut declarations: Vec<_> = state
+                            .declarations
+                            .iter()
+                            .filter(|(name, digest)| before.5.get(*name) != Some(*digest))
+                            .map(|(name, digest)| (name.clone(), Some(*digest)))
+                            .collect();
+                        declarations.extend(
+                            before
+                                .5
+                                .keys()
+                                .filter(|name| !state.declarations.contains_key(*name))
+                                .map(|name| (name.clone(), None)),
+                        );
+                        Some((state.generation, changes, declarations))
                     }
                 };
-                if let Some((generation, changes)) = pending {
-                    disk.persist(generation, changes).await?;
+                if let Some((generation, changes, declarations)) = pending {
+                    disk.persist(generation, changes, declarations).await?;
                 }
             }
             rollback.before = None;
@@ -1223,6 +1240,7 @@ type PinSnapshot = (
     VecDeque<(PinEvent, Option<PinValue>, usize)>,
     usize,
     AcquiredOwners,
+    BTreeMap<PinName, Digest>,
 );
 struct PinCommit {
     core: Core,
@@ -1231,13 +1249,16 @@ struct PinCommit {
 }
 impl Drop for PinCommit {
     fn drop(&mut self) {
-        if let Some((pins, generation, events, event_bytes, acquired)) = self.before.take() {
+        if let Some((pins, generation, events, event_bytes, acquired, declarations)) =
+            self.before.take()
+        {
             let mut state = self.core.state.lock().unwrap();
             state.pins = pins;
             state.generation = generation;
             state.events = events;
             state.event_bytes = event_bytes;
             state.acquired = acquired;
+            state.declarations = declarations;
         }
     }
 }
