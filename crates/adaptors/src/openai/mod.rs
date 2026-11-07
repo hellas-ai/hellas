@@ -1,3 +1,4 @@
+pub mod audio_transcriptions;
 pub mod chat_completions;
 pub mod codex_responses;
 pub mod completions;
