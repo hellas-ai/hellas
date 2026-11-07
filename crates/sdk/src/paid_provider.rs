@@ -494,13 +494,10 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Aborts accepted jobs, then stops every channel before releasing its mount. Cancellation retains
-    /// the mounts so shutdown can resume; namespace changes serialize with draining.
+    /// Stops admission and waits out journal writes before aborting accepted jobs.
+    /// Cancellation retains the mounts so shutdown can resume.
     pub async fn clear_all(&self) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
-        if let Some(driver) = &self.driver {
-            driver.shutdown().await;
-        }
         let (channels, mut result) = {
             let (held, result) = match self.mounted.lock() {
                 Ok(held) => (held, Ok(())),
@@ -513,11 +510,27 @@ impl MountedWork {
                 result,
             )
         };
-        for service in channels {
-            let stopped = service.stop().await.map_err(MountError::from);
+        for service in &channels {
+            service.stop().await?;
+        }
+        use hellas_channel::work_close::CloseChannel as _;
+        let mut drivers = channels
+            .iter()
+            .map(WorkService::drive)
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            // Hold every journal writer while aborting; queued writers are
+            // cancelled before these guards are released.
+            let mut writers = Vec::new();
+            for driver in &mut drivers {
+                writers.push(driver.store().await.map_err(|_| MountError::Poisoned)?);
+            }
+            if let Some(driver) = &self.driver {
+                driver.shutdown().await;
+            }
+        }
+        for driver in &mut drivers {
             let closed = async {
-                use hellas_channel::work_close::CloseChannel as _;
-                let mut driver = service.drive()?;
                 driver
                     .store()
                     .await
@@ -527,7 +540,7 @@ impl MountedWork {
                 Ok::<_, MountError>(())
             }
             .await;
-            result = result.and(stopped).and(closed);
+            result = result.and(closed);
         }
         let mut held = match self.mounted.lock() {
             Ok(held) => held,
@@ -1188,7 +1201,7 @@ impl WorkRunner {
 
     async fn run_observing<S, D, F>(
         mut self,
-        mut stop: oneshot::Receiver<()>,
+        stop: oneshot::Receiver<()>,
         dial: D,
         finalized: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<(), MountError>
@@ -1198,7 +1211,8 @@ impl WorkRunner {
         F: core::future::Future<Output = Option<S>>,
     {
         {
-            use futures::{StreamExt as _, stream::FuturesUnordered};
+            use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
+            let stop = stop.map(|_| ()).shared();
             let signer = &self.signer;
             let work_mount = &self.work_mount;
             let setup_mount = &self.setup_mount;
@@ -1206,10 +1220,14 @@ impl WorkRunner {
             let poll = self.poll;
             let finalized = &finalized;
             let observe = |mut clock: SetupClock| {
+                let stop = stop.clone();
                 Box::pin(async move {
                     let mut chain = None;
                     let mut finalized = finalized.clone();
                     loop {
+                        if stop.peek().is_some() {
+                            break;
+                        }
                         let budget = clock.max_observation_age;
                         if chain.is_none() {
                             chain = tokio::time::timeout(budget, dial()).await.ok().flatten();
@@ -1235,11 +1253,15 @@ impl WorkRunner {
                         }
                         if let Some(progress) = &mut finalized {
                             tokio::select! {
+                                _ = stop.clone() => break,
                                 changed = progress.changed() => if changed.is_err() { break; },
                                 _ = tokio::time::sleep(poll) => {},
                             }
                         } else {
-                            tokio::time::sleep(poll).await;
+                            tokio::select! {
+                                _ = stop.clone() => break,
+                                _ = tokio::time::sleep(poll) => {},
+                            }
                         }
                     }
                 })
@@ -1251,13 +1273,15 @@ impl WorkRunner {
                 .collect::<FuturesUnordered<_>>();
             loop {
                 tokio::select! {
-                    _ = &mut stop => break,
+                    _ = stop.clone() => break,
                     Some(clock) = self.adopt.recv() => observers.push(observe(clock)),
                     Some(()) = observers.next(), if !observers.is_empty() => {},
                 }
             }
+            self.adopt.close();
+            // A tick may own a journal write: finish it before dropping the observer.
+            while observers.next().await.is_some() {}
         }
-        self.adopt.close();
         while self.adopt.try_recv().is_ok() {}
         let result = self.unmount_all().await;
         info!("the paid-work clock stopped, and its journals are closed");

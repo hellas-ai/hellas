@@ -2617,7 +2617,7 @@ impl WorkService {
         Ok(())
     }
 
-    /// Ends admission and delivery after accepted work and the observer have stopped.
+    /// Ends admission and delivery while retaining the journal and close duties.
     pub async fn stop(&self) -> Result<(), EndpointError> {
         let mut endpoint = self.endpoint().await?;
         let height = endpoint.state().cursor().0;
