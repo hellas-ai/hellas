@@ -87,9 +87,6 @@ impl UploadSession {
     pub fn object(&self) -> ContentRef {
         self.object
     }
-    pub fn chunks(&self) -> &[Chunk] {
-        &self.chunks
-    }
     pub fn next_chunk(&self) -> usize {
         self.next
     }
@@ -362,22 +359,15 @@ impl UploadSession {
             else {
                 unreachable!()
             };
-            let copy_charge = if self.copy_charge.is_none() {
-                self.ram
-                    .as_ref()
-                    .map(|ram| ram.reserve(std::mem::size_of_val(self.chunks.as_slice()) as u64))
-                    .transpose()?
-            } else {
-                self.copy_charge.clone()
-            };
-            let chunks = self.chunks.clone();
+            let charges = (self.descriptor_charge.take(), self.copy_charge.take());
+            let chunks = std::mem::take(&mut self.chunks);
             self.failed = true;
             local
                 .store
                 .clone()
                 .effect(&local.scope.clone(), move |core| {
                     core.publish(&mut local, chunks)?;
-                    Ok(copy_charge)
+                    Ok(charges)
                 })
                 .await?;
             self.failed = false;

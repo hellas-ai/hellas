@@ -128,12 +128,8 @@ impl FileIdentity {
     }
 }
 
-/// What one store remembers about files it has hashed.
-///
-/// Owned rather than global. A process-wide table would mean one
-/// store's `force_recheck` silently emptied another's, and two stores in
-/// one process could never be reasoned about independently — which also
-/// made tests interfere with each other, which is how this was noticed.
+/// Verified identities belong to one store. Explicit rechecks forget only
+/// the descriptor identity being indexed, preserving unrelated records.
 #[derive(Debug, Default)]
 pub struct Records {
     entries: Mutex<HashMap<FileIdentity, Indexed>>,
@@ -268,26 +264,6 @@ impl Records {
         if let Ok(mut entries) = self.entries.lock() {
             entries.remove(&identity);
         }
-    }
-
-    /// Discards every record, forcing a re-hash of everything.
-    ///
-    /// The "force recheck" every fastresume implementation needs,
-    /// because the identity check is a heuristic and heuristics are
-    /// wrong eventually.
-    pub fn force_recheck(&self) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
-        }
-    }
-
-    /// Number of files remembered.
-    #[must_use]
-    pub fn remembered(&self) -> usize {
-        self.entries
-            .lock()
-            .map(|entries| entries.len())
-            .unwrap_or(0)
     }
 }
 

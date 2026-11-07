@@ -155,10 +155,8 @@ impl ClientEndpoint {
         if authorization.retention != hellas_rpc::Retention::Retain {
             return Ok(());
         }
-        let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
-            prepared.application_policy.as_bytes(),
-        )
-        .map_err(PaidWorkError::from)?;
+        let (policy, facts) =
+            crate::job::job_facts(self.state().channel(), authorization, prepared)?;
         let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
         let root = if policy.content_closure(&manifest, &[]).is_ok() {
             bytes::Bytes::new()
@@ -178,8 +176,6 @@ impl ClientEndpoint {
                 readers.push((reference, reader));
             }
         }
-        let facts =
-            crate::job::check_paid_input(self.state().channel(), authorization, &policy, prepared)?;
         let (store, scope) = self
             .store
             .open_content(

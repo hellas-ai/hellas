@@ -101,11 +101,7 @@ impl Reservations {
         }
     }
     pub(crate) fn check(&self) -> Result<()> {
-        if self.fits(0)? {
-            Ok(())
-        } else {
-            Err(Error::Capacity)
-        }
+        self.fits(0)?.then_some(()).ok_or(Error::Capacity)
     }
     pub(crate) fn reconcile_used(&self, bytes: u64) {
         self.0.lock().unwrap().used = bytes;

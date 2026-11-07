@@ -17,14 +17,8 @@
 //!
 //! # The URL is signed, so ask for exactly what you were offered
 //!
-//! Fetch URLs are CloudFront-signed (`Expires`, `Policy`, `Signature`,
-//! `Key-Pair-Id`). The protocol docs describe an `X-Xet-Signed-Range`
-//! parameter pinning the URL to specific byte ranges; the
-//! single-range responses observed here do not carry one, so that has
-//! NOT been confirmed against production and multi-range behaviour is
-//! untested. Either way the rule is the same: request the ranges the
-//! response listed, unmodified. Widening a request to save a round trip
-//! is how you get an authorisation failure instead of a 416.
+//! Use the advertised byte ranges with their signed URLs; changing offsets
+//! can invalidate authorization.
 //!
 //! # Verification
 //!
@@ -228,17 +222,14 @@ impl Reconstruction {
         }
         for ranges in allowed.values_mut() {
             ranges.sort_by_key(|range| range.start);
-            let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
-            for range in ranges.drain(..) {
-                if let Some(previous) = merged.last_mut()
-                    && range.start <= previous.end
-                {
+            ranges.dedup_by(|range, previous| {
+                if range.start <= previous.end {
                     previous.end = previous.end.max(range.end);
+                    true
                 } else {
-                    merged.push(range);
+                    false
                 }
-            }
-            *ranges = merged;
+            });
         }
         for (xorb, ranges) in &fetches {
             for range in ranges {

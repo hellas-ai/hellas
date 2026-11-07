@@ -93,8 +93,7 @@ pub(crate) fn cursor(cursor: &Cursor) -> pb::Cursor {
         after: cursor
             .after
             .as_ref()
-            .map(|name| name.as_str().to_owned())
-            .unwrap_or_default(),
+            .map_or_else(String::new, |name| name.as_str().to_owned()),
     }
 }
 pub(crate) fn cursor_from(cursor: pb::Cursor) -> Result<Cursor> {

@@ -321,20 +321,8 @@ impl Core {
         missing: u64,
     ) -> Result<super::upload::LocalSession> {
         let (reservation, charge) = match &scope.kind {
-            ScopeKind::Owner => {
-                if pin.is_none() {
-                    return Err(Error::Invalid("owner upload requires pin"));
-                }
-                (self.data_pool().next_id()?, self.reserve(object.bytes())?)
-            }
-            ScopeKind::Work {
-                reservation,
-                closure,
-                ..
-            } => {
-                if pin.is_some() || !closure.contains(&object) {
-                    return Err(Error::Denied);
-                }
+            ScopeKind::Owner => (self.data_pool().next_id()?, self.reserve(object.bytes())?),
+            ScopeKind::Work { reservation, .. } => {
                 let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
                 if missing > work.upload_limit {
                     return Err(Error::Capacity);
@@ -525,18 +513,15 @@ impl State {
                 let depth = tree
                     .entries()
                     .iter()
-                    .try_fold(0usize, |depth, (name, child)| {
+                    .map(|(name, child)| {
                         let suffix = match child {
-                            Target::Tree(object) => {
-                                depths
-                                    .get(&object.id())
-                                    .ok_or(Error::Invalid("tree dependency"))?
-                                    .1
-                            }
+                            Target::Tree(object) => depths[&object.id()].1,
                             Target::Object(_) => 0,
                         };
-                        Ok::<_, Error>(depth.max(name.len() + suffix + usize::from(suffix != 0)))
-                    })?;
+                        name.len() + suffix + usize::from(suffix != 0)
+                    })
+                    .max()
+                    .unwrap_or(0);
                 check_path(depth)?;
                 active.remove(&object.id());
                 depths.insert(object.id(), (object, depth));
@@ -578,20 +563,17 @@ impl State {
         // Each consumer keeps the existing acquisition pin alive. Its current
         // policy/expiry still controls reads; Channel and ordinary pins stay separate.
         let requested = closure.iter().copied().collect::<BTreeSet<_>>();
-        self.acquired
-            .keys()
-            .filter_map(|name| {
-                let pin = self.pins.get(name)?;
-                if pin.policy != PinPolicy::Jobs || !readable(scope, name, pin) {
-                    return None;
-                }
-                Some(
-                    self.walk([pin.target])
-                        .map(|objects| (!objects.is_disjoint(&requested)).then(|| name.clone())),
-                )
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(|names| names.into_iter().flatten().collect())
+        let mut names = Vec::new();
+        for name in self.acquired.keys() {
+            if let Some(pin) = self.pins.get(name)
+                && pin.policy == PinPolicy::Jobs
+                && readable(scope, name, pin)
+                && !self.walk([pin.target])?.is_disjoint(&requested)
+            {
+                names.push(name.clone());
+            }
+        }
+        Ok(names)
     }
     fn add_acquired(&mut self, name: PinName, owner: AcquiredOwner) {
         let owners = self.acquired.entry(name).or_default();
@@ -626,9 +608,7 @@ impl State {
             && self
                 .objects
                 .get(&object.id())
-                .map(|stored| stored.usable(object))
-                .transpose()?
-                .unwrap_or(false))
+                .map_or(Ok(false), |stored| stored.usable(object))?)
     }
     fn verified_present(&self, scope: &Scope, object: ContentRef) -> Result<bool> {
         let readable = self.readable_refs(scope)?;
@@ -641,9 +621,7 @@ impl State {
         }
         self.objects
             .get(&object.id())
-            .map(|stored| stored.usable(object))
-            .transpose()
-            .map(|present| present.unwrap_or(false))
+            .map_or(Ok(false), |stored| stored.usable(object))
     }
     fn held(&self, scope: &Scope, closure: &[ContentRef]) -> Result<BTreeSet<ContentId>> {
         let reachable = self.readable_refs(scope)?;
@@ -839,9 +817,7 @@ impl Core {
                     .work
                     .get(reservation)
                     .and_then(|work| work.staged.get(&object.id()))
-                    .map(|stored| stored.usable(object))
-                    .transpose()?
-                    .unwrap_or(false),
+                    .map_or(Ok(false), |stored| stored.usable(object))?,
                 _ => false,
             };
             if own {
@@ -911,14 +887,10 @@ impl Core {
         // Owner snapshots can resume the existing watch; other scopes start a
         // bounded replay/resync without disclosing node activity in ListPins.
         let current = Cursor {
-            generation: if matches!(scope.kind, ScopeKind::Owner) {
-                if cursor.after.is_some() {
-                    cursor.generation
-                } else {
-                    state.generation
-                }
-            } else {
-                0
+            generation: match (&scope.kind, cursor.after.is_some()) {
+                (ScopeKind::Owner, true) => cursor.generation,
+                (ScopeKind::Owner, false) => state.generation,
+                _ => 0,
             },
             ..Default::default()
         };
@@ -1443,9 +1415,6 @@ impl Core {
         requester: Option<(Core, Scope)>,
     ) -> Result<Acquisition> {
         if !matches!(s.kind, ScopeKind::Owner) {
-            return Err(Error::Denied);
-        }
-        if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
             return Err(Error::Denied);
         }
         let scope = s.clone();
