@@ -19,6 +19,7 @@ pub(crate) struct Core {
     pub(crate) disk: Option<Arc<super::disk::Disk>>,
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) lower: Option<Box<Core>>,
+    needed: Option<Arc<Mutex<Option<u64>>>>,
 }
 pub(crate) struct Stored {
     last_read: std::sync::atomic::AtomicU64,
@@ -74,6 +75,7 @@ impl Core {
             disk: None,
             gate: Arc::new(tokio::sync::Mutex::new(())),
             lower: None,
+            needed: None,
             http: crate::hf::http().clone(),
             #[cfg(test)]
             hf_hub: None,
@@ -158,9 +160,7 @@ impl Core {
             Some(lower) => lower.state()?.acquired_pins(&scope, &closure)?,
             None => state.acquired_pins(&scope, &closure)?,
         };
-        let charge = self
-            .data_pool()
-            .reserve(missing.saturating_sub(held_input))?;
+        let charge = self.reserve(missing.saturating_sub(held_input))?;
         let reservation = self.data_pool().next_id()?;
         drop(state);
         let scope = Scope::work(job, closure.clone(), reservation);
@@ -230,8 +230,10 @@ impl Core {
             } else {
                 0
             };
-            work.charge
-                .extend((missing - work.input_reserved).saturating_sub(recovered))?;
+            self.extend(
+                &work.charge,
+                (missing - work.input_reserved).saturating_sub(recovered),
+            )?;
             work.input_reserved = missing;
         }
         drop(state);
@@ -326,10 +328,7 @@ impl Core {
                 if pin.is_none() {
                     return Err(Error::Invalid("owner upload requires pin"));
                 }
-                (
-                    self.data_pool().next_id()?,
-                    self.data_pool().reserve(object.bytes())?,
-                )
+                (self.data_pool().next_id()?, self.reserve(object.bytes())?)
             }
             ScopeKind::Work {
                 reservation,
@@ -344,7 +343,7 @@ impl Core {
                     return Err(Error::Capacity);
                 }
                 if missing > work.input_reserved {
-                    work.charge.extend(missing - work.input_reserved)?;
+                    self.extend(&work.charge, missing - work.input_reserved)?;
                     work.input_reserved = missing;
                 }
                 (*reservation, work.charge.clone())
@@ -1081,13 +1080,21 @@ impl Core {
         }
         Ok(())
     }
-    pub(crate) fn collect_sync(&self, scope: &Scope, one: bool) -> Result<Collected> {
+    pub(crate) fn collect_sync(&self, scope: &Scope, goal: Option<u64>) -> Result<Collected> {
         self.require_ready()?;
-        self.collect_unpinned(scope, one)
+        self.collect_unpinned(scope, goal)
     }
-    pub(crate) fn collect_unpinned(&self, scope: &Scope, one: bool) -> Result<Collected> {
+    pub(crate) fn collect_unpinned(&self, scope: &Scope, goal: Option<u64>) -> Result<Collected> {
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
+        }
+        if let Some(bytes) = goal
+            && (self.data_pool().fits(bytes)?
+                || bytes
+                    .checked_add(self.data_pool().held())
+                    .is_none_or(|held| held > self.data_pool().limit()))
+        {
+            return Ok(Collected::default());
         }
         let mut state = self.state()?;
         let mut reached: BTreeSet<ContentId> = state
@@ -1139,7 +1146,9 @@ impl Core {
             };
             collected.objects += 1;
             collected.bytes += bytes;
-            if one {
+            if let Some(bytes) = goal
+                && self.data_pool().fits(bytes)?
+            {
                 break;
             }
         }
@@ -1369,7 +1378,7 @@ impl ContentStore for Core {
     }
     async fn collect(&self, s: &Scope) -> Result<Collected> {
         let s = s.clone();
-        self.access(&s.clone(), move |c| c.collect_sync(&s, false))
+        self.access(&s.clone(), move |c| c.collect_sync(&s, None))
             .await
     }
 }
@@ -1440,34 +1449,25 @@ impl Core {
         if self.disk.as_ref().is_some_and(|disk| !disk.ready()) {
             return Err(Error::Denied);
         }
-        loop {
-            let (checking_pin, checking_requester) = (pin.clone(), requester.clone());
-            self.access(s, move |core| {
-                core.require_ready()?;
-                core.check_acquisition(&checking_pin, &checking_requester)
-            })
-            .await?;
-            let result = super::acquire::memory(
-                self,
-                s,
+        let scope = s.clone();
+        self.retry_capacity(s, move |core| {
+            let (scope, source, pin, requester) = (
+                scope.clone(),
                 source.clone(),
-                expect,
                 pin.clone(),
                 requester.clone(),
-            )
-            .await;
-            if !matches!(result, Err(Error::Capacity)) || self.disk.is_none() {
-                return result;
+            );
+            async move {
+                let (checking_pin, checking_requester) = (pin.clone(), requester.clone());
+                core.access(&scope, move |core| {
+                    core.require_ready()?;
+                    core.check_acquisition(&checking_pin, &checking_requester)
+                })
+                .await?;
+                super::acquire::memory(&core, &scope, source, expect, pin, requester).await
             }
-            if self
-                .access(s, |core| core.collect_sync(&Scope::Owner, true))
-                .await?
-                .objects
-                == 0
-            {
-                return result;
-            }
-        }
+        })
+        .await
     }
 
     pub(crate) fn missing_refs(
@@ -1579,7 +1579,7 @@ impl Core {
         if recovering {
             work.charge.restore(remaining)?;
         } else {
-            work.charge.extend(remaining)?;
+            self.extend(&work.charge, remaining)?;
         }
         work.output_allowance = total;
         work.output_remaining = remaining;
@@ -1600,7 +1600,7 @@ impl Core {
             .output_remaining
             .checked_add(extra)
             .ok_or(Error::Capacity)?;
-        work.charge.extend(extra)?;
+        self.extend(&work.charge, extra)?;
         work.output_allowance = work.output_allowance.max(bytes);
         work.output_remaining = remaining;
         Ok(())
@@ -1821,27 +1821,70 @@ impl Core {
 }
 
 impl Core {
+    pub(crate) fn capacity<T>(&self, bytes: u64, result: Result<T>) -> Result<T> {
+        if self.disk.is_some()
+            && matches!(&result, Err(Error::Capacity))
+            && let Some(needed) = &self.needed
+        {
+            *needed.lock().map_err(|_| Error::Invalid("store lock"))? = Some(bytes);
+        }
+        result
+    }
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<Arc<Reservation>> {
+        self.capacity(bytes, self.data_pool().reserve(bytes))
+    }
+    fn extend(&self, charge: &Reservation, bytes: u64) -> Result<()> {
+        self.capacity(bytes, charge.extend(bytes))
+    }
+    pub(crate) async fn retry_capacity<T, F, Fut>(&self, scope: &Scope, f: F) -> Result<T>
+    where
+        T: Send,
+        F: Fn(Core) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        loop {
+            // Attempt-local failure context, never shared State or an admission permit.
+            let needed = Arc::new(Mutex::new(None));
+            let mut core = self.clone();
+            core.needed = Some(needed.clone());
+            let pending = f(core);
+            let result = pending.await;
+            if !matches!(&result, Err(Error::Capacity))
+                || self.disk.as_ref().is_none_or(|disk| !disk.ready())
+            {
+                return result;
+            }
+            let bytes = needed
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?
+                .take();
+            let Some(bytes) = bytes else {
+                return result;
+            };
+            let checking = scope.clone();
+            if !self
+                .access(scope, move |core| {
+                    core.check(&checking)?;
+                    core.collect_sync(&Scope::Owner, Some(bytes))?;
+                    core.data_pool().fits(bytes)
+                })
+                .await?
+            {
+                return result;
+            }
+        }
+    }
     pub(crate) async fn admit<T: Send + 'static>(
         &self,
         scope: &Scope,
         f: impl Fn(Core) -> Result<T> + Clone + Send + 'static,
     ) -> Result<T> {
-        loop {
-            let result = self.effect(scope, f.clone()).await;
-            if !matches!(result, Err(Error::Capacity))
-                || self.disk.as_ref().is_none_or(|disk| !disk.ready())
-            {
-                return result;
-            }
-            if self
-                .access(scope, |core| core.collect_sync(&Scope::Owner, true))
-                .await?
-                .objects
-                == 0
-            {
-                return result;
-            }
-        }
+        let checking = scope.clone();
+        self.retry_capacity(scope, move |core| {
+            let (scope, f) = (checking.clone(), f.clone());
+            async move { core.effect(&scope, f).await }
+        })
+        .await
     }
 }
 

@@ -289,7 +289,14 @@ fn hf_git_paths_are_encoded_and_dataset_files_use_the_dataset_endpoint() {
         xet_hash: None,
         lfs: None,
     };
-    let stage = hf_file(&cas, &file, &Core::new(pool.clone()), None).unwrap();
+    let stage = hf_file(
+        &cas,
+        &file,
+        &Core::new(pool.clone()),
+        &BTreeMap::new(),
+        None,
+    )
+    .unwrap();
     serving.join().unwrap();
     assert_eq!(stage.object, ContentRef::for_bytes(b"git file"));
     assert_eq!(pool.held(), 8);

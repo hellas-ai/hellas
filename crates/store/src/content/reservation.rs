@@ -88,12 +88,24 @@ impl Reservations {
         pool.next_id = pool.next_id.checked_add(1).ok_or(Error::Capacity)?;
         Ok(pool.next_id)
     }
-    pub(crate) fn check(&self) -> Result<()> {
-        self.0
+    pub(crate) fn fits(&self, bytes: u64) -> Result<bool> {
+        match self
+            .0
             .lock()
             .map_err(|_| Error::Invalid("reservation lock"))?
-            .admit(0)
-            .map(drop)
+            .admit(bytes)
+        {
+            Ok(_) => Ok(true),
+            Err(Error::Capacity) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.fits(0)? {
+            Ok(())
+        } else {
+            Err(Error::Capacity)
+        }
     }
     pub(crate) fn reconcile_used(&self, bytes: u64) {
         self.0.lock().unwrap().used = bytes;

@@ -862,11 +862,8 @@ impl DiskStore {
             // All journal roots and obligations now exist. Keep admission behind
             // this held gate while reclaiming only the cache needed to fit them.
             let result = (|| {
-                while disk.quota.check().is_err() {
-                    if core.collect_unpinned(&Scope::Owner, true)?.objects == 0 {
-                        return Err(Error::Capacity);
-                    }
-                }
+                core.collect_unpinned(&Scope::Owner, Some(0))?;
+                disk.quota.check()?;
                 Ok(())
             })();
             if result.is_ok() {
