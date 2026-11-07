@@ -2,6 +2,7 @@ use super::*;
 use hellas_channel::model::work::PrivateRecord as _;
 use hellas_channel::test_support::channel::accept_uploaded_client;
 use hellas_channel::work::{Admitted, ClientEndpoint, JobProposal, fetch_result_stream};
+use hellas_private::StoreLocation;
 use hellas_rpc::fetch::{
     build_input_events_with_retention, encode_fetch_event_payload, encode_fetch_terminal_payload,
     verify_input_events,
@@ -304,8 +305,9 @@ async fn metadata_store(root: &std::path::Path) -> ChannelStore {
 }
 
 async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> ChannelStore {
+    let location = StoreLocation::for_test(root);
     let mut store = ChannelStore::open(
-        root,
+        &location,
         ready.channel().clone(),
         settlement(),
         role,

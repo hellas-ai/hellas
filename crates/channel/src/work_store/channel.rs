@@ -1,13 +1,13 @@
 //! Durable state for one paid channel.
 //!
-//! Records are fsynced before signed artifacts leave the endpoint. Replay
+//! Records are committed before signed artifacts leave the endpoint (flushed
+//! in power mode). Replay
 //! checks every transition at its recorded cursor height, preserving per-job
 //! credit limits and terminal outcomes across restart.
 
 use hellas_kernel::Cursor;
 use hex::encode as hex;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use hellas_kernel::{
     Decode, EarnedCertificate, Key, NetworkId, Party, PayloadHash, PaymentCloseStart,
@@ -380,7 +380,7 @@ mod outcome_code {
 pub enum ChannelRecord {
     /// The origin block's own close transactions are durable.
     OriginObserved,
-    /// Client-side exchange state, fsynced before a retry leaves or a known
+    /// Client-side exchange state, committed before a retry leaves or a known
     /// refusal permits another nonce. This never releases funding obligations.
     ProposalExchange {
         /// Retained half-signed proposal whose exchange is being recorded.
@@ -518,7 +518,7 @@ pub enum ChannelRecord {
     ///
     /// Written before the response leaves the process, like every other
     /// signature here. What it says is that the answer is *chosen*, and
-    /// that is all it says: it is fsynced before the submission it
+    /// that is all it says: it is committed before the submission it
     /// authorises, so a process that dies between the two leaves a
     /// journal holding an answer consensus has never seen. Read as
     /// "handed off" it would be a lie exactly then, which is why nothing

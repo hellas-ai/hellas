@@ -1,5 +1,6 @@
 use hellas_auth::authority::{AuthorityInspection, InspectionQuery};
 use hellas_authority::{model::grant::grant_network, test_support::Node};
+use hellas_private::StoreLocation;
 use std::process::Command;
 
 #[tokio::test]
@@ -33,7 +34,8 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
         String::from_utf8_lossy(&locked.stderr)
     );
     drop(world);
-    let journal = hellas_channel::work_store::journal::Journal::path(&root, "grants");
+    let location = StoreLocation::for_test(&root);
+    let journal = hellas_channel::work_store::journal::Journal::path(&location, "grants");
     let sidecars_before = hellas_channel::test_support::all_files(&root);
     let before = std::fs::read(&journal).unwrap();
     let output = invoke();

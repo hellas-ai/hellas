@@ -1,4 +1,5 @@
 //! Shared provider routing and finalized-chain clock for paid work.
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::Refusable;
 
 mod offers;
@@ -110,7 +111,7 @@ impl WorkRunnerConfig {
     pub fn network(&self) -> NetworkId {
         NetworkId::new(self.chain.network_id()).expect("validated chain profile")
     }
-    pub fn journal_root(&self) -> PathBuf {
+    pub fn journal_root(&self) -> StoreLocation {
         self.chain.provider_journals()
     }
     /// Validate observation policy before startup performs I/O.
@@ -488,6 +489,7 @@ impl MountedWork {
         };
         for service in channels {
             let stopped = service.stop().await.map_err(MountError::from);
+            service.close().await;
             result = result.and(stopped);
         }
         let mut held = match self.mounted.lock() {
@@ -553,25 +555,30 @@ impl MountedSetup {
             .get(&(peer, bond))
             .cloned())
     }
-    fn clear(&self, peer: PeerId, bond: EdgeId) -> Result<(), MountError> {
-        self.0
+    async fn clear(&self, peer: PeerId, bond: EdgeId) -> Result<(), MountError> {
+        let setup = self
+            .0
             .lock()
             .map_err(|_| MountError::Poisoned)?
             .remove(&(peer, bond));
+        if let Some(setup) = setup {
+            setup.close().await;
+        }
         Ok(())
     }
     /// Releases every setup, including after a poisoned mount lock.
-    pub fn clear_all(&self) -> Result<(), MountError> {
-        match self.0.lock() {
-            Ok(mut held) => {
-                held.clear();
-                Ok(())
-            }
-            Err(error) => {
-                error.into_inner().clear();
-                Err(MountError::Poisoned)
-            }
+    pub async fn clear_all(&self) -> Result<(), MountError> {
+        let (setups, result) = match self.0.lock() {
+            Ok(mut held) => (std::mem::take(&mut *held), Ok(())),
+            Err(error) => (
+                std::mem::take(&mut *error.into_inner()),
+                Err(MountError::Poisoned),
+            ),
+        };
+        for setup in setups.into_values() {
+            setup.close().await;
         }
+        result
     }
 }
 
@@ -820,7 +827,7 @@ impl SetupClock {
                 Ok(SetupAdvance { progress, mounted }) => {
                     if let Some(store) = mounted {
                         if let Some(peer) = self.route_peer
-                            && let Err(error) = setup_mount.clear(peer, self.bond_edge)
+                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
                         {
                             warn!(%error, "setup could not be unmounted");
                         }
@@ -968,7 +975,7 @@ impl WorkRunner {
         let found = discover_setups(&config.journal_root(), config.network())
             .await
             .map_err(|source| PaidProviderError::Discover {
-                path: config.journal_root(),
+                path: config.journal_root().into_path_buf(),
                 source,
             })?;
         if !found.unidentified.is_empty() {
@@ -1181,7 +1188,7 @@ impl WorkRunner {
             None => Ok(()),
         };
         let work = self.work_mount.clear_all().await;
-        let setup = self.setup_mount.clear_all();
+        let setup = self.setup_mount.clear_all().await;
         offers.and(work).and(setup)
     }
 
@@ -1409,7 +1416,10 @@ mod tests {
             setups.service(&context, fixture.descriptor.bond_edge()),
             Err(MountError::Poisoned)
         ));
-        assert!(matches!(setups.clear_all(), Err(MountError::Poisoned)));
+        assert!(matches!(
+            setups.clear_all().await,
+            Err(MountError::Poisoned)
+        ));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
     reason = "inventory class A/B/C: test timing fixtures pending their rollout"
 )]
 #![cfg(unix)]
+use hellas_private::StoreLocation;
 mod contact;
 mod local_compute;
 mod local_flux;
@@ -551,8 +552,9 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     };
     let journal = root.join("gateway-authority");
     let root_grant = GrantId([0; 16]);
+    let location = StoreLocation::for_test(&journal);
     let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(

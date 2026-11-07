@@ -1,4 +1,5 @@
 //! Process-owned paid chain configuration.
+use hellas_private::StoreLocation;
 use std::path::Path;
 use std::time::Duration;
 mod error;
@@ -25,8 +26,8 @@ impl WorkConfig {
     pub fn max_observation_age(&self) -> Duration {
         self.max_observation_age
     }
-    pub fn for_chain(chain: ChainProfile, root: &Path) -> Result<Self> {
-        Self::from_chain_dir(ChainDir::open(root, &chain)?)
+    pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
+        Self::from_chain_dir(ChainDir::open(root, &chain, Default::default())?)
     }
 
     pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {

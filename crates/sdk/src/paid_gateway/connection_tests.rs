@@ -188,6 +188,7 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                         genesis_json,
                     })
                     .unwrap(),
+                    Default::default(),
                 )
                 .unwrap(),
                 poll: Duration::from_millis(20),

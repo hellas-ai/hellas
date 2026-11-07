@@ -3,6 +3,7 @@ use super::*;
 use hellas_authority::model::grant::{
     ChannelClient, ChannelId, grant_channel_id, grant_network, owner_grant_id, records::*,
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     Admission, InvocationPolicy, Limits, compute, output::InvocationOutput,
 };
@@ -184,8 +185,9 @@ impl LocalCompute {
         transcript: &[u8],
         expected: &InvocationOutput,
     ) {
+        let location = StoreLocation::for_test(&self.journal);
         let store = hellas_authority::work_store::grant::NodeStore::open(
-            &self.journal,
+            &location,
             grant_network(),
             Some(self.enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap(),

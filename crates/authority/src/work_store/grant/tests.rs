@@ -3,6 +3,7 @@
 
 use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
+use hellas_private::StoreLocation;
 use hellas_rpc::*;
 use proptest::prelude::*;
 use {crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*};
@@ -188,8 +189,9 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         client: hellas_channel::test_support::channel_client(principal(1).0),
     };
     let client_dir = dir.path().join("client");
+    let location = StoreLocation::for_test(&client_dir);
     let mut client = GrantClientStore::open(
-        &client_dir,
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
@@ -225,7 +227,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     client.rotate().await.unwrap();
     drop(client);
     let mut client = GrantClientStore::open(
-        &client_dir,
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
@@ -283,8 +285,9 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         generation: 0,
         client: hellas_channel::test_support::channel_client(principal(1).0),
     };
+    let location = StoreLocation::for_test(&dir.path().join("client"));
     let mut client = GrantClientStore::open(
-        &dir.path().join("client"),
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
@@ -340,8 +343,9 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         client: hellas_channel::test_support::channel_client(principal(1).0),
     };
     let path = dir.path().join("client");
+    let location = StoreLocation::for_test(&path);
     let mut client = GrantClientStore::open(
-        &path,
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
@@ -361,7 +365,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
     client.rotate().await.unwrap();
     drop(client);
     let mut client = GrantClientStore::open(
-        &path,
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         channel,
@@ -857,9 +861,10 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
         .clone();
     replacement.subject = principal(3).0;
     drop(store);
-    let (_, before) = Journal::inspect(dir.path(), "grants").await.unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let (_, before) = Journal::inspect(&location, "grants").await.unwrap();
     let (receipt, _) = NodeStore::recover_offline(
-        dir.path(),
+        &location,
         network(),
         expected,
         crate::test_support::common_node::approval_for(
@@ -871,7 +876,7 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
     )
     .await
     .unwrap();
-    let (_, after) = Journal::inspect(dir.path(), "grants").await.unwrap();
+    let (_, after) = Journal::inspect(&location, "grants").await.unwrap();
     assert_eq!(
         after.records.len(),
         before.records.len() + 1,
@@ -928,7 +933,7 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
     store.rotate().await.unwrap();
     let before = store.state().clone();
     drop(store);
-    let store = NodeStore::open(dir.path(), network(), None, UnixMillis(1001))
+    let store = NodeStore::open(&location, network(), None, UnixMillis(1001))
         .await
         .unwrap();
     assert_eq!(

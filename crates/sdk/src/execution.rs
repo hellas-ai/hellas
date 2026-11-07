@@ -1104,7 +1104,9 @@ impl ExecutionAttempt {
             generation: offer.generation,
             client,
         };
-        let directory = options.journal_root.join(hex::encode(channel.0.as_bytes()));
+        let directory = options
+            .journal_root
+            .child(hex::encode(channel.0.as_bytes()));
         let observed = hellas_authority::work_store::grant::GrantClientStore::inspect_work(
             &directory,
             offer.network,

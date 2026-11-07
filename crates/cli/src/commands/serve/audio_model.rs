@@ -10,6 +10,7 @@ use hellas_authority::model::grant::{
     records::GrantPolicy,
 };
 use hellas_client::model::{ModelPackage, ModelRequest};
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{Admission, ComputePrograms, InvocationPolicy, Limits};
 use hellas_sdk::grant_config::GrantConfig;
 use std::{
@@ -17,7 +18,7 @@ use std::{
     path::Path,
 };
 
-pub fn configure(model: &Path, root: &Path) -> Result<GrantConfig> {
+pub fn configure(model: &Path, root: &StoreLocation) -> Result<GrantConfig> {
     let name = model
         .file_name()
         .and_then(|name| name.to_str())

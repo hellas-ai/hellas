@@ -95,6 +95,7 @@ ciborium.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
+hellas-private = { workspace = true, features = ["test-support"] }
 # The paid-work path runs over a real multiplexed transport rather than a
 # handler call: framing, method routing, and trailers are where a
 # wire-shaped mistake actually shows up.

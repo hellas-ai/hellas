@@ -5,6 +5,7 @@ use hellas_authority::{
     model::grant::{grant_network, records::decode_enrollment},
     test_support::common_node,
 };
+use hellas_private::StoreLocation;
 use serde_json::json;
 use std::{path::Path, process::Command, sync::Arc};
 
@@ -179,8 +180,9 @@ async fn main() {
         expires: UnixMillis(now.0 + 600_000),
     };
     let gateway_journal = root.join("gateway-authority");
+    let location = StoreLocation::for_test(&gateway_journal);
     let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &gateway_journal,
+        &location,
         grant_network(),
         ROOT_GRANT,
         common_node::approval(

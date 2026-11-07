@@ -5,6 +5,7 @@
 //! The source serves the real light-client protocol and ChainSync; configured
 //! full nodes consume that history through production verification and execution.
 
+use hellas_private::Durability::Crash;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -543,7 +544,7 @@ impl Devnet {
         home: &std::path::Path,
         validator: usize,
     ) -> crate::chain_dir::ChainDir {
-        crate::chain_dir::ChainDir::open(home, &self.profile(validator)).unwrap()
+        crate::chain_dir::ChainDir::open(home, &self.profile(validator), Crash).unwrap()
     }
 
     pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {

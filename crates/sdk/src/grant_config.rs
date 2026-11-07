@@ -11,6 +11,7 @@ use hellas_authority::model::grant::{
     resource::HttpsResource,
     responses::ResponsesResource,
 };
+use hellas_private::StoreLocation;
 use serde::Deserialize;
 use std::{
     num::NonZeroU64,
@@ -61,20 +62,20 @@ struct ConfigFile {
     resources: Vec<ResourceFile>,
 }
 pub struct GrantConfig {
-    provider_dir: PathBuf,
+    provider_dir: StoreLocation,
     pub remote_control: crate::node_control::RemoteControlAdmission,
     pub max_job_millis: NonZeroU64,
     pub configuration: NodeConfiguration,
 }
 impl GrantConfig {
-    pub fn provider_dir(home: &Path) -> PathBuf {
-        home.join("provider")
+    pub fn provider_dir(home: &StoreLocation) -> StoreLocation {
+        home.child("provider")
     }
-    pub fn journal_dir(home: &Path) -> PathBuf {
-        Self::provider_dir(home).join("authority")
+    pub fn journal_dir(home: &StoreLocation) -> StoreLocation {
+        Self::provider_dir(home).child("authority")
     }
-    pub fn journal_root(&self) -> PathBuf {
-        self.provider_dir.join("authority")
+    pub fn journal_root(&self) -> StoreLocation {
+        self.provider_dir.child("authority")
     }
     pub fn control_socket(&self) -> PathBuf {
         self.provider_dir.join("control.sock")
@@ -87,7 +88,7 @@ impl GrantConfig {
     }
 
     /// Serves no resources and configures no budgets; never supplies permissions.
-    pub fn unconfigured(root: &Path) -> Self {
+    pub fn unconfigured(root: &StoreLocation) -> Self {
         Self {
             provider_dir: Self::provider_dir(root),
             remote_control: Default::default(),
@@ -97,7 +98,7 @@ impl GrantConfig {
     }
 
     /// Provider authority state is fixed under the selected home.
-    pub fn load(path: &Path, home: &Path) -> Result<Self, GrantConfigError> {
+    pub fn load(path: &Path, home: &StoreLocation) -> Result<Self, GrantConfigError> {
         let bytes = hellas_private::read_bounded_regular_file(path, 1 << 20)?;
         let file: ConfigFile = serde_json::from_slice(&bytes)?;
         let remote_control = if file.remote_control && file.remote_control_peers.is_empty() {
@@ -143,6 +144,7 @@ impl GrantConfig {
 mod tests {
     use super::*;
     use hellas_channel::test_support::assert_err;
+    use hellas_private::StoreLocation;
     use serde_json::json;
 
     #[test]
@@ -197,7 +199,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let config = GrantConfig::load(&path, directory.path()).unwrap();
+        let location = StoreLocation::for_test(directory.path());
+        let config = GrantConfig::load(&path, &location).unwrap();
         assert!(config.remote_control.enabled());
     }
 
@@ -207,11 +210,10 @@ mod tests {
         let path = directory.path().join("resources.json");
         let mut config = json!({"max_job_millis":10000,"resources":[]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let loaded = GrantConfig::load(&path, directory.path()).unwrap();
-        assert_eq!(
-            loaded.journal_root(),
-            directory.path().join("provider/authority")
-        );
+        let location = StoreLocation::for_test(directory.path());
+        let loaded = GrantConfig::load(&path, &location).unwrap();
+        let other_location = StoreLocation::for_test(&directory.path().join("provider/authority"));
+        assert_eq!(loaded.journal_root(), other_location.clone());
         assert_eq!(
             loaded.control_private_key(),
             directory.path().join("provider/control.key.der")
@@ -219,7 +221,7 @@ mod tests {
         config["journal_root"] = json!(directory.path().join("elsewhere"));
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert_err!(
-            GrantConfig::load(&path, directory.path()),
+            GrantConfig::load(&path, &location),
             GrantConfigError::Json(_)
         );
     }
@@ -231,7 +233,8 @@ mod tests {
         let mut config = json!({"max_job_millis":10000,"resources":[]});
         let load = |value: &serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            GrantConfig::load(&path, directory.path())
+            let location = StoreLocation::for_test(directory.path());
+            GrantConfig::load(&path, &location)
         };
         assert!(!load(&config).unwrap().remote_control.enabled());
         let peer = iroh::SecretKey::from_bytes(&[1; 32]).public().to_string();
@@ -271,7 +274,8 @@ mod tests {
             "invocation_policy":expected.invocation_policy
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let parsed = GrantConfig::load(&path, directory.path()).unwrap();
+        let location = StoreLocation::for_test(directory.path());
+        let parsed = GrantConfig::load(&path, &location).unwrap();
         assert_eq!(parsed.configuration.resources(), [expected.clone()]);
         assert_eq!(
             parsed.configuration.machine().unwrap().max_in_flight.get(),
@@ -283,7 +287,8 @@ mod tests {
         // account is used exactly once.
         let load = |value: &serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            GrantConfig::load(&path, directory.path())
+            let location = StoreLocation::for_test(directory.path());
+            GrantConfig::load(&path, &location)
         };
         let other = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"other account"));
         for (field, value) in [
@@ -312,7 +317,7 @@ mod tests {
             .unwrap()
             .remove("pricing");
         std::fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
-        assert_err!(GrantConfig::load(&path, directory.path()), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+        assert_err!(GrantConfig::load(&path, &location), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
         for invalid in [
             json!(null),
             json!({"revision":0,"rates":[]}),
@@ -324,10 +329,12 @@ mod tests {
             changed["resources"][0]["pricing"] = invalid;
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
             if malformed_json {
-                assert_err!(GrantConfig::load(&path, directory.path()), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+                let location = StoreLocation::for_test(directory.path());
+                assert_err!(GrantConfig::load(&path, &location), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
             } else {
+                let location = StoreLocation::for_test(directory.path());
                 assert_err!(
-                    GrantConfig::load(&path, directory.path()),
+                    GrantConfig::load(&path, &location),
                     GrantConfigError::Grant(GrantError::Limits)
                 );
             }
@@ -343,8 +350,9 @@ mod tests {
             // Isolate resource validation from unsupported priced meters.
             changed["resources"][0]["pricing"]["rates"] = json!(null);
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            let location = StoreLocation::for_test(directory.path());
             assert_err!(
-                GrantConfig::load(&path, directory.path()),
+                GrantConfig::load(&path, &location),
                 GrantConfigError::Grant(GrantError::Malformed)
             );
         }

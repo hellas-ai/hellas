@@ -1,6 +1,7 @@
 use crate::work_store::grant::NodeStore;
 use hellas_auth::authority::{GrantId, PrincipalId, Revision, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, Signature};
+use hellas_private::StoreLocation;
 use hellas_rpc::*;
 use std::num::NonZeroU64;
 use {
@@ -456,8 +457,9 @@ pub async fn reopen(
     path: &std::path::Path,
     now: u64,
 ) -> Result<NodeStore, crate::work_store::grant::NodeStoreError> {
+    let location = StoreLocation::for_test(path);
     NodeStore::open(
-        path,
+        &location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],

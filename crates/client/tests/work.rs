@@ -12,6 +12,7 @@ use hellas_channel::test_support::channel::{
     CURSOR, PRICE, accept, authorization, client, payload_at, provider, ready, run_to_result,
     store_at,
 };
+use hellas_private::StoreLocation;
 
 use hellas_channel::work::{ClientEndpoint, ProviderEndpoint, WorkService};
 use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
@@ -298,8 +299,9 @@ async fn model_job_restart(provider_held: bool) {
             .index(&weights_path)
             .expect("the provider indexes its weights");
     }
+    let location = StoreLocation::for_test(provider_root.path());
     let mut provider_store = ChannelStore::open(
-        provider_root.path(),
+        &location,
         ready.channel().clone(),
         settlement(),
         Role::Provider,
@@ -531,7 +533,7 @@ async fn model_job_restart(provider_held: bool) {
         );
     }
     let mut provider_store = ChannelStore::open(
-        provider_root.path(),
+        &location,
         ready.channel().clone(),
         settlement(),
         Role::Provider,

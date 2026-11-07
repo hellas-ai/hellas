@@ -1,16 +1,28 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 /// The durable setup journal: the state above, plus the file it is
 /// replayed from.
 #[derive(Debug)]
 pub struct SetupStore {
-    root: PathBuf,
+    root: StoreLocation,
     journal: Journal,
     state: SetupState,
     content: hellas_store::ContentStore,
 }
 
 impl SetupStore {
+    /// Release the journal before another owner opens it.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+    }
+
+    /// Return replayed metadata after releasing the writer.
+    pub async fn into_state(mut self) -> SetupState {
+        self.close().await;
+        self.state
+    }
+
     /// Opens the setup journal for one bond, replaying and re-checking
     /// every record it holds.
     ///
@@ -24,7 +36,7 @@ impl SetupStore {
     /// some other journal, and [`WorkStoreError::Setup`] when a
     /// replayed record does not obey the transition rules.
     pub async fn open<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
@@ -35,7 +47,7 @@ impl SetupStore {
 
     /// Reopen an existing setup without creating a replacement journal.
     pub async fn open_existing<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
@@ -45,7 +57,7 @@ impl SetupStore {
     }
 
     async fn open_inner<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
@@ -75,7 +87,7 @@ impl SetupStore {
         }
         journal.observe_replay(replayed, replay.records.len());
         Ok(Self {
-            root: root.to_path_buf(),
+            root: root.clone(),
             journal,
             state,
             content: hellas_store::ContentStore::new(),
@@ -98,7 +110,7 @@ impl SetupStore {
 
     /// Returns the root under which recovered channel journals are mounted.
     #[must_use]
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &StoreLocation {
         &self.root
     }
 
@@ -108,7 +120,7 @@ impl SetupStore {
         self.state.role
     }
 
-    /// Journals one step, and returns only once it is on the disk.
+    /// Journals one committed step under the configured durability policy.
     ///
     /// The rule this exists to enforce: call it *before* exporting the
     /// revision's signature, and before broadcasting a transaction. A
@@ -337,7 +349,7 @@ pub struct SetupDiscovery {
 /// [`SetupDiscovery::unidentified`], because the journals beside it are
 /// still this node's to open.
 pub async fn discover_setups(
-    root: &Path,
+    root: &StoreLocation,
     network: NetworkId,
 ) -> Result<SetupDiscovery, WorkStoreError> {
     let mut discovery = SetupDiscovery::default();
@@ -364,7 +376,7 @@ fn setup_stem_key(stem: &str) -> Option<[u8; 32]> {
 
 /// Recovers what one setup journal is about, or says why it cannot.
 async fn identify_setup(
-    root: &Path,
+    root: &StoreLocation,
     stem: &str,
     named: [u8; 32],
     network: NetworkId,

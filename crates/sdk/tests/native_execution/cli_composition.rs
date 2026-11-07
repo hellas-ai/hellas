@@ -4,6 +4,7 @@ use hellas_auth::authority::{
     AuthorityId, CredentialHolder, CredentialSecret, GrantId, GrantSpec, NodeKey, Ownership,
 };
 use hellas_authority::test_support::common_node;
+use hellas_private::StoreLocation;
 use hellas_sdk::grant_client::GrantSessionOptions;
 use hellas_sdk::trust_policy::{TrustPolicy, TrustPolicyStore};
 use std::path::Path;
@@ -178,9 +179,10 @@ pub(super) fn run_gateway<'a>(
         };
         let gateway_root = root.join("composition-http-authority");
         let root_grant = GrantId([0; 16]);
+        let location = StoreLocation::for_test(&gateway_root);
         let (node_store, administrator_secret) =
             hellas_authority::work_store::grant::NodeStore::bootstrap(
-                &gateway_root,
+                &location,
                 hellas_authority::model::grant::grant_network(),
                 root_grant,
                 common_node::approval(

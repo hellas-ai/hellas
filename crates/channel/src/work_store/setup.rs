@@ -1,12 +1,13 @@
 //! Durable state for the channel-opening handshake.
 //!
-//! Each signed revision is fsynced before export; recovery resumes from the
+//! Each signed revision is committed before export (flushed in power mode);
+//! recovery resumes from the
 //! retained revision and decides from one coherent observed chain state.
 
 use hellas_kernel::Cursor;
 use hex::encode as hex;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
@@ -250,7 +251,7 @@ pub enum SetupRecord {
         payload: [u8; 32],
     },
     /// An executable revision and everything close-only recovery needs,
-    /// fsynced together before that revision is returned to the peer.
+    /// committed together before that revision is returned to the peer.
     ArmedBundle {
         /// The revision's exact canonical bytes.
         bundle: Vec<u8>,

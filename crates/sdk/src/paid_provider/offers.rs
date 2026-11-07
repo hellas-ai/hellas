@@ -1,5 +1,6 @@
 use hellas_authority::model::grant::records::check_grant_provider;
-use std::path::{Path, PathBuf};
+use hellas_private::StoreLocation;
+use std::path::PathBuf;
 
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
 use hellas_chain::WorkBlocks;
@@ -451,7 +452,7 @@ impl OfferAllocator {
 struct ProvisionOptions {
     /// Chain and journal identity.
     network: NetworkId,
-    journal_root: PathBuf,
+    journal_root: StoreLocation,
     policy: ProviderChannelPolicy,
     omission_bond: u64,
     payment_funding: Funding,
@@ -513,7 +514,7 @@ struct Provisioned {
 /// Deterministic bond inputs, checked before a signature is journaled.
 struct BondCandidate {
     network: NetworkId,
-    journal_root: PathBuf,
+    journal_root: StoreLocation,
     bond_edge: EdgeId,
     bond_funding: Funding,
     bond_terms: WorkStakeBondTerms,
@@ -675,7 +676,7 @@ impl Offer {
         write_started.store(true, std::sync::atomic::Ordering::Release);
         {
             let mut store = open_provider_journal(&journal_root, network, bond_edge).await?;
-            store
+            let written = store
                 .commit(
                     SetupRecord::Offer {
                         peer,
@@ -684,15 +685,18 @@ impl Offer {
                     },
                     &Secp256k1Verifier::new(),
                 )
-                .await?;
+                .await
+                .map(|_| ());
+            store.close().await;
+            written?;
         }
 
         // Reopen with the same replay and signature checks used at startup.
         let reopened = open_provider_journal(&journal_root, network, bond_edge).await?;
-        let state = reopened.state();
+        let state = reopened.into_state().await;
         let (Some(1), Some(floor)) = (state.revision(), state.scan_armed()) else {
             return Err(ProvisionError::JournalReplay {
-                root: journal_root,
+                root: journal_root.into_path_buf(),
                 revision: state.revision(),
                 floor: state.scan_armed().map(|scan| scan.height),
             });
@@ -710,7 +714,7 @@ impl Offer {
 }
 
 async fn open_provider_journal(
-    root: &Path,
+    root: &StoreLocation,
     network: NetworkId,
     bond_edge: EdgeId,
 ) -> Result<SetupStore> {
@@ -723,7 +727,7 @@ async fn open_provider_journal(
     )
     .await
     .map_err(|source| ProvisionError::Journal {
-        root: root.into(),
+        root: root.to_path_buf(),
         source,
     })
 }

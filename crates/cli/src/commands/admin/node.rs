@@ -9,6 +9,7 @@ use hellas_authority::model::grant::admin::{
     MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply,
 };
 use hellas_authority::model::grant::records::{decode_enrollment, grant_transport};
+use hellas_private::StoreLocation;
 use hellas_rpc::{
     pb::host::{
         BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
@@ -30,7 +31,7 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 /// Offline inspection neither loads nor creates a machine identity or passkey.
-pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
+pub async fn inspect_offline(args: AdminArgs, home: &StoreLocation) -> Result<()> {
     if let AdminCommand::InspectOffline { journal, command } = &args.command {
         ensure!(
             args.profile.is_none()
@@ -41,7 +42,7 @@ pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
         );
         let query: hellas_auth::authority::InspectionQuery = read(command)?;
         let inspection = NodeStore::inspect_offline(
-            journal,
+            &home.child(journal),
             hellas_authority::model::grant::grant_network(),
             &query,
         )
@@ -59,7 +60,7 @@ pub async fn run(
     args: AdminArgs,
     identity: &LocalIdentity,
     passkey: Option<&dyn Authenticator>,
-    home: &Path,
+    home: &StoreLocation,
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
         ensure!(
@@ -86,7 +87,7 @@ pub async fn run(
                 "offline initialization does not connect to a daemon"
             );
             let passkey = passkey.context("offline initialization requires --passkey")?;
-            return offline(args.command, identity, passkey).await;
+            return offline(args.command, identity, passkey, home).await;
         }
         _ => {}
     }
@@ -431,6 +432,7 @@ async fn offline(
     command: AdminCommand,
     identity: &LocalIdentity,
     passkey: &dyn Authenticator,
+    home: &StoreLocation,
 ) -> Result<()> {
     let (state, root, revision, bearer) = match command {
         AdminCommand::Bootstrap {
@@ -477,7 +479,7 @@ async fn offline(
     let (secret, revision) = match (root, revision) {
         (Some(root), None) => {
             let (store, secret) = NodeStore::bootstrap(
-                &journal,
+                &home.child(&journal),
                 network,
                 root,
                 approve(Ownership::Bootstrap { root, target: None }).await?,
@@ -509,7 +511,7 @@ async fn offline(
         }
         (None, Some(expected)) => {
             let (record, secret) = NodeStore::recover_offline(
-                &journal,
+                &home.child(&journal),
                 network,
                 expected,
                 approve(Ownership::Recover { expected }).await?,

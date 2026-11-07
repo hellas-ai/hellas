@@ -9,6 +9,7 @@ use hellas_channel::work::{
     admission::{CapacityDomain, WorkPermit},
 };
 use hellas_channel::work_store::{Role, SetupAbort, SetupEnd, SetupStore};
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, OfferRefusalCode, RequestOfferRequest, RequestOfferResponse,
     exchange_setup_response, request_offer_response::Outcome,
@@ -364,8 +365,9 @@ impl Provider {
         identity: NodeIdentity,
     ) -> Self {
         let enrollment = provider_enrollment(&identity);
+        let location = StoreLocation::for_test(&root.join("authority"));
         let store = NodeStore::open(
-            &root.join("authority"),
+            &location,
             hellas_authority::model::grant::grant_network(),
             Some(enrollment.clone()),
             UnixMillis(1),
@@ -1982,8 +1984,9 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             .unwrap()
             .to_string(),
     );
+    let location = StoreLocation::for_test(&interrupted_root);
     let mut interrupted = SetupStore::open(
-        &interrupted_root,
+        &location,
         devnet.network(),
         third.offer().proposal.bond_edge(),
         Role::Client,
@@ -2177,6 +2180,7 @@ fn grant_composition<'a>(
                 apple_app_attest: None,
             })
             .unwrap();
+        let location = StoreLocation::for_test(&data_root.join("channels"));
         let options = GrantSessionOptions {
             target,
             principal: subject,
@@ -2187,7 +2191,7 @@ fn grant_composition<'a>(
                 credential,
                 local: None,
             }),
-            journal_root: data_root.join("channels"),
+            journal_root: location.clone(),
             control_timeout: Duration::from_secs(10),
         };
         let transport = bind_paid_endpoint(iroh::SecretKey::generate())
@@ -2239,7 +2243,7 @@ fn grant_composition<'a>(
             if cli_binary.is_some() { 2 } else { 1 },
         )
         .await;
-        other.options.journal_root = data_root.join("channels");
+        other.options.journal_root = location;
         if let Some(binary) = cli_binary.as_deref() {
             super::cli_composition::run_gateway(binary, root, &options, &other, &data_root).await;
         }
@@ -2452,8 +2456,9 @@ async fn finish(case: Box<Case>) {
     }).await.expect("the unanswered offer durably expires at its horizon");
     drop(transport);
     provider.shutdown().await;
+    let location = StoreLocation::for_test(&config.chain.provider().join("channels"));
     let store = SetupStore::open(
-        &config.chain.provider().join("channels"),
+        &location,
         devnet.network(),
         third.offer().proposal.bond_edge(),
         Role::Provider,

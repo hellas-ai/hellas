@@ -1,11 +1,12 @@
 use super::*;
 use hellas_chain::genesis::Chain;
+use hellas_private::StoreLocation;
 
 #[test]
 fn a_single_authenticated_route_is_usable() {
     let root = tempfile::tempdir().unwrap();
-    let mut config =
-        WorkConfig::for_chain(ChainProfile::known(Chain::Devnet), root.path()).unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let mut config = WorkConfig::for_chain(ChainProfile::known(Chain::Devnet), &location).unwrap();
     config.chain = config
         .chain
         .with_validators(vec![" WSS://EXAMPLE.COM:443 ".into()])
@@ -33,7 +34,8 @@ fn custom_full_genesis_can_derive_h0_at_node_start() {
         genesis_json,
     })
     .unwrap();
-    let node = WorkConfig::for_chain(profile, root.path())
+    let location = StoreLocation::for_test(root.path());
+    let node = WorkConfig::for_chain(profile, &location)
         .unwrap()
         .node_config(None)
         .unwrap();
@@ -92,7 +94,8 @@ fn paid_client_accepts_scheduled_keys_while_static_node_rejects_them() {
         genesis_json,
     })
     .unwrap();
-    let config = WorkConfig::for_chain(profile, root.path()).unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let config = WorkConfig::for_chain(profile, &location).unwrap();
     assert!(config.node_config(None).is_err());
     let error = config.threshold_identity().unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));

@@ -218,6 +218,7 @@ fn read_file(file: hellas_store::VerifiedFile) -> Result<Arc<Vec<u8>>, ContentEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
 
     #[test]
     fn ephemeral_reads_are_hash_derived_bounded_and_never_expose_a_retained_store() {
@@ -268,7 +269,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = ContentStore::new();
         let bytes = b"retained-view-bytes";
-        store.put(root.path(), bytes).unwrap();
+        let location = StoreLocation::for_test(root.path());
+        store.put(&location, bytes).unwrap();
         let reference = ContentRef::for_bytes(bytes);
         let view = InvocationContent::Retained(store);
         assert!(view.retained_store().is_some());

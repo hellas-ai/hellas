@@ -1,6 +1,7 @@
 use super::*;
 use axum::{Router, routing::get};
 use hellas_auth::{Digest, authority::*};
+use hellas_private::StoreLocation;
 use tower::ServiceExt;
 use {
     hellas_authority::node::GATEWAY_INVOKE, hellas_authority::node::host_resource,
@@ -34,8 +35,9 @@ impl Fixture {
             (99_000, 0),
             &[],
         );
+        let location = StoreLocation::for_test(root.path());
         let (store, admin) = NodeStore::bootstrap(
-            root.path(),
+            &location,
             hellas_authority::model::grant::grant_network(),
             ROOT_GRANT,
             hellas_authority::test_support::common_node::approval_for(

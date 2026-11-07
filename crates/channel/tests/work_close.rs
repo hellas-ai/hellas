@@ -16,6 +16,7 @@
 
 use hellas_channel::test_support::channel::NONCE;
 use hellas_channel::test_support::transport::transport_pair;
+use hellas_private::StoreLocation;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use support::temp;
 
@@ -1797,13 +1798,14 @@ fn adjudicated(ready: &ReadyChannel, payout: u64) -> hellas_kernel::Tx {
 /// could be counted from.
 async fn journal_records(root: &std::path::Path) -> usize {
     use hellas_channel::work_store::journal::Journal;
-    let Ok(stems) = Journal::stems(root) else {
+    let location = StoreLocation::for_test(root);
+    let Ok(stems) = Journal::stems(&location) else {
         panic!("the journal directory reads");
     };
     let Some(stem) = stems.iter().find(|stem| stem.starts_with("channel-")) else {
         panic!("the channel journal exists");
     };
-    match Journal::inspect(root, stem).await {
+    match Journal::inspect(&location, stem).await {
         Ok((_, replay)) => replay.records.len(),
         Err(error) => panic!("the journal is readable: {error}"),
     }
@@ -3371,8 +3373,9 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
 /// close-only channel. Nothing here calls `check_ready`, and on these
 /// channels nothing could.
 async fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
+    let location = StoreLocation::for_test(root);
     let mut store = match ChannelStore::open(
-        root,
+        &location,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
@@ -3742,7 +3745,7 @@ async fn a_close_step_samples_its_tip_its_blocks_and_its_prepared_fsync() {
         Some(start.valid_through_height().to_string().as_str()),
     );
     assert!(
-        !samples.of("fsync_tail_ms").is_empty(),
+        !samples.of("append_commit_ms").is_empty(),
         "the journal's own append is sampled under it, as its own term",
     );
 
@@ -3847,7 +3850,7 @@ async fn a_restart_samples_the_replay_it_ran() {
 ///
 /// `response_build_ms` is `Wresp`'s signing term and nothing else: the
 /// record that fixes the answer is counted separately, as one of the
-/// three fsyncs. A contest this endpoint cannot answer is refused before
+/// three commits. A contest this endpoint cannot answer is refused before
 /// anything is built, and a term nothing spent time on contributes
 /// nothing.
 #[tokio::test]

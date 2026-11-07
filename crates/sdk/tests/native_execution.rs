@@ -11,6 +11,7 @@
 //! produces signed source history and the upstream HTTP response is a fixture.
 //! Money is read back from the finalized source state and the real executing node.
 
+use hellas_private::StoreLocation;
 // The executor re-executes this binary as its Catena compile child.
 #[ctor::ctor(unsafe)]
 fn catena_child() {
@@ -338,13 +339,14 @@ async fn start_provider(
     identity: &NodeIdentity,
 ) -> (hellas_sdk::ProviderHandle, PausedFetch) {
     let (routes, upstream) = routes();
+    let location = StoreLocation::for_test(&root.join("provider-state"));
     let provider = start_fetch_provider(
         FetchProviderOptions {
             port: Some(0),
             identity: identity.clone(),
             enrollment: provider_enrollment(identity),
             root: Arc::new(SoftwareRoot),
-            home: root.join("provider-state"),
+            home: location,
             grants: Some(hellas_sdk::GrantProviderOptions {
                 configuration: Default::default(),
                 max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
@@ -811,11 +813,10 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     devnet.seal().await;
 
     // The owner stores standing policy once; no client route or bond exists.
+    let location = StoreLocation::for_test(&root.path().join("provider-state"));
     let (store, secret) =
         hellas_authority::test_support::common_node::bootstrap_node_with_credential(
-            &hellas_sdk::grant_config::GrantConfig::journal_dir(
-                &root.path().join("provider-state"),
-            ),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(&location),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment(&identity)),
             now,

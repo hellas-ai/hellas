@@ -13,6 +13,7 @@ hellas-auth.workspace = true
 hellas-authority.workspace = true
 hellas-channel.workspace = true
 hellas-executor.workspace = true
+hellas-private.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch", "work"] }
 hellas-sdk.workspace = true

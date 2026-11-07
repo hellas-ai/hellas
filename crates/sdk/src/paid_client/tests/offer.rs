@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::{PaidFixture, enrollment, signer};
 use hellas_channel::model::offer::{PaidOffer, SignedPaidOffer};
 use hellas_channel::work::ObservationTime;
+use hellas_private::StoreLocation;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
 use std::sync::Arc;
@@ -311,13 +312,14 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             }
         }).await.unwrap();
         assert_eq!(backend_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let location = StoreLocation::for_test(&fixture.root.path().join("grant-client"));
         let mut authorized = crate::grant_client::GrantSession::open(
             GrantSessionOptions {
                 target: grant_target,
                 principal: principal(1).0,
                 signer: Arc::new(principal(1).1),
                 application,
-                journal_root: fixture.root.path().join("grant-client"),
+                journal_root: location,
                 control_timeout: Duration::from_secs(5),
             },
             GrantTransport::Remote(client_endpoint.clone()),

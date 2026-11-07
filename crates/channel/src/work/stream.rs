@@ -478,6 +478,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
 
     #[test]
     fn incremental_spool_size_matches_wire_encoding_at_array_boundaries() {
@@ -584,8 +585,9 @@ mod tests {
         .await
         .expect("the detached durable append finishes and the journal remains writable");
         drop(service);
+        let location = StoreLocation::for_test(provider_root.path());
         let store = ChannelStore::open(
-            provider_root.path(),
+            &location,
             ready.channel().clone(),
             fixture::settlement(),
             Role::Provider,

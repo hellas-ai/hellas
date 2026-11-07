@@ -88,6 +88,7 @@ pub enum HostError {
 }
 
 pub struct HostHandle {
+    node: Option<NodeCoordinator>,
     pub(super) runtime: Runtime,
     listener: Option<hellas_wire::local::LocalControlServer>,
     stop: watch::Sender<bool>,
@@ -164,6 +165,7 @@ impl HostHandle {
             has_gateway: options.gateway.is_some() || deferred.is_some(),
             endpoint: watch::channel(None).0,
         };
+        let node = options.control.as_ref().map(|(node, _)| node.clone());
         let (control, listener) = if let Some((node, config)) = options.control {
             let mut control = NodeControl::new(node).with_remote_admission(config.remote);
             control.host = Some(runtime.clone());
@@ -207,6 +209,7 @@ impl HostHandle {
                 .or(deferred),
         ));
         let host = Self {
+            node,
             runtime,
             transport: remote,
             listener,
@@ -256,12 +259,16 @@ impl HostHandle {
             .await
             .map_err(HostError::from)
             .and_then(|result| result);
+        let mut result = listener.and(stopped);
         // Accepted remote Work drains while the host-owned endpoint is alive.
         if let Some((endpoint, task)) = self.transport.take() {
             endpoint.close().await;
-            task.await?;
+            result = result.and(task.await.map_err(HostError::from));
         }
-        listener.and(stopped)
+        if let Some(node) = self.node.take() {
+            node.close().await;
+        }
+        result
     }
 }
 impl Drop for HostHandle {

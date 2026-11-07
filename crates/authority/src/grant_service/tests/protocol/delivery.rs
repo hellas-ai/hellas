@@ -1,5 +1,6 @@
 use super::*;
 use hellas_channel::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
+use hellas_private::StoreLocation;
 use std::{future::Future, io, task::Poll, time::Duration};
 
 pub(super) fn delivery_request(a: &GrantJobAuthorizationV1, id: Digest) -> StreamResultRequest {
@@ -385,8 +386,9 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                 let (service, work) = if recovered {
                     drop(work);
                     drop(service);
+                    let location = StoreLocation::for_test(dir.path());
                     let store = NodeStore::open(
-                        dir.path(),
+                        &location,
                         network(),
                         Some(hellas_channel::test_support::software_enrollment(
                             2, [2; 32],

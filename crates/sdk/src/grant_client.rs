@@ -14,6 +14,7 @@ use hellas_channel::content::InvocationContent;
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     InvocationPolicy, PreparedInvocation, output::StreamVerifier,
 };
@@ -34,7 +35,6 @@ use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
 use iroh::{Endpoint, EndpointId};
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -250,7 +250,7 @@ pub struct GrantSessionOptions {
     /// The node key the application credential is bound to; it signs every job.
     pub signer: Arc<ProducerSigningKey>,
     pub application: Arc<ClientProfile>,
-    pub journal_root: PathBuf,
+    pub journal_root: StoreLocation,
     /// Bounds connection/control calls and terminal-delivery grace.
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
@@ -565,7 +565,9 @@ impl GrantSession {
             Self::query_standing(&target, client, options.control_timeout, &link).await?;
         let offer = standing.offer;
         let channel = offer.offer().channel(client);
-        let path = options.journal_root.join(hex::encode(channel.0.as_bytes()));
+        let path = options
+            .journal_root
+            .child(hex::encode(channel.0.as_bytes()));
         let store = GrantClientStore::open(
             &path,
             target.network,
@@ -1215,11 +1217,12 @@ impl GrantSession {
             Ok(())
         };
         let drained = if let SessionTransport::Local { service, .. } = &self.transport {
-            service.drain().await.map_err(GrantClientError::from)
+            service.shutdown().await.map_err(GrantClientError::from)
         } else {
             Ok(())
         };
         self.transport = SessionTransport::Closed;
+        self.store.close().await;
         drained.and(recovered)
     }
 }

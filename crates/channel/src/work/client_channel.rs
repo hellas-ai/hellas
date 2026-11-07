@@ -28,6 +28,17 @@ pub struct ClientService {
 }
 
 impl ClientService {
+    /// Release the journal once the request owner has joined its observer.
+    pub async fn close(&mut self) {
+        self.observer
+            .endpoint
+            .lock_for_shutdown()
+            .await
+            .store
+            .close()
+            .await;
+    }
+
     /// Starts sharing an already opened journal with its observer.
     #[must_use]
     pub fn new(mut endpoint: ClientEndpoint) -> Self {

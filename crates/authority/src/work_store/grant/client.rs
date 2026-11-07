@@ -16,11 +16,11 @@ use hellas_channel::work_store::journal::{
 };
 use hellas_channel::work_store::{Applied, JobBook, JobPhase, JobState, Role};
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::invocation::{InvocationPolicy, PreparedInvocation};
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
-use std::path::{Path, PathBuf};
 
 const NAMESPACE: &str = "hellas.work.grant-client.v2";
 const MAX_JOBS: usize = 256;
@@ -28,7 +28,7 @@ const JOURNAL_STEM: &str = "grant-client";
 
 pub struct GrantClientStore {
     journal: Journal,
-    directory: PathBuf,
+    directory: StoreLocation,
     context: WorkContext,
     channel: GrantChannelState,
     provider: ProviderEnrollmentBundle,
@@ -89,6 +89,11 @@ struct StoredJob {
     result: Option<SignedResult>,
 }
 impl GrantClientStore {
+    /// Release the client writer before this channel is reopened.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+    }
+
     fn replayer(&self) -> GrantReplayer {
         GrantReplayer {
             context: self.context,
@@ -99,7 +104,7 @@ impl GrantClientStore {
     /// Replay a grant journal read-only with its expected identities. This
     /// does not tick its clock or create a journal.
     pub async fn inspect_work(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         provider: ProviderEnrollmentBundle,
         channel: GrantChannelState,
@@ -140,7 +145,7 @@ impl GrantClientStore {
     /// The channel's node key, which this client's credential is bound to,
     /// signs every proposal on behalf of the channel's principal.
     pub async fn open(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         provider: ProviderEnrollmentBundle,
         channel: GrantChannelState,
@@ -168,7 +173,7 @@ impl GrantClientStore {
             Journal::open_latest(directory, JOURNAL_STEM, journal_id(&channel)).await?;
         let mut store = Self {
             journal,
-            directory: directory.into(),
+            directory: directory.clone(),
             context,
             channel,
             provider,

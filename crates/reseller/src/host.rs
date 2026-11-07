@@ -1,11 +1,12 @@
 //! Vendor composition uses SDK's checked Fetch service and its existing authority store.
+use hellas_private::StoreLocation;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     GrantProviderOptions, NodeIdentity, ProviderError, ProviderHandle, RootProver,
     start_fetch_provider,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiProviderError {
@@ -27,7 +28,7 @@ pub struct OpenAiProviderOptions<R> {
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     /// Process home; the SDK derives chain-agnostic grant state beneath it.
-    pub home: PathBuf,
+    pub home: StoreLocation,
     pub service: String,
     pub method: String,
     pub bearer_token: String,

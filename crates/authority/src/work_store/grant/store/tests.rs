@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{accept, proposal, setup};
 use hellas_auth::assert_err;
+use hellas_private::StoreLocation;
 
 impl NodeStore {
     pub(crate) async fn pause_next_statement(
@@ -45,8 +46,9 @@ async fn a_poisoned_writer_refuses_new_acceptance_until_reopen() {
     );
     assert_eq!(store.state(), &before);
     drop(store);
+    let location = StoreLocation::for_test(directory.path());
     let mut store = NodeStore::open(
-        directory.path(),
+        &location,
         hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
@@ -74,9 +76,9 @@ async fn old_checkpoint_cannot_bypass_the_journal_format_boundary() {
         .await
         .unwrap();
     drop(store);
+    let location = StoreLocation::for_test(directory.path());
     assert!(matches!(
-        NodeStore::open_initialized(directory.path(), hellas_channel::test_support::network())
-            .await,
+        NodeStore::open_initialized(&location, hellas_channel::test_support::network()).await,
         Err(NodeStoreError::Malformed)
     ));
 }

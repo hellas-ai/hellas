@@ -1,5 +1,6 @@
 use super::*;
 use clap::Parser as _;
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
@@ -18,9 +19,10 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let location = StoreLocation::for_test(&root.path().join("provider"));
     let mut paid = PaidWork::load(
         &example,
-        root.path().join("provider"),
+        location,
         None,
         None,
         hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
@@ -28,7 +30,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     .unwrap();
     let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);
     assert!(
-        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+        paid.prepare(&config, &identity.enrollment, &identity.node_key,)
             .await
             .is_err()
     );
@@ -48,7 +50,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
         .unwrap();
     let owner = paid.owner.take();
     assert!(
-        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+        paid.prepare(&config, &identity.enrollment, &identity.node_key,)
             .await
             .is_err()
     );
@@ -86,13 +88,13 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     assert_eq!(admin.node().paid_policy().await.unwrap().unwrap(), approved);
     drop(admin);
     assert!(
-        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+        paid.prepare(&config, &identity.enrollment, &identity.node_key,)
             .await
             .is_err()
     );
     paid.policy.offers.max_open_offers -= 1;
     assert!(
-        paid.prepare(&config, &identity.enrollment, &identity.node_key)
+        paid.prepare(&config, &identity.enrollment, &identity.node_key,)
             .await
             .unwrap()
             .is_none()
@@ -152,9 +154,10 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
         .unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
+    let location = StoreLocation::for_test(&root.path().join("provider"));
     let paid = PaidWork::load(
         &example,
-        root.path().join("provider"),
+        location,
         Some(owner),
         None,
         hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
@@ -287,9 +290,10 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
     )
     .unwrap();
 
+    let location = StoreLocation::for_test(&root.path().join("provider"));
     let paid = PaidWork::load(
         &terms_path,
-        root.path().join("provider"),
+        location,
         Some(owner),
         Some(&fetch_path),
         hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),

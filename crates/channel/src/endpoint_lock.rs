@@ -25,6 +25,12 @@ impl<T> EndpointLock<T> {
         })))
     }
 
+    /// Borrow only to release resources after users have stopped, even after panic.
+    /// This does not clear poison or authorize recovery of cached state.
+    pub async fn lock_for_shutdown(&self) -> EndpointGuard<'_, T> {
+        EndpointGuard(self.0.lock().await)
+    }
+
     pub async fn lock(&self) -> Result<EndpointGuard<'_, T>, ()> {
         let held = self.0.lock().await;
         if held.failed {

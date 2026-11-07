@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn durability_is_global_and_defaults_to_crash() {
+    use hellas_private::Durability;
+    for args in [
+        vec![
+            "hellas",
+            "--durability",
+            "power",
+            "identity",
+            "show-node-id",
+        ],
+        vec![
+            "hellas",
+            "identity",
+            "show-node-id",
+            "--durability",
+            "power",
+        ],
+        vec!["hellas", "serve", "--durability", "power"],
+    ] {
+        assert_eq!(
+            Cli::try_parse_from(args).unwrap().durability,
+            Durability::Power
+        );
+    }
+    assert_eq!(
+        Cli::try_parse_from(["hellas", "identity", "show-node-id"])
+            .unwrap()
+            .durability,
+        Durability::Crash,
+    );
+}
+
+#[test]
 fn image_cli_and_gateway_surfaces_are_available() {
     let convert = Cli::try_parse_from([
         "hellas",

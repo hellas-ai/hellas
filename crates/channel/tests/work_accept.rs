@@ -6,6 +6,7 @@
 //! transport, so the request is framed, routed by method id, decoded,
 //! and answered rather than handed to a function.
 
+use hellas_private::StoreLocation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use support::temp;
@@ -73,8 +74,9 @@ async fn store_with(
     role: Role,
     settlement: WorkPaymentSettlement,
 ) -> ChannelStore {
+    let location = StoreLocation::for_test(root);
     match ChannelStore::open(
-        root,
+        &location,
         ready().channel().clone(),
         settlement,
         role,
@@ -1901,8 +1903,9 @@ async fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
         payment_edge: elsewhere.payment_edge(),
         ..origin()
     };
+    let location = StoreLocation::for_test(fourth.path());
     let Ok(other_store) = ChannelStore::open(
-        fourth.path(),
+        &location,
         elsewhere,
         settlement(),
         Role::Provider,

@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 mod expiry;
 
 use super::*;
@@ -650,7 +651,8 @@ async fn renamed_policy_keeps_the_selected_resource() {
     let fixture = Fixture::builder().build().await;
     let journal = tempfile::tempdir().unwrap();
     let mut options = fixture.host.options(vec![]);
-    options.journal_root = journal.path().to_owned();
+    let location = StoreLocation::for_test(journal.path());
+    options.journal_root = location;
     let source = GrantSource::open(
         options,
         GrantTransport::Local(fixture.host.world.service.clone()),
@@ -840,7 +842,8 @@ async fn source_start_failure_does_not_close_shared_endpoint() {
         .host
         .options(fixture.remote.as_ref().unwrap().addresses());
     let journal = tempfile::tempdir().unwrap();
-    options.journal_root = journal.path().to_owned();
+    let location = StoreLocation::for_test(journal.path());
+    options.journal_root = location;
     assert!(
         GrantSource::open(
             options.clone(),

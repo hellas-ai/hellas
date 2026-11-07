@@ -1,14 +1,14 @@
 //! Normal node startup with one explicit owner-pairing interval.
 use crate::identity::LocalIdentity;
 use anyhow::{Context, Result};
+use hellas_private::StoreLocation;
 use hellas_sdk::{
     grant_config::GrantConfig,
     node_control::{RemoteControlAdmission, bootstrap},
 };
-use std::path::Path;
 
 pub async fn prepare(
-    home: &Path,
+    home: &StoreLocation,
     identity: &LocalIdentity,
     port: Option<u16>,
     configured: Option<GrantConfig>,
@@ -29,8 +29,8 @@ pub async fn prepare(
     )
     .await
     {
-        Ok(store) => {
-            drop(store);
+        Ok(mut store) => {
+            store.close().await;
             return Ok((config, None));
         }
         Err(hellas_authority::work_store::grant::NodeStoreError::Uninitialized) => {}

@@ -2,6 +2,7 @@
 use crate::{grant_client::*, node_control::profile::ClientProfile};
 use hellas_auth::authority::*;
 use hellas_authority::model::grant::records::{GrantDef, Offer, SignedOffer};
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use std::sync::Arc;
 use {
@@ -68,12 +69,13 @@ impl Host {
                 apple_app_attest: None,
             })
             .unwrap();
+        let location = StoreLocation::for_test(&self.root.path().join("client"));
         GrantSessionOptions {
             target,
             principal: FRIEND.principal(),
             signer: Arc::new(FRIEND.node_key()),
             application: self.application.clone(),
-            journal_root: self.root.path().join("client"),
+            journal_root: location,
             // Control calls stay bounded independently of the signed job limit.
             control_timeout: std::time::Duration::from_secs(5),
         }

@@ -9,6 +9,7 @@ use hellas_channel::test_support::{
     network, principal, software_enrollment, test_responses_contract,
 };
 use hellas_client::ProviderTrustAnchor;
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
 use hellas_sdk::node_control::profile::ClientProfile;
@@ -98,6 +99,7 @@ async fn granted_compute_executes_through_the_native_facade() {
             apple_app_attest: None,
         })
         .unwrap();
+    let location = StoreLocation::for_test(&root.path().join("client"));
     let options = GrantSessionOptions {
         target,
         principal: principal(1).0,
@@ -108,7 +110,7 @@ async fn granted_compute_executes_through_the_native_facade() {
             credential,
             local: None,
         }),
-        journal_root: root.path().join("client"),
+        journal_root: location,
         control_timeout: Duration::from_secs(5),
     };
     let environment = hellas_channel::test_support::channel::environment();
@@ -261,12 +263,13 @@ async fn local_grant_session_executes_without_http() {
     };
     let path = root.path().join("attempt.json");
     let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(&path, &input, terms).unwrap();
+    let location = StoreLocation::for_test(&root.path().join("client"));
     let options = GrantSessionOptions {
         target,
         principal: principal(1).0,
         signer: Arc::new(principal(1).1),
         application: profile,
-        journal_root: root.path().join("client"),
+        journal_root: location,
         control_timeout: Duration::from_secs(5),
     };
     let mut session = attempt

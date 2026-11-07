@@ -3,6 +3,7 @@ use anyhow::{Context as _, bail, ensure};
 use clap::Args;
 use hellas_auth::ProducerSigningKey;
 use hellas_kernel::Secp256k1Signer;
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use hellas_sdk::{
     execution::{
@@ -177,7 +178,7 @@ pub struct Context {
     pub settlement: Secp256k1Signer,
     pub producer: ProducerSigningKey,
     pub owner: hellas_kernel::SoftPasskey,
-    pub home: PathBuf,
+    pub home: StoreLocation,
     pub chain: hellas_chain::chain_dir::ChainDir,
 }
 
@@ -185,7 +186,7 @@ impl Context {
     pub(crate) fn new(
         identity: &crate::identity::LocalIdentity,
         owner: Option<&hellas_kernel::SoftPasskey>,
-        home: &Path,
+        home: &StoreLocation,
         chain: &hellas_chain::genesis::ChainProfile,
     ) -> super::CliResult<Self> {
         Ok(Self {
@@ -195,8 +196,8 @@ impl Context {
             owner: owner
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
-            home: home.to_path_buf(),
-            chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
+            home: home.clone(),
+            chain: hellas_chain::chain_dir::ChainDir::open(home, chain, home.durability())?,
         })
     }
 }
@@ -209,7 +210,7 @@ impl ClientArgs {
     }
 
     fn root(&self, context: &Context) -> PathBuf {
-        context.chain.client()
+        context.chain.client().into_path_buf()
     }
     fn owner(
         &self,

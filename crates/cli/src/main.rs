@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use hellas_private::StoreLocation;
 #[macro_use]
 extern crate tracing;
 
@@ -122,6 +123,10 @@ struct Cli {
     /// Process state home (default: HELLAS_HOME or $HOME/.hellas).
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
+
+    /// Journal durability: process crashes only, or also OS crash/power loss.
+    #[arg(long, global = true, default_value = "crash")]
+    durability: hellas_private::Durability,
 
     /// Choose the software platform root when a command creates an identity.
     #[arg(long = "software-root", global = true)]
@@ -518,7 +523,7 @@ async fn async_main() {
     // bypasses the requested log file.
     let cli = Cli::parse();
     let home = match identity::resolve_home(cli.home.as_deref()) {
-        Ok(home) => home,
+        Ok(home) => StoreLocation::from_home(&home, cli.durability),
         Err(error) => {
             eprintln!("error: {error:#}");
             std::process::exit(2);
@@ -676,7 +681,7 @@ async fn async_main() {
                 ..
             },
         ) => {
-            let result = commands::admin::inspect_offline(args).await;
+            let result = commands::admin::inspect_offline(args, &home).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -1056,12 +1061,14 @@ async fn async_main() {
                 "--grant-policy requires a remote or local allowance"
             );
             let hellas_sdk::node_control::profile::GatewayHost {
-                access, control, ..
-            } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                node,
+                access,
+                control,
+            } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(
                 gateway_profile.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--gateway-profile is required to serve HTTP")
                 })?,
-            )
+            ))
             .await?;
             let http = http_fetch_config
                 .map(
@@ -1191,10 +1198,12 @@ async fn async_main() {
             let served = hellas_gateway::wait_for_shutdown(gateway)
                 .await
                 .map_err(anyhow::Error::from);
-            match control {
+            let stopped = match control {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,
-            }
+            };
+            node.close().await;
+            stopped
         }
         .await,
         Commands::Rpc {

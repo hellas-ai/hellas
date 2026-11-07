@@ -1,5 +1,6 @@
 use super::*;
 use crate::grant_service::ResultCache;
+use hellas_private::StoreLocation;
 
 pub(super) fn cached(service: &GrantService, id: Digest) -> Arc<ResultCache> {
     service
@@ -189,8 +190,9 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
     drop(work);
     drop(service);
     // Keep the cache handle alive: neither it nor its timer may retain the writer.
+    let location = StoreLocation::for_test(dir.path());
     let reopened = NodeStore::open(
-        dir.path(),
+        &location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],

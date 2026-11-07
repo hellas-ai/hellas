@@ -1,5 +1,6 @@
 use super::*;
 use hellas_channel::content::UploadQuota;
+use hellas_private::StoreLocation;
 use hellas_rpc::{
     ContentRef, pb::work::UploadContentRequest, protocol::content_upload::chunk_digest,
 };
@@ -381,10 +382,11 @@ async fn malformed_first_grant_chunks_release_quota_and_cannot_retain_the_writer
     );
     drop(work);
     drop(service);
+    let location = StoreLocation::for_test(root.path());
     let _reopened = tokio::time::timeout(
         Duration::from_millis((future_auth.acceptance_deadline_ms.0 - 1000) / 4),
         NodeStore::open(
-            root.path(),
+            &location,
             common::network(),
             Some(common::software_enrollment(2, [2; 32])),
             UnixMillis(1000),

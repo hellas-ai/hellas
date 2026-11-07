@@ -26,6 +26,7 @@ use hellas_kernel::{
     PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, Tx,
     WorkPaymentTerms, WorkStakeBondTerms,
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefusalCode, WorkRefused,
     exchange_setup_response::Outcome,
@@ -181,8 +182,9 @@ async fn endpoint(
     signer: Secp256k1Signer,
     admission: PaymentAdmission,
 ) -> SetupEndpoint {
+    let location = StoreLocation::for_test(root);
     let store = match SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         role,
@@ -246,8 +248,9 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
 
 /// Reopens one setup journal over its own files.
 async fn reopen(root: &std::path::Path, role: Role) -> SetupStore {
+    let location = StoreLocation::for_test(root);
     match SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         role,

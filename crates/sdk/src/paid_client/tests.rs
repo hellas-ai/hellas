@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::enrollment;
+use hellas_private::StoreLocation;
 mod offer;
 mod recovery;
 use hellas_auth::{ProducerSigningKey, PublicKey};
@@ -561,8 +562,9 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
             PartyAuth::owner(Auth::native(provider.sign(hash))),
         )
         .unwrap();
+        let location = StoreLocation::for_test(&root.path().join(name));
         let store = SetupStore::open(
-            &root.path().join(name),
+            &location,
             fixture.config.network(),
             proposal.bond_edge(),
             Role::Client,

@@ -1,4 +1,5 @@
 //! Proposal-scoped content transport. Only compute content may reach disk.
+use hellas_private::StoreLocation;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read as _,
@@ -192,8 +193,8 @@ impl MemoryUpload {
 
 #[derive(Clone, Debug)]
 struct DurableFiles {
-    directory: PathBuf,
-    content_root: PathBuf,
+    directory: StoreLocation,
+    content_root: StoreLocation,
 }
 #[derive(Debug)]
 struct DurableUpload {
@@ -218,7 +219,10 @@ impl DurableUpload {
         if self.persisted {
             return Ok(());
         }
-        hellas_private::create_dir_all_durable(&self.files.directory)?;
+        self.files
+            .directory
+            .durability()
+            .create_dir_all(&self.files.directory)?;
         let mut bytes = self.meta.work.as_bytes().to_vec();
         bytes.extend_from_slice(&self.meta.deadline.to_be_bytes());
         for object in self.meta.objects.values() {
@@ -226,7 +230,10 @@ impl DurableUpload {
         }
         #[cfg(test)]
         ticket_publication_boundary(false)?;
-        hellas_private::write_atomically(&self.ticket(), ".pending", &bytes)?;
+        self.files
+            .directory
+            .durability()
+            .write_atomically(&self.ticket(), ".pending", &bytes)?;
         #[cfg(test)]
         ticket_publication_boundary(true)?;
         self.persisted = true;
@@ -240,7 +247,10 @@ impl DurableUpload {
             if offset != 0 {
                 return Err(ContentError::Invalid);
             }
-            hellas_private::write_atomically(&path, ".pending", &[])?;
+            self.files
+                .directory
+                .durability()
+                .write_atomically(&path, ".pending", &[])?;
         }
         let mut file = hellas_private::open_nofollow_rw(&path)?;
         if !hellas_private::is_private(&file)? {
@@ -260,7 +270,7 @@ impl DurableUpload {
         } else if offset == current {
             file.seek(SeekFrom::End(0))?;
             file.write_all(chunk)?;
-            file.sync_all()?;
+            self.files.directory.durability().sync_file(&file)?;
         } else {
             return Err(ContentError::Invalid);
         }
@@ -308,13 +318,19 @@ impl DurableUpload {
             }
         }
         if self.files.directory.try_exists()? {
-            hellas_private::sync_directory(&self.files.directory)?;
+            self.files
+                .directory
+                .durability()
+                .sync_directory(&self.files.directory)?;
         }
         if self.ticket().try_exists()? {
             std::fs::remove_file(self.ticket())?;
         }
         if self.files.directory.try_exists()? {
-            hellas_private::sync_directory(&self.files.directory)?;
+            self.files
+                .directory
+                .durability()
+                .sync_directory(&self.files.directory)?;
         }
         Ok(())
     }
@@ -358,7 +374,7 @@ impl std::fmt::Debug for UploadStore {
 /// the endpoint lock. Published objects remain independent of caller files.
 #[derive(Clone)]
 pub(crate) struct ContentRetention {
-    root: PathBuf,
+    root: StoreLocation,
     store: ContentStore,
 }
 impl ContentRetention {
@@ -380,9 +396,10 @@ impl ContentRetention {
                 if indexed.id != object.id().digest() || indexed.len != object.bytes() {
                     return Err(ContentError::Hash);
                 }
-                hellas_private::open_nofollow(&path)?.sync_all()?;
-                hellas_private::sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
-                hellas_private::sync_directory(&target.root)?;
+                let durability = target.root.durability();
+                durability.sync_file(&hellas_private::open_nofollow(&path)?)?;
+                durability.sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
+                durability.sync_directory(&target.root)?;
                 return Ok(());
             }
             target
@@ -417,14 +434,14 @@ impl UploadStore {
         }
     }
     pub fn durable(
-        root: &Path,
+        root: &StoreLocation,
         stem: &str,
         channel: Digest,
         content: ContentStore,
     ) -> Result<Self, ContentError> {
         let files = DurableFiles {
-            directory: root.join(format!("{stem}.staging")),
-            content_root: root.join("content"),
+            directory: root.child(format!("{stem}.staging")),
+            content_root: root.child("content"),
         };
         let mut store = Self::memory(channel, UploadQuota::default(), content);
         store.files = Some(files.clone());
@@ -502,7 +519,10 @@ impl UploadStore {
                     return Err(ContentError::Invalid);
                 }
             }
-            hellas_private::sync_directory(&files.directory)?;
+            files
+                .directory
+                .durability()
+                .sync_directory(&files.directory)?;
             store.quota.restore(channel, store.reserved_bytes()?)?;
         }
         Ok(store)
@@ -886,17 +906,21 @@ impl UploadStore {
         if let Some(Upload::Retained(upload)) = self.uploads.get(&work) {
             let mut published = Vec::new();
             for object in upload.meta.objects.values() {
-                let directory = upload.files.content_root.join("objects");
-                let destination = directory.join(object.id().to_string());
+                let directory = upload.files.content_root.child("objects");
+                let destination = directory.child(object.id().to_string());
                 if self.held_file(*object)?.is_none() {
                     let source = upload.part(object.id());
                     verify_file(&source, *object)?;
-                    hellas_private::create_dir_all_durable(&directory)?;
+                    upload
+                        .files
+                        .directory
+                        .durability()
+                        .create_dir_all(&directory)?;
                     install_part(&source, &destination, *object)?;
+                } else if destination.try_exists()? {
+                    finalize_publication(&destination)?;
                 }
                 if destination.try_exists()? {
-                    // Presence alone does not prove a previous publication finished its flush.
-                    finalize_publication(&destination)?;
                     published.push((destination, *object));
                 }
             }
@@ -1100,7 +1124,7 @@ fn ticket_publication_boundary(published: bool) -> Result<(), ContentError> {
 #[cfg(test)]
 thread_local! { static FAIL_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
-fn finalize_publication(destination: &Path) -> Result<(), ContentError> {
+fn finalize_publication(destination: &StoreLocation) -> Result<(), ContentError> {
     #[cfg(test)]
     if FAIL_PUBLICATION.with(|failure| failure.replace(false)) {
         return Err(ContentError::Storage(
@@ -1116,21 +1140,24 @@ fn finalize_publication(destination: &Path) -> Result<(), ContentError> {
         permissions.set_readonly(true);
         file.set_permissions(permissions)?;
     }
-    file.sync_all()?;
-    hellas_private::sync_directory(destination.parent().ok_or(ContentError::Invalid)?)?;
+    destination.durability().sync_file(&file)?;
+    destination
+        .durability()
+        .sync_directory(destination.parent().ok_or(ContentError::Invalid)?)?;
     Ok(())
 }
 
 fn install_part(
     source: &Path,
-    destination: &Path,
+    destination: &StoreLocation,
     _object: ContentRef,
 ) -> Result<(), ContentError> {
     match std::fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.into()),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
     }
+    finalize_publication(destination)
 }
 
 fn verify_file(path: &Path, object: ContentRef) -> Result<(), ContentError> {
@@ -1165,6 +1192,7 @@ fn verify_file(path: &Path, object: ContentRef) -> Result<(), ContentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
     fn id(byte: u8) -> Digest {
         Digest::from_bytes([byte; 32])
     }
@@ -1172,8 +1200,9 @@ mod tests {
     fn retained_closure_replacement_preserves_recovery_at_publication_boundaries() {
         for published in [false, true] {
             let root = tempfile::tempdir().unwrap();
+            let location = StoreLocation::for_test(root.path());
             let mut store =
-                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+                UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
             let first = store.retain(b"original-client-object").unwrap();
             store.retain_closure(id(2), &[first], 100).unwrap();
             let second = store.retain(b"new-client-object").unwrap();
@@ -1181,7 +1210,7 @@ mod tests {
             assert!(store.retain_closure(id(2), &[first, second], 100).is_err());
             drop(store);
             let store =
-                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+                UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
             let retained = store
                 .retained_closure(id(2))
                 .expect("an interrupted retry retains a complete ticket");
@@ -1194,8 +1223,9 @@ mod tests {
     #[test]
     fn retained_closure_retry_never_forgets_a_previously_retained_object() {
         let root = tempfile::tempdir().unwrap();
+        let location = StoreLocation::for_test(root.path());
         let mut store =
-            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+            UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
         let first = store
             .retain(b"client-object-now-also-held-by-provider")
             .unwrap();
@@ -1209,8 +1239,7 @@ mod tests {
             "an identical union does not rewrite its ticket"
         );
         drop(store);
-        let store =
-            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+        let store = UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
         assert!(store.retained_closure(id(2)).unwrap().contains(&first));
     }
 
@@ -1222,8 +1251,8 @@ mod tests {
         let source = ContentStore::new();
         source.index(&source_path).unwrap();
         let object = ContentRef::for_bytes(b"original");
-        let store =
-            UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+        let location = StoreLocation::for_test(root.path());
+        let store = UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
         let target = store.retention_target().unwrap();
         target
             .retain(InvocationContent::Retained(source), object)
@@ -1240,8 +1269,9 @@ mod tests {
     fn a_live_retry_finishes_an_uncertain_ticket_replacement() {
         for published in [false, true] {
             let root = tempfile::tempdir().unwrap();
+            let location = StoreLocation::for_test(root.path());
             let mut store =
-                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+                UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
             let first = store.retain(b"old-object").unwrap();
             let second = store.retain(b"new-object").unwrap();
             store.retain_closure(id(2), &[first], 100).unwrap();
@@ -1252,7 +1282,7 @@ mod tests {
             store.retain_closure(id(2), &[first], 100).unwrap();
             drop(store);
             let store =
-                UploadStore::durable(root.path(), "client", id(1), ContentStore::new()).unwrap();
+                UploadStore::durable(&location, "client", id(1), ContentStore::new()).unwrap();
             let retained = store.retained_closure(id(2)).unwrap();
             assert!(retained.contains(&first) && retained.contains(&second));
         }
@@ -1277,13 +1307,10 @@ mod tests {
         let held_object = ContentRef::for_bytes(held);
         let secret = b"customer-private-payload";
         let object = ContentRef::for_bytes(secret);
-        let mut store = UploadStore::durable(
-            root.path(),
-            "mixed",
-            id(1),
-            hellas_store::ContentStore::new(),
-        )
-        .unwrap();
+        let location = StoreLocation::for_test(root.path());
+        let mut store =
+            UploadStore::durable(&location, "mixed", id(1), hellas_store::ContentStore::new())
+                .unwrap();
         store.retain(held).unwrap();
         // Held content satisfies an ephemeral job without an upload.
         assert_eq!(
@@ -1318,13 +1345,9 @@ mod tests {
         assert_eq!(content.read(held_object).unwrap().as_slice(), held);
         assert_eq!(content.read(object).unwrap().as_slice(), secret);
         drop(store);
-        let recovered = UploadStore::durable(
-            root.path(),
-            "mixed",
-            id(1),
-            hellas_store::ContentStore::new(),
-        )
-        .unwrap();
+        let recovered =
+            UploadStore::durable(&location, "mixed", id(1), hellas_store::ContentStore::new())
+                .unwrap();
         assert!(matches!(
             recovered.retained(object),
             Err(ContentError::Missing)
@@ -1335,13 +1358,10 @@ mod tests {
     fn memory_retention_on_a_durable_channel_releases_node_quota_on_drop() {
         let root = tempfile::tempdir().unwrap();
         let quota = UploadQuota::new(16);
-        let mut first = UploadStore::durable(
-            root.path(),
-            "first",
-            id(1),
-            hellas_store::ContentStore::new(),
-        )
-        .unwrap();
+        let location = StoreLocation::for_test(root.path());
+        let mut first =
+            UploadStore::durable(&location, "first", id(1), hellas_store::ContentStore::new())
+                .unwrap();
         first.set_quota(quota.clone()).unwrap();
         let bytes = b"private-payload!";
         let object = ContentRef::for_bytes(bytes);
@@ -1374,7 +1394,8 @@ mod tests {
         let adopted = ContentRef::for_bytes(adopted_bytes);
         let content = ContentStore::new();
         content.index(&adopted_path).unwrap();
-        let mut store = UploadStore::durable(root.path(), "compute", id(1), content).unwrap();
+        let location = StoreLocation::for_test(root.path());
+        let mut store = UploadStore::durable(&location, "compute", id(1), content).unwrap();
         store
             .declare_closure(
                 id(2),
@@ -1403,7 +1424,7 @@ mod tests {
         drop(store);
         let content = ContentStore::new();
         content.index(&adopted_path).unwrap();
-        let mut recovered = UploadStore::durable(root.path(), "compute", id(1), content).unwrap();
+        let mut recovered = UploadStore::durable(&location, "compute", id(1), content).unwrap();
         assert_eq!(
             recovered
                 .stage(id(2), object, 100, Retention::Retain, 1024, 0, &[])
@@ -1440,8 +1461,9 @@ mod tests {
     #[test]
     fn retained_transcripts_reopen_by_exact_reference_and_refuse_corruption() {
         let root = tempfile::tempdir().unwrap();
+        let location = StoreLocation::for_test(root.path());
         let store = UploadStore::durable(
-            root.path(),
+            &location,
             "result",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1450,7 +1472,7 @@ mod tests {
         let reference = store.retain(b"complete-signed-transcript").unwrap();
         drop(store);
         let reopened = UploadStore::durable(
-            root.path(),
+            &location,
             "result",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1479,18 +1501,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bytes = b"shared-closure-object";
         let object = ContentRef::for_bytes(bytes);
-        let mut first = UploadStore::durable(
-            root.path(),
-            "first",
-            id(1),
-            hellas_store::ContentStore::new(),
-        )
-        .unwrap();
+        let location = StoreLocation::for_test(root.path());
+        let mut first =
+            UploadStore::durable(&location, "first", id(1), hellas_store::ContentStore::new())
+                .unwrap();
         first
             .stage(id(3), object, 50, Retention::Retain, 1024, 0, &bytes[..3])
             .unwrap();
         let mut second = UploadStore::durable(
-            root.path(),
+            &location,
             "second",
             id(2),
             hellas_store::ContentStore::new(),
@@ -1526,8 +1545,9 @@ mod tests {
         let b = b"second complete proposal";
         let ar = ContentRef::for_bytes(a);
         let br = ContentRef::for_bytes(b);
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1541,7 +1561,7 @@ mod tests {
             .unwrap();
         drop(store);
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1554,7 +1574,7 @@ mod tests {
         assert!(!store.has_stage(id(3)));
         drop(store);
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1574,8 +1594,9 @@ mod tests {
         let b = b"deadline second";
         let ar = ContentRef::for_bytes(a);
         let br = ContentRef::for_bytes(b);
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1612,8 +1633,9 @@ mod tests {
     fn closure_budget_is_checked_before_any_files_or_memory_are_staged() {
         let root = tempfile::tempdir().unwrap();
         for retention in [Retention::Retain, Retention::Ephemeral] {
+            let location = StoreLocation::for_test(root.path());
             let mut store = UploadStore::durable(
-                root.path(),
+                &location,
                 "channel",
                 id(1),
                 hellas_store::ContentStore::new(),
@@ -1638,8 +1660,9 @@ mod tests {
         let bytes = DEFAULT_MAX_STAGING_BYTES + 1;
         let object = ContentRef::new(ContentId::from_bytes([9; 32]), bytes);
         let quota = UploadQuota::new(bytes * 2);
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1651,7 +1674,7 @@ mod tests {
             .unwrap();
         drop(store);
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1668,12 +1691,41 @@ mod tests {
     }
 
     #[test]
+    fn power_install_flushes_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let crash = StoreLocation::for_test(dir.path());
+        let power = crash
+            .clone()
+            .with_durability(hellas_private::Durability::Power);
+        let bytes = b"existing staged object";
+        let object = ContentRef::for_bytes(bytes);
+        let source = dir.path().join("part");
+        crash
+            .durability()
+            .write_atomically(&source, ".tmp", bytes)
+            .unwrap();
+        let destination = crash.child("object");
+        install_part(&source, &destination, object).unwrap();
+        FAIL_PUBLICATION.with(|failure| failure.set(true));
+        let result = install_part(&source, &power.child("object"), object);
+        FAIL_PUBLICATION.with(|failure| failure.set(false));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("publication flush failure")
+        );
+        install_part(&source, &power.child("object"), object).unwrap();
+    }
+
+    #[test]
     fn interrupted_publication_retries_its_flush_before_removing_the_stage() {
         let root = tempfile::tempdir().unwrap();
         let bytes = b"accepted closure survives a publication flush failure";
         let object = ContentRef::for_bytes(bytes);
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1694,7 +1746,7 @@ mod tests {
         }
         drop(store);
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1713,8 +1765,9 @@ mod tests {
         let quota = UploadQuota::new(20);
         let bytes = b"0123456789";
         let object = ContentRef::for_bytes(bytes);
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1752,8 +1805,9 @@ mod tests {
     #[test]
     fn publication_copy_debris_is_scavenged_from_its_job_staging_namespace() {
         let root = tempfile::tempdir().unwrap();
+        let location = StoreLocation::for_test(root.path());
         let mut store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),
@@ -1772,7 +1826,7 @@ mod tests {
         .unwrap();
         drop(store);
         let store = UploadStore::durable(
-            root.path(),
+            &location,
             "channel",
             id(1),
             hellas_store::ContentStore::new(),

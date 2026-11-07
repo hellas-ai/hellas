@@ -1,5 +1,6 @@
 //! In-process configuration on the normal host's serialized provider lifecycle.
 use super::*;
+use hellas_private::StoreLocation;
 use hellas_sdk::node_control::{configuration::*, host::*};
 use std::path::Path;
 
@@ -8,9 +9,9 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
     grants: Option<hellas_sdk::grant_config::GrantConfig>,
     path: Option<PathBuf>,
     transport: Option<iroh::Endpoint>,
-    home: &Path,
+    home: &StoreLocation,
 ) -> CliResult<HostHandle> {
-    let home = home.to_path_buf();
+    let home = home.clone();
     let path = path.map(std::path::absolute).transpose()?;
     let control = prepare_provider(&mut provider, grants).await?;
     let transport = match (transport, &control) {
@@ -104,7 +105,7 @@ struct StagedConfiguration {
     retain_keys: bool,
 }
 impl StagedConfiguration {
-    fn prepare(path: &Path, update: ProviderUpdate, home: &Path) -> CliResult<Self> {
+    fn prepare(path: &Path, update: ProviderUpdate, home: &StoreLocation) -> CliResult<Self> {
         use std::io::Write as _;
         let parent = path.parent().context("configuration needs a parent")?;
         anyhow::ensure!(
@@ -168,7 +169,7 @@ fn prepare_update(
     path: &Path,
     old: &[u8],
     update: ProviderUpdate,
-    home: &Path,
+    home: &StoreLocation,
 ) -> CliResult<Vec<u8>> {
     let mut file: FetchConfigFile = serde_json::from_slice(old)?;
     anyhow::ensure!(
@@ -397,8 +398,10 @@ fn check_key_directory(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
     fn apply(path: &Path, update: ProviderUpdate) -> CliResult<()> {
-        let mut prepared = StagedConfiguration::prepare(path, update, path.parent().unwrap())?;
+        let location = StoreLocation::for_test(path.parent().unwrap());
+        let mut prepared = StagedConfiguration::prepare(path, update, &location)?;
         prepared.commit().map_err(anyhow::Error::from_boxed)?;
         Ok(())
     }
@@ -565,8 +568,10 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&a, a.parent().unwrap()).unwrap();
-        load_fetch_config(&b, b.parent().unwrap()).unwrap();
+        let location = StoreLocation::for_test(a.parent().unwrap());
+        load_fetch_config(&a, &location).unwrap();
+        let other_location = StoreLocation::for_test(b.parent().unwrap());
+        load_fetch_config(&b, &other_location).unwrap();
     }
     #[test]
     fn staged_replacement_retains_old_keys_until_commit_succeeds_or_rolls_back() {
@@ -590,13 +595,14 @@ mod tests {
         )
         .unwrap();
         let original = std::fs::read(&path).unwrap();
+        let location = StoreLocation::for_test(path.parent().unwrap());
         let mut prepared = StagedConfiguration::prepare(
             &path,
             ProviderUpdate {
                 expected_revision: 2,
                 change: Some(UpstreamChange::ReplaceKey(key("new-key"))),
             },
-            path.parent().unwrap(),
+            &location,
         )
         .unwrap();
         assert_eq!(
@@ -627,7 +633,7 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&path, path.parent().unwrap()).unwrap();
+        load_fetch_config(&path, &location).unwrap();
     }
 
     #[cfg(unix)]

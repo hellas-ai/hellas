@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 pub mod local;
 
 use super::CliResult;
@@ -22,7 +23,7 @@ struct PoolChannelFile {
 /// Resolve a static pool from private stores without contacting a provider.
 pub fn load_pool(
     path: &Path,
-    home: &Path,
+    home: &StoreLocation,
     root: &Path,
     trust_directory: &Path,
     identity: &LocalIdentity,
@@ -60,7 +61,7 @@ pub fn load_pool(
                 principal: client,
                 signer: Arc::new(identity.node_key.clone()),
                 application,
-                journal_root: root.join("channels"),
+                journal_root: home.child(root).child("channels"),
                 control_timeout: Duration::from_secs(90),
             },
             resources,
@@ -73,7 +74,7 @@ pub fn load_pool(
 }
 
 pub fn session(
-    home: &Path,
+    home: &StoreLocation,
     target: PinnedOffer,
     identity: &LocalIdentity,
     client: hellas_auth::authority::PrincipalId,
@@ -98,6 +99,7 @@ mod tests {
     use hellas_authority::model::grant::records::{Offer, SignedOffer};
     use hellas_authority::test_support::definition;
     use hellas_channel::test_support::{network, principal, software_enrollment};
+    use hellas_private::StoreLocation;
     use hellas_sdk::{
         access_bundle::AccessBundle,
         grant_store::GrantStore,
@@ -161,9 +163,10 @@ mod tests {
             std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"channels":[{"offer": imported.offers[0].name,"work_profile":"shared","trust_policy":"provider","resources":[resource]}]})).unwrap()).unwrap()
         };
         write_config(resource.0.to_string());
+        let location = StoreLocation::for_test(dir.path());
         let pool = load_pool(
             &config,
-            dir.path(),
+            &location,
             &root,
             &trust,
             &identity,
@@ -177,7 +180,7 @@ mod tests {
         assert!(
             load_pool(
                 &config,
-                dir.path(),
+                &location,
                 &root,
                 &trust,
                 &other,
@@ -190,7 +193,7 @@ mod tests {
         assert!(
             load_pool(
                 &config,
-                dir.path(),
+                &location,
                 &root,
                 &trust,
                 &identity,
