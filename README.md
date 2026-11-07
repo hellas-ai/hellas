@@ -451,6 +451,15 @@ consensus have independent Hydra release jobsets for their heavier tests and
 artifacts. `devnet` tracks chain rollout; it does not trigger
 CLI or GPU releases.
 
+`nix run .#check-coverage` measures line coverage of the regression suite with
+`cargo llvm-cov` and writes `lcov.info`, `summary.json` and `summary.txt` to
+`$COVERAGE_DIR` (default `target/check/<deps>/coverage`). It fails if any
+crate's production line coverage falls more than 0.5 points below its floor in
+`nix/coverage-floor.json`. After raising coverage, record the new floors with
+`nix run .#check-coverage -- --update`, or without rerunning the suite:
+`python3 nix/coverage-ratchet.py <summary.json> nix/coverage-floor.json --update`.
+It is not part of `check` or any release validation and adds no time to them.
+
 ## Docker
 
 The default `docker` output is a network-only node image. It contains no local Catena or

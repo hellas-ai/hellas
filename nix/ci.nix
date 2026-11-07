@@ -1,5 +1,6 @@
 {
   bufLintCommand,
+  cargoLlvmCov,
   clippyArgs,
   denyCommand,
   cargoDeps,
@@ -320,6 +321,31 @@ let
     );
   };
 
+  # Line coverage of the regression feature set, with a per-crate ratchet.
+  # Deliberately not a check: it is in neither `nix run .#check` nor any
+  # release validation, so it adds no time to either. Writes lcov.info,
+  # summary.json and summary.txt to $COVERAGE_DIR (default
+  # $CARGO_TARGET_DIR/coverage); pass --update to rewrite the floors.
+  coverage =
+    mkCargo "check-coverage"
+      ''
+        out="''${COVERAGE_DIR:-$CARGO_TARGET_DIR/coverage}"
+        mkdir -p "$out"
+        cargo llvm-cov nextest --locked --workspace --features integration-tests,hellas-chain/indexer-api --no-report
+        cargo llvm-cov report --lcov --output-path "$out/lcov.info"
+        cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
+        cargo llvm-cov report --summary-only | tee "$out/summary.txt"
+        python3 ${./coverage-ratchet.py} "$out/summary.json" nix/coverage-floor.json "$@"
+      ''
+      (
+        cargoEnv rustToolchain
+        ++ [
+          cargoLlvmCov
+          pkgs.cargo-nextest
+          pkgs.python3
+        ]
+      );
+
   checks =
     (
       if isValidatorHost then
@@ -401,6 +427,7 @@ in
 {
   inherit
     checks
+    coverage
     fixes
     mergeChecks
     ;

@@ -20,14 +20,16 @@ let
     workspaceNativeBuildInputs
     ;
 
+  # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
+  # (format 11) its paired llvm-profdata (format 10) cannot read. At run
+  # time the tool uses our toolchain's llvm-tools-preview instead.
+  cargoLlvmCov = pkgs.cargo-llvm-cov.overrideAttrs { doCheck = false; };
+
   cargoToolPackages = with pkgs; [
     cargo-audit
     cargo-deny
     cargo-fuzz
-    # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
-    # (format 11) its paired llvm-profdata (format 10) cannot read. At run
-    # time the tool uses our toolchain's llvm-tools-preview instead.
-    (cargo-llvm-cov.overrideAttrs { doCheck = false; })
+    cargoLlvmCov
     cargo-mutants
     cargo-nextest
     cargo-outdated
@@ -150,6 +152,7 @@ let
     inherit (nativePkg) clippyArgs;
     inherit
       bufLintCommand
+      cargoLlvmCov
       denyCommand
       pkgs
       lib
@@ -430,6 +433,11 @@ in
       type = "app";
       program = lib.getExe ci.checkRelease;
       meta.description = "Run the full release test and feature-check suite";
+    };
+    check-coverage = {
+      type = "app";
+      program = lib.getExe ci.coverage;
+      meta.description = "Measure line coverage and enforce the per-crate floors";
     };
     fix = {
       type = "app";
