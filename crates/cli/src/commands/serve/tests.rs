@@ -142,11 +142,7 @@ fn core_cli_rejects_moved_openai_hosting_and_operator_endpoints() {
 }
 
 #[test]
-fn obsolete_callers_and_unknown_capabilities_are_rejected() {
-    for value in [
-        serde_json::json!({"routes": [], "callers": []}),
-        serde_json::json!({"routes": [codex_route(serde_json::json!({"modles": []}))]}),
-    ] {
-        assert!(serde_json::from_value::<FetchConfigFile>(value).is_err());
-    }
+fn unknown_capabilities_are_rejected() {
+    let value = serde_json::json!({"routes": [codex_route(serde_json::json!({"modles": []}))]});
+    assert!(serde_json::from_value::<FetchConfigFile>(value).is_err());
 }

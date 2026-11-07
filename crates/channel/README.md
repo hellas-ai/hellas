@@ -4,8 +4,7 @@ Paid Fetch shares the existing channel authorization, execution gate, delivery,
 payment certificate, and settlement flow with Compute. A Fetch channel's
 `InvocationPolicy` admits Fetch; the admission commits to its route, contract and
 resource limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
-Both profiles use version-3 close descriptors and journal format 7. Older
-journals are refused; close old devnet channels with the old binary first.
+Both profiles use version-3 close descriptors and journal format 7.
 
 Canonical paid-work and grant records, prepared inputs, and usage accounting live in
 `hellas_channel::model` and `hellas_authority::model`. RPC owns generated messages and signed-transcript codecs.
@@ -163,7 +162,3 @@ not contact a paid upstream or enroll a real Apple device.
 Work uses journal format 7 and close descriptor v3. Each request selects its
 funding kind and channel ID; setup requests select their bond. One peer may own
 several bonds.
-
-The grant definition format no longer includes scheduling `weight`. Offers and
-journals written with that field are incompatible with this format; retain those
-journals for explicit migration instead of deleting them or resetting allowances.

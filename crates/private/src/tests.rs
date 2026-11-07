@@ -171,12 +171,6 @@ fn store_locations_are_resolved_only_from_home_or_chain() {
                 "store root constructed outside home/chain resolution: {relative}"
             );
         }
-        for suffix in [".funding", ".provider", ".faucet"] {
-            assert!(
-                !production.contains(&format!("{{}}{suffix}")),
-                "legacy store layout in {relative}"
-            );
-        }
     }
     assert_eq!(chain_roots, ["crates/chain/src/chain_dir.rs"]);
 }

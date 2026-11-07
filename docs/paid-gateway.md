@@ -441,11 +441,5 @@ window. Missing or inconsistent evidence remains an error. A source used as
 same pinned consensus chain; an unverified remote RPC connection does not meet
 that contract.
 
-The channel journal adds record tag **14** and an optional checkpoint tail for
-verified contest history. Existing checkpoints remain readable and require no
-separate migration. Once a new binary writes these records or checkpoints,
-binaries predating this extension cannot read that journal and fail closed.
-A software rollback must therefore retain support for this journal extension;
-replacing the binary with an older release is not a compatible rollback. Merely
-building or integrating this change does not upgrade running deployments or
-rewrite their journals.
+The channel journal records verified contest history under record tag **14**
+and in an optional checkpoint tail.

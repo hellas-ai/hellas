@@ -62,7 +62,7 @@ only that accepted job can invoke the upstream. The credential's origin, path
 and method restrictions remain enforced by the provider. Every execution is authorized by Work.
 
 The SDK Fetch provider advertises only Work and WorkSetup when configured for
-paid work; the unpaid Fetch execution service has been removed. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
+paid work. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
 concurrency is full. Further submissions wait at the executor mailbox while
 completion handling remains available. Provider validator connections check the
 configured genesis digest before advancing payment state; this check runs on
@@ -283,7 +283,7 @@ This is an HTTP API bridge with explicit routes, authentication and resource
 limits. It does not implement CONNECT, WebSocket upgrades, streaming uploads,
 HTTP trailers or automatic rewriting of redirect URLs. Clients using Responses
 WebSockets must select their HTTP/SSE transport. Archive I/O remains on the
-response path, although its errors no longer fail requests. These are contract
+response path, although its errors do not fail requests. These are contract
 differences from a general transparent HTTP proxy, even when inference and
 tool-call payloads are preserved exactly.
 

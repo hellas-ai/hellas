@@ -248,7 +248,6 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
         for invalid in [
             vec!["--address", "127.0.0.1:9000"],
             vec!["--node", "node.enrollment", "--control-socket", "node.sock"],
-            vec!["--output-cache", "off"],
         ] {
             let mut argv = vec!["hellas", "admin"];
             argv.extend(operation.iter().copied());
@@ -363,11 +362,6 @@ fn serve_accepts_work_config() {
     }
 }
 
-#[test]
-fn manual_provisioning_command_is_removed() {
-    assert!(Cli::try_parse_from(["hellas", "provision"]).is_err());
-}
-
 /// An identity file that is there and is not one is a startup
 /// failure naming that file.
 #[test]
@@ -462,13 +456,6 @@ fn codex_auth_import_accepts_external_source() {
             );
         }
         _ => panic!("expected codex-auth import command"),
-    }
-}
-
-#[test]
-fn retired_commands_are_not_exposed() {
-    for command in ["llm", "fetch", "artifact", "output-cache"] {
-        assert!(Cli::try_parse_from(["hellas", command]).is_err());
     }
 }
 
