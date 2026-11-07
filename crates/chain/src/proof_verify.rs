@@ -164,7 +164,7 @@ impl ProofVerifier {
 
     /// Packages locally stored finalized evidence under this trust identity.
     /// The returned bytes still require `verify` before use as a checkpoint.
-    #[cfg(any(feature = "indexer-api", test))]
+    #[cfg(feature = "indexer-api")]
     pub(crate) fn bundle(&self, finalized: FinalizedBlock) -> ProofBundle {
         let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
             .map_or(u64::MAX, |proof| proof.certificate_epoch());

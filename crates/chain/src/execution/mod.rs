@@ -15,8 +15,8 @@ mod verifier;
 #[cfg(feature = "full-node")]
 mod working_set;
 
-#[cfg(all(any(test, feature = "test-support"), feature = "full-node"))]
-pub use kernel::execute_all;
+#[cfg(feature = "full-node")]
+pub(crate) use kernel::execute_all;
 #[cfg(feature = "full-node")]
 pub use kernel::{ExecutionError, execute_proposal};
 #[cfg(feature = "full-node")]

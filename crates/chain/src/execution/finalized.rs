@@ -19,7 +19,7 @@ pub(crate) async fn execute<E>(
 where
     E: Context + Spawner + Send + Sync + 'static,
 {
-    let batch = super::kernel::execute_all(
+    let batch = super::execute_all(
         hellas_kernel::Context::with_fees(
             network,
             hellas_kernel::BlockHeight::new(block.height().get()),
