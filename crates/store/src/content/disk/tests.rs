@@ -55,6 +55,7 @@ async fn failed_sqlite_commit_never_exposes_a_pin_to_an_existing_watch() {
         .cursor;
     let mut watch = store.watch(&Scope::Owner, "new", cursor).await.unwrap();
     let disk = store.core.disk.as_ref().unwrap();
+    sqlx::raw_sql("CREATE TRIGGER keep_base_insert BEFORE INSERT ON pins WHEN NEW.name='base' BEGIN SELECT RAISE(ABORT,'unchanged pin written'); END; CREATE TRIGGER keep_base_update BEFORE UPDATE ON pins WHEN OLD.name='base' BEGIN SELECT RAISE(ABORT,'unchanged pin written'); END; CREATE TRIGGER keep_base_delete BEFORE DELETE ON pins WHEN OLD.name='base' BEGIN SELECT RAISE(ABORT,'unchanged pin written'); END;").execute(&disk.db).await.unwrap();
     sqlx::raw_sql("CREATE TRIGGER reject_pin BEFORE INSERT ON pins BEGIN SELECT RAISE(ABORT,'injected'); END;").execute(&disk.db).await.unwrap();
     let value = PinValue {
         target: Target::Object(object),

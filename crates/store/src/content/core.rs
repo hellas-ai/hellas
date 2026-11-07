@@ -1110,12 +1110,30 @@ impl Core {
             let (result, mut rollback) = core.run(move |core| Ok((f(core), rollback))).await?;
             let result = result?;
             if let Some(disk) = &core.disk {
-                let (generation, pins) = {
+                let pending = {
                     let state = core.state.lock().unwrap();
-                    (state.generation, state.pins.clone())
+                    let before = rollback.before.as_ref().unwrap();
+                    if state.generation == before.1 {
+                        None
+                    } else {
+                        let mut changes: Vec<_> = state
+                            .pins
+                            .iter()
+                            .filter(|(name, value)| before.0.get(*name) != Some(*value))
+                            .map(|(name, value)| (name.clone(), Some(value.clone())))
+                            .collect();
+                        changes.extend(
+                            before
+                                .0
+                                .keys()
+                                .filter(|name| !state.pins.contains_key(*name))
+                                .map(|name| (name.clone(), None)),
+                        );
+                        Some((state.generation, changes))
+                    }
                 };
-                if generation != rollback.before.as_ref().unwrap().1 {
-                    disk.persist(generation, pins).await?;
+                if let Some((generation, changes)) = pending {
+                    disk.persist(generation, changes).await?;
                 }
             }
             rollback.before = None;

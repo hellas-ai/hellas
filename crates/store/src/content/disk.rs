@@ -205,20 +205,24 @@ impl Disk {
     pub(crate) async fn persist(
         &self,
         generation: u64,
-        pins: BTreeMap<PinName, PinValue>,
+        changes: Vec<(PinName, Option<PinValue>)>,
     ) -> Result<()> {
         let mut tx = self.db.begin().await.map_err(database)?;
-        sqlx::query("DELETE FROM pins")
-            .execute(&mut *tx)
-            .await
-            .map_err(database)?;
-        for (name, value) in pins {
-            sqlx::query("INSERT INTO pins(name,value) VALUES(?,?)")
-                .bind(name.as_str())
-                .bind(super::wire::pin_value(&value).encode_to_vec())
-                .execute(&mut *tx)
-                .await
-                .map_err(database)?;
+        for (name, value) in changes {
+            if let Some(value) = value {
+                sqlx::query("INSERT INTO pins(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
+                    .bind(name.as_str())
+                    .bind(super::wire::pin_value(&value).encode_to_vec())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(database)?;
+            } else {
+                sqlx::query("DELETE FROM pins WHERE name=?")
+                    .bind(name.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(database)?;
+            }
         }
         sqlx::query("UPDATE head SET generation=? WHERE id=1")
             .bind(generation.to_be_bytes().as_slice())
