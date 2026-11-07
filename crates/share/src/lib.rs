@@ -12,5 +12,5 @@ mod policy;
 mod responses_projector;
 pub use host::{OpenAiProviderError, OpenAiProviderOptions, start_openai_provider};
 pub use openai::{OpenAiConfigError, OpenAiResponsesFetchProvider};
-pub use policy::responses_policy;
+pub use policy::{ResponsesPolicyOptions, responses_policy};
 pub use responses_projector::OpenAiResponsesAdaptorFactory;

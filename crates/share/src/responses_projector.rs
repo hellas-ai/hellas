@@ -20,7 +20,7 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 pub struct OpenAiResponsesAdaptorFactory(ContentId);
 
 impl OpenAiResponsesAdaptorFactory {
-    pub fn new() -> Result<Self, crate::OpenAiConfigError> {
+    pub fn new() -> Result<Self, hellas_rpc::protocol::value::CanonicalDecodeError> {
         Ok(Self(crate::responses_contract()?.manifest_id()))
     }
 }

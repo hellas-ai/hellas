@@ -52,20 +52,22 @@ pub async fn start_openai_provider<R>(
 where
     R: RootProver + Send + Sync + 'static,
 {
-    let policy = crate::responses_policy(
-        options.resource,
-        options.account,
-        options.policy_revision,
-        &options.service,
-        &options.method,
-        options.responses.clone(),
-        options.pricing.clone(),
-        options.max_job_millis,
-    )?;
+    let policy = crate::responses_policy(crate::ResponsesPolicyOptions {
+        resource: options.resource,
+        account: options.account,
+        revision: options.policy_revision,
+        service: &options.service,
+        method: &options.method,
+        responses: options.responses.clone(),
+        pricing: options.pricing.clone(),
+        max_job_millis: options.max_job_millis,
+    })?;
     let upstream = Arc::new(crate::OpenAiResponsesFetchProvider::with_bearer(
         options.bearer_token.clone(),
     )?);
-    let adaptor = Arc::new(crate::OpenAiResponsesAdaptorFactory::new()?);
+    let adaptor = Arc::new(
+        crate::OpenAiResponsesAdaptorFactory::new().map_err(crate::OpenAiConfigError::from)?,
+    );
     let mut routes = FetchRouteRegistry::new();
     routes.register(
         FetchRoute::new(options.service.clone(), options.method.clone()),

@@ -222,20 +222,20 @@ impl ShareFixtureBuilder {
                 grants: Some(GrantProviderOptions {
                     configuration: hellas_authority::test_support::common_node::configuration(
                         vec![
-                            crate::responses_policy(
-                                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                                    b"test resource",
-                                )),
-                                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                                    b"test account",
-                                )),
-                                hellas_auth::authority::Revision(1),
-                                "openai",
-                                "responses",
-                                responses_resource(),
-                                pricing(),
-                                NonZeroU64::new(60_000).unwrap(),
-                            )
+                            crate::responses_policy(crate::ResponsesPolicyOptions {
+                                resource: hellas_auth::authority::ResourceId(
+                                    hellas_auth::Digest::hash(b"test resource"),
+                                ),
+                                account: hellas_auth::authority::ResourceId(
+                                    hellas_auth::Digest::hash(b"test account"),
+                                ),
+                                revision: hellas_auth::authority::Revision(1),
+                                service: "openai",
+                                method: "responses",
+                                responses: responses_resource(),
+                                pricing: pricing(),
+                                max_job_millis: NonZeroU64::new(60_000).unwrap(),
+                            })
                             .unwrap(),
                         ],
                     ),
