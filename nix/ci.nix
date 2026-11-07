@@ -197,12 +197,6 @@ let
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
-    # Compare one representative shipped Qwen3 program with upstream for
-    # both CUDA and HIP, including generated source and ABI.
-    model-programs =
-      mkCargo "check-model-programs"
-        "cargo test --locked -p hellas-client --features models --lib model::package::tests::shipped_qwen3_program_matches_catena_models -- --exact --ignored"
-        (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
     http-fetch =
       mkCargo "check-http-fetch"

@@ -3231,7 +3231,6 @@ dependencies = [
  "async-stream",
  "base64 0.23.1",
  "bytes",
- "catena-lang",
  "catena-models",
  "ciborium",
  "futures",

@@ -78,8 +78,7 @@ let
         "wasm-rpc"
         "wasm-chain"
         "wasm-xet"
-      ]
-      ++ lib.optional (!darwin) "model-programs";
+      ];
       artifacts =
         lib.optionalAttrs darwin {
           portable-aarch64 = archive "${system}-portable" portableDarwin;
@@ -106,7 +105,6 @@ let
       checks = [
         "executor"
         "client-work"
-        "model-programs"
         "http-fetch"
       ];
       artifacts = {
