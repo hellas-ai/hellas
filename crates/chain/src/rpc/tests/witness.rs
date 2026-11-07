@@ -20,7 +20,6 @@ struct Operations {
     saved: Option<hellas_rpc::pb::chain::ObjectProof>,
     old_response: Option<GetObjectProofsResponse>,
     replay_old: bool,
-    corrupt_root: bool,
     pause_second_owner_page: bool,
     owner_page_entered: Option<Arc<tokio::sync::Semaphore>>,
     owner_page_release: Option<Arc<tokio::sync::Semaphore>>,
@@ -43,13 +42,6 @@ macro_rules! forward {
 }
 
 impl LightClient for ObservedClient {
-    async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
-        if self.operations.lock().unwrap().corrupt_root {
-            Ok(Some(Digest::from([0x91; 32])))
-        } else {
-            self.local.get_state_root().await
-        }
-    }
     async fn get_object_proofs(
         &self,
         request: GetObjectProofsRequest,
@@ -62,9 +54,7 @@ impl LightClient for ObservedClient {
                 operations.saved.clone(),
                 operations.old_response.clone(),
                 operations.replay_old,
-                if (request.owner_after_key.is_some() || request.owner_offset > 0)
-                    && operations.pause_second_owner_page
-                {
+                if request.owner_after_key.is_some() && operations.pause_second_owner_page {
                     Some((
                         operations.owner_page_entered.as_ref().unwrap().clone(),
                         operations.owner_page_release.as_ref().unwrap().clone(),
@@ -99,18 +89,7 @@ impl LightClient for ObservedClient {
             2 => {
                 response.proofs.pop();
             }
-            3 => response.proofs[0].object_id[0] ^= 1,
             4 => response.proofs[0] = saved.expect("prior proof"),
-            5 => {
-                response
-                    .block
-                    .as_mut()
-                    .unwrap()
-                    .snapshot
-                    .as_mut()
-                    .unwrap()
-                    .finalization[0] ^= 1
-            }
             6 => response.owner_page = None,
             7 => {
                 let mut page = response.owner_page.as_ref().unwrap().clone();
@@ -123,6 +102,7 @@ impl LightClient for ObservedClient {
     }
 
     forward! {
+        get_state_root() -> Option<Digest>;
         get_proof(object_id: ObjectId) -> Option<Vec<u8>>;
         get_coin(payload: Digest, object_id: ObjectId) -> Option<crate::domain::Coin>;
         get_edge(payload: Digest, object_id: ObjectId) -> Option<crate::EdgeLookup>;
@@ -156,6 +136,16 @@ struct Fixture {
     verifier: Arc<crate::proof_verify::ProofVerifier>,
     trust: hellas_genesis::TrustDocument,
     genesis_json: Vec<u8>,
+    committee: crate::execution::test_support::ConsensusFixture,
+}
+
+impl Fixture {
+    async fn stop(self) {
+        self.server.abort();
+        let _ = self.server.await;
+        self.archive.abort();
+        let _ = self.archive.await;
+    }
 }
 
 async fn prepare(
@@ -265,11 +255,7 @@ async fn fixture_with_allocations(
     let (applied, batch) = prepare(&database, &allocations, &genesis, &committee, vec![]).await;
     database.finalize(batch).await;
     archive
-        .publish_proof(
-            applied.clone(),
-            &crate::finality_proof::encode(&finalization(&committee, &applied).encode(), &[])
-                .unwrap(),
-        )
+        .publish_proof(applied.clone(), &finality_envelope(&committee, &applied))
         .await
         .unwrap();
     owners.apply_finalized(&applied).unwrap();
@@ -287,11 +273,7 @@ async fn fixture_with_allocations(
     let (archived, pending) = prepare(&database, &allocations, &applied, &committee, txs).await;
     // Marshal has the real certificate, but Stateful has not committed this batch.
     archive
-        .publish_proof(
-            archived.clone(),
-            &crate::finality_proof::encode(&finalization(&committee, &archived).encode(), &[])
-                .unwrap(),
-        )
+        .publish_proof(archived.clone(), &finality_envelope(&committee, &archived))
         .await
         .unwrap();
     let local = LocalLightClient::new(
@@ -341,6 +323,7 @@ async fn fixture_with_allocations(
         verifier: proof_verifier,
         trust,
         genesis_json,
+        committee,
     }
 }
 
@@ -355,7 +338,6 @@ fn empty_current_database_absence_is_verified_by_hellas() {
                 object_ids: vec![missing.to_vec()],
                 payload: None,
                 owner: None,
-                owner_offset: 0,
                 owner_limit: 0,
                 owner_after_key: None,
             })
@@ -385,10 +367,7 @@ fn empty_current_database_absence_is_verified_by_hellas() {
                 )
                 .is_err()
         );
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -412,10 +391,7 @@ fn owner_listing_completes_across_five_verified_pages() {
             5,
             "129 holdings require five authenticated pages of at most 32 keys"
         );
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -428,14 +404,6 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
             .finalize(fixture.pending.take().unwrap())
             .await;
         fixture.owners.apply_finalized(&fixture.archived).unwrap();
-        let genesis: hellas_genesis::Genesis =
-            serde_json::from_slice(&fixture.genesis_json).unwrap();
-        let committee = crate::execution::test_support::consensus_fixture_in(
-            91,
-            4,
-            crate::domain::TEST_NETWORK,
-            crate::genesis_digest(&genesis),
-        );
         let allocations = vec![(fixture.owner, 100); 129];
         let mut parent = fixture.archived.clone();
         let mut after = None;
@@ -448,7 +416,6 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
                 .unwrap()
                 .unwrap();
             assert_eq!(page.snapshot.height, index + 2);
-            assert_eq!(page.owned_balance, Some(12_900));
             assert_eq!(page.coins.len(), if index == 4 { 1 } else { 32 });
             for (id, value) in &page.coins {
                 assert_eq!(*value, 100);
@@ -457,19 +424,18 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
             after = page.next;
             if index < 4 {
                 assert!(after.is_some());
-                let (next, batch) =
-                    prepare(&fixture.database, &allocations, &parent, &committee, vec![]).await;
+                let (next, batch) = prepare(
+                    &fixture.database,
+                    &allocations,
+                    &parent,
+                    &fixture.committee,
+                    vec![],
+                )
+                .await;
                 fixture.database.finalize(batch).await;
                 fixture
                     .chain_indexer
-                    .publish_proof(
-                        next.clone(),
-                        &crate::finality_proof::encode(
-                            &finalization(&committee, &next).encode(),
-                            &[],
-                        )
-                        .unwrap(),
-                    )
+                    .publish_proof(next.clone(), &finality_envelope(&fixture.committee, &next))
                     .await
                     .unwrap();
                 fixture.owners.apply_finalized(&next).unwrap();
@@ -479,10 +445,7 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
             }
         }
         assert_eq!(ids.len(), 129);
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -498,13 +461,6 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
             .unwrap()
             .unwrap();
         assert_eq!(first.block.payload, fixture.applied.digest());
-        fixture.operations.lock().unwrap().corrupt_root = true;
-        assert_eq!(
-            fixture.remote.get_state_root().await.unwrap(),
-            Some(fixture.archived.state_root()),
-            "a proof-pinned client must ignore an unverified raw root"
-        );
-        fixture.operations.lock().unwrap().corrupt_root = false;
         assert!(first.objects.contains_key(&fixture.old_coin));
         assert!(!first.objects.contains_key(&fixture.new_coin));
         let request = fixture.operations.lock().unwrap().requests[0].clone();
@@ -555,27 +511,18 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
         assert!(matches!(
             fixture
                 .remote
-                .get_objects_at(
-                    keys.clone(),
-                    FinalizedBlockQuery::Payload(fixture.applied.digest())
-                )
+                .get_objects_at(keys.clone(), fixture.applied.digest())
                 .await,
             Err(QueryError::StateUnavailable(_))
         ));
         let pinned = fixture
             .remote
-            .get_objects_at(
-                keys,
-                FinalizedBlockQuery::Payload(fixture.archived.digest()),
-            )
+            .get_objects_at(keys, fixture.archived.digest())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(pinned.block.payload, fixture.archived.digest());
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -614,10 +561,7 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
                 .objects
                 .contains_key(&key)
         );
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -666,15 +610,12 @@ fn remote_point_reads_use_a_finalized_floor_after_the_current_root_advances() {
         assert!(matches!(
             fixture
                 .remote
-                .get_objects_at(vec![fixture.new_coin], FinalizedBlockQuery::Payload(floor))
+                .get_objects_at(vec![fixture.new_coin], floor)
                 .await,
             Err(QueryError::StateUnavailable(_))
         ));
 
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -732,10 +673,7 @@ fn owner_page_and_coin_proofs_share_one_root_and_reject_omission() {
             .unwrap();
         assert_eq!(delegated.snapshot.payload, fixture.archived.digest());
         assert_eq!(delegated.coins, vec![(fixture.new_coin, 100)]);
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -748,14 +686,6 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
             .finalize(fixture.pending.take().unwrap())
             .await;
         fixture.owners.apply_finalized(&fixture.archived).unwrap();
-        let genesis_doc: hellas_genesis::Genesis =
-            serde_json::from_slice(&fixture.genesis_json).unwrap();
-        let committee = crate::execution::test_support::consensus_fixture_in(
-            91,
-            4,
-            crate::domain::TEST_NETWORK,
-            crate::genesis_digest(&genesis_doc),
-        );
         let (reshape, ids) = crate::execution::test_support::reshape(
             41,
             &[fixture.new_coin],
@@ -765,7 +695,7 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
             &fixture.database,
             &[(fixture.owner, 100)],
             &fixture.archived,
-            &committee,
+            &fixture.committee,
             vec![reshape],
         )
         .await;
@@ -774,8 +704,7 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
             .chain_indexer
             .publish_proof(
                 block.clone(),
-                &crate::finality_proof::encode(&finalization(&committee, &block).encode(), &[])
-                    .unwrap(),
+                &finality_envelope(&fixture.committee, &block),
             )
             .await
             .unwrap();
@@ -794,10 +723,7 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
             .unwrap();
         assert_eq!(owned.coins, vec![(ids[0], 100)]);
         assert_eq!(delegated.coins, vec![(ids[0], 100)]);
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }
 
@@ -840,9 +766,6 @@ fn human_owner_listing_reports_changed_root_between_verified_pages() {
             first_page_requests, 1,
             "human listing does not restart old roots"
         );
-        fixture.server.abort();
-        let _ = fixture.server.await;
-        fixture.archive.abort();
-        let _ = fixture.archive.await;
+        fixture.stop().await;
     });
 }

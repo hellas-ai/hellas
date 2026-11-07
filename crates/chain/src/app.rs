@@ -43,7 +43,6 @@ use commonware_runtime::Spawner;
 use commonware_runtime::telemetry::metrics::Registered;
 use commonware_storage::Context as StorageContext;
 #[cfg(feature = "full-node")]
-#[cfg(feature = "full-node")]
 use commonware_utils::SystemTimeExt;
 #[cfg(feature = "full-node")]
 use futures::{Stream, StreamExt};
@@ -371,6 +370,9 @@ fn kernel_context(
     )
 }
 
+// Each method boxes its future at the boundary into commonware's generic
+// actor: the actor's poll frames grow with these futures, and debug builds
+// copy them per await.
 #[cfg(feature = "full-node")]
 impl<E> StatefulApplication<E> for Application
 where
@@ -397,8 +399,6 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
-        // Box at the boundary into commonware's generic actor: the actor's
-        // poll frames grow with this future, and debug builds copy it per await.
         Box::pin(async move {
             let (runtime, consensus_context) = context;
             let mut ancestry = Box::pin(ancestry);
@@ -503,8 +503,6 @@ where
         ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        // Box at the boundary into commonware's generic actor: the actor's
-        // poll frames grow with this future, and debug builds copy it per await.
         Box::pin(async move {
             let (runtime, consensus_context) = context;
             let mut ancestry = Box::pin(ancestry);
@@ -541,8 +539,6 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        // Box at the boundary into commonware's generic actor: the actor's
-        // poll frames grow with this future, and debug builds copy it per await.
         Box::pin(async move {
             #[cfg(feature = "indexer-api")]
             if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
@@ -583,8 +579,6 @@ where
         block: &Self::Block,
         databases: &Self::Databases,
     ) {
-        // Box at the boundary into commonware's generic actor: the actor's
-        // poll frames grow with this future, and debug builds copy it per await.
         Box::pin(async move {
             if databases.read().await.root() != block.state_root() {
                 return;

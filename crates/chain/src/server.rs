@@ -798,7 +798,7 @@ pub(crate) fn finalized_block_response(block: Option<FinalizedBlock>) -> GetFina
     }
 }
 
-fn finalized_block_to_proto(block: FinalizedBlock) -> ProtoFinalizedBlock {
+pub(crate) fn finalized_block_to_proto(block: FinalizedBlock) -> ProtoFinalizedBlock {
     ProtoFinalizedBlock {
         snapshot: Some(latest_block_to_proto(block.snapshot)),
         block: block.block,

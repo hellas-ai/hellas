@@ -453,14 +453,13 @@ mod tests {
     use crate::domain::{KERNEL_FEES, SettlementKey, TEST_NETWORK, genesis_object_id};
     use crate::execution::store::{UtxoDatabase, utxo_db_config};
     use crate::execution::test_support::{
-        consensus_fixture, finalization, index_genesis, run_qmdb,
+        consensus_fixture, finality_envelope, index_genesis, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
     use crate::indexer::fixtures::spawn_archive;
     use crate::light_client::ConsensusInfo;
     use crate::owner_index::{ApplyOutcome, OwnerIndex};
     use crate::rpc::LocalLightClient;
-    use commonware_codec::Encode as _;
     use commonware_cryptography::Digestible as _;
 
     /// What the client funds its payment channel with.
@@ -704,14 +703,7 @@ mod tests {
                 fresh,
             );
             self.indexer
-                .publish_proof(
-                    block.clone(),
-                    &crate::finality_proof::encode(
-                        &finalization(&self.fixture, &block).encode(),
-                        &[],
-                    )
-                    .unwrap(),
-                )
+                .publish_proof(block.clone(), &finality_envelope(&self.fixture, &block))
                 .await
                 .expect("finalized ingest");
             self.database.finalize(merkleized).await;

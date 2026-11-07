@@ -117,8 +117,8 @@ impl Publication {
             .get_finalized_block(FinalizedBlockQuery::Height(block.height().get()))
             .await?
             .ok_or("finalized index block is absent from archive")?;
-        let verified = self.verifier.verify(
-            self.verifier.bundle(stored),
+        let verified = self.verifier.verify_finalized(
+            stored,
             ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
         )?;
         if verified.view().payload() != block.digest() {

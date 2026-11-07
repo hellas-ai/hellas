@@ -169,11 +169,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
     let network = config.network_id(profile.genesis()).unwrap();
     let verifier = std::sync::Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            profile.trust().clone(),
-            profile.consensus_digest(),
-        )
-        .unwrap(),
+        hellas_chain::proof_verify::ProofVerifier::for_profile(&profile).unwrap(),
     );
     let client = tokio::time::timeout(HANG_GUARD, async {
         loop {
@@ -380,11 +376,7 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
     );
     let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
     let verifier = std::sync::Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            profile.trust().clone(),
-            profile.consensus_digest(),
-        )
-        .unwrap(),
+        hellas_chain::proof_verify::ProofVerifier::for_profile(&profile).unwrap(),
     );
     // A hang guard, not a speed requirement: the property is that RPC starts
     // only after the full peer-floor probe, asserted below.

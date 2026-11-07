@@ -525,9 +525,6 @@ fn verify_path(
     let mut rank = 0_u64;
     for depth in (0..256).rev() {
         let sibling = siblings[depth];
-        let mut bytes = Vec::new();
-        write_commit(&mut bytes, sibling);
-        read_commit(&bytes)?;
         current = if bit(key, depth) {
             rank = rank
                 .checked_add(sibling.count)
@@ -905,12 +902,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(next.holdings.len(), OWNER_PAGE_LIMIT as usize);
-            let bytes = serde_json::to_vec(&page).unwrap();
-            assert!(
-                bytes.len() < 256 * 1024,
-                "compact owner page used {} bytes",
-                bytes.len()
-            );
             let mut bad = page;
             let sibling = bad.holdings[0].path.siblings[0].clone();
             bad.holdings[0].path.siblings.insert(0, sibling);

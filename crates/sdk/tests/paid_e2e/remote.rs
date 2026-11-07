@@ -410,7 +410,6 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
             object_ids: keys.iter().map(|key| key.to_vec()).collect(),
             payload: Some(old.snapshot.payload.to_vec()),
             owner: None,
-            owner_offset: 0,
             owner_limit: 0,
             owner_after_key: None,
         })
@@ -485,10 +484,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     assert!(
         matches!(
             fresh
-                .get_objects_at(
-                    keys.clone(),
-                    FinalizedBlockQuery::Payload(latest.snapshot.payload)
-                )
+                .get_objects_at(keys.clone(), latest.snapshot.payload)
                 .await,
             Err(QueryError::Remote(_))
         ),

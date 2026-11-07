@@ -685,9 +685,8 @@ async fn connect_with_verified_snapshots(
     let rpc = rpc
         .or_else(|| profile.validators().first().cloned())
         .context("selected chain has no validator routes")?;
-    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::with_digest(
-        profile.trust().clone(),
-        profile.consensus_digest(),
+    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::for_profile(
+        profile,
     )?);
     Ok(RemoteLightClient::connect(rpc, verifier).await?)
 }

@@ -14,13 +14,7 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 
 fn test_proof_verifier() -> Arc<crate::proof_verify::ProofVerifier> {
     let profile = crate::genesis::ChainProfile::known(crate::genesis::Chain::Devnet);
-    Arc::new(
-        crate::proof_verify::ProofVerifier::with_genesis(
-            profile.trust().clone(),
-            profile.genesis_json().as_bytes(),
-        )
-        .unwrap(),
-    )
+    Arc::new(crate::proof_verify::ProofVerifier::for_profile(&profile).unwrap())
 }
 
 struct ResponseBlocker {

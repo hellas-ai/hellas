@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 pub(super) async fn read(
     client: &RemoteLightClient,
     keys: Vec<ObjectId>,
-    query: FinalizedBlockQuery,
+    payload: Option<Digest>,
 ) -> Result<Option<ObjectSnapshot>, QueryError> {
     let verifier = &client.proof_verifier;
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
@@ -14,26 +14,12 @@ pub(super) async fn read(
         ));
     }
     let keys: BTreeSet<_> = keys.into_iter().collect();
-    let payload = match query {
-        FinalizedBlockQuery::Latest => None,
-        FinalizedBlockQuery::Payload(payload) => Some(payload),
-        FinalizedBlockQuery::Height(height) => {
-            let Some(block) = client
-                .get_applied_finalized_block(FinalizedBlockQuery::Height(height))
-                .await?
-            else {
-                return Ok(None);
-            };
-            Some(block.snapshot.payload)
-        }
-    };
     let response = client
         .rpc_client()
         .get_object_proofs(GetObjectProofsRequest {
             object_ids: keys.iter().map(|key| key.to_vec()).collect(),
             payload: payload.map(|digest| digest.to_vec()),
             owner: None,
-            owner_offset: 0,
             owner_limit: 0,
             owner_after_key: None,
         })
@@ -46,7 +32,7 @@ pub(super) async fn read(
     let verified = verifier
         .verify_objects(response, &keys, expected, None)
         .map_err(|error| QueryError::Remote(error.to_string()))?;
-    if matches!(query, FinalizedBlockQuery::Latest) {
+    if payload.is_none() {
         record_progress(
             &client.applied_progress,
             verified.block().view().height(),

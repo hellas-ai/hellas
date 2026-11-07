@@ -33,11 +33,11 @@ use hellas_kernel::{
 };
 use hellas_rpc::SubmitTxOutcome;
 
-fn object_id_from_proto(bytes: Vec<u8>) -> Result<ObjectId, QueryError> {
+fn digest_from_proto(bytes: Vec<u8>, field: &str) -> Result<Digest, QueryError> {
     let bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| QueryError::InvalidTransaction("object_id must be 32 bytes".into()))?;
-    Ok(ObjectId::from(bytes))
+        .map_err(|_| QueryError::InvalidTransaction(format!("{field} must be 32 bytes")))?;
+    Ok(Digest::from(bytes))
 }
 
 fn owner_from_proto(bytes: Vec<u8>) -> Result<SettlementKey, QueryError> {
@@ -45,13 +45,6 @@ fn owner_from_proto(bytes: Vec<u8>) -> Result<SettlementKey, QueryError> {
         .try_into()
         .map_err(|_| QueryError::InvalidTransaction("owner must be 33 bytes".into()))?;
     Ok(SettlementKey::from_bytes(bytes))
-}
-
-fn payload_from_proto(bytes: Vec<u8>) -> Result<Digest, QueryError> {
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| QueryError::InvalidTransaction("payload must be 32 bytes".into()))?;
-    Ok(Digest::from(bytes))
 }
 #[cfg(feature = "validator")]
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
@@ -77,10 +70,7 @@ enum TransactionIngress {
     #[cfg(feature = "validator")]
     Mempool(Mempool),
     #[cfg(feature = "full-node")]
-    Validators {
-        addresses: std::sync::Arc<[String]>,
-        verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
-    },
+    Validators(std::sync::Arc<[String]>),
 }
 
 impl LocalLightClient {
@@ -114,7 +104,6 @@ impl LocalLightClient {
         chain_indexer: ChainIndexer,
         consensus_info: ConsensusInfo,
         validators: Vec<String>,
-        verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
         readiness: std::sync::Arc<crate::node::Readiness>,
     ) -> Self {
         Self {
@@ -122,10 +111,7 @@ impl LocalLightClient {
             owner_index,
             chain_indexer,
             consensus_info,
-            ingress: TransactionIngress::Validators {
-                addresses: validators.into(),
-                verifier,
-            },
+            ingress: TransactionIngress::Validators(validators.into()),
             readiness: Some(readiness),
             runtime: None,
             #[cfg(feature = "full-node")]
@@ -152,12 +138,30 @@ impl LocalLightClient {
         Ok(())
     }
 
+    async fn objects(
+        &self,
+        keys: Vec<ObjectId>,
+        payload: Option<Digest>,
+    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+        self.require_ready()?;
+        objects_at(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            keys,
+            NetworkId::new(&self.consensus_info.network_id)
+                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
+            payload,
+        )
+        .await
+    }
+
     #[cfg(feature = "validator")]
     fn mempool(&self) -> &Mempool {
         match &self.ingress {
             TransactionIngress::Mempool(pool) => pool,
             #[cfg(feature = "full-node")]
-            TransactionIngress::Validators { .. } => unreachable!("full nodes forward submissions"),
+            TransactionIngress::Validators(_) => unreachable!("full nodes forward submissions"),
         }
     }
 
@@ -559,17 +563,10 @@ async fn work_channel_snapshot_at(
     query: WorkChannelQuery,
 ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
     let keys = query.object_keys(network);
-    objects_at(
-        databases,
-        owner_index,
-        chain_indexer,
-        keys,
-        network,
-        FinalizedBlockQuery::Latest,
-    )
-    .await?
-    .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
-    .transpose()
+    objects_at(databases, owner_index, chain_indexer, keys, network, None)
+        .await?
+        .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
+        .transpose()
 }
 
 async fn objects_at(
@@ -578,7 +575,7 @@ async fn objects_at(
     chain_indexer: &ChainIndexer,
     keys: Vec<ObjectId>,
     network: NetworkId,
-    query: FinalizedBlockQuery,
+    payload: Option<Digest>,
 ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
         return Err(QueryError::InvalidTransaction(
@@ -589,15 +586,10 @@ async fn objects_at(
         return Ok(None);
     }
     let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
-    match query {
-        FinalizedBlockQuery::Latest => {}
-        FinalizedBlockQuery::Payload(payload) if payload == cursor.payload => {}
-        FinalizedBlockQuery::Height(height) if height == cursor.height => {}
-        _ => {
-            return Err(QueryError::StateUnavailable(
-                "requested current-state snapshot is unavailable".into(),
-            ));
-        }
+    if payload.is_some_and(|payload| payload != cursor.payload) {
+        return Err(QueryError::StateUnavailable(
+            "requested current-state snapshot is unavailable".into(),
+        ));
     }
     let finalization = chain_indexer
         .get_finalization(cursor.payload)
@@ -661,36 +653,29 @@ impl LightClient for LocalLightClient {
     ) -> Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError> {
         use commonware_codec::Encode as _;
         self.require_ready()?;
-        if request.object_ids.len() > crate::proof_verify::MAX_CURRENT_KEYS {
-            return Err(QueryError::InvalidTransaction(
-                "at most 32 object keys are allowed".into(),
-            ));
-        }
         let mut keys = request
             .object_ids
             .into_iter()
-            .map(object_id_from_proto)
+            .map(|id| digest_from_proto(id, "object_id"))
             .collect::<Result<std::collections::BTreeSet<_>, QueryError>>()?;
         let owner = request.owner.map(owner_from_proto).transpose()?;
         let after = request
             .owner_after_key
-            .map(|key| {
-                <[u8; 32]>::try_from(key.as_slice())
-                    .map_err(|_| QueryError::InvalidTransaction("invalid owner cursor".into()))
-            })
+            .map(|key| digest_from_proto(key, "owner cursor").map(|key| key.0))
             .transpose()?;
         if owner.is_some()
             && (request.owner_limit == 0
-                || request.owner_limit > crate::proof_verify::MAX_CURRENT_KEYS as u32)
-            || owner.is_none()
-                && (request.owner_offset != 0 || request.owner_limit != 0 || after.is_some())
-            || after.is_some() && request.owner_offset != 0
+                || request.owner_limit > crate::owner_proof::OWNER_PAGE_LIMIT)
+            || owner.is_none() && (request.owner_limit != 0 || after.is_some())
         {
             return Err(QueryError::InvalidTransaction(
                 "invalid owner page request".into(),
             ));
         }
-        let wanted = request.payload.map(payload_from_proto).transpose()?;
+        let wanted = request
+            .payload
+            .map(|payload| digest_from_proto(payload, "payload"))
+            .transpose()?;
         if self.owner_index.cursor().height == 0 {
             if wanted.is_some() {
                 return Err(QueryError::StateUnavailable(
@@ -719,42 +704,27 @@ impl LightClient for LocalLightClient {
             .ok_or_else(|| {
                 QueryError::StateUnavailable("applied finalized block is unavailable".into())
             })?;
-        if finalized.snapshot.state_root != reader.root() {
-            return Err(QueryError::StateUnavailable(
-                "applied root changed while serving proofs".into(),
-            ));
-        }
         let owner_page = if let Some(owner) = owner {
-            let page = if after.is_some() {
-                crate::execution::owner_tree::prove_stored_owner_page_after(
-                    &reader,
-                    owner,
-                    after,
-                    request.owner_limit,
-                )
-                .await
-            } else {
-                crate::execution::owner_tree::prove_stored_owner_page(
-                    &reader,
-                    owner,
-                    request.owner_offset,
-                    request.owner_limit,
-                )
-                .await
-            }
+            let page = crate::execution::owner_tree::prove_stored_owner_page_after(
+                &reader,
+                owner,
+                after,
+                request.owner_limit,
+            )
+            .await
             .map_err(|error| QueryError::StateUnavailable(format!("owner page: {error}")))?;
             for holding in &page.holdings {
                 keys.insert(ObjectId::from(holding.object_id));
-            }
-            if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
-                return Err(QueryError::InvalidTransaction(
-                    "owner page and object keys exceed 32".into(),
-                ));
             }
             Some(page.into_proto())
         } else {
             None
         };
+        if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
+            return Err(QueryError::InvalidTransaction(
+                "owner page and object keys exceed 32".into(),
+            ));
+        }
         let mut proofs = Vec::with_capacity(keys.len());
         for key in keys {
             let object = reader
@@ -787,15 +757,7 @@ impl LightClient for LocalLightClient {
             });
         }
         Ok(hellas_rpc::pb::chain::GetObjectProofsResponse {
-            block: Some(hellas_rpc::pb::chain::FinalizedBlock {
-                snapshot: Some(hellas_rpc::pb::chain::FinalizedSnapshot {
-                    height: finalized.snapshot.height,
-                    payload: finalized.snapshot.payload.to_vec(),
-                    state_root: finalized.snapshot.state_root.to_vec(),
-                    finalization: finalized.snapshot.finalization,
-                }),
-                block: finalized.block,
-            }),
+            block: Some(crate::server::finalized_block_to_proto(finalized)),
             proofs,
             owner_page,
         })
@@ -805,35 +767,15 @@ impl LightClient for LocalLightClient {
         &self,
         keys: Vec<ObjectId>,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        self.require_ready()?;
-        objects_at(
-            &self.databases,
-            &self.owner_index,
-            &self.chain_indexer,
-            keys,
-            NetworkId::new(&self.consensus_info.network_id)
-                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
-            FinalizedBlockQuery::Latest,
-        )
-        .await
+        self.objects(keys, None).await
     }
 
     async fn get_objects_at(
         &self,
         keys: Vec<ObjectId>,
-        query: FinalizedBlockQuery,
+        payload: Digest,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        self.require_ready()?;
-        objects_at(
-            &self.databases,
-            &self.owner_index,
-            &self.chain_indexer,
-            keys,
-            NetworkId::new(&self.consensus_info.network_id)
-                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
-            query,
-        )
-        .await
+        self.objects(keys, Some(payload)).await
     }
 
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
@@ -990,21 +932,12 @@ impl LightClient for LocalLightClient {
                     }
                 }
                 #[cfg(feature = "full-node")]
-                TransactionIngress::Validators {
-                    addresses,
-                    verifier,
-                } => {
+                TransactionIngress::Validators(validators) => {
                     let mut error = QueryError::Connect("no validator seed is reachable".into());
-                    for address in addresses.iter() {
+                    for address in validators.iter() {
                         let result =
                             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                                crate::client::RemoteLightClient::connect(
-                                    address.clone(),
-                                    verifier.clone(),
-                                )
-                                .await?
-                                .submit_tx(tx.clone())
-                                .await
+                                crate::client::forward_submission(address, tx.clone()).await
                             })
                             .await;
                         match result {

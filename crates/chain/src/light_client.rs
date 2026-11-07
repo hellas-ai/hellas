@@ -119,25 +119,22 @@ pub struct CoinPage {
     pub snapshot: LatestBlock,
     pub coins: Vec<(ObjectId, u64)>,
     pub next: Option<ObjectId>,
-    /// Total balance of coins owned by this key; delegated coins are excluded.
-    pub owned_balance: Option<u128>,
 }
 
-fn page_from_local_listing(listing: CoinListing, after: Option<ObjectId>, owned: bool) -> CoinPage {
+fn page_from_local_listing(listing: CoinListing, after: Option<ObjectId>) -> CoinPage {
+    let limit = crate::owner_proof::OWNER_PAGE_LIMIT as usize;
     let mut all = listing.coins;
     all.sort_unstable_by_key(|(id, _)| *id);
-    let balance = owned.then(|| all.iter().map(|(_, value)| u128::from(*value)).sum());
     let coins: Vec<_> = all
         .into_iter()
         .filter(|(id, _)| after.is_none_or(|key| *id > key))
-        .take(33)
+        .take(limit + 1)
         .collect();
-    let next = (coins.len() > 32).then(|| coins[31].0);
+    let next = (coins.len() > limit).then(|| coins[limit - 1].0);
     CoinPage {
         snapshot: listing.snapshot,
-        coins: coins.into_iter().take(32).collect(),
+        coins: coins.into_iter().take(limit).collect(),
         next,
-        owned_balance: balance,
     }
 }
 
@@ -306,20 +303,17 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Read the exact current root selected by a payload or height. An older
-    /// root is unavailable after execution advances; point reads use a floor.
+    /// Read the exact current root of a finalized payload. An older root is
+    /// unavailable after execution advances; point reads use a floor.
     fn get_objects_at(
         &self,
-        keys: Vec<ObjectId>,
-        query: FinalizedBlockQuery,
+        _keys: Vec<ObjectId>,
+        _payload: Digest,
     ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
-        async move {
-            if !matches!(query, FinalizedBlockQuery::Latest) {
-                return Err(QueryError::StateUnavailable(
-                    "pinned object reads are unavailable".into(),
-                ));
-            }
-            self.get_objects(keys).await
+        async {
+            Err(QueryError::StateUnavailable(
+                "pinned object reads are unavailable".into(),
+            ))
         }
     }
 
@@ -389,7 +383,7 @@ pub trait LightClient: Clone + Send + Sync + 'static {
             let Some(listing) = self.get_coins_by_owner(owner).await? else {
                 return Ok(None);
             };
-            Ok(Some(page_from_local_listing(listing, after, true)))
+            Ok(Some(page_from_local_listing(listing, after)))
         }
     }
 
@@ -409,7 +403,7 @@ pub trait LightClient: Clone + Send + Sync + 'static {
             let Some(listing) = self.get_coins_by_delegate(delegate).await? else {
                 return Ok(None);
             };
-            Ok(Some(page_from_local_listing(listing, after, false)))
+            Ok(Some(page_from_local_listing(listing, after)))
         }
     }
 

@@ -1415,11 +1415,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let trust_config = work_config(&devnet, root.path().join("paid"));
     let profile = &trust_config.chain;
     let verifier = std::sync::Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            profile.trust().clone(),
-            profile.consensus_digest(),
-        )
-        .unwrap(),
+        hellas_chain::proof_verify::ProofVerifier::for_profile(profile).unwrap(),
     );
     let chain = RemoteLightClient::connect(devnet.light_client_url(0), verifier)
         .await

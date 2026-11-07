@@ -237,8 +237,9 @@ mod id_pins {
             GetAppliedFinalizedBlock, GetStateRoot, LightClient, SubmitWorkResponse,
             SubscribeFinalized,
         };
-        // Applied witness checkpoints deliberately rotate the LightClient service.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xf06c_d7ee);
+        // Retiring offset paging on GetObjectProofs deliberately rotates the
+        // LightClient service.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xc05b_bf12);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974
