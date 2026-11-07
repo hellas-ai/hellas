@@ -209,7 +209,8 @@ impl LocalStore {
                         Some(object),
                         PinTarget {
                             name: PinName::new(format!(
-                                "work/{}/acquired/{}",
+                                "work/{}/{}/acquired/{}",
+                                job.channel,
                                 job.id,
                                 object.id()
                             ))?,

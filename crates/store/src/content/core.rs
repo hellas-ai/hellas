@@ -46,7 +46,7 @@ struct Work {
     staged: BTreeMap<ContentId, Arc<Stored>>,
 }
 type AcquiredOwner = (std::sync::Weak<Mutex<State>>, ReservationId);
-type AcquiredOwners = BTreeMap<PinName, AcquiredOwner>;
+type AcquiredOwners = BTreeMap<PinName, Vec<AcquiredOwner>>;
 pub(crate) struct State {
     pub(crate) peers: Option<hellas_wire::iroh::Pool>,
     #[cfg(test)]
@@ -117,14 +117,14 @@ impl Core {
             .collect();
         state.publish(objects, target, pin)?;
         if let Some(owner) = owner {
-            state.acquired.insert(name, owner);
+            state.add_acquired(name, owner);
         }
         self.changed.notify_waiters();
         Ok(())
     }
     /// Called by the authenticated application opening, first with the root only.
     pub fn open_work(&self, job: JobId, closure: Closure, max_upload_bytes: u64) -> Result<Scope> {
-        let mut state = self.state()?;
+        let state = self.state()?;
         if let Some((id, work)) = state.work.iter().find(|(_, work)| work.job == job) {
             if work.root_recovery {
                 return Err(Error::Denied);
@@ -152,11 +152,21 @@ impl Core {
         if missing > max_upload_bytes {
             return Err(Error::Capacity);
         }
+        let acquired = match &self.lower {
+            Some(lower) => lower.state()?.acquired_pins(&scope, &closure)?,
+            None => state.acquired_pins(&scope, &closure)?,
+        };
         let charge = self
             .data_pool()
             .reserve(missing.saturating_sub(held_input))?;
         let reservation = self.data_pool().next_id()?;
-        state.work.insert(
+        drop(state);
+        let scope = Scope::work(job, closure.clone(), reservation);
+        self.lower
+            .as_deref()
+            .unwrap_or(self)
+            .protect_acquired(self, &scope, acquired)?;
+        self.state()?.work.insert(
             reservation,
             Work {
                 root_recovery: false,
@@ -170,7 +180,7 @@ impl Core {
                 staged,
             },
         );
-        Ok(Scope::work(job, closure, reservation))
+        Ok(scope)
     }
     /// Widen only after the application has verified and parsed the root.
     pub fn widen_work(
@@ -201,6 +211,10 @@ impl Core {
         if missing > max_upload_bytes {
             return Err(Error::Capacity);
         }
+        let acquired = match &self.lower {
+            Some(lower) => lower.state()?.acquired_pins(&new_scope, &closure)?,
+            None => state.acquired_pins(&new_scope, &closure)?,
+        };
         let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
         if missing > work.input_reserved {
             let recovered = if self.disk.is_some() {
@@ -218,7 +232,16 @@ impl Core {
                 .extend((missing - work.input_reserved).saturating_sub(recovered))?;
             work.input_reserved = missing;
         }
-        work.closure = closure;
+        drop(state);
+        self.lower
+            .as_deref()
+            .unwrap_or(self)
+            .protect_acquired(self, &new_scope, acquired)?;
+        self.state()?
+            .work
+            .get_mut(reservation)
+            .ok_or(Error::Denied)?
+            .closure = closure;
         Ok(new_scope)
     }
     pub(crate) fn work_bytes(&self, scope: &Scope) -> Result<u64> {
@@ -525,13 +548,45 @@ impl State {
                 .map(|(_, pin)| pin.target),
         )
     }
-    fn unpin_acquired(&mut self, owner: &AcquiredOwner) -> Result<()> {
-        let names = self
-            .acquired
+    fn acquired_pins(&self, scope: &Scope, closure: &[ContentRef]) -> Result<Vec<PinName>> {
+        // Each consumer keeps the existing acquisition pin alive. Its current
+        // policy/expiry still controls reads; Channel and ordinary pins stay separate.
+        let requested = closure.iter().copied().collect::<BTreeSet<_>>();
+        self.acquired
+            .keys()
+            .filter_map(|name| {
+                let pin = self.pins.get(name)?;
+                if pin.policy != PinPolicy::Jobs || !readable(scope, name, pin) {
+                    return None;
+                }
+                Some(
+                    self.walk([pin.target])
+                        .map(|objects| (!objects.is_disjoint(&requested)).then(|| name.clone())),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|names| names.into_iter().flatten().collect())
+    }
+    fn add_acquired(&mut self, name: PinName, owner: AcquiredOwner) {
+        let owners = self.acquired.entry(name).or_default();
+        if !owners
             .iter()
-            .filter(|(_, current)| current.0.ptr_eq(&owner.0) && current.1 == owner.1)
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
+            .any(|current| current.0.ptr_eq(&owner.0) && current.1 == owner.1)
+        {
+            owners.push(owner);
+        }
+    }
+    fn unpin_acquired(&mut self, owner: &AcquiredOwner) -> Result<()> {
+        let mut names = Vec::new();
+        for (name, owners) in &mut self.acquired {
+            owners.retain(|current| {
+                current.0.strong_count() != 0
+                    && !(current.0.ptr_eq(&owner.0) && current.1 == owner.1)
+            });
+            if owners.is_empty() {
+                names.push(name.clone());
+            }
+        }
         for name in names {
             self.acquired.remove(&name);
             if self.pins.contains_key(&name) {
@@ -1384,6 +1439,17 @@ impl Core {
             .collect())
     }
 
+    fn protect_acquired(&self, requester: &Core, scope: &Scope, names: Vec<PinName>) -> Result<()> {
+        let ScopeKind::Work { reservation, .. } = &scope.kind else {
+            return Err(Error::Denied);
+        };
+        let mut state = self.state()?;
+        for name in names {
+            state.add_acquired(name, (Arc::downgrade(&requester.state), *reservation));
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_acquired(&self, owner: AcquiredOwner) -> Result<()> {
         self.state()?.unpin_acquired(&owner)
     }
@@ -1392,28 +1458,39 @@ impl Core {
             return Ok(());
         }
         let mut state = self.state()?;
-        let live = state
-            .work
-            .iter()
-            .map(|(reservation, work)| (work.job.id.to_string(), *reservation))
-            .collect::<BTreeMap<_, _>>();
-        let names = state
+        let pins = state
             .pins
-            .keys()
-            .filter_map(|name| {
+            .iter()
+            .filter(|(name, _)| {
                 let parts = name.as_str().split('/').collect::<Vec<_>>();
-                (parts.len() == 4 && parts[0] == "work" && parts[2] == "acquired")
-                    .then(|| (name.clone(), live.get(parts[1]).copied()))
+                parts.len() == 5 && parts[0] == "work" && parts[3] == "acquired"
             })
+            .map(|(name, pin)| (name.clone(), pin.clone()))
             .collect::<Vec<_>>();
-        for (name, reservation) in names {
-            if let Some(reservation) = reservation {
-                state
-                    .acquired
-                    .insert(name, (Arc::downgrade(&self.state), reservation));
+        for (name, pin) in pins {
+            let parts = name.as_str().split('/').collect::<Vec<_>>();
+            let reached = if pin.policy == PinPolicy::Jobs && live(&pin) {
+                state.walk([pin.target])?
             } else {
+                BTreeSet::new()
+            };
+            let owners = state
+                .work
+                .iter()
+                .filter(|(_, work)| {
+                    (work.job.channel.to_string() == parts[1]
+                        && work.job.id.to_string() == parts[2])
+                        || work.closure.iter().any(|object| reached.contains(object))
+                })
+                .map(|(reservation, _)| (Arc::downgrade(&self.state), *reservation))
+                .collect::<Vec<_>>();
+            if owners.is_empty() {
                 state.change_pin(name.clone(), None)?;
                 state.acquired.remove(&name);
+            } else {
+                for owner in owners {
+                    state.add_acquired(name.clone(), owner);
+                }
             }
         }
         Ok(())

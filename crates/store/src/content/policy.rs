@@ -160,11 +160,71 @@ mod tests {
                 .pins;
             assert_eq!(pins.len(), 1);
             assert_eq!(pins[0].1.policy, PinPolicy::Jobs);
+            let private_channel = hellas_auth::Digest::from_bytes([43; 32]);
+            node.core
+                .effect(&Scope::Owner, move |core| {
+                    core.publish_acquired(
+                        vec![(
+                            reference,
+                            super::super::storage::Data::Ram(bytes::Bytes::from_static(b"root")),
+                            hellas_xet::chunk(b"root"),
+                        )],
+                        Target::Object(reference),
+                        PinTarget {
+                            name: PinName::new("channel-private".into())?,
+                            policy: PinPolicy::Channel(private_channel),
+                        },
+                        None,
+                    )
+                })
+                .await
+                .unwrap();
+            // Same work id on a different channel must independently retain shared content.
+            // Admission of a cache hit must retain it without acquire_missing.
+            let other = JobContent::new(
+                &node,
+                JobId {
+                    channel: private_channel,
+                    ..job()
+                },
+                vec![reference, object],
+                reference.bytes(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                node.pins(&Scope::Owner, "work/", Cursor::default())
+                    .await
+                    .unwrap()
+                    .pins
+                    .len(),
+                1
+            );
             match local {
                 LocalStore::Job(work) => work.end().await.unwrap(),
                 LocalStore::Disk(node) => node.end_work(&scope).await.unwrap(),
                 _ => unreachable!(),
             };
+            assert_eq!(node.collect(&Scope::Owner).await.unwrap().bytes, 0);
+            assert!(
+                LocalStore::Job(other.clone())
+                    .open_verified(other.scope(), object, None)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            other.end().await.unwrap();
+            let private_name = PinName::new("channel-private".into()).unwrap();
+            let private = node
+                .pins(&Scope::Owner, "channel-private", Cursor::default())
+                .await
+                .unwrap()
+                .pins[0]
+                .1
+                .clone();
+            node.set_pin(&Scope::Owner, &private_name, Some(&private), None)
+                .await
+                .unwrap();
             assert!(
                 node.pins(&Scope::Owner, "work/", Cursor::default())
                     .await
@@ -175,7 +235,7 @@ mod tests {
             assert_eq!(node.ram_pool().held(), 0);
             assert_eq!(
                 node.collect(&Scope::Owner).await.unwrap().bytes,
-                object.bytes()
+                object.bytes() + reference.bytes()
             );
             serving.join().unwrap();
         }
@@ -328,9 +388,16 @@ mod tests {
             );
             let restored = if restore {
                 Some(
-                    node.open_work(job(), vec![reference, object], reference.bytes())
-                        .await
-                        .unwrap(),
+                    node.open_work(
+                        JobId {
+                            channel: hellas_auth::Digest::from_bytes([43; 32]),
+                            ..job()
+                        },
+                        vec![reference, object],
+                        reference.bytes(),
+                    )
+                    .await
+                    .unwrap(),
                 )
             } else {
                 None
@@ -500,7 +567,13 @@ mod tests {
         let acquiring =
             tokio::spawn(async move { local.acquire_missing(&scope, vec![object]).await });
         received.await.unwrap();
-        let name = PinName::new(format!("work/{}/acquired/{}", job().id, object.id())).unwrap();
+        let name = PinName::new(format!(
+            "work/{}/{}/acquired/{}",
+            job().channel,
+            job().id,
+            object.id()
+        ))
+        .unwrap();
         node.set_pin(
             &Scope::Owner,
             &name,
