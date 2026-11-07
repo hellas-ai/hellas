@@ -38,7 +38,7 @@
 
 use std::io::Read as _;
 
-use hellas_xet::{Chunk, XetHash};
+use hellas_xet::XetHash;
 
 /// Which kind of repository a model lives in. The API path pluralises
 /// it, which is why this is not just a string.
@@ -669,35 +669,13 @@ impl HfCas {
         }
         Ok(response.into_body().into_reader())
     }
-    /// Reconstruction streams framed chunks; no whole xorb or file assembly.
     pub(crate) fn write_xet(
         &self,
         id: XetHash,
         len: u64,
-        expected: Option<&[Chunk]>,
         writer: &mut impl std::io::Write,
         pool: &crate::content::Reservations,
     ) -> Result<()> {
-        if let Some(chunks) = expected {
-            let total = chunks
-                .iter()
-                .try_fold(0u64, |total, chunk| total.checked_add(chunk.data_len));
-            if total != Some(len)
-                || hellas_xet::file_hash(chunks) != id
-                || chunks.iter().any(|chunk| {
-                    chunk.data_len == 0 || chunk.data_len > hellas_xet::MAX_CHUNK_SIZE as u64
-                })
-                || chunks
-                    .iter()
-                    .rev()
-                    .skip(1)
-                    .any(|chunk| chunk.data_len < hellas_xet::MIN_CHUNK_SIZE as u64)
-            {
-                return Err(FetchError::Malformed(
-                    "expected descriptor commitment".into(),
-                ));
-            }
-        }
         let _metadata = pool
             .reserve(TOKEN_BODY_LIMIT + RECONSTRUCTION_BODY_LIMIT)
             .map_err(|_| FetchError::Capacity)?;
@@ -714,7 +692,6 @@ impl HfCas {
             ));
         }
         let mut skip = plan.offset_into_first_range;
-        let mut descriptor = 0usize;
         let mut written = 0u64;
         for term in &plan.terms {
             if term.chunks.end - term.chunks.start
@@ -781,20 +758,7 @@ impl HfCas {
                         .read_exact(&mut frame[header.len()..])
                         .map_err(|_| FetchError::Malformed("truncated xorb payload".into()))?;
                     let in_term = term.chunks.contains(&index);
-                    let chunk = if in_term {
-                        expected
-                            .map(|expected| {
-                                expected.get(descriptor).ok_or_else(|| {
-                                    FetchError::Malformed(
-                                        "reconstruction exceeded descriptors".into(),
-                                    )
-                                })
-                            })
-                            .transpose()?
-                    } else {
-                        None
-                    };
-                    let decoded = crate::xorb::decode_chunk_bounded(&frame, chunk)?;
+                    let decoded = crate::xorb::decode_chunk_bounded(&frame, None)?;
                     if !in_term {
                         continue;
                     }
@@ -822,7 +786,6 @@ impl HfCas {
                     writer
                         .write_all(bytes)
                         .map_err(|_| FetchError::Malformed("staging reconstructed bytes".into()))?;
-                    descriptor += 1;
                 }
                 let mut sentinel = [0];
                 if consumed != length
@@ -838,10 +801,7 @@ impl HfCas {
                 return Err(FetchError::Malformed("reconstruction term length".into()));
             }
         }
-        if written != len
-            || skip != 0
-            || expected.is_some_and(|expected| descriptor != expected.len())
-        {
+        if written != len || skip != 0 {
             return Err(FetchError::Malformed("short reconstruction".into()));
         }
         Ok(())

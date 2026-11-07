@@ -331,7 +331,7 @@ fn new_hf_reconstruction_streams_multiterm_and_nonzero_offset() {
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
     let mut bytes = Vec::new();
-    cas.write_xet(id, expected.len() as u64, None, &mut bytes, &pool)
+    cas.write_xet(id, expected.len() as u64, &mut bytes, &pool)
         .unwrap();
     serving.join().unwrap();
     assert_eq!(bytes, expected);
@@ -361,7 +361,7 @@ fn legacy_hf_chunking_is_refused_before_writing_with_a_specific_store_error() {
     let pool = Reservations::ram(16 << 20);
     let mut bytes = Vec::new();
     let error = cas
-        .write_xet(id, content.len() as u64, None, &mut bytes, &pool)
+        .write_xet(id, content.len() as u64, &mut bytes, &pool)
         .unwrap_err();
     serving.join().unwrap();
     assert!(
@@ -372,24 +372,6 @@ fn legacy_hf_chunking_is_refused_before_writing_with_a_specific_store_error() {
         hellas_wire::WireCode::InvalidArgument, crate::hf::LEGACY_CHUNKING
     )), Error::Invalid(reason) if reason == crate::hf::LEGACY_CHUNKING)
     );
-    assert!(bytes.is_empty());
-    assert_eq!(pool.held(), 0);
-}
-
-#[test]
-fn hf_expected_descriptors_never_downgrade_to_cold_when_the_list_is_short() {
-    let cas =
-        crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub("http://127.0.0.1:1");
-    let pool = Reservations::ram(16 << 20);
-    let mut bytes = Vec::new();
-    let result = cas.write_xet(
-        hellas_xet::XetHash::hash(b"file"),
-        4,
-        Some(&[]),
-        &mut bytes,
-        &pool,
-    );
-    assert!(result.is_err());
     assert!(bytes.is_empty());
     assert_eq!(pool.held(), 0);
 }
@@ -448,31 +430,6 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
             .await,
         Err(Error::Missing)
     ));
-}
-
-#[test]
-fn known_hf_reconstruction_checks_the_expected_chunk_hash_before_writing() {
-    let good = b"hello";
-    let wrong = framed(b"jello");
-    let id = hellas_xet::XetHash::hash(good);
-    let xorb = hellas_xet::XetHash::ZERO;
-    let (base, serving) = hub(|base| {
-        vec![(format!("/api/models/org/repo/xet-read-token/{}","a".repeat(40)),200,format!("{{\"accessToken\":\"t\",\"casUrl\":\"{base}\"}}").into_bytes()),
-        (format!("/v2/reconstructions/{id}"),200,serde_json::json!({"terms":[{"hash":xorb.to_string(),"range":{"start":0,"end":1},"unpacked_length":5}],"xorbs":{xorb.to_string():[{"url":format!("{base}/xorb"),"ranges":[{"chunks":{"start":0,"end":1},"bytes":{"start":0,"end":wrong.len()-1}}]}]}}).to_string().into_bytes()),
-        ("/xorb".into(),206,wrong)]
-    });
-    let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
-    let pool = Reservations::ram(16 << 20);
-    let mut bytes = Vec::new();
-    assert!(matches!(
-        cas.write_xet(id, 5, Some(&hellas_xet::chunk(good)), &mut bytes, &pool),
-        Err(crate::hf::FetchError::Xorb(
-            crate::xorb::XorbError::HashMismatch { .. }
-        ))
-    ));
-    serving.join().unwrap();
-    assert!(bytes.is_empty());
-    assert_eq!(pool.held(), 0);
 }
 
 #[tokio::test]

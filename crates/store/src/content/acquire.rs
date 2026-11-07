@@ -267,14 +267,8 @@ fn hf_file(
     let charge = stage_charge(core, stages, file.size)?;
     let mut bytes = Buffer::new(core, file.size, charge)?;
     if let Some(advertised) = advertised {
-        cas.write_xet(
-            advertised.id().digest(),
-            file.size,
-            None,
-            &mut bytes,
-            &core.pool,
-        )
-        .map_err(hf_error)?;
+        cas.write_xet(advertised.id().digest(), file.size, &mut bytes, &core.pool)
+            .map_err(hf_error)?;
     } else {
         bytes.fill(
             cas.small_file(&file.path).map_err(hf_error)?,

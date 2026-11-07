@@ -144,15 +144,7 @@ pub(crate) fn decode_chunk_bounded(
     // the length — and the check that follows is only reached if the
     // allocation succeeded.
     let data = match scheme {
-        Scheme::None => {
-            if compressed_size != uncompressed_size {
-                return Err(XorbError::LengthMismatch {
-                    declared: uncompressed_size,
-                    actual: compressed_size,
-                });
-            }
-            payload.to_vec()
-        }
+        Scheme::None => payload.to_vec(),
         Scheme::Lz4 => lz4_frame(payload, uncompressed_size)?,
         Scheme::ByteGrouping4Lz4 => ungroup(&lz4_frame(payload, uncompressed_size)?),
     };
@@ -205,15 +197,6 @@ pub fn decode_chunks(
             bytes.get(offset..).ok_or(XorbError::Truncated)?,
             expected.and_then(|chunks| chunks.get(index)),
         )?;
-        if let Some(chunk) = expected.and_then(|chunks| chunks.get(index)) {
-            let actual = chunk_hash(&next.data);
-            if actual != chunk.hash {
-                return Err(XorbError::HashMismatch {
-                    expected: chunk.hash,
-                    actual,
-                });
-            }
-        }
         offset += next.consumed;
         decoded.push(next.data);
     }
