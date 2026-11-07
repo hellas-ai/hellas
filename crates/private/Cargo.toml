@@ -35,7 +35,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
 keyring-core = "1"
+serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 zeroize = "1.9"

@@ -11,28 +11,27 @@ documentation.workspace = true
 libc = "0.2"
 
 [dependencies]
-async-trait = "0.1"
 async-stream.workspace = true
+async-trait = "0.1"
 bytes.workspace = true
-futures-core.workspace = true
 futures.workspace = true
-tokio.workspace = true
+futures-core.workspace = true
 hellas-auth.workspace = true
-hellas-wire = { workspace = true, features = ["mux", "iroh"] }
-iroh = { workspace = true, features = ["tls-ring"] }
-sha2.workspace = true
-prost = { version = "0.14", default-features = false, features = ["derive"] }
-url = "2"
 hellas-private.workspace = true
 hellas-rpc.workspace = true
+hellas-wire = { workspace = true, features = ["mux", "iroh"] }
 hellas-xet = { workspace = true, features = ["chunking"] }
+iroh = { workspace = true, features = ["tls-ring"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
-sqlx.workspace = true
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde.workspace = true
 serde_ipld_dagcbor.workspace = true
 serde_json = { workspace = true }
+sha2.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 thiserror = { workspace = true }
+tokio.workspace = true
 tracing.workspace = true
 # Bundled Mozilla roots, matching the workspace `reqwest`. Deliberately
 # NOT `platform-verifier`: two HTTP clients in one binary trusting two
@@ -44,8 +43,12 @@ ureq = { version = "3", default-features = false, features = [
     "rustls",
     "rustls-webpki-roots",
 ] }
+url = "2"
 
 [dev-dependencies]
 hellas-private = { workspace = true, features = ["test-support"] }
 rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }

@@ -41,7 +41,6 @@ hellas-rpc = { workspace = true, features = [
     "host-control",
 ] }
 hellas-store.workspace = true
-hellas-xet.workspace = true
 hellas-wire = { workspace = true, features = [
     "mux",
     "iroh",
@@ -49,6 +48,7 @@ hellas-wire = { workspace = true, features = [
     "tls",
     "discovery-mdns",
 ] }
+hellas-xet.workspace = true
 hex = { workspace = true }
 iroh = { workspace = true, features = ["tls-ring"] }
 iroh-mdns-address-lookup = { workspace = true }
@@ -71,7 +71,6 @@ url = { version = "2" }
 zeroize = { version = "1.9" }
 
 [dev-dependencies]
-sqlx.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 bytes.workspace = true
@@ -91,6 +90,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
+sqlx.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",

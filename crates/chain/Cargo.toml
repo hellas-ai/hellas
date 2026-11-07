@@ -221,7 +221,6 @@ tracing = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-hellas-store.workspace = true
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true
@@ -243,6 +242,7 @@ hellas-kernel = { workspace = true, features = ["test-support"] }
 # consensus is asked to accept. As a runtime dependency `hellas-rpc`
 # arrives without the work protocol; the settlement suite needs it.
 hellas-rpc = { workspace = true, features = ["work"] }
+hellas-store.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile = "3"
