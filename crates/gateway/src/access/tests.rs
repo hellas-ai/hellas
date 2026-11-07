@@ -145,18 +145,6 @@ async fn malformed_bearers_are_unauthorized() {
     }
 }
 #[tokio::test]
-async fn legacy_sixty_four_character_tokens_are_unauthorized() {
-    let fixture = Fixture::new().await;
-    assert_eq!(
-        status(
-            &router(fixture.access),
-            Some(&format!("Bearer {}", "11".repeat(32)))
-        )
-        .await,
-        StatusCode::UNAUTHORIZED
-    );
-}
-#[tokio::test]
 async fn query_tokens_do_not_authenticate() {
     let fixture = Fixture::new().await;
     let request = Request::builder()

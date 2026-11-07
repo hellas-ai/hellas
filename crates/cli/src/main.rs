@@ -1029,6 +1029,7 @@ async fn async_main() {
                     .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
             };
             let mut local_content = None;
+            let mut local_service = None;
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
                 let offer = commands::contributions::load_offer(&home, &client, name)?;
@@ -1058,7 +1059,7 @@ async fn async_main() {
                     assurance == hellas_rpc::Assurance::ProducerSigned,
                     "local Work requires producer-signed assurance"
                 );
-                let (source, reload) = commands::grant_gateway::local::prepare(
+                let ((session, service), reload) = commands::grant_gateway::local::prepare(
                     &home,
                     grant,
                     native,
@@ -1069,7 +1070,11 @@ async fn async_main() {
                 )
                 .await?;
                 local_content = Some(reload);
-                Some(source)
+                local_service = Some(service.clone());
+                Some((
+                    session,
+                    hellas_sdk::grant_client::GrantTransport::Local(service),
+                ))
             } else {
                 None
             };
@@ -1236,14 +1241,20 @@ async fn async_main() {
             if let Some(content) = paid_content {
                 content.close().await;
             }
-            let served = if let Some(content) = local_content {
-                served.and(content.shutdown().await)
-            } else {
-                served
-            };
             let stopped = match control {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,
+            };
+            // The gateway's session only drained the local service it borrowed.
+            let stopped = match local_service {
+                Some(service) => stopped.and(service.shutdown().await.map_err(anyhow::Error::from)),
+                None => stopped,
+            };
+            // The local content store outlives the service that reads it.
+            let stopped = if let Some(content) = local_content {
+                stopped.and(content.shutdown().await)
+            } else {
+                stopped
             };
             node.close().await;
             stopped

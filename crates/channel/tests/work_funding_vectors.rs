@@ -1,4 +1,4 @@
-//! Fixed V2 encodings assembled field-by-field before caller migration.
+//! Fixed V2 encodings assembled field-by-field.
 use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, NodeKey, PrincipalId, ResourceId, Revision, UnixMillis};
 use hellas_channel::job;

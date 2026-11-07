@@ -25,8 +25,8 @@ Attestation only works on a genuine, locked-down Apple machine.
    carry the enrollment with the grant. Paid clients compare the offered bundle
    with independently approved enrollment and Apple software pins.
 4. **Serve with Apple assurance:** start the sealed-Fetch provider from Gate.
-   The command-line node intentionally no longer owns DeviceCheck enrollment
-   or native proof production.
+   The command-line node does not own DeviceCheck enrollment or native proof
+   production.
 
 ## Requester
 

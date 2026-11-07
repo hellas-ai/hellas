@@ -116,10 +116,8 @@ pub(crate) fn respond(status: StatusCode, content_type: &'static str, body: Vec<
 
 /// Structured failure, in the negotiated representation.
 ///
-/// Every route on this API now answers errors the same way. The proof
-/// routes used to return a bare string while the EdgeIndex routes returned
-/// an encoded `IndexError`, so a client could not parse failures uniformly
-/// and had to branch on which path it had called.
+/// Every route on this API answers errors the same way, so a client parses
+/// failures uniformly whichever path it called.
 ///
 /// The code is derived from the status rather than supplied per call site,
 /// which keeps the vocabulary closed: the same condition cannot acquire two

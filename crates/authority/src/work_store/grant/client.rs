@@ -1,5 +1,6 @@
 //! One proposal writer per grant channel. Bodies are never journaled; an
 //! uncertain acceptance survives restart and cannot be replaced by a new nonce.
+use super::checkpoint::CheckpointBound;
 use super::{Deserialize, GrantChannelState, NodeStoreError, Serialize, Signature, SignedResult};
 use crate::model::grant::records::{check_grant_provider, grant_producer};
 use crate::model::grant::{
@@ -24,6 +25,10 @@ use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 
 const NAMESPACE: &str = "hellas.work.grant-client.v2";
 const MAX_JOBS: usize = 256;
+/// Each job's reserve for a provider signature and result. Also covers what a
+/// frame adds to the snapshot beyond its own bytes: a new job's field names,
+/// the pending work id, and widened clock and nonce integers.
+const JOB_HEADROOM: usize = 512;
 const JOURNAL_STEM: &str = "grant-client";
 
 pub struct GrantClientStore {
@@ -33,8 +38,10 @@ pub struct GrantClientStore {
     channel: GrantChannelState,
     provider: ProviderEnrollmentBundle,
     state: ClientState,
+    /// Covers the encoded snapshot of `state`.
+    checkpoint_bound: CheckpointBound,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ClientState {
     book: JobBook<GrantFunding>,
     now: UnixMillis,
@@ -178,6 +185,7 @@ impl GrantClientStore {
             channel,
             provider,
             state: ClientState::default(),
+            checkpoint_bound: CheckpointBound::UNMEASURED,
         };
         store.state = store.replayer().replay(replay)?;
         store.tick(now).await?;
@@ -194,6 +202,7 @@ impl GrantClientStore {
         let (journal, replay) =
             Journal::open_latest(&self.directory, JOURNAL_STEM, journal_id(&self.channel)).await?;
         self.state = self.replayer().replay(replay)?;
+        self.checkpoint_bound = CheckpointBound::UNMEASURED;
         self.journal = journal;
         Ok(())
     }
@@ -368,9 +377,9 @@ impl GrantClientStore {
         Ok(())
     }
     pub async fn rotate(&mut self) -> Result<(), NodeStoreError> {
-        self.journal
-            .rotate(&encode(&self.snapshot(&self.state))?)
-            .await?;
+        let checkpoint = encode(&self.snapshot(&self.state))?;
+        self.journal.rotate(&checkpoint).await?;
+        self.checkpoint_bound.measured(checkpoint.len());
         Ok(())
     }
 
@@ -388,24 +397,29 @@ impl GrantClientStore {
         };
         let mut candidate = self.state.clone();
         self.replayer().apply(&mut candidate, &frame)?;
-        // Reserve enough space for a provider signature and result for each
-        // exported proposal before admitting it, including unanswered ones.
-        if candidate.book.jobs().len() > MAX_JOBS
-            || encode(&self.snapshot(&candidate))?
-                .len()
-                .saturating_add(candidate.book.jobs().len() * 512)
-                > MAX_CHECKPOINT_BYTES
-        {
+        let record = encode(&frame);
+        let jobs = candidate.book.jobs().len();
+        if jobs > MAX_JOBS {
             return Err(GrantError::StateCapacity.into());
         }
+        // Reserve enough space for a provider signature and result for each
+        // exported proposal before admitting it, including unanswered ones.
+        // A frame's values reach the snapshot at most once.
+        let len = record.as_ref().map_or(usize::MAX, Vec::len);
+        let bound = self.checkpoint_bound.admit(
+            len.saturating_add(JOB_HEADROOM),
+            jobs * JOB_HEADROOM,
+            || Ok(encode(&self.snapshot(&candidate))?.len()),
+        )?;
         if self.journal.at_soft_limit() {
             let rotated = self.rotate().await;
             if new {
                 rotated?;
             }
         }
-        self.journal.append(&encode(&frame)?).await?;
+        self.journal.append(&record?).await?;
         self.state = candidate;
+        self.checkpoint_bound.commit(bound);
         Ok(())
     }
     fn snapshot(&self, state: &ClientState) -> Snapshot {
@@ -623,6 +637,9 @@ fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        channel_client, network, principal, proposal, setup, software_enrollment,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     impl GrantClientStore {
@@ -660,5 +677,130 @@ mod tests {
             assert!(decode::<Probe>(&vec![0; length]).is_err());
             assert_eq!(DECODED.load(Ordering::SeqCst), called, "{length}");
         }
+    }
+
+    async fn open(
+        location: &StoreLocation,
+        channel: &GrantChannelState,
+        now: u64,
+    ) -> GrantClientStore {
+        let provider = software_enrollment(2, [2; 32]);
+        GrantClientStore::open(
+            location,
+            network(),
+            provider,
+            channel.clone(),
+            UnixMillis(now),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Commits no longer encode the snapshot. The running bound must never
+    /// under-count, and replay from any point between appends or around a
+    /// rotation must reach exactly the live state.
+    #[tokio::test]
+    async fn checkpoint_bound_covers_every_client_commit_and_replay_matches_live_state() {
+        use hellas_channel::model::work::{PaidJobResultV1, ResultOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, _) = setup(&directory.path().join("provider")).await;
+        let (template, _, _) = proposal(&provider, 1);
+        let channel = GrantChannelState {
+            id: template.channel_id,
+            grant: template.grant_id,
+            generation: 0,
+            client: channel_client(principal(1).0),
+        };
+        let location = StoreLocation::for_test(&directory.path().join("client"));
+        let (mut seed, mut now, mut full) = (0x9e37_79b9_7f4a_7c15_u64, 1_000, 0);
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut store = open(&location, &channel, now).await;
+        for _ in 0..1500 {
+            let step = next(10);
+            let pending = store.book().pending_proposal();
+            let provider_sign = |digest| principal(2).1.sign_digest(digest).unwrap();
+            match (step, pending) {
+                (0..=3, None) => {
+                    // Deadlines follow the clock so jobs both accumulate and expire.
+                    let mut a = template;
+                    a.proposal_nonce = store.next_nonce().unwrap();
+                    a.acceptance_deadline_ms = UnixMillis(now + 1_000);
+                    a.terminal_deadline_ms = UnixMillis(now + 2_000);
+                    a.delivery_deadline_ms = UnixMillis(now + 2_000 + next(300_000));
+                    let work = grant_work_id(network(), &a);
+                    let signature = principal(1).1.sign_digest(work).unwrap();
+                    let change = Change::Proposed {
+                        authorization: a,
+                        signature,
+                    };
+                    match store.commit(UnixMillis(now), change, true).await {
+                        Ok(()) => {}
+                        Err(NodeStoreError::Grant(GrantError::StateCapacity)) => {
+                            assert_eq!(store.book().jobs().len(), MAX_JOBS);
+                            full += 1;
+                        }
+                        Err(error) => panic!("{error:?}"),
+                    }
+                }
+                (0..=3, Some(work)) => {
+                    let signature = provider_sign(work);
+                    store
+                        .accepted(work, signature, UnixMillis(now))
+                        .await
+                        .unwrap();
+                }
+                (4, Some(work)) if next(2) == 0 => {
+                    store.refused(work, UnixMillis(now)).await.unwrap()
+                }
+                (4, Some(work)) => store.resume(work, UnixMillis(now)).await.unwrap(),
+                (5 | 6, _) if store.book().jobs().any(|j| j.phase() == JobPhase::Accepted) => {
+                    let accepted = store
+                        .book()
+                        .jobs()
+                        .filter(|j| j.phase() == JobPhase::Accepted)
+                        .map(|j| j.work_id)
+                        .collect::<Vec<_>>();
+                    let work = accepted[next(accepted.len() as u64) as usize];
+                    let result = PaidJobResultV1 {
+                        work_id: work,
+                        terminal_transcript_commitment: hellas_rpc::EventCommitment::from_digest(
+                            Digest::hash(b"terminal"),
+                        ),
+                        canonical_output_digest: Digest::hash(b"output"),
+                        outcome: ResultOutcome::Finished,
+                        transcript_content: hellas_rpc::ContentRef::for_bytes(b"transcript"),
+                    };
+                    let digest = bound_result_digest(network(), store.context.channel, &result);
+                    let signed = SignedResult {
+                        result,
+                        signature: provider_sign(digest),
+                    };
+                    let change = Change::Result { work, signed };
+                    store.commit(UnixMillis(now), change, false).await.unwrap();
+                }
+                (7, _) => {
+                    now += next(1_000);
+                    store.tick(UnixMillis(now)).await.unwrap();
+                }
+                (8, _) => store.rotate().await.unwrap(),
+                _ => {}
+            }
+            let cost = encode(&store.snapshot(&store.state)).unwrap().len();
+            let bound = store.checkpoint_bound.get();
+            assert!(cost <= bound, "{cost} > {bound}");
+            if step == 8 || next(16) == 0 {
+                let live = store.state.clone();
+                store.close().await;
+                drop(store);
+                store = open(&location, &channel, now).await;
+                assert_eq!(store.state, live);
+            }
+        }
+        assert!(full > 0, "never reached MAX_JOBS");
     }
 }

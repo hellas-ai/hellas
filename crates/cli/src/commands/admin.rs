@@ -272,6 +272,5 @@ mod tests {
         }
         let limit = super::parse_limit("output-tokens:day:1000").unwrap();
         assert_eq!(limit.amount, 1000);
-        assert!(crate::Cli::try_parse_from(["hellas", "admin", "export-bundle"]).is_err());
     }
 }

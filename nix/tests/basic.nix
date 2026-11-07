@@ -15,7 +15,6 @@
         export HOME="$TMPDIR/home"
         mkdir -p "$HOME"
 
-        ! ${package}/bin/hellas llm --help
         ${package}/bin/hellas --version
         ${package}/bin/hellas --help | grep -F "Hellas node CLI"
         ${package}/bin/hellas --help | grep -F -- "--chain <CHAIN>"

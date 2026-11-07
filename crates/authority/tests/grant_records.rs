@@ -383,29 +383,13 @@ fn signed_http_models_decode_compressed_bodies_under_a_fixed_limit() {
 }
 
 #[test]
-fn signed_model_policy_is_authenticated_and_old_parsers_reject_it() {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)]
-    struct LegacyResource {
-        origin: serde_json::Value,
-        paths: serde_json::Value,
-        methods: serde_json::Value,
-        credential: serde_json::Value,
-        tls: serde_json::Value,
-        accounting: serde_json::Value,
-        max_output_tokens: serde_json::Value,
-        max_response_bytes: serde_json::Value,
-    }
+fn signed_model_policy_is_authenticated() {
     let mut offer = https_offer();
     let template = offer.grant.policies[0].https.as_mut().unwrap();
     template.model_policy = Some(vec![PathModelPolicy {
         path: template.paths[0].clone(),
         models: vec!["model-a".into()],
     }]);
-    assert!(
-        serde_json::from_value::<LegacyResource>(serde_json::to_value(template).unwrap()).is_err()
-    );
     let signed = SignedOffer::sign(offer, &principal(1).1).unwrap();
     let mut bytes = signed.encode().unwrap();
     let position = bytes

@@ -252,8 +252,9 @@ pub struct GrantSessionOptions {
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
 }
-/// A remote session connects through an endpoint it does not own: whoever
-/// binds the endpoint closes it, after the session has shut down.
+/// A session borrows its transport: whoever binds the remote endpoint closes
+/// it, and whoever builds the local service shuts it down, after the session
+/// has shut down.
 pub enum GrantTransport {
     Remote(Endpoint),
     Local(GrantService),
@@ -1322,7 +1323,7 @@ impl GrantSession {
             Ok(())
         };
         let drained = if let SessionTransport::Local { service, .. } = &self.transport {
-            service.shutdown().await.map_err(GrantClientError::from)
+            service.drain().await.map_err(GrantClientError::from)
         } else {
             Ok(())
         };

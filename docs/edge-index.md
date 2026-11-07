@@ -84,10 +84,8 @@ Rebuilding the derived index uses finalized history and fresh replay storage.
 
 Index files and replay partitions are scoped by genesis, trust and schema. A new
 scope builds from genesis/archive in a separate namespace; old data is retained.
-This change also advances the on-disk index format to 3. Existing older-format files
-are rejected with a rebuild instruction; use a new storage directory. Deploy the
-indexer and Explorer schema-2 consumer together: prior cursors/response layouts
-and schema-derived RPC method IDs are incompatible. No live storage is deleted.
+The on-disk index format is 3. Files in another format are rejected with a
+rebuild instruction; use a new storage directory. No live storage is deleted.
 redb holds a 64 MiB page cache. Queries retain a read transaction, so in-flight
 readers keep their exact view during publication. The open lookup contains only
 live edges; closing an edge removes its open lookup entries immediately. Closed

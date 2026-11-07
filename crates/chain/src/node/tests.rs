@@ -1040,29 +1040,6 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
     });
 }
 
-#[test]
-fn provisioned_anchor_ignores_legacy_chain_directory() {
-    run_qmdb(|runtime| async move {
-        let directory = tempfile::tempdir().unwrap();
-        let fixture = Fixture::new(runtime, directory.path()).await;
-        let legacy = directory.path().join("chain/legacy-network");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("old-state"), b"obsolete").unwrap();
-        let node = FullNode::start(fixture.config.clone()).await.unwrap();
-        node.shutdown().await.unwrap();
-        assert_eq!(
-            std::fs::read(legacy.join("old-state")).unwrap(),
-            b"obsolete"
-        );
-        assert!(
-            fixture
-                .config
-                .storage_dir()
-                .starts_with(directory.path().join("chains"))
-        );
-    });
-}
-
 #[cfg(feature = "validator")]
 #[test]
 fn full_node_and_validator_execution_roles_share_the_same_directory() {

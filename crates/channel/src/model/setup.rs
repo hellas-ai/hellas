@@ -639,7 +639,7 @@ pub struct CloseDescriptor {
     expected_payment_values: EdgeValues,
 }
 
-/// Only close-descriptor v3 is supported. Older formats require old binaries.
+/// The only close-descriptor version this binary encodes and decodes.
 const CLOSE_DESCRIPTOR_VERSION: u8 = 4;
 
 impl CloseDescriptor {

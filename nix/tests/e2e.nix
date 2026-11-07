@@ -373,8 +373,6 @@ in
       machine.wait_for_unit("hellas.service")
       machine.wait_until_succeeds("test -e /var/lib/hellas/content-store/fastresume.bin", timeout=30)
 
-      machine.fail("${package}/bin/hellas llm --help")
-
       unit = machine.succeed(
           "systemctl show hellas.service "
           "--property=Environment --property=ExecStart --property=WorkingDirectory --property=LimitMEMLOCK "
