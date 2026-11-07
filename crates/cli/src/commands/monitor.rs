@@ -222,7 +222,7 @@ pub async fn run(
         unique_peers, interrogated, interrogation_ok, interrogation_failed, hinted_peers
     );
 
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
     Ok(())
 }
 

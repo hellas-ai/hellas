@@ -29,6 +29,16 @@ pub async fn run(
         .await
         .context("failed to bind iroh endpoint")?;
 
+    let result = query(&endpoint, node_id, node_addrs).await;
+    hellas_wire::iroh::close(&endpoint).await;
+    result
+}
+
+async fn query(
+    endpoint: &Endpoint,
+    node_id: EndpointId,
+    node_addrs: Vec<SocketAddr>,
+) -> CliResult<()> {
     let endpoint_addr =
         EndpointAddr::from_parts(node_id, node_addrs.into_iter().map(TransportAddr::Ip));
 
