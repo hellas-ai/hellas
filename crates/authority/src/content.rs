@@ -294,8 +294,8 @@ impl ContentHandler for GrantWork {
         &self,
         _: pb::AcquireRequest,
         _: TransportContext,
-    ) -> Result<ResponseStream<pb::AcquireResponse>, WireStatus> {
-        Err(content_denied())
+    ) -> Result<impl Into<WithTrailer<pb::ContentRef>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::ContentRef>, _>(content_denied())
     }
     async fn set_pin(
         &self,

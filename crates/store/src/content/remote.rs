@@ -432,7 +432,7 @@ where
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
-        let mut call = self
+        let response = self
             .client
             .acquire(pb::AcquireRequest {
                 source: Some(w::source(source)),
@@ -441,18 +441,7 @@ where
             })
             .await
             .map_err(w::error)?;
-        let mut result = None;
-        while let Some(progress) = call.next().await {
-            let progress = progress.map_err(w::error)?;
-            if result.is_some() {
-                return Err(Error::Invalid("progress after acquire completion"));
-            }
-            if let Some(object) = progress.complete {
-                result = Some(w::object(&object)?);
-            }
-        }
-        call.finish().map_err(w::error)?;
-        let object = result.ok_or(Error::Invalid("missing acquisition result"))?;
+        let object = w::object(&response)?;
         if expect.is_some_and(|expected| expected != object) {
             return Err(Error::Invalid("acquisition mismatch"));
         }

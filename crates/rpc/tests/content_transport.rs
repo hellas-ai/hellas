@@ -57,11 +57,7 @@ impl ContentHandler for Handler {
     unused!(stat, pb::StatRequest, pb::StatResponse);
     unused!(chunks, pb::ChunksRequest, pb::ChunksResponse);
     unused!(read, pb::ReadRequest, stream pb::ReadResponse);
-    unused!(
-        acquire,
-        pb::AcquireRequest,
-        stream pb::AcquireResponse
-    );
+    unused!(acquire, pb::AcquireRequest, pb::ContentRef);
     unused!(set_pin, pb::SetPinRequest, pb::SetPinResponse);
     unused!(list_pins, pb::ListPinsRequest, pb::ListPinsResponse);
     unused!(

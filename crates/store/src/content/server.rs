@@ -319,7 +319,10 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
         &self,
         r: pb::AcquireRequest,
         _: TransportContext,
-    ) -> std::result::Result<ResponseStream<pb::AcquireResponse>, WireStatus> {
+    ) -> std::result::Result<
+        impl Into<hellas_rpc::call::WithTrailer<pb::ContentRef>> + Send,
+        WireStatus,
+    > {
         let source = w::source_from(required(r.source)?).map_err(status)?;
         let expect = r
             .expect
@@ -328,22 +331,13 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
             .transpose()
             .map_err(status)?;
         let pin = w::pin_target_from(required(r.pin)?).map_err(status)?;
-        let service = self.clone();
-        Ok(self.stream(ResponseStream::new(async_stream::try_stream! {
-            yield pb::AcquireResponse {
-                received: 0,
-                complete: None,
-            };
-            let acquired = service
-                .store
-                .acquire(&service.scope()?, source, expect, pin)
-                .await
-                .map_err(status)?;
-            yield pb::AcquireResponse {
-                received: 0,
-                complete: Some(super::page::wire_ref(acquired.object)),
-            };
-        })))
+        let scope = self.scope()?;
+        let acquired = tokio::select! {
+            biased;
+            _ = scope.ended() => return Err(status(Error::Denied)),
+            acquired = self.store.acquire(&scope, source, expect, pin) => acquired.map_err(status)?,
+        };
+        Ok(self.reply(super::page::wire_ref(acquired.object)))
     }
     async fn set_pin(
         &self,

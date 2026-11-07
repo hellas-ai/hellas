@@ -203,7 +203,7 @@ impl ContentHandler for Handler {
             if number==0&&fixture.mode==Mode::BadTrailerOnce{Err(WireStatus::new(WireCode::PermissionDenied,"fixture revoked before trailer"))?;}
         }))
     }
-    unused!(acquire,pb::AcquireRequest,stream pb::AcquireResponse);
+    unused!(acquire, pb::AcquireRequest, pb::ContentRef);
     unused!(set_pin, pb::SetPinRequest, pb::SetPinResponse);
     unused!(list_pins, pb::ListPinsRequest, pb::ListPinsResponse);
     unused!(watch_pins,pb::WatchPinsRequest,stream pb::WatchPinsResponse);

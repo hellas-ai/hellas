@@ -6,7 +6,7 @@ service Content {
   rpc Chunks(ChunksRequest) returns (ChunksResponse);
   rpc Read(ReadRequest) returns (stream ReadResponse);
   rpc Upload(stream UploadRequest) returns (stream UploadResponse);
-  rpc Acquire(AcquireRequest) returns (stream AcquireResponse);
+  rpc Acquire(AcquireRequest) returns (ContentRef);
   rpc SetPin(SetPinRequest) returns (SetPinResponse);
   rpc ListPins(ListPinsRequest) returns (ListPinsResponse);
   rpc WatchPins(WatchPinsRequest) returns (stream WatchPinsResponse);
@@ -59,7 +59,6 @@ message HfXet { string repo = 1; string commit = 2; optional string path = 3; bo
 message Https { string url = 1; optional bytes sha256 = 2; uint64 bytes = 3; }
 message Source { oneof kind { Peer peer = 1; HfXet hf_xet = 2; Https https = 3; } }
 message AcquireRequest { Source source = 1; ContentRef expect = 2; PinTarget pin = 3; }
-message AcquireResponse { uint64 received = 1; ContentRef complete = 2; }
 message SetPinRequest { string name = 1; PinValue expected = 2; PinValue value = 3; }
 message SetPinResponse {}
 message ListPinsRequest { string prefix = 1; Cursor cursor = 2; }

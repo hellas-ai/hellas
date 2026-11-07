@@ -492,6 +492,7 @@ async fn idle_watch_ends_on_revocation_without_a_pin_event() {
                 offset: 0,
                 object: None,
                 generation: cursor.generation,
+                after: String::new(),
             }),
         })
         .await
