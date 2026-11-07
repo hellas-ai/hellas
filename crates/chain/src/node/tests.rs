@@ -259,16 +259,12 @@ fn recovery_finds_the_first_committed_block_before_its_archive_acknowledgment() 
         let block = fixture.next().await;
         let input = input::FinalizedInput::new(archive.clone(), Arc::default(), trust);
         input.accept(&block).await.unwrap();
-        let acknowledgment = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let update = receive.recv().await.expect("archive remained open");
-                if matches!(update, Update::Block(..)) {
-                    break update;
-                }
+        let acknowledgment = loop {
+            let update = receive.recv().await.expect("archive remained open");
+            if matches!(update, Update::Block(..)) {
+                break update;
             }
-        })
-        .await
-        .unwrap();
+        };
         assert_eq!(
             archive
                 .marshal
@@ -312,7 +308,7 @@ fn certified_future_history_suspends_retained_reads_until_ancestry_executes() {
         node.accept_finalized(&tip).await.unwrap();
         assert_eq!(
             node.status(),
-            NodeStatus::CatchingUp {
+            NodeState::CatchingUp {
                 observed: Some(3),
                 executed: 1
             }
@@ -348,18 +344,16 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
         let a = FullNode::start(config).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), a.wait_ready())
+        a.wait_ready().await.unwrap();
+        apply(&seed, block2.clone()).await.unwrap();
+        a.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+            })
             .await
             .unwrap()
+            .running()
             .unwrap();
-        apply(&seed, block2.clone()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while a.status().executed_height() != 2 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
         config.chain =
@@ -368,10 +362,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
         let b = FullNode::start(config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), b.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = b.wait_ready().await.unwrap();
         let coins = view
             .client()
             .get_coins_by_owner(fixture.allocations[0].0)
@@ -381,28 +372,25 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         assert_eq!(coins.coins.len(), 1);
         assert_eq!(coins.coins[0].1, 5000);
         assert_eq!(coins.snapshot.payload, block2.snapshot.payload);
-        let mut progress = b.finalized();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while *progress.borrow_and_update() < 2 {
-                progress.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
+        b.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+            })
+            .await
+            .unwrap()
+            .running()
+            .unwrap();
         assert_eq!(
             b.view().unwrap().client().get_state_root().await.unwrap(),
             Some(block2.snapshot.state_root)
         );
         assert!(!archived(&b, 1).await);
         let local = b.view().unwrap().client();
-        let historical = tokio::time::timeout(
-            Duration::from_secs(15),
-            local.get_finalized_block(FinalizedBlockQuery::Height(1)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let historical = local
+            .get_finalized_block(FinalizedBlockQuery::Height(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(historical, block);
         // The public read subset does not trigger private recovery fetching.
         use hellas_rpc::{pb::chain as pb, services::chain_sync::ChainSyncHandler as _};
@@ -451,7 +439,7 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
         ));
         assert_eq!(
             node.status(),
-            NodeStatus::CatchingUp {
+            NodeState::CatchingUp {
                 observed: None,
                 executed: 0
             }
@@ -482,6 +470,44 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
 }
 
 #[test]
+fn shutdown_wakes_all_readiness_waiters_and_halt_is_terminal() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start(fixture.config).await.unwrap();
+        let shutting_down = node.clone();
+        // Poll both waiters before shutting down; each must wake on the halt.
+        let (first, second, shutdown) = tokio::join!(biased;
+            node.wait_ready(),
+            node.wait_ready(),
+            shutting_down.shutdown(),
+        );
+        shutdown.unwrap();
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(node.0.core.readiness.cancel.is_cancelled());
+        let NodeState::Halted {
+            reason,
+            executed: 0,
+        } = node.status()
+        else {
+            panic!("shutdown must publish the halt");
+        };
+        node.0.core.readiness.advance(Some(1), 1);
+        node.0.core.readiness.halt("later shutdown");
+        assert_eq!(
+            node.status(),
+            NodeState::Halted {
+                reason,
+                executed: 1
+            },
+            "late publication cannot revive a halted node or replace its reason"
+        );
+        assert!(node.wait_ready().await.is_err());
+    });
+}
+
+#[test]
 fn pruned_archive_restarts_with_live_owner_state() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -494,14 +520,8 @@ fn pruned_archive_restarts_with_live_owner_state() {
             last = fixture.next().await;
             apply(&node, last.clone()).await.unwrap();
         }
-        // Marshal's pruning request is processed asynchronously.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while archived(&node, 1).await {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // The public retention floor is installed before execution is published.
+        assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         assert!(
@@ -601,6 +621,8 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
             } else if request.op_count == state.old_count {
                 // Bootstrap must receive a newer live target before any good
                 // operations for the initial target are allowed to complete.
+                // This deliberate busy response forces retry/target advancement;
+                // it does not impose a hang limit on the test.
                 if tokio::time::timeout(
                     Duration::from_millis(200),
                     state.advanced.subscribe().wait_for(|advanced| *advanced),
@@ -686,18 +708,13 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
             let node = FullNode::start(fixture.config.clone()).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(15), async {
-                while node.peer_ids().contains(&endpoint.id()) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
+            // Startup's awaited floor fetch verifies and quarantines this source.
+            assert!(!node.peer_ids().contains(&endpoint.id()));
             assert!(node.view().is_err());
             assert_eq!(node.status().executed_height(), 0);
             assert_eq!(
                 node.status(),
-                NodeStatus::CatchingUp {
+                NodeState::CatchingUp {
                     observed: None,
                     executed: 0
                 }
@@ -836,10 +853,7 @@ fn validator_archive_seeds_execution_over_iroh() {
             .await
             .unwrap();
         let node = FullNode::start(fixture.config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), node.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = node.wait_ready().await.unwrap();
         assert_eq!(
             view.client().get_state_root().await.unwrap(),
             Some(block.snapshot.state_root)
@@ -858,9 +872,7 @@ fn validator_archive_seeds_execution_over_iroh() {
 // its published read view; they never execute or finalize the consumer database.
 async fn apply(node: &FullNode, incoming: FinalizedBlock) -> Result<(), Error> {
     node.accept_finalized(&incoming).await?;
-    tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
-        .await
-        .expect("node execution is bounded")?;
+    node.wait_ready().await?;
     Ok(())
 }
 
@@ -894,17 +906,30 @@ fn current_state_root_and_operation_sync_target_survive_node_restart() {
         apply(&node, finalized.clone()).await.unwrap();
         node.shutdown().await.unwrap();
         let node = FullNode::start(fixture.config).await.unwrap();
-        node.accept_finalized(&finalized).await.unwrap();
-        // Acceptance queues the block; the published watch marks executed state.
-        let mut executed = node.finalized();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            executed
-                .wait_for(|height| *height >= block.height().get())
-                .await
-                .expect("execution progress remains published");
-        })
-        .await
-        .expect("the accepted block executes");
+        node.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. })
+                    || state.executed_height() >= block.height().get()
+            })
+            .await
+            .unwrap()
+            .running()
+            .unwrap();
+        assert_eq!(
+            node.status(),
+            NodeState::CatchingUp {
+                observed: None,
+                executed: 1
+            }
+        );
+        // Register first: a fresh observation must wake readiness even though
+        // the restored execution height does not change.
+        let (ready, accepted) = tokio::join!(biased;
+            node.wait_ready(),
+            node.accept_finalized(&finalized),
+        );
+        accepted.unwrap();
+        ready.unwrap();
         assert_eq!(node.status().executed_height(), block.height().get());
         assert_eq!(
             node.view()
@@ -957,16 +982,10 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
         let starting = tokio::spawn(FullNode::start(config));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
-            .await
-            .unwrap();
+        requested.requested.notified().await;
         let block = fixture.next().await;
         apply(&seed, block.clone()).await.unwrap();
-        let node = tokio::time::timeout(Duration::from_secs(30), starting)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let node = starting.await.unwrap().unwrap();
         assert_eq!(node.status().executed_height(), 2);
         assert_eq!(
             node.view()
@@ -1107,6 +1126,15 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                     .unwrap();
                 let network =
                     replication::Network::new(endpoint.clone(), Trust::Genesis(Arc::new(verifier)));
+                let readiness = Arc::new(Readiness::default());
+                let mut changes = readiness.state.subscribe();
+                app.publication = Some(pipeline::Publication {
+                    archive: indexer.clone(),
+                    retention: None,
+                    readiness,
+                    #[cfg(feature = "indexer-api")]
+                    index: None,
+                });
                 let (execution, mailbox) = pipeline::init(
                     context.child("execution"),
                     app,
@@ -1127,27 +1155,30 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let archive = archive.start_unbuffered(mailbox.clone(), (receiver, resolver));
                 let execution = execution.start();
                 let database = mailbox.subscribe_databases().await;
-                // Database attachment precedes replay of blocks whose execution
-                // was committed before shutdown but not yet acknowledged.
-                let restored = tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let height = pipeline::restore(
-                            &indexer,
-                            &database,
-                            &owner,
-                            startup.into_iter().chain(processed).max(),
-                            &genesis,
-                        )
+                let restore = || {
+                    pipeline::restore(
+                        &indexer,
+                        &database,
+                        &owner,
+                        startup.into_iter().chain(processed).max(),
+                        &genesis,
+                    )
+                };
+                let mut restored = restore().await.unwrap();
+                // An acknowledged checkpoint is already restored; otherwise
+                // await publication of the replay after database attachment.
+                if restored == 0 {
+                    changes
+                        .wait_for(|state| {
+                            matches!(state, NodeState::Halted { .. })
+                                || state.executed_height() >= 1
+                        })
                         .await
+                        .unwrap()
+                        .running()
                         .unwrap();
-                        if height > 0 {
-                            break height;
-                        }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                    restored = restore().await.unwrap();
+                }
                 assert_eq!(restored, 1);
                 assert_eq!(database.read().await.root(), first.snapshot.state_root);
                 let client = LocalLightClient::new(
@@ -1176,13 +1207,14 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                             .certificate,
                     ),
                 );
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while owner.cursor().height < 2 {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                changes
+                    .wait_for(|state| {
+                        matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+                    })
+                    .await
+                    .unwrap()
+                    .running()
+                    .unwrap();
                 assert_eq!(
                     client.get_state_root().await.unwrap(),
                     Some(next.snapshot.state_root)
@@ -1198,10 +1230,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         .unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.accept_finalized(&second).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = node.wait_ready().await.unwrap();
         assert_eq!(
             view.client().get_state_root().await.unwrap(),
             Some(second.snapshot.state_root)
@@ -1265,24 +1294,16 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         .unwrap();
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
-            .await
-            .unwrap();
+        requested.requested.notified().await;
         assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
         starting.abort();
         let _ = starting.await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while crate::execution::pipeline::lock(&config.storage_dir()).is_err() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        config.peers = vec![seed.endpoint_addr()];
-        let node = tokio::time::timeout(Duration::from_secs(20), FullNode::start(config))
+        let lock = hellas_private::open_lock_beside(&config.storage_dir().join("node")).unwrap();
+        tokio::task::spawn_blocking(move || lock.lock().unwrap())
             .await
-            .unwrap()
             .unwrap();
+        config.peers = vec![seed.endpoint_addr()];
+        let node = FullNode::start(config).await.unwrap();
         assert_eq!(node.status().executed_height(), 1);
         assert_eq!(
             node.view()
@@ -1366,7 +1387,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
                 Err(Error::InvalidBlock(_))
             ));
             assert_eq!(follower.status().executed_height(), 0);
-            assert!(!matches!(follower.status(), NodeStatus::Stopped { .. }));
+            assert!(!matches!(follower.status(), NodeState::Halted { .. }));
             follower.shutdown().await.unwrap();
         }
         serving.abort();

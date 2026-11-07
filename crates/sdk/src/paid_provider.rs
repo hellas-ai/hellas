@@ -6,7 +6,7 @@ use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
 use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
-use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery};
+use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery, node::NodeState};
 use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
 use hellas_channel::model::work::{
@@ -1077,7 +1077,7 @@ impl WorkRunner {
         mut self,
         mut stop: oneshot::Receiver<()>,
         dial: D,
-        finalized: Option<tokio::sync::watch::Receiver<u64>>,
+        finalized: Option<tokio::sync::watch::Receiver<NodeState>>,
     ) -> Result<(), MountError>
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
@@ -1097,6 +1097,14 @@ impl WorkRunner {
                     let mut chain = None;
                     let mut finalized = finalized.clone();
                     loop {
+                        if finalized.as_ref().is_some_and(|state| {
+                            matches!(*state.borrow(), NodeState::Halted { .. })
+                        }) {
+                            if let Driven::Channel(channel) = &clock.driven {
+                                let _ = channel.service.suspend().await;
+                            }
+                            break;
+                        }
                         let budget = clock.max_observation_age;
                         if chain.is_none() {
                             chain = tokio::time::timeout(budget, dial()).await.ok().flatten();
@@ -1120,12 +1128,20 @@ impl WorkRunner {
                         if matches!(clock.driven, Driven::Done) {
                             break;
                         }
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class C: channel clock freshness/deadlines"
+                        )]
                         if let Some(progress) = &mut finalized {
                             tokio::select! {
                                 changed = progress.changed() => if changed.is_err() { break; },
                                 _ = tokio::time::sleep(poll) => {},
                             }
                         } else {
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "inventory class B/C: remote retry and clock deadlines"
+                            )]
                             tokio::time::sleep(poll).await;
                         }
                     }
@@ -1218,7 +1234,10 @@ impl NodeWorkRunner {
                 stop,
                 move || {
                     let node = node.clone();
-                    async move { node.view().ok().map(|view| WorkBlocks::new(view.client())) }
+                    async move {
+                        let view = node.wait_ready().await.ok()?;
+                        Some(WorkBlocks::new(view.client()))
+                    }
                 },
                 Some(finalized),
             )

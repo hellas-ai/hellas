@@ -284,8 +284,7 @@ impl Harness {
             block: block.encode().to_vec(),
         };
         self.node.accept_finalized(&incoming).await?;
-        ::tokio::time::timeout(std::time::Duration::from_secs(10), self.node.wait_ready())
-            .await??;
+        self.node.wait_ready().await?;
         Ok(())
     }
 

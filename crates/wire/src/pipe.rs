@@ -103,6 +103,10 @@ pub async fn connect_stream(path: impl AsRef<Path>) -> io::Result<NamedPipeClien
                 if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
                     && tokio::time::Instant::now() < deadline =>
             {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: Windows busy-pipe retry"
+                )]
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Err(error) => return Err(error),

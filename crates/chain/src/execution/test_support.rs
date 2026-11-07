@@ -36,7 +36,16 @@ where
     let config = tokio::Config::new().with_storage_directory(directory.path());
     // Own the composed fixture on the heap before the runtime wraps/polls it.
     // Real-chain scenarios otherwise exhaust libtest's default debug stack.
-    tokio::Runner::new(config).start(|context| Box::pin(test(context)))
+    tokio::Runner::new(config).start(|context| {
+        let test = Box::pin(test(context));
+        async move {
+            // This is a whole-fixture hang guard, not a readiness performance bound.
+            // Leave slow hosts and deliberately contended runs time to finish replay/pruning.
+            ::tokio::time::timeout(std::time::Duration::from_secs(30 * 60), test)
+                .await
+                .expect("QMDB test exceeded its whole-test hang limit")
+        }
+    })
 }
 
 pub(crate) fn validator_key(seed: u64) -> PrivateKey {

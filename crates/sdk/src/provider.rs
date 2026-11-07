@@ -769,6 +769,10 @@ where
     });
 
     let mut dispatches = JoinSet::new();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "inventory class C: connection lifetime"
+    )]
     let lifetime = tokio::time::sleep(MAX_LIFETIME);
     tokio::pin!(lifetime);
     let mut draining = false;
@@ -841,6 +845,10 @@ where
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 pub(crate) mod tests;
 
 /// The shared confidential-open proof handler. Software enrollment roots are

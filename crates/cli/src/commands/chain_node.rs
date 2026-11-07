@@ -22,6 +22,10 @@ impl ChainNodeArgs {
         let started = std::time::Instant::now();
         let startup = hellas_sdk::FullNode::start(config.node_config(self.chain_archive_blocks)?);
         tokio::pin!(startup);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class C: startup progress output"
+        )]
         let mut progress = tokio::time::interval(std::time::Duration::from_secs(15));
         progress.tick().await;
         let node = loop {

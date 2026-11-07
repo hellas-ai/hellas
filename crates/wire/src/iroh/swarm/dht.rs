@@ -504,6 +504,10 @@ impl DhtPublisher {
         info!(services = services.len(), "Starting DHT publisher");
         publish_all(&dht, &services, &secret_key, &config.tags).await;
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class C: expiring DHT advert refresh"
+        )]
         let mut interval = tokio::time::interval(config.publish_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let _ = interval.tick().await;
@@ -697,6 +701,10 @@ fn dht_feed(
     let poll_alpn = alpn.clone();
     let poll_resolver = resolver.clone();
     let required_poll = required_tags.to_vec();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "inventory class B: DHT discovery; no push"
+    )]
     let mut interval = IntervalStream::new(tokio::time::interval(poll_interval));
     let dht_stream = async_stream::try_stream! {
         // skip first tick, burst already queried

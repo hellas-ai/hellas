@@ -1,3 +1,7 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 //! One paid Fetch job through the SDK, against the six-validator devnet.
 //!
 //! The provider creates its offer over RPC under its owner-approved policy; the client runs `transact`, then settles

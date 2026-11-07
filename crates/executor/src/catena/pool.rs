@@ -145,6 +145,10 @@ fn spawn_on(
             Ok(()) => break,
             Err(mpsc::TrySendError::Full(queued)) => {
                 request = queued;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class A: spawn queue; rollout 4"
+                )]
                 thread::sleep(Duration::from_millis(2));
             }
             Err(_) => return Err(SpawnError::Unavailable),

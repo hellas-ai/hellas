@@ -116,6 +116,7 @@ where
                         tracing::debug!(%status, "provider offer temporarily unavailable");
                         unavailable = Some(status);
                         needs_funding = false;
+                        #[expect(clippy::disallowed_methods, reason = "inventory class C: unavailable offer proof retry")]
                         tokio::time::sleep(poll).await;
                     }
                     Ok(response)
@@ -124,6 +125,7 @@ where
                                 if refused.code == hellas_rpc::pb::work::OfferRefusalCode::NeedsFunding as i32) =>
                     {
                         needs_funding = true;
+                        #[expect(clippy::disallowed_methods, reason = "inventory class B: finalized funding; rollout 3")]
                         tokio::time::sleep(poll).await;
                     }
                     response => {

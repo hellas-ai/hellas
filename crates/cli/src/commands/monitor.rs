@@ -109,6 +109,10 @@ pub async fn run(
 
     let monitor_timeout = async {
         if let Some(secs) = timeout_secs {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: monitor deadline"
+            )]
             tokio::time::sleep(Duration::from_secs(secs)).await;
         } else {
             future::pending::<()>().await;

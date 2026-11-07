@@ -674,6 +674,7 @@ impl GrantService {
         result
     }
 
+    #[expect(clippy::disallowed_methods, reason = "inventory class C: grant expiry")]
     async fn monitor_execution(
         &self,
         id: Digest,
@@ -911,6 +912,10 @@ impl GrantService {
         let service = self.clone();
         self.stream_binding(async move { service.bind_delivery(&access, &request).await })
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "inventory class C: delivery expiry"
+    )]
     fn stream_binding(
         &self,
         binding: impl Future<Output = Result<Arc<Delivery>, WorkRefused>> + Send + 'static,

@@ -73,6 +73,7 @@ full-node = [
     "hellas-wire/iroh",
     "hellas-rpc/swarm",
     "dep:iroh",
+    "dep:tokio-util",
     "hellas-kernel/webauthn",
 ]
 indexer-api = [
@@ -214,6 +215,7 @@ tokio = { workspace = true, optional = true, features = [
 ] }
 tokio-stream = { workspace = true, optional = true, features = ["sync"] }
 tokio-tungstenite = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = { version = "2", optional = true }

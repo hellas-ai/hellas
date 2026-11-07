@@ -216,6 +216,7 @@ impl hellas_wire::WriteAuthorization for DeliveryWriter {
             return Poll::Ready(Err(denied()));
         };
         let remaining = Duration::from_millis(expires.0.saturating_sub(now.0).max(1));
+        #[expect(clippy::disallowed_methods, reason = "inventory class C: grant expiry")]
         let timer = self
             .timer
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(remaining)));

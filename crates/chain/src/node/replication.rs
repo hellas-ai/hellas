@@ -254,6 +254,10 @@ impl Network {
     }
     pub async fn discover_periodically(&self) {
         loop {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: peer discovery; no push"
+            )]
             tokio::time::sleep(Duration::from_secs(10)).await;
             self.discover_all().await;
         }
@@ -261,6 +265,10 @@ impl Network {
     pub(super) async fn feed(&self, input: super::input::FinalizedInput) {
         let mut tasks = FuturesUnordered::new();
         let mut running = std::collections::BTreeSet::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class A: peer membership; rollout 5"
+        )]
         let mut discovery = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -313,6 +321,10 @@ impl Network {
             }
             self.clients.lock().unwrap().remove(&id);
             failures = failures.saturating_add(1);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: reconnect backoff"
+            )]
             tokio::time::sleep(retry_delay(failures)).await;
         }
     }
@@ -479,6 +491,10 @@ impl state::Resolver for Network {
                 // QMDB treats resolver errors as fatal. An unavailable peer set
                 // is transient, so retry here until the engine cancels this range.
                 attempt = attempt.saturating_add(1);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: state-fetch backoff"
+                )]
                 tokio::time::sleep(retry_delay(attempt)).await;
             }
         };

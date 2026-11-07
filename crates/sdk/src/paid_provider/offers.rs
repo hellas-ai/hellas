@@ -486,10 +486,11 @@ async fn provision_offer(
     held: &[SetupState],
     write_started: &std::sync::atomic::AtomicBool,
 ) -> Result<Provisioned> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
     let offer = Offer::plan(&options, candidate, held)?;
-    let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
+    let view = tokio::time::timeout_at(deadline, node.wait_ready())
         .await
         .map_err(|_| ProvisionError::NoFinalizedBlock)??;
     let floor = floor_of(&WorkBlocks::new(view.client()))
