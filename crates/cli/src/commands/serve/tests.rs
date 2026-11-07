@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 use std::fs;
 mod control;
 use super::*;
@@ -12,10 +13,8 @@ fn codex_route(capabilities: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "service": "codex",
         "method": "responses",
-        // Keep this fixture independent of the process-global HOME.
         "destination": {
-            "type": "codex-responses",
-            "auth_path": "target/hellas-test-codex-auth.json"
+            "type": "codex-responses"
         },
         "capabilities": capabilities,
     })
@@ -26,7 +25,7 @@ fn authenticated_codex_route(
     capabilities: serde_json::Value,
 ) -> serde_json::Value {
     let auth_path = dir.path().join("codex-auth.json");
-    let auth = crate::commands::codex_auth::CodexAuthStore::new(Some(&auth_path)).unwrap();
+    let auth = crate::commands::codex_auth::CodexAuthStore::new(&auth_path).unwrap();
     auth.save(&crate::commands::codex_auth::CodexAuthState::new(
         crate::commands::codex_auth::test_tokens_with_account_id(
             "test-access",
@@ -36,9 +35,7 @@ fn authenticated_codex_route(
         None,
     ))
     .unwrap();
-    let mut route = codex_route(capabilities);
-    route["destination"]["auth_path"] = serde_json::json!(auth_path);
-    route
+    codex_route(capabilities)
 }
 
 #[test]
@@ -54,7 +51,8 @@ fn load_fetch_config_parses_route_capabilities() {
         }),
     );
 
-    let registry = load_fetch_config(&path).unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let registry = load_fetch_config(&path, &location).unwrap();
 
     let capabilities = &registry
         .entry(&FetchRoute::new("codex", "responses"))
@@ -83,7 +81,8 @@ fn load_fetch_config_rejects_duplicate_route() {
         }),
     );
 
-    let err = load_fetch_config(&path).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let err = load_fetch_config(&path, &location).unwrap_err();
 
     assert!(err.to_string().contains("registered twice"));
 }
@@ -94,7 +93,8 @@ fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
     let mut route = codex_route(serde_json::json!({}));
     route["adaptor"] = serde_json::json!("codex-0.0.1");
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let err = load_fetch_config(&path).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let err = load_fetch_config(&path, &location).unwrap_err();
     assert!(format!("{err:#}").contains("unknown field `adaptor`"));
 
     let mut route = codex_route(serde_json::json!({}));
@@ -104,7 +104,7 @@ fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
         "build": "03"
     });
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let err = load_fetch_config(&path).unwrap_err();
+    let err = load_fetch_config(&path, &location).unwrap_err();
     assert!(format!("{err:#}").contains("unknown field `environment`"));
 }
 
@@ -114,19 +114,24 @@ fn load_fetch_config_rejects_operator_selected_destination() {
     let mut route = codex_route(serde_json::json!({}));
     route["destination"]["base_url"] = serde_json::json!("https://example.invalid/codex");
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let error = load_fetch_config(&path).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let error = load_fetch_config(&path, &location).unwrap_err();
 
     assert!(format!("{error:#}").contains("unknown field `base_url`"));
 }
 
 #[test]
 fn core_cli_rejects_moved_openai_hosting_and_operator_endpoints() {
-    let codex: FetchDestination = serde_json::from_value(serde_json::json!({
-        "type": "codex-responses",
-        "auth_path": "target/codex-auth.json"
-    }))
-    .unwrap();
-    assert!(matches!(codex, FetchDestination::CodexResponses { .. }));
+    assert!(
+        serde_json::from_value::<FetchDestination>(serde_json::json!({
+            "type": "codex-responses",
+            "auth_path": "target/codex-auth.json"
+        }))
+        .is_err()
+    );
+    let codex: FetchDestination =
+        serde_json::from_value(serde_json::json!({"type":"codex-responses"})).unwrap();
+    assert!(matches!(codex, FetchDestination::CodexResponses {}));
 
     for value in [
         serde_json::json!({"type":"openai-responses","api_key_env":"HELLAS_TEST_OPENAI_KEY"}),

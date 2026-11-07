@@ -354,7 +354,7 @@ fn a_fifo_replacing_an_indexed_name_is_refused_before_reading() {
         send.send(open_indexed_file(object, 14, &entry)).unwrap();
     });
     assert!(
-        matches!(receive.recv_timeout(std::time::Duration::from_secs(2)).expect("FIFO open blocked"),
+        matches!(receive.recv_timeout(crate::HANG_GUARD).expect("FIFO open blocked"),
         Err(StoreError::Read { source, .. }) if source.kind() == io::ErrorKind::InvalidInput)
     );
 }

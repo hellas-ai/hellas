@@ -65,9 +65,9 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
                 result.attempt.reported()?;
                 return Ok(());
             }
-            let (mut purchase, result) = purchase_and_execute(&args.client, &context, &job).await?;
+            purchase_and_execute(&args.client, &context, &job, |result| {
             if let Some(directory) = &args.output {
-                save_outputs(directory, &job, &result)?;
+                save_outputs(directory, &job, result)?;
             }
             let ModelResponse::Transcription(transcription) = package.decode(&result.output)?
             else {
@@ -75,8 +75,8 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
             };
             println!("{}", transcription.text);
             std::io::stdout().lock().flush()?;
-            purchase.reported()?;
             Ok(())
+            }).await
         },
         |timeout| {
             format!("transcription exceeded {timeout:?}; use the saved job folder to recover the existing attempt")

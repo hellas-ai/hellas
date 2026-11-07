@@ -21,7 +21,7 @@ fn fixture_with_epochs(
 ) -> (ConsensusVerifier, Vec<HellasBlock>, Vec<u8>, Vec<u8>) {
     let (network, genesis) = if cross_epoch {
         let document: hellas_genesis::Genesis =
-            serde_json::from_str(hellas_genesis::HELLAS_DEVNET_1_JSON).unwrap();
+            serde_json::from_str(hellas_genesis::HELLAS_DEVNET_2_JSON).unwrap();
         (
             crate::domain::network_id(&document).unwrap(),
             crate::genesis_digest(&document),
@@ -122,11 +122,22 @@ fn snapshot(block: &HellasBlock, proof: Vec<u8>) -> LatestBlock {
 }
 
 #[test]
+fn direct_finality_requires_the_envelope() {
+    let (verifier, blocks, certificate, _) = fixture();
+    assert!(FinalityProof::decode(&certificate).is_err());
+    let wrapped = encode(&certificate, &[]).unwrap();
+    assert_ne!(wrapped, certificate);
+    verifier
+        .verify_snapshot(&snapshot(&blocks[3], wrapped), &blocks[3].encode())
+        .unwrap();
+}
+
+#[test]
 fn descendant_finality_verifies_with_full_and_light_consensus() {
     let (verifier, blocks, certificate, _) = fixture();
     verifier
         .verify_snapshot(
-            &snapshot(&blocks[3], certificate.clone()),
+            &snapshot(&blocks[3], encode(&certificate, &[]).unwrap()),
             &blocks[3].encode(),
         )
         .unwrap();
@@ -193,12 +204,12 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
 fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     use crate::proof_verify::{ProofBundle, ProofQuery, ProofVerifier};
     use commonware_cryptography::{Hasher as _, Sha256};
-    use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustDocument, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_2_ID, HELLAS_DEVNET_2_JSON, TrustDocument, TrustEpoch};
     let (_, blocks, certificate, identity) = fixture_with_epochs(true);
     let mut trust = TrustDocument {
         schema_version: 1,
-        network_id: HELLAS_DEVNET_1_ID.into(),
-        genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_1_JSON.as_bytes())),
+        network_id: HELLAS_DEVNET_2_ID.into(),
+        genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_2_JSON.as_bytes())),
         epochs: vec![
             TrustEpoch {
                 epoch: 0,
@@ -214,7 +225,8 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
             },
         ],
     };
-    let verifier = ProofVerifier::new(trust.clone()).unwrap();
+    let verifier =
+        ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_2_JSON.as_bytes()).unwrap();
     let target = &blocks[1];
     let bundle = ProofBundle {
         schema_version: 1,
@@ -258,7 +270,8 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     assert!(verifier.verify(wrong_epoch, query).is_err());
     trust.epochs[0].end_height = Some(3);
     trust.epochs[1].start_height = 3;
-    let wrong_schedule = ProofVerifier::new(trust).unwrap();
+    let wrong_schedule =
+        ProofVerifier::with_genesis(trust, HELLAS_DEVNET_2_JSON.as_bytes()).unwrap();
     let mut wrong_bundle = bundle;
     wrong_bundle.trust_sha256 = wrong_schedule.trust_sha256().into();
     // The terminal certificate still belongs to epoch 1 at height 3, but the
@@ -321,7 +334,7 @@ fn archive_reconstructs_descendant_finality_for_every_ancestor() {
 #[test]
 fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
     let (verifier, blocks, certificate, identity) = fixture();
-    let snapshot = snapshot(blocks.last().unwrap(), certificate);
+    let snapshot = snapshot(blocks.last().unwrap(), encode(&certificate, &[]).unwrap());
     verifier
         .verify_snapshot(&snapshot, &blocks.last().unwrap().encode())
         .unwrap();
@@ -351,7 +364,7 @@ fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
 fn direct_certificate_rejects_forged_snapshot_height() {
     let (verifier, blocks, certificate, _) = fixture();
     let block = blocks.last().unwrap();
-    let mut snapshot = snapshot(block, certificate);
+    let mut snapshot = snapshot(block, encode(&certificate, &[]).unwrap());
     verifier
         .verify_snapshot(&snapshot, &block.encode())
         .unwrap();
@@ -367,7 +380,7 @@ fn direct_certificate_rejects_forged_snapshot_height() {
 fn direct_certificate_rejects_forged_snapshot_state_root() {
     let (verifier, blocks, certificate, _) = fixture();
     let block = blocks.last().unwrap();
-    let mut snapshot = snapshot(block, certificate);
+    let mut snapshot = snapshot(block, encode(&certificate, &[]).unwrap());
     verifier
         .verify_snapshot(&snapshot, &block.encode())
         .unwrap();

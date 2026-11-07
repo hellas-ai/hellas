@@ -8,6 +8,7 @@ use hellas_auth::{
     test_support::{Actor, actors::*, ids},
 };
 use hellas_channel::model::work::PrivateRecord;
+use hellas_private::StoreLocation;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -16,11 +17,11 @@ use std::{
     },
 };
 
-pub const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub use hellas_channel::test_support::HANG_GUARD;
 pub async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(WAIT, future)
+    tokio::time::timeout(HANG_GUARD, future)
         .await
-        .expect("test operation exceeded WAIT")
+        .expect("test operation hung")
 }
 
 #[derive(Clone)]
@@ -154,8 +155,9 @@ impl Node {
             &[crate::grant_service::WORK_EXECUTE],
         );
         let provider = self.provider;
+        let location = StoreLocation::for_test(&self.path);
         let (store, secret) = NodeStore::bootstrap(
-            &self.path,
+            &location,
             self.network,
             ids::ROOT_GRANT,
             common_node::approval(
@@ -167,7 +169,6 @@ impl Node {
             ),
             Some(provider.clone()),
             self.clock.now(),
-            Default::default(),
         )
         .await
         .unwrap();
@@ -224,15 +225,9 @@ impl Node {
         service.drain().await.unwrap();
         drop(admin);
         drop(service);
-        let store = NodeStore::open(
-            &self.path,
-            self.network,
-            Some(provider),
-            self.clock.now(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let store = NodeStore::open(&location, self.network, Some(provider), self.clock.now())
+            .await
+            .unwrap();
         TestNode {
             store,
             content,
@@ -404,15 +399,10 @@ impl TestNode {
         let provider = store.state().provider().unwrap().clone();
         let network = store.state().network();
         drop(store);
-        let store = NodeStore::open(
-            &path,
-            network,
-            Some(provider),
-            clock.now(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let location = StoreLocation::for_test(&path);
+        let store = NodeStore::open(&location, network, Some(provider), clock.now())
+            .await
+            .unwrap();
         Self {
             store,
             content,

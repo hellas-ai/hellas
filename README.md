@@ -18,7 +18,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-6e6ee62fc00e`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-a621c8b54a7b`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
@@ -50,6 +50,9 @@ are public development keys; the selected account is retained beside the
 identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
 work is sold only with `--paid-work-config FILE`: at startup the selected owner
 approves exactly that file's terms and delegates the stake its offers bond.
+The default chain is the compiled Devnet profile. `--chain devnet` selects it
+explicitly; `--chain-config FILE` selects an independently authenticated custom
+chain for the whole process. Each gateway pool also uses one selected chain.
 The example charges 20 per job, ten jobs per channel, and stops execution after
 90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
 content ID of A's enrollment and the node it binds. B learns it from A out of
@@ -86,9 +89,9 @@ that exceeds the execution limit is killed with its worker and is not paid.
 Compilation has no time limit. Sources and weights a job names by content ID
 must be available to A through declared Jobs pins in its content configuration.
 Local model directories and existing HuggingFace caches are read-only lower
-layers; acquired objects live in the upper, which defaults to `~/.hellas/store`.
-Pass the same file to `hellas serve --content-config content.toml` and local
-index preparation:
+layers; acquired objects live in the upper, which defaults to `<home>/store`
+(`--home` or `HELLAS_HOME` selects home). Pass the same file to
+`hellas serve --content-config content.toml` and local index preparation:
 
 ```toml
 [content]
@@ -142,17 +145,13 @@ resource JSON is required. The resource is named after the directory,
 
 ```sh
 mkdir -m 700 worker
-cat > worker/content.toml <<'CONTENT'
-[content]
-upper = "/state/store"
-CONTENT
 docker run -d --name hellas-gpu --network host --device nvidia.com/gpu=all \
   --user "$(id -u):$(id -g)" \
   -v "$PWD/worker:/state" -v "$PWD/whisper-tiny:/models/whisper-tiny:ro" \
   "ghcr.io/hellas-ai/hellas:sha-${REVISION}-cuda" \
-  --identity /state/worker.identity --software-root \
-  --await-owner /state/node --audio-model /models/whisper-tiny \
-  --content-config /state/content.toml --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
+  --home /state --software-root \
+  --await-owner --audio-model /models/whisper-tiny \
+  --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
 ```
 
 For Strix Halo, use the matching `-hip` image, replace the NVIDIA device option
@@ -196,14 +195,14 @@ For a second principal, the recipient creates their own key/device and exports
 only their contact and holder. To exercise this locally with separate credentials:
 
 ```sh
-hellas --identity guest.identity --software-root identity init --passkey-out guest.passkey
+hellas --home guest-home --software-root identity init --passkey-out guest.passkey
 hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
-hellas --identity guest.identity identity show-holder > guest.holder
+hellas --home guest-home identity show-holder > guest.holder
 hellas --passkey owner.passkey admin --profile operator/profile.json share \
   --contact guest.contact --holder guest.holder --resource whisper-tiny \
   --limit requests:total:1 --max-job 15m --expires 1h --out guest.access
-hellas --identity guest.identity --passkey guest.passkey offer import-bundle guest.access --name box
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey offer import-bundle guest.access --name box
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-result
 ```
 
@@ -214,7 +213,7 @@ its existing counters. See [renewal](docs/admin.md) before replacing a credentia
 A different request must now fail the guest's one-request quota:
 
 ```sh
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --max-tokens 255
 ```
 
@@ -223,7 +222,7 @@ result and consumes no additional request:
 
 ```sh
 docker stop hellas-gpu
-hellas --identity guest.identity --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-replay
 cmp guest-result/transcript.cbor guest-replay/transcript.cbor
 ```
@@ -464,6 +463,15 @@ nix run .#check-kernel-model-verify
 consensus have independent Hydra release jobsets for their heavier tests and
 artifacts. `devnet` tracks chain rollout; it does not trigger
 CLI or GPU releases.
+
+`nix run .#check-coverage` measures line coverage of the regression suite with
+`cargo llvm-cov` and writes `lcov.info`, `summary.json` and `summary.txt` to
+`$COVERAGE_DIR` (default `target/check/<deps>/coverage`). It fails if any
+crate's production line coverage falls more than 0.5 points below its floor in
+`nix/coverage-floor.json`. After raising coverage, record the new floors with
+`nix run .#check-coverage -- --update`, or without rerunning the suite:
+`python3 nix/coverage-ratchet.py <summary.json> nix/coverage-floor.json --update`.
+It is not part of `check` or any release validation and adds no time to them.
 
 ## Docker
 

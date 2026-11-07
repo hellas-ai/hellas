@@ -10,13 +10,12 @@ const CRASH_UPPER: &str = "HELLAS_TEST_CRASH_UPPER";
 async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
     if let Some(root) = std::env::var_os(CRASH_UPPER) {
         let store = DiskStore::open(
-            root.into(),
+            hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -87,10 +86,10 @@ async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
     )
     .unwrap();
     let output = tokio::time::timeout(
-        hellas_authority::test_support::WAIT,
+        hellas_channel::test_support::HANG_GUARD,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas"))
-            .arg("--identity")
-            .arg(root.path().join("identity"))
+            .arg("--home")
+            .arg(root.path())
             .args([
                 "--software-root",
                 "serve",

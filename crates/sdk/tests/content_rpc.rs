@@ -12,7 +12,6 @@ use hellas_channel::test_support::actors::ROOT;
 use hellas_rpc::{ContentRef, pb::resolve, services::resolve::ResolveClientImpl};
 use hellas_sdk::node_control::{NodeControl, connect_tls, profile};
 use hellas_store::content::*;
-use std::time::Duration;
 
 #[tokio::test]
 async fn owner_content_uses_the_authenticated_providerless_control_connection() {
@@ -121,7 +120,7 @@ async fn owner_content_uses_the_authenticated_providerless_control_connection() 
         .await
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(10), watch.next())
+        tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, watch.next())
             .await
             .unwrap()
             .unwrap()
@@ -180,7 +179,7 @@ async fn owner_content_uses_the_authenticated_providerless_control_connection() 
     drop(upload);
     drop(remote);
     drop(client);
-    let _ = tokio::time::timeout(Duration::from_secs(10), serving)
+    let _ = tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, serving)
         .await
         .unwrap()
         .unwrap();
@@ -438,7 +437,7 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), watch.next())
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, watch.next())
         .await
         .unwrap()
         .unwrap()
@@ -446,12 +445,15 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
     // The stream has delivered an event and is still open; do not close its
     // transport or drop the watch before waiting for the real provider stop.
     assert!(futures::poll!(watch.next()).is_pending());
-    tokio::time::timeout(Duration::from_secs(10), provider.shutdown())
-        .await
-        .expect("public watch cannot hold the provider's reply drain")
-        .unwrap();
+    tokio::time::timeout(
+        hellas_channel::test_support::HANG_GUARD,
+        provider.shutdown(),
+    )
+    .await
+    .expect("public watch cannot hold the provider's reply drain")
+    .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(10), watch.next())
+        tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, watch.next())
             .await
             .unwrap()
             .is_none_or(|event| event.is_err())

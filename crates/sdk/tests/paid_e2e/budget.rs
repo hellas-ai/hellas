@@ -75,7 +75,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 calls: 0,
             })));
             let mut bond = None;
-            for n in 0..10 {
+            for n in 0u64..10 {
                 // The SDK retries funding visibility on the same connection;
                 // a failed session open must fail the test, not start another.
                 let open = PaidWorkSession::open(
@@ -104,12 +104,17 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                let mut purchase = hellas_sdk::transact::Purchase::open(
-                    &case.root.path().join(format!("purchase-{n}.json")),
-                    &job,
-                    false,
+                let mut nonce = [0; 16];
+                nonce[8..].copy_from_slice(&n.to_be_bytes());
+                let attempt = hellas_sdk::transact::PaidAttemptPath::new(
+                    &case.options.config.chain,
+                    case.options.provider,
+                    case.owner.principal(),
+                    job.digest(),
                 )
-                .unwrap();
+                .with_nonce(nonce);
+                let mut purchase =
+                    hellas_sdk::transact::Purchase::open(&attempt, &job, false).unwrap();
                 let result = tokio::time::timeout(
                     Duration::from_secs(30),
                     hellas_sdk::transact::transact(
@@ -124,7 +129,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 )
                 .await
                 .expect("consecutive retained job completes")
-                .unwrap();
+                .unwrap_or_else(|error| panic!("executing job {n}: {error}"));
                 assert_eq!(result.credited_cumulative, PRICE * (n + 1));
                 purchase.reported().unwrap();
                 assert_eq!(
@@ -152,12 +157,11 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             let bond = bond.expect("ten jobs used one retained bond");
             let verifier = hellas_kernel::Secp256k1Verifier::new();
             let setup = hellas_channel::work_store::SetupStore::open_existing(
-                &case.options.journal_root,
-                case.options.config.chain.network,
+                &case.options.journal_root(),
+                case.options.config.network(),
                 bond,
                 hellas_channel::work_store::Role::Client,
                 &verifier,
-                Default::default(),
             )
             .await
             .unwrap();
@@ -165,7 +169,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
             let origin = setup.state().origin().unwrap();
             drop(setup);
             let channel = hellas_channel::work_store::ChannelStore::open_existing(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 descriptor.channel().clone(),
                 descriptor.expected_settlement().unwrap(),
                 hellas_channel::work_store::Role::Client,

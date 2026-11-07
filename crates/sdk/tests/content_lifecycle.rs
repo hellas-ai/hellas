@@ -108,20 +108,20 @@ async fn child(root: &Path, phase: &str) -> ! {
 
 async fn recover(root: &Path, role: Role) -> (ChannelStore, DiskStore) {
     let ready = fixture::ready();
+    let location = hellas_private::StoreLocation::for_test(root);
     let content = DiskStore::open(
-        root.join("content"),
+        location.child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     assert!(content.collect(&Scope::Owner).await.is_err());
     let store = ChannelStore::recover(
-        root,
+        &location,
         ready.channel().clone(),
         role,
         content.clone(),
@@ -183,7 +183,7 @@ async fn retained_process_loss_restores_authority_before_collect_and_sdk_deliver
         .await;
     }
     for phase in ["proposal", "accepted", "result", "terminal-checkpoint"] {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
             let root = tempfile::tempdir().unwrap();
             let log = std::fs::File::create(root.path().join("child.log")).unwrap();
             let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -195,6 +195,10 @@ async fn retained_process_loss_restores_authority_before_collect_and_sdk_deliver
             while !root.path().join("ready").exists() {
                 assert!(child.try_wait().unwrap().is_none(), "child failed: {}",
                     std::fs::read_to_string(root.path().join("child.log")).unwrap());
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class A: a separate child process publishes readiness only as a file"
+                )]
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let expected: Expected = serde_json::from_slice(&std::fs::read(root.path().join("ready")).unwrap()).unwrap();

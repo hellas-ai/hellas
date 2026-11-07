@@ -11,6 +11,7 @@ use hellas_channel::work_open::SetupView;
 use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
@@ -65,8 +66,7 @@ use super::super::*;
 use iroh::SecretKey;
 use tokio::task::JoinHandle;
 
-// Bound hangs without making journal I/O and scheduling part of the assertion.
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+use hellas_channel::test_support::HANG_GUARD;
 
 fn assert_retryable_not_ready(refusal: WorkRefused) {
     assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
@@ -327,7 +327,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(TEST_TIMEOUT, first_entered.notified())
+    tokio::time::timeout(HANG_GUARD, first_entered.notified())
         .await
         .expect("the first handler starts");
 
@@ -340,7 +340,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(TEST_TIMEOUT, second_entered.notified())
+    tokio::time::timeout(HANG_GUARD, second_entered.notified())
         .await
         .expect("the second handler starts while the first is blocked");
     release_first.notify_one();
@@ -354,7 +354,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         .expect("the second RPC succeeds");
 
     connection.close(0_u32.into(), b"concurrency test complete");
-    let closed = tokio::time::timeout(TEST_TIMEOUT, serving)
+    let closed = tokio::time::timeout(HANG_GUARD, serving)
         .await
         .expect("the server observes connection close")
         .expect("the server task does not panic")
@@ -483,13 +483,10 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let setup_mount = MountedSetup::with_content_store(content.clone());
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-
-            journal_root: dir.path().to_path_buf(),
+            chain: crate::test_support::chain_dir(dir.path(), network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -617,13 +614,10 @@ async fn discover_two_route_runner(
 ) -> WorkRunner {
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         work_mount.clone(),
@@ -863,7 +857,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     let observing = tokio::spawn(async move { runner.tick(&observer_source).await });
     entered.acquire().await.unwrap().forget();
     let repeated = tokio::time::timeout(
-        TEST_TIMEOUT,
+        HANG_GUARD,
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()),
     )
     .await
@@ -890,7 +884,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
         prepared_input: first_request.prepared_input.clone(),
     };
     let response = tokio::time::timeout(
-        TEST_TIMEOUT,
+        HANG_GUARD,
         accept_mounted_route(&work_mount, first_route_peer(), expired),
     )
     .await
@@ -1333,6 +1327,10 @@ fn origin() -> SetupOrigin {
 
 /// A provider's setup journal, complete and recording where its
 /// channel begins — which is exactly what a restarting node finds.
+fn provider_journals(home: &Path) -> std::path::PathBuf {
+    (crate::test_support::chain_dir(home, network()).provider_journals()).into_path_buf()
+}
+
 async fn write_setup_journal(root: &Path) {
     OfferFixture::first()
         .write_completed_setup_for(root, default_route_peer())
@@ -1343,8 +1341,10 @@ async fn write_setup_journal(root: &Path) {
 /// channel, settlement, role and origin the descriptor fixes.
 async fn open_channel(root: &Path) -> ChannelStore {
     let content = hellas_channel::test_support::channel::content_store(root).await;
+    let journals = provider_journals(root);
+    let location = StoreLocation::for_test(&journals);
     let store = ChannelStore::open(
-        root,
+        &location,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
@@ -1601,6 +1601,21 @@ async fn write_contested_channel(root: &Path) -> StartId {
             opener: Party::Maker,
             response_deadline: RESPONSE_DEADLINE,
             claimed: 0,
+        },
+    )
+    .await;
+    let pending =
+        PendingPaymentClose::from_accepted_start(network(), CONTEST_HEIGHT, &contest_start())
+            .expect("the fixture contest start creates pending state");
+    commit(
+        &mut store,
+        ChannelRecord::CloseHistoryAdvanced {
+            parent: payload_at(ORIGIN),
+            history: hellas_channel::work_store::CloseHistory {
+                height: CONTEST_HEIGHT,
+                payload: payload_at(CONTEST_HEIGHT),
+                pending,
+            },
         },
     )
     .await;
@@ -2291,13 +2306,10 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
     let content = hellas_channel::test_support::channel::content_store(root).await;
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         mount.clone(),
@@ -2347,13 +2359,13 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
     let PaymentAdmission::Admits(policy) = admission else {
         panic!("admitting fixture policy")
     };
+    let location = StoreLocation::for_test(&provider_journals(root));
     let mut store = SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -2506,13 +2518,14 @@ impl OfferFixture {
     /// The same journal, routed to `peer`.
     async fn write_completed_setup_for(self, root: &Path, peer: PeerId) {
         let verifier = Secp256k1Verifier::new();
+        let journals = provider_journals(root);
+        let location = StoreLocation::for_test(&journals);
         let mut store = match SetupStore::open(
-            root,
+            &location,
             network(),
             self.bond_edge(),
             Role::Provider,
             &verifier,
-            Default::default(),
         )
         .await
         {
@@ -2552,12 +2565,11 @@ impl OfferFixture {
     async fn write_completed_client_setup(self, root: &Path) {
         let verifier = Secp256k1Verifier::new();
         let mut store = SetupStore::open(
-            root,
+            &StoreLocation::for_test(root),
             network(),
             self.bond_edge(),
             Role::Client,
             &verifier,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -2763,13 +2775,13 @@ impl OfferFixture {
         let PaymentAdmission::Admits(policy) = admission else {
             panic!("admitting fixture policy")
         };
+        let location = StoreLocation::for_test(&provider_journals(root));
         let mut store = SetupStore::open(
-            root,
+            &location,
             network(),
             self.bond_edge(),
             Role::Provider,
             &Secp256k1Verifier::new(),
-            Default::default(),
         )
         .await
         .unwrap();
@@ -2784,13 +2796,13 @@ impl OfferFixture {
 }
 
 async fn client_setup(root: &Path, policy: ProviderChannelPolicy) -> SetupEndpoint {
+    let location = StoreLocation::for_test(root);
     let store = match SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         Role::Client,
         &Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     {
@@ -2848,13 +2860,10 @@ impl RunningPaidNode {
         });
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
-                durability: Default::default(),
-                network: network(),
-
-                journal_root: root.to_path_buf(),
+                chain: crate::test_support::chain_dir(root, network()),
 
                 poll: Duration::from_millis(1),
-                max_observation_age: TEST_TIMEOUT,
+                max_observation_age: HANG_GUARD,
                 settlement_key: provider(),
             },
             work_mount.clone(),
@@ -2997,7 +3006,7 @@ impl RunningPaidNode {
 
     async fn connect(&self, alpn: &[u8]) -> (IrohTransport, Connection) {
         let connecting = self.client.connect(self.target.clone(), alpn);
-        let connection = match tokio::time::timeout(TEST_TIMEOUT, connecting).await {
+        let connection = match tokio::time::timeout(HANG_GUARD, connecting).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => panic!("the advertised ALPN is dialable: {error}"),
             Err(_) => panic!("the advertised ALPN dial timed out"),
@@ -3146,7 +3155,7 @@ impl RunningPaidNode {
     /// Polls through the wire's retryable `NotReady` until the detached
     /// invocation has made its signed terminal durable.
     async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
-        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+        let delivered = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if let Some(delivered) = self.stream_result(work_id).await {
                     break delivered;
@@ -3187,7 +3196,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_mount(&self) {
-        let mounted = tokio::time::timeout(TEST_TIMEOUT, async {
+        let mounted = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if self
                     .work_mount
@@ -3212,7 +3221,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_cursor(&self, height: u64) {
-        let caught_up = tokio::time::timeout(TEST_TIMEOUT, async {
+        let caught_up = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let cursor = match self
                     .work_mount
@@ -3313,7 +3322,7 @@ async fn run_advertised_paid_exchange(
 
     // The observer must publish readiness before the first request. Request
     // handling itself has no validator connection and cannot refresh it.
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Some(service) = node
                 .work_mount
@@ -3646,7 +3655,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
 
         assert!(runner.tick(&chain).await, "the recovery read answers");
 
-        let finished = tokio::time::timeout(TEST_TIMEOUT, async {
+        let finished = tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let phase = match mount
                     .service(
@@ -3750,7 +3759,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .handler(&context, request.route.as_ref())
             .unwrap()
             .expect("restarted channel is mounted");
-        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+        let delivered = tokio::time::timeout(HANG_GUARD, async {
             let mut stream = handler
                 .stream_result(request.clone(), context.clone())
                 .await
@@ -3783,7 +3792,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .expect("refusal is answered");
         let Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
             outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)),
-        })) = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+        })) = tokio::time::timeout(HANG_GUARD, stream.next())
             .await
             .expect("a finalized contest terminates delivery")
         else {
@@ -3841,7 +3850,7 @@ async fn open_result_stream_stops(shutdown: bool) {
         .stream_result(request, context.clone())
         .await
         .unwrap();
-    let first = tokio::time::timeout(TEST_TIMEOUT, stream.next())
+    let first = tokio::time::timeout(HANG_GUARD, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -3873,7 +3882,7 @@ async fn open_result_stream_stops(shutdown: bool) {
         assert!(runner.tick(&chain).await);
     }
     backend.finish();
-    let next = tokio::time::timeout(TEST_TIMEOUT, &mut next)
+    let next = tokio::time::timeout(HANG_GUARD, &mut next)
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");
@@ -3925,7 +3934,7 @@ async fn the_clock_does_not_starve_the_request_path() {
     ) else {
         panic!("the channel is mounted before the chain is read")
     };
-    let answered = tokio::time::timeout(TEST_TIMEOUT, async move {
+    let answered = tokio::time::timeout(HANG_GUARD, async move {
         let mut context = vouched_context(default_route_peer());
         context.open_exporter = Some([7; 32]);
         let (request, uploads) = upload_messages(signed_accept_request(), [7; 32]);
@@ -3954,7 +3963,7 @@ async fn the_clock_does_not_starve_the_request_path() {
         Ok(Err(error)) => panic!("the request path is reachable: {error}"),
         Err(_) => panic!("an inbound request waited on the clock's chain read"),
     }
-    let entered = tokio::time::timeout(TEST_TIMEOUT, backend.wait_for_call()).await;
+    let entered = tokio::time::timeout(HANG_GUARD, backend.wait_for_call()).await;
     assert!(
         entered.is_ok(),
         "the accepted job reaches its executor without joining the close clock",
@@ -4041,13 +4050,13 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     // caller's pool across restarts. Finish this fixture's physical handoff.
     content.close().await;
     // Both files are released, and both replay to what the clock left in them.
+    let location = StoreLocation::for_test(&provider_journals(dir.path()));
     let setup = match SetupStore::open(
-        dir.path(),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     {
@@ -4099,12 +4108,12 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
             .await
             .unwrap();
     });
-    tokio::time::timeout(TEST_TIMEOUT, entered.acquire())
+    tokio::time::timeout(HANG_GUARD, entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Some(service) = mount
                 .service(
@@ -4135,7 +4144,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
         .unwrap()
         .unwrap();
     stop.send(()).unwrap();
-    tokio::time::timeout(TEST_TIMEOUT, observing)
+    tokio::time::timeout(HANG_GUARD, observing)
         .await
         .expect("shutdown cancels the blocked read")
         .unwrap();
@@ -4302,17 +4311,19 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let (enrollment, producer_key) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
     let provider = enrollment;
+    let location = StoreLocation::for_test(root.path());
+    let journal = crate::grant_config::GrantConfig::journal_dir(&location);
     let config = || ProviderGrants {
         config: crate::GrantProviderOptions {
             configuration: Default::default(),
             max_job_millis: std::num::NonZeroU64::MIN,
         },
         authority: ProviderAuthority::Journal {
-            root: root.path().join("provider"),
+            root: journal.clone(),
         },
     };
     let (store, secret) = common_node::bootstrap_node_with_credential(
-        &root.path().join("provider"),
+        &journal,
         grant_network(),
         Some(provider.clone()),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
@@ -4346,7 +4357,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         }],
     );
     let store = common_node::provision(
-        &root.path().join("provider"),
+        &journal,
         store,
         &secret,
         producer_key.clone(),
@@ -4377,11 +4388,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         hellas_authority::test_support::content_store(&root.path().join("grant-content")).await;
     for options in [config(), changed, config()] {
         let node = options
-            .open(
-                ProviderResources::ComputeAndFetch(&routes),
-                &provider,
-                Default::default(),
-            )
+            .open(ProviderResources::ComputeAndFetch(&routes), &provider)
             .await
             .unwrap();
         let caller = hellas_authority::test_support::session(&node, &secret).await;
@@ -4420,6 +4427,16 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         assert_eq!(allowances[0].revision, hellas_auth::authority::Revision(1));
         assert_eq!(allowances[0].policies, vec!["initial".to_owned()]);
     }
+    // The local-grant CLI opens this same authority journal after provider restart.
+    let local = hellas_authority::work_store::grant::NodeStore::open(
+        &crate::grant_config::GrantConfig::journal_dir(&location),
+        grant_network(),
+        Some(provider),
+        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+    )
+    .await
+    .unwrap();
+    assert!(local.state().generation(id).is_some());
 }
 
 #[tokio::test]
@@ -4604,7 +4621,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         response.outcome,
         Some(accept_work_response::Outcome::Accepted(_))
     ));
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !paid
             .with_state(|state| state.jobs().any(|job| job.phase() == JobPhase::Ready))
             .await
@@ -4642,7 +4659,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         response.response.outcome,
         Some(accept_work_response::Outcome::Accepted(_))
     ));
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(HANG_GUARD, async {
         while admin.used(id, BudgetNode::Machine, Meter::Requests).await == 0 {
             tokio::task::yield_now().await;
         }
@@ -4717,15 +4734,15 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
         ContentStore as _, Cursor, DiskStore, IndexMode, Reservations, Scope, Target, Tree,
     };
     let root = temp();
+    let journals = StoreLocation::for_test(&provider_journals(root.path()));
     let offer = OfferFixture::first();
     offer.write_completed_setup(root.path()).await;
     let setup = SetupStore::open(
-        root.path(),
+        &journals,
         network(),
         offer.bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -4738,7 +4755,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     assert_ne!(actual, descriptor.expected_settlement().unwrap());
     let node = hellas_channel::test_support::channel::content_store(root.path()).await;
     let mut journal = ChannelStore::open(
-        root.path(),
+        &journals,
         channel.clone(),
         actual,
         Role::Provider,
@@ -4820,14 +4837,13 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let key = ChannelStore::journal_key(&channel);
     let stem = format!("channel-{}", hex::encode(key));
     let (mut journal, _) = Journal::open_existing(
-        root.path(),
+        &journals,
         &stem,
         JournalId {
             kind: JournalKind::Channel,
             role: Role::Provider,
             key,
         },
-        Default::default(),
     )
     .await
     .unwrap();
@@ -4845,13 +4861,12 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     journal.close().await;
     drop(journal);
     let node = DiskStore::open(
-        root.path().join("content"),
+        StoreLocation::for_test(root.path()).child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -4862,11 +4877,9 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     // already be restored while every service still lacks fresh readiness.
     let mut runner = WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-            journal_root: root.path().to_owned(),
+            chain: crate::test_support::chain_dir(root.path(), network()),
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         mounted.clone(),
@@ -4955,17 +4968,15 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     drop(runner);
     node.close().await;
     drop(node);
-    let canonical = Journal::path(root.path(), &stem);
-    let duplicate = Journal::path(root.path(), "channel-duplicate");
+    let canonical = Journal::path(&journals, &stem);
+    let duplicate = Journal::path(&journals, "channel-duplicate");
     std::fs::copy(&canonical, &duplicate).unwrap();
     let node = hellas_channel::test_support::channel::content_store(root.path()).await;
     let duplicate_result = WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-            journal_root: root.path().to_owned(),
+            chain: crate::test_support::chain_dir(root.path(), network()),
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -4981,21 +4992,19 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     std::fs::remove_file(duplicate).unwrap();
     // A surviving channel checkpoint must never be skipped merely because its
     // signed setup descriptor is no longer discoverable under the node root.
-    let setup_stem = Journal::stems(root.path())
+    let setup_stem = Journal::stems(&journals)
         .unwrap()
         .into_iter()
         .find(|stem| stem.starts_with("setup-"))
         .unwrap();
-    let setup_path = Journal::path(root.path(), &setup_stem);
+    let setup_path = Journal::path(&journals, &setup_stem);
     std::fs::rename(&setup_path, setup_path.with_extension("held-aside")).unwrap();
     let node = hellas_channel::test_support::channel::content_store(root.path()).await;
     let recovered = WorkRunner::discover(
         WorkRunnerConfig {
-            durability: Default::default(),
-            network: network(),
-            journal_root: root.path().to_owned(),
+            chain: crate::test_support::chain_dir(root.path(), network()),
             poll: Duration::from_millis(1),
-            max_observation_age: TEST_TIMEOUT,
+            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -5017,18 +5026,17 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     };
     let root = temp();
     let paths = [
-        root.path().join("client-one"),
-        root.path().join("client-two"),
+        StoreLocation::for_test(&root.path().join("client-one")),
+        StoreLocation::for_test(&root.path().join("client-two")),
     ];
     let offers = [OfferFixture::first(), OfferFixture::second()];
     let node = DiskStore::open(
-        root.path().join("shared-content"),
+        StoreLocation::for_test(&root.path().join("shared-content")),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -5036,16 +5044,10 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     let verifier = Secp256k1Verifier::new();
     for (offer, path) in offers.into_iter().zip(&paths) {
         offer.write_completed_client_setup(path).await;
-        let setup = SetupStore::open_existing(
-            path,
-            network(),
-            offer.bond_edge(),
-            Role::Client,
-            &verifier,
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
         let origin = setup.state().origin().unwrap();
         drop(setup);
         let mut journal = ChannelStore::open(
@@ -5094,13 +5096,12 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     node.close().await;
     drop(node);
     let node = DiskStore::open(
-        root.path().join("shared-content"),
+        StoreLocation::for_test(&root.path().join("shared-content")),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -5128,16 +5129,10 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     // Offline handles are gone. Canonical online reopening reuses reservations
     // rather than doubling them; no chain source was contacted to reach this gate.
     for (offer, path) in offers.into_iter().zip(&paths) {
-        let setup = SetupStore::open_existing(
-            path,
-            network(),
-            offer.bond_edge(),
-            Role::Client,
-            &verifier,
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
         let journal = ChannelStore::open_existing(
             path,
             offer.descriptor().channel().clone(),
@@ -5164,13 +5159,12 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
         payment_coin: 0xb3,
     };
     let node = DiskStore::open(
-        root.path().join("shared-content"),
+        StoreLocation::for_test(&root.path().join("shared-content")),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -5225,7 +5219,7 @@ async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handler
                 .await
         })
     };
-    let held = tokio::time::timeout(TEST_TIMEOUT, async {
+    let held = tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Some(service) = mount
                 .service(
@@ -5305,7 +5299,7 @@ async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handler
     blocker.await.unwrap().unwrap();
     match result {
         Ok(result) => result.unwrap().unwrap(),
-        Err(_) => tokio::time::timeout(TEST_TIMEOUT, stopping)
+        Err(_) => tokio::time::timeout(HANG_GUARD, stopping)
             .await
             .unwrap()
             .unwrap()

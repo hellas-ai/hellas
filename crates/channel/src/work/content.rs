@@ -131,6 +131,10 @@ impl hellas_wire::WriteAuthorization for ContentWrite {
             return Poll::Ready(Err(denied()));
         }
         if let Some(remaining) = held.observation.as_ref().and_then(Observation::remaining) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: observation expiry"
+            )]
             let timer = self
                 .timer
                 .get_or_insert_with(|| Box::pin(tokio::time::sleep(remaining)));
@@ -468,6 +472,7 @@ impl WorkService {
                     if !endpoint.close.store.has_content_scope(work, reservation) || endpoint.check_content_authority(&authorization).is_err() { return; }
                     endpoint.observation.as_ref().and_then(Observation::remaining)
                 };
+                #[expect(clippy::disallowed_methods, reason = "inventory class C: observation expiry")]
                 let expiry = async { match remaining { Some(remaining) => tokio::time::sleep(remaining).await, None => std::future::pending().await } };
                 tokio::select! { biased; _ = &mut cancelled => return, _ = changed => {}, _ = expiry => {} }
             }
@@ -727,10 +732,7 @@ mod carrier_tests {
     use super::*;
     use crate::test_support::channel as fixture;
     use hellas_wire::WriteAuthorization as _;
-    use std::{
-        task::{Context, Poll},
-        time::Duration,
-    };
+    use std::task::{Context, Poll};
 
     #[tokio::test]
     async fn a_successful_carrier_write_leaves_no_dormant_authority_waiter() {
@@ -783,7 +785,7 @@ mod carrier_tests {
         ));
         // A native carrier need not poll this callback again until its next ACK.
         // Producing that ACK must be able to acquire the same actual writer.
-        let next = tokio::time::timeout(Duration::from_secs(1), service.endpoint()).await;
+        let next = tokio::time::timeout(crate::test_support::HANG_GUARD, service.endpoint()).await;
         assert!(next.is_ok(), "a dormant callback owns the endpoint permit");
         drop(writer);
     }

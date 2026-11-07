@@ -167,13 +167,12 @@ async fn metadata_reservation_fits_real_input_and_transcript_publications_at_exa
         + transcript.bytes()
         + tree_reservation(&closure, transcript.bytes()).unwrap();
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(1 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

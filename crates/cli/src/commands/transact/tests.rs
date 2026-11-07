@@ -1,5 +1,33 @@
 use super::*;
 use clap::Parser as _;
+use hellas_private::Durability::Crash;
+use hellas_private::StoreLocation;
+
+#[tokio::test]
+async fn paid_output_is_flushed_before_a_failed_settlement() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("output");
+    let result = deliver_then_settle(
+        || {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
+            writer.write_all(b"paid result")?;
+            writer.flush()?;
+            Ok(())
+        },
+        async {
+            assert_eq!(std::fs::read(&output).unwrap(), b"paid result");
+            bail!("injected settlement failure")
+        },
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("injected settlement failure")
+    );
+    assert_eq!(std::fs::read(output).unwrap(), b"paid result");
+}
 
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
@@ -13,9 +41,7 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
         &["--settle"][..],
         &["--buy-again"],
         &["--validator", "ws://localhost"],
-        &["--trust", "chain.json"],
         &["--address", "127.0.0.1:1"],
-        &["--state-dir", "paid-state"],
         &["--acceptance-blocks", "300"],
         &["--terminal-blocks", "3000"],
         &["--payment-blocks", "600"],
@@ -33,10 +59,23 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
-    let identity = crate::identity::load_or_create(Some(&identity_path)).unwrap();
+    let identity = crate::identity::load_or_create(&identity_path).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
-    let owner = cli.owner.load().unwrap().unwrap();
-    let context = Context::new(&identity, Some(&owner), Some(&identity_path)).unwrap();
+    let owner = cli
+        .owner
+        .load(&hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::Devnet,
+        ))
+        .unwrap()
+        .unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let context = Context::new(
+        &identity,
+        Some(&owner),
+        &location,
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
     for (extra, expected) in [
         (vec![], (300, 3000, 600)),
         (
@@ -52,22 +91,19 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
         ),
     ] {
         let args = fetch_args(&extra).client;
-        let content = client::content(
-            &args,
-            &context,
-            hellas_sdk::client_chain::devnet(root.path())
-                .unwrap()
-                .chain
-                .network,
+        let location = StoreLocation::for_test(root.path());
+        let config = hellas_sdk::work_config::WorkConfig::for_chain(
+            hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            &location,
         )
-        .await
         .unwrap();
+        let content = client::content(&context, config.network()).await.unwrap();
         let options = args
             .options_with_config(
                 &context,
                 20,
                 Assurance::ProducerSigned,
-                hellas_sdk::client_chain::devnet(root.path()).unwrap(),
+                config,
                 content.clone(),
             )
             .unwrap();
@@ -96,26 +132,43 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     )
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    let legacy = root.path().join(format!("{}.json", job.digest()));
-    let pointer = legacy.with_extension("latest");
-    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    let chain = hellas_chain::chain_dir::ChainDir::open(
+        root.path(),
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+        Crash,
+    )
+    .unwrap();
+    let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();
+    let owner = hellas_auth::authority::PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+        passkey.party_key().to_bytes(),
+    ))
+    .unwrap();
+    let legacy = PaidAttemptPath::new(&chain, provider().parse().unwrap(), owner, job.digest());
+    let pointer = legacy.as_path().with_extension("latest");
+    drop(select_attempt(&legacy, &job, false).unwrap());
     let first = std::fs::read_to_string(&pointer).unwrap();
-    drop(select_attempt(&legacy, &job, false).unwrap().unwrap());
+    drop(select_attempt(&legacy, &job, false).unwrap());
     assert_eq!(std::fs::read_to_string(&pointer).unwrap(), first);
     std::fs::remove_file(&pointer).unwrap();
     assert!(select_attempt(&legacy, &job, false).is_err());
     std::fs::write(&pointer, &first).unwrap();
-    drop(select_attempt(&legacy, &job, true).unwrap().unwrap());
+    drop(select_attempt(&legacy, &job, true).unwrap());
     let second = std::fs::read_to_string(&pointer).unwrap();
     assert_ne!(first, second);
     assert!(
-        root.path()
+        legacy
+            .as_path()
+            .parent()
+            .unwrap()
             .join(format!("{}.{}.json", job.digest(), first))
             .exists()
     );
-    let second_path = root
-        .path()
-        .join(format!("{}.{}.json", job.digest(), second));
+    let second_path =
+        legacy
+            .as_path()
+            .parent()
+            .unwrap()
+            .join(format!("{}.{}.json", job.digest(), second));
     std::fs::remove_file(second_path).unwrap();
     assert!(select_attempt(&legacy, &job, false).is_err());
     assert_eq!(std::fs::read_to_string(&pointer).unwrap(), second);
@@ -426,9 +479,8 @@ fn output_claims_only_provider_signature_and_job_binding() {
         Assurance::ProducerSigned,
     )
     .unwrap();
-    let result = PaidWorkResult {
+    let result = PaidCompletion {
         bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
-        payment_edge: hellas_kernel::EdgeId::from_bytes([2; 32]),
         channel_id: hellas_auth::Digest::from_bytes([3; 32]),
         transcript: vec![],
         output: hellas_rpc::protocol::invocation::output::InvocationOutput {
@@ -437,14 +489,10 @@ fn output_claims_only_provider_signature_and_job_binding() {
             metadata: hellas_rpc::JsonBytes(vec![]),
         },
         work_id: hellas_auth::Digest::from_bytes([4; 32]),
-        acceptance_signature: hellas_kernel::Sig::from_bytes([0; hellas_kernel::Sig::LENGTH]),
-        credited_cumulative: 20,
         job_price: 20,
         provider_key: ProducerSigningKey::from_secret_bytes([8; 32])
             .unwrap()
             .public_key(),
-        input: hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([5; 32])),
-        settled_provider_payout: None,
     };
     let output = wording(args.client.paid_provider().unwrap(), &job, &result);
     assert_eq!(

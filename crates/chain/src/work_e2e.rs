@@ -923,165 +923,165 @@ fn payment_close_coins(allocations: &Allocations) -> (CoinId, CoinId) {
 /// number could pass on principal alone.
 #[test]
 fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
-    for owners in [OwnerKind::Native, OwnerKind::Passkey] {
-        for locked in [false, true] {
-            eprintln!("paid lifecycle owners={owners:?}, locked={locked}");
-            run_qmdb(move |runtime| async move {
-                let provider_root = tempfile::tempdir().expect("a temp dir");
-                let client_root = tempfile::tempdir().expect("a temp dir");
-                let mut devnet =
-                    WorkDevnet::start(runtime, "work_e2e_paid", owners, locked, false).await;
-                let allocations = devnet.allocations.clone();
+    // Owner kinds are covered by the kernel signature tests (secp256k1,
+    // webauthn); pairing each kind with one variant halves the devnets.
+    for (owners, locked) in [(OwnerKind::Native, false), (OwnerKind::Passkey, true)] {
+        eprintln!("paid lifecycle owners={owners:?}, locked={locked}");
+        run_qmdb(move |runtime| async move {
+            let provider_root = tempfile::tempdir().expect("a temp dir");
+            let client_root = tempfile::tempdir().expect("a temp dir");
+            let mut devnet =
+                WorkDevnet::start(runtime, "work_e2e_paid", owners, locked, false).await;
+            let allocations = devnet.allocations.clone();
 
-                let mut opened =
-                    open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
-                assert_eq!(opened.origin.payment_edge, payment_edge(&allocations));
+            let mut opened =
+                open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
+            assert_eq!(opened.origin.payment_edge, payment_edge(&allocations));
 
-                // The provider's stake is locked and its genesis coin is gone,
-                // so nothing it holds now can be mistaken for earnings later.
-                assert_eq!(
-                    devnet
-                        .coins(PROVIDER_NODE, allocations.provider_key())
-                        .await,
-                    Vec::new(),
-                    "the provider holds no coin at all while its stake is bonded",
-                );
-
-                let credited = run_one_paid_job(&devnet, &mut opened).await;
-                assert_eq!(credited, PRICE);
-
-                // Nothing has moved on chain yet: an admitted certificate is not
-                // a payout.
-                assert_eq!(
-                    devnet
-                        .coins(PROVIDER_NODE, allocations.provider_key())
-                        .await,
-                    Vec::new(),
-                    "an off-chain certificate pays nobody",
-                );
-
-                // Settle. The provider opens its own close at the certificate it
-                // holds; there is nothing for anyone to answer.
-                opened
-                    .service
-                    .prepare_close()
-                    .await
-                    .expect("the provider prepares the close its certificate spends");
-                drive_close_onto_chain(&mut devnet, &opened.service).await;
-                let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
-                    PendingSlot::Present(pending) => {
-                        assert_eq!(
-                            pending.final_cumulative(),
-                            PRICE,
-                            "the contest consensus holds settles at the certificate the client signed",
-                        );
-                        pending.response_deadline()
-                    }
-                    other => panic!("the start opened a contest on chain: {other:?}"),
-                };
-                devnet.seal_through(deadline).await;
-                settle_on_the_clock(&mut devnet, &opened.service).await;
-
-                // The provider's own journal, caught up past its close, agrees
-                // about what it was paid.
-                let advance = provider_clock(&devnet, &opened.service).await;
-                assert_eq!(
-                    advance.close,
-                    CloseProgress::Settled {
-                        provider_payout: PRICE
-                    },
-                );
-                assert_eq!(advance.adjudication, None, "the payment edge is gone");
-                assert_eq!(
-                    advance.bond_timeout,
-                    Some(crate::SubmitTxOutcome::Enqueued),
-                    "a finalized payment close releases its bond before the horizon"
-                );
-
-                // ── The money ─────────────────────────────────────────────────
-                //
-                // Earnings first, named by the exact coin the adjudicated close
-                // minted for the provider — so this is the payout of *this*
-                // close, not a total.
-                let (earnings_coin, refund_coin) = payment_close_coins(&allocations);
-                assert_eq!(
-                    devnet
-                        .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
-                        .await,
-                    Some(PRICE),
-                    "EARNINGS: the payment close paid the provider exactly the job price",
-                );
-                assert_eq!(
-                    devnet
-                        .value_of(CLIENT_NODE, allocations.provider_key(), earnings_coin)
-                        .await,
-                    Some(PRICE),
-                    "and a second validator's finalized QMDB says the same",
-                );
-                assert_eq!(
-                    devnet
-                        .coins(PROVIDER_NODE, allocations.provider_key())
-                        .await,
-                    vec![(earnings_coin, PRICE)],
-                    "EARNINGS ARE THE WHOLE OF WHAT THE PROVIDER HOLDS: \
-             no principal has come back yet, so this number cannot be one",
-                );
-
-                // The client's side of the same close.
-                assert_eq!(
-                    devnet
-                        .value_of(CLIENT_NODE, allocations.client_key(), refund_coin)
-                        .await,
-                    Some(CLIENT_FUNDING - PRICE),
-                    "the client got back its funding less exactly the job price",
-                );
-                assert_eq!(
-                    devnet.coins(CLIENT_NODE, allocations.client_key()).await,
-                    vec![(refund_coin, CLIENT_FUNDING - PRICE)],
-                    "and holds nothing else: 100 in, 90 out, a fall of exactly 10",
-                );
-
-                // Returned principal, separately: a different coin, from a
-                // different edge, minted by a different close.
-                let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
-                assert_ne!(
-                    principal_coin, earnings_coin,
-                    "principal and earnings are different coins",
-                );
-                assert_eq!(
-                    devnet
-                        .value_of(PROVIDER_NODE, allocations.provider_key(), principal_coin)
-                        .await,
-                    Some(PROVIDER_STAKE),
-                    "RETURNED PRINCIPAL: the bond timeout returned the stake, 12, unchanged",
-                );
-                assert_eq!(
-                    devnet
-                        .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
-                        .await,
-                    Some(PRICE),
-                    "and the earnings coin is still exactly the price, 10, unchanged by it",
-                );
-
-                // The whole provider balance, decomposed. 22 = 10 earned + 12
-                // returned, and the two halves are named.
-                let mut held = devnet
+            // The provider's stake is locked and its genesis coin is gone,
+            // so nothing it holds now can be mistaken for earnings later.
+            assert_eq!(
+                devnet
                     .coins(PROVIDER_NODE, allocations.provider_key())
-                    .await;
-                held.sort_by_key(|(_, value)| *value);
-                assert_eq!(
-                    held,
-                    vec![(earnings_coin, PRICE), (principal_coin, PROVIDER_STAKE)]
-                );
-                assert_eq!(
-                    held.iter().map(|(_, value)| value).sum::<u64>(),
-                    PRICE + PROVIDER_STAKE,
-                );
+                    .await,
+                Vec::new(),
+                "the provider holds no coin at all while its stake is bonded",
+            );
 
-                drop(opened);
-                devnet.shutdown().await;
-            });
-        }
+            let credited = run_one_paid_job(&devnet, &mut opened).await;
+            assert_eq!(credited, PRICE);
+
+            // Nothing has moved on chain yet: an admitted certificate is not
+            // a payout.
+            assert_eq!(
+                devnet
+                    .coins(PROVIDER_NODE, allocations.provider_key())
+                    .await,
+                Vec::new(),
+                "an off-chain certificate pays nobody",
+            );
+
+            // Settle. The provider opens its own close at the certificate it
+            // holds; there is nothing for anyone to answer.
+            opened
+                .service
+                .prepare_close()
+                .await
+                .expect("the provider prepares the close its certificate spends");
+            drive_close_onto_chain(&mut devnet, &opened.service).await;
+            let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
+                PendingSlot::Present(pending) => {
+                    assert_eq!(
+                        pending.final_cumulative(),
+                        PRICE,
+                        "the contest consensus holds settles at the certificate the client signed",
+                    );
+                    pending.response_deadline()
+                }
+                other => panic!("the start opened a contest on chain: {other:?}"),
+            };
+            devnet.seal_through(deadline).await;
+            settle_on_the_clock(&mut devnet, &opened.service).await;
+
+            // The provider's own journal, caught up past its close, agrees
+            // about what it was paid.
+            let advance = provider_clock(&devnet, &opened.service).await;
+            assert_eq!(
+                advance.close,
+                CloseProgress::Settled {
+                    provider_payout: PRICE
+                },
+            );
+            assert_eq!(advance.adjudication, None, "the payment edge is gone");
+            assert_eq!(
+                advance.bond_timeout,
+                Some(crate::SubmitTxOutcome::Enqueued),
+                "a finalized payment close releases its bond before the horizon"
+            );
+
+            // ── The money ─────────────────────────────────────────────────
+            //
+            // Earnings first, named by the exact coin the adjudicated close
+            // minted for the provider — so this is the payout of *this*
+            // close, not a total.
+            let (earnings_coin, refund_coin) = payment_close_coins(&allocations);
+            assert_eq!(
+                devnet
+                    .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
+                    .await,
+                Some(PRICE),
+                "EARNINGS: the payment close paid the provider exactly the job price",
+            );
+            assert_eq!(
+                devnet
+                    .value_of(CLIENT_NODE, allocations.provider_key(), earnings_coin)
+                    .await,
+                Some(PRICE),
+                "and a second validator's finalized QMDB says the same",
+            );
+            assert_eq!(
+                devnet
+                    .coins(PROVIDER_NODE, allocations.provider_key())
+                    .await,
+                vec![(earnings_coin, PRICE)],
+                "EARNINGS ARE THE WHOLE OF WHAT THE PROVIDER HOLDS: \
+         no principal has come back yet, so this number cannot be one",
+            );
+
+            // The client's side of the same close.
+            assert_eq!(
+                devnet
+                    .value_of(CLIENT_NODE, allocations.client_key(), refund_coin)
+                    .await,
+                Some(CLIENT_FUNDING - PRICE),
+                "the client got back its funding less exactly the job price",
+            );
+            assert_eq!(
+                devnet.coins(CLIENT_NODE, allocations.client_key()).await,
+                vec![(refund_coin, CLIENT_FUNDING - PRICE)],
+                "and holds nothing else: 100 in, 90 out, a fall of exactly 10",
+            );
+
+            // Returned principal, separately: a different coin, from a
+            // different edge, minted by a different close.
+            let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
+            assert_ne!(
+                principal_coin, earnings_coin,
+                "principal and earnings are different coins",
+            );
+            assert_eq!(
+                devnet
+                    .value_of(PROVIDER_NODE, allocations.provider_key(), principal_coin)
+                    .await,
+                Some(PROVIDER_STAKE),
+                "RETURNED PRINCIPAL: the bond timeout returned the stake, 12, unchanged",
+            );
+            assert_eq!(
+                devnet
+                    .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
+                    .await,
+                Some(PRICE),
+                "and the earnings coin is still exactly the price, 10, unchanged by it",
+            );
+
+            // The whole provider balance, decomposed. 22 = 10 earned + 12
+            // returned, and the two halves are named.
+            let mut held = devnet
+                .coins(PROVIDER_NODE, allocations.provider_key())
+                .await;
+            held.sort_by_key(|(_, value)| *value);
+            assert_eq!(
+                held,
+                vec![(earnings_coin, PRICE), (principal_coin, PROVIDER_STAKE)]
+            );
+            assert_eq!(
+                held.iter().map(|(_, value)| value).sum::<u64>(),
+                PRICE + PROVIDER_STAKE,
+            );
+
+            drop(opened);
+            devnet.shutdown().await;
+        });
     }
 }
 
@@ -1098,161 +1098,159 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
 /// what the response overrides.
 #[test]
 fn an_understated_close_is_answered_and_pays_the_certificate() {
-    for owners in [OwnerKind::Native, OwnerKind::Passkey] {
-        for owner_exit in [false, true] {
-            eprintln!("contested lifecycle owners={owners:?}, owner_exit={owner_exit}");
-            run_qmdb(move |runtime| async move {
-                let provider_root = tempfile::tempdir().expect("a temp dir");
-                let client_root = tempfile::tempdir().expect("a temp dir");
-                let mut devnet =
-                    WorkDevnet::start(runtime, "work_e2e_contest", owners, false, owner_exit).await;
-                let allocations = devnet.allocations.clone();
+    // Owner kinds are covered by the kernel signature tests (secp256k1,
+    // webauthn); pairing each kind with one variant halves the devnets.
+    for (owners, owner_exit) in [(OwnerKind::Native, false), (OwnerKind::Passkey, true)] {
+        eprintln!("contested lifecycle owners={owners:?}, owner_exit={owner_exit}");
+        run_qmdb(move |runtime| async move {
+            let provider_root = tempfile::tempdir().expect("a temp dir");
+            let client_root = tempfile::tempdir().expect("a temp dir");
+            let mut devnet =
+                WorkDevnet::start(runtime, "work_e2e_contest", owners, false, owner_exit).await;
+            let allocations = devnet.allocations.clone();
 
-                let mut opened =
-                    open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
-                assert_eq!(run_one_paid_job(&devnet, &mut opened).await, PRICE);
+            let mut opened =
+                open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
+            assert_eq!(run_one_paid_job(&devnet, &mut opened).await, PRICE);
 
-                // The client opens a close claiming the provider earned nothing.
-                // Its own signature, on the real start builder, at the height
-                // its own validator reports.
-                let start = close_start(
-                    opened.ready.channel(),
-                    Party::Maker,
-                    devnet.height(),
-                    None,
-                    &client(),
+            // The client opens a close claiming the provider earned nothing.
+            // Its own signature, on the real start builder, at the height
+            // its own validator reports.
+            let start = close_start(
+                opened.ready.channel(),
+                Party::Maker,
+                devnet.height(),
+                None,
+                &client(),
+            )
+            .expect("the client signs an understated start");
+            let start = if allocations.owner_exit {
+                let hash =
+                    hellas_channel::work_close::start_body_digest(opened.ready.channel(), &start);
+                hellas_kernel::PaymentCloseStart::new(
+                    start.payment_edge(),
+                    start.terms().clone(),
+                    start.opener_role(),
+                    (start.valid_from_height(), start.valid_through_height()),
+                    start.certificate().cloned(),
+                    hellas_kernel::PartyAuth::new(
+                        hellas_kernel::Authority::Owner,
+                        allocations.client_owner().authorize(hash),
+                    ),
                 )
-                .expect("the client signs an understated start");
-                let start = if allocations.owner_exit {
-                    let hash = hellas_channel::work_close::start_body_digest(
-                        opened.ready.channel(),
-                        &start,
+            } else {
+                start
+            };
+            assert!(
+                start.certificate().is_none(),
+                "the claim under test is that the provider earned nothing",
+            );
+            let client_blocks = devnet.blocks(CLIENT_NODE);
+            assert_eq!(
+                client_blocks
+                    .submit(KernelTx::move_action(Move::StartPaymentClose(start)))
+                    .await
+                    .expect("the client's validator takes the start"),
+                crate::SubmitTxOutcome::Enqueued,
+            );
+            devnet.seal().await;
+
+            let opened_at = devnet.height();
+            let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
+                PendingSlot::Present(pending) => {
+                    assert_eq!(
+                        pending.final_cumulative(),
+                        0,
+                        "the understated claim is on chain"
                     );
-                    hellas_kernel::PaymentCloseStart::new(
-                        start.payment_edge(),
-                        start.terms().clone(),
-                        start.opener_role(),
-                        (start.valid_from_height(), start.valid_through_height()),
-                        start.certificate().cloned(),
-                        hellas_kernel::PartyAuth::new(
-                            hellas_kernel::Authority::Owner,
-                            allocations.client_owner().authorize(hash),
-                        ),
-                    )
-                } else {
-                    start
-                };
-                assert!(
-                    start.certificate().is_none(),
-                    "the claim under test is that the provider earned nothing",
-                );
-                let client_blocks = devnet.blocks(CLIENT_NODE);
-                assert_eq!(
-                    client_blocks
-                        .submit(KernelTx::move_action(Move::StartPaymentClose(start)))
-                        .await
-                        .expect("the client's validator takes the start"),
-                    crate::SubmitTxOutcome::Enqueued,
-                );
-                devnet.seal().await;
+                    pending.response_deadline()
+                }
+                other => panic!("the client's start opened a contest: {other:?}"),
+            };
+            assert!(
+                deadline > opened_at,
+                "the window is open when the drive runs"
+            );
 
-                let opened_at = devnet.height();
-                let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
-                    PendingSlot::Present(pending) => {
-                        assert_eq!(
-                            pending.final_cumulative(),
-                            0,
-                            "the understated claim is on chain"
-                        );
-                        pending.response_deadline()
-                    }
-                    other => panic!("the client's start opened a contest: {other:?}"),
-                };
-                assert!(
-                    deadline > opened_at,
-                    "the window is open when the drive runs"
-                );
+            // The runner's close drive, on its cadence, over the provider's
+            // own validator. This is the whole of the provider's answer.
+            let advance = provider_clock(&devnet, &opened.service).await;
+            let CloseProgress::Opened { .. } = advance.close else {
+                panic!("the drive saw the contest: {advance:?}");
+            };
+            assert_eq!(
+                advance.adjudication, None,
+                "the response is not consensus evidence before it lands",
+            );
+            assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
+            let answer_block = devnet.seal().await;
+            assert!(
+                answer_block.txs().iter().any(|tx| matches!(
+                    tx,
+                    crate::domain::Transaction::Kernel(KernelTx::Move {
+                        action: Move::RespondPaymentClose(_)
+                    })
+                )),
+                "the response is in finalized history",
+            );
+            assert!(
+                devnet.height() < deadline,
+                "and it landed at {} — before the deadline at {deadline}",
+                devnet.height(),
+            );
 
-                // The runner's close drive, on its cadence, over the provider's
-                // own validator. This is the whole of the provider's answer.
-                let advance = provider_clock(&devnet, &opened.service).await;
-                let CloseProgress::Opened { .. } = advance.close else {
-                    panic!("the drive saw the contest: {advance:?}");
-                };
-                assert_eq!(
-                    advance.adjudication, None,
-                    "the response is not consensus evidence before it lands",
-                );
-                assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
-                let answer_block = devnet.seal().await;
-                assert!(
-                    answer_block.txs().iter().any(|tx| matches!(
-                        tx,
-                        crate::domain::Transaction::Kernel(KernelTx::Move {
-                            action: Move::RespondPaymentClose(_)
-                        })
-                    )),
-                    "the response is in finalized history",
-                );
-                assert!(
-                    devnet.height() < deadline,
-                    "and it landed at {} — before the deadline at {deadline}",
-                    devnet.height(),
-                );
+            let settled = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
+                PendingSlot::Present(pending) => pending,
+                other => panic!("the answered contest is still pending: {other:?}"),
+            };
+            assert!(settled.responded(), "consensus recorded the answer");
+            assert_eq!(
+                settled.final_cumulative(),
+                PRICE,
+                "the contest now settles at the certificate, not the claim",
+            );
 
-                let settled = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
-                    PendingSlot::Present(pending) => pending,
-                    other => panic!("the answered contest is still pending: {other:?}"),
-                };
-                assert!(settled.responded(), "consensus recorded the answer");
-                assert_eq!(
-                    settled.final_cumulative(),
-                    PRICE,
-                    "the contest now settles at the certificate, not the claim",
-                );
+            settle_on_the_clock(&mut devnet, &opened.service).await;
 
-                settle_on_the_clock(&mut devnet, &opened.service).await;
+            // The adjudicated payouts: the certificate plus the forfeited
+            // omission bond, and the client's remainder.
+            let paid = PRICE + OMISSION_BOND;
+            let (earnings_coin, refund_coin) = payment_close_coins(&allocations);
+            assert_eq!(
+                devnet
+                    .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
+                    .await,
+                Some(paid),
+                "the adjudicated close paid the certificate amount plus the bond: 10 + 4",
+            );
+            assert_eq!(
+                devnet
+                    .coins(PROVIDER_NODE, allocations.provider_key())
+                    .await,
+                vec![(earnings_coin, paid)],
+                "and that is the whole of what the provider holds: no principal is in it",
+            );
+            assert_eq!(
+                devnet
+                    .value_of(CLIENT_NODE, allocations.client_key(), refund_coin)
+                    .await,
+                Some(CLIENT_FUNDING - paid),
+                "the client kept 86 of its 100, having tried to keep 100",
+            );
 
-                // The adjudicated payouts: the certificate plus the forfeited
-                // omission bond, and the client's remainder.
-                let paid = PRICE + OMISSION_BOND;
-                let (earnings_coin, refund_coin) = payment_close_coins(&allocations);
-                assert_eq!(
-                    devnet
-                        .value_of(PROVIDER_NODE, allocations.provider_key(), earnings_coin)
-                        .await,
-                    Some(paid),
-                    "the adjudicated close paid the certificate amount plus the bond: 10 + 4",
-                );
-                assert_eq!(
-                    devnet
-                        .coins(PROVIDER_NODE, allocations.provider_key())
-                        .await,
-                    vec![(earnings_coin, paid)],
-                    "and that is the whole of what the provider holds: no principal is in it",
-                );
-                assert_eq!(
-                    devnet
-                        .value_of(CLIENT_NODE, allocations.client_key(), refund_coin)
-                        .await,
-                    Some(CLIENT_FUNDING - paid),
-                    "the client kept 86 of its 100, having tried to keep 100",
-                );
+            // And the principal, separately, as above.
+            let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
+            assert_eq!(
+                devnet
+                    .value_of(PROVIDER_NODE, allocations.provider_key(), principal_coin)
+                    .await,
+                Some(PROVIDER_STAKE),
+                "RETURNED PRINCIPAL: still 12, still not earnings",
+            );
 
-                // And the principal, separately, as above.
-                let principal_coin = return_the_stake(&mut devnet, &opened.service).await;
-                assert_eq!(
-                    devnet
-                        .value_of(PROVIDER_NODE, allocations.provider_key(), principal_coin)
-                        .await,
-                    Some(PROVIDER_STAKE),
-                    "RETURNED PRINCIPAL: still 12, still not earnings",
-                );
-
-                drop(opened);
-                devnet.shutdown().await;
-            });
-        }
+            drop(opened);
+            devnet.shutdown().await;
+        });
     }
 }
 

@@ -308,7 +308,7 @@ async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_a
     let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
     let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
     let signer = Arc::new(signer);
-    let journals = root.path().join("provider");
+    let journals = hellas_private::StoreLocation::for_test(&root.path().join("provider"));
     let (store, secret) = common_node::bootstrap_node_with_credential(
         &journals,
         hellas_authority::model::grant::grant_network(),
@@ -367,7 +367,6 @@ async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_a
         hellas_authority::model::grant::grant_network(),
         Some(enrollment),
         UnixMillis::now().unwrap(),
-        content.durability(),
     )
     .await
     .unwrap();

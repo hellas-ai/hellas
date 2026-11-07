@@ -1784,6 +1784,11 @@ impl CloseChannel for ClientEndpoint {
 }
 
 impl ClientEndpoint {
+    /// Release a locally owned channel after its observer and requests stop.
+    pub async fn close(&mut self) -> Result<(), WorkStoreError> {
+        self.store.close().await
+    }
+
     /// Applies one finalized block: every transition it carries, then
     /// the cursor that says it was read.
     ///
@@ -2615,6 +2620,18 @@ impl WorkService {
             .reject(height);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    /// Finish provider unaccepted content cleanup and release the journal
+    /// after request execution and observation have drained.
+    pub async fn close(&self) -> Result<(), WorkStoreError> {
+        self.endpoint
+            .lock_for_shutdown()
+            .await
+            .close
+            .store
+            .close()
+            .await
     }
 
     /// Ends admission and delivery while retaining the journal and close duties.

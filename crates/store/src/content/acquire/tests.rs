@@ -439,13 +439,12 @@ async fn disk_cold_https_streams_an_object_larger_than_any_tree_without_ram_mate
     let root = tempfile::tempdir().unwrap();
     let ram = Reservations::ram(2 << 20);
     let mut store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         Some(data.len() as u64),
         ram.clone(),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -487,13 +486,12 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
     let tree = Tree::new(vec![("tokenizer.json".into(), Target::Object(tokenizer))]).unwrap();
     let capacity = tree.bytes().len() as u64 + tokenizer.bytes();
     let mut store = DiskStore::open(
-        directory.path().into(),
+        hellas_private::StoreLocation::for_test(directory.path()),
         vec![],
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

@@ -4,8 +4,9 @@ use crate::identity::LocalIdentity;
 use hellas_auth::{Digest, authority as auth};
 use hellas_authority::{
     node::{HOST_STATUS, host_resource},
-    test_support::{WAIT, common_node, ids},
+    test_support::{HANG_GUARD, common_node, ids},
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use hellas_sdk::{grant_config::GrantConfig, node_control};
 use std::path::Path;
@@ -61,12 +62,14 @@ async fn run(
         .as_deref()
         .map(crate::commands::chain::passkey)
         .transpose()?;
+    let location = StoreLocation::for_test(Path::new("."));
     crate::commands::admin::run(
         args,
         identity,
         passkey
             .as_ref()
             .map(|key| key as &dyn hellas_authority::authenticator::Authenticator),
+        &location,
     )
     .await
 }
@@ -95,12 +98,11 @@ impl Daemon {
             .tempdir_in(scratch.canonicalize().unwrap())
             .unwrap();
         hellas_private::restrict_directory(root.path()).unwrap();
-        let identity =
-            crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+        let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
         let provider_identity =
-            crate::identity::load_or_create(Some(&root.path().join("provider-identity"))).unwrap();
+            crate::identity::load_or_create(&root.path().join("provider-identity")).unwrap();
         let wrong_identity =
-            crate::identity::load_or_create(Some(&root.path().join("other-identity"))).unwrap();
+            crate::identity::load_or_create(&root.path().join("other-identity")).unwrap();
         let authority = auth::AuthorityId(Digest::hash(b"daemon control fixture"));
         let root_grant = ROOT_GRANT;
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
@@ -128,7 +130,8 @@ impl Daemon {
             (3_600_000, 8),
             &[],
         );
-        let mut grant_config = GrantConfig::unconfigured(&root.path().canonicalize().unwrap());
+        let location = StoreLocation::for_test(&root.path().canonicalize().unwrap());
+        let mut grant_config = GrantConfig::unconfigured(&location);
         grant_config.remote_control = node_control::RemoteControlAdmission::new(vec![
             identity.transport_key.public(),
             wrong_identity.transport_key.public(),
@@ -143,7 +146,7 @@ impl Daemon {
         )
         .unwrap();
         let offline = || OfflineArgs {
-            journal: grant_config.journal_root.clone(),
+            journal: grant_config.journal_root().to_path_buf(),
             administrator: scope_file.clone(),
             credential_scope: scope_file.clone(),
             holder: admin_holder.clone(),
@@ -165,13 +168,13 @@ impl Daemon {
         .unwrap();
         let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         hellas_private::write_atomically(
-            &grant_config.control_certificate,
+            &grant_config.control_certificate(),
             ".writing",
             tls.cert.der(),
         )
         .unwrap();
         hellas_private::write_atomically(
-            &grant_config.control_private_key,
+            &grant_config.control_private_key(),
             ".writing",
             &tls.signing_key.serialize_der(),
         )
@@ -180,7 +183,7 @@ impl Daemon {
         let profile_json = serde_json::json!({
             "authority": authority, "authorization": root_grant,
             "credential": "app.credential",
-            "local": {"certificate": "control.cert.der", "server_name": "localhost"},
+            "local": {"certificate": grant_config.control_certificate(), "server_name": "localhost"},
         });
         hellas_private::write_atomically(
             &profile_path,
@@ -188,8 +191,8 @@ impl Daemon {
             &serde_json::to_vec(&profile_json).unwrap(),
         )
         .unwrap();
-        let socket = grant_config.control_socket.clone();
-        let journal = grant_config.journal_root.clone();
+        let socket = grant_config.control_socket().to_path_buf();
+        let journal = grant_config.journal_root().to_path_buf();
         let mut executor = ExecutorSpawnConfig::new(
             Arc::new(provider_identity.node_key.clone()),
             Assurance::ProducerSigned,
@@ -203,7 +206,7 @@ impl Daemon {
             std::fs::create_dir(&lower).unwrap();
             std::fs::write(lower.join("weights"), b"cli daemon data").unwrap();
             hellas_store::content::DiskStore::open(
-                root.path().join("content/content"),
+                StoreLocation::for_test(&root.path().join("content/content")),
                 vec![lower],
                 hellas_store::content::IndexMode::Resume,
                 None,
@@ -211,13 +214,13 @@ impl Daemon {
                     hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
                 ),
                 false,
-                Default::default(),
             )
             .await
             .unwrap()
         } else {
             hellas_authority::test_support::content_store(&root.path().join("content")).await
         };
+        let other_location = StoreLocation::for_test(root.path());
         let daemon = super::super::configuration::start_host(
             hellas_sdk::ProviderOptions {
                 executor,
@@ -234,6 +237,7 @@ impl Daemon {
             Some(grant_config),
             None,
             None,
+            &other_location,
         )
         .await
         .unwrap();
@@ -391,7 +395,7 @@ impl Daemon {
     }
     async fn stop(&mut self) {
         assert!(self.socket.exists());
-        tokio::time::timeout(WAIT, self.handle.take().unwrap().shutdown())
+        tokio::time::timeout(HANG_GUARD, self.handle.take().unwrap().shutdown())
             .await
             .unwrap()
             .unwrap();
@@ -399,12 +403,12 @@ impl Daemon {
         self.content.close().await;
     }
     async fn store(&self) -> hellas_authority::work_store::grant::NodeStore {
+        let location = StoreLocation::for_test(&self.journal);
         hellas_authority::work_store::grant::NodeStore::open(
-            &self.journal,
+            &location,
             hellas_authority::model::grant::grant_network(),
             Some(self.provider_identity.enrollment.clone()),
             auth::UnixMillis::now().unwrap_or_default(),
-            Default::default(),
         )
         .await
         .unwrap()
@@ -629,7 +633,7 @@ async fn offline_recovery_publishes_a_usable_replacement_credential() {
 #[tokio::test]
 async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let root = tempfile::tempdir().unwrap();
-    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
     let (passkey_file, owner) = passkey(root.path(), "operator.passkey", 0x33);
     let authority = auth::AuthorityId(Digest::hash(b"gateway bearer fixture"));
     let now = auth::UnixMillis::now().unwrap_or_default();
@@ -687,12 +691,12 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let admin = node_control::profile::read_credential(&admin_out).unwrap();
     let bearer = node_control::profile::read_credential(&bearer_out).unwrap();
     assert_ne!(admin.id(), bearer.id());
+    let location = StoreLocation::for_test(&journal);
     let store = hellas_authority::work_store::grant::NodeStore::open(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         None,
         now,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -727,6 +731,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
         content_config: None,
         command,
     };
+    let home = StoreLocation::for_test(daemon.root.path());
     crate::commands::store::run(
         args(StoreCommand::Pin {
             command: PinCommand::Set {
@@ -738,6 +743,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
                 expires_ms: None,
             },
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
@@ -752,6 +758,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
             end: Some(9),
             out: Some(output.clone()),
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
@@ -768,6 +775,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
                 end: None,
                 out: Some(refused.clone())
             }),
+            &home,
             Some(&daemon.wrong_identity),
             None
         )
@@ -848,6 +856,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
             path: None,
             source_pin: Some("public/source".into()),
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
@@ -862,6 +871,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
             end: None,
             out: Some(peer_output.clone()),
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
@@ -875,6 +885,7 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
                 name: "operator/from-peer".into(),
             },
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
@@ -888,13 +899,19 @@ async fn store_commands_use_the_authenticated_owner_carrier_and_never_fallback_a
                 name: "operator/weights".into(),
             },
         }),
+        &home,
         Some(&daemon.identity),
         None,
     )
     .await
     .unwrap();
-    crate::commands::store::run(args(StoreCommand::Collect), Some(&daemon.identity), None)
-        .await
-        .unwrap();
+    crate::commands::store::run(
+        args(StoreCommand::Collect),
+        &home,
+        Some(&daemon.identity),
+        None,
+    )
+    .await
+    .unwrap();
     daemon.stop().await;
 }

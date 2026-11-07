@@ -1,5 +1,6 @@
 use super::*;
 use crate::grant_service::ResultCache;
+use hellas_private::StoreLocation;
 
 pub(super) fn cached(service: &GrantService, id: Digest) -> Arc<ResultCache> {
     service
@@ -104,7 +105,7 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
             }
             discarded(&cache);
             if !completed {
-                tokio::time::timeout(WAIT, backend.cancelled.notified())
+                tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                     .await
                     .unwrap();
                 assert_eq!(backend.slots.available_permits(), 0);
@@ -184,21 +185,21 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
     let cache = cached(&service, id);
     assert!(cache.bytes() > 0);
     clock.set(UnixMillis(1100));
-    tokio::time::timeout(WAIT, cache.cancellation().cancelled())
+    tokio::time::timeout(HANG_GUARD, cache.cancellation().cancelled())
         .await
         .unwrap();
     discarded(&cache);
     drop(work);
     drop(service);
     // Keep the cache handle alive: neither it nor its timer may retain the writer.
+    let location = StoreLocation::for_test(dir.path());
     let reopened = NodeStore::open(
-        dir.path(),
+        &location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],
         )),
         UnixMillis(1100),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -253,7 +254,7 @@ async fn discarded_prefix_still_verifies_usage_and_rejects_a_different_signed_co
         assert!(cache.bytes() > 0);
         revoke_access(&service, &secret, &credential, AccessTarget::Credential).await;
         discarded(&cache);
-        tokio::time::timeout(WAIT, backend.cancelled.notified())
+        tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
             .await
             .unwrap();
         assert_eq!(backend.slots.available_permits(), 0);
@@ -361,7 +362,7 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
         assert_err!(service.bind_delivery(&work.access, &delivery::delivery_request(&a, id)).await,
             refusal if refusal.grant.as_ref().unwrap().code == GrantRefusalCode::OutOfScope as i32);
         if !completed {
-            tokio::time::timeout(WAIT, backend.cancelled.notified())
+            tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                 .await
                 .unwrap();
             assert_eq!(backend.slots.available_permits(), 0);

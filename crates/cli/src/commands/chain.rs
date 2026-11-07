@@ -1,14 +1,11 @@
 use hellas_authority::authenticator::{Authenticator, kernel_auth};
 use std::time::Duration;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
 use hellas_chain::domain::{Digest, SettlementKey, Transaction};
-use hellas_chain::genesis::{Genesis, known_network, known_network_names};
+use hellas_chain::genesis::ChainProfile;
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
@@ -24,15 +21,9 @@ use crate::commands::CliResult;
 pub enum ChainCommand {
     /// Query the chain light-client API
     Query {
-        /// RPC endpoint
+        /// RPC endpoint; defaults to the selected chain's first validator.
         #[arg(long)]
-        rpc: String,
-        /// Independently authenticated deployment trust document
-        #[arg(long)]
-        trust: PathBuf,
-        /// Genesis document; defaults to the shipped devnet
-        #[arg(long)]
-        genesis: Option<PathBuf>,
+        rpc: Option<String>,
         #[command(subcommand)]
         query: QueryCommand,
     },
@@ -80,14 +71,7 @@ pub enum ChainCommand {
 #[derive(Args)]
 pub struct OwnerCoinArgs {
     #[arg(long)]
-    rpc: String,
-    /// Independently authenticated deployment trust document
-    #[arg(long)]
-    trust: PathBuf,
-    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
-    network: String,
-    #[arg(long)]
-    genesis: Option<PathBuf>,
+    rpc: Option<String>,
     /// Live coin ID; repeat or comma-separate values
     #[arg(long = "coin", value_delimiter = ',', required = true)]
     coins: Vec<String>,
@@ -97,17 +81,7 @@ pub struct OwnerCoinArgs {
 pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
-    rpc: String,
-    /// Independently authenticated deployment trust document
-    #[arg(long)]
-    trust: PathBuf,
-    /// Network to sign for: a shipped name (`devnet`) or a
-    /// full network id
-    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
-    network: String,
-    /// Genesis document to sign for, instead of a shipped network
-    #[arg(long)]
-    genesis: Option<PathBuf>,
+    rpc: Option<String>,
     /// Maker secret-scalar file path (32 raw bytes or 64 hex digits)
     #[arg(long)]
     maker_key: PathBuf,
@@ -144,17 +118,7 @@ pub struct OpenArgs {
 pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
-    rpc: String,
-    /// Independently authenticated deployment trust document
-    #[arg(long)]
-    trust: PathBuf,
-    /// Network to sign for: a shipped name (`devnet`) or a
-    /// full network id
-    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
-    network: String,
-    /// Genesis document to sign for, instead of a shipped network
-    #[arg(long)]
-    genesis: Option<PathBuf>,
+    rpc: Option<String>,
     /// Hex-encoded kernel edge ID
     #[arg(long)]
     edge_id: String,
@@ -253,14 +217,6 @@ pub enum IndexerCommand {
         /// ChainSync peer as ENDPOINT_ID@IP:PORT; repeat for multiple peers
         #[arg(long = "peer", value_parser = parse_chain_peer)]
         peers: Vec<iroh::EndpointAddr>,
-        /// Authenticated trust document, provisioned independently of the RPC origin
-        #[arg(long)]
-        trust: PathBuf,
-        /// Exact authenticated genesis JSON; defaults to the embedded devnet document
-        #[arg(long)]
-        genesis: Option<PathBuf>,
-        #[arg(long)]
-        storage_dir: PathBuf,
         #[arg(long, default_value = "hellas-explorer")]
         partition_prefix: String,
         /// Retain only the last N executed blocks; the default keeps the complete archive
@@ -275,6 +231,11 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
+    /// Reset this chain's validator state once when its generation changes.
+    StateGeneration {
+        #[arg(long)]
+        generation: u64,
+    },
     /// Export public epoch-zero explorer trust from a validator config and exact genesis file
     ExportTrust {
         #[arg(long)]
@@ -317,6 +278,9 @@ pub enum ValidatorCommand {
     },
     /// Generate a TOML config for one validator
     Config {
+        /// Network ID for a newly generated genesis; omitted for the shipped devnet.
+        #[arg(long, conflicts_with = "genesis")]
+        network_id: Option<String>,
         /// Total number of validators in the network
         #[arg(short = 'n', long)]
         validators: u32,
@@ -353,6 +317,9 @@ pub enum ValidatorCommand {
         /// Canonical genesis JSON; validator identities must match --seed
         #[arg(long)]
         genesis: Option<PathBuf>,
+        /// Write the exact generated genesis JSON to this file.
+        #[arg(long)]
+        genesis_out: Option<PathBuf>,
         /// Genesis allocation as address:balance
         #[arg(long = "genesis-allocation")]
         genesis_allocations: Vec<String>,
@@ -371,33 +338,43 @@ pub enum ValidatorCommand {
     },
 }
 
-pub async fn run(command: ChainCommand, owner: Option<&hellas_kernel::SoftPasskey>) -> CliResult {
+pub async fn run(
+    command: ChainCommand,
+    owner: Option<&hellas_kernel::SoftPasskey>,
+    profile: &ChainProfile,
+    _home: &std::path::Path,
+) -> CliResult {
     match command {
         ChainCommand::Delegate { coins, node, split } => {
             anyhow::ensure!(
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
                 "delegate must be a valid secp256k1 node key"
             );
-            run_owner_coins(coins, Some(node.into_kernel()), split, None, owner).await
+            run_owner_coins(coins, Some(node.into_kernel()), split, None, owner, profile).await
         }
-        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, None, None, owner).await,
+        ChainCommand::Sweep(coins) => {
+            run_owner_coins(coins, None, None, None, owner, profile).await
+        }
         ChainCommand::Send { coins, to, amount } => {
             anyhow::ensure!(amount > 0, "amount must be positive");
             hellas_sdk::coin_owner::OwnerReshape::validate_recipient(to.into_kernel())?;
-            run_owner_coins(coins, None, None, Some((to.into_kernel(), amount)), owner).await
+            run_owner_coins(
+                coins,
+                None,
+                None,
+                Some((to.into_kernel(), amount)),
+                owner,
+                profile,
+            )
+            .await
         }
-        ChainCommand::Query {
-            rpc,
-            trust,
-            genesis,
-            query,
-        } => run_query(rpc, trust, genesis, query).await,
-        ChainCommand::Open(args) => run_open(args).await,
-        ChainCommand::Close(args) => run_close(args).await,
+        ChainCommand::Query { rpc, query } => run_query(rpc, profile, query).await,
+        ChainCommand::Open(args) => run_open(args, profile).await,
+        ChainCommand::Close(args) => run_close(args, profile).await,
         #[cfg(feature = "indexer")]
-        ChainCommand::Indexer { command } => run_indexer(command).await,
+        ChainCommand::Indexer { command } => run_indexer(command, profile, _home).await,
         #[cfg(feature = "validator")]
-        ChainCommand::Validator { command } => run_validator(command).await,
+        ChainCommand::Validator { command } => run_validator(command, profile, _home).await,
     }
 }
 
@@ -407,13 +384,13 @@ async fn run_owner_coins(
     split: Option<u64>,
     payment: Option<(hellas_kernel::Key, u64)>,
     owner: Option<&hellas_kernel::SoftPasskey>,
+    profile: &ChainProfile,
 ) -> CliResult {
     let owner = owner
         .context("chain delegate/sweep/send requires --passkey, --faucet or --faucet-account")?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
-    let network = selected_network(&args.network, args.genesis.clone())?;
-    let client =
-        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
+    let network = NetworkId::new(profile.network_id()).expect("validated profile");
+    let client = connect_with_verified_snapshots(args.rpc, profile).await?;
     let key = hellas_kernel::Key::from_bytes(owner.public_key()?.to_compressed());
     let plan = if let Some((recipient, amount)) = payment {
         hellas_sdk::coin_owner::OwnerReshape::pay(
@@ -453,23 +430,13 @@ async fn run_owner_coins(
     Ok(())
 }
 
-async fn run_query(
-    rpc: String,
-    trust: PathBuf,
-    genesis: Option<PathBuf>,
-    query: QueryCommand,
-) -> CliResult {
-    let client = connect_with_verified_snapshots(rpc, &trust, genesis.as_deref()).await?;
+async fn run_query(rpc: Option<String>, profile: &ChainProfile, query: QueryCommand) -> CliResult {
+    let client = connect_with_verified_snapshots(rpc, profile).await?;
     if matches!(
         query,
-        QueryCommand::Coin { .. }
-            | QueryCommand::Edge { .. }
-            | QueryCommand::CoinsByOwner { .. }
-            | QueryCommand::EdgesByOwner { .. }
-            | QueryCommand::Validators
-            | QueryCommand::Finalization { .. }
+        QueryCommand::Validators | QueryCommand::Finalization { .. }
     ) {
-        eprintln!("records are unverified; only finalized block snapshots are authenticated");
+        eprintln!("this RPC record is unverified; use finalized block evidence for authentication");
     }
     match query {
         QueryCommand::LatestBlock => match client.get_latest_block().await? {
@@ -598,7 +565,7 @@ async fn run_query(
     Ok(())
 }
 
-async fn run_open(args: OpenArgs) -> CliResult {
+async fn run_open(args: OpenArgs, profile: &ChainProfile) -> CliResult {
     let maker = DevSigner::load(args.maker_auth, &args.maker_key)?;
     let taker = DevSigner::load(args.taker_auth, &args.taker_key)?;
     let funding = Funding::new(
@@ -616,9 +583,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
         timeout_outputs,
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
-    let network = selected_network(&args.network, args.genesis.clone())?;
-    let client =
-        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
+    let network = NetworkId::new(profile.network_id()).expect("validated profile");
+    let client = connect_with_verified_snapshots(args.rpc, profile).await?;
     let network = confirm_network(network, &client).await?;
     let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
@@ -644,12 +610,11 @@ async fn run_open(args: OpenArgs) -> CliResult {
     Ok(())
 }
 
-async fn run_close(args: CloseArgs) -> CliResult {
+async fn run_close(args: CloseArgs, profile: &ChainProfile) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
-    let network = selected_network(&args.network, args.genesis.clone())?;
-    let client =
-        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
+    let network = NetworkId::new(profile.network_id()).expect("validated profile");
+    let client = connect_with_verified_snapshots(args.rpc, profile).await?;
     let network = confirm_network(network, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
@@ -714,59 +679,17 @@ async fn run_close(args: CloseArgs) -> CliResult {
 }
 
 async fn connect_with_verified_snapshots(
-    rpc: String,
-    trust: &Path,
-    genesis: Option<&Path>,
+    rpc: Option<String>,
+    profile: &ChainProfile,
 ) -> CliResult<RemoteLightClient> {
-    let trust: hellas_chain::genesis::TrustDocument = serde_json::from_slice(&fs::read(trust)?)?;
-    let genesis_json = match genesis {
-        Some(path) => fs::read(path)?,
-        None => hellas_chain::genesis::HELLAS_DEVNET_1_JSON
-            .as_bytes()
-            .to_vec(),
-    };
-    let client = RemoteLightClient::connect(rpc).await?;
-    let reported = client.get_consensus_info().await?;
-    let verifier = pinned_consensus_verifier(&trust, &genesis_json, &reported)?;
-    Ok(client.with_consensus_verifier(verifier))
-}
-
-pub(super) use hellas_sdk::client_chain::pinned_consensus_verifier;
-
-/// Resolves the network to sign for, and refuses if the node on the
-/// other end is not on it.
-///
-/// The genesis document is the authority — a signature has to be built
-/// before anyone can tell you whether it was wanted — but the node
-/// reports its own network, so the mismatch is worth catching here
-/// rather than as an unexplained rejected transaction. Pointing devnet
-/// keys at a different network node is exactly the mistake this slice makes
-/// impossible to get away with silently.
-/// Resolves the network to sign for, without touching the network.
-///
-/// `--network` names one of the documents compiled into this binary;
-/// `--genesis` hands over a document instead, for a network this binary
-/// does not ship. Local and fallible first, so a mistyped network is
-/// reported as a mistyped network rather than as whatever the RPC
-/// endpoint happens to say.
-fn selected_network(network: &str, genesis: Option<PathBuf>) -> CliResult<NetworkId> {
-    let document = match genesis {
-        Some(path) => std::fs::read_to_string(&path)
-            .with_context(|| format!("reading genesis document {}", path.display()))?,
-        None => known_network(network)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown network `{network}`; this binary ships {}. \
-                     Pass --genesis <path> for a network it does not ship.",
-                    known_network_names().join(", "),
-                )
-            })?
-            .json
-            .to_string(),
-    };
-    let genesis: Genesis =
-        serde_json::from_str(&document).context("parsing the genesis document")?;
-    Ok(hellas_chain::domain::network_id(&genesis)?)
+    let rpc = rpc
+        .or_else(|| profile.validators().first().cloned())
+        .context("selected chain has no validator routes")?;
+    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::with_digest(
+        profile.trust().clone(),
+        profile.consensus_digest(),
+    )?);
+    Ok(RemoteLightClient::connect(rpc, verifier).await?)
 }
 
 /// Refuses if the node on the other end is not on `network`.
@@ -813,6 +736,10 @@ async fn get_live_edge(
             Err(error) => return Err(error.into()),
         }
         if attempt + 1 < SNAPSHOT_RETRIES {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: remote index; rollout 3"
+            )]
             tokio::time::sleep(SNAPSHOT_RETRY_DELAY).await;
         }
     }
@@ -893,27 +820,30 @@ fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
 }
 
 #[cfg(feature = "indexer")]
-async fn run_indexer(command: IndexerCommand) -> CliResult {
+async fn run_indexer(
+    command: IndexerCommand,
+    profile: &ChainProfile,
+    home: &std::path::Path,
+) -> CliResult {
     match command {
         IndexerCommand::Serve {
             rpc,
             peers,
-            trust,
-            genesis,
-            storage_dir,
             partition_prefix,
             chain_archive_blocks,
             listen,
         } => {
-            let trust = serde_json::from_slice(&fs::read(&trust)?)?;
-            let genesis_json = genesis.map(fs::read).transpose()?;
+            let selected = if rpc.is_empty() {
+                profile.clone()
+            } else {
+                profile.clone().with_validators(rpc)?
+            };
+            let chain =
+                hellas_chain::chain_dir::ChainDir::open(home, &selected, Default::default())?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
-                    rpc,
+                    chain,
                     peers,
-                    trust,
-                    genesis_json,
-                    storage_dir,
                     partition_prefix,
                     listen,
                     archive_blocks: chain_archive_blocks,
@@ -939,8 +869,15 @@ fn parse_chain_peer(raw: &str) -> Result<iroh::EndpointAddr, String> {
 }
 
 #[cfg(feature = "validator")]
-async fn run_validator(command: ValidatorCommand) -> CliResult {
+async fn run_validator(
+    command: ValidatorCommand,
+    profile: &ChainProfile,
+    home: &std::path::Path,
+) -> CliResult {
     let command = match command {
+        ValidatorCommand::StateGeneration { generation } => {
+            return reset_validator_generation(profile, home, generation);
+        }
         ValidatorCommand::ExportTrust { config, genesis } => {
             hellas_chain::validator::Command::ExportTrust { config, genesis }
         }
@@ -968,6 +905,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             output_dir,
         },
         ValidatorCommand::Config {
+            network_id,
             validators,
             validator,
             start_port,
@@ -980,8 +918,10 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
+            network_id,
             validators,
             validator,
             start_port,
@@ -994,14 +934,51 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         },
-        ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run { config },
-        ValidatorCommand::CheckConfig { config } => {
-            hellas_chain::validator::Command::CheckConfig { config }
-        }
+        ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run {
+            config,
+            profile: profile.clone(),
+            home: home.to_path_buf(),
+        },
+        ValidatorCommand::CheckConfig { config } => hellas_chain::validator::Command::CheckConfig {
+            config,
+            profile: profile.clone(),
+        },
     };
     tokio::task::spawn_blocking(move || hellas_chain::validator::run_command(command)).await??;
+    Ok(())
+}
+
+#[cfg(feature = "validator")]
+fn reset_validator_generation(
+    profile: &ChainProfile,
+    home: &std::path::Path,
+    generation: u64,
+) -> CliResult {
+    anyhow::ensure!(generation > 0, "generation must be positive");
+    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile, Default::default())?;
+    let state = chain.validator();
+    let stamp = state.join(".state-generation");
+    let current = match fs::read_to_string(&stamp) {
+        Ok(value) => value.trim().parse::<u64>().ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current == Some(generation) {
+        return Ok(());
+    }
+    fs::create_dir_all(&state)?;
+    for entry in fs::read_dir(&state)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::write(stamp, generation.to_string())?;
     Ok(())
 }
 
@@ -1031,76 +1008,6 @@ mod tests {
     use hellas_kernel::{Key, MAX_PARTY_INPUTS};
 
     #[test]
-    fn pinned_custom_network_accepts_matching_identity_and_rejects_substitution() {
-        let mut genesis: Genesis =
-            serde_json::from_slice(hellas_chain::genesis::HELLAS_DEVNET_1_JSON.as_bytes()).unwrap();
-        genesis.network_id = "custom-network-1".into();
-        genesis.validate().unwrap();
-        let json = serde_json::to_vec(&genesis).unwrap();
-        let identity = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
-        let mut trust = hellas_chain::genesis::TrustDocument {
-            schema_version: 1,
-            network_id: genesis.network_id.clone(),
-            genesis_sha256: hex::encode(hellas_chain::genesis_digest(&genesis)),
-            epochs: vec![hellas_chain::genesis::TrustEpoch {
-                epoch: 0,
-                start_height: 0,
-                end_height: None,
-                threshold_identity: identity.into(),
-            }],
-        };
-        let mut reported = hellas_chain::ConsensusInfo {
-            network_id: trust.network_id.clone(),
-            threshold_identity: hex::decode(identity).unwrap(),
-            validators: vec![],
-        };
-        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_ok());
-        reported.threshold_identity[0] ^= 0x20;
-        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
-        reported.threshold_identity[0] ^= 0x20;
-        reported.network_id = hellas_chain::genesis::HELLAS_DEVNET_1_ID.into();
-        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
-        reported.network_id = trust.network_id.clone();
-        trust.genesis_sha256 = "00".repeat(32);
-        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
-        trust.genesis_sha256 = hex::encode(hellas_chain::genesis_digest(&genesis));
-        trust.network_id = hellas_chain::genesis::HELLAS_DEVNET_1_ID.into();
-        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
-    }
-
-    #[test]
-    fn endpoint_cannot_choose_its_own_threshold_identity() {
-        let json = hellas_chain::genesis::HELLAS_DEVNET_1_JSON.as_bytes();
-        let identity = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
-        let trust = hellas_chain::genesis::TrustDocument {
-            schema_version: 1,
-            network_id: hellas_chain::genesis::HELLAS_DEVNET_1_ID.into(),
-            genesis_sha256: "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17"
-                .into(),
-            epochs: vec![hellas_chain::genesis::TrustEpoch {
-                epoch: 0,
-                start_height: 0,
-                end_height: None,
-                threshold_identity: identity.into(),
-            }],
-        };
-        let mut reported = hellas_chain::ConsensusInfo {
-            validators: vec![],
-            network_id: trust.network_id.clone(),
-            threshold_identity: hex::decode(identity).unwrap(),
-        };
-        assert!(pinned_consensus_verifier(&trust, json, &reported).is_ok());
-        // The negative of the pinned generator is also a valid BLS identity.
-        reported.threshold_identity[0] ^= 0x20;
-        let genesis: Genesis = serde_json::from_slice(json).unwrap();
-        assert!(
-            hellas_chain::ConsensusVerifier::new(&reported, hellas_chain::genesis_digest(&genesis))
-                .is_ok()
-        );
-        assert!(pinned_consensus_verifier(&trust, json, &reported).is_err());
-    }
-
-    #[test]
     fn owner_commands_use_global_passkey_and_one_coin_parser() {
         use clap::Parser as _;
         let node = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
@@ -1115,8 +1022,6 @@ mod tests {
                 operation,
                 "--rpc",
                 "ws://127.0.0.1:1",
-                "--trust",
-                "trust.json",
                 "--coin",
                 &coin,
             ];
@@ -1140,19 +1045,19 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_rejects_an_invalid_node_before_network_or_owner_access() {
+        let home = tempfile::tempdir().unwrap();
         let error = run(
             ChainCommand::Delegate {
                 split: None,
                 coins: OwnerCoinArgs {
-                    rpc: "invalid".into(),
-                    network: "devnet".into(),
-                    genesis: None,
-                    trust: "trust.json".into(),
+                    rpc: Some("invalid".into()),
                     coins: vec!["01".repeat(32)],
                 },
                 node: SettlementKey::from(Key::from_bytes([0; Key::LENGTH])),
             },
             None,
+            &ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            home.path(),
         )
         .await
         .unwrap_err();

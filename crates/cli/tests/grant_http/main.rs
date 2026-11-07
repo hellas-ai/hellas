@@ -1,4 +1,9 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 #![cfg(unix)]
+use hellas_private::StoreLocation;
 mod contact;
 mod local_compute;
 mod local_flux;
@@ -26,6 +31,11 @@ use tokio::{
     process::{Child, Command},
     sync::Semaphore,
 };
+
+/// Bound for a hung process or request, not a performance requirement. These
+/// tests start real nodes that compile, sign and journal while CI runs many
+/// suites at once; the properties under test never depend on how fast that is.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 struct Https {
     origin: String,
@@ -142,6 +152,7 @@ const STRANGER_PASSKEY: [u8; 32] = [0x16; 32];
 /// software passkey file.
 struct Cli {
     root: PathBuf,
+    home: PathBuf,
     identity: PathBuf,
     passkey: PathBuf,
     metrics_endpoint: Option<String>,
@@ -151,10 +162,12 @@ impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
         let path = root.join(format!("{name}.passkey"));
         std::fs::write(&path, hex::encode(passkey)).unwrap();
-        std::fs::create_dir_all(root.join("homes").join(name)).unwrap();
+        let home = root.join(name);
+        std::fs::create_dir_all(&home).unwrap();
         Self {
             root: root.into(),
-            identity: root.join(name),
+            identity: home.join("identity"),
+            home,
             passkey: path,
             metrics_endpoint: None,
             metrics_address: None,
@@ -178,32 +191,19 @@ impl Cli {
     async fn holder_file(&self) -> PathBuf {
         let path = self.root.join(format!(
             "{}-holder.json",
-            self.identity.file_name().unwrap().to_string_lossy()
+            self.home.file_name().unwrap().to_string_lossy()
         ));
         std::fs::write(&path, self.run(&["identity", "show-holder"]).await).unwrap();
         path
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hellas"));
-        // These commands use no node identity and refuse `--identity`.
-        if !matches!(
-            args,
-            ["trust", ..] | ["contact", ..] | ["offer", "import", ..]
-        ) {
-            command.arg("--identity").arg(&self.identity);
-        }
+        command.arg("--home").arg(&self.home);
         if args.first() != Some(&"trust") {
             command.arg("--passkey").arg(&self.passkey);
         }
         command
             .args(args)
-            .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
-            .env(
-                "HOME",
-                self.root
-                    .join("homes")
-                    .join(self.identity.file_name().unwrap()),
-            )
             .env("RUST_LOG", "warn,hellas_gateway=info,hellas::metrics=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
@@ -224,7 +224,7 @@ impl Cli {
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
-        tokio::time::timeout(Duration::from_secs(30), self.command(args).output())
+        tokio::time::timeout(HANG_GUARD, self.command(args).output())
             .await
             .unwrap()
             .unwrap()
@@ -256,7 +256,7 @@ struct Process {
 }
 impl Process {
     async fn wait_for(&mut self, marker: &str) -> String {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + HANG_GUARD;
         loop {
             let log = std::fs::read_to_string(&self.log).unwrap();
             if let Some((_, tail)) = log.split_once(marker) {
@@ -277,7 +277,7 @@ impl Process {
         unsafe {
             libc::kill(self.child.id().unwrap() as i32, libc::SIGTERM);
         }
-        let status = tokio::time::timeout(Duration::from_secs(15), self.child.wait())
+        let status = tokio::time::timeout(HANG_GUARD, self.child.wait())
             .await
             .unwrap()
             .unwrap();
@@ -552,8 +552,9 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     };
     let journal = root.join("gateway-authority");
     let root_grant = GrantId([0; 16]);
+    let location = StoreLocation::for_test(&journal);
     let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
@@ -565,7 +566,6 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
         ),
         None,
         now,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -602,7 +602,7 @@ fn gateway_client(token: &str) -> reqwest::Client {
                 .into_iter()
                 .collect(),
         )
-        .timeout(Duration::from_secs(10))
+        .timeout(HANG_GUARD)
         .build()
         .unwrap()
 }

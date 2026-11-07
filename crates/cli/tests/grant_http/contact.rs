@@ -45,8 +45,8 @@ async fn contact_cards_introduce_the_passkey_principal() {
     .unwrap();
     assert_eq!(decoded.principal(), provider.principal());
     assert!(
-        directory
-            .path()
+        friend
+            .home
             .join("grants")
             .join(format!(
                 "p256-{}",

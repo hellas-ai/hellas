@@ -123,6 +123,10 @@ pub fn compile_cancellable(
         .is_err()
     {
         check_cancelled()?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class A: compile contention; rollout 4"
+        )]
         std::thread::sleep(Duration::from_millis(2));
     }
     let guard = CacheGuard;

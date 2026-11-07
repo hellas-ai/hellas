@@ -18,6 +18,7 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
+use hellas_private::Durability::Crash;
 use std::time::Duration;
 
 struct Fixture {
@@ -26,6 +27,43 @@ struct Fixture {
     head: HellasBlock,
     config: Config,
     allocations: Vec<(SettlementKey, u64)>,
+}
+
+#[test]
+fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
+    use commonware_runtime::Supervisor as _;
+    run_qmdb(|runtime| async move {
+        let profile = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet);
+        let genesis = profile.genesis();
+        let leader = genesis
+            .validators
+            .iter()
+            .map(|validator| {
+                PublicKey::decode(hex::decode(&validator.public_key).unwrap().as_slice()).unwrap()
+            })
+            .min()
+            .unwrap();
+        let application = crate::Application::new(
+            runtime.child("known_genesis"),
+            crate::domain::network_id(genesis).unwrap(),
+            crate::genesis_digest(genesis),
+            leader,
+            genesis_allocations(genesis).unwrap(),
+            "known_genesis",
+            crate::ApplicationConfig::default(),
+        )
+        .await;
+        assert_eq!(
+            application.genesis_block().digest().0,
+            profile.known_genesis_payload_pin().unwrap()
+        );
+        let home = tempfile::tempdir().unwrap();
+        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+        let mut config = Config::for_profile(chain, vec![], None).unwrap();
+        config.validators.clear();
+        let node = FullNode::start(config).await.unwrap();
+        node.shutdown().await.unwrap();
+    });
 }
 impl Fixture {
     async fn new(runtime: runtime::Context, directory: &std::path::Path) -> Self {
@@ -75,15 +113,27 @@ impl Fixture {
             target,
             crate::genesis_digest(&genesis),
         );
-        let config = Config {
-            genesis,
-            threshold_identity: committee.assembler.identity().encode().to_vec(),
-            genesis_payload: head.digest(),
-            storage_dir: directory.to_path_buf(),
-            validators: vec![],
-            peers: vec![],
-            archive_blocks: None,
-        };
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
+        let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+            .trust()
+            .clone();
+        trust.network_id = genesis.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+            trust,
+            validators: vec!["ws://unused.invalid".into()],
+            genesis_json,
+        })
+        .unwrap();
+        let mut config = Config::for_profile(
+            crate::chain_dir::ChainDir::open(directory, &profile, Crash).unwrap(),
+            vec![],
+            None,
+        )
+        .unwrap();
+        config.validators.clear();
         let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(
             runtime.child("producer"),
             utxo_db_config(&runtime, "producer", 4096, 128),
@@ -101,7 +151,7 @@ impl Fixture {
         let height = self.head.height().get() + 1;
         let batch = crate::execution::execute_all(
             hellas_kernel::Context::with_fees(
-                crate::domain::network_id(&self.config.genesis).unwrap(),
+                crate::domain::network_id(self.config.genesis()).unwrap(),
                 hellas_kernel::BlockHeight::new(height),
                 hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
                 domain::KERNEL_FEES,
@@ -115,7 +165,6 @@ impl Fixture {
         .unwrap();
         let owner_root = crate::execution::owner_tree::root(&batch).await.unwrap();
         let executed = batch.merkleize().await.unwrap();
-        let bounds = executed.bounds();
         let block = HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -127,8 +176,11 @@ impl Fixture {
             height,
             executed.root(),
             Target {
-                root: executed.root(),
-                range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
+                root: executed.ops_root(),
+                range: non_empty_range!(
+                    executed.sync_boundary(),
+                    Location::new(executed.bounds().total_size)
+                ),
             },
             vec![],
         )
@@ -143,7 +195,11 @@ impl Fixture {
                 height: block.height().get(),
                 payload: block.digest(),
                 state_root: block.state_root(),
-                finalization: finalization(&self.committee, &block).encode().to_vec(),
+                finalization: crate::finality_proof::encode(
+                    &finalization(&self.committee, &block).encode(),
+                    &[],
+                )
+                .unwrap(),
             },
             block: block.encode().to_vec(),
         }
@@ -204,16 +260,12 @@ fn recovery_finds_the_first_committed_block_before_its_archive_acknowledgment() 
         let block = fixture.next().await;
         let input = input::FinalizedInput::new(archive.clone(), Arc::default(), trust);
         input.accept(&block).await.unwrap();
-        let acknowledgment = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let update = receive.recv().await.expect("archive remained open");
-                if matches!(update, Update::Block(..)) {
-                    break update;
-                }
+        let acknowledgment = loop {
+            let update = receive.recv().await.expect("archive remained open");
+            if matches!(update, Update::Block(..)) {
+                break update;
             }
-        })
-        .await
-        .unwrap();
+        };
         assert_eq!(
             archive
                 .marshal
@@ -257,7 +309,7 @@ fn certified_future_history_suspends_retained_reads_until_ancestry_executes() {
         node.accept_finalized(&tip).await.unwrap();
         assert_eq!(
             node.status(),
-            NodeStatus::CatchingUp {
+            NodeState::CatchingUp {
                 observed: Some(3),
                 executed: 1
             }
@@ -286,31 +338,36 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         apply(&seed, block.clone()).await.unwrap();
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("relay");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("relay"),
+            config.chain.profile(),
+            Crash,
+        )
+        .unwrap();
         config.peers = vec![seed.endpoint_addr()];
         let a = FullNode::start(config).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), a.wait_ready())
+        a.wait_ready().await.unwrap();
+        apply(&seed, block2.clone()).await.unwrap();
+        a.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+            })
             .await
             .unwrap()
+            .running()
             .unwrap();
-        apply(&seed, block2.clone()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while a.status().executed_height() != 2 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("b");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("b"),
+            config.chain.profile(),
+            Crash,
+        )
+        .unwrap();
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
         let b = FullNode::start(config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), b.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = b.wait_ready().await.unwrap();
         let coins = view
             .client()
             .get_coins_by_owner(fixture.allocations[0].0)
@@ -320,28 +377,25 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         assert_eq!(coins.coins.len(), 1);
         assert_eq!(coins.coins[0].1, 5000);
         assert_eq!(coins.snapshot.payload, block2.snapshot.payload);
-        let mut progress = b.finalized();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while *progress.borrow_and_update() < 2 {
-                progress.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
+        b.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+            })
+            .await
+            .unwrap()
+            .running()
+            .unwrap();
         assert_eq!(
             b.view().unwrap().client().get_state_root().await.unwrap(),
             Some(block2.snapshot.state_root)
         );
         assert!(!archived(&b, 1).await);
         let local = b.view().unwrap().client();
-        let historical = tokio::time::timeout(
-            Duration::from_secs(15),
-            local.get_finalized_block(FinalizedBlockQuery::Height(1)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let historical = local
+            .get_finalized_block(FinalizedBlockQuery::Height(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(historical, block);
         // The public read subset does not trigger private recovery fetching.
         use hellas_rpc::{pb::chain as pb, services::chain_sync::ChainSyncHandler as _};
@@ -390,7 +444,7 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
         ));
         assert_eq!(
             node.status(),
-            NodeStatus::CatchingUp {
+            NodeState::CatchingUp {
                 observed: None,
                 executed: 0
             }
@@ -421,6 +475,44 @@ fn corrupt_proofs_cannot_raise_readiness_and_certified_root_failure_halts() {
 }
 
 #[test]
+fn shutdown_wakes_all_readiness_waiters_and_halt_is_terminal() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start(fixture.config).await.unwrap();
+        let shutting_down = node.clone();
+        // Poll both waiters before shutting down; each must wake on the halt.
+        let (first, second, shutdown) = tokio::join!(biased;
+            node.wait_ready(),
+            node.wait_ready(),
+            shutting_down.shutdown(),
+        );
+        shutdown.unwrap();
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(node.0.core.readiness.cancel.is_cancelled());
+        let NodeState::Halted {
+            reason,
+            executed: 0,
+        } = node.status()
+        else {
+            panic!("shutdown must publish the halt");
+        };
+        node.0.core.readiness.advance(Some(1), 1);
+        node.0.core.readiness.halt("later shutdown");
+        assert_eq!(
+            node.status(),
+            NodeState::Halted {
+                reason,
+                executed: 1
+            },
+            "late publication cannot revive a halted node or replace its reason"
+        );
+        assert!(node.wait_ready().await.is_err());
+    });
+}
+
+#[test]
 fn pruned_archive_restarts_with_live_owner_state() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -433,14 +525,8 @@ fn pruned_archive_restarts_with_live_owner_state() {
             last = fixture.next().await;
             apply(&node, last.clone()).await.unwrap();
         }
-        // Marshal's pruning request is processed asynchronously.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while archived(&node, 1).await {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // The public retention floor is installed before execution is published.
+        assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         assert!(
@@ -470,12 +556,6 @@ fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong_genesis = fixture.config.clone();
-        wrong_genesis.genesis_payload = [0xff; 32].into();
-        assert!(matches!(
-            FullNode::start(wrong_genesis).await,
-            Err(Error::Config(_))
-        ));
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         assert!(matches!(
             FullNode::start(fixture.config.clone()).await,
@@ -546,6 +626,8 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
             } else if request.op_count == state.old_count {
                 // Bootstrap must receive a newer live target before any good
                 // operations for the initial target are allowed to complete.
+                // This deliberate busy response forces retry/target advancement;
+                // it does not impose a hang limit on the test.
                 if tokio::time::timeout(
                     Duration::from_millis(200),
                     state.advanced.subscribe().wait_for(|advanced| *advanced),
@@ -620,25 +702,25 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
                 None,
             );
             let (endpoint, serving) = serve_source(server).await;
-            fixture.config.storage_dir = directory.path().join(if corrupt_certificate {
-                "bad-certificate"
-            } else {
-                "bad-block"
-            });
+            fixture.config.chain = crate::chain_dir::ChainDir::open(
+                &directory.path().join(if corrupt_certificate {
+                    "bad-certificate"
+                } else {
+                    "bad-block"
+                }),
+                fixture.config.chain.profile(),
+                Crash,
+            )
+            .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
             let node = FullNode::start(fixture.config.clone()).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(15), async {
-                while node.peer_ids().contains(&endpoint.id()) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
+            // Startup's awaited floor fetch verifies and quarantines this source.
+            assert!(!node.peer_ids().contains(&endpoint.id()));
             assert!(node.view().is_err());
             assert_eq!(node.status().executed_height(), 0);
             assert_eq!(
                 node.status(),
-                NodeStatus::CatchingUp {
+                NodeState::CatchingUp {
                     observed: None,
                     executed: 0
                 }
@@ -669,37 +751,19 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
 #[cfg(feature = "indexer-api")]
 #[test]
 fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state() {
-    use commonware_cryptography::{Hasher as _, Sha256};
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new_in(
             runtime,
             directory.path(),
-            hellas_kernel::NetworkId::new(hellas_genesis::HELLAS_DEVNET_1_ID).unwrap(),
+            hellas_kernel::NetworkId::new("custom-indexed-node").unwrap(),
             5000,
         )
         .await;
         fixture.config.archive_blocks = NonZeroU64::new(1);
-        let json = serde_json::to_vec(&fixture.config.genesis).unwrap();
-        let trust = hellas_genesis::TrustDocument {
-            schema_version: 1,
-            network_id: fixture.config.genesis.network_id.clone(),
-            genesis_sha256: hex::encode(Sha256::hash(&json)),
-            epochs: vec![hellas_genesis::TrustEpoch {
-                epoch: 0,
-                start_height: 0,
-                end_height: None,
-                threshold_identity: hex::encode(&fixture.config.threshold_identity),
-            }],
-        };
-        let node = FullNode::start_indexed(
-            fixture.config.clone(),
-            trust.clone(),
-            json.clone(),
-            "read".into(),
-        )
-        .await
-        .unwrap();
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
+            .await
+            .unwrap();
         let mut last = fixture.next().await;
         apply(&node, last.clone()).await.unwrap();
         for _ in 1..3 {
@@ -721,7 +785,7 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
         assert_eq!(coins.coins.len(), 1);
         assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
-        let node = FullNode::start_indexed(fixture.config.clone(), trust, json, "read".into())
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
             .await
             .unwrap();
         assert!(node.view().is_err());
@@ -795,10 +859,7 @@ fn validator_archive_seeds_execution_over_iroh() {
             .await
             .unwrap();
         let node = FullNode::start(fixture.config).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(20), node.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = node.wait_ready().await.unwrap();
         assert_eq!(
             view.client().get_state_root().await.unwrap(),
             Some(block.snapshot.state_root)
@@ -817,9 +878,7 @@ fn validator_archive_seeds_execution_over_iroh() {
 // its published read view; they never execute or finalize the consumer database.
 async fn apply(node: &FullNode, incoming: FinalizedBlock) -> Result<(), Error> {
     node.accept_finalized(&incoming).await?;
-    tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
-        .await
-        .expect("node execution is bounded")?;
+    node.wait_ready().await?;
     Ok(())
 }
 
@@ -834,6 +893,61 @@ async fn archived(node: &FullNode, height: u64) -> bool {
     .unwrap()
     .block
     .is_some()
+}
+
+#[test]
+fn current_state_root_and_operation_sync_target_survive_node_restart() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start(fixture.config.clone()).await.unwrap();
+        let finalized = fixture.next().await;
+        let block = HellasBlock::decode(finalized.block.as_slice()).unwrap();
+        let target = block.sync_target();
+        assert_ne!(block.state_root(), target.root);
+        {
+            let producer = fixture.database.read().await;
+            assert_eq!(block.state_root(), producer.root());
+        }
+        apply(&node, finalized.clone()).await.unwrap();
+        node.shutdown().await.unwrap();
+        let node = FullNode::start(fixture.config).await.unwrap();
+        node.finalized()
+            .wait_for(|state| {
+                matches!(state, NodeState::Halted { .. })
+                    || state.executed_height() >= block.height().get()
+            })
+            .await
+            .unwrap()
+            .running()
+            .unwrap();
+        assert_eq!(
+            node.status(),
+            NodeState::CatchingUp {
+                observed: None,
+                executed: 1
+            }
+        );
+        // Register first: a fresh observation must wake readiness even though
+        // the restored execution height does not change.
+        let (ready, accepted) = tokio::join!(biased;
+            node.wait_ready(),
+            node.accept_finalized(&finalized),
+        );
+        accepted.unwrap();
+        ready.unwrap();
+        assert_eq!(node.status().executed_height(), block.height().get());
+        assert_eq!(
+            node.view()
+                .unwrap()
+                .client()
+                .get_state_root()
+                .await
+                .unwrap(),
+            Some(block.state_root())
+        );
+        node.shutdown().await.unwrap();
+    });
 }
 
 #[test]
@@ -867,19 +981,18 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
             endpoints.push(endpoint);
         }
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("replica");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("replica"),
+            config.chain.profile(),
+            Crash,
+        )
+        .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
         let starting = tokio::spawn(FullNode::start(config));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
-            .await
-            .unwrap();
+        requested.requested.notified().await;
         let block = fixture.next().await;
         apply(&seed, block.clone()).await.unwrap();
-        let node = tokio::time::timeout(Duration::from_secs(30), starting)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let node = starting.await.unwrap().unwrap();
         assert_eq!(node.status().executed_height(), 2);
         assert_eq!(
             node.view()
@@ -928,28 +1041,25 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
 }
 
 #[test]
-fn provisioned_anchor_and_directory_identity_cannot_be_replaced_by_a_peer() {
+fn provisioned_anchor_ignores_legacy_chain_directory() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong = fixture.config.clone();
-        wrong.genesis_payload = Digest::from([99; 32]);
-        assert!(matches!(
-            FullNode::start(wrong).await,
-            Err(Error::Config(_))
-        ));
+        let legacy = directory.path().join("chain/legacy-network");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old-state"), b"obsolete").unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.shutdown().await.unwrap();
-        let mut wrong = fixture.config;
-        wrong.threshold_identity = consensus_fixture(100)
-            .assembler
-            .identity()
-            .encode()
-            .to_vec();
-        assert!(matches!(
-            FullNode::start(wrong).await,
-            Err(Error::Storage(_))
-        ));
+        assert_eq!(
+            std::fs::read(legacy.join("old-state")).unwrap(),
+            b"obsolete"
+        );
+        assert!(
+            fixture
+                .config
+                .storage_dir()
+                .starts_with(directory.path().join("chains"))
+        );
     });
 }
 
@@ -980,18 +1090,18 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         // the full node's directory. Feed a committee certificate without
         // starting a second consensus network inside this storage-role test.
         tokio::task::spawn_blocking(move || {
-            let _lock = pipeline::lock(&config.storage_dir).unwrap();
+            let _lock = pipeline::lock(&config.storage_dir()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(&config.storage_dir),
+                runtime::Config::new().with_storage_directory(config.storage_dir()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
                 let mut app = crate::Application::new(
                     context.child("app"),
-                    domain::network_id(&config.genesis).unwrap(),
-                    crate::genesis_digest(&config.genesis),
+                    domain::network_id(config.genesis()).unwrap(),
+                    crate::genesis_digest(config.genesis()),
                     signer.participants().iter().min().unwrap().clone(),
-                    genesis_allocations(&config.genesis).unwrap(),
+                    genesis_allocations(config.genesis()).unwrap(),
                     "chain",
                     crate::ApplicationConfig::default(),
                 )
@@ -1000,13 +1110,6 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let mempool = app.mempool();
                 let owner = app.owner_index();
                 let genesis = app.genesis_block();
-                pipeline::pin(
-                    &config.storage_dir,
-                    &config.genesis,
-                    &config.threshold_identity,
-                    genesis.digest(),
-                )
-                .unwrap();
                 let plan = SyncPlan::<_, domain::Scheme, Standard<HellasBlock>>::init(
                     &context.child("startup"),
                     "chain",
@@ -1030,6 +1133,15 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                     .unwrap();
                 let network =
                     replication::Network::new(endpoint.clone(), Trust::Genesis(Arc::new(verifier)));
+                let readiness = Arc::new(Readiness::default());
+                let mut changes = readiness.state.subscribe();
+                app.publication = Some(pipeline::Publication {
+                    archive: indexer.clone(),
+                    retention: None,
+                    readiness,
+                    #[cfg(feature = "indexer-api")]
+                    index: None,
+                });
                 let (execution, mailbox) = pipeline::init(
                     context.child("execution"),
                     app,
@@ -1050,27 +1162,30 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let archive = archive.start_unbuffered(mailbox.clone(), (receiver, resolver));
                 let execution = execution.start();
                 let database = mailbox.subscribe_databases().await;
-                // Database attachment precedes replay of blocks whose execution
-                // was committed before shutdown but not yet acknowledged.
-                let restored = tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let height = pipeline::restore(
-                            &indexer,
-                            &database,
-                            &owner,
-                            startup.into_iter().chain(processed).max(),
-                            &genesis,
-                        )
+                let restore = || {
+                    pipeline::restore(
+                        &indexer,
+                        &database,
+                        &owner,
+                        startup.into_iter().chain(processed).max(),
+                        &genesis,
+                    )
+                };
+                let mut restored = restore().await.unwrap();
+                // An acknowledged checkpoint is already restored; otherwise
+                // await publication of the replay after database attachment.
+                if restored == 0 {
+                    changes
+                        .wait_for(|state| {
+                            matches!(state, NodeState::Halted { .. })
+                                || state.executed_height() >= 1
+                        })
                         .await
+                        .unwrap()
+                        .running()
                         .unwrap();
-                        if height > 0 {
-                            break height;
-                        }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                    restored = restore().await.unwrap();
+                }
                 assert_eq!(restored, 1);
                 assert_eq!(database.read().await.root(), first.snapshot.state_root);
                 let client = LocalLightClient::new(
@@ -1082,7 +1197,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 );
                 assert_eq!(
                     client
-                        .get_coins_by_owner(genesis_allocations(&config.genesis).unwrap()[0].0)
+                        .get_coins_by_owner(genesis_allocations(config.genesis()).unwrap()[0].0)
                         .await
                         .unwrap()
                         .unwrap()
@@ -1099,13 +1214,14 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                             .certificate,
                     ),
                 );
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while owner.cursor().height < 2 {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                changes
+                    .wait_for(|state| {
+                        matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
+                    })
+                    .await
+                    .unwrap()
+                    .running()
+                    .unwrap();
                 assert_eq!(
                     client.get_state_root().await.unwrap(),
                     Some(next.snapshot.state_root)
@@ -1121,10 +1237,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         .unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.accept_finalized(&second).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
-            .await
-            .unwrap()
-            .unwrap();
+        let view = node.wait_ready().await.unwrap();
         assert_eq!(
             view.client().get_state_root().await.unwrap(),
             Some(second.snapshot.state_root)
@@ -1181,27 +1294,24 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         ))
         .await;
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("replica");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("replica"),
+            config.chain.profile(),
+            Crash,
+        )
+        .unwrap();
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
-        tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
-            .await
-            .unwrap();
-        assert!(crate::execution::pipeline::lock(&config.storage_dir).is_err());
+        requested.requested.notified().await;
+        assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
         starting.abort();
         let _ = starting.await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while crate::execution::pipeline::lock(&config.storage_dir).is_err() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        config.peers = vec![seed.endpoint_addr()];
-        let node = tokio::time::timeout(Duration::from_secs(20), FullNode::start(config))
+        let lock = hellas_private::open_lock_beside(&config.storage_dir().join("node")).unwrap();
+        tokio::task::spawn_blocking(move || lock.lock().unwrap())
             .await
-            .unwrap()
             .unwrap();
+        config.peers = vec![seed.endpoint_addr()];
+        let node = FullNode::start(config).await.unwrap();
         assert_eq!(node.status().executed_height(), 1);
         assert_eq!(
             node.view()
@@ -1258,12 +1368,12 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
             let verifier = ConsensusVerifier::new(
                 &target.config.info().unwrap(),
-                crate::genesis_digest(&target.config.genesis),
+                crate::genesis_digest(target.config.genesis()),
             )
             .unwrap();
             let trust = Trust::Genesis(Arc::new(verifier));
@@ -1285,7 +1395,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
                 Err(Error::InvalidBlock(_))
             ));
             assert_eq!(follower.status().executed_height(), 0);
-            assert!(!matches!(follower.status(), NodeStatus::Stopped { .. }));
+            assert!(!matches!(follower.status(), NodeState::Halted { .. }));
             follower.shutdown().await.unwrap();
         }
         serving.abort();
@@ -1295,7 +1405,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
 }
 
 #[test]
-fn genesis_payload_pin_distinguishes_allocations_and_networks() {
+fn genesis_digest_distinguishes_allocations_and_networks() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let source = Fixture::new(runtime.child("source"), &directory.path().join("source")).await;
@@ -1315,10 +1425,88 @@ fn genesis_payload_pin_distinguishes_allocations_and_networks() {
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
-            assert_ne!(source.config.genesis_payload, target.config.genesis_payload);
+            assert_ne!(
+                crate::genesis_digest(source.config.genesis()),
+                crate::genesis_digest(target.config.genesis())
+            );
         }
+    });
+}
+
+#[test]
+fn full_node_derives_h0_from_the_selected_custom_genesis() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let expected = fixture.head.digest();
+        let node = FullNode::start(fixture.config).await.unwrap();
+        assert_eq!(node.genesis_payload(), expected);
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let mut genesis: hellas_genesis::Genesis =
+        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_2_JSON).unwrap();
+    genesis.network_id = "custom-node-rotating-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+        .trust()
+        .clone();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    trust.epochs[0].end_height = Some(2);
+    let mut next = trust.epochs[0].clone();
+    next.epoch = 1;
+    next.start_height = 2;
+    next.end_height = None;
+    trust.epochs.push(next);
+    let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+        trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json,
+    })
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
+    let error = Config::for_profile(chain, vec![], None).unwrap_err();
+    assert!(error.to_string().contains("one open trusted epoch"));
+}
+
+#[test]
+fn one_home_keeps_each_chains_state_across_a_switch_and_back() {
+    run_qmdb(|runtime| async move {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("identity"), b"device identity").unwrap();
+        let mut a =
+            Fixture::new_in(runtime.child("a"), home.path(), domain::TEST_NETWORK, 5000).await;
+        let first = a.next().await;
+        let second = a.next().await;
+        let node = FullNode::start(a.config.clone()).await.unwrap();
+        apply(&node, first).await.unwrap();
+        node.shutdown().await.unwrap();
+
+        // A different genesis under the same home gets its own, empty state.
+        let b = Fixture::new_in(runtime.child("b"), home.path(), domain::TEST_NETWORK, 6000).await;
+        assert_ne!(a.config.storage_dir(), b.config.storage_dir());
+        let node = FullNode::start(b.config.clone()).await.unwrap();
+        assert_eq!(node.status().executed_height(), 0);
+        assert!(apply(&node, second.clone()).await.is_err());
+        node.shutdown().await.unwrap();
+
+        // Back on A, its executed state is intact: the next block extends it.
+        let node = FullNode::start(a.config.clone()).await.unwrap();
+        apply(&node, second).await.unwrap();
+        assert_eq!(node.status().executed_height(), 2);
+        node.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read(home.path().join("identity")).unwrap(),
+            b"device identity"
+        );
     });
 }

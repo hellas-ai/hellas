@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::common_node::{NoBackend, WorkAdmin};
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_kernel::{EdgeValues, Fees};
+use hellas_private::StoreLocation;
 use std::sync::Arc;
 use {
     crate::model::grant::admin::WorkControlCommand,
@@ -123,14 +124,9 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
     drop(admin);
     drop(service);
     drop(node);
-    let reopened = NodeStore::open(
-        dir.path(),
-        network(),
-        None,
-        UnixMillis(1000),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(1000))
+        .await
+        .unwrap();
     assert_eq!(reopened.state().paid_policy(), Some(&current));
 }

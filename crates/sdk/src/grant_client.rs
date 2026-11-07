@@ -13,10 +13,11 @@ use hellas_authority::model::grant::records::{
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     InvocationPolicy, PreparedInvocation, output::StreamVerifier,
 };
-use hellas_rpc::{ContentId, ContentRef, protocol::content::encode_reference};
+use hellas_rpc::{ContentRef, protocol::content::encode_reference};
 use hellas_rpc::{
     OutputEventEnvelope, ProviderEnrollmentBundle,
     pb::work::{
@@ -31,7 +32,6 @@ use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
 use iroh::{Endpoint, EndpointId};
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -98,6 +98,10 @@ pub enum GrantClientError {
     Content(#[from] hellas_store::content::Error),
     #[error("grant operation timed out; proposal recovery may be required")]
     Timeout,
+    /// No proposal was sent, or a fresh proposal was conclusively refused and
+    /// that refusal is durable. Never produced by recovery or result delivery.
+    #[error("grant admission deadline expired before acceptance")]
+    AdmissionExpired,
     #[error("grant refused: {code:?} (current revision {current_revision})")]
     Refused {
         code: GrantRefusalCode,
@@ -229,7 +233,7 @@ impl GrantTarget {
         let transport =
             self.resolve_transport(transport, trust, application, &Arc::new(signer.clone()))?;
         let link = transport.connect(timeout, timeout).await?;
-        let standing = GrantSession::query_standing(self, client, timeout, &link).await?;
+        let (standing, _) = GrantSession::query_standing(self, client, timeout, &link).await?;
         UnpinnedOffer::decode(&standing.offer.encode()?, standing.now)
             .and_then(|offer| offer.pin(trust))
             .map_err(GrantClientError::from)
@@ -243,7 +247,7 @@ pub struct GrantSessionOptions {
     /// The node key the application credential is bound to; it signs every job.
     pub signer: Arc<ProducerSigningKey>,
     pub application: Arc<ClientProfile>,
-    pub journal_root: PathBuf,
+    pub journal_root: StoreLocation,
     /// Bounds connection/control calls and terminal-delivery grace.
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
@@ -370,6 +374,44 @@ impl SessionTransport {
         .map_err(|_| GrantClientError::Timeout)?
     }
 }
+/// Resolve local input bytes and their closure before obtaining admission time.
+struct PreparedUpload {
+    bytes: Vec<u8>,
+    reference: ContentRef,
+    manifest: Vec<u8>,
+    root: Option<Vec<u8>>,
+    objects: Vec<ContentRef>,
+}
+impl PreparedUpload {
+    async fn new(input: &PreparedInvocation, content: &(LocalStore, Scope)) -> Result<Self> {
+        let bytes = input.canonical_bytes()?;
+        let reference = ContentRef::for_bytes(&bytes);
+        let manifest = input.manifest()?;
+        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
+        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+            None
+        } else {
+            Some(
+                hellas_channel::content::root(&content.0, &content.1, manifest.root())
+                    .await?
+                    .to_vec(),
+            )
+        };
+        let objects = hellas_channel::job::content_closure(
+            &policy,
+            &manifest,
+            root.as_deref().unwrap_or_default(),
+            reference,
+        )?;
+        Ok(Self {
+            bytes,
+            reference,
+            manifest: manifest.canonical_bytes(),
+            root,
+            objects,
+        })
+    }
+}
 enum Link {
     /// The host closes the connection, and cancels its work, when the
     /// authenticated session expires.
@@ -410,26 +452,10 @@ impl Link {
         &self,
         request: AcceptWorkRequest,
         work: Digest,
-        input: Option<(&PreparedInvocation, &(LocalStore, Scope))>,
+        input: Option<(&PreparedUpload, &(LocalStore, Scope))>,
         signer: &ProducerSigningKey,
     ) -> Result<AcceptWorkResponse> {
         if let Some((input, content)) = input {
-            let bytes = input.canonical_bytes()?;
-            let reference = ContentRef::for_bytes(&bytes);
-            let manifest = input.manifest()?;
-            let policy =
-                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
-            let root = if policy.content_closure(&manifest, &[]).is_ok() {
-                None
-            } else {
-                Some(hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?)
-            };
-            let objects = hellas_channel::job::content_closure(
-                &policy,
-                &manifest,
-                root.as_deref().unwrap_or_default(),
-                reference,
-            )?;
             let (exporter, transport) = match self {
                 Self::Remote(transport, _) => (
                     transport
@@ -442,8 +468,8 @@ impl Link {
             };
             let mut opening = hellas_rpc::pb::content::WorkOpening {
                 signed_opening: prost::Message::encode_to_vec(&request),
-                manifest: manifest.canonical_bytes(),
-                root: root.as_ref().map(|bytes| {
+                manifest: input.manifest.clone(),
+                root: input.root.as_ref().map(|bytes| {
                     let object = ContentRef::for_bytes(bytes);
                     hellas_rpc::pb::content::ContentRef {
                         id: object.id().as_bytes().to_vec(),
@@ -462,13 +488,14 @@ impl Link {
                     channel: authorization.channel_id.0,
                     id: work,
                 },
-                objects.clone(),
+                input.objects.clone(),
                 0,
             );
-            let first = root
+            let first = input
+                .root
                 .as_ref()
                 .map(|bytes| ContentRef::for_bytes(bytes))
-                .unwrap_or(reference);
+                .unwrap_or(input.reference);
             // Both native and remote use the same RemoteStore transfer helper.
             macro_rules! transfer {
                 ($transport:expr) => {{
@@ -477,12 +504,16 @@ impl Link {
                             .with_opening(opening);
                     let transferred: std::result::Result<(), hellas_store::content::Error> =
                         async {
-                            for object in std::iter::once(first)
-                                .chain(objects.into_iter().filter(|object| *object != first))
-                            {
-                                let reader = if object == reference {
+                            for object in std::iter::once(first).chain(
+                                input
+                                    .objects
+                                    .iter()
+                                    .copied()
+                                    .filter(|object| *object != first),
+                            ) {
+                                let reader = if object == input.reference {
                                     Some(hellas_store::content::VerifiedReader::Memory(
-                                        std::io::Cursor::new(bytes.clone().into()),
+                                        std::io::Cursor::new(input.bytes.clone().into()),
                                     ))
                                 } else {
                                     content.0.open_verified(&content.1, object, None).await?
@@ -622,11 +653,13 @@ impl GrantSession {
         let link = transport
             .connect(options.control_timeout, options.control_timeout)
             .await?;
-        let standing =
+        let (standing, observed_at) =
             Self::query_standing(&target, client, options.control_timeout, &link).await?;
         let offer = standing.offer;
         let channel = offer.offer().channel(client);
-        let path = options.journal_root.join(hex::encode(channel.0.as_bytes()));
+        let path = options
+            .journal_root
+            .child(hex::encode(channel.0.as_bytes()));
         let store = GrantClientStore::open(
             &path,
             target.network,
@@ -638,7 +671,6 @@ impl GrantSession {
                 client,
             },
             standing.now,
-            Default::default(),
         )
         .await?;
         Ok(Self {
@@ -649,7 +681,7 @@ impl GrantSession {
             store,
             observed: standing.now,
             standing_now: standing.now,
-            observed_at: Instant::now(),
+            observed_at,
             pending_body: None,
         })
     }
@@ -680,7 +712,7 @@ impl GrantSession {
         client: ChannelClient,
         timeout: Duration,
         link: &Link,
-    ) -> Result<Standing> {
+    ) -> Result<(Standing, Instant)> {
         let locator = StandingLocator {
             provider: target.provider.content_id(),
             grant: target.grant,
@@ -694,6 +726,7 @@ impl GrantSession {
         let response = tokio::time::timeout(timeout, link.standing(request))
             .await
             .map_err(|_| GrantClientError::Timeout)??;
+        let observed_at = Instant::now();
         let bytes = match response.outcome {
             Some(get_standing_response::Outcome::Standing(bytes)) => bytes,
             Some(get_standing_response::Outcome::Refused(refusal)) => {
@@ -713,15 +746,18 @@ impl GrantSession {
         {
             return Err(GrantError::Audience.into());
         }
-        Ok(standing)
+        Ok((standing, observed_at))
     }
     pub async fn refresh(&mut self) -> Result<Standing> {
         let link = self.link().await?;
-        let standing = Self::query_standing(
+        self.refresh_on(&link).await
+    }
+    async fn refresh_on(&mut self, link: &Link) -> Result<Standing> {
+        let (standing, observed_at) = Self::query_standing(
             &self.target,
             self.store.channel().client,
             self.options.control_timeout,
-            &link,
+            link,
         )
         .await?;
         if standing.offer.offer().channel(self.store.channel().client) != self.store.channel().id {
@@ -732,7 +768,7 @@ impl GrantSession {
         }
         self.observed = standing.now.max(self.store.now());
         self.standing_now = standing.now;
-        self.observed_at = Instant::now();
+        self.observed_at = observed_at;
         self.offer = standing.offer.clone();
         self.store.tick(self.now()).await?;
         Ok(standing)
@@ -760,7 +796,13 @@ impl GrantSession {
             .pending_body
             .as_ref()
             .filter(|(work, _, _)| *work == id)
-            .map(|(_, body, content)| (body.clone(), content.clone()));
+            .cloned();
+        let prepared = match prepared {
+            Some((_, body, content)) => {
+                Some((PreparedUpload::new(&body, &content).await?, content))
+            }
+            None => None,
+        };
         let probe = prepared.is_none();
         if probe {
             self.refresh().await?;
@@ -895,7 +937,7 @@ impl GrantSession {
         .await
     }
 
-    /// The gateway has just refreshed standing and prepared this exact resource.
+    /// Run the gateway's prepared resource with fresh admission standing.
     pub(crate) async fn run_current(
         &mut self,
         resource: hellas_auth::authority::ResourceId,
@@ -1121,9 +1163,25 @@ impl GrantSession {
         if input.request.assurance != self.options.target.trust().required_assurance {
             return Err(GrantProtocolError::Assurance.into());
         }
-        if matches!(selection, GrantSelection::Name(_)) {
-            self.refresh().await?;
-        }
+        let channel = self.store.channel().id;
+        let prepared = PreparedUpload::new(input, content).await?;
+        let prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(
+            self.target.network,
+            channel.0,
+            input,
+        )?;
+        let request_commitment = input.request.commitment()?;
+        let grace = self.options.control_timeout;
+        let link = self
+            .transport
+            .connect(
+                self.options.control_timeout,
+                Duration::from_millis(self.offer.offer().grant.max_job_millis.get()) + grace,
+            )
+            .await?;
+        // Preparation and connection setup must not spend an old standing's
+        // admission window. Its clock includes every wait after response arrival.
+        self.refresh_on(&link).await?;
         let policy = self
             .offer
             .offer()
@@ -1157,14 +1215,6 @@ impl GrantSession {
             .0
             .checked_add(self.offer.offer().grant.max_job_millis.get())
             .ok_or(GrantError::Malformed)?;
-        let grace = self.options.control_timeout;
-        let link = self
-            .transport
-            .connect(
-                self.options.control_timeout,
-                Duration::from_millis(terminal.saturating_sub(now.0)) + grace,
-            )
-            .await?;
         // Work must end, and report its terminal state, before the session
         // that delivers it expires; the host would cancel it at that instant.
         let terminal = link.expires().map_or(terminal, |expires| {
@@ -1176,14 +1226,13 @@ impl GrantSession {
             terminal.min(now.0.saturating_add(carried))
         });
         let span = terminal.saturating_sub(now.0);
-        if span == 0 {
-            return Err(GrantError::Expired.into());
+        // Integer milliseconds need one tick for admission and one for execution.
+        if span < 2 {
+            return Err(GrantClientError::AdmissionExpired);
         }
         let finish_by = tokio::time::Instant::now()
             + Duration::from_millis(span)
             + self.options.control_timeout;
-        let channel = self.store.channel().id;
-        let prepared = input.canonical_bytes()?;
         let a = GrantJobAuthorizationV1 {
             channel_id: channel,
             generation: self.store.channel().generation,
@@ -1197,15 +1246,11 @@ impl GrantSession {
                 channel.0,
                 &policy.invocation_policy,
             )?,
-            input_content: hellas_rpc::ContentRef::for_bytes(&prepared),
-            prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
-                self.target.network,
-                channel.0,
-                input,
-            )?,
+            input_content: prepared.reference,
+            prepared_input_digest,
             proposal_nonce: self.store.next_nonce()?,
             acceptance_deadline_ms: UnixMillis(now.0 + (span / 2).min(30_000)),
-            request_commitment: input.request.commitment()?,
+            request_commitment,
             environment_commitment: input.request.execution_environment,
             terminal_deadline_ms: UnixMillis(terminal),
             delivery_deadline_ms: UnixMillis(
@@ -1232,18 +1277,34 @@ impl GrantSession {
             route: Some(WorkRoute::grant(channel.0)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: encode_reference(ContentRef::new(
-                ContentId::hash(&prepared),
-                prepared.len() as u64,
-            )),
+            prepared_input: encode_reference(prepared.reference),
         };
         let response = tokio::time::timeout(
             self.options.control_timeout,
-            link.accept(request, id, Some((input, content)), &self.options.signer),
+            link.accept(
+                request,
+                id,
+                Some((&prepared, content)),
+                &self.options.signer,
+            ),
         )
         .await
         .map_err(|_| GrantClientError::Timeout)??;
-        self.apply_acceptance(id, response, false, tracker).await?;
+        if let Err(error) = self.apply_acceptance(id, response, false, tracker).await {
+            // Only this first admission can authorize a replacement. Recovery
+            // may concern accepted work whose ACK was lost; delivery certainly does.
+            if matches!(
+                error,
+                GrantClientError::Refused {
+                    code: GrantRefusalCode::Expired,
+                    ..
+                }
+            ) && self.store.book().pending_proposal().is_none()
+            {
+                return Err(GrantClientError::AdmissionExpired);
+            }
+            return Err(error);
+        }
         let delivery = StreamResultRequest {
             route: Some(WorkRoute::grant(channel.0)),
             work_id: id.as_bytes().to_vec(),
@@ -1261,11 +1322,12 @@ impl GrantSession {
             Ok(())
         };
         let drained = if let SessionTransport::Local { service, .. } = &self.transport {
-            service.drain().await.map_err(GrantClientError::from)
+            service.shutdown().await.map_err(GrantClientError::from)
         } else {
             Ok(())
         };
         self.transport = SessionTransport::Closed;
+        self.store.close().await;
         drained.and(recovered)
     }
 }

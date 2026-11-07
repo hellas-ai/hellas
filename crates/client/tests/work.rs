@@ -257,7 +257,7 @@ async fn a_retained_model_proposal_reuploads_its_share_after_upload_connection_l
 #[cfg(feature = "models")]
 async fn model_job_restart(provider_held: bool) {
     tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        hellas_channel::test_support::HANG_GUARD,
         model_job_restart_inner(provider_held),
     )
     .await
@@ -317,19 +317,19 @@ async fn model_job_restart_inner(provider_held: bool) {
         "the client deliberately does not hold the provider's weights"
     );
 
+    let location = hellas_private::StoreLocation::for_test(provider_root.path());
     let weights_store = DiskStore::open(
-        provider_root.path().join("content"),
+        location.child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     let mut provider_store = ChannelStore::open(
-        provider_root.path(),
+        &location,
         ready.channel().clone(),
         settlement(),
         Role::Provider,
@@ -626,18 +626,17 @@ async fn model_job_restart_inner(provider_held: bool) {
         );
     }
     let weights_store = DiskStore::open(
-        provider_root.path().join("content"),
+        location.child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     let mut provider_store = ChannelStore::open(
-        provider_root.path(),
+        &location,
         ready.channel().clone(),
         settlement(),
         Role::Provider,

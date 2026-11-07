@@ -910,13 +910,12 @@ async fn memory() {
 async fn disk() {
     let root = tempfile::tempdir().unwrap();
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -931,13 +930,12 @@ async fn disk() {
 async fn rpc_disk() {
     let root = tempfile::tempdir().unwrap();
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

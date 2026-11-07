@@ -594,13 +594,12 @@ async fn revoked_owner_cannot_publish_an_acquisition_that_finishes_after_revocat
     peers.connection(server.addr()).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     let store = DiskStore::open(
-        directory.path().into(),
+        hellas_private::StoreLocation::for_test(directory.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap()

@@ -26,7 +26,6 @@ pub async fn recover_funding_intent(
     owner
         .recover_funding_intent(
             &chain,
-            args.config.chain.network,
             args.provider.node,
             reservation,
             crate::client_owner::FundingControls {
@@ -60,8 +59,8 @@ async fn recover_funding_channels_inner(
     if intents.is_empty() {
         return Ok(Vec::new());
     }
-    let network = args.config.chain.network;
-    let found = hellas_channel::work_store::discover_setups(&args.journal_root, network).await?;
+    let network = args.config.network();
+    let found = hellas_channel::work_store::discover_setups(&args.journal_root(), network).await?;
     if !found.unidentified.is_empty() {
         return Err(PaidClientError::MissingState("unidentified funding setup"));
     }
@@ -70,15 +69,15 @@ async fn recover_funding_channels_inner(
     let mut used = std::collections::BTreeSet::new();
     for setup in found.setups.into_iter().filter(|s| s.role == Role::Client) {
         let store = SetupStore::open(
-            &args.journal_root,
+            &args.journal_root(),
             network,
             setup.bond_edge,
             Role::Client,
             &verifier,
-            args.content.durability(),
         )
         .await?;
-        let Some((_, signed)) = store.state().offer() else {
+        let store = store.into_state().await;
+        let Some((_, signed)) = store.offer() else {
             continue;
         };
         signed.check()?;
@@ -106,10 +105,10 @@ async fn recover_funding_channels_inner(
             return Err(PaidClientError::InputMismatch("archived funding amount"));
         }
         // Incomplete setups remain reserved until they produce a channel.
-        let Some(descriptor) = store.state().close_descriptor() else {
+        let Some(descriptor) = store.close_descriptor() else {
             continue;
         };
-        if store.state().origin().is_none() {
+        if store.origin().is_none() {
             continue;
         }
         let channel = descriptor.channel();

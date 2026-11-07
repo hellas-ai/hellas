@@ -1,6 +1,7 @@
 use super::*;
 use hellas_authority::model::grant::records::decode_enrollment;
 use hellas_channel::test_support::actors::{FRIEND, ROOT};
+use hellas_private::StoreLocation;
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -74,14 +75,9 @@ impl OfferHost {
         let exported = provider.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider_enrollment = decode_enrollment(&exported.stdout).unwrap();
+        let location = StoreLocation::for_test(&provider.home);
         let (store, app_secret) = common_node::bootstrap_node_with_credential(
-            &root
-                .join("grants")
-                .join(format!(
-                    "p256-{}",
-                    hex::encode(provider.principal().as_bytes())
-                ))
-                .join("provider"),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(&location),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
@@ -142,12 +138,14 @@ impl OfferHost {
         .await
         .unwrap();
         drop(coordinator);
-        let provider_profile = profile(root, "control", authority, root_grant, &app_secret);
-        let client_profile = profile(root, "reader", authority, reader_grant, &client_secret);
-        let socket = root.join("control.sock");
+        let control = provider.home.join("provider");
+        std::fs::create_dir_all(&control).unwrap();
+        let provider_profile = profile(&control, "control", authority, root_grant, &app_secret);
+        let client_profile = profile(&control, "reader", authority, reader_grant, &client_secret);
+        let socket = control.join("control.sock");
         let fetch = root.join("fetch.json");
         let resources = root.join("resources.json");
-        let (control_certificate, control_private_key) = control_tls(root);
+        let (_control_certificate, _control_private_key) = control_tls(&control);
         let secret = root.join("account.json");
         hellas_private::write_atomically(&secret, ".new", br#"{"access_token":"fixture-key"}"#)
             .unwrap();
@@ -156,7 +154,7 @@ impl OfferHost {
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
         }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
+        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
         let mut node = provider.spawn(
             &[
@@ -328,8 +326,6 @@ impl OfferHost {
                 "0",
                 "--gateway-profile",
                 string(&profile),
-                "--archive-dir",
-                string(&self.root().join("archive")),
                 "--zdr",
             ],
             "gateway.log",
@@ -505,7 +501,7 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let mut stream = response.bytes_stream();
-    let first = tokio::time::timeout(hellas_authority::test_support::WAIT, stream.next())
+    let first = tokio::time::timeout(hellas_authority::test_support::HANG_GUARD, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -632,7 +628,7 @@ async fn metrics_scrape_observes_gateway_and_serve_work() {
             b"hellas.gateway.http.requests".as_slice(),
             b"hellas.execution.executions_completed".as_slice(),
         ];
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !names.is_empty() {
                 let body = exports.recv().await.unwrap();
                 names.retain(|name| !body.windows(name.len()).any(|window| window == *name));
@@ -677,8 +673,9 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     };
     let journal = root.join("controlled-authority");
     let root_grant = GrantId([0; 16]);
+    let location = StoreLocation::for_test(&journal);
     let (store, admin_secret) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
@@ -690,7 +687,6 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         ),
         None,
         now,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -947,8 +943,9 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         ])
         .await;
     let secret = hellas_sdk::node_control::profile::read_credential(&credential_file).unwrap();
+    let location = StoreLocation::for_test(&host.provider.home);
     let administrator_profile = profile(
-        root,
+        &hellas_sdk::grant_config::GrantConfig::provider_dir(&location),
         "sharing-admin-control",
         authority,
         authorization,
@@ -970,7 +967,11 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         !own.status.success(),
         "an execution-only ceiling must not expose the administrative assignment"
     );
-    assert!(String::from_utf8_lossy(&own.stderr).contains("authorization failed"));
+    assert!(
+        String::from_utf8_lossy(&own.stderr).contains("authorization failed"),
+        "{}",
+        String::from_utf8_lossy(&own.stderr)
+    );
     let query = request_file(root, &auth::InspectionQuery::Grants { after: None });
     let visible: auth::AuthorityInspection = serde_json::from_str(
         &administrator
@@ -1504,8 +1505,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             "0",
             "--gateway-profile",
             string(&gateway_profile),
-            "--archive-dir",
-            string(&root.join("bundle-archive")),
             "--zdr",
         ],
         "bundle-gateway.log",
@@ -1655,8 +1654,6 @@ async fn pool_gateway_opens_two_independent_providers() {
             "0",
             "--gateway-profile",
             string(&profile),
-            "--archive-dir",
-            string(&root.join("two-provider-archive")),
             "--zdr",
         ],
         "two-provider-gateway.log",

@@ -28,13 +28,12 @@ async fn open(
     capacity: Option<u64>,
 ) -> DiskStore {
     DiskStore::open(
-        root,
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
         lower,
         mode,
         capacity,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap()
@@ -237,13 +236,12 @@ async fn require_uses_only_explicit_records_until_reload() {
     let upper = root.path().join("upper");
     assert!(
         DiskStore::open(
-            upper.clone(),
+            hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
             vec![lower.clone()],
             IndexMode::Require,
             None,
             Reservations::ram(32 << 20),
             false,
-            Default::default(),
         )
         .await
         .is_err()

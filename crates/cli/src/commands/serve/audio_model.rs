@@ -10,6 +10,7 @@ use hellas_authority::model::grant::{
     records::GrantPolicy,
 };
 use hellas_client::model::{ModelPackage, ModelRequest};
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{Admission, ComputePrograms, InvocationPolicy, Limits};
 use hellas_sdk::grant_config::GrantConfig;
 use std::{
@@ -18,12 +19,12 @@ use std::{
 };
 
 /// Enforce require mode before model opening can hash its weight file.
-pub fn precheck(content: Option<&Path>, model: &Path) -> Result<()> {
+pub fn precheck(content: Option<&Path>, model: &Path, home: &StoreLocation) -> Result<()> {
     let loaded =
         crate::content_configuration::ContentConfiguration::load(content.map(Into::into), None)?;
     if loaded.config().index == hellas_store::content::IndexMode::Require {
         let records = hellas_store::fastresume::Records::default();
-        let _ = records.load(&loaded.config().upper()?.join("fastresume.bin"));
+        let _ = records.load(&loaded.config().upper(home).join("fastresume.bin"));
         let metadata = std::fs::metadata(model.join(hellas_client::model::whisper::WEIGHTS_FILE))?;
         anyhow::ensure!(
             metadata.is_file() && records.get(&metadata).is_some(),
@@ -33,7 +34,10 @@ pub fn precheck(content: Option<&Path>, model: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn configure(model: &Path, root: &Path) -> Result<(GrantConfig, hellas_rpc::ContentRef)> {
+pub async fn configure(
+    model: &Path,
+    root: &StoreLocation,
+) -> Result<(GrantConfig, hellas_rpc::ContentRef)> {
     let name = model
         .file_name()
         .and_then(|name| name.to_str())
@@ -117,6 +121,7 @@ mod tests {
     async fn require_rejects_unknown_or_replaced_audio_weights_before_model_opening() {
         use hellas_store::content::{IndexMode, Reservations};
         let root = tempfile::tempdir().unwrap();
+        let home = StoreLocation::for_test(root.path());
         let model = root.path().join("model");
         std::fs::create_dir(&model).unwrap();
         let weights = model.join(hellas_client::model::whisper::WEIGHTS_FILE);
@@ -127,7 +132,7 @@ mod tests {
             "[content]\nupper = 'upper'\nlower = ['model']\nindex = 'require'\n",
         )
         .unwrap();
-        let error = precheck(Some(&path), &model).unwrap_err();
+        let error = precheck(Some(&path), &model, &home).unwrap_err();
         assert!(error.to_string().contains("unchanged index record"));
         // Preparing the index is an explicit owner operation. Startup itself
         // only reads the identity record, before any model metadata or hasher.
@@ -138,18 +143,18 @@ mod tests {
         config.index = IndexMode::Resume;
         let store = config
             .open(
+                &home,
                 Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
                 false,
-                Default::default(),
             )
             .await
             .unwrap();
         store.close().await;
-        precheck(Some(&path), &model).unwrap();
+        precheck(Some(&path), &model, &home).unwrap();
         let replacement = model.join("replacement");
         std::fs::write(&replacement, b"replaced weights").unwrap();
         std::fs::rename(replacement, weights).unwrap();
-        let error = precheck(Some(&path), &model).unwrap_err();
+        let error = precheck(Some(&path), &model, &home).unwrap_err();
         assert!(error.to_string().contains("unchanged index record"));
     }
 }

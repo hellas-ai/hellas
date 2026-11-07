@@ -22,6 +22,7 @@ use hellas_channel::work_store::journal::{
 };
 use hellas_channel::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
@@ -40,25 +41,37 @@ const DUTY_FRAMES: u64 = 2 * MAX_OPEN_JOBS as u64 + 1;
 /// Both profiles deliberately keep bodies outside this store.
 pub struct NodeStore {
     clock: super::clock::ClockBound,
-    _identity_lock: Option<bootstrap::IdentityLock>,
     journal: Journal,
+    _identity_lock: Option<bootstrap::IdentityLock>,
     pub(super) state: State,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
     pub(super) deliveries: Vec<super::delivery::DeliveryEntry>,
 }
 impl NodeStore {
+    /// Release the database before returning identity ownership to another opener.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+        self._identity_lock.take();
+    }
+
+    /// Read a replayed snapshot without retaining database ownership.
+    pub async fn into_state(mut self) -> State {
+        self.close().await;
+        self.state
+    }
+
     pub async fn open(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
-        durability: hellas_private::Durability,
     ) -> Result<Self, NodeStoreError> {
-        let mut store = Self::open_initialized(directory, network, durability).await?;
+        let mut store = Self::open_initialized(directory, network).await?;
         if provider
             .as_ref()
             .is_some_and(|expected| store.state.provider.as_ref() != Some(expected))
         {
+            store.close().await;
             return Err(GrantError::Audience.into());
         }
         let now = now.max(store.state.now());
@@ -105,11 +118,6 @@ impl NodeStore {
         let now = now.max(self.state.now());
         self.clock.check(now)?;
         Ok(now)
-    }
-    pub(crate) async fn close(&mut self) {
-        self.journal.close().await;
-        // Late service handles must retain neither SQLite nor identity ownership.
-        self._identity_lock.take();
     }
     pub(crate) fn check_authority(&self) -> Result<(), NodeStoreError> {
         self.journal.check_authority()?;

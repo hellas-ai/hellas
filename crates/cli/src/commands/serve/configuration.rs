@@ -1,5 +1,6 @@
 //! In-process configuration on the normal host's serialized provider lifecycle.
 use super::*;
+use hellas_private::StoreLocation;
 use hellas_sdk::node_control::{configuration::*, host::*};
 use std::path::Path;
 
@@ -8,7 +9,9 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
     grants: Option<hellas_sdk::grant_config::GrantConfig>,
     path: Option<PathBuf>,
     transport: Option<iroh::Endpoint>,
+    home: &StoreLocation,
 ) -> CliResult<HostHandle> {
+    let home = home.clone();
     let path = path.map(std::path::absolute).transpose()?;
     let control = prepare_provider(&mut provider, grants).await?;
     let transport = match (transport, &control) {
@@ -27,7 +30,12 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
         clean_unused_keys(path)?;
     }
     let prepare = path.clone().map(|path| -> ProviderPrepare {
-        Arc::new(move |update| Ok(Box::new(StagedConfiguration::prepare(&path, update)?)))
+        let home = home.clone();
+        Arc::new(move |update| {
+            Ok(Box::new(StagedConfiguration::prepare(
+                &path, update, &home,
+            )?))
+        })
     });
     let content = provider.content.clone();
     let factory = ProviderFactory {
@@ -35,10 +43,11 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
         start: Arc::new(move |control| {
             let mut provider = provider.clone();
             let path = path.clone();
+            let home = home.clone();
             Box::pin(async move {
                 let metadata = match &path {
                     Some(path) => {
-                        provider.executor.fetch_routes = load_fetch_config(path)?;
+                        provider.executor.fetch_routes = load_fetch_config(path, &home)?;
                         Some(metadata(&read(path)?))
                     }
                     None => None,
@@ -98,7 +107,7 @@ struct StagedConfiguration {
     retain_keys: bool,
 }
 impl StagedConfiguration {
-    fn prepare(path: &Path, update: ProviderUpdate) -> CliResult<Self> {
+    fn prepare(path: &Path, update: ProviderUpdate, home: &StoreLocation) -> CliResult<Self> {
         use std::io::Write as _;
         let parent = path.parent().context("configuration needs a parent")?;
         anyhow::ensure!(
@@ -115,7 +124,7 @@ impl StagedConfiguration {
             committed: false,
             retain_keys: false,
         };
-        let bytes = prepare_update(path, &prepared.old, update)?;
+        let bytes = prepare_update(path, &prepared.old, update, home)?;
         prepared.metadata = metadata(&serde_json::from_slice(&bytes)?);
         let mut stage = hellas_private::private_tempfile(parent, ".configure-", ".json")?;
         stage.write_all(&bytes)?;
@@ -158,7 +167,12 @@ impl Drop for StagedConfiguration {
         }
     }
 }
-fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<Vec<u8>> {
+fn prepare_update(
+    path: &Path,
+    old: &[u8],
+    update: ProviderUpdate,
+    home: &StoreLocation,
+) -> CliResult<Vec<u8>> {
     let mut file: FetchConfigFile = serde_json::from_slice(old)?;
     anyhow::ensure!(
         file.revision == update.expected_revision,
@@ -295,7 +309,7 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
         route
             .destination
             .clone()
-            .into_entry(route.capabilities.clone().into_policy()?)?;
+            .into_entry(route.capabilities.clone().into_policy()?, home)?;
     }
     file.revision = file
         .revision
@@ -386,8 +400,10 @@ fn check_key_directory(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
     fn apply(path: &Path, update: ProviderUpdate) -> CliResult<()> {
-        let mut prepared = StagedConfiguration::prepare(path, update)?;
+        let location = StoreLocation::for_test(path.parent().unwrap());
+        let mut prepared = StagedConfiguration::prepare(path, update, &location)?;
         prepared.commit().map_err(anyhow::Error::from_boxed)?;
         Ok(())
     }
@@ -554,8 +570,10 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&a).unwrap();
-        load_fetch_config(&b).unwrap();
+        let location = StoreLocation::for_test(a.parent().unwrap());
+        load_fetch_config(&a, &location).unwrap();
+        let other_location = StoreLocation::for_test(b.parent().unwrap());
+        load_fetch_config(&b, &other_location).unwrap();
     }
     #[test]
     fn staged_replacement_retains_old_keys_until_commit_succeeds_or_rolls_back() {
@@ -579,12 +597,14 @@ mod tests {
         )
         .unwrap();
         let original = std::fs::read(&path).unwrap();
+        let location = StoreLocation::for_test(path.parent().unwrap());
         let mut prepared = StagedConfiguration::prepare(
             &path,
             ProviderUpdate {
                 expected_revision: 2,
                 change: Some(UpstreamChange::ReplaceKey(key("new-key"))),
             },
+            &location,
         )
         .unwrap();
         assert_eq!(
@@ -615,7 +635,7 @@ mod tests {
                 .count(),
             1
         );
-        load_fetch_config(&path).unwrap();
+        load_fetch_config(&path, &location).unwrap();
     }
 
     #[cfg(unix)]

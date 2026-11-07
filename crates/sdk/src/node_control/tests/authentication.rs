@@ -1,4 +1,5 @@
 use super::*;
+use hellas_authority::test_support::HANG_GUARD;
 
 async fn hello(connection: &Connection) -> (SendStream, RecvStream, SessionChallenge) {
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
@@ -68,7 +69,7 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
     let (_send, mut recv, _) = hello(&cc).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(hellas_authority::test_support::WAIT, recv.read(&mut [0]))
+    tokio::time::timeout(HANG_GUARD, recv.read(&mut [0]))
         .await
         .unwrap()
         .unwrap_err();

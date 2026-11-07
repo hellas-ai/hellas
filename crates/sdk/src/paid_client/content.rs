@@ -5,14 +5,19 @@ use hellas_channel::work_store::{
     journal::{Journal, JournalKind},
 };
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_store::content::DiskStore;
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 /// Restore one configured client journal root using canonical setup/channel
 /// replay. This performs no chain read and does not open admission. The host
 /// must call it for every root sharing the upper before `finish_recovery`.
 /// Ordinary online setup/origin/chain checks still gate admission and execution.
-pub async fn recover_content(root: &Path, network: NetworkId, content: &DiskStore) -> Result<()> {
+pub async fn recover_content(
+    root: &StoreLocation,
+    network: NetworkId,
+    content: &DiskStore,
+) -> Result<()> {
     let found = hellas_channel::work_store::discover_setups(root, network).await?;
     if !found.unidentified.is_empty() {
         return Err(PaidClientError::MissingState("unidentified client journal"));
@@ -43,16 +48,12 @@ pub async fn recover_content(root: &Path, network: NetworkId, content: &DiskStor
         .into_iter()
         .filter(|entry| entry.role == Role::Client)
     {
-        let setup = SetupStore::open_existing(
-            root,
-            network,
-            entry.bond_edge,
-            Role::Client,
-            &verifier,
-            content.durability(),
-        )
-        .await?;
-        if let Some(descriptor) = setup.state().close_descriptor() {
+        let setup =
+            SetupStore::open_existing(root, network, entry.bond_edge, Role::Client, &verifier)
+                .await?
+                .into_state()
+                .await;
+        if let Some(descriptor) = setup.close_descriptor() {
             let recovered = ChannelStore::recover(
                 root,
                 descriptor.channel().clone(),

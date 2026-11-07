@@ -198,6 +198,7 @@ pub struct RemoteRpc {
 pub struct ClientDiscovery {
     pub registry: ServiceRegistry,
     pub peer_exchange: PeerExchangeBackend,
+    pub mdns_subscribed: Result<tokio::sync::watch::Receiver<bool>, String>,
 }
 
 impl<L> ExecutionRuntime<L> {
@@ -227,7 +228,7 @@ impl<L> ExecutionRuntime<L> {
     /// Long-lived callers such as the HTTP gateway keep their runtime instead.
     pub async fn close_remote(&self) {
         if let Some(remote) = &self.remote {
-            remote.endpoint.close().await;
+            hellas_wire::iroh::close(&remote.endpoint).await;
         }
     }
 
@@ -266,26 +267,31 @@ fn remote_unavailable() -> ClientError {
 
 /// Build the native discovery registry shared by clients and the monitor.
 pub fn build_client_registry(endpoint: &::iroh::Endpoint) -> ClientResult<ClientDiscovery> {
-    let mdns = MdnsAddressLookup::builder()
-        .advertise(false)
-        .build(endpoint.id())
-        .client_context("failed to start mDNS discovery")?;
-    endpoint
-        .address_lookup()
-        .client_context("iroh endpoint has no address lookup registry")?
-        .add(mdns.clone());
-
     let dht = DhtBackend::new(endpoint).client_context("failed to start DHT discovery")?;
     let peer_exchange = PeerExchangeBackend::new();
-
     let mut registry = ServiceRegistry::new(endpoint);
-    registry.add(MdnsBackend::new(mdns));
+    let mdns_subscribed = match MdnsAddressLookup::builder()
+        .advertise(false)
+        .build(endpoint.id())
+    {
+        Ok(mdns) => {
+            endpoint
+                .address_lookup()
+                .client_context("iroh endpoint has no address lookup registry")?
+                .add(mdns.clone());
+            let (ready, subscribed) = tokio::sync::watch::channel(false);
+            registry.add(MdnsBackend::new(mdns).notify_subscribed(ready));
+            Ok(subscribed)
+        }
+        Err(error) => Err(format!("failed to start mDNS discovery: {error}")),
+    };
     registry.add(dht);
     registry.add(peer_exchange.clone());
 
     Ok(ClientDiscovery {
         registry,
         peer_exchange,
+        mdns_subscribed,
     })
 }
 

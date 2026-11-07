@@ -20,14 +20,16 @@ let
     workspaceNativeBuildInputs
     ;
 
+  # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
+  # (format 11) its paired llvm-profdata (format 10) cannot read. At run
+  # time the tool uses our toolchain's llvm-tools-preview instead.
+  cargoLlvmCov = pkgs.cargo-llvm-cov.overrideAttrs { doCheck = false; };
+
   cargoToolPackages = with pkgs; [
     cargo-audit
     cargo-deny
     cargo-fuzz
-    # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
-    # (format 11) its paired llvm-profdata (format 10) cannot read. At run
-    # time the tool uses our toolchain's llvm-tools-preview instead.
-    (cargo-llvm-cov.overrideAttrs { doCheck = false; })
+    cargoLlvmCov
     cargo-mutants
     cargo-nextest
     cargo-outdated
@@ -147,8 +149,10 @@ let
   };
 
   ci = import ./ci.nix {
+    inherit (nativePkg) clippyArgs;
     inherit
       bufLintCommand
+      cargoLlvmCov
       denyCommand
       pkgs
       lib
@@ -159,24 +163,19 @@ let
     extraChecks = kernel.checks;
   };
 
+  # Whole-tree lints (workflows, Nix files, TOML outside the crates) as
+  # derivations. Each runs the same ci.nix app that `nix run .#check-<name>`
+  # runs, so the two cannot drift apart.
   mkHydraSourceCheck =
-    {
-      name,
-      inputs,
-      command,
-    }:
-    pkgs.runCommand "hellas-${name}"
-      {
-        nativeBuildInputs = inputs;
-      }
-      ''
-        export HOME="$TMPDIR/home"
-        export XDG_CACHE_HOME="$TMPDIR/cache"
-        mkdir -p "$HOME" "$XDG_CACHE_HOME"
-        cd ${nativePkg.buildSrc}
-        ${command}
-        touch "$out"
-      '';
+    check:
+    pkgs.runCommand "hellas-${check.name}" { } ''
+      export HOME="$TMPDIR/home"
+      export XDG_CACHE_HOME="$TMPDIR/cache"
+      mkdir -p "$HOME" "$XDG_CACHE_HOME"
+      cd ${self}
+      ${lib.getExe check}
+      touch "$out"
+    '';
 
   packagesFor =
     crossSystem:
@@ -196,20 +195,26 @@ let
         {
           otel ? false,
         }:
-        pkgSpec.mkHellasPackage {
-          buildNoDefaultFeatures = true;
-          # Client, gateway and daemon share one native composition.
-          buildFeatures = lib.optional otel "otel";
-        }
+        pkgSpec.mkHellasPackage (
+          pkgSpec.revEnv
+          // {
+            buildNoDefaultFeatures = true;
+            # Client, gateway and daemon share one native composition.
+            buildFeatures = lib.optional otel "otel";
+          }
+        )
       ) { };
       cli-validator = lib.makeOverridable (
         {
           otel ? false,
         }:
-        pkgSpec.mkHellasPackage {
-          buildNoDefaultFeatures = true;
-          buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
-        }
+        pkgSpec.mkHellasPackage (
+          pkgSpec.revEnv
+          // {
+            buildNoDefaultFeatures = true;
+            buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
+          }
+        )
       ) { };
     };
 
@@ -258,6 +263,7 @@ let
     in
     wasmPlatform.buildRustPackage (
       nativePkg.commonArgs
+      // nativePkg.revEnv
       // {
         pname = "hellas-rpc-wasm";
         # cargoBuildHook passes the native --target explicitly, which overrides
@@ -383,103 +389,23 @@ let
         touch "$out"
       '';
 
-  hydraLints = {
-    actions = mkHydraSourceCheck {
-      name = "check-actions";
-      inputs = [
-        pkgs.actionlint
-        pkgs.shellcheck
-      ];
-      command = "actionlint -config-file /dev/null .github/workflows/*.yml";
-    };
-    "no-catgrad-lock" = noCatgradLock;
-
-    sort = mkHydraSourceCheck {
-      name = "check-sort";
-      inputs = [ pkgs.cargo-sort ];
-      # Taplo owns TOML layout; cargo-sort owns table/key ordering.
-      command = "cargo-sort --workspace --check --no-format";
+  hydraLints =
+    lib.genAttrs [
+      "actions"
+      "sort"
+      "fmt"
+      "taplo"
+      "buf"
+      "deadnix"
+      "statix"
+      "nixfmt"
+    ] (name: mkHydraSourceCheck ci.checks.${name})
+    // {
+      "no-catgrad-lock" = noCatgradLock;
+      inherit (nativePkg.craneChecks) clippy;
     };
 
-    fmt = mkHydraSourceCheck {
-      name = "check-fmt";
-      inputs = [ rustToolchain ];
-      command = "cargo fmt --all -- --check";
-    };
-
-    clippy = nativePkg.mkHellasPackage {
-      pname = "hellas-check-clippy";
-      cargoBuildType = "debug";
-      buildPhase = ''
-        runHook preBuild
-        cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --offline -- -D warnings
-        runHook postBuild
-      '';
-      doCheck = false;
-      installPhase = ''
-        mkdir -p "$out"
-        touch "$out/passed"
-      '';
-    };
-
-    taplo = mkHydraSourceCheck {
-      name = "check-taplo";
-      inputs = [ pkgs.taplo ];
-      command = "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'";
-    };
-
-    buf = mkHydraSourceCheck {
-      name = "check-buf";
-      inputs = [ pkgs.buf ];
-      command = bufLintCommand;
-    };
-
-    deadnix = mkHydraSourceCheck {
-      name = "check-deadnix";
-      inputs = [ pkgs.deadnix ];
-      command = ''
-        shopt -s globstar
-        deadnix --fail flake.nix nix/**/*.nix
-      '';
-    };
-
-    statix = mkHydraSourceCheck {
-      name = "check-statix";
-      inputs = [ pkgs.statix ];
-      command = "statix check .";
-    };
-
-    nixfmt = mkHydraSourceCheck {
-      name = "check-nixfmt";
-      inputs = [ pkgs.nixfmt ];
-      command = ''
-        shopt -s globstar
-        nixfmt --check flake.nix nix/**/*.nix
-      '';
-    };
-
-  };
-
-  hydraUnit = nativePkg.mkHellasPackage (
-    {
-      pname = "hellas-check-unit";
-      buildType = "debug";
-      dontBuild = true;
-      doCheck = true;
-      cargoTestFlags = [
-        "--locked"
-        "--workspace"
-      ];
-      installPhase = ''
-        mkdir -p "$out"
-        touch "$out/passed"
-      '';
-    }
-    // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-      cargoTestJobs = 1;
-      RUST_TEST_THREADS = "1";
-    }
-  );
+  hydraUnit = nativePkg.craneChecks.unit;
 
 in
 {
@@ -507,6 +433,11 @@ in
       type = "app";
       program = lib.getExe ci.checkRelease;
       meta.description = "Run the full release test and feature-check suite";
+    };
+    check-coverage = {
+      type = "app";
+      program = lib.getExe ci.coverage;
+      meta.description = "Measure line coverage and enforce the per-crate floors";
     };
     fix = {
       type = "app";
@@ -544,6 +475,9 @@ in
 
   checks = hydraLints // {
     unit = hydraUnit;
+    inherit (nativePkg.craneChecks) regressions;
+    # Published so later builds substitute compiled dependencies.
+    cargo-deps = nativePkg.cargoDeps;
   };
   nixosTests = linuxOutputs.nixosTests or { };
 

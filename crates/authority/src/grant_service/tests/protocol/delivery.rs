@@ -1,5 +1,6 @@
 use super::*;
 use hellas_channel::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
+use hellas_private::StoreLocation;
 use std::{future::Future, io, task::Poll, time::Duration};
 
 pub(super) fn delivery_request(a: &GrantJobAuthorizationV1, id: Digest) -> StreamResultRequest {
@@ -276,7 +277,7 @@ async fn extending_expired_authority_does_not_revive_an_unpolled_response() {
             .await
             .unwrap();
         if !completed {
-            tokio::time::timeout(WAIT, backend.cancelled.notified())
+            tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                 .await
                 .expect("the expired execution cannot revive after extension");
             assert_eq!(backend.slots.available_permits(), 0);
@@ -344,7 +345,7 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
         .await
         .unwrap();
         let count = calls.load(Ordering::SeqCst);
-        let error = tokio::time::timeout(WAIT, waiting)
+        let error = tokio::time::timeout(HANG_GUARD, waiting)
             .await
             .unwrap()
             .unwrap()
@@ -390,14 +391,14 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                     service.content.close().await;
                     drop(work);
                     drop(service);
+                    let location = StoreLocation::for_test(dir.path());
                     let store = NodeStore::open(
-                        dir.path(),
+                        &location,
                         network(),
                         Some(hellas_channel::test_support::software_enrollment(
                             2, [2; 32],
                         )),
                         UnixMillis(1000),
-                        Default::default(),
                     )
                     .await
                     .unwrap();

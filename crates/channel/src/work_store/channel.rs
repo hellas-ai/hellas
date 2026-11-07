@@ -8,7 +8,6 @@
 use hellas_kernel::Cursor;
 use hex::encode as hex;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use hellas_kernel::{
     Decode, EarnedCertificate, Key, NetworkId, Party, PayloadHash, PaymentCloseStart,

@@ -5,6 +5,12 @@ use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::NetworkId;
 use hellas_rpc::*;
 
+/// Bound for a hung wait, not a performance requirement. CI runs many suites at
+/// once on shared machines, where a step can take ten times its quiet duration;
+/// the properties under test never depend on how fast that is, only on the
+/// awaited event happening at all. A guard costs time only on a real hang.
+pub const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn network() -> NetworkId {
     NetworkId::new("grants-fixture").unwrap()
 }

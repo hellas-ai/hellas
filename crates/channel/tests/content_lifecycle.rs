@@ -56,19 +56,18 @@ async fn invalid_result_leaves_exact_retained_allowance_available_for_valid_deli
         + replacement.len() as u64
         + facts.max_spool_bytes;
     let node = DiskStore::open(
-        root.path().join("content"),
+        hellas_private::StoreLocation::for_test(root.path()).child("content"),
         vec![],
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     let verifier = Secp256k1Verifier::new();
     let mut journal = ChannelStore::open(
-        root.path(),
+        &hellas_private::StoreLocation::for_test(root.path()),
         ready.channel().clone(),
         fixture::settlement(),
         Role::Provider,
@@ -227,7 +226,7 @@ async fn pending_upload_fixture() -> (
 }
 
 async fn wait_for_pending_cleanup(node: &DiskStore) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while node.stats().unwrap().outstanding != 0 || node.stats().unwrap().used != 0 {
             tokio::task::yield_now().await;
         }
@@ -457,18 +456,17 @@ async fn a_durable_unaccepted_proposal_can_reupload_and_accept_after_reopening_w
     node.close().await;
     drop(node);
     let node = DiskStore::open(
-        root.path().join("content"),
+        hellas_private::StoreLocation::for_test(root.path()).child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     let journal = ChannelStore::open(
-        root.path(),
+        &hellas_private::StoreLocation::for_test(root.path()),
         ready.channel().clone(),
         fixture::settlement(),
         Role::Provider,
@@ -713,7 +711,7 @@ async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
     );
     assert_eq!(service.content_upload_count().await.unwrap(), 1);
     connection.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
@@ -822,18 +820,17 @@ async fn owner_lifecycle_pin_policy_survives_acceptance_pin_move_and_boot_recove
         node.close().await;
         drop(node);
         let node = DiskStore::open(
-            root.path().join("content"),
+            hellas_private::StoreLocation::for_test(root.path()).child("content"),
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
         let mut journal = ChannelStore::open(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             fixture::settlement(),
             role,
@@ -925,7 +922,7 @@ async fn reopening_a_channel_on_a_ready_node_preserves_its_scope_and_spent_outpu
     let before = node.stats().unwrap();
     drop(journal);
     let mut reopened = ChannelStore::open_existing(
-        root.path(),
+        &hellas_private::StoreLocation::for_test(root.path()),
         ready.channel().clone(),
         fixture::settlement(),
         Role::Provider,
@@ -1042,18 +1039,17 @@ async fn recovering_many_retained_jobs_loads_bodies_only_when_each_job_is_used()
     node.close().await;
     drop(node);
     let node = DiskStore::open(
-        root.path().join("content"),
+        hellas_private::StoreLocation::for_test(root.path()).child("content"),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(ram_limit),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
     let journal = ChannelStore::open_existing(
-        root.path(),
+        &hellas_private::StoreLocation::for_test(root.path()),
         ready.channel().clone(),
         fixture::settlement(),
         Role::Provider,
@@ -1155,15 +1151,19 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
         role: Role::Provider,
         key,
     };
-    let (mut journal, _) = Journal::open_latest(root.path(), &stem, identity, Default::default())
-        .await
-        .unwrap();
+    let (mut journal, _) = Journal::open_latest(
+        &hellas_private::StoreLocation::for_test(root.path()),
+        &stem,
+        identity,
+    )
+    .await
+    .unwrap();
     journal.close().await;
     drop(journal);
     let node = fixture::content_store(root.path()).await;
     assert!(
         ChannelStore::recover(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             Role::Provider,
             node.clone(),
@@ -1174,9 +1174,13 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
         .is_none()
     );
     assert!(node.collect(&Scope::Owner).await.is_err());
-    let (mut journal, _) = Journal::open_existing(root.path(), &stem, identity, Default::default())
-        .await
-        .unwrap();
+    let (mut journal, _) = Journal::open_existing(
+        &hellas_private::StoreLocation::for_test(root.path()),
+        &stem,
+        identity,
+    )
+    .await
+    .unwrap();
     journal
         .append(&ChannelRecord::OriginObserved.encode())
         .await
@@ -1185,7 +1189,7 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
     drop(journal);
     assert!(matches!(
         ChannelStore::recover(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             Role::Provider,
             node.clone(),
@@ -1210,7 +1214,7 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
         let settlement = fixture::settlement();
         let node = fixture::content_store(root.path()).await;
         let store = ChannelStore::open(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             settlement,
             Role::Provider,
@@ -1233,14 +1237,13 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
         checkpoint[48..56].copy_from_slice(&capacity.to_be_bytes());
         let key = ChannelStore::journal_key(ready.channel());
         let (mut journal, _) = Journal::open_existing(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             &format!("channel-{}", hex::encode(key)),
             JournalId {
                 kind: JournalKind::Channel,
                 role: Role::Provider,
                 key,
             },
-            Default::default(),
         )
         .await
         .unwrap();
@@ -1248,7 +1251,7 @@ async fn recovery_refuses_invalid_capacity_and_a_different_signed_omission_bond(
         journal.close().await;
         drop(journal);
         let error = ChannelStore::recover(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             Role::Provider,
             node.clone(),
@@ -1273,18 +1276,17 @@ async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
     let root = tempfile::tempdir().unwrap();
     let upper = root.path().join("content");
     let node = DiskStore::open(
-        upper.clone(),
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         true,
-        Default::default(),
     )
     .await
     .unwrap();
     let channel = ChannelStore::open(
-        root.path(),
+        &hellas_private::StoreLocation::for_test(root.path()),
         fixture::ready().channel().clone(),
         fixture::settlement(),
         Role::Provider,
@@ -1308,13 +1310,12 @@ async fn even_an_empty_channel_claims_its_upper_before_offline_owner_use() {
     drop(node);
     assert!(matches!(
         DiskStore::open(
-            upper,
+            hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
             true,
-            Default::default(),
         )
         .await,
         Err(Error::WorkOwned)

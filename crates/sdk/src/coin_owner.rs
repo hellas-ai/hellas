@@ -198,22 +198,21 @@ impl OwnerReshape {
         if need == 0 {
             return Err(CoinOwnerError::Split);
         }
-        let listing = chain
-            .get_coins_by_owner(owner.into())
-            .await?
-            .ok_or(CoinOwnerError::NoSnapshot)?;
-        let mut candidates = listing
-            .coins
-            .into_iter()
-            .filter(|(id, _)| !reserved.contains(&CoinId::from_bytes((*id).into())))
-            .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut seen = std::collections::BTreeSet::new();
-        candidates.retain(|(id, _)| seen.insert(*id));
         let mut eligible = Vec::new();
-        for batch in candidates.chunks(32) {
+        let mut after = None;
+        loop {
+            let page = chain
+                .get_coins_by_owner_page(owner.into(), after)
+                .await?
+                .ok_or(CoinOwnerError::NoSnapshot)?;
+            let mut candidates = page
+                .coins
+                .into_iter()
+                .filter(|(id, _)| !reserved.contains(&CoinId::from_bytes((*id).into())))
+                .collect::<Vec<_>>();
+            candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let snapshot = chain
-                .get_objects(batch.iter().map(|(id, _)| *id).collect())
+                .get_objects(candidates.iter().map(|(id, _)| *id).collect())
                 .await?
                 .ok_or(CoinOwnerError::NoSnapshot)?;
             if snapshot.network != network {
@@ -239,6 +238,10 @@ impl OwnerReshape {
                 .fold(0_u64, |sum, coin| sum.saturating_add(coin.1))
                 >= need
             {
+                break;
+            }
+            after = page.next;
+            if after.is_none() {
                 break;
             }
         }
@@ -362,6 +365,186 @@ impl OwnerReshape {
 mod tests {
     use super::*;
     use hellas_kernel::Secp256k1Signer;
+
+    #[derive(Clone)]
+    struct PagedFunding {
+        owner: hellas_chain::domain::SettlementKey,
+        network: NetworkId,
+        pages: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<Vec<hellas_chain::domain::ObjectId>>>>,
+    }
+
+    impl hellas_chain::LightClient for PagedFunding {
+        async fn get_coins_by_owner_page(
+            &self,
+            owner: hellas_chain::domain::SettlementKey,
+            after: Option<hellas_chain::domain::ObjectId>,
+        ) -> Result<Option<hellas_chain::light_client::CoinPage>, hellas_chain::QueryError>
+        {
+            assert_eq!(owner, self.owner);
+            let start = after.map_or(1, |id| id.0[0] as usize + 1);
+            let end = (start + 32).min(130);
+            let page = self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let coins = (start..end)
+                .map(|index| {
+                    (
+                        hellas_chain::domain::ObjectId::from([index as u8; 32]),
+                        if index == 129 { 200 } else { 1 },
+                    )
+                })
+                .collect();
+            Ok(Some(hellas_chain::light_client::CoinPage {
+                snapshot: hellas_chain::LatestBlock {
+                    height: page + 1,
+                    payload: hellas_chain::domain::Digest::from([page as u8; 32]),
+                    state_root: hellas_chain::domain::Digest::from([page as u8; 32]),
+                    finalization: Vec::new(),
+                },
+                coins,
+                next: (end < 130)
+                    .then(|| hellas_chain::domain::ObjectId::from([(end - 1) as u8; 32])),
+                owned_balance: Some(328),
+            }))
+        }
+
+        async fn get_objects(
+            &self,
+            keys: Vec<hellas_chain::domain::ObjectId>,
+        ) -> Result<Option<hellas_chain::light_client::ObjectSnapshot>, hellas_chain::QueryError>
+        {
+            self.reads.lock().unwrap().push(keys.clone());
+            let page = self.pages.load(std::sync::atomic::Ordering::SeqCst);
+            let objects = keys
+                .into_iter()
+                .map(|id| {
+                    let value = if id.0[0] == 129 { 200 } else { 1 };
+                    (
+                        id,
+                        hellas_chain::domain::Object::Coin(hellas_chain::domain::Coin::owned(
+                            self.owner, value,
+                        )),
+                    )
+                })
+                .collect();
+            Ok(Some(hellas_chain::light_client::ObjectSnapshot {
+                network: self.network,
+                block: hellas_chain::LatestBlock {
+                    height: page + 2,
+                    payload: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
+                    state_root: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
+                    finalization: Vec::new(),
+                },
+                objects,
+            }))
+        }
+
+        async fn get_state_root(
+            &self,
+        ) -> Result<Option<hellas_chain::domain::Digest>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_proof(
+            &self,
+            _: hellas_chain::domain::ObjectId,
+        ) -> Result<Option<Vec<u8>>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_coin(
+            &self,
+            _: hellas_chain::domain::Digest,
+            _: hellas_chain::domain::ObjectId,
+        ) -> Result<Option<hellas_chain::domain::Coin>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_edge(
+            &self,
+            _: hellas_chain::domain::Digest,
+            _: hellas_chain::domain::ObjectId,
+        ) -> Result<Option<hellas_chain::EdgeLookup>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_finalization(
+            &self,
+            _: hellas_chain::domain::Digest,
+        ) -> Result<Option<Vec<u8>>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_latest_block(
+            &self,
+        ) -> Result<Option<hellas_chain::LatestBlock>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_finalized_block(
+            &self,
+            _: hellas_chain::FinalizedBlockQuery,
+        ) -> Result<Option<hellas_chain::FinalizedBlock>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn submit_tx(
+            &self,
+            _: hellas_chain::domain::Transaction,
+        ) -> Result<hellas_chain::SubmitTxOutcome, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_validators(&self) -> Result<Vec<String>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_consensus_info(
+            &self,
+        ) -> Result<hellas_chain::ConsensusInfo, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_coins_by_owner(
+            &self,
+            _: hellas_chain::domain::SettlementKey,
+        ) -> Result<Option<hellas_chain::CoinListing>, hellas_chain::QueryError> {
+            panic!("whole owner listing must not fund")
+        }
+        async fn get_coins_by_delegate(
+            &self,
+            _: hellas_chain::domain::SettlementKey,
+        ) -> Result<Option<hellas_chain::CoinListing>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+        async fn get_edges_by_owner(
+            &self,
+            _: hellas_chain::domain::SettlementKey,
+        ) -> Result<Option<hellas_chain::OwnerEdges>, hellas_chain::QueryError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn split_finds_later_page_funding_and_rechecks_selected_input_at_one_root() {
+        let signer = Secp256k1Signer::from_secret_scalar([21; 32]).unwrap();
+        let owner: hellas_chain::domain::SettlementKey = signer.party_key().into();
+        let network = NetworkId::new("paged-funding-test").unwrap();
+        let source = PagedFunding {
+            owner,
+            network,
+            pages: Default::default(),
+            reads: Default::default(),
+        };
+        let plan = OwnerReshape::split(
+            &source,
+            network,
+            signer.party_key(),
+            200,
+            signer.party_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.pages.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(plan.inputs().as_slice(), &[CoinId::from_bytes([129; 32])]);
+        let reads = source.reads.lock().unwrap();
+        assert_eq!(
+            reads.last().unwrap(),
+            &vec![hellas_chain::domain::ObjectId::from([129; 32])]
+        );
+        assert!(reads.iter().all(|batch| batch.len() <= 32));
+        assert_eq!(plan.floor(), Some((7, [6; 32])));
+        assert_eq!(plan.outputs().as_slice()[0].value(), 200);
+    }
 
     #[test]
     fn recipients_must_be_valid_points_on_a_supported_owner_curve() {

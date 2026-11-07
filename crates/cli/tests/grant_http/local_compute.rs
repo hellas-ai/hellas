@@ -3,6 +3,7 @@ use super::*;
 use hellas_authority::model::grant::{
     ChannelClient, ChannelId, grant_channel_id, grant_network, owner_grant_id, records::*,
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     Admission, InvocationPolicy, Limits, compute, output::InvocationOutput,
 };
@@ -36,10 +37,7 @@ impl LocalCompute {
         assert!(export.status.success());
         let enrollment = decode_enrollment(&export.stdout).unwrap();
         let principal = owner.principal();
-        let journal = root
-            .join("grants")
-            .join(format!("p256-{}", hex::encode(principal.as_bytes())))
-            .join("provider");
+        let journal = owner.home.join("provider");
         let (store, secret) = common_node::bootstrap_node_with_credential(
             &journal,
             grant_network(),
@@ -117,7 +115,6 @@ impl LocalCompute {
         let trust_root = approve(root, "local", enrollment.content_id());
         let configuration = prepare_content(root, &journal, content);
         let allowance = hex::encode(allowance.0);
-        let archive = root.join("archive");
         let mut args = vec![
             "gateway",
             "--trust-store",
@@ -138,8 +135,6 @@ impl LocalCompute {
             "0",
             "--gateway-profile",
             string(&gateway_profile),
-            "--archive-dir",
-            string(&archive),
             "--zdr",
         ];
         args.extend_from_slice(extra);
@@ -178,12 +173,12 @@ impl LocalCompute {
         transcript: &[u8],
         expected: &InvocationOutput,
     ) {
+        let location = StoreLocation::for_test(&self.journal);
         let store = hellas_authority::work_store::grant::NodeStore::open(
-            &self.journal,
+            &location,
             grant_network(),
             Some(self.enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap(),
-            Default::default(),
         )
         .await
         .unwrap();
@@ -296,7 +291,11 @@ async fn local_model_fixture_indexes_the_whole_lower_and_declares_only_requested
     let value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let config: Config = value.get("content").unwrap().clone().try_into().unwrap();
     let store = config
-        .open(Reservations::ram(32 << 20), true, Default::default())
+        .open(
+            &StoreLocation::for_test(directory.path()),
+            Reservations::ram(32 << 20),
+            true,
+        )
         .await
         .unwrap();
     store.finish_recovery().await.unwrap();

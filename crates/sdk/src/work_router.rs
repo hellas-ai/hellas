@@ -160,7 +160,20 @@ impl WorkHandler for ConnectionWork {
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
             Handler::Grants(service) => wt(service.accept_work(request, context)).await,
-            Handler::Payment(service) => wt(service.accept_work(request, context)).await,
+            Handler::Payment(service) => {
+                let response = wt(service.accept_work(request, context)).await?;
+                // Accepted paid work proves current channel authority. Merely
+                // selecting payment mode or receiving a refusal does not.
+                if matches!(
+                    response.response.outcome.as_ref(),
+                    Some(hellas_rpc::pb::work::accept_work_response::Outcome::Accepted(_))
+                ) && let Ok(mut unverified) = self.unverified.lock()
+                    && let Some(unverified) = unverified.take()
+                {
+                    unverified.authenticated();
+                }
+                Ok(response)
+            }
             Handler::Unavailable => wt(UnmountedWork.accept_work(request, context)).await,
         }
     }

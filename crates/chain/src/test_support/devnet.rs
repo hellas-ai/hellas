@@ -5,6 +5,7 @@
 //! The source serves the real light-client protocol and ChainSync; configured
 //! full nodes consume that history through production verification and execution.
 
+use hellas_private::Durability::Crash;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +18,6 @@ use commonware_consensus::{
 use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
-use commonware_utils::non_empty_range;
 use hellas_kernel::{Auth, BlockHash, BlockHeight, CoinId, Context as KernelContext, PayloadHash};
 
 use crate::HellasBlock;
@@ -79,7 +78,7 @@ impl GenesisOwner {
     /// Panics if `index` is not in 0..100.
     pub fn faucet(index: u8) -> Self {
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON)
                 .expect("the shipped faucet list parses");
         let account = accounts
             .into_iter()
@@ -206,6 +205,8 @@ const VALIDATOR_LABELS: [&str; VALIDATORS] = [
 /// Six validators on one genesis, and the proposer they do not have.
 pub struct Devnet {
     validators: Vec<Validator>,
+    runtime_guard: Option<Runtime>,
+    executor: tokio::runtime::Handle,
     fixture: ConsensusFixture,
     document: Genesis,
     consensus_info: ConsensusInfo,
@@ -215,7 +216,7 @@ pub struct Devnet {
     full_nodes: Vec<crate::node::FullNode>,
     rpc: tokio::task::JoinSet<()>,
     activity: Vec<tokio::sync::broadcast::Sender<crate::ConsensusActivity>>,
-    storage: tempfile::TempDir,
+    storage: Option<tempfile::TempDir>,
     head: HellasBlock,
     height: u64,
     /// Every transaction already in finalized history, by digest.
@@ -389,6 +390,8 @@ impl Devnet {
 
             let mut devnet = Self {
                 validators,
+                runtime_guard: Some(runtime.child("devnet_teardown")),
+                executor: tokio::runtime::Handle::current(),
                 fixture,
                 document,
                 consensus_info,
@@ -398,14 +401,14 @@ impl Devnet {
                 full_nodes: Vec::new(),
                 rpc,
                 activity,
-                storage,
+                storage: Some(storage),
                 head: genesis,
                 height: 0,
                 included: BTreeSet::new(),
             };
             for ordinal in 0..full_node_count {
                 let mut config = devnet.full_node_config(
-                    devnet.storage.path().join(format!("full-node-{ordinal}")),
+                    devnet.storage().join(format!("full-node-{ordinal}")),
                     ordinal,
                 );
                 config
@@ -416,6 +419,10 @@ impl Devnet {
             }
             devnet
         })
+    }
+
+    fn storage(&self) -> &Path {
+        self.storage.as_ref().expect("live devnet storage").path()
     }
 
     /// The genesis document every validator started from.
@@ -447,6 +454,26 @@ impl Devnet {
         }
     }
 
+    pub fn proof_verifier(&self) -> std::sync::Arc<crate::proof_verify::ProofVerifier> {
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_vec(&self.document).expect("fixture genesis encodes");
+        let trust = crate::genesis::TrustDocument {
+            schema_version: crate::genesis::TRUST_SCHEMA_VERSION,
+            network_id: self.consensus_info.network_id.clone(),
+            genesis_sha256: hex::encode(Sha256::hash(&genesis_json)),
+            epochs: vec![crate::genesis::TrustEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: None,
+                threshold_identity: hex::encode(&self.consensus_info.threshold_identity),
+            }],
+        };
+        std::sync::Arc::new(
+            crate::proof_verify::ProofVerifier::with_genesis(trust, &genesis_json)
+                .expect("fixture trust verifies fixture genesis"),
+        )
+    }
+
     /// The genesis owners, as configured.
     pub fn owners(&self) -> &[GenesisOwner] {
         &self.owners
@@ -464,7 +491,7 @@ impl Devnet {
             self.owners.contains(owner),
             "a genesis owner of this devnet"
         );
-        owner_file(self.storage.path(), owner)
+        owner_file(self.storage(), owner)
     }
 
     /// Validator `validator`'s light-client WebSocket URL.
@@ -495,17 +522,38 @@ impl Devnet {
 
     /// A full-node configuration that submits through `validator` and
     /// syncs from it. The caller owns the node it starts.
-    pub fn full_node_config(&self, storage_dir: PathBuf, validator: usize) -> crate::node::Config {
+    pub fn profile(&self, validator: usize) -> crate::genesis::ChainProfile {
+        use crate::genesis::{Chain, ChainProfile, CustomChainFile};
+        use commonware_cryptography::{Hasher as _, Sha256};
         let validator = &self.validators[validator];
-        crate::node::Config {
-            genesis: self.document.clone(),
-            threshold_identity: self.consensus_info.threshold_identity.clone(),
-            genesis_payload: self.genesis_payload,
-            storage_dir,
+        let genesis_json = serde_json::to_string(&self.document).unwrap();
+        let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+        trust.network_id = self.document.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
+        ChainProfile::custom(CustomChainFile {
+            trust,
             validators: vec![validator.light_client_url.clone()],
-            peers: vec![validator.chain_sync.clone()],
-            archive_blocks: None,
-        }
+            genesis_json,
+        })
+        .unwrap()
+    }
+
+    pub fn chain_dir(
+        &self,
+        home: &std::path::Path,
+        validator: usize,
+    ) -> crate::chain_dir::ChainDir {
+        crate::chain_dir::ChainDir::open(home, &self.profile(validator), Crash).unwrap()
+    }
+
+    pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {
+        crate::node::Config::for_profile(
+            self.chain_dir(&home, validator),
+            vec![self.validators[validator].chain_sync.clone()],
+            None,
+        )
+        .unwrap()
     }
 
     /// The `node`th full node this devnet started.
@@ -580,14 +628,7 @@ impl Devnet {
                 }
                 owner_root = Some(owners);
                 let merkleized = batches.merkleize().await.expect("state merkleizes");
-                let bounds = merkleized.bounds();
-                let validator_target = Target {
-                    root: merkleized.root(),
-                    range: non_empty_range!(
-                        bounds.inactivity_floor,
-                        Location::new(bounds.total_size)
-                    ),
-                };
+                let validator_target = crate::execution::store::sync_target(&merkleized);
                 if let Some(expected) = &target {
                     assert_eq!(&validator_target, expected);
                 }
@@ -625,7 +666,10 @@ impl Devnet {
             for (validator, executed) in self.validators.iter().zip(executed) {
                 validator
                     .indexer
-                    .publish_proof(block.clone(), &certificate.clone().encode())
+                    .publish_proof(
+                        block.clone(),
+                        &crate::finality_proof::encode(&certificate.clone().encode(), &[]).unwrap(),
+                    )
                     .await
                     .expect("a certified block is ingested");
                 validator.database.finalize(executed).await;
@@ -651,7 +695,7 @@ impl Devnet {
             for node in &self.full_nodes {
                 let mut progress = node.finalized();
                 tokio::time::timeout(crate::node::RECOVERY_TIMEOUT, async {
-                    while *progress.borrow_and_update() < self.height {
+                    while progress.borrow_and_update().executed_height() < self.height {
                         progress.changed().await.unwrap();
                     }
                     node.wait_ready().await.unwrap();
@@ -677,6 +721,24 @@ impl Devnet {
             }
             block
         })
+    }
+
+    /// Whether any validator's mempool holds a transaction no sealed block
+    /// has included yet: the event a test awaits instead of sleeping until
+    /// a submission has probably arrived.
+    pub async fn has_pending_transactions(&self) -> bool {
+        for validator in &self.validators {
+            for transaction in validator.mempool.test_transactions().await {
+                let digest =
+                    <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
+                        &commonware_codec::Encode::encode(&transaction),
+                    );
+                if !self.included.contains(&digest) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub async fn seal_through(&mut self, height: u64) {
@@ -754,14 +816,52 @@ impl Devnet {
     /// Stops every full node and server, then every follower indexer
     /// before the commonware runtime that owns it is dropped.
     pub async fn shutdown(mut self) {
-        for node in self.full_nodes {
-            node.shutdown().await.unwrap();
+        stop(
+            std::mem::take(&mut self.full_nodes),
+            std::mem::take(&mut self.rpc),
+            std::mem::take(&mut self.validators),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn stop(
+    nodes: Vec<crate::node::FullNode>,
+    mut rpc: tokio::task::JoinSet<()>,
+    validators: Vec<Validator>,
+) -> Result<(), crate::node::Error> {
+    let mut result = Ok(());
+    for node in nodes {
+        if let Err(error) = node.shutdown().await {
+            result = Err(error);
         }
-        self.rpc.shutdown().await;
-        for validator in self.validators {
-            validator.task.abort();
-            let _ = validator.task.await;
-        }
+    }
+    rpc.shutdown().await;
+    for validator in validators {
+        validator.task.abort();
+        let _ = validator.task.await;
+    }
+    result
+}
+
+impl Drop for Devnet {
+    fn drop(&mut self) {
+        let validators = std::mem::take(&mut self.validators);
+        let Some(runtime) = self.runtime_guard.take() else {
+            return;
+        };
+        let nodes = std::mem::take(&mut self.full_nodes);
+        let rpc = std::mem::take(&mut self.rpc);
+        let storage = self.storage.take();
+        // Keep the runtime and its storage alive until all fixture tasks stop,
+        // including when a test unwinds before calling shutdown().
+        let cleanup = self.executor.spawn(stop(nodes, rpc, validators));
+        std::thread::spawn(move || {
+            let _ = futures::executor::block_on(cleanup);
+            drop(runtime);
+            drop(storage);
+        });
     }
 }
 

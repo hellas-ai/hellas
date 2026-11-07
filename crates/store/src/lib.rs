@@ -32,6 +32,11 @@ pub struct Indexed {
     pub len: u64,
 }
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+#[cfg(test)]
+pub(crate) const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[cfg(test)]
 thread_local! {
     static HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

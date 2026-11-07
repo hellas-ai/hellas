@@ -172,6 +172,10 @@ impl Pool {
                 }
                 let idle_timeout = inner.options.idle_timeout;
                 drop(inner);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: idle connection sweep"
+                )]
                 n0_future::time::sleep(idle_timeout).await;
                 let Some(inner) = weak.upgrade() else {
                     return;

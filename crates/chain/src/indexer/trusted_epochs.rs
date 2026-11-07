@@ -19,10 +19,6 @@ pub(crate) struct TrustedEpochs {
     verifiers: Arc<Vec<ConsensusVerifier>>,
 }
 impl TrustedEpochs {
-    #[cfg(test)]
-    pub fn new(trust: TrustDocument) -> Result<Self, TrustError> {
-        Self::with_genesis(trust, hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes())
-    }
     pub fn with_genesis(trust: TrustDocument, genesis_json: &[u8]) -> Result<Self, TrustError> {
         crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)
             .map_err(|error| TrustError::Schedule(error.to_string()))?;
@@ -106,7 +102,7 @@ mod tests {
     };
     use commonware_cryptography::{Hasher as _, Sha256};
     use commonware_runtime::{Runner as _, deterministic};
-    use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_2_ID, HELLAS_DEVNET_2_JSON, TrustEpoch};
 
     #[test]
     fn proof_verifier_accepts_rotated_threshold_keys_only_at_the_scheduled_height() {
@@ -114,19 +110,19 @@ mod tests {
             let first = crate::execution::test_support::consensus_fixture_in(
                 501,
                 4,
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
             );
             let second = crate::execution::test_support::consensus_fixture_in(
                 601,
                 4,
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
             );
             let trust = TrustDocument {
                 schema_version: 1,
-                network_id: HELLAS_DEVNET_1_ID.into(),
-                genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_1_JSON.as_bytes())),
+                network_id: HELLAS_DEVNET_2_ID.into(),
+                genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_2_JSON.as_bytes())),
                 epochs: vec![
                     TrustEpoch {
                         epoch: 0,
@@ -142,7 +138,9 @@ mod tests {
                     },
                 ],
             };
-            let schedule = TrustedEpochs::new(trust.clone()).unwrap();
+            let schedule =
+                TrustedEpochs::with_genesis(trust.clone(), HELLAS_DEVNET_2_JSON.as_bytes())
+                    .unwrap();
             assert_eq!(schedule.first(Epoch::new(1)), Some(Height::new(2)));
             assert_eq!(schedule.last(Epoch::zero()), Some(Height::new(1)));
             assert!(schedule.scoped(Epoch::new(2)).is_none());
@@ -162,11 +160,16 @@ mod tests {
                 base.sync_target(),
                 Vec::new(),
             );
-            let verifier = crate::proof_verify::ProofVerifier::new(trust).unwrap();
+            let verifier = crate::proof_verify::ProofVerifier::with_genesis(
+                trust,
+                HELLAS_DEVNET_2_JSON.as_bytes(),
+            )
+            .unwrap();
             let check = |block: &HellasBlock, committee| {
                 let bundle = verifier.bundle(super::finalized_block(
                     block.clone(),
-                    finalization(committee, block).encode().to_vec(),
+                    crate::finality_proof::encode(&finalization(committee, block).encode(), &[])
+                        .unwrap(),
                 ));
                 verifier.verify(
                     bundle,

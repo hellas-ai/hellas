@@ -141,7 +141,7 @@ impl Fixture {
             principal: principal(1).0,
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
-            journal_root: self.root.path().join("client"),
+            journal_root: hellas_private::StoreLocation::for_test(&self.root.path().join("client")),
             control_timeout: Duration::from_secs(10),
         }
     }

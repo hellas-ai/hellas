@@ -12,13 +12,12 @@ fn at(name: &str) -> Path {
 }
 async fn open(root: &FsPath) -> DiskStore {
     let store = DiskStore::open(
-        root.into(),
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -197,13 +196,12 @@ async fn tree_bytes_modified_after_verified_open_are_rejected_and_only_that_back
     let path = lower.join("tree");
     fs::write(&path, &bytes).unwrap();
     let store = DiskStore::open(
-        root.path().join("upper"),
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&root.path().join("upper"))),
         vec![lower],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -334,13 +332,12 @@ async fn failed_promotion_remains_scope_protected_until_retry_or_journal_recover
     store.close().await;
     drop(store);
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -493,13 +490,12 @@ async fn corrupt_existing_destination_is_replaced_from_verified_private_staging(
     store.close().await;
     drop(store);
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -680,7 +676,7 @@ async fn an_opener_cannot_adopt_the_temporary_root_scope_while_its_pin_is_commit
             )
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    tokio::time::timeout(crate::HANG_GUARD, async {
         while store.core.state.lock().unwrap().generation == generation {
             tokio::task::yield_now().await;
         }
@@ -789,13 +785,12 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
     store.close().await;
     drop(store);
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         true,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -837,13 +832,12 @@ async fn work_owned_is_durable_before_the_first_scope_and_survives_all_pin_remov
     let incomplete = root.path().join("staging/incomplete");
     fs::write(&incomplete, b"do not clean a work-owned upper").unwrap();
     let result = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         true,
-        Default::default(),
     )
     .await;
     assert!(matches!(result, Err(Error::WorkOwned)));
@@ -900,13 +894,12 @@ async fn a_failed_ownership_commit_cannot_open_a_work_scope_or_reserve_content()
     store.close().await;
     drop(store);
     let ordinary = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         true,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -918,13 +911,12 @@ async fn durability_modes_apply_real_sqlite_pragmas() {
     for (durability, expected) in [(Durability::default(), 1), (Durability::Power, 2)] {
         let root = tempfile::tempdir().unwrap();
         let store = DiskStore::open(
-            root.path().into(),
+            hellas_private::StoreLocation::for_test(root.path()).with_durability(durability),
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
             false,
-            durability,
         )
         .await
         .unwrap();
@@ -943,7 +935,7 @@ async fn durability_modes_apply_real_sqlite_pragmas() {
             .unwrap();
         assert_eq!(mode, "wal");
         assert_eq!(synchronous, expected);
-        assert_eq!(busy, 0);
+        assert_eq!(busy, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
         #[cfg(target_os = "macos")]
         {
             let fullfsync: i64 = sqlx::query_scalar("PRAGMA fullfsync")
@@ -960,22 +952,16 @@ async fn content_ownership_probe() {
     let Some(root) = std::env::var_os("HELLAS_CONTENT_OWNERSHIP_PROBE") else {
         return;
     };
-    let started = std::time::Instant::now();
     let result = DiskStore::open(
-        root.into(),
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Durability::default(),
     )
     .await;
     assert!(matches!(result, Err(Error::Locked)));
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(250),
-        "must refuse before the former busy wait"
-    );
 }
 #[tokio::test]
 async fn a_second_process_cannot_open_the_content_database() {
@@ -1003,25 +989,23 @@ async fn failed_lower_initialization_releases_the_writer_before_returning() {
     let upper = root.path().join("upper");
     assert!(
         DiskStore::open(
-            upper.clone(),
+            hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
             vec![root.path().join("missing-lower")],
             IndexMode::Resume,
             None,
             Reservations::ram(32 << 20),
-            false,
-            Durability::default()
+            false
         )
         .await
         .is_err()
     );
     let reopened = DiskStore::open(
-        upper,
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Durability::default(),
     )
     .await
     .unwrap();

@@ -77,6 +77,7 @@ pub type GrantClock = Arc<dyn Fn() -> UnixMillis + Send + Sync>;
 
 #[derive(Clone)]
 pub struct GrantService {
+    owns_node: bool,
     node: crate::node::NodeCoordinator,
     inner: Arc<Mutex<Runtime>>,
     signer: Arc<ProducerSigningKey>,
@@ -243,13 +244,15 @@ impl GrantService {
         {
             return Err(GrantError::Signature.into());
         }
-        Ok(Self::build(
+        let mut service = Self::build(
             crate::node::NodeCoordinator::new(store, clock),
             signer,
             backend,
             addresses,
             content,
-        ))
+        );
+        service.owns_node = true;
+        Ok(service)
     }
 
     /// Attach execution to the host's existing writer. Restarting a provider
@@ -300,6 +303,7 @@ impl GrantService {
             },
         );
         Self {
+            owns_node: false,
             node,
             inner: Arc::new(Mutex::new(Runtime {
                 contents: BTreeMap::new(),
@@ -465,9 +469,11 @@ impl GrantService {
                     return Ok(accepted(id, signature));
                 }
                 // Refresh after the durable probe; its wait must not extend the job deadline.
-                let observed_at = Instant::now();
                 let now = self.node.observed_time(&store);
                 access.authorize(&store, a.grant_id, now)?;
+                if now > a.acceptance_deadline_ms {
+                    return Err(refused(GrantRefusalCode::Expired));
+                }
                 let reference =
                     hellas_rpc::protocol::content::decode_reference(&request.prepared_input)
                         .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
@@ -572,6 +578,8 @@ impl GrantService {
                 if permit.domain() != domain {
                     return Err(refused(GrantRefusalCode::QueueCapacity));
                 }
+                let observed_at = Instant::now();
+                let now = self.node.observed_time(&store);
                 let deadline = observed_at
                     .checked_add(Duration::from_millis(
                         a.terminal_deadline_ms.0.saturating_sub(now.0),
@@ -725,6 +733,7 @@ impl GrantService {
         result
     }
 
+    #[expect(clippy::disallowed_methods, reason = "inventory class C: grant expiry")]
     async fn monitor_execution(
         &self,
         id: Digest,
@@ -962,6 +971,10 @@ impl GrantService {
         let service = self.clone();
         self.stream_binding(async move { service.bind_delivery(&access, &request).await })
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "inventory class C: delivery expiry"
+    )]
     fn stream_binding(
         &self,
         binding: impl Future<Output = Result<Arc<Delivery>, WorkRefused>> + Send + 'static,
@@ -1160,6 +1173,16 @@ impl GrantService {
             Poll::Ready(result)
         })
         .await
+    }
+
+    /// Drain physical work, then release a standalone service's journal owner.
+    /// A host-attached service leaves its writer with the host.
+    pub async fn shutdown(&self) -> Result<(), NodeStoreError> {
+        let result = self.drain().await;
+        if self.owns_node {
+            self.node.close().await;
+        }
+        result
     }
 }
 fn terminal_refusal(id: Digest, terminal: &GrantTerminal) -> WorkRefused {

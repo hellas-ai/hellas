@@ -1,5 +1,6 @@
 use super::*;
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use {
     crate::test_support::ids, hellas_channel::test_support::Actor,
     hellas_channel::test_support::actors::*, hellas_channel::test_support::assert_err,
@@ -19,8 +20,9 @@ fn network() -> NetworkId {
     NetworkId::new("checked-node-fixture").unwrap()
 }
 async fn fixture(path: &std::path::Path, admin: GrantSpec) -> (NodeCoordinator, CredentialSecret) {
+    let location = StoreLocation::for_test(path);
     let (store, secret) = NodeStore::bootstrap(
-        path,
+        &location,
         network(),
         ids::ROOT_GRANT,
         crate::test_support::common_node::approval(
@@ -32,7 +34,6 @@ async fn fixture(path: &std::path::Path, admin: GrantSpec) -> (NodeCoordinator, 
         ),
         None,
         UnixMillis(1),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -115,15 +116,10 @@ async fn checked_administration_persists_caller_audit_and_rechecks_sessions_afte
     );
     node.store.lock().await.unwrap().rotate().await.unwrap();
     drop(node);
-    let store = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(11),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let store = NodeStore::open(&location, network(), None, UnixMillis(11))
+        .await
+        .unwrap();
     assert_eq!(store.state().last_administration(), Some(&revoked));
     assert!(store.state().authority().grant(ids::FRIEND_GRANT).is_some());
     assert!(store.state().authority().grant(ids::AGENT_GRANT).is_none());
@@ -172,15 +168,10 @@ async fn unmounted_operations_cannot_be_issued() {
     );
     assert_eq!(node.store.lock().await.unwrap().state(), &before);
     drop(node);
-    let reopened = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(10),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(10))
+        .await
+        .unwrap();
     assert_eq!(reopened.state().authority(), before.authority());
     assert!(reopened.state().last_administration().is_none());
 }
@@ -234,7 +225,8 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 );
                 node.store.lock().await.unwrap().resume_statements(release).await;
                 drop(node);
-                let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11), Default::default(),)
+                let location = StoreLocation::for_test(directory.path());
+                let reopened = NodeStore::open(&location, network(), None, UnixMillis(11))
                     .await
                     .unwrap();
                 crate::test_support::passkey_caller(
@@ -368,15 +360,10 @@ async fn an_owner_binds_one_verified_provider_and_may_retry_it() {
     );
     node.check_provider(&provider).await.unwrap();
     drop((node, root, gateway));
-    let reopened = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(10),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(10))
+        .await
+        .unwrap();
     assert_eq!(reopened.state().provider().unwrap(), &provider);
 }
 

@@ -41,6 +41,17 @@ pub struct ClientService {
 }
 
 impl ClientService {
+    /// Release the journal once the request owner has joined its observer.
+    pub async fn close(&mut self) -> Result<(), WorkStoreError> {
+        self.observer
+            .endpoint
+            .lock_for_shutdown()
+            .await
+            .store
+            .close()
+            .await
+    }
+
     /// Starts sharing an already opened journal with its observer.
     #[must_use]
     pub fn new(mut endpoint: ClientEndpoint) -> Self {
@@ -335,19 +346,19 @@ mod proposal_tests {
         let capacity = closure.iter().map(|object| object.bytes()).sum::<u64>()
             + facts.max_spool_bytes
             + crate::content::tree_reservation(&closure, facts.max_spool_bytes).unwrap();
+        let location = hellas_private::StoreLocation::for_test(root);
         let content = DiskStore::open(
-            root.join("content"),
+            location.child("content"),
             vec![],
             IndexMode::Resume,
             Some(capacity),
             Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
         let mut store = ChannelStore::open(
-            root,
+            &location,
             ready.channel().clone(),
             fixture::settlement(),
             Role::Client,
@@ -474,7 +485,7 @@ mod proposal_tests {
             holding.pins(&bound, "", Cursor::default()).await.unwrap();
         });
         waiting
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(crate::test_support::HANG_GUARD)
             .unwrap();
         let observer = client.observer();
         let proposal = JobProposal {
@@ -492,7 +503,7 @@ mod proposal_tests {
         release.send(()).unwrap();
         hold.await.unwrap();
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(30), observed)
+            tokio::time::timeout(crate::test_support::HANG_GUARD, observed)
                 .await
                 .unwrap()
                 .unwrap(),

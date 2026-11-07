@@ -3,6 +3,10 @@
 mod operator_interception;
 pub use operator_interception::rejects_operator_interception;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+pub const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A fresh private CA and a TLS acceptor serving its `localhost` leaf.
 pub fn private_ca_acceptor() -> (
     rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,

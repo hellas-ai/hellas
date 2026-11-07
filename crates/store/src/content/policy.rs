@@ -49,13 +49,12 @@ mod tests {
     }
     async fn node(root: &std::path::Path, lower: Vec<std::path::PathBuf>) -> DiskStore {
         let node = DiskStore::open(
-            root.into(),
+            hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
             lower,
             IndexMode::Resume,
             None,
             Reservations::ram(8 << 20),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -370,13 +369,12 @@ mod tests {
             node.close().await;
             drop(node);
             let node = DiskStore::open(
-                root.path().to_owned(),
+                hellas_private::StoreLocation::for_test(root.path()),
                 vec![],
                 IndexMode::Resume,
                 None,
                 Reservations::ram(8 << 20),
                 false,
-                Default::default(),
             )
             .await
             .unwrap();

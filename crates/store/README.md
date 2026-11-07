@@ -34,7 +34,7 @@ trusted file identity and the opened descriptor still determine validity.
 Keep the upper and its ancestors private and stable. Lower files are assumed
 immutable: an independent writer holding the same inode can change its bytes.
 
-The upper defaults to `$HOME/.hellas/store`; capacity defaults to available
+The upper defaults to `<home>/store` (`--home` or `HELLAS_HOME` selects home) and takes the node durability; capacity defaults to available
 physical free space. Admission collects unpinned cache on demand; network-on-miss is refused by default.
 Declared pins must live under `config/` and default to `Jobs`. They can explicitly
 select `owner`, `jobs`, `granted` or `public`; Channel policy uses

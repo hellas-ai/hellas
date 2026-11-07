@@ -1,4 +1,5 @@
 use hellas_authority::model::grant::records::{check_grant_provider, grant_transport};
+use hellas_private::StoreLocation;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -84,7 +85,8 @@ pub struct FetchProviderOptions<R> {
     pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
-    pub state_directory: PathBuf,
+    /// Process home for chain-agnostic grant authority state.
+    pub home: StoreLocation,
     pub content: hellas_store::content::DiskStore,
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
@@ -118,9 +120,7 @@ impl<R> FetchProviderOptions<R> {
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
-                    durability: options.content.durability(),
-                    network: config.chain.network,
-                    journal_root: config.journal_root,
+                    chain: config.chain.clone(),
                     poll: config.poll,
                     max_observation_age: config.max_observation_age,
                     settlement_key,
@@ -147,7 +147,7 @@ impl<R> FetchProviderOptions<R> {
             grants: options.grants.map(|config| ProviderGrants {
                 config,
                 authority: ProviderAuthority::Journal {
-                    root: options.state_directory.join("grants"),
+                    root: crate::grant_config::GrantConfig::journal_dir(&options.home),
                 },
             }),
             work: work_config,
@@ -176,7 +176,7 @@ pub struct ProviderGrants {
 /// to the host's existing control service and writer.
 #[derive(Clone)]
 pub enum ProviderAuthority {
-    Journal { root: PathBuf },
+    Journal { root: StoreLocation },
     Host(Box<crate::node_control::NodeControl>),
 }
 impl ProviderAuthority {
@@ -193,7 +193,6 @@ impl ProviderGrants {
         &self,
         resources: crate::grant_provider::ProviderResources<'_>,
         provider: &ProviderEnrollmentBundle,
-        durability: hellas_private::Durability,
     ) -> Result<hellas_authority::node::NodeCoordinator, ProviderError> {
         resources.validate(self.config.configuration.resources())?;
         match &self.authority {
@@ -204,7 +203,6 @@ impl ProviderGrants {
                         hellas_authority::model::grant::grant_network(),
                         Some(provider.clone()),
                         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-                        durability,
                     )
                     .await?,
                     Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
@@ -361,7 +359,7 @@ impl ProviderHandle {
             discovery.shutdown().await;
         }
         if let Some(grants) = self.router.as_ref().and_then(WorkRouter::grant_service) {
-            let drained = grants.drain().await.map_err(ProviderError::from);
+            let drained = grants.shutdown().await.map_err(ProviderError::from);
             result = result.and(drained);
         }
         if let Some(work) = &mut self.work {
@@ -378,10 +376,10 @@ impl ProviderHandle {
         };
         result = result.and(joined);
         if self.owns_endpoint {
-            self.endpoint.close().await;
+            hellas_wire::iroh::close(&self.endpoint).await;
         }
         if let Some(node) = self.owned_authority.take() {
-            result = result.and(node.close().await.map_err(ProviderError::from));
+            node.close().await;
         }
         result
     }
@@ -434,9 +432,9 @@ where
 {
     if let Some((work, _)) = &config.work {
         work.validate()?;
-        if config.content.durability() == hellas_private::Durability::Crash {
+        if work.chain.home().durability() == hellas_private::Durability::Crash {
             tracing::warn!(
-                "paid channel state may be lost on power failure; set durability = \"power\""
+                r#"paid channel state may be lost on power failure; set durability = "power""#
             );
         }
     }
@@ -457,9 +455,7 @@ where
             } else {
                 crate::grant_provider::ProviderResources::Fetch(&config.executor.fetch_routes)
             };
-            let store = grants
-                .open(resources, enrollment, config.content.durability())
-                .await?;
+            let store = grants.open(resources, enrollment).await?;
             Some((grants, store))
         }
         None => None,
@@ -695,8 +691,8 @@ where
         accept_task,
         endpoint,
         owns_endpoint,
-        work,
         owned_authority,
+        work,
     })
 }
 
@@ -943,6 +939,10 @@ where
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 pub(crate) mod tests;
 
 /// The shared confidential-open proof handler. Software enrollment roots are

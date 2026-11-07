@@ -21,7 +21,7 @@ const AUTH_FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(35);
 const REFRESH_SKEW_SECONDS: u64 = 120;
 const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
 
-pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
+pub(crate) async fn login(auth_path: &Path) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
     let client = CodexAuthClient::new(
         Url::parse(ISSUER).expect("Codex auth issuer URL is valid"),
@@ -33,7 +33,7 @@ pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn status(auth_path: Option<&Path>) -> anyhow::Result<()> {
+pub(crate) fn status(auth_path: &Path) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
     match store.load() {
         Ok(state) => {
@@ -61,10 +61,7 @@ pub(crate) fn status(auth_path: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn import_codex_cli(
-    auth_path: Option<&Path>,
-    source_path: Option<&Path>,
-) -> anyhow::Result<()> {
+pub(crate) fn import_codex_cli(auth_path: &Path, source_path: Option<&Path>) -> anyhow::Result<()> {
     let source_path = match source_path {
         Some(path) => path.to_path_buf(),
         None => default_codex_cli_auth_path()?,
@@ -92,11 +89,8 @@ pub(crate) struct CodexAuthStore {
 }
 
 impl CodexAuthStore {
-    pub(crate) fn new(path: Option<&Path>) -> Result<Self, CodexAuthError> {
-        let path = match path {
-            Some(path) => path.to_path_buf(),
-            None => default_auth_path()?,
-        };
+    pub(crate) fn new(path: &Path) -> Result<Self, CodexAuthError> {
+        let path = path.to_path_buf();
         Ok(Self {
             path,
             token_url: Url::parse(TOKEN_URL).expect("Codex auth token URL is valid"),
@@ -255,7 +249,7 @@ pub(crate) enum CodexAuthError {
     Encode(serde_json::Error),
     #[error("Codex auth IO error: {0}")]
     Io(std::io::Error),
-    #[error("HOME environment variable is not set; pass --auth-path")]
+    #[error("HOME environment variable is not set; cannot locate the Codex CLI auth file")]
     MissingHome,
     #[error("failed to read Codex CLI auth file {0}: {1}")]
     CodexCliAuthRead(PathBuf, std::io::Error),
@@ -380,6 +374,10 @@ impl CodexAuthClient {
     ) -> Result<DeviceExchange, CodexAuthError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
         while tokio::time::Instant::now() < deadline {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: OAuth-mandated interval"
+            )]
             tokio::time::sleep(Duration::from_secs(device.interval)).await;
             let response = self
                 .http
@@ -718,10 +716,6 @@ fn home_dir() -> Result<PathBuf, CodexAuthError> {
         .ok_or(CodexAuthError::MissingHome)
 }
 
-fn default_auth_path() -> Result<PathBuf, CodexAuthError> {
-    Ok(home_dir()?.join(".hellas").join("codex-auth.json"))
-}
-
 fn default_codex_cli_auth_path() -> Result<PathBuf, CodexAuthError> {
     Ok(home_dir()?.join(".codex").join("auth.json"))
 }
@@ -752,6 +746,10 @@ impl FileLock {
                     ),
                 )));
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: OS advisory file lock"
+            )]
             std::thread::sleep(Duration::from_millis(25));
         }
     }

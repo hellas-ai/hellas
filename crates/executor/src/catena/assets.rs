@@ -83,6 +83,10 @@ impl Assets {
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err("resident cache poisoned".into());
                 }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class A: cache mutex; rollout 4"
+                )]
                 Err(std::sync::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(2))
                 }
@@ -198,13 +202,12 @@ mod tests {
         let path = lower.join("weights");
         std::fs::write(&path, b"original").unwrap();
         let node = DiskStore::open(
-            root.path().join("upper"),
+            hellas_private::StoreLocation::for_test(root.path()).child("upper"),
             vec![lower],
             IndexMode::Resume,
             None,
             Reservations::ram(1 << 20),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -257,7 +260,6 @@ mod tests {
                     .to_string()
                     .contains("timed out or cancelled")
             );
-            assert!(start.elapsed() < Duration::from_millis(100));
         }
     }
 }

@@ -1,138 +1,102 @@
 use super::*;
-use serde_json::{Value, json};
+use hellas_chain::genesis::Chain;
+use hellas_private::StoreLocation;
 
-fn config() -> WorkConfig {
-    WorkConfig {
-        chain: ChainCrossCheck {
-            network: NetworkId::new("hellas-devnet-1").unwrap(),
-            genesis_payload_digest: Digest::from_bytes([1; 32]),
-            threshold_identity: hex::decode(concat!(
-                "97f1d3a73197d7942695638c4fa9ac0fc",
-                "3688c4f9774b905a14e3a3f171bac586",
-                "c55e83ff97a1aeffb3af00adb22c6bb",
-            ))
-            .unwrap(),
-            genesis: None,
-        },
-        validators: (1..=VALIDATOR_COUNT)
-            .map(|i| format!("ws://127.0.0.1:900{i}"))
-            .collect(),
-        journal_root: PathBuf::from("/var/lib/hellas/work"),
-        poll: Duration::from_millis(250),
-        max_observation_age: Duration::from_millis(5_000),
-    }
+#[test]
+fn a_single_authenticated_route_is_usable() {
+    let root = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let mut config = WorkConfig::for_chain(ChainProfile::known(Chain::Devnet), &location).unwrap();
+    config.chain = config
+        .chain
+        .with_validators(vec![" WSS://EXAMPLE.COM:443 ".into()])
+        .unwrap();
+    let config = config.validate().unwrap();
+    assert_eq!(config.chain.validators(), ["wss://example.com/"]);
+    assert_eq!(config.network().as_str(), "hellas-devnet-2");
+    assert!(config.node_config(None).is_ok());
 }
 
-fn file(config: &WorkConfig) -> Value {
-    json!({
-        "chain": {
-            "network_id": config.chain.network.as_str(),
-            "genesis_payload_digest": hex::encode(config.chain.genesis_payload_digest.as_bytes()),
-            "threshold_identity": hex::encode(&config.chain.threshold_identity),
-            "genesis": config.chain.genesis,
-        },
-        "validators": config.validators, "journal": {"root": config.journal_root},
-        "poll_ms": config.poll.as_millis(),
-        "max_observation_age_ms": config.max_observation_age.as_millis(),
+#[test]
+fn custom_full_genesis_can_derive_h0_at_node_start() {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let mut genesis: hellas_chain::genesis::Genesis =
+        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
+    genesis.network_id = "custom-execution-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    let profile = ChainProfile::custom(CustomChainFile {
+        trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json,
     })
+    .unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let node = WorkConfig::for_chain(profile, &location)
+        .unwrap()
+        .node_config(None)
+        .unwrap();
+    assert_eq!(node.genesis().network_id, "custom-execution-1");
 }
 
-fn load(config: &WorkConfig) -> Result<WorkConfig> {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("work.json");
-    std::fs::write(&path, file(config).to_string()).unwrap();
-    load_work_config(&path).map_err(|error| match error {
-        WorkConfigError::File { source, .. } => *source,
-        other => other,
+#[test]
+fn a_registered_id_cannot_rebind_pins_but_can_change_routes() {
+    let known = ChainProfile::known(Chain::Devnet);
+    let changed_route = ChainProfile::custom(CustomChainFile {
+        trust: known.trust().clone(),
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json: known.genesis_json().to_owned(),
     })
-}
-
-fn accepts(config: WorkConfig) -> WorkConfig {
-    let loaded = load(&config).unwrap();
-    let typed = config.validate().unwrap();
-    assert_eq!(typed.chain, loaded.chain);
-    assert_eq!(typed.validators, loaded.validators);
-    assert_eq!(typed.journal_root, loaded.journal_root);
-    assert_eq!(typed.poll, loaded.poll);
-    assert_eq!(typed.max_observation_age, loaded.max_observation_age);
-    typed
-}
-
-fn refuses(config: WorkConfig) {
-    let loaded = load(&config).unwrap_err();
-    let typed = config.validate().unwrap_err();
-    assert_eq!(
-        std::mem::discriminant(&typed),
-        std::mem::discriminant(&loaded)
+    .unwrap();
+    assert_eq!(changed_route.known_chain(), Some(Chain::Devnet));
+    let mut changed_genesis = known.genesis().clone();
+    changed_genesis.allocations[0].balance += 1;
+    let changed_json = serde_json::to_string(&changed_genesis).unwrap();
+    let mut changed_trust = known.trust().clone();
+    use commonware_cryptography::{Hasher as _, Sha256};
+    changed_trust.genesis_sha256 = hex::encode(Sha256::hash(changed_json.as_bytes()));
+    let error = ChainProfile::custom(CustomChainFile {
+        trust: changed_trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json: changed_json,
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("this binary is out of date for devnet; please update")
     );
-    assert_eq!(typed.to_string(), loaded.to_string());
 }
 
 #[test]
-fn typed_and_loaded_configs_normalize_identically() {
-    let mut c = config();
-    c.validators[0] = " WSS://EXAMPLE.COM:443 ".into();
-    let c = accepts(c);
-    assert_eq!(c.validators[0], "wss://example.com/");
-    assert_eq!(c.validators[1], "ws://127.0.0.1:9002/");
-    let node = c.node_config(PathBuf::from("node"), None).unwrap();
-    assert_eq!(node.validators, c.validators);
-    accepts(c); // Normalization is idempotent.
-}
-
-#[test]
-fn typed_and_loaded_validator_refusals_match() {
-    for entry in [
-        "",
-        "not a URL",
-        "mailto:validators@example.com",
-        "http://example.com",
-        "https://example.com",
-        "ftp://example.com",
-    ] {
-        let mut c = config();
-        c.validators[0] = entry.into();
-        refuses(c);
-    }
-    let mut c = config();
-    c.validators.pop();
-    refuses(c);
-    let mut c = config();
-    c.validators.push("ws://extra.example".into());
-    refuses(c);
-    let mut c = config();
-    c.validators[0] = " WS://EXAMPLE.COM:80 ".into();
-    c.validators[5] = "ws://example.com/".into();
-    refuses(c);
-}
-
-#[test]
-fn typed_and_loaded_chain_timing_and_journal_refusals_match() {
-    for identity in [vec![], vec![0; 48], vec![1; 16]] {
-        let mut c = config();
-        c.chain.threshold_identity = identity;
-        refuses(c);
-    }
-    let mut c = config();
-    c.chain.network = NetworkId::new("custom-network").unwrap();
-    refuses(c);
-    let mut c = config();
-    c.chain.genesis = Some(chain_genesis(c.chain.network, &None).unwrap());
-    c.chain.network = NetworkId::new("custom-network").unwrap();
-    refuses(c);
-    let mut c = config();
-    c.journal_root = PathBuf::new();
-    refuses(c);
-    let mut c = config();
-    c.poll = Duration::ZERO;
-    refuses(c);
-    for age in [
-        Duration::ZERO,
-        Duration::from_millis(249),
-        Duration::from_millis(250),
-    ] {
-        let mut c = config();
-        c.max_observation_age = age;
-        refuses(c);
-    }
+fn paid_client_accepts_scheduled_keys_while_static_node_rejects_them() {
+    let root = tempfile::tempdir().unwrap();
+    let known = ChainProfile::known(Chain::Devnet);
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = "custom-rotating-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    let mut trust = known.trust().clone();
+    trust.network_id = "custom-rotating-1".into();
+    use commonware_cryptography::{Hasher as _, Sha256};
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    trust.epochs[0].end_height = Some(2);
+    let mut next = trust.epochs[0].clone();
+    next.epoch = 1;
+    next.start_height = 2;
+    next.end_height = None;
+    trust.epochs.push(next);
+    let profile = ChainProfile::custom(CustomChainFile {
+        trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json,
+    })
+    .unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let config = WorkConfig::for_chain(profile, &location).unwrap();
+    assert!(config.node_config(None).is_err());
+    let error = config.threshold_identity().unwrap_err();
+    assert!(error.to_string().contains("one open trusted epoch"));
 }

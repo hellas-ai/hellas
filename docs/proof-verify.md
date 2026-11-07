@@ -4,7 +4,7 @@
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
-`schema_version: 1`, `network_id: "hellas-devnet-1"`, the SHA-256 of the exact
+`schema_version: 1`, `network_id: "hellas-devnet-2"`, the SHA-256 of the exact
 genesis JSON bytes, and a nonempty contiguous epoch schedule. Each epoch supplies
 an ID, a height range, and the 96-character compressed BLS MinPk threshold
 identity. Schedules start at height zero, have no gaps or overlaps, and use
@@ -32,50 +32,70 @@ cannot erase it. Reverify stored evidence against independently provisioned trus
 before rendering; the shared storage interface permits native and Worker backends.
 
 Address summaries and holdings pages use `AddressProofBundle`. Its bounded page
-is a JSON-encoded `OwnerPageProof` linked to the owner root in the certified
-block. `verify_address` checks the certificate and proof before exposing a
+is a typed `OwnerPageProof` linked to the owner root in the certified
+block. JSON and protobuf responses carry the same page fields. `verify_address` checks the certificate and proof before exposing a
 `VerifiedAddress`. Summary `balance` is the sum of spendable coins; `count`
 includes coins and edges, while edges contribute zero balance. It makes no claim
 about complete transaction history.
 
 Consensus updates the sparse owner tree in the same speculative QMDB batch as
-coin and edge mutations. Canonical `HLS2` blocks commit both the QMDB state root
+coin and edge mutations. Canonical `HLS3` blocks commit both the QMDB state root
 and the owner root.
 
-Owner paths prove membership or absence. Holdings paths include authenticated
-subtree counts, so a page cannot omit, reorder, duplicate, or substitute a
-holding. Limits are 1 through 64. The origin reads owner nodes from the durable
+Owner paths prove membership or absence. A Latest page carries an authenticated
+after-key path, including when that key has been removed; subtree counts prove
+the exact next rank. A page cannot omit, reorder, duplicate, or substitute a
+holding. Financial selection reads pages until it finds enough candidates and
+rechecks selected objects together at one current root. Complete human listings
+report a changed root and can be retried. Limits are 1 through 32, matching the Current proof key budget. The
+origin reads owner nodes from the durable
 QMDB checkpoint shared with finalized EdgeIndex replay. It publishes a checkpoint
 only after deterministic replay matches the certified state and owner roots.
 
 ## Run the native origin
 
-For a disposable devnet, export the public epoch-zero trust from the generated
-validator configuration:
+For a disposable custom network, give generated genesis a fresh `--network-id`
+and export the public epoch-zero trust from the validator configuration. A
+registered network ID must keep its shipped genesis:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
-hellas chain indexer serve --rpc ws://127.0.0.1:8789 --genesis network/genesis.json --trust network/trust.json --storage-dir network/indexer
+python3 - <<'PY'
+import json
+from pathlib import Path
+root = Path("network")
+profile = {
+    "genesis_json": (root / "genesis.json").read_bytes().decode("utf-8"),
+    "trust": json.loads((root / "trust.json").read_text()),
+    "validators": ["ws://127.0.0.1:8789"],
+}
+(root / "chain.json").write_text(json.dumps(profile))
+PY
+hellas --chain-config network/chain.json chain indexer serve --rpc ws://127.0.0.1:8789 --home network/indexer
 ```
 
-The exporter checks the genesis against the validator configuration and emits
-public trust data. Authenticate `network/trust.json` and the exact genesis file
-separately from the RPC peer. Do not parse, reserialize, trim, or otherwise
-change the provisioned genesis bytes.
+The exporter checks the genesis committee against the validator configuration
+and emits public trust data. Authenticate `network/trust.json` and the exact genesis file
+separately from the RPC peer. Put the trust document, validator URLs, and exact
+genesis bytes as a JSON string in `network/chain.json` before starting the indexer.
+Do not parse, reserialize, trim, or otherwise change the
+provisioned genesis bytes when calculating its exact-file SHA-256.
 
-CLI chain queries and signing commands also require `--trust network/trust.json`.
-Pass `--genesis network/genesis.json` for a separately provisioned genesis. The
-RPC client authenticates snapshot height and roots by fetching the canonical
-block committed by its certificate. Coin and edge records remain unverified;
-the CLI labels them accordingly. RPC snapshot verification currently accepts
-one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
+CLI chain queries and signing commands for this custom network also require
+`--chain-config network/chain.json`. The RPC client authenticates snapshot
+height and roots by fetching the canonical
+block committed by its certificate. Coin, edge, and owner listings carry
+Current-state inclusion, exclusion, and owner-rank proofs checked by
+`ProofVerifier` against the selected epoch schedule. The CLI labels raw
+validator and finalization metadata as unverified.
 
-`ProofVerifier::with_genesis(trust, genesis_bytes)` pins both inputs.
-`ProofVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
-the embedded devnet genesis.
+`ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
+`ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
+light-client pin. Without `--chain-config`, CLI commands
+select the compiled Devnet profile.
 
-`hellas chain indexer serve --rpc wss://relay.example/ws --trust trust.json
---storage-dir /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
+`hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
+--home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
 origin over a full executing chain node. Repeat `--rpc` for multiple validator
 or relay seeds; the node also discovers iroh ChainSync peers from its provisioned
 committee. Trust and genesis are always provisioned locally. Publish or protect
@@ -99,7 +119,7 @@ Block and transaction evidence is reverified before serving. Owner checkpoints
 are certified on admission and reverified on disk recovery; address pages are
 verified against that immutable checkpoint without repeating its signature check.
 
-`/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address
+`/api/v1/addresses/{base58-owner}/proof?offset=0&limit=32` returns an address
 bundle. `payload=...` pins the current durable owner checkpoint. The origin serves
 only that checkpoint, so a new finalized block makes an older pin unavailable,
 including between pagination requests. EdgeIndex and owner proofs both use the

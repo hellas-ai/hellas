@@ -2,9 +2,10 @@
 //! The pairing secret is delivered through the authenticated machine console.
 use super::*;
 use hellas_authority::work_store::grant::{NodeStore, PreparedBootstrap};
+use hellas_private::StoreLocation;
 use hellas_rpc::ProviderEnrollmentBundle;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::Path};
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
@@ -58,10 +59,9 @@ impl Invitation {
 pub async fn accept(
     endpoint: &iroh::Endpoint,
     invitation: &Invitation,
-    directory: &Path,
+    directory: &StoreLocation,
     network: hellas_kernel::NetworkId,
     provider: Option<ProviderEnrollmentBundle>,
-    durability: hellas_private::Durability,
 ) -> Result<(), WireStatus> {
     let now = UnixMillis::now().map_err(|_| unavailable())?;
     let remaining = invitation.expires.0.checked_sub(now.0).ok_or_else(denied)?;
@@ -140,24 +140,23 @@ pub async fn accept(
         // Admission ends the client's handshake deadline. Accepted writes must
         // still finish if the client disconnects before either reply arrives.
         let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.write_all(&[VERSION])).await;
-        let store = NodeStore::bootstrap_prepared(
+        let mut store = NodeStore::bootstrap_prepared(
             directory,
             network,
             request.root,
             request.approval,
             provider.clone(),
             now,
-            durability,
         )
         .await
         .map_err(node_error)?;
         // The store is now the crash-safe completion marker. No other request
         // can commit; cancel remaining unauthenticated connections before handoff.
+        store.close().await;
         pending.shutdown().await;
         let _ = send.write_all(&[VERSION]).await;
         let _ = send.finish();
         let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
-        drop(store);
         tracing::info!("owner bootstrap committed");
         return Ok(());
     }
@@ -223,6 +222,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
     use {hellas_authority::test_support::common_node, hellas_channel::test_support::actors::ROOT};
 
     #[test]
@@ -337,6 +337,7 @@ mod tests {
     async fn slow_bootstrap_commit_outlives_handshake_timeout() {
         use hellas_authority::test_support::BOOTSTRAP_COMMIT_PAUSE;
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let invitation = invitation(&server);
         let (root, approval, secret) = prepared(server.id());
@@ -349,10 +350,9 @@ mod tests {
                 accept(
                     &server,
                     &invitation,
-                    directory.path(),
+                    &store_location,
                     hellas_channel::test_support::network(),
                     None,
-                    Default::default(),
                 ),
             ),
             async {
@@ -381,11 +381,10 @@ mod tests {
         connected.unwrap();
         let node = NodeCoordinator::new(
             NodeStore::open(
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
                 UnixMillis::now().unwrap(),
-                Default::default(),
             )
             .await
             .unwrap(),
@@ -464,6 +463,7 @@ mod tests {
             }
         }
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let invitation = invitation(&server);
         let (root, mut approval, _) = prepared(server.id());
@@ -484,10 +484,9 @@ mod tests {
             accept(
                 &server,
                 &invitation,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             ),
             connect(&client, &invitation, root, approval),
         );
@@ -500,19 +499,19 @@ mod tests {
     #[tokio::test]
     async fn owner_approval_cannot_be_retargeted_to_another_machine() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, other) = endpoints().await;
         let (root, mut approval, _) = prepared(other.id());
         // Changing the public target cannot adapt the owner's signature.
         approval.target = Some(*server.id().as_bytes());
         assert!(
             NodeStore::bootstrap_prepared(
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 root,
                 approval,
                 None,
-                UnixMillis::now().unwrap(),
-                Default::default(),
+                UnixMillis::now().unwrap()
             )
             .await
             .is_err()
@@ -525,6 +524,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_bootstrap_does_not_block_a_valid_owner() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let staller = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .bind()
@@ -536,10 +536,9 @@ mod tests {
             accept(
                 &server,
                 &invitation,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             ),
             async {
                 let stalled = staller
@@ -592,6 +591,7 @@ mod tests {
     #[tokio::test]
     async fn expired_invitation_cannot_initialize_or_send_approval() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let mut invitation = invitation(&server);
         invitation.expires = UnixMillis(0);
@@ -600,10 +600,9 @@ mod tests {
             accept(
                 &server,
                 &invitation,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             )
             .await
             .is_err()
@@ -616,6 +615,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_commits_the_saved_credential_and_cannot_be_replayed() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let invitation = invitation(&server);
         let (root, approval, secret) = prepared(server.id());
@@ -623,10 +623,9 @@ mod tests {
             accept(
                 &server,
                 &invitation,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             ),
             connect(&client, &invitation, root, approval.clone()),
         );
@@ -634,11 +633,10 @@ mod tests {
         client_result.unwrap();
         let node = NodeCoordinator::new(
             NodeStore::open(
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
                 UnixMillis::now().unwrap(),
-                Default::default(),
             )
             .await
             .unwrap(),
@@ -650,13 +648,12 @@ mod tests {
         drop(node);
         assert!(
             NodeStore::bootstrap_prepared(
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 root,
                 approval,
                 None,
-                UnixMillis::now().unwrap(),
-                Default::default(),
+                UnixMillis::now().unwrap()
             )
             .await
             .is_err()
@@ -667,6 +664,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_pairing_exhausts_the_invitation_without_creating_authority() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         let invitation = invitation(&server);
         let mut wrong: Invitation =
@@ -677,10 +675,9 @@ mod tests {
             accept(
                 &server,
                 &invitation,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             ),
             async {
                 for _ in 0..MAX_PAIRING_ATTEMPTS {
@@ -700,6 +697,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_invitation_refuses_old_secret_and_prebootstrap_authentication() {
         let directory = tempfile::tempdir().unwrap();
+        let store_location = StoreLocation::for_test(directory.path());
         let (server, client) = endpoints().await;
         // Start with the ordinary node's wider protocol set. Pairing must
         // narrow it before handling any incoming request.
@@ -715,10 +713,9 @@ mod tests {
             accept(
                 &server,
                 &current,
-                directory.path(),
+                &store_location,
                 hellas_channel::test_support::network(),
                 None,
-                Default::default(),
             ),
             async {
                 assert!(

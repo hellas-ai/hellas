@@ -42,15 +42,33 @@ pub struct DiskStore {
     pub(crate) core: Core,
 }
 pub(crate) struct Disk {
-    pub root: PathBuf,
+    pub root: StoreLocation,
     pub ram: Reservations,
     pub quota: Reservations,
     records: Arc<Records>,
     db: sqlx::SqlitePool,
     recovered: AtomicBool,
     work_owned: AtomicBool,
-    durability: Durability,
+    ownership: Mutex<Option<ContentLock>>,
 }
+/// The OS lock refuses a competing owner before SQLite opens the database.
+struct ContentLock(fs::File);
+impl Drop for ContentLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+fn lock_content(path: &FsPath) -> Result<ContentLock> {
+    let file = hellas_private::open_lock_beside(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(ContentLock(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(Error::Locked),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+// Ownership is decided by the OS lock without waiting. SQLite may still meet
+// transient locks while creating its WAL or closing a previous owner's connection.
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 pub(crate) struct FileObject {
     pub object: ContentRef,
     disk: Arc<Disk>,
@@ -90,19 +108,21 @@ fn database(error: sqlx::Error) -> Error {
 }
 impl Disk {
     async fn open(
-        root: PathBuf,
+        root: StoreLocation,
         capacity: Option<u64>,
         ram: Reservations,
         owner_only: bool,
-        durability: Durability,
     ) -> Result<Arc<Self>> {
+        let durability = root.durability();
         let directory = root.clone();
-        tokio::task::spawn_blocking(move || {
-            durability.create_dir_all(&directory)?;
-            Ok::<_, Error>(())
-        })
-        .await
-        .map_err(|_| Error::Invalid("content startup worker"))??;
+        let mut ownership = Some(
+            tokio::task::spawn_blocking(move || {
+                durability.create_dir_all(&directory)?;
+                lock_content(&directory.join("content.sqlite"))
+            })
+            .await
+            .map_err(|_| Error::Invalid("content startup worker"))??,
+        );
         let options = SqliteConnectOptions::new()
             .filename(root.join("content.sqlite"))
             .create_if_missing(true)
@@ -120,7 +140,7 @@ impl Disk {
                 },
             )
             .locking_mode(SqliteLockingMode::Exclusive)
-            .busy_timeout(std::time::Duration::ZERO);
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
         let db = SqlitePoolOptions::new()
             .max_connections(1)
             .max_lifetime(None)
@@ -129,8 +149,8 @@ impl Disk {
             .await
             .map_err(database)?;
         let opened = async {
-            // Ownership is checked outside after_connect, whose failures SQLx retries.
-            // Keep this one connection until close so its EXCLUSIVE lock stays live.
+            // The OS lock already excludes another owner. Keep this one
+            // connection until close so its EXCLUSIVE lock stays live.
             let mut connection = db.acquire().await.map_err(database)?;
             if let Err(error) = sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT")
                 .execute(&mut *connection)
@@ -178,14 +198,14 @@ impl Disk {
             .await
             .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
             Ok(Arc::new(Self {
-                quota: Reservations::disk(root.clone(), capacity, 0),
+                quota: Reservations::disk(root.to_path_buf(), capacity, 0),
                 root,
                 ram,
                 records,
                 db: db.clone(),
                 recovered: AtomicBool::new(false),
                 work_owned: AtomicBool::new(work_owned),
-                durability,
+                ownership: Mutex::new(ownership.take()),
             }))
 
         }
@@ -193,7 +213,17 @@ impl Disk {
         if opened.is_err() {
             db.close().await;
         }
+        drop(ownership);
         opened
+    }
+    /// Power republication also flushes an object another writer published.
+    fn sync_existing(&self, path: &FsPath) -> Result<()> {
+        if self.root.durability() == Durability::Power {
+            self.root
+                .durability()
+                .sync_file(&hellas_private::open_nofollow(path)?)?;
+        }
+        Ok(())
     }
     pub(crate) fn ready(&self) -> bool {
         self.recovered.load(Ordering::Acquire)
@@ -372,7 +402,7 @@ impl FileObject {
         chunks: Vec<hellas_xet::Chunk>,
         charge: Arc<Reservation>,
     ) -> Result<Self> {
-        disk.durability.sync_file(file.as_file())?;
+        disk.root.durability().sync_file(file.as_file())?;
         let entry = Entry {
             path: file.path().to_owned(),
             identity: FileIdentity::of(&file.as_file().metadata()?),
@@ -586,6 +616,7 @@ impl FileObject {
         let private = self.private.lock().unwrap().clone();
         if let Some(path) = private {
             let entry = if let Some(entry) = self.verify_upper(&destination)? {
+                self.disk.sync_existing(&destination)?;
                 entry
             } else {
                 fs::hard_link(&path, &destination)?;
@@ -599,7 +630,8 @@ impl FileObject {
                 }
             };
             self.disk
-                .durability
+                .root
+                .durability()
                 .sync_directory(destination.parent().unwrap())?;
             let private_entry = Entry {
                 path: path.clone(),
@@ -640,7 +672,7 @@ impl FileObject {
         Ok(None)
     }
     fn link_temp(&self, directory: &FsPath) -> Result<()> {
-        self.disk.durability.create_dir_all(directory)?;
+        self.disk.root.durability().create_dir_all(directory)?;
         let path = directory.join(self.object.id().to_string());
         let mut staged = self
             .staged
@@ -653,6 +685,8 @@ impl FileObject {
         let chunks = self.entries.lock().unwrap()[0].chunks.clone();
         if existing.is_none() {
             fs::hard_link(file.path(), &path)?;
+        } else {
+            self.disk.sync_existing(&path)?;
         }
         let temp_path = file.path().to_owned();
         let charge = charge.clone();
@@ -672,9 +706,10 @@ impl FileObject {
         entries.retain(|old| old.path != temp_path && old.path != entry.path);
         entries.push(entry);
         drop(entries);
-        self.disk.durability.sync_directory(directory)?;
+        self.disk.root.durability().sync_directory(directory)?;
         self.disk
-            .durability
+            .root
+            .durability()
             .sync_directory(&self.disk.root.join("staging"))?;
         Ok(())
     }
@@ -714,27 +749,27 @@ impl FileObject {
             .retain(|entry| entry.path != path);
         self.disk.quota.remove_owned(self.object.bytes());
         self.disk
-            .durability
+            .root
+            .durability()
             .sync_directory(path.parent().unwrap())?;
         Ok(self.object.bytes())
     }
 }
 impl DiskStore {
     pub fn durability(&self) -> Durability {
-        self.core.disk.as_ref().unwrap().durability
+        self.core.disk.as_ref().unwrap().root.durability()
     }
     /// Set owner_only for callers without an authoritative work-journal census.
     /// The monotone ownership fact is checked before scanning or cleanup.
     pub async fn open(
-        upper: PathBuf,
+        upper: StoreLocation,
         lower: Vec<PathBuf>,
         mode: IndexMode,
         capacity: Option<u64>,
         ram: Reservations,
         owner_only: bool,
-        durability: Durability,
     ) -> Result<Self> {
-        let disk = Disk::open(upper, capacity, ram.clone(), owner_only, durability).await?;
+        let disk = Disk::open(upper, capacity, ram.clone(), owner_only).await?;
         let opened = async {
             let core = Core::new(ram);
             let (generation, pins) = disk.pins().await?;
@@ -815,7 +850,9 @@ impl DiskStore {
                     disk.discard_directory(&entry.path(), false)?;
                 }
             }
-            disk.durability.sync_directory(&disk.root.join("staging"))?;
+            disk.root
+                .durability()
+                .sync_directory(&disk.root.join("staging"))?;
             disk.quota.reconcile_used(Disk::owned_bytes(&disk.root)?);
             // All journal roots and obligations now exist. Keep admission behind
             // this held gate while reclaiming only the cache needed to fit them.
@@ -1010,7 +1047,9 @@ impl Disk {
         let directory = self.root.join("staging").join(Self::job_name(job));
         if directory.exists() {
             self.discard_directory(&directory, true)?;
-            self.durability.sync_directory(&self.root.join("staging"))?;
+            self.root
+                .durability()
+                .sync_directory(&self.root.join("staging"))?;
         }
         Ok(())
     }
@@ -1089,7 +1128,8 @@ impl FileObject {
                 }
             }
             self.disk
-                .durability
+                .root
+                .durability()
                 .sync_directory(path.parent().unwrap())?;
         }
         Ok(())
@@ -1130,9 +1170,12 @@ mod tests;
 
 impl DiskStore {
     /// Wait for in-flight effects and release SQLite's exclusive writer lock.
+    /// Close the database, then release ownership for another opener.
     pub async fn close(&self) {
         let _gate = self.core.gate.lock().await;
-        self.core.disk.as_ref().unwrap().db.close().await;
+        let disk = self.core.disk.as_ref().unwrap();
+        disk.db.close().await;
+        disk.ownership.lock().unwrap().take();
     }
 }
 

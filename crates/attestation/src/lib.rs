@@ -77,22 +77,6 @@ impl RootProver for hellas_auth::ProducerSigningKey {
     }
 }
 
-#[derive(Clone)]
-pub struct MockAttester {
-    pub codec: &'static str,
-    pub credential: Vec<u8>,
-}
-
-impl Attester for MockAttester {
-    async fn attest(&self, binding: Binding) -> Result<AssuranceEvidence, AttestationError> {
-        Ok(AssuranceEvidence {
-            codec: self.codec.into(),
-            credential: self.credential.clone(),
-            proof: binding.as_bytes().to_vec(),
-        })
-    }
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AttestationError {
     #[error("wrong evidence codec")]

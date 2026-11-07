@@ -8,6 +8,7 @@ use crate::work::{
     fetch_result_stream, run_accepted_work,
 };
 use hellas_kernel::PendingSlot;
+use hellas_private::StoreLocation;
 use hellas_rpc::services::work::WorkServer;
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
@@ -419,7 +420,7 @@ async fn send_frames(
     }
     let response = service.accept(wire).await;
     connection.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
@@ -534,13 +535,12 @@ pub async fn client_service(
 /// The host restores every journal before calling finish_recovery.
 pub async fn content_store(root: &std::path::Path) -> hellas_store::content::DiskStore {
     hellas_store::content::DiskStore::open(
-        root.join("content"),
+        hellas_private::StoreLocation::for_test(root).child("content"),
         vec![],
         hellas_store::content::IndexMode::Resume,
         None,
         hellas_store::content::Reservations::ram(crate::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap()
@@ -553,8 +553,9 @@ pub async fn store_at(
     height: u64,
 ) -> ChannelStore {
     let content = content_store(root).await;
+    let location = StoreLocation::for_test(root);
     let mut store = match ChannelStore::open(
-        root,
+        &location,
         ready.channel().clone(),
         settlement(),
         role,
@@ -1020,16 +1021,10 @@ pub async fn open_setup_store(
     bond: EdgeId,
     role: Role,
 ) -> crate::work_store::SetupStore {
-    crate::work_store::SetupStore::open(
-        root,
-        network,
-        bond,
-        role,
-        &Secp256k1Verifier::new(),
-        Default::default(),
-    )
-    .await
-    .expect("the setup journal opens")
+    let location = StoreLocation::for_test(root);
+    crate::work_store::SetupStore::open(&location, network, bond, role, &Secp256k1Verifier::new())
+        .await
+        .expect("the setup journal opens")
 }
 
 /// Drive the same three signed revisions while each caller keeps its own terms and scan.

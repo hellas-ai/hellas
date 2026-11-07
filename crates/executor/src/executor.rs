@@ -588,13 +588,12 @@ mod content_tests {
      {
         let root = tempfile::tempdir().unwrap();
         let node = DiskStore::open(
-            root.path().into(),
+            hellas_private::StoreLocation::for_test(root.path()),
             vec![],
             IndexMode::Resume,
             None,
             Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
             false,
-            Default::default(),
         )
         .await
         .unwrap();

@@ -1,2 +1,8 @@
 future-size-threshold = 131072
 stack-size-threshold = 262144
+
+disallowed-methods = [
+    "tokio::time::sleep",
+    "tokio::time::interval",
+    "std::thread::sleep",
+]

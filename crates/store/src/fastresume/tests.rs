@@ -1,5 +1,9 @@
 use super::*;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn test_path(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -81,13 +85,12 @@ async fn forged_persisted_identity_cannot_supply_content_or_chunks() {
         Target,
     };
     let store = DiskStore::open(
-        upper,
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
         vec![lower],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -245,7 +248,7 @@ fn special_file_index_is_rejected_without_blocking() {
     });
     assert_eq!(
         receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(HANG_GUARD)
             .expect("fastresume load blocked while opening a FIFO"),
         0
     );

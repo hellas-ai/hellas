@@ -21,7 +21,7 @@ path (`--attempt FILE`) is an explicit request to execute again and consume the 
 `run`, `image` and `transcribe` accept `--offer NAME.POLICY` as the exclusive
 alternative to `--payment`; they save a zero-price job and use this same route.
 Grant channel journals share the imported offers' data directory with the
-gateway (`HELLAS_GRANT_DATA_DIR`); `--state-dir` is for paid execution.
+gateway under `<home>/grants`; paid execution lives under `<home>/chains/<full consensus digest>/`.
 Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
@@ -53,10 +53,11 @@ presents any other enrollment, before anything is signed or funded.
 `--faucet` only selects a key from the devnet genesis faucet allocation and
 retains it beside the identity; `--faucet-account N` selects one explicitly,
 and `--passkey FILE` uses your own owner key. Faucet keys are public
-development keys. The default chain is the shipped devnet. A custom chain uses `--trust FILE`, `--genesis FILE`, and six
-repeated `--validator URL` options. `--timeout 90s` bounds the whole operation;
-without it the command waits until the job is done. `--state-dir DIR` selects
-requester state.
+development keys. The default chain is the shipped devnet. Select a compiled chain with
+`--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
+The profile contains the exact `genesis_json` bytes as a JSON string, `trust`,
+and a nonempty `validators` URL list. `--timeout 90s` bounds the whole operation;
+without it the command waits until the job is done. `--home DIR` selects the directory for identity and requester state.
 
 The authenticated quote must admit the application's exact manifest and price.
 Those checks and the advertised input limits run before new channel funding.
@@ -108,7 +109,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-6e6ee62fc00e"
+evaluator = "hellas/catena-a621c8b54a7b"
 adaptor = "compute-0.0.1"
 
 [payment]

@@ -481,6 +481,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_private::StoreLocation;
 
     #[test]
     fn incremental_spool_size_matches_wire_encoding_at_array_boundaries() {
@@ -505,7 +506,6 @@ mod tests {
     async fn cancelled_paid_acceptance_finishes_journaling_and_ram_transfer_before_upload_cleanup()
     {
         use crate::test_support::channel as fixture;
-        use std::time::Duration;
         let root = tempfile::tempdir().unwrap();
         let client_root = tempfile::tempdir().unwrap();
         let ready = fixture::ready_of(
@@ -561,7 +561,7 @@ mod tests {
             .await;
         let (accepting, proposal) = (service.clone(), wire.clone());
         let caller = tokio::spawn(async move { accepting.accept(&proposal).await });
-        tokio::time::timeout(Duration::from_secs(5), entered)
+        tokio::time::timeout(crate::test_support::HANG_GUARD, entered)
             .await
             .unwrap()
             .unwrap();
@@ -573,7 +573,7 @@ mod tests {
             "the owned transition retains staged bytes while the real SQLite worker waits"
         );
         release.send(()).unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(5), service.accept(&wire))
+        let response = tokio::time::timeout(crate::test_support::HANG_GUARD, service.accept(&wire))
             .await
             .unwrap();
         let work = client.accepted(&response).await.unwrap();
@@ -606,19 +606,19 @@ mod tests {
             role: Role,
             bytes: u64,
         ) -> ChannelStore {
+            let location = StoreLocation::for_test(root);
             let content = DiskStore::open(
-                root.join("content"),
+                location.child("content"),
                 vec![],
                 IndexMode::Resume,
                 None,
                 Reservations::ram(bytes),
                 false,
-                Default::default(),
             )
             .await
             .unwrap();
             let store = ChannelStore::open(
-                root,
+                &location,
                 ready.channel().clone(),
                 fixture::settlement(),
                 role,
@@ -1157,7 +1157,7 @@ mod tests {
             }
         }
         drop(release);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(crate::test_support::HANG_GUARD, async {
             let mut endpoint = service.endpoint().await.unwrap();
             endpoint
                 .close
@@ -1416,7 +1416,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let resumed = tokio::time::timeout(Duration::from_secs(5), &mut next)
+        let resumed = tokio::time::timeout(crate::test_support::HANG_GUARD, &mut next)
             .await
             .expect("finalized progress must wake the same stream")
             .unwrap();

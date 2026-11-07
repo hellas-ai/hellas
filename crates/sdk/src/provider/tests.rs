@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 mod handshakes;
 pub(crate) mod host;
 mod node;
@@ -52,9 +53,10 @@ async fn paid_provider_advertises_work_and_chain_services() {
             .unwrap();
         let root = Arc::new(UnusedRoot);
         let state = fixture.root.path().join("state");
+        let location = StoreLocation::for_test(&state);
         drop(
             crate::test_node::bootstrap_node(
-                &state.join("grants"),
+                &crate::grant_config::GrantConfig::journal_dir(&location),
                 hellas_authority::model::grant::grant_network(),
                 Some(enrollment.clone()),
                 hellas_auth::authority::UnixMillis::now().unwrap(),
@@ -69,7 +71,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 enrollment,
                 root: root.clone(),
                 content: hellas_channel::test_support::channel::content_store(&state).await,
-                state_directory: state,
+                home: location,
                 routes,
                 fetch_max_in_flight: 1,
                 fetch_queue_capacity: 1,
@@ -326,6 +328,7 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let provider =
         crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0;
+    let location = StoreLocation::for_test(&root.path().join("provider"));
     let mut options = ProviderGrants {
         config: crate::GrantProviderOptions {
             configuration: hellas_authority::test_support::common_node::configuration(vec![
@@ -333,18 +336,12 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
             ]),
             max_job_millis: std::num::NonZeroU64::MIN,
         },
-        authority: ProviderAuthority::Journal {
-            root: root.path().join("provider"),
-        },
+        authority: ProviderAuthority::Journal { root: location },
     };
     let routes = FetchRouteRegistry::default();
     assert!(matches!(
         options
-            .open(
-                ProviderResources::Fetch(&routes),
-                &provider,
-                Default::default()
-            )
+            .open(ProviderResources::Fetch(&routes), &provider,)
             .await,
         Err(ProviderError::GrantConfig(
             GrantProviderError::MissingRoute(_)
@@ -354,11 +351,7 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
     options.config.configuration = Default::default();
     assert!(matches!(
         options
-            .open(
-                ProviderResources::Fetch(&routes),
-                &provider,
-                Default::default()
-            )
+            .open(ProviderResources::Fetch(&routes), &provider,)
             .await,
         Err(ProviderError::NodeStore(NodeStoreError::Uninitialized))
     ));

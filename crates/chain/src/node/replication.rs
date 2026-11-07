@@ -91,6 +91,17 @@ impl Network {
             .filter_map(|p| iroh::EndpointId::from_bytes(p.as_bytes()).ok())
             .collect()
     }
+    /// Discovered ChainSync peers first, then hints discovery has not reached.
+    /// Verification, not discovery, makes an answer safe.
+    fn candidates(&self) -> Vec<iroh::EndpointId> {
+        let known = self.ids();
+        let hints = self.hints.lock().unwrap();
+        let unreached = hints.keys().filter(|id| !known.contains(id));
+        let mut ids: Vec<_> = known.iter().chain(unreached).copied().collect();
+        ids.shuffle(&mut rand::rng());
+        ids.sort_by_key(|id| !known.contains(id));
+        ids
+    }
     pub fn block(&self, id: iroh::EndpointId) {
         let _ = self
             .manager()
@@ -188,9 +199,7 @@ impl Network {
         .cloned()
     }
     pub async fn fetch(&self, query: FinalizedBlockQuery) -> Option<FinalizedBlock> {
-        let mut ids = self.ids();
-        ids.shuffle(&mut rand::rng());
-        let mut pending = futures_util::stream::iter(ids)
+        let mut pending = futures_util::stream::iter(self.candidates())
             .map(|id| async move {
                 let mut permit = self
                     .manager()
@@ -208,8 +217,7 @@ impl Network {
                     let Some(wire) = response.block else {
                         return Ok(None);
                     };
-                    let block =
-                        crate::client::finalized_block_from_proto(wire, None).map_err(invalid)?;
+                    let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
                     self.trust.verify(&block)?;
                     if match query {
                         FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
@@ -246,22 +254,27 @@ impl Network {
         }
         None
     }
-    /// One bounded discovery pass. Registry capability observations select fetchers.
-    pub async fn discover_all(&self) {
-        let addresses: Vec<_> = self.hints.lock().unwrap().values().cloned().collect();
-        futures_util::stream::iter(addresses)
-            .for_each_concurrent(8, |address| self.discover(address))
-            .await;
-    }
+    /// Background discovery. Registry capability observations select feeders.
     pub async fn discover_periodically(&self) {
         loop {
+            let addresses: Vec<_> = self.hints.lock().unwrap().values().cloned().collect();
+            futures_util::stream::iter(addresses)
+                .for_each_concurrent(8, |address| self.discover(address))
+                .await;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: peer discovery; no push"
+            )]
             tokio::time::sleep(Duration::from_secs(10)).await;
-            self.discover_all().await;
         }
     }
     pub(super) async fn feed(&self, input: super::input::FinalizedInput) {
         let mut tasks = FuturesUnordered::new();
         let mut running = std::collections::BTreeSet::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class A: peer membership; rollout 5"
+        )]
         let mut discovery = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -299,8 +312,7 @@ impl Network {
                     let Some(wire) = response.block else {
                         continue;
                     };
-                    let block =
-                        crate::client::finalized_block_from_proto(wire, None).map_err(invalid)?;
+                    let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
                     if self.manager().is_blocked(peer(id)) {
                         return Err(invalid("peer quarantined"));
                     }
@@ -315,6 +327,10 @@ impl Network {
             }
             self.clients.lock().unwrap().remove(&id);
             failures = failures.saturating_add(1);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: reconnect backoff"
+            )]
             tokio::time::sleep(retry_delay(failures)).await;
         }
     }
@@ -355,7 +371,7 @@ impl opaque::Fetcher for Network {
     }
 }
 
-type Operation = commonware_storage::qmdb::any::unordered::fixed::Operation<
+type Operation = commonware_storage::qmdb::any::ordered::fixed::Operation<
     mmr::Family,
     Digest,
     crate::domain::Object,
@@ -383,10 +399,8 @@ impl state::Resolver for Network {
         let fetch = async {
             let mut attempt = 0u32;
             loop {
-                let mut ids = self.ids();
-                ids.shuffle(&mut rand::rng());
                 let mut pending = FuturesUnordered::new();
-                for id in ids.into_iter().take(8) {
+                for id in self.candidates().into_iter().take(8) {
                     pending.push(async move {
                         let mut permit = self
                             .manager()
@@ -481,6 +495,10 @@ impl state::Resolver for Network {
                 // QMDB treats resolver errors as fatal. An unavailable peer set
                 // is transient, so retry here until the engine cancels this range.
                 attempt = attempt.saturating_add(1);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: state-fetch backoff"
+                )]
                 tokio::time::sleep(retry_delay(attempt)).await;
             }
         };

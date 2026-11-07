@@ -75,6 +75,8 @@ pub async fn run(
         .context("failed to bind iroh endpoint")?;
 
     let discovery = build_client_registry(&endpoint)?;
+    let mdns_ready = discovery_readiness(discovery.mdns_subscribed);
+    tokio::pin!(mdns_ready);
     let mut registry = discovery.registry;
     registry.with_pool_options(PoolOptions {
         connect_timeout: CONNECT_TIMEOUT,
@@ -103,10 +105,14 @@ pub async fn run(
             .map(|secs| secs.to_string())
             .unwrap_or_else(|| "none".to_string())
     );
-    println!("event=monitor-ready message=\"press Ctrl+C to stop\"");
+    let mut ready = false;
 
     let monitor_timeout = async {
         if let Some(secs) = timeout_secs {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: monitor deadline"
+            )]
             tokio::time::sleep(Duration::from_secs(secs)).await;
         } else {
             future::pending::<()>().await;
@@ -116,6 +122,13 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            unavailable = &mut mdns_ready, if !ready => {
+                if let Some(reason) = unavailable {
+                    println!("{}", error_record("discovery-unavailable source=mdns", None, &reason));
+                }
+                ready = true;
+                println!("event=monitor-ready message=\"press Ctrl+C to stop\"");
+            }
             _ = tokio::signal::ctrl_c() => {
                 println!("event=monitor-stop reason=signal");
                 break;
@@ -209,7 +222,7 @@ pub async fn run(
         unique_peers, interrogated, interrogation_ok, interrogation_failed, hinted_peers
     );
 
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
     Ok(())
 }
 
@@ -230,6 +243,19 @@ fn error_record(event: &str, peer_id: Option<EndpointId>, error: &str) -> String
     match peer_id {
         Some(peer_id) => format!("event={event} peer={peer_id} error={error:?}"),
         None => format!("event={event} error={error:?}"),
+    }
+}
+
+async fn discovery_readiness(
+    subscription: Result<tokio::sync::watch::Receiver<bool>, String>,
+) -> Option<String> {
+    match subscription {
+        Ok(mut subscribed) => subscribed
+            .wait_for(|ready| *ready)
+            .await
+            .err()
+            .map(|_| "mDNS discovery stopped before subscribing".to_owned()),
+        Err(reason) => Some(reason),
     }
 }
 

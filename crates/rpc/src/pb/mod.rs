@@ -246,18 +246,17 @@ mod id_pins {
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{
-            GetAppliedFinalizedBlock, GetOperations, GetStateRoot, LightClient, SubmitWorkResponse,
+            GetAppliedFinalizedBlock, GetStateRoot, LightClient, SubmitWorkResponse,
             SubscribeFinalized,
         };
         // Applied witness checkpoints deliberately rotate the LightClient service.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x001c0b51);
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xf06c_d7ee);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974
         );
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
-        assert_eq!(<GetOperations as MethodMarker>::METHOD_ID, 0x2fa2a439);
         assert_eq!(<SubscribeFinalized as MethodMarker>::METHOD_ID, 0xc0ccad00);
     }
 }

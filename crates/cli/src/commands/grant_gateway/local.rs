@@ -4,12 +4,14 @@ use crate::{commands::CliResult, compute::ServeArgs, identity::LocalIdentity};
 use anyhow::Context as _;
 use hellas_authority::model::grant::grant_network;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
+use hellas_private::StoreLocation;
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTarget, GrantTransport};
 use std::{sync::Arc, time::Duration};
 
 /// Opens this node's own provider store and serves `grant` from an in-process
 /// executor. The allowance must already be configured on this node.
 pub async fn prepare(
+    home: &StoreLocation,
     grant: &str,
     native: ServeArgs,
     identity: &LocalIdentity,
@@ -23,13 +25,11 @@ pub async fn prepare(
     let grant = grant
         .parse()
         .context("--local-grant must be a 16-byte hexadecimal ID")?;
-    let root = crate::commands::contributions::data_root(&principal)?;
     let store = hellas_authority::work_store::grant::NodeStore::open(
-        &root.join("provider"),
+        &hellas_sdk::grant_config::GrantConfig::journal_dir(home),
         grant_network(),
         Some(identity.enrollment.clone()),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-        Default::default(),
     )
     .await?;
     let generation = store
@@ -42,7 +42,7 @@ pub async fn prepare(
         hellas_rpc::Assurance::ProducerSigned,
         FetchRouteRegistry::default(),
     );
-    let (content, reload) = prepare_content(&root, native, &mut executor).await?;
+    let (content, reload) = prepare_content(home, native, &mut executor).await?;
     let backend = Executor::spawn_configured(executor)
         .await
         .context("start local Work executor")?;
@@ -79,7 +79,9 @@ pub async fn prepare(
                 principal,
                 signer,
                 application,
-                journal_root: crate::commands::contributions::client_journal_root(&principal)?,
+                journal_root: crate::commands::contributions::client_journal_root(
+                    home, &principal,
+                )?,
                 control_timeout,
             },
             transport,
@@ -89,24 +91,24 @@ pub async fn prepare(
 }
 
 async fn prepare_content(
-    root: &std::path::Path,
+    home: &StoreLocation,
     native: ServeArgs,
     executor: &mut ExecutorSpawnConfig,
 ) -> CliResult<(
     hellas_store::content::DiskStore,
     crate::content_configuration::ContentReload,
 )> {
-    let configuration = native
-        .configure(executor)?
-        .with_default_upper(root.join("provider/content"));
+    let configuration = native.configure(executor)?.with_default_upper(
+        hellas_sdk::grant_config::GrantConfig::provider_dir(home).join("content"),
+    );
     let content = configuration
         .config()
         .open(
+            home,
             hellas_store::content::Reservations::ram(
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
             true,
-            Default::default(),
         )
         .await?;
     // Grant jobs are ephemeral; this host has no paid channel journals.
@@ -143,9 +145,13 @@ mod tests {
     #[tokio::test]
     async fn dedicated_local_upper_restarts_after_ram_work_and_refuses_paid_owned_reuse() {
         let root = tempfile::tempdir().unwrap();
-        let (store, reload) = prepare_content(root.path(), native(None), &mut executor())
-            .await
-            .unwrap();
+        let (store, reload) = prepare_content(
+            &StoreLocation::for_test(root.path()),
+            native(None),
+            &mut executor(),
+        )
+        .await
+        .unwrap();
         assert!(
             root.path()
                 .join("provider/content/content.sqlite")
@@ -172,20 +178,28 @@ mod tests {
         store.close().await;
         drop(content);
         drop(store);
-        let (store, reload) = prepare_content(root.path(), native(None), &mut executor())
-            .await
-            .unwrap();
+        let (store, reload) = prepare_content(
+            &StoreLocation::for_test(root.path()),
+            native(None),
+            &mut executor(),
+        )
+        .await
+        .unwrap();
         let scope = store.open_work(job, vec![], 0).await.unwrap();
         store.end_work(&scope).await.unwrap();
         reload.shutdown().await.unwrap();
         store.close().await;
         drop(store);
         assert!(matches!(
-            prepare_content(root.path(), native(None), &mut executor())
-                .await
-                .err()
-                .unwrap()
-                .downcast_ref::<hellas_store::content::Error>(),
+            prepare_content(
+                &StoreLocation::for_test(root.path()),
+                native(None),
+                &mut executor()
+            )
+            .await
+            .err()
+            .unwrap()
+            .downcast_ref::<hellas_store::content::Error>(),
             Some(hellas_store::content::Error::WorkOwned)
         ));
         let other = tempfile::tempdir().unwrap();
@@ -198,10 +212,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let error = prepare_content(other.path(), native(Some(&config)), &mut executor())
-            .await
-            .err()
-            .unwrap();
+        let error = prepare_content(
+            &StoreLocation::for_test(other.path()),
+            native(Some(&config)),
+            &mut executor(),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(
             error
                 .to_string()

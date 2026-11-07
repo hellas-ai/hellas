@@ -1,15 +1,15 @@
 //! Append-only, durable journal with exclusive ownership, one SQLite
 //! database per journal.
 //!
-//! An append returns after commit. Crash mode preserves consistency after
-//! process loss; power mode also flushes each commit before returning.
-//! Power loss in crash mode may lose recent commits. Replay hands
+//! An append returns after commit: crash mode survives a process crash. An OS
+//! crash or power loss may roll back recent commits with no time bound. Power
+//! mode also flushes the commit. Replay hands
 //! back the checkpoint and then every later record in the order it was
 //! appended. Rotation stores the checkpoint and deletes the records it
 //! replaces in one transaction, so a crash leaves either the generation
 //! before it or the one after it, never a mix of the two.
 
-pub use hellas_private::Durability;
+use hellas_private::StoreLocation;
 use hex::encode as hex;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -150,21 +150,24 @@ pub struct Replay {
     pub records: Vec<Vec<u8>>,
 }
 
-/// How long an open waits on another connection's lock before reporting
-/// [`JournalError::Locked`].
-const OPEN_BUSY_TIMEOUT: Duration = Duration::ZERO;
+// Ownership is decided without waiting. SQLite may still encounter transient
+// locks while creating its WAL or closing its own worker connection.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One append-only durable journal, exclusively held by its host.
 #[derive(Debug)]
 pub struct Journal {
-    /// Taken only by `Drop`.
+    /// Present until explicit close or final drop.
     connection: Option<SqliteConnection>,
+    ownership: Option<JournalLock>,
+    durability: hellas_private::Durability,
     id: JournalId,
     generation: u64,
     records: u64,
     bytes: u64,
     poisoned: bool,
-    durability: Durability,
+    #[cfg(any(test, feature = "test-support"))]
+    test_path: PathBuf,
 }
 
 impl Drop for Journal {
@@ -172,6 +175,10 @@ impl Drop for Journal {
     /// handle: sqlx would close it later on its worker thread, and this
     /// process reopening the journal would find it still held.
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if test_support::defer_drop(self) {
+            return;
+        }
         if let Some(connection) = self.connection.take() {
             // The worker is a plain thread, so this wait needs no runtime.
             let _ = futures::executor::block_on(connection.close());
@@ -179,13 +186,26 @@ impl Drop for Journal {
     }
 }
 
-impl Journal {
-    pub fn durability(&self) -> Durability {
-        self.durability
+#[derive(Debug)]
+struct JournalLock(std::fs::File);
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
+}
+fn lock_journal(path: &Path) -> Result<JournalLock, JournalError> {
+    let file = hellas_private::open_lock_beside(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(JournalLock(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(JournalError::Locked { path: path.into() }),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+impl Journal {
     /// Returns where the journal named `stem` lives under `directory`.
     #[must_use]
-    pub fn path(directory: &Path, stem: &str) -> PathBuf {
+    pub fn path(directory: &StoreLocation, stem: &str) -> PathBuf {
         directory
             .join(PARTITION)
             .join(format!("{stem}.{EXTENSION}"))
@@ -193,7 +213,7 @@ impl Journal {
 
     /// Lists the stems of the journals under `directory`, sorted, so two
     /// machines holding the same journals list them in the same order.
-    pub fn stems(directory: &Path) -> Result<Vec<String>, JournalError> {
+    pub fn stems(directory: &StoreLocation) -> Result<Vec<String>, JournalError> {
         let entries = match std::fs::read_dir(directory.join(PARTITION)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             entries => entries?,
@@ -212,78 +232,76 @@ impl Journal {
 
     /// Opens the journal, creating it empty when it does not exist yet.
     pub async fn open_latest(
-        directory: &Path,
+        directory: &StoreLocation,
         stem: &str,
         id: JournalId,
-        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
-        Self::open_owned(directory, stem, id, true, durability).await
+        Self::open_owned(directory, stem, id, true).await
     }
 
     /// Recovers an initialized journal without creating an empty replacement.
     pub async fn open_existing(
-        directory: &Path,
+        directory: &StoreLocation,
         stem: &str,
         id: JournalId,
-        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
-        Self::open_owned(directory, stem, id, false, durability).await
+        Self::open_owned(directory, stem, id, false).await
     }
 
     async fn open_owned(
-        directory: &Path,
+        directory: &StoreLocation,
         stem: &str,
         id: JournalId,
         create: bool,
-        durability: Durability,
     ) -> Result<(Self, Replay), JournalError> {
+        let durability = directory.durability();
         if !valid_stem(stem) {
             let invalid = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid stem");
             return Err(invalid.into());
         }
         let path = Self::path(directory, stem);
         let missing = || JournalError::Missing {
-            directory: directory.into(),
+            directory: directory.to_path_buf(),
         };
         if create {
-            hellas_private::create_dir_all_durable(&directory.join(PARTITION))?;
+            durability.create_dir_all(&directory.join(PARTITION))?;
         } else if !path.try_exists()? {
             return Err(missing());
         }
+        let ownership = lock_journal(&path)?;
         let options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(create)
             .locking_mode(SqliteLockingMode::Exclusive)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(match durability {
-                Durability::Crash => SqliteSynchronous::Normal,
-                Durability::Power => SqliteSynchronous::Full,
+                hellas_private::Durability::Crash => SqliteSynchronous::Normal,
+                hellas_private::Durability::Power => SqliteSynchronous::Full,
             })
-            .pragma(
-                "fullfsync",
-                if cfg!(target_os = "macos") && durability == Durability::Power {
-                    "ON"
-                } else {
-                    "OFF"
-                },
-            )
             // A rotation deletes records a channel journal may hold payloads
             // in; zero them rather than leave them in free pages.
             .pragma("secure_delete", "ON")
-            // Another writer is refused immediately; no dormant busy wait.
-            .busy_timeout(OPEN_BUSY_TIMEOUT);
+            // The OS lock already excludes another Hellas journal owner.
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        #[cfg(target_os = "macos")]
+        let options = options.pragma(
+            "fullfsync",
+            if durability == hellas_private::Durability::Power {
+                "ON"
+            } else {
+                "OFF"
+            },
+        );
         let sqlx_error = |error| JournalError::from_sqlx(error, &path);
-        // Acquire ownership directly: a pool's after_connect error is retried.
         let mut connection = SqliteConnection::connect_with(&options)
             .await
             .map_err(sqlx_error)?;
-        let opened = async {
+        let initialized = async {
             sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT")
                 .execute(&mut connection)
                 .await
                 .map_err(sqlx_error)?;
-            // A new database's directory entry must outlive a power cut too.
-            hellas_private::sync_directory(&directory.join(PARTITION))?;
+            durability.sync_directory(&directory.join(PARTITION))?;
             let version: i64 = sqlx::query_scalar("PRAGMA user_version")
                 .fetch_one(&mut connection)
                 .await
@@ -339,11 +357,10 @@ impl Journal {
                 .chain(&records)
                 .map(|r| r.len() as u64)
                 .sum();
-
-            Ok::<_, JournalError>((generation, records, bytes, checkpoint))
+            Ok::<_, JournalError>((generation, checkpoint, records, bytes))
         }
         .await;
-        let (generation, records, bytes, checkpoint) = match opened {
+        let (generation, checkpoint, records, bytes) = match initialized {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = connection.close().await;
@@ -353,12 +370,15 @@ impl Journal {
         let (connection, records_len) = (Some(connection), records.len() as u64);
         let journal = Self {
             connection,
+            ownership: Some(ownership),
+            durability,
             id,
             generation,
             records: records_len,
             bytes,
             poisoned: false,
-            durability,
+            #[cfg(any(test, feature = "test-support"))]
+            test_path: path,
         };
         Ok((
             journal,
@@ -373,24 +393,25 @@ impl Journal {
     /// journal open elsewhere is [`JournalError::Locked`]: its owner holds
     /// the database exclusively.
     pub async fn inspect(
-        directory: &Path,
+        directory: &StoreLocation,
         stem: &str,
     ) -> Result<(JournalId, Replay), JournalError> {
         let path = Self::path(directory, stem);
         if !path.try_exists()? {
             return Err(JournalError::Missing {
-                directory: directory.into(),
+                directory: directory.to_path_buf(),
             });
         }
+        let _ownership = lock_journal(&path)?;
         let options = SqliteConnectOptions::new()
             .filename(&path)
             .read_only(true)
-            .busy_timeout(Duration::ZERO);
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
         let sqlx_error = |error| JournalError::from_sqlx(error, &path);
         let mut connection = SqliteConnection::connect_with(&options)
             .await
             .map_err(sqlx_error)?;
-        let inspected = async {
+        let result = async {
             let Some((id, _, checkpoint)) = read_head(&mut connection, &path).await? else {
                 return Err(JournalError::NotAJournal { path: path.clone() });
             };
@@ -405,13 +426,9 @@ impl Journal {
         }
         .await;
         let closed = connection.close().await.map_err(sqlx_error);
-        match inspected {
-            Ok(value) => {
-                closed?;
-                Ok(value)
-            }
-            Err(error) => Err(error),
-        }
+        let result = result?;
+        closed?;
+        Ok(result)
     }
 
     /// Returns how many rotations this journal has been through.
@@ -446,10 +463,12 @@ impl Journal {
 
     /// Closes the database and ends ownership, so the host can reopen and
     /// replay it. Every later call is refused like a poisoned handle.
+    /// Await this after draining users and before publishing an ownership handover.
     pub async fn close(&mut self) {
         if let Some(connection) = self.connection.take() {
             let _ = connection.close().await;
         }
+        self.ownership.take();
     }
 
     /// Returns whether this generation has reached the hard limit less the
@@ -522,8 +541,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Appends one committed record, protected against process loss in crash
-    /// mode and flushed against power loss in power mode.
+    /// Appends one committed record under the configured durability policy.
     ///
     /// A write that fails poisons this handle: whether it committed is not
     /// something this process can tell, so every later call is refused
@@ -543,17 +561,20 @@ impl Journal {
         let Some(connection) = self.connection.as_mut() else {
             return Err(JournalError::Poisoned);
         };
-        let fsync = Timing::start();
+        let commit = Timing::start();
         // Cancellation is an ambiguous append too: the statement runs on
         // sqlx's worker whether or not this future is still polled.
         self.poisoned = true;
         let insert = sqlx::query!("INSERT INTO record (payload) VALUES (?)", payload);
         insert.execute(connection).await?;
-        if let Some(ms) = fsync.ms() {
+        #[cfg(any(test, feature = "test-support"))]
+        test_support::after_append(&self.test_path, payload).await;
+        if let Some(ms) = commit.ms() {
             tracing::event!(
-                name: "fsync_tail_ms", target: TARGET, LEVEL,
+                name: "append_commit_ms", target: TARGET, LEVEL,
                 kind = ?self.id.kind, role = ?self.id.role, key = %hex(self.id.key),
                 generation = self.generation, seq = frames, bytes = len, ms,
+                mode = %self.durability,
             );
         }
         (self.records, self.bytes, self.poisoned) = (frames + 1, bytes + len, false);
@@ -644,4 +665,4 @@ mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod test_support;
+pub mod test_support;

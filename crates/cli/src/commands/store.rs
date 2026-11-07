@@ -4,6 +4,7 @@ use anyhow::{Context as _, ensure};
 use clap::{Args, Subcommand};
 use futures::StreamExt as _;
 use hellas_authority::{authenticator::Authenticator, node::SessionKey};
+use hellas_private::StoreLocation;
 use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
 use hellas_sdk::node_control::profile::ClientProfile;
 use hellas_store::content::{self, config::Reconciler, owner_pin as find_pin, *};
@@ -15,7 +16,7 @@ pub struct StoreArgs {
     /// Private Owner credential and independently provisioned daemon trust.
     #[arg(long, global = true)]
     pub profile: Option<PathBuf>,
-    /// Local daemon socket; defaults to the principal's control.sock.
+    /// Local daemon socket; defaults to <home>/provider/control.sock.
     #[arg(
         long,
         global = true,
@@ -135,6 +136,7 @@ fn target(value: Target) {
 
 pub async fn run(
     args: StoreArgs,
+    home: &StoreLocation,
     identity: Option<&LocalIdentity>,
     passkey: Option<&dyn Authenticator>,
 ) -> CliResult<()> {
@@ -148,9 +150,9 @@ pub async fn run(
             crate::content_configuration::ContentConfiguration::load(args.content_config, None)?;
         let config = loaded.config().clone();
         if let StoreCommand::Index { paths, recheck } = args.command {
-            return index(&config, paths, recheck).await;
+            return index(&config, home, paths, recheck).await;
         }
-        let store = config.open(ram(), true, Default::default()).await.context(
+        let store = config.open(home, ram(), true).await.context(
             "opening the local upper; use --profile for an authenticated daemon connection",
         )?;
         let result = async {
@@ -168,7 +170,7 @@ pub async fn run(
                 let repo = hellas_store::hf::Repo::from_uri(&uri)?;
                 Ok(resolving.resolve_hf(&Scope::Owner, repo).await?)
             }).await;
-            if let Some(endpoint) = peer { endpoint.close().await; }
+            if let Some(endpoint) = peer { hellas_wire::iroh::close(&endpoint).await; }
             result
         }.await;
         store.close().await;
@@ -192,7 +194,7 @@ pub async fn run(
             crate::commands::admin::connect_remote(identity, node, args.addresses, &profile, key)
                 .await?;
         let result = remote(client.transport().clone(), args.command).await;
-        endpoint.close().await;
+        hellas_wire::iroh::close(&endpoint).await;
         result
     } else {
         ensure!(
@@ -200,8 +202,7 @@ pub async fn run(
             "--address requires a profile paired with a remote node"
         );
         let (client, _) =
-            crate::commands::admin::connect_local(profile, args.control_socket, passkey, key)
-                .await?;
+            crate::commands::admin::connect_local(profile, args.control_socket, home, key).await?;
         // A failed connection or authentication never falls back to local Owner.
         remote(client.transport().clone(), args.command).await
     }
@@ -422,12 +423,13 @@ where
 
 async fn index(
     config: &content::config::Config,
+    home: &StoreLocation,
     paths: Vec<PathBuf>,
     recheck: bool,
 ) -> CliResult<()> {
     let config = config.clone();
+    let upper = config.upper(home);
     tokio::task::spawn_blocking(move || -> CliResult<()> {
-        let upper = config.upper()?;
         hellas_private::create_dir_all_durable(&upper)?;
         let path = upper.join("fastresume.bin");
         let records = hellas_store::fastresume::Records::default();
@@ -473,6 +475,7 @@ mod tests {
     async fn local_index_and_commands_share_the_verified_store_and_paid_ownership_refuses_fallback()
     {
         let root = tempfile::tempdir().unwrap();
+        let home = StoreLocation::for_test(root.path());
         let lower = root.path().join("lower");
         std::fs::create_dir(&lower).unwrap();
         let body = b"ordinary indexed weights";
@@ -488,6 +491,7 @@ mod tests {
                     recheck: false,
                 },
             ),
+            &home,
             None,
             None,
         )
@@ -505,6 +509,7 @@ mod tests {
                     path: String::new(),
                 },
             ),
+            &home,
             None,
             None,
         )
@@ -522,6 +527,7 @@ mod tests {
                     out: Some(out.clone()),
                 },
             ),
+            &home,
             None,
             None,
         )
@@ -542,6 +548,7 @@ mod tests {
                     },
                 },
             ),
+            &home,
             None,
             None,
         )
@@ -556,23 +563,23 @@ mod tests {
                     },
                 },
             ),
+            &home,
             None,
             None,
         )
         .await
         .unwrap();
-        run(args(&config, StoreCommand::Collect), None, None)
+        run(args(&config, StoreCommand::Collect), &home, None, None)
             .await
             .unwrap();
         assert_eq!(std::fs::read(lower.join("weights")).unwrap(), body);
         let node = DiskStore::open(
-            root.path().join("upper"),
+            home.child("upper"),
             vec![lower],
             IndexMode::Require,
             None,
             ram(),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -602,6 +609,7 @@ mod tests {
                     out: Some(refused.clone()),
                 },
             ),
+            &home,
             None,
             None,
         )

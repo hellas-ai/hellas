@@ -27,7 +27,13 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 &fixture.root.path().join("pool-content"),
             )
             .await;
-            let mut args = pool_options(&fixture, &content).providers.remove(0);
+            let pool = pool_options(&fixture, &content);
+            let mut args = pool
+                .providers
+                .into_iter()
+                .next()
+                .unwrap()
+                .with_config(pool.config, pool.content);
             args.timeout = Some(hellas_chain::node::RECOVERY_TIMEOUT);
             let signed = SignedPaidOffer::sign(
                 PaidOffer {
@@ -48,12 +54,11 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
             )
             .unwrap();
             let mut store = SetupStore::open(
-                &args.journal_root,
+                &args.journal_root(),
                 devnet.network(),
                 signed.offer().proposal.bond_edge(),
                 Role::Client,
                 &hellas_kernel::Secp256k1Verifier::new(),
-                Default::default(),
             )
             .await
             .unwrap();
@@ -81,10 +86,9 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 let read = provider_policy(
                     &args,
                     crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root,
-                        args.config.chain.network,
+                        &args.journal_root(),
+                        args.config.network(),
                         args.provider,
-                        Default::default(),
                     )
                     .await
                     .unwrap(),
@@ -111,10 +115,9 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 provider_policy(
                     &args,
                     crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root,
-                        args.config.chain.network,
+                        &args.journal_root(),
+                        args.config.network(),
                         args.provider,
-                        Default::default(),
                     )
                     .await
                     .unwrap(),

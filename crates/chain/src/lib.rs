@@ -4,6 +4,8 @@ mod app;
 pub mod block;
 #[cfg(feature = "client-core")]
 pub mod block_view;
+#[cfg(all(feature = "chain-dir", not(target_arch = "wasm32")))]
+pub mod chain_dir;
 #[cfg(feature = "client-core")]
 pub mod client;
 #[cfg(any(feature = "indexer", feature = "validator"))]
@@ -121,9 +123,9 @@ mod genesis_reexport {
     #[test]
     fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
         let selector = "devnet";
-        let id = crate::genesis::HELLAS_DEVNET_1_ID;
-        let json = crate::genesis::HELLAS_DEVNET_1_JSON;
-        let expected = "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17";
+        let id = crate::genesis::HELLAS_DEVNET_2_ID;
+        let json = crate::genesis::HELLAS_DEVNET_2_JSON;
+        let expected = "35b2444df762b668cc66df28e784348ff9019d1dc0ee16ec2bea3949b4828c75";
         let hex: String = Sha256::digest(json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))

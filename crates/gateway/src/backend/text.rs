@@ -58,6 +58,10 @@ pub(super) fn text_events(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests {
     use super::*;
     use crate::ComputeEvent;

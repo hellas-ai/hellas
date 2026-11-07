@@ -1,5 +1,7 @@
 use crate::domain::{Object, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
+#[cfg(any(feature = "validator", feature = "full-node"))]
+use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::ManagedDb;
 #[cfg(any(feature = "validator", feature = "full-node"))]
 use commonware_glue::stateful::db::Shared;
@@ -9,17 +11,38 @@ use commonware_storage::{
     Context as StorageContext,
     journal::contiguous::fixed::Config as FixedLogConfig,
     mmr::{self, full::Config as MmrConfig},
-    qmdb::any::{FixedConfig, unordered::fixed::Db as AnyFixedDb},
+    qmdb::current::{FixedConfig, ordered::fixed::Db as CurrentFixedDb},
     translator::EightCap,
 };
+#[cfg(any(feature = "validator", feature = "full-node"))]
+use commonware_storage::{mmr::Location, qmdb::sync::Target};
+#[cfg(any(feature = "validator", feature = "full-node"))]
+use commonware_utils::non_empty_range;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
-pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightCap, Sequential>;
+pub type UtxoDb<E> =
+    CurrentFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightCap, 32, Sequential>;
 /// Shared authenticated state used by consensus and full-node execution.
 #[cfg(any(feature = "validator", feature = "full-node"))]
 pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub use crate::block::UtxoSyncTarget;
+
+#[cfg(any(feature = "validator", feature = "full-node"))]
+pub(crate) fn sync_target<E>(
+    merkleized: &<UtxoDatabase<E> as DatabaseSet<E>>::Merkleized,
+) -> UtxoSyncTarget
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    Target {
+        root: merkleized.ops_root(),
+        range: non_empty_range!(
+            merkleized.sync_boundary(),
+            Location::new(merkleized.bounds().total_size)
+        ),
+    }
+}
 
 const ITEMS_PER_BLOB: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(8192).unwrap();
@@ -40,19 +63,20 @@ pub fn utxo_db_config(
 
     FixedConfig {
         merkle_config: MmrConfig {
-            journal_partition: format!("{partition_prefix}_utxo_mmr_journal_v3"),
-            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata_v3"),
+            journal_partition: format!("{partition_prefix}_utxo_mmr_journal_v4"),
+            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata_v4"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
             strategy: Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedLogConfig {
-            partition: format!("{partition_prefix}_utxo_log_journal_v3"),
+            partition: format!("{partition_prefix}_utxo_log_journal_v4"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache,
             write_buffer: WRITE_BUFFER,
         },
+        grafted_metadata_partition: format!("{partition_prefix}_utxo_grafted_metadata_v4"),
         translator: EightCap,
         init_cache_size: None,
         init_buffer: INIT_BUFFER,

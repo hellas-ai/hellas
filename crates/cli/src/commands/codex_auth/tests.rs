@@ -15,7 +15,7 @@ fn parses_jwt_expiry() {
 #[test]
 fn save_and_load_round_trip() {
     let dir = tempfile::tempdir().unwrap();
-    let store = CodexAuthStore::new(Some(&dir.path().join("codex-auth.json"))).unwrap();
+    let store = CodexAuthStore::new(&dir.path().join("codex-auth.json")).unwrap();
     let state = CodexAuthState::new(
         CodexTokens {
             access_token: "access".to_string(),
@@ -55,11 +55,8 @@ fn import_codex_cli_auth_extracts_tokens() {
     .unwrap();
 
     let target_path = dir.path().join("hellas-codex-auth.json");
-    import_codex_cli(Some(&target_path), Some(&source_path)).unwrap();
-    let loaded = CodexAuthStore::new(Some(&target_path))
-        .unwrap()
-        .load()
-        .unwrap();
+    import_codex_cli(&target_path, Some(&source_path)).unwrap();
+    let loaded = CodexAuthStore::new(&target_path).unwrap().load().unwrap();
 
     assert_eq!(loaded.tokens.access_token, "access");
     assert_eq!(loaded.tokens.refresh_token, "refresh");
@@ -76,7 +73,7 @@ fn v1_auth_state_without_account_id_remains_loadable() {
         br#"{"version":1,"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":null,"refresh_token_blocked":null}"#,
     )
     .unwrap();
-    let store = CodexAuthStore::new(Some(&path)).unwrap();
+    let store = CodexAuthStore::new(&path).unwrap();
     assert_eq!(store.load().unwrap().tokens.account_id, None);
     assert!(matches!(
         store.account_id(),
@@ -228,7 +225,7 @@ async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
     ready.wait().await;
     // Probe runtime progress while a refresh holds the file lock. Finishing
     // all sixteen reads and the durable token write is not a liveness clock.
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, started.notified())
         .await
         .expect("file-lock contention must not block Tokio workers");
     finish.add_permits(1);

@@ -4,6 +4,8 @@ use hellas_auth::test_support::actors::{FRIEND, ROOT};
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_channel::work_store::discover_setups;
 use hellas_kernel::{EdgeValues, Fees};
+use hellas_private::StoreLocation;
+use std::path::Path;
 
 fn signer(seed: u8) -> Secp256k1Signer {
     Secp256k1Signer::from_secret_scalar([seed; 32]).unwrap()
@@ -11,9 +13,10 @@ fn signer(seed: u8) -> Secp256k1Signer {
 fn options(root: &Path) -> ProvisionOptions {
     let key = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
     let provider = hellas_channel::test_support::enrollment(&key, &key, [7; 32], [3; 32]);
+    let location = StoreLocation::for_test(root);
     ProvisionOptions {
         network: NetworkId::new("hellas-devnet-1").unwrap(),
-        journal_root: root.to_path_buf(),
+        journal_root: location,
         settlement_key: signer(0x22),
         provider,
         addresses: vec!["127.0.0.1:9000".into()],
@@ -66,22 +69,14 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
     let options = options(&dir.path().join("journal"));
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(
-            floor(),
-            &std::sync::atomic::AtomicBool::new(false),
-            Default::default(),
-        )
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     offered.offer.check().unwrap();
-    let mut store = open_provider_journal(
-        &options.journal_root,
-        options.network,
-        offered.bond_edge,
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let mut store =
+        open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
+            .await
+            .unwrap();
     assert_eq!(
         store.len(),
         1,
@@ -117,22 +112,18 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
     );
     store.rotate().await.unwrap();
     drop(store);
-    let reopened = open_provider_journal(
-        &options.journal_root,
-        options.network,
-        offered.bond_edge,
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let reopened = open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
+        .await
+        .unwrap();
     assert_eq!(
         reopened.state().offer().unwrap().1.encode().unwrap(),
         offered.offer.encode().unwrap()
     );
     assert_eq!(reopened.state().scan_armed(), Some(floor()));
     drop(reopened);
+    let location = StoreLocation::for_test(&options.journal_root);
     assert_eq!(
-        discover_setups(&options.journal_root, options.network)
+        discover_setups(&location, options.network)
             .await
             .unwrap()
             .setups
@@ -147,21 +138,13 @@ async fn every_unanswered_offer_reserves_its_coins_before_another_offer_is_signe
     let first = options(dir.path());
     let offered = planned(&first, &[])
         .unwrap()
-        .journal(
-            floor(),
-            &std::sync::atomic::AtomicBool::new(false),
-            Default::default(),
-        )
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
-    let store = open_provider_journal(
-        dir.path(),
-        first.network,
-        offered.bond_edge,
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let store = open_provider_journal(&location, first.network, offered.bond_edge)
+        .await
+        .unwrap();
     let held = store.state().clone();
     let mut second = options(dir.path());
     second.client_node = signer(0x23).party_key();
@@ -185,7 +168,7 @@ async fn expired_or_excessive_lifetime_offers_leave_no_journal_or_signature() {
         assert!(matches!(
             planned(&options, &[])
                 .unwrap()
-                .journal(floor(), &write_started, Default::default())
+                .journal(floor(), &write_started,)
                 .await,
             Err(ProvisionError::ExpiredBond { .. } | ProvisionError::BondLifetime)
         ));
@@ -202,29 +185,21 @@ async fn a_crash_after_creating_an_unsigned_header_does_not_block_discovery_or_r
     let dir = tempfile::tempdir().unwrap();
     let options = options(dir.path());
     let candidate = BondCandidate::plan(&options, ROOT.principal()).unwrap();
+    let location = StoreLocation::for_test(dir.path());
     drop(
-        open_provider_journal(
-            dir.path(),
-            options.network,
-            candidate.bond_edge,
-            Default::default(),
-        )
-        .await
-        .unwrap(),
+        open_provider_journal(&location, options.network, candidate.bond_edge)
+            .await
+            .unwrap(),
     );
-    let found = discover_setups(dir.path(), options.network).await.unwrap();
+    let found = discover_setups(&location, options.network).await.unwrap();
     assert!(found.setups.is_empty() && found.unidentified.is_empty());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(
-            floor(),
-            &std::sync::atomic::AtomicBool::new(false),
-            Default::default(),
-        )
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     assert_eq!(offered.bond_edge, candidate.bond_edge);
-    let found = discover_setups(dir.path(), options.network).await.unwrap();
+    let found = discover_setups(&location, options.network).await.unwrap();
     assert_eq!(found.setups.len(), 1);
     assert!(found.unidentified.is_empty());
 }
@@ -253,11 +228,7 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
     let options = options(dir.path());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(
-            floor(),
-            &std::sync::atomic::AtomicBool::new(false),
-            Default::default(),
-        )
+        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     let original = serde_json::to_value(&offered.offer).unwrap();

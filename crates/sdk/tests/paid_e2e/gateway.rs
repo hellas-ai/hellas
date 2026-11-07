@@ -9,11 +9,15 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
-            case.options.timeout = Some(Duration::from_secs(60));
+            // The request deadline only has to outlast the connection
+            // allowance; size it as a hang guard so load cannot expire it.
+            case.options.timeout = Some(HANG_GUARD);
             case.endpoint.close().await;
             let gateway = PaidGateway::open(
                 PaidGatewayOptions {
-                    providers: vec![case.options.clone()],
+                    config: case.options.config.clone(),
+                    content: case.options.content.clone(),
+                    providers: vec![gateway_provider(&case.options)],
                     max_pending_requests: 1,
                 },
                 NodeIdentity::from_secret_bytes(case.client_transport.to_bytes(), [0x21; 32])
@@ -63,8 +67,10 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 let endpoint = bind_paid_endpoint(case.client_transport.clone())
                     .await
                     .unwrap();
+                let gateway_options = gateway_provider(&case.options)
+                    .with_config(case.options.config.clone(), case.options.content.clone());
                 let mut session = PaidWorkSession::open(
-                    case.options.clone(),
+                    gateway_options,
                     endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
@@ -93,8 +99,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 stayed_pending,
                 "funding finality must outlive the connection allowance: {result:?}"
             );
+            // Completing at all proves it finished within the request deadline.
             assert!(elapsed > Duration::from_secs(10));
-            assert!(elapsed < Duration::from_secs(60));
             let events =
                 result.expect("the same gateway request completes after funding finalizes");
             assert!(

@@ -13,12 +13,10 @@ pub(super) struct Source {
     pub unavailable: Arc<AtomicBool>,
     pub tips_unavailable: Arc<AtomicBool>,
     tip_refusals: Arc<tokio::sync::Semaphore>,
-    pub listing_padding: Arc<AtomicBool>,
     pub attempts: Arc<AtomicUsize>,
     pub replay: Arc<AtomicU64>,
-    pub corrupt: Arc<AtomicUsize>,
     pub forged: Arc<AtomicBool>,
-    pub stale: Arc<std::sync::Mutex<Option<hellas_rpc::pb::chain::GetOperationsResponse>>>,
+    pub stale: Arc<std::sync::Mutex<Option<hellas_rpc::pb::chain::GetObjectProofsResponse>>>,
     pub connections: Arc<AtomicUsize>,
     /// Latency injected into source selection only.
     pub delay: std::time::Duration,
@@ -51,27 +49,12 @@ impl hellas_chain::LightClient for Source {
     forward!(get_finalization(payload: hellas_chain::domain::Digest) -> Option<Vec<u8>>);
     forward!(submit_tx(tx: Transaction) -> hellas_chain::SubmitTxOutcome);
     forward!(get_validators() -> Vec<String>);
-    async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
-        tokio::time::sleep(self.delay).await;
-        self.local.get_consensus_info().await
-    }
-    async fn get_coins_by_owner(
-        &self,
-        owner: SettlementKey,
-    ) -> Result<Option<CoinListing>, QueryError> {
-        let mut listing = self.local.get_coins_by_owner(owner).await?;
-        if self.listing_padding.load(Ordering::SeqCst)
-            && let Some(listing) = &mut listing
-        {
-            listing
-                .coins
-                .extend((1..=32).map(|n| (ObjectId::from([n; 32]), u64::MAX)));
-        }
-        Ok(listing)
-    }
+    forward!(get_consensus_info() -> ConsensusInfo);
+    forward!(get_coins_by_owner(owner: SettlementKey) -> Option<CoinListing>);
     forward!(get_coins_by_delegate(delegate: SettlementKey) -> Option<CoinListing>);
     forward!(get_edges_by_owner(owner: SettlementKey) -> Option<OwnerEdges>);
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
+        tokio::time::sleep(self.delay).await;
         Ok(self
             .get_finalized_block(FinalizedBlockQuery::Latest)
             .await?
@@ -140,10 +123,10 @@ impl hellas_chain::LightClient for Source {
         }
         Ok(block)
     }
-    async fn get_operations(
+    async fn get_object_proofs(
         &self,
-        request: hellas_rpc::pb::chain::GetOperationsRequest,
-    ) -> Result<hellas_rpc::pb::chain::GetOperationsResponse, QueryError> {
+        request: hellas_rpc::pb::chain::GetObjectProofsRequest,
+    ) -> Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(QueryError::StateUnavailable(
@@ -153,24 +136,16 @@ impl hellas_chain::LightClient for Source {
         if let Some(stale) = self.stale.lock().unwrap().clone() {
             return Ok(stale);
         }
-        let mut response = self.local.get_operations(request).await?;
-        match self.corrupt.load(Ordering::SeqCst) {
-            1 => {
-                // Change a key in a canonical Any-QMDB Update, preserving the
-                // operation tag, value and terminal commit-floor encoding.
-                if let Some(update) = response
-                    .operations
-                    .iter_mut()
-                    .find(|operation| operation[0] == 0xd2)
-                {
-                    update[20] ^= 1;
-                }
-            }
-            2 => {
-                response.operations.pop();
-            }
-            3 => response.operations.reverse(),
-            _ => {}
+        let mut response = self.local.get_object_proofs(request).await?;
+        if self.forged.load(Ordering::SeqCst) {
+            response
+                .block
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .finalization[0] ^= 1;
         }
         Ok(response)
     }
@@ -196,10 +171,8 @@ impl Relays {
             unavailable: Arc::new(AtomicBool::new(false)),
             tips_unavailable: Arc::new(AtomicBool::new(false)),
             tip_refusals: Arc::new(tokio::sync::Semaphore::new(0)),
-            listing_padding: Arc::new(AtomicBool::new(false)),
             attempts: Arc::new(AtomicUsize::new(0)),
             replay: Arc::new(AtomicU64::new(replay)),
-            corrupt: Arc::new(AtomicUsize::new(0)),
             forged: Arc::new(AtomicBool::new(false)),
             stale: Arc::new(std::sync::Mutex::new(None)),
             connections: Arc::new(AtomicUsize::new(0)),
@@ -290,7 +263,7 @@ pub(super) async fn stale_source_selection(runtime: commonware_runtime::tokio::C
     devnet.seal().await;
     let mut relays = Relays::start(&devnet).await;
     let mut config = work_config(&devnet, root.path().join("journal"));
-    config.validators = relays.urls.clone();
+    config.chain = config.chain.with_validators(relays.urls.clone()).unwrap();
     let tip = devnet.height();
     assert!(tip > 1, "the fixture finalizes more than one block");
     let behind = tip - 1;
@@ -388,13 +361,19 @@ pub(super) async fn paid_startup_uses_the_retained_floor(
     let mut options = case.options.clone();
     // The configured committee is six validators: three fast stale ones
     // beside three slower current ones.
-    options.config.validators = stale
-        .urls
-        .iter()
-        .take(3)
-        .chain(current.urls.iter().take(3))
-        .cloned()
-        .collect();
+    options.config.chain = options
+        .config
+        .chain
+        .with_validators(
+            stale
+                .urls
+                .iter()
+                .take(3)
+                .chain(current.urls.iter().take(3))
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
     options.timeout = Some(Duration::from_secs(30));
     let mut session = sealing_while(
         &mut case.devnet,
@@ -438,7 +417,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     devnet.seal().await;
     let mut relays = Relays::start(&devnet).await;
     let mut config = work_config(&devnet, root.path().join("journal"));
-    config.validators = relays.urls.clone();
+    config.chain = config.chain.with_validators(relays.urls.clone()).unwrap();
     let client = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
         .await
         .unwrap();
@@ -456,20 +435,20 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         .await
         .unwrap()
         .unwrap();
-    let old_block = hellas_chain::HellasBlock::decode(old.block.as_slice()).unwrap();
-    let old_target = old_block.sync_target();
     let stale = relays
         .source
         .local
-        .get_operations(hellas_rpc::pb::chain::GetOperationsRequest {
-            op_count: *old_target.range.end(),
-            start: *old_target.range.start(),
-            max_ops: (*old_target.range.end() - *old_target.range.start()).min(64),
-            include_pinned_nodes: false,
+        .get_object_proofs(hellas_rpc::pb::chain::GetObjectProofsRequest {
+            object_ids: keys.iter().map(|key| key.to_vec()).collect(),
+            payload: Some(old.snapshot.payload.to_vec()),
+            owner: None,
+            owner_offset: 0,
+            owner_limit: 0,
+            owner_after_key: None,
         })
         .await
         .unwrap();
-    relays.source.listing_padding.store(true, Ordering::SeqCst);
+    let proof_reads_before_split = relays.source.attempts.load(Ordering::SeqCst);
     let plan = hellas_sdk::coin_owner::OwnerReshape::split(
         &client,
         devnet.network(),
@@ -479,11 +458,14 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     )
     .await
     .unwrap();
-    relays.source.listing_padding.store(false, Ordering::SeqCst);
+    assert!(
+        relays.source.attempts.load(Ordering::SeqCst) > proof_reads_before_split,
+        "funding must query authenticated owner and object proofs"
+    );
     assert_eq!(
         plan.inputs().as_slice(),
         &[genesis],
-        "scan beyond 32 ineligible, untrusted listing hints"
+        "the authenticated owner page must identify the spendable input"
     );
     assert_eq!(
         plan.outputs().as_slice()[1].value(),
@@ -528,37 +510,21 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         *block.sync_target().range.start() > 0,
         "exercise a real nonzero inactivity floor"
     );
-    for mode in 1..=3 {
-        relays.source.corrupt.store(0, Ordering::SeqCst);
-        // Each corruption must be read from the transport rather than a
-        // previously verified in-memory object view.
-        let fresh = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
-            .await
-            .unwrap();
-        relays.source.corrupt.store(mode, Ordering::SeqCst);
-        let error = fresh.get_objects(keys.clone()).await.unwrap_err();
-        assert!(
-            matches!(error, QueryError::Remote(_)),
-            "corrupt, missing or reordered operation witness {mode}: {error}"
-        );
-        if mode == 1 {
-            assert!(
-                error.to_string().contains("range proof"),
-                "canonical update tampering must fail cryptographic verification: {error}"
-            );
-        }
-    }
-    relays.source.corrupt.store(0, Ordering::SeqCst);
     let fresh = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
         .await
         .unwrap();
     *relays.source.stale.lock().unwrap() = Some(stale);
     assert!(
         matches!(
-            fresh.get_objects(keys.clone()).await,
+            fresh
+                .get_objects_at(
+                    keys.clone(),
+                    FinalizedBlockQuery::Payload(latest.snapshot.payload)
+                )
+                .await,
             Err(QueryError::Remote(_))
         ),
-        "a genuine old range proof cannot establish current state"
+        "a genuine old proof cannot answer a pinned current payload"
     );
     *relays.source.stale.lock().unwrap() = None;
     relays.source.forged.store(true, Ordering::SeqCst);
@@ -571,14 +537,9 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     relays.source.forged.store(false, Ordering::SeqCst);
     assert!(client.get_objects(keys.clone()).await.unwrap().is_some());
-    let unpinned = RemoteLightClient::connect(&relays.urls[0]).await.unwrap();
-    assert!(matches!(
-        unpinned.get_objects(keys.clone()).await,
-        Err(QueryError::Remote(_))
-    ));
     assert!(matches!(
         client.get_objects(vec![coin_object_id(missing); 33]).await,
-        Err(QueryError::Remote(_))
+        Err(QueryError::InvalidTransaction(_))
     ));
     let mut foreign = Devnet::start(
         foreign_runtime,
@@ -643,7 +604,9 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     // One hanging relay must not discard an already verified healthy answer.
     let hanging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    config.validators[0] = format!("ws://{}", hanging.local_addr().unwrap());
+    let mut routes = config.chain.validators().to_vec();
+    routes[0] = format!("ws://{}", hanging.local_addr().unwrap());
+    config.chain = config.chain.with_validators(routes).unwrap();
     assert!(
         hellas_sdk::client_chain::connect(&config, Duration::from_millis(500))
             .await
@@ -652,7 +615,10 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     drop(hanging);
     // One source makes two refusals evidence of a retry, rather than two
     // concurrent source-selection requests. Observe requests, not elapsed time.
-    config.validators = vec![relays.urls[0].clone()];
+    config.chain = config
+        .chain
+        .with_validators(vec![relays.urls[0].clone()])
+        .unwrap();
     relays.source.tips_unavailable.store(true, Ordering::SeqCst);
     let connecting = hellas_sdk::client_chain::connect(&config, Duration::from_secs(2));
     tokio::pin!(connecting);
@@ -694,22 +660,23 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         .await
         .unwrap();
     devnet.seal().await;
+    let short = hellas_sdk::coin_owner::OwnerReshape::split(
+        &client,
+        devnet.network(),
+        CLIENT_OWNER.key().into_kernel(),
+        504,
+        client_settlement().party_key(),
+    )
+    .await;
     assert!(
         matches!(
-            hellas_sdk::coin_owner::OwnerReshape::split(
-                &client,
-                devnet.network(),
-                CLIENT_OWNER.key().into_kernel(),
-                504,
-                client_settlement().party_key()
-            )
-            .await,
+            short,
             Err(hellas_sdk::coin_owner::CoinOwnerError::Insufficient {
                 required: 504,
                 available: 503
             })
         ),
-        "five otherwise eligible inputs cannot fund a four-input channel reshape"
+        "five otherwise eligible inputs cannot fund a four-input channel reshape: {short:?}"
     );
     relays.shutdown().await;
     devnet.shutdown().await;
@@ -736,9 +703,9 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
     .unwrap();
     let descriptor = session.descriptor().clone();
     let height = case.devnet.height();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while session.with_state(|state| state.cursor().0).await.unwrap() < height {
-            tokio::time::sleep(case.options.config.poll).await;
+            tokio::time::sleep(case.options.config.poll()).await;
         }
     })
     .await
@@ -752,14 +719,15 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
     case.relays.source.replay.store(height, Ordering::SeqCst);
     for expires in [false, true] {
         let mut options = case.options.clone();
-        options.config.max_observation_age = options.config.poll * 2;
+        let poll = options.config.poll();
+        options.config = options.config.with_max_observation_age(poll * 2);
         options.timeout = case.options.timeout;
         let gate = ObservationGate {
             reads: Arc::new(AtomicUsize::new(0)),
             first_blocked: Arc::new(AtomicUsize::new(0)),
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
             release: Arc::new(tokio::sync::Semaphore::new(0)),
-            delay: options.config.max_observation_age + options.config.poll,
+            delay: options.config.max_observation_age() + options.config.poll(),
         };
         *case.relays.source.observation_gate.lock().unwrap() = Some(gate.clone());
         let mut opening = Box::pin(PaidWorkSession::open(
@@ -770,7 +738,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
             SessionOpenMode::Retained,
             SessionFundingOptions::default(),
         ));
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(HANG_GUARD, async {
             tokio::select! {
                 result = &mut opening => panic!("opening ended before initial observation: {:?}; applied reads {}, first blocked {}", result.err(), gate.reads.load(Ordering::SeqCst), gate.first_blocked.load(Ordering::SeqCst)),
                 permit = gate.entered.acquire() => permit.unwrap().forget(),
@@ -783,7 +751,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
         );
         assert!(matches!(
             ChannelStore::recover(
-                &case.options.journal_root,
+                &case.options.journal_root(),
                 descriptor.channel().clone(),
                 Role::Client,
                 case.options.content.clone(),
@@ -808,7 +776,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
             drop(opening);
         }
         let mut recovered = ChannelStore::recover(
-            &case.options.journal_root,
+            &case.options.journal_root(),
             descriptor.channel().clone(),
             Role::Client,
             case.options.content.clone(),

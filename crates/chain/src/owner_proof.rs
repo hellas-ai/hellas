@@ -3,11 +3,13 @@
 //! Nodes live in the same speculative storage transaction as object changes. The root is
 //! committed in canonical blocks; these proofs never substitute a historical QMDB value proof
 //! for proof of the current owner state.
-use crate::domain::{Digest, SettlementKey};
+use crate::domain::{Digest, Object, SettlementKey};
 use commonware_cryptography::{Hasher as _, Sha256};
 use serde::{Deserialize, Serialize};
 
-pub const OWNER_PAGE_LIMIT: u32 = 64;
+// Current RPC merges each page's holdings into the object-key request. One full
+// page must fit that request's key budget; the verifier derives it from here.
+pub const OWNER_PAGE_LIMIT: u32 = 32;
 pub const OWNER_NODE_BYTES: usize = 163;
 
 /// A coin its owner holds. The only kind whose balance is spendable, and
@@ -60,6 +62,198 @@ pub struct OwnerPageProof {
     pub offset: u64,
     pub limit: u32,
     pub holdings: Vec<HoldingProof>,
+    /// A proof of the requested cursor, including its absence after deletion.
+    pub after_key: Option<Key>,
+    pub after_path: Option<OwnerPathProof>,
+}
+
+#[cfg(feature = "proof-verify")]
+impl OwnerPageProof {
+    pub(crate) fn into_proto(self) -> hellas_rpc::pb::chain::OwnerPageProof {
+        hellas_rpc::pb::chain::OwnerPageProof {
+            owner: self.owner,
+            summary: Some(self.summary.into_proto()),
+            offset: self.offset,
+            limit: self.limit,
+            holdings: self
+                .holdings
+                .into_iter()
+                .map(|holding| hellas_rpc::pb::chain::HoldingProof {
+                    object_id: holding.object_id.to_vec(),
+                    path: Some(holding.path.into_proto()),
+                })
+                .collect(),
+            after_key: self.after_key.map(|key| key.to_vec()),
+            after_path: self.after_path.map(OwnerPathProof::into_proto),
+        }
+    }
+
+    pub(crate) fn from_proto(
+        value: hellas_rpc::pb::chain::OwnerPageProof,
+    ) -> Result<Self, OwnerProofError> {
+        Ok(Self {
+            owner: value.owner,
+            summary: OwnerPathProof::from_proto(value.summary.ok_or(OwnerProofError::Invalid)?)?,
+            offset: value.offset,
+            limit: value.limit,
+            holdings: value
+                .holdings
+                .into_iter()
+                .map(|holding| {
+                    Ok(HoldingProof {
+                        object_id: holding
+                            .object_id
+                            .try_into()
+                            .map_err(|_| OwnerProofError::Invalid)?,
+                        path: OwnerPathProof::from_proto(
+                            holding.path.ok_or(OwnerProofError::Invalid)?,
+                        )?,
+                    })
+                })
+                .collect::<Result<_, OwnerProofError>>()?,
+            after_key: value
+                .after_key
+                .map(|key| key.try_into().map_err(|_| OwnerProofError::Invalid))
+                .transpose()?,
+            after_path: value
+                .after_path
+                .map(OwnerPathProof::from_proto)
+                .transpose()?,
+        })
+    }
+}
+
+#[cfg(feature = "proof-verify")]
+impl OwnerPathProof {
+    fn into_proto(self) -> hellas_rpc::pb::chain::OwnerPathProof {
+        use hellas_rpc::pb::chain::{OwnerHoldingLeaf, owner_leaf::Value};
+        hellas_rpc::pb::chain::OwnerPathProof {
+            leaf: self.leaf.map(|leaf| hellas_rpc::pb::chain::OwnerLeaf {
+                value: Some(match leaf {
+                    OwnerLeaf::Summary(commitment) => Value::Summary(commitment.into_proto()),
+                    OwnerLeaf::Holding { kind, balance } => Value::Holding(OwnerHoldingLeaf {
+                        kind: kind.into(),
+                        balance,
+                    }),
+                }),
+            }),
+            siblings: self
+                .siblings
+                .into_iter()
+                .map(|sibling| hellas_rpc::pb::chain::OwnerSibling {
+                    depth: sibling.depth.into(),
+                    commitment: Some(sibling.commitment.into_proto()),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(value: hellas_rpc::pb::chain::OwnerPathProof) -> Result<Self, OwnerProofError> {
+        use hellas_rpc::pb::chain::owner_leaf::Value;
+        let leaf = value
+            .leaf
+            .map(|leaf| match leaf.value.ok_or(OwnerProofError::Invalid)? {
+                Value::Summary(commitment) => {
+                    Ok(OwnerLeaf::Summary(OwnerCommitment::from_proto(commitment)?))
+                }
+                Value::Holding(holding) => Ok(OwnerLeaf::Holding {
+                    kind: holding
+                        .kind
+                        .try_into()
+                        .map_err(|_| OwnerProofError::Invalid)?,
+                    balance: holding.balance,
+                }),
+            })
+            .transpose()?;
+        let siblings = value
+            .siblings
+            .into_iter()
+            .map(|sibling| {
+                Ok(OwnerSibling {
+                    depth: sibling
+                        .depth
+                        .try_into()
+                        .map_err(|_| OwnerProofError::Invalid)?,
+                    commitment: OwnerCommitment::from_proto(
+                        sibling.commitment.ok_or(OwnerProofError::Invalid)?,
+                    )?,
+                })
+            })
+            .collect::<Result<_, OwnerProofError>>()?;
+        Ok(Self { leaf, siblings })
+    }
+}
+
+#[cfg(feature = "proof-verify")]
+impl OwnerCommitment {
+    fn into_proto(self) -> hellas_rpc::pb::chain::OwnerCommitment {
+        hellas_rpc::pb::chain::OwnerCommitment {
+            hash: self.hash.to_vec(),
+            count: self.count,
+            balance: self.balance.to_be_bytes().to_vec(),
+        }
+    }
+
+    fn from_proto(value: hellas_rpc::pb::chain::OwnerCommitment) -> Result<Self, OwnerProofError> {
+        Ok(Self {
+            hash: value
+                .hash
+                .try_into()
+                .map_err(|_| OwnerProofError::Invalid)?,
+            count: value.count,
+            balance: u128::from_be_bytes(
+                value
+                    .balance
+                    .try_into()
+                    .map_err(|_| OwnerProofError::Invalid)?,
+            ),
+        })
+    }
+}
+
+/// The current object and authenticated owner leaf must describe the same holding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifiedHolding {
+    OwnedCoin {
+        value: u64,
+        delegated_to_owner: bool,
+    },
+    DelegatedCoin(u64),
+    Edge,
+}
+
+pub fn validate_holding(
+    owner: SettlementKey,
+    holding: &HoldingProof,
+    object: &Object,
+) -> Result<VerifiedHolding, OwnerProofError> {
+    match (&holding.path.leaf, object) {
+        (
+            Some(OwnerLeaf::Holding {
+                kind: HOLDING_COIN,
+                balance,
+            }),
+            Object::Coin(coin),
+        ) if coin.owner == owner && *balance == coin.value => Ok(VerifiedHolding::OwnedCoin {
+            value: coin.value,
+            delegated_to_owner: coin.delegate == Some(owner),
+        }),
+        (
+            Some(OwnerLeaf::Holding {
+                kind: HOLDING_DELEGATED,
+                balance: 0,
+            }),
+            Object::Coin(coin),
+        ) if coin.delegate == Some(owner) => Ok(VerifiedHolding::DelegatedCoin(coin.value)),
+        (
+            Some(OwnerLeaf::Holding {
+                kind: HOLDING_EDGE,
+                balance: 0,
+            }),
+            Object::Edge(_),
+        ) => Ok(VerifiedHolding::Edge),
+        _ => Err(OwnerProofError::Binding),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -437,12 +631,76 @@ pub async fn prove_owner_page<S: OwnerTreeStore>(
         offset,
         limit,
         holdings,
+        after_key: None,
+        after_path: None,
     })
+}
+
+/// Prove the first holdings strictly after a key at this owner root. A deleted
+/// cursor has an absence proof; its insertion rank is the next page's start.
+pub async fn prove_owner_page_after<S: OwnerTreeStore>(
+    store: &S,
+    owner: SettlementKey,
+    after: Option<Key>,
+    limit: u32,
+) -> Result<OwnerPageProof, OwnerProofError> {
+    let Some(key) = after else {
+        return prove_owner_page(store, owner, 0, limit).await;
+    };
+    let cursor = path(store, holding_scope(&owner), key).await?;
+    let (_, rank) = verify_path(holding_scope(&owner), key, &cursor)?;
+    let offset = rank
+        .checked_add(u64::from(cursor.leaf.is_some()))
+        .ok_or(OwnerProofError::Invalid)?;
+    let mut page = prove_owner_page(store, owner, offset, limit).await?;
+    page.after_key = Some(key);
+    page.after_path = Some(cursor);
+    Ok(page)
 }
 
 /// Verifies ownership, total spendable balance, absence, and page completeness at one finalized
 /// owner root. Returns the authenticated summary (its count is the total number of holdings).
 pub fn verify_owner_page(
+    root: Key,
+    owner: SettlementKey,
+    offset: u64,
+    limit: u32,
+    proof: &OwnerPageProof,
+) -> Result<OwnerCommitment, OwnerProofError> {
+    if proof.after_key.is_some() || proof.after_path.is_some() {
+        return Err(OwnerProofError::Binding);
+    }
+    verify_owner_page_at(root, owner, offset, limit, proof)
+}
+
+pub fn verify_owner_page_after(
+    root: Key,
+    owner: SettlementKey,
+    after: Option<Key>,
+    limit: u32,
+    proof: &OwnerPageProof,
+) -> Result<OwnerCommitment, OwnerProofError> {
+    let offset = match (after, proof.after_key, proof.after_path.as_ref()) {
+        (None, None, None) => 0,
+        (Some(requested), Some(proved), Some(path)) if requested == proved => {
+            let (commitment, rank) = verify_path(holding_scope(&owner), requested, path)?;
+            let summary = match &proof.summary.leaf {
+                Some(OwnerLeaf::Summary(summary)) => *summary,
+                None => OwnerCommitment::default(),
+                _ => return Err(OwnerProofError::Invalid),
+            };
+            if commitment != summary {
+                return Err(OwnerProofError::Binding);
+            }
+            rank.checked_add(u64::from(path.leaf.is_some()))
+                .ok_or(OwnerProofError::Invalid)?
+        }
+        _ => return Err(OwnerProofError::Binding),
+    };
+    verify_owner_page_at(root, owner, offset, limit, proof)
+}
+
+fn verify_owner_page_at(
     root: Key,
     owner: SettlementKey,
     offset: u64,
@@ -513,10 +771,110 @@ impl OwnerTreeStore for MemoryOwnerTree {
     }
 }
 
+#[cfg(test)]
+mod holding_tests {
+    use super::*;
+
+    #[test]
+    fn holding_leaf_must_match_current_coin_owner_delegate_and_value() {
+        let owner = SettlementKey::from_bytes([1; 33]);
+        let delegate = SettlementKey::from_bytes([2; 33]);
+        let holding = HoldingProof {
+            object_id: [3; 32],
+            path: OwnerPathProof {
+                leaf: Some(OwnerLeaf::Holding {
+                    kind: HOLDING_COIN,
+                    balance: 7,
+                }),
+                siblings: Vec::new(),
+            },
+        };
+        let coin = Object::Coin(crate::domain::Coin::owned(owner, 7));
+        assert_eq!(
+            validate_holding(owner, &holding, &coin).unwrap(),
+            VerifiedHolding::OwnedCoin {
+                value: 7,
+                delegated_to_owner: false
+            }
+        );
+        assert!(validate_holding(delegate, &holding, &coin).is_err());
+        let wrong_value = Object::Coin(crate::domain::Coin::owned(owner, 8));
+        assert!(validate_holding(owner, &holding, &wrong_value).is_err());
+
+        let delegated = HoldingProof {
+            path: OwnerPathProof {
+                leaf: Some(OwnerLeaf::Holding {
+                    kind: HOLDING_DELEGATED,
+                    balance: 0,
+                }),
+                siblings: Vec::new(),
+            },
+            ..holding
+        };
+        let coin = Object::Coin(crate::domain::Coin {
+            owner,
+            delegate: Some(delegate),
+            value: 7,
+        });
+        assert_eq!(
+            validate_holding(delegate, &delegated, &coin).unwrap(),
+            VerifiedHolding::DelegatedCoin(7)
+        );
+    }
+}
+
 #[cfg(all(test, feature = "indexer"))]
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, deterministic};
+    #[test]
+    fn cursor_proof_starts_at_insertion_rank_after_removal() {
+        deterministic::Runner::default().start(|_| async {
+            let owner = SettlementKey::from_bytes([3; 33]);
+            let mut tree = MemoryOwnerTree::default();
+            for key in [1_u8, 3, 5, 7] {
+                update_holding(
+                    &mut tree,
+                    owner,
+                    Digest::from([key; 32]),
+                    Some((HOLDING_COIN, 1)),
+                )
+                .await
+                .unwrap();
+            }
+            let first = prove_owner_page_after(&tree, owner, None, 2).await.unwrap();
+            let root = owner_root(&tree).await.unwrap();
+            verify_owner_page_after(root, owner, None, 2, &first).unwrap();
+            assert_eq!(
+                first
+                    .holdings
+                    .iter()
+                    .map(|holding| holding.object_id[0])
+                    .collect::<Vec<_>>(),
+                vec![1, 3]
+            );
+            update_holding(&mut tree, owner, Digest::from([3; 32]), None)
+                .await
+                .unwrap();
+            let root = owner_root(&tree).await.unwrap();
+            let second = prove_owner_page_after(&tree, owner, Some([3; 32]), 2)
+                .await
+                .unwrap();
+            verify_owner_page_after(root, owner, Some([3; 32]), 2, &second).unwrap();
+            assert_eq!(
+                second
+                    .holdings
+                    .iter()
+                    .map(|holding| holding.object_id[0])
+                    .collect::<Vec<_>>(),
+                vec![5, 7]
+            );
+            assert!(verify_owner_page_after(root, owner, Some([1; 32]), 2, &second).is_err());
+            let mut omitted = second.clone();
+            omitted.holdings.remove(0);
+            assert!(verify_owner_page_after(root, owner, Some([3; 32]), 2, &omitted).is_err());
+        });
+    }
     #[test]
     fn compact_pages_omit_empty_paths_and_reject_duplicate_depths() {
         deterministic::Runner::default().start(|_| async {
@@ -529,18 +887,34 @@ mod tests {
                     .unwrap();
             }
             let root = owner_root(&tree).await.unwrap();
-            let page = prove_owner_page(&tree, owner, 0, 64).await.unwrap();
-            verify_owner_page(root, owner, 0, 64, &page).unwrap();
+            let page = prove_owner_page(&tree, owner, 0, OWNER_PAGE_LIMIT)
+                .await
+                .unwrap();
+            verify_owner_page(root, owner, 0, OWNER_PAGE_LIMIT, &page).unwrap();
+            assert_eq!(page.holdings.len(), OWNER_PAGE_LIMIT as usize);
+            let next =
+                prove_owner_page(&tree, owner, u64::from(OWNER_PAGE_LIMIT), OWNER_PAGE_LIMIT)
+                    .await
+                    .unwrap();
+            verify_owner_page(
+                root,
+                owner,
+                u64::from(OWNER_PAGE_LIMIT),
+                OWNER_PAGE_LIMIT,
+                &next,
+            )
+            .unwrap();
+            assert_eq!(next.holdings.len(), OWNER_PAGE_LIMIT as usize);
             let bytes = serde_json::to_vec(&page).unwrap();
             assert!(
                 bytes.len() < 256 * 1024,
-                "compact64 page used {} bytes",
+                "compact owner page used {} bytes",
                 bytes.len()
             );
             let mut bad = page;
             let sibling = bad.holdings[0].path.siblings[0].clone();
             bad.holdings[0].path.siblings.insert(0, sibling);
-            assert!(verify_owner_page(root, owner, 0, 64, &bad).is_err());
+            assert!(verify_owner_page(root, owner, 0, OWNER_PAGE_LIMIT, &bad).is_err());
         });
     }
 
@@ -566,9 +940,11 @@ mod tests {
                 verify_owner_page(root, absent, 0, 5, &empty).unwrap().count,
                 0
             );
-            let last = prove_owner_page(&tree, owner, 2, 64).await.unwrap();
+            let last = prove_owner_page(&tree, owner, 2, OWNER_PAGE_LIMIT)
+                .await
+                .unwrap();
             assert_eq!(last.holdings.len(), 1);
-            verify_owner_page(root, owner, 2, 64, &last).unwrap();
+            verify_owner_page(root, owner, 2, OWNER_PAGE_LIMIT, &last).unwrap();
             let mut bad = page.clone();
             bad.holdings.clear();
             assert!(verify_owner_page(root, owner, 1, 1, &bad).is_err());

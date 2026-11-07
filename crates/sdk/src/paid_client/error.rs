@@ -40,6 +40,11 @@ pub enum PaidClientError {
     DeadlineOverflow { stage: &'static str },
     #[error("{stage} timed out; journals retain payment state")]
     Timeout { stage: &'static str },
+    #[error("offer availability timed out: {source}; journals retain payment state")]
+    OfferUnavailable {
+        #[source]
+        source: hellas_wire::WireStatus,
+    },
     #[error("authenticated provider key differs from the payment channel")]
     ProviderIdentityChanged,
     #[error("the open channel with {0} was funded for a different provider enrollment")]

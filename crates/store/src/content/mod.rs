@@ -1,5 +1,5 @@
 //! Generic verified objects, trees, pins and scoped content operations.
-pub use hellas_private::Durability;
+use hellas_private::{Durability, StoreLocation};
 
 mod acquire;
 pub mod config;

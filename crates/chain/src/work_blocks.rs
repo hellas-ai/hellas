@@ -427,8 +427,6 @@ mod tests {
     };
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_runtime::{Handle, Supervisor as _};
-    use commonware_storage::mmr::Location;
-    use commonware_utils::non_empty_range;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
         Funding, List, MAX_PARTY_INPUTS, Move, Parties, Party, Payout, PendingSlot,
@@ -692,7 +690,6 @@ mod tests {
             .expect("the block executes");
             let merkleized = batches.merkleize().await.expect("state merkleizes");
             let root = merkleized.root();
-            let bounds = merkleized.bounds();
             let block = HellasBlock::new(
                 Context {
                     round: Round::new(Epoch::zero(), View::new(self.height)),
@@ -703,14 +700,18 @@ mod tests {
                 Height::new(self.height),
                 self.height,
                 root,
-                crate::UtxoSyncTarget::new(
-                    root,
-                    non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
-                ),
+                crate::execution::store::sync_target(&merkleized),
                 fresh,
             );
             self.indexer
-                .publish_proof(block.clone(), &finalization(&self.fixture, &block).encode())
+                .publish_proof(
+                    block.clone(),
+                    &crate::finality_proof::encode(
+                        &finalization(&self.fixture, &block).encode(),
+                        &[],
+                    )
+                    .unwrap(),
+                )
                 .await
                 .expect("finalized ingest");
             self.database.finalize(merkleized).await;

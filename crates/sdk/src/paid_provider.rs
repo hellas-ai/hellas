@@ -1,4 +1,5 @@
 //! Shared provider routing and finalized-chain clock for paid work.
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::Refusable;
 
 mod offers;
@@ -6,7 +7,7 @@ use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
 use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
-use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery};
+use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery, node::NodeState};
 use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
 use hellas_channel::model::work::{
@@ -86,11 +87,7 @@ pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
 #[derive(Clone)]
 pub struct WorkRunnerConfig {
-    pub durability: hellas_private::Durability,
-    /// The network the journals are keyed and the signatures bound to.
-    pub network: NetworkId,
-    /// The configured root the setup journals live under.
-    pub journal_root: PathBuf,
+    pub chain: hellas_chain::chain_dir::ChainDir,
     /// How often the clock ticks.
     pub poll: Duration,
     /// Bounds observer stalls and the age of local admission evidence.
@@ -115,6 +112,12 @@ impl std::fmt::Debug for AdmissionNode {
 }
 
 impl WorkRunnerConfig {
+    pub fn network(&self) -> NetworkId {
+        NetworkId::new(self.chain.network_id()).expect("validated chain profile")
+    }
+    pub fn journal_root(&self) -> StoreLocation {
+        self.chain.provider_journals()
+    }
     /// Validate observation policy before startup performs I/O.
     pub fn validate(&self) -> Result<(), PaidProviderError> {
         if self.poll.is_zero() || self.max_observation_age <= self.poll {
@@ -606,25 +609,30 @@ impl MountedSetup {
             .get(&(peer, bond))
             .cloned())
     }
-    fn clear(&self, peer: PeerId, bond: EdgeId) -> Result<(), MountError> {
-        self.0
+    async fn clear(&self, peer: PeerId, bond: EdgeId) -> Result<(), MountError> {
+        let setup = self
+            .0
             .lock()
             .map_err(|_| MountError::Poisoned)?
             .remove(&(peer, bond));
+        if let Some(setup) = setup {
+            setup.close().await;
+        }
         Ok(())
     }
     /// Releases every setup, including after a poisoned mount lock.
-    pub fn clear_all(&self) -> Result<(), MountError> {
-        match self.0.lock() {
-            Ok(mut held) => {
-                held.clear();
-                Ok(())
-            }
-            Err(error) => {
-                error.into_inner().clear();
-                Err(MountError::Poisoned)
-            }
+    pub async fn clear_all(&self) -> Result<(), MountError> {
+        let (setups, result) = match self.0.lock() {
+            Ok(mut held) => (std::mem::take(&mut *held), Ok(())),
+            Err(error) => (
+                std::mem::take(&mut *error.into_inner()),
+                Err(MountError::Poisoned),
+            ),
+        };
+        for setup in setups.into_values() {
+            setup.close().await;
         }
+        result
     }
 }
 
@@ -893,7 +901,7 @@ impl SetupClock {
                         };
 
                         if let Some(peer) = self.route_peer
-                            && let Err(error) = setup_mount.clear(peer, self.bond_edge)
+                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
                         {
                             warn!(%error, "setup could not be unmounted");
                         }
@@ -1032,37 +1040,38 @@ impl WorkRunner {
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
         config.validate()?;
-        let found = discover_setups(&config.journal_root, config.network)
+        let found = discover_setups(&config.journal_root(), config.network())
             .await
             .map_err(|source| PaidProviderError::Discover {
-                path: config.journal_root.clone(),
+                path: config.journal_root().into_path_buf(),
                 source,
             })?;
         if !found.unidentified.is_empty() {
             return Err(PaidProviderError::InvalidOffer);
         }
+        let journal_root = config.journal_root();
         // Every initialized channel must be claimed before the global disk
         // recovery barrier can permit collection or new reservations.
         use hellas_channel::work_store::journal::{Journal, JournalKind};
         let mut unmatched = BTreeMap::new();
-        for stem in Journal::stems(&config.journal_root)
+        for stem in Journal::stems(&journal_root)
             .map_err(hellas_channel::work_store::WorkStoreError::from)?
         {
             if !stem.starts_with("channel-") {
                 continue;
             }
-            let (identity, replay) = Journal::inspect(&config.journal_root, &stem)
+            let (identity, replay) = Journal::inspect(&journal_root, &stem)
                 .await
                 .map_err(hellas_channel::work_store::WorkStoreError::from)?;
             if identity.kind != JournalKind::Channel
                 || stem != format!("channel-{}", hex::encode(identity.key))
             {
                 return Err(PaidProviderError::UnmatchedChannel {
-                    path: Journal::path(&config.journal_root, &stem),
+                    path: Journal::path(&journal_root, &stem),
                 });
             }
             if replay.checkpoint.is_some() || !replay.records.is_empty() {
-                unmatched.insert(identity.key, Journal::path(&config.journal_root, &stem));
+                unmatched.insert(identity.key, Journal::path(&journal_root, &stem));
             }
         }
         let mut clocks = Vec::new();
@@ -1073,12 +1082,11 @@ impl WorkRunner {
             .filter(|s| s.role == Role::Provider)
         {
             let store = SetupStore::open(
-                &config.journal_root,
-                config.network,
+                &config.journal_root(),
+                config.network(),
                 setup.bond_edge,
                 Role::Provider,
                 &Secp256k1Verifier::new(),
-                config.durability,
             )
             .await?;
             let recovered = match (
@@ -1087,7 +1095,7 @@ impl WorkRunner {
                 &setup_mount.3,
             ) {
                 (Some(origin), Some(descriptor), Some(content)) => Box::pin(ChannelStore::recover(
-                    &config.journal_root,
+                    &journal_root,
                     descriptor.channel().clone(),
                     Role::Provider,
                     content.clone(),
@@ -1111,7 +1119,7 @@ impl WorkRunner {
                     .take_mount(store, &config.settlement_key, &policy, &work_mount, origin)
                     .await?;
                 if let Some(peer) = clock.route_peer {
-                    setup_mount.clear(peer, clock.bond_edge)?;
+                    setup_mount.clear(peer, clock.bond_edge).await?;
                 }
             }
             clocks.push(clock);
@@ -1203,7 +1211,7 @@ impl WorkRunner {
         mut self,
         stop: oneshot::Receiver<()>,
         dial: D,
-        finalized: Option<tokio::sync::watch::Receiver<u64>>,
+        finalized: Option<tokio::sync::watch::Receiver<NodeState>>,
     ) -> Result<(), MountError>
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
@@ -1226,6 +1234,14 @@ impl WorkRunner {
                     let mut finalized = finalized.clone();
                     loop {
                         if stop.peek().is_some() {
+                            break;
+                        }
+                        if finalized.as_ref().is_some_and(|state| {
+                            matches!(*state.borrow(), NodeState::Halted { .. })
+                        }) {
+                            if let Driven::Channel(channel) = &clock.driven {
+                                let _ = channel.service.suspend().await;
+                            }
                             break;
                         }
                         let budget = clock.max_observation_age;
@@ -1251,6 +1267,10 @@ impl WorkRunner {
                         if matches!(clock.driven, Driven::Done) {
                             break;
                         }
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class B/C: channel clock freshness, remote retry and deadlines"
+                        )]
                         if let Some(progress) = &mut finalized {
                             tokio::select! {
                                 _ = stop.clone() => break,
@@ -1302,7 +1322,7 @@ impl WorkRunner {
             None => Ok(()),
         };
         let work = self.work_mount.clear_all().await;
-        let setup = self.setup_mount.clear_all();
+        let setup = self.setup_mount.clear_all().await;
         offers.and(work).and(setup)
     }
 
@@ -1355,7 +1375,10 @@ impl NodeWorkRunner {
                 stop,
                 move || {
                     let node = node.clone();
-                    async move { node.view().ok().map(|view| WorkBlocks::new(view.client())) }
+                    async move {
+                        let view = node.wait_ready().await.ok()?;
+                        Some(WorkBlocks::new(view.client()))
+                    }
                 },
                 Some(finalized),
             )
@@ -1502,7 +1525,10 @@ mod tests {
             setups.service(&context, fixture.descriptor.bond_edge()),
             Err(MountError::Poisoned)
         ));
-        assert!(matches!(setups.clear_all(), Err(MountError::Poisoned)));
+        assert!(matches!(
+            setups.clear_all().await,
+            Err(MountError::Poisoned)
+        ));
     }
 
     #[tokio::test]
@@ -1511,9 +1537,7 @@ mod tests {
         let config = &fixture.config;
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                durability: Default::default(),
-                network: config.chain.network,
-                journal_root: config.journal_root.clone(),
+                chain: config.chain.clone(),
                 poll: Duration::ZERO,
                 max_observation_age: config.max_observation_age,
                 settlement_key: crate::test_support::signer(2),
@@ -1525,6 +1549,6 @@ mod tests {
             runner.await,
             Err(PaidProviderError::InvalidObservationPolicy)
         ));
-        assert!(!config.journal_root.exists());
+        assert!(!config.chain.provider_journals().exists());
     }
 }

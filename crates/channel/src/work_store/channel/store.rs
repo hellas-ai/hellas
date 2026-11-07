@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 type ContentEntry = (
     hellas_store::content::LocalStore,
@@ -81,7 +82,7 @@ impl ChannelStore {
     /// is another channel's or a replayed record does not obey the
     /// transition rules.
     pub async fn open<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
@@ -106,7 +107,7 @@ impl ChannelStore {
     /// Replays an initialized channel without creating an empty replacement.
     /// Settlement callers must never forget a previously signed payment.
     pub async fn open_existing<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
@@ -131,7 +132,7 @@ impl ChannelStore {
     /// Recover the journal's initialized funding binding without a chain read.
     /// Missing journals and empty pre-initialization headers carry no channel effects.
     pub async fn recover<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         role: Role,
         content: hellas_store::content::DiskStore,
@@ -149,7 +150,7 @@ impl ChannelStore {
 
     #[allow(clippy::too_many_arguments)]
     async fn open_inner<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: Option<WorkPaymentSettlement>,
         role: Role,
@@ -174,9 +175,9 @@ impl ChannelStore {
             key,
         };
         let (mut journal, replay) = if existing {
-            Journal::open_existing(root, &stem, id, content.durability()).await?
+            Journal::open_existing(root, &stem, id).await?
         } else {
-            Journal::open_latest(root, &stem, id, content.durability()).await?
+            Journal::open_latest(root, &stem, id).await?
         };
         let mut state = match &replay.checkpoint {
             Some(bytes) => {
@@ -289,6 +290,12 @@ impl ChannelStore {
         }
         self.state.restore_input(work_id, bytes.into())?;
         Ok(())
+    }
+
+    /// Inspect the actual owned connection, rather than a fresh SQLite connection.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn synchronous_for_test(&mut self) -> i64 {
+        self.journal.synchronous_for_test().await
     }
 
     #[cfg(test)]

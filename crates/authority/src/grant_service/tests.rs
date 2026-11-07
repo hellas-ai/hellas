@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 mod protocol;
 use super::*;
 use hellas_channel::work_store::journal::JournalError;
@@ -76,14 +77,14 @@ async fn backend_panic_finishes_the_job_and_does_not_strand_shutdown() {
         .await
         .unwrap();
     drop(service);
+    let location = StoreLocation::for_test(directory.path());
     let reopened = NodeStore::open(
-        directory.path(),
+        &location,
         common::network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],
         )),
         UnixMillis(1000),
-        Default::default(),
     )
     .await
     .unwrap();

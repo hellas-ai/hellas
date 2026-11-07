@@ -1,5 +1,6 @@
 use hellas_authority::model::grant::records::check_grant_provider;
-use std::path::{Path, PathBuf};
+use hellas_private::StoreLocation;
+use std::path::PathBuf;
 
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
 use hellas_chain::WorkBlocks;
@@ -210,7 +211,7 @@ impl OfferAllocator {
             &hellas_auth::PublicKey::Secp256k1(key),
             &hellas_auth::Signature::Secp256k1(signature),
             request_digest(
-                self.config.network,
+                self.config.network(),
                 self.provider.content_id(),
                 &request,
                 &exporter,
@@ -231,7 +232,7 @@ impl OfferAllocator {
         {
             return Err(unavailable("offer lifetime exceeds chain maximum"));
         }
-        let policy = current.provider_policy(self.config.network);
+        let policy = current.provider_policy(self.config.network());
         let values = policy.expected_payment_values;
         // The node's consensus fee schedule is fixed. Reject terms that could
         // quote a capacity the finalized Open cannot produce.
@@ -315,42 +316,33 @@ impl OfferAllocator {
         if coins.is_empty() {
             return quote(&policy, current.policy.offers.omission_bond);
         }
-        let owned = chain
-            .get_coins_by_owner(Key::from_bytes(principal).into())
+        // The request names at most four funding inputs. Verify those exact
+        // objects together at one current root instead of listing an owner.
+        let funding = chain
+            .get_objects(
+                coins
+                    .iter()
+                    .copied()
+                    .map(hellas_chain::domain::coin_object_id)
+                    .collect(),
+            )
             .await
             .map_err(unavailable)?
-            .ok_or_else(|| unavailable("client ownership unavailable"))?;
-        let delegated = chain
-            .get_coins_by_delegate(Key::from_bytes(key).into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("client delegation unavailable"))?;
-        if owned.snapshot.payload != delegated.snapshot.payload
-            || owned.snapshot.state_root != delegated.snapshot.state_root
-        {
-            return Err(unavailable(
-                "client funding snapshot advanced; retry offer request",
-            ));
-        }
+            .ok_or_else(|| unavailable("client funding unavailable"))?;
         let mut total = 0_u64;
         for coin in &coins {
-            let id: hellas_chain::domain::ObjectId = coin.to_bytes().into();
-            let value = owned
-                .coins
-                .iter()
-                .find(|(held, _)| *held == id)
-                .map(|(_, value)| *value);
-            if value.is_none()
-                || !delegated
-                    .coins
-                    .iter()
-                    .any(|(held, delegated_value)| *held == id && Some(*delegated_value) == value)
+            let Some(hellas_chain::domain::Object::Coin(state)) = funding
+                .objects
+                .get(&hellas_chain::domain::coin_object_id(*coin))
+            else {
+                return Ok(refused(OfferRefusalCode::NeedsFunding, required));
+            };
+            if state.owner != Key::from_bytes(principal).into()
+                || state.delegate != Some(Key::from_bytes(key).into())
             {
                 return Ok(refused(OfferRefusalCode::NeedsFunding, required));
             }
-            total = total
-                .checked_add(value.ok_or_else(invalid)?)
-                .ok_or_else(invalid)?;
+            total = total.checked_add(state.value).ok_or_else(invalid)?;
         }
         if total != required {
             return Ok(refused(OfferRefusalCode::NeedsFunding, required));
@@ -359,39 +351,40 @@ impl OfferAllocator {
             return Ok(refused(OfferRefusalCode::OfferLimit, 0));
         }
         let owner = self.authority.owner().await.map_err(unavailable)?;
-        let listing = chain
-            .get_coins_by_delegate(self.config.settlement_key.party_key().into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("delegated stake unavailable"))?;
-        let owned_stake = chain
-            .get_coins_by_owner(Key::from_bytes(*owner.as_bytes()).into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("stake ownership unavailable"))?;
-        if owned_stake.snapshot.payload != listing.snapshot.payload
-            || owned_stake.snapshot.state_root != listing.snapshot.state_root
-        {
-            return Err(unavailable("stake snapshot advanced; retry offer request"));
-        }
-        let mut available = Vec::new();
-        for (id, value) in listing.coins {
-            let coin_id = CoinId::from_bytes(id.0);
-            if !reserved.contains(&coin_id)
-                && value > 0
-                && value <= current.policy.offers.max_stake_per_client
-                && owned_stake
-                    .coins
-                    .iter()
-                    .any(|(held, owned_value)| *held == id && *owned_value == value)
-            {
-                available.push((coin_id, value));
+        let mut after = None;
+        let stake = loop {
+            let page = chain
+                .get_coins_by_delegate_page(self.config.settlement_key.party_key().into(), after)
+                .await
+                .map_err(unavailable)?
+                .ok_or_else(|| unavailable("delegated stake unavailable"))?;
+            let mut found = None;
+            for (id, _) in page.coins {
+                let coin_id = CoinId::from_bytes(id.0);
+                if reserved.contains(&coin_id) {
+                    continue;
+                }
+                let snapshot = chain
+                    .get_objects(vec![id])
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("stake object unavailable"))?;
+                if let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot.objects.get(&id)
+                    && coin.owner == Key::from_bytes(*owner.as_bytes()).into()
+                    && coin.delegate == Some(self.config.settlement_key.party_key().into())
+                    && coin.value > 0
+                    && coin.value <= current.policy.offers.max_stake_per_client
+                {
+                    found = Some((coin_id, coin.value));
+                    break;
+                }
             }
-        }
-        // A positive stake insures the protocol's price cap; omission collateral
-        // belongs to the payment edge. One eligible coin is the fewest possible.
-        available.sort_by_key(|(id, value)| (*value, *id));
-        let Some((stake, stake_value)) = available.first().copied() else {
+            if found.is_some() || page.next.is_none() {
+                break found;
+            }
+            after = page.next;
+        };
+        let Some((stake, stake_value)) = stake else {
             return Ok(refused(OfferRefusalCode::NoStakeAvailable, 0));
         };
         let timeout = tip
@@ -401,8 +394,8 @@ impl OfferAllocator {
         let adoption = self.adopt.try_reserve().map_err(unavailable)?;
         let provisioned = provision_offer(
             ProvisionOptions {
-                network: self.config.network,
-                journal_root: self.config.journal_root.clone(),
+                network: self.config.network(),
+                journal_root: self.config.journal_root(),
                 policy,
                 omission_bond: current.policy.offers.omission_bond,
                 peer,
@@ -428,17 +421,15 @@ impl OfferAllocator {
             &self.authority,
             &held,
             &self.needs_restart,
-            self.config.durability,
         )
         .await
         .map_err(unavailable)?;
         let store = SetupStore::open(
-            &self.config.journal_root,
-            self.config.network,
+            &self.config.journal_root(),
+            self.config.network(),
             provisioned.bond_edge,
             Role::Provider,
             &Secp256k1Verifier::new(),
-            self.config.durability,
         )
         .await
         .map_err(unavailable)?;
@@ -461,7 +452,7 @@ impl OfferAllocator {
 struct ProvisionOptions {
     /// Chain and journal identity.
     network: NetworkId,
-    journal_root: PathBuf,
+    journal_root: StoreLocation,
     policy: ProviderChannelPolicy,
     omission_bond: u64,
     payment_funding: Funding,
@@ -495,18 +486,18 @@ async fn provision_offer(
     authority: &hellas_authority::node::NodeCoordinator,
     held: &[SetupState],
     write_started: &std::sync::atomic::AtomicBool,
-    durability: hellas_private::Durability,
 ) -> Result<Provisioned> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
     let offer = Offer::plan(&options, candidate, held)?;
-    let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
+    let view = tokio::time::timeout_at(deadline, node.wait_ready())
         .await
         .map_err(|_| ProvisionError::NoFinalizedBlock)??;
     let floor = floor_of(&WorkBlocks::new(view.client()))
         .await?
         .ok_or(ProvisionError::NoFinalizedBlock)?;
-    offer.journal(floor, write_started, durability).await
+    offer.journal(floor, write_started).await
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -523,7 +514,7 @@ struct Provisioned {
 /// Deterministic bond inputs, checked before a signature is journaled.
 struct BondCandidate {
     network: NetworkId,
-    journal_root: PathBuf,
+    journal_root: StoreLocation,
     bond_edge: EdgeId,
     bond_funding: Funding,
     bond_terms: WorkStakeBondTerms,
@@ -634,7 +625,6 @@ impl Offer {
         self,
         floor: SetupScan,
         write_started: &std::sync::atomic::AtomicBool,
-        durability: hellas_private::Durability,
     ) -> Result<Provisioned> {
         let timeout = self.candidate.bond_terms.timeout.get();
         if timeout <= floor.height {
@@ -685,9 +675,8 @@ impl Offer {
         // Preflight reads and signatures above this boundary cannot do so.
         write_started.store(true, std::sync::atomic::Ordering::Release);
         {
-            let mut store =
-                open_provider_journal(&journal_root, network, bond_edge, durability).await?;
-            store
+            let mut store = open_provider_journal(&journal_root, network, bond_edge).await?;
+            let written = store
                 .commit(
                     SetupRecord::Offer {
                         peer,
@@ -696,15 +685,18 @@ impl Offer {
                     },
                     &Secp256k1Verifier::new(),
                 )
-                .await?;
+                .await
+                .map(|_| ());
+            store.close().await;
+            written?;
         }
 
         // Reopen with the same replay and signature checks used at startup.
-        let reopened = open_provider_journal(&journal_root, network, bond_edge, durability).await?;
-        let state = reopened.state();
+        let reopened = open_provider_journal(&journal_root, network, bond_edge).await?;
+        let state = reopened.into_state().await;
         let (Some(1), Some(floor)) = (state.revision(), state.scan_armed()) else {
             return Err(ProvisionError::JournalReplay {
-                root: journal_root,
+                root: journal_root.into_path_buf(),
                 revision: state.revision(),
                 floor: state.scan_armed().map(|scan| scan.height),
             });
@@ -722,10 +714,9 @@ impl Offer {
 }
 
 async fn open_provider_journal(
-    root: &Path,
+    root: &StoreLocation,
     network: NetworkId,
     bond_edge: EdgeId,
-    durability: hellas_private::Durability,
 ) -> Result<SetupStore> {
     SetupStore::open(
         root,
@@ -733,11 +724,10 @@ async fn open_provider_journal(
         bond_edge,
         Role::Provider,
         &Secp256k1Verifier::new(),
-        durability,
     )
     .await
     .map_err(|source| ProvisionError::Journal {
-        root: root.into(),
+        root: root.to_path_buf(),
         source,
     })
 }

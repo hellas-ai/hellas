@@ -1,4 +1,5 @@
 use super::*;
+use hellas_authority::test_support::HANG_GUARD;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -148,7 +149,7 @@ async fn local_control_matches_remote_authority_decisions() {
         NodeStoreError::Authority(AuthorityError::Credential)
     );
 
-    tokio::time::timeout(hellas_authority::test_support::WAIT, listener.shutdown())
+    tokio::time::timeout(HANG_GUARD, listener.shutdown())
         .await
         .unwrap()
         .unwrap();
@@ -157,7 +158,7 @@ async fn local_control_matches_remote_authority_decisions() {
             .get_host_status(read_request(ROOT_GRANT))
             .await, status if matches!(status.code(), WireCode::Unavailable | WireCode::Internal));
     closer.close(0u32.into(), b"test completed");
-    hellas_channel::test_support::assert_err!(tokio::time::timeout(hellas_authority::test_support::WAIT, remote_task)
+    hellas_channel::test_support::assert_err!(tokio::time::timeout(HANG_GUARD, remote_task)
             .await
             .unwrap()
             .unwrap(), status if status.code() == WireCode::Unavailable);
@@ -222,7 +223,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     hellas_channel::test_support::assert_err!(f.service
             .bind_local(&socket, server_config.clone()), error if error.kind() == std::io::ErrorKind::AddrInUse);
     let wait_slots = async |expected| {
-        tokio::time::timeout(hellas_authority::test_support::WAIT, async {
+        tokio::time::timeout(HANG_GUARD, async {
             while f.service.local_slots.available_permits() != expected {
                 tokio::task::yield_now().await;
             }
@@ -239,7 +240,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     wait_slots(0).await;
     let mut extra = hellas_wire::local::connect_stream(&socket).await.unwrap();
     assert_eq!(
-        tokio::time::timeout(hellas_authority::test_support::WAIT, extra.read_u8())
+        tokio::time::timeout(HANG_GUARD, extra.read_u8())
             .await
             .unwrap()
             .unwrap_err()
@@ -293,7 +294,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     // If someone replaced the socket path, cleanup must preserve their file.
     std::fs::remove_file(&socket).unwrap();
     std::fs::write(&socket, b"replacement").unwrap();
-    tokio::time::timeout(hellas_authority::test_support::WAIT, listener.shutdown())
+    tokio::time::timeout(HANG_GUARD, listener.shutdown())
         .await
         .unwrap()
         .unwrap();
@@ -313,7 +314,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     let mut pending = hellas_wire::local::connect_stream(&socket).await.unwrap();
     wait_slots(MAX_CONNECTIONS - 1).await;
     drop(listener);
-    tokio::time::timeout(hellas_authority::test_support::WAIT, pending.read_u8())
+    tokio::time::timeout(HANG_GUARD, pending.read_u8())
         .await
         .unwrap()
         .unwrap_err();

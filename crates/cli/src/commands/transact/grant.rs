@@ -9,7 +9,7 @@ use hellas_sdk::{
 #[derive(Debug, Default, Args)]
 pub(super) struct GrantArgs {
     /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
-    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "trust", "genesis", "addresses", "state_dir", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
+    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
     pub offer: Option<String>,
     /// Select a resource ID in an imported allowance containing several policies.
     #[arg(long, requires = "offer")]
@@ -65,6 +65,7 @@ pub(super) async fn execute(
     let principal = super::super::contributions::principal(&context.owner)?;
     let holder = NodeKey::from_public_key(context.producer.public_key())?;
     let store = hellas_sdk::grant_store::GrantStore::new(super::super::contributions::data_root(
+        &context.home,
         &principal,
     )?);
     let (offer, application) = store.load_access(
@@ -84,10 +85,13 @@ pub(super) async fn execute(
         );
     }
     let trust = match (&args.trust_store, &args.trust_policy, job.assurance()) {
-        (Some(directory), Some(id), assurance) => hellas_sdk::trust_policy::TrustPolicyStore::new(
-            directory,
-        )
-        .resolve(id, assurance, crate::identity::assertion_counters()?)?,
+        (Some(directory), Some(id), assurance) => {
+            hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
+                id,
+                assurance,
+                crate::identity::assertion_counters(&context.home)?,
+            )?
+        }
         (None, None, Assurance::ProducerSigned) => hellas_client::ProviderTrustAnchor {
             expected_genesis: provider.enrollment,
             required_assurance: Assurance::ProducerSigned,
@@ -105,8 +109,9 @@ pub(super) async fn execute(
             .to_bytes(),
     );
     let terms = ExecutionTerms::Grant { resource };
-    let default_attempt = args
-        .root(context)
+    let default_attempt = context
+        .home
+        .join("grants")
         .join("grant-attempts")
         .join(provider.to_string())
         .join(offer.offer().grant.id.to_string())
@@ -116,7 +121,6 @@ pub(super) async fn execute(
         job.input(),
         terms,
     )?;
-    attempt.retain_results(true);
     attempt.bind_target(ExecutionTarget {
         network: offer.offer().network,
         provider,
@@ -129,7 +133,10 @@ pub(super) async fn execute(
             principal,
             signer: Arc::new(context.producer.clone()),
             application,
-            journal_root: super::super::contributions::client_journal_root(&principal)?,
+            journal_root: super::super::contributions::client_journal_root(
+                &context.home,
+                &principal,
+            )?,
             control_timeout: Duration::from_secs(90),
         };
         let endpoint = hellas_sdk::grant_client::bind_endpoint(context.transport.clone()).await?;
@@ -139,7 +146,7 @@ pub(super) async fn execute(
         let mut session = match session {
             Ok(session) => session,
             Err(error) => {
-                endpoint.close().await;
+                hellas_wire::iroh::close(&endpoint).await;
                 return Err(error.into());
             }
         };
@@ -161,7 +168,7 @@ pub(super) async fn execute(
         let closed = session.shutdown().await;
         // Closing acknowledges the provider's final frames; dropping the
         // endpoint would leave it waiting for them until its write timeout.
-        endpoint.close().await;
+        hellas_wire::iroh::close(&endpoint).await;
         let result = result?;
         closed?;
         result

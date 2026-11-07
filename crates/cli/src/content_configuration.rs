@@ -192,7 +192,13 @@ mod tests {
         assert!(ContentConfiguration::load(Some(path.clone()), None).is_err());
         std::fs::write(&path, document("model")).unwrap();
         let loaded = ContentConfiguration::load(Some(path), None).unwrap();
-        assert_eq!(loaded.config.upper().unwrap(), root.path().join("upper"));
+        assert_eq!(
+            loaded
+                .config
+                .upper(&hellas_private::StoreLocation::for_test(root.path()))
+                .as_path(),
+            root.path().join("upper")
+        );
         assert_eq!(loaded.config.lower, vec![root.path().join("lower")]);
     }
 
@@ -207,9 +213,9 @@ mod tests {
         let store = loaded
             .config
             .open(
+                &hellas_private::StoreLocation::for_test(root.path()),
                 Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
                 false,
-                Default::default(),
             )
             .await
             .unwrap();
@@ -254,9 +260,9 @@ mod tests {
         let store = loaded
             .config
             .open(
+                &hellas_private::StoreLocation::for_test(root.path()),
                 Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
                 false,
-                Default::default(),
             )
             .await
             .unwrap();
@@ -264,8 +270,7 @@ mod tests {
         hellas_channel::content::upload_object(&store, b"weights")
             .await
             .unwrap();
-        let identity =
-            crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+        let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
         let provider = hellas_sdk::ProviderOptions {
             content: store.clone(),
             executor: hellas_executor::ExecutorSpawnConfig::new(

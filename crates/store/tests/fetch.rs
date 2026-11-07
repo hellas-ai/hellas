@@ -114,13 +114,12 @@ fn a_range_that_ends_before_it_starts_does_not_parse() {
 async fn fetches_the_reference_file_and_verifies_it() {
     let directory = tempfile::tempdir().unwrap();
     let store = DiskStore::open(
-        directory.path().into(),
+        hellas_private::StoreLocation::for_test(directory.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

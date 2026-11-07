@@ -3,7 +3,7 @@ use crate::domain::{
     ThresholdShare,
 };
 pub use crate::genesis::{
-    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
+    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_2_JSON,
 };
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;
@@ -27,8 +27,6 @@ pub enum ConfigError {
     InvalidHex(#[from] hex::FromHexError),
     #[error("invalid key bytes")]
     InvalidKey(#[from] commonware_codec::Error),
-    #[error("unable to determine local data directory")]
-    MissingDataDirectory,
     #[error("duplicate public keys in config")]
     DuplicatePublicKeys,
     #[error("invalid genesis document")]
@@ -150,7 +148,6 @@ pub struct ValidatorConfig {
     pub archive_blocks: Option<NonZeroU64>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
-    pub genesis: Genesis,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -170,15 +167,15 @@ impl ValidatorConfig {
             .map(|port| SocketAddr::new(self.metrics_bind_address, port))
     }
 
-    pub fn validate_genesis(&self) -> Result<(), ConfigError> {
-        self.genesis.validate()?;
-        self.network_id()?;
+    pub fn validate_genesis(&self, genesis: &Genesis) -> Result<(), ConfigError> {
+        genesis.validate()?;
+        self.network_id(genesis)?;
         Ok(())
     }
 
     /// The network every signature domain on this node is bound to.
-    pub fn network_id(&self) -> Result<NetworkId, ConfigError> {
-        Ok(crate::domain::network_id(&self.genesis)?)
+    pub fn network_id(&self, genesis: &Genesis) -> Result<NetworkId, ConfigError> {
+        Ok(crate::domain::network_id(genesis)?)
     }
 
     pub fn decode_private_key(&self) -> Result<ed25519::PrivateKey, ConfigError> {
@@ -191,9 +188,12 @@ impl ValidatorConfig {
         Ok(ThresholdShare::decode(bytes.as_slice())?)
     }
 
-    pub fn decode_threshold_polynomial(&self) -> Result<ThresholdPolynomial, ConfigError> {
+    pub fn decode_threshold_polynomial(
+        &self,
+        genesis: &Genesis,
+    ) -> Result<ThresholdPolynomial, ConfigError> {
         let bytes = hex::decode(&self.threshold_polynomial)?;
-        let total = u32::try_from(self.genesis.validators.len()).unwrap_or(u32::MAX);
+        let total = u32::try_from(genesis.validators.len()).unwrap_or(u32::MAX);
         let max_participants = NonZeroU32::new(total).unwrap_or(NonZeroU32::MIN);
         Ok(ThresholdPolynomial::decode_cfg(
             bytes.as_slice(),
@@ -201,21 +201,14 @@ impl ValidatorConfig {
         )?)
     }
 
-    pub fn storage_directory(&self) -> Result<PathBuf, ConfigError> {
-        let base = dirs::data_local_dir().ok_or(ConfigError::MissingDataDirectory)?;
-        let pk_hex = hex::encode(self.public_key()?.encode());
-        Ok(base.join("hellas").join(&pk_hex[..16]))
-    }
-
     pub fn public_key(&self) -> Result<PublicKey, ConfigError> {
         Ok(self.decode_private_key()?.public_key())
     }
 
-    pub fn participants(&self) -> Result<Set<PublicKey>, ConfigError> {
-        self.validate_genesis()?;
+    pub fn participants(&self, genesis: &Genesis) -> Result<Set<PublicKey>, ConfigError> {
+        self.validate_genesis(genesis)?;
         let me = self.public_key()?;
-        let keys: Vec<PublicKey> = self
-            .genesis
+        let keys: Vec<PublicKey> = genesis
             .validators
             .iter()
             .map(|validator| -> Result<PublicKey, ConfigError> {
@@ -231,7 +224,10 @@ impl ValidatorConfig {
         Ok(set)
     }
 
-    pub fn peer_address_map(&self) -> Result<Map<PublicKey, P2pAddress>, ConfigError> {
+    pub fn peer_address_map(
+        &self,
+        genesis: &Genesis,
+    ) -> Result<Map<PublicKey, P2pAddress>, ConfigError> {
         let me = self.public_key()?;
         let listen: SocketAddr = format!("0.0.0.0:{}", self.listen_port).parse()?;
 
@@ -253,7 +249,7 @@ impl ValidatorConfig {
                 .collect::<Vec<_>>(),
         )
         .map_err(|_| ConfigError::DuplicatePeerAddressKeys)?;
-        if configured != self.participants()? {
+        if configured != self.participants(genesis)? {
             return Err(ConfigError::PeerSetMismatch);
         }
         Map::try_from(entries).map_err(|_| ConfigError::DuplicatePeerAddressKeys)
@@ -283,8 +279,11 @@ impl ValidatorConfig {
         Ok(true)
     }
 
-    pub fn genesis_allocations(&self) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
-        genesis_allocations(&self.genesis)
+    pub fn genesis_allocations(
+        &self,
+        genesis: &Genesis,
+    ) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
+        genesis_allocations(genesis)
     }
 }
 

@@ -63,14 +63,9 @@ fn indexed_startup_rejects_corrupt_published_evidence() {
             write.commit().unwrap();
             drop(h.index);
             assert!(
-                crate::node::FullNode::start_indexed(
-                    config,
-                    h.trust,
-                    h.genesis_json,
-                    "edge-test".into()
-                )
-                .await
-                .is_err()
+                crate::node::FullNode::start_indexed(config, "edge-test".into())
+                    .await
+                    .is_err()
             );
         });
     }

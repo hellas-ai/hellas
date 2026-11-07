@@ -357,14 +357,13 @@ async fn child(root: &Path, funding: &str, phase: &str, seed: &str) -> ! {
             let directory = fixture
                 .options(vec![])
                 .journal_root
-                .join(hex::encode(channel.id.0.as_bytes()));
+                .child(hex::encode(channel.id.0.as_bytes()));
             let mut client = hellas_authority::work_store::grant::GrantClientStore::open(
                 &directory,
                 common::network(),
                 fixture.enrollment.clone(),
                 channel,
                 fixture.now,
-                Default::default(),
             )
             .await
             .unwrap();
@@ -500,7 +499,7 @@ async fn ephemeral_process_loss_keeps_large_paid_and_grant_payloads_out_of_every
     }
     for funding in ["paid", "grant"] {
         for phase in ["accepted", "success", "checkpoint"] {
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
                 let root = tempfile::tempdir().unwrap();
                 let data = root.path().join("data"); std::fs::create_dir(&data).unwrap();
                 let seed = hex::encode(rand::random::<[u8;32]>());
@@ -513,6 +512,10 @@ async fn ephemeral_process_loss_keeps_large_paid_and_grant_payloads_out_of_every
                     .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).kill_on_drop(true).spawn().unwrap();
                 while !root.path().join("ready").exists() {
                     assert!(child.try_wait().unwrap().is_none(), "{funding}/{phase}: {}", std::fs::read_to_string(root.path().join("child.log")).unwrap());
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class A: a separate child process publishes readiness only as a file"
+                    )]
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 scan(root.path(), &canaries).await.unwrap();
@@ -524,7 +527,7 @@ async fn ephemeral_process_loss_keeps_large_paid_and_grant_payloads_out_of_every
                 if let Some(grant) = grant {
                     assert!(grant.starts_with(&data));
                     let enrollment = hellas_channel::test_support::software_enrollment(2, *iroh::SecretKey::from_bytes(&[2;32]).public().as_bytes());
-                    let store = hellas_authority::work_store::grant::NodeStore::open(&grant.join("provider"), common::network(), Some(enrollment), hellas_auth::authority::UnixMillis::now().unwrap(), Default::default(),).await.unwrap();
+                    let store = hellas_authority::work_store::grant::NodeStore::open(&hellas_private::StoreLocation::for_test(&grant.join("provider")), common::network(), Some(enrollment), hellas_auth::authority::UnixMillis::now().unwrap(),).await.unwrap();
                     let backend = Backend { finish:Completion::Immediate, ..Default::default() };
                     let calls = backend.calls.clone();
                     let content = common::content_store(&grant.join("provider")).await;
@@ -539,8 +542,8 @@ async fn ephemeral_process_loss_keeps_large_paid_and_grant_payloads_out_of_every
                     admission.limits.max_request_body_bytes=1<<20; admission.limits.max_spool_bytes=1<<20;
                     let channel = fixture::ready_of(&fixture::descriptor_with(policy), fixture::CURSOR);
                     for (name, role) in [("provider",Role::Provider),("client",Role::Client)] {
-                        let node_root = root.path().join(name);
-                        let content = DiskStore::open(node_root.join("content"),vec![],IndexMode::Resume,None,Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES), false, Default::default(),).await.unwrap();
+                        let node_root = hellas_private::StoreLocation::for_test(&root.path().join(name));
+                        let content = DiskStore::open(node_root.child("content"),vec![],IndexMode::Resume,None,Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES), false,).await.unwrap();
                         assert!(content.collect(&Scope::Owner).await.is_err());
                         let journal = ChannelStore::recover(&node_root,channel.channel().clone(),role,content.clone(),&Secp256k1Verifier::new()).await.unwrap().unwrap();
                         for job in journal.state().jobs() {assert!(job.prepared_input().is_empty() && job.transcript().is_empty());}

@@ -193,4 +193,8 @@ fn error_body(status: StatusCode, message: impl Into<String>) -> (StatusCode, se
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;

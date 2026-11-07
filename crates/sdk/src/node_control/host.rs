@@ -91,6 +91,7 @@ pub enum HostError {
 }
 
 pub struct HostHandle {
+    node: Option<NodeCoordinator>,
     pub(super) runtime: Runtime,
     listener: Option<hellas_wire::local::LocalControlServer>,
     stop: watch::Sender<bool>,
@@ -175,6 +176,7 @@ impl HostHandle {
             has_gateway: options.gateway.is_some() || deferred.is_some(),
             endpoint: watch::channel(None).0,
         };
+        let node = options.control.as_ref().map(|(node, _)| node.clone());
         let (control, listener) = if let Some((node, config)) = options.control {
             let mut control = NodeControl::new(node)
                 .with_content_store(options.content.clone())
@@ -221,6 +223,7 @@ impl HostHandle {
                 .or(deferred),
         ));
         let host = Self {
+            node,
             runtime,
             transport: remote,
             listener,
@@ -270,12 +273,16 @@ impl HostHandle {
             .await
             .map_err(HostError::from)
             .and_then(|result| result);
+        let mut result = listener.and(stopped);
         // Accepted remote Work drains while the host-owned endpoint is alive.
         if let Some((endpoint, task)) = self.transport.take() {
-            endpoint.close().await;
-            task.await?;
+            hellas_wire::iroh::close(&endpoint).await;
+            result = result.and(task.await.map_err(HostError::from));
         }
-        listener.and(stopped)
+        if let Some(node) = self.node.take() {
+            node.close().await;
+        }
+        result
     }
 }
 impl Drop for HostHandle {
@@ -833,18 +840,18 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
     }
     let control = if let Some(config) = grants {
         let tls = super::profile::server_identity(
-            &config.control_certificate,
-            &config.control_private_key,
+            &config.control_certificate(),
+            &config.control_private_key(),
         )
         .map_err(ProviderError::from)?;
+        let journal_root = config.journal_root();
+        let control_socket = config.control_socket();
         let grants = crate::ProviderGrants {
             config: crate::GrantProviderOptions {
                 configuration: config.configuration,
                 max_job_millis: config.max_job_millis,
             },
-            authority: crate::ProviderAuthority::Journal {
-                root: config.journal_root,
-            },
+            authority: crate::ProviderAuthority::Journal { root: journal_root },
         };
         let resources = if provider.executor.supports_compute() {
             crate::grant_provider::ProviderResources::ComputeAndFetch(
@@ -854,17 +861,13 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
             crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
         };
         let node = grants
-            .open(
-                resources,
-                &provider.open_identity.enrollment,
-                provider.content.durability(),
-            )
+            .open(resources, &provider.open_identity.enrollment)
             .await?;
         provider.grants = Some(grants);
         Some((
             node,
             ProviderControl {
-                socket: config.control_socket,
+                socket: control_socket,
                 tls,
                 remote: config.remote_control,
             },

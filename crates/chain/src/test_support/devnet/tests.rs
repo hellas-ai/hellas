@@ -7,7 +7,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
     run(|runtime| async move {
         let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
         let published: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
         for (owner, account) in owners.iter().zip(&published) {
             assert_eq!(owner.key().to_string(), account.address);
         }
@@ -89,7 +89,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
 }
 
 #[test]
-fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds() {
+fn a_full_node_recovers_when_its_chain_sync_source_returns_after_an_outage() {
     run(|runtime| async move {
         let owner = GenesisOwner {
             kind: OwnerKind::Native,
@@ -124,13 +124,10 @@ fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds(
         // Keep its address so the node's ordinary reconnect path can recover.
         let validator = &devnet.validators[0];
         validator.sync_task.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !validator.sync_task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the ChainSync server stopped");
+        // `run` bounds a hang for the whole fixture.
+        while !validator.sync_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
         let (indexer, events, endpoint, database, verifier) = (
             validator.indexer.archive.clone(),
             devnet.activity[0].clone(),
@@ -139,7 +136,9 @@ fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds(
             devnet.fixture.verifier.clone(),
         );
         let started = tokio::time::Instant::now();
-        let outage = std::time::Duration::from_secs(30);
+        // Long enough for several failed reconnects with growing backoff. The
+        // reconnect loop has no attempt limit, so a longer outage only waits.
+        let outage = std::time::Duration::from_secs(2);
         devnet.rpc.spawn(async move {
             tokio::time::sleep_until(started + outage).await;
             crate::node::transport::serve_validator_endpoint(
@@ -208,9 +207,10 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
         devnet.seal().await;
         let node_key = SettlementKey::from(native_signer([0x42; 32]).party_key());
         let (tx, delegated) = delegate_allocation(devnet.allocations(), &owner, node_key);
-        let submitter = RemoteLightClient::connect(devnet.light_client_url(3))
-            .await
-            .unwrap();
+        let submitter =
+            RemoteLightClient::connect(devnet.light_client_url(3), devnet.proof_verifier())
+                .await
+                .unwrap();
         assert_eq!(
             submitter.submit_tx(tx).await.unwrap(),
             crate::SubmitTxOutcome::Enqueued,
@@ -228,10 +228,9 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
             .unwrap()
             .unwrap();
         for url in devnet.light_client_urls() {
-            let remote = RemoteLightClient::connect(url.clone())
+            let remote = RemoteLightClient::connect(url.clone(), devnet.proof_verifier())
                 .await
-                .unwrap()
-                .with_consensus_verifier(devnet.consensus_verifier());
+                .unwrap();
             assert_eq!(
                 remote.get_latest_block().await.unwrap().as_ref(),
                 Some(&latest),
@@ -263,15 +262,85 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
                 TEST_NETWORK,
                 crate::genesis_digest(devnet.genesis()),
             );
-            let refused = RemoteLightClient::connect(url.clone())
+            let profile = devnet.profile(0);
+            let mut trust = profile.trust().clone();
+            trust.epochs[0].threshold_identity =
+                hex::encode(stranger.assembler.identity().encode());
+            let foreign = std::sync::Arc::new(
+                crate::proof_verify::ProofVerifier::with_digest(trust, profile.consensus_digest())
+                    .unwrap(),
+            );
+            let refused = RemoteLightClient::connect(url.clone(), foreign)
                 .await
-                .unwrap()
-                .with_consensus_verifier(stranger.verifier);
+                .unwrap();
             assert!(
                 refused.get_latest_block().await.is_err(),
                 "another committee's verifier refuses {url}",
             );
         }
         devnet.shutdown().await;
+    });
+}
+
+#[test]
+fn unwinding_keeps_fixture_storage_until_aborted_tasks_finish() {
+    use commonware_runtime::Spawner as _;
+    use futures::FutureExt as _;
+    use std::panic::AssertUnwindSafe;
+
+    run(|runtime| async move {
+        let mut devnet = Devnet::start(
+            runtime.child("fixture"),
+            DevnetConfig {
+                name: "unwind_storage",
+                owners: vec![GenesisOwner::faucet(0)],
+                full_nodes: 0,
+            },
+        )
+        .await;
+        let path = devnet.storage().to_owned();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, stopped) = tokio::sync::oneshot::channel();
+        struct CleanupProbe {
+            path: PathBuf,
+            released: std::sync::mpsc::Receiver<()>,
+            finished: Option<tokio::sync::oneshot::Sender<bool>>,
+        }
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                // Observe only after the primary fixture's Drop has returned.
+                let _ = self.released.recv();
+                let _ = self.finished.take().unwrap().send(self.path.exists());
+            }
+        }
+        let probe = runtime.child("cleanup_probe").spawn(move |_| async move {
+            let _probe = CleanupProbe {
+                path,
+                released,
+                finished: Some(finished),
+            };
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        let archive = std::mem::replace(&mut devnet.validators[0].task, probe);
+        archive.abort();
+        let _ = archive.await;
+        ready.await.unwrap();
+        let panic = AssertUnwindSafe(async move {
+            let _fixture = devnet;
+            panic!("intentional fixture unwind");
+        })
+        .catch_unwind()
+        .await;
+        assert!(panic.is_err());
+        release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, stopped)
+                .await
+                .unwrap()
+                .unwrap(),
+            "fixture storage was removed before task cleanup"
+        );
     });
 }

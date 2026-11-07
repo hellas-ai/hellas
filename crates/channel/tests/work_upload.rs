@@ -24,7 +24,6 @@ use hellas_rpc::{
 };
 use hellas_store::content::*;
 use hellas_wire::TransportContext;
-use std::time::Duration;
 
 async fn service(root: &std::path::Path, ready: &ReadyChannel) -> (WorkService, DiskStore) {
     let journal = store_at(root, ready, Role::Provider, CURSOR).await;
@@ -105,7 +104,7 @@ async fn upload(
     }
 }
 async fn claims_released(service: &WorkService) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
@@ -479,7 +478,7 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
     shutdown(service, node).await;
     let node = content_store(&provider_root).await;
     let mut journal = ChannelStore::open(
-        &provider_root,
+        &hellas_private::StoreLocation::for_test(&provider_root),
         ready.channel().clone(),
         settlement(),
         Role::Provider,
@@ -729,11 +728,21 @@ async fn durable_expiry_before_cleanup_releases_unaccepted_payloads_on_reopen() 
     drop(store);
     node.close().await;
     drop(node);
-    let stem = Journal::stems(root.path()).unwrap().pop().unwrap();
-    let (header, _) = Journal::inspect(root.path(), &stem).await.unwrap();
-    let (mut journal, _) = Journal::open_existing(root.path(), &stem, header, Default::default())
-        .await
+    let stem = Journal::stems(&hellas_private::StoreLocation::for_test(root.path()))
+        .unwrap()
+        .pop()
         .unwrap();
+    let (header, _) =
+        Journal::inspect(&hellas_private::StoreLocation::for_test(root.path()), &stem)
+            .await
+            .unwrap();
+    let (mut journal, _) = Journal::open_existing(
+        &hellas_private::StoreLocation::for_test(root.path()),
+        &stem,
+        header,
+    )
+    .await
+    .unwrap();
     let expired = authorization.acceptance_deadline + 1;
     journal
         .append(
@@ -769,7 +778,7 @@ async fn durable_expiry_before_cleanup_releases_unaccepted_payloads_on_reopen() 
     for _ in 0..2 {
         let node = content_store(root.path()).await;
         let store = ChannelStore::open(
-            root.path(),
+            &hellas_private::StoreLocation::for_test(root.path()),
             ready.channel().clone(),
             settlement(),
             Role::Provider,
@@ -887,7 +896,7 @@ async fn paid_upload_termination_cancels_a_blocked_ack_and_releases_its_ram() {
         atomic::{AtomicUsize, Ordering},
     };
     for end in ["close", "cancel", "deadline"] {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
             let root = tempfile::tempdir().unwrap();
             let ready = ready_of(&descriptor_with(fetch_policy()), CURSOR);
             let (service, node) = service(&root.path().join("provider"), &ready).await;

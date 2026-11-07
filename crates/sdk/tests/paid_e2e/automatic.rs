@@ -9,6 +9,7 @@ use hellas_channel::work::{
     admission::{CapacityDomain, WorkPermit},
 };
 use hellas_channel::work_store::{Role, SetupAbort, SetupEnd, SetupStore};
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, OfferRefusalCode, RequestOfferRequest, RequestOfferResponse,
     exchange_setup_response, request_offer_response::Outcome,
@@ -380,12 +381,12 @@ impl Provider {
         identity: NodeIdentity,
     ) -> Self {
         let enrollment = provider_enrollment(&identity);
+        let location = StoreLocation::for_test(&root.join("authority"));
         let store = NodeStore::open(
-            &root.join("authority"),
+            &location,
             hellas_authority::model::grant::grant_network(),
             Some(enrollment.clone()),
             UnixMillis(1),
-            Default::default(),
         )
         .await
         .unwrap();
@@ -436,11 +437,9 @@ impl Provider {
         let work = MountedWork::with_backend(compute.clone());
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                durability: Default::default(),
-                network: config.chain.network,
-                journal_root: config.journal_root,
-                poll: config.poll,
-                max_observation_age: config.max_observation_age,
+                chain: config.chain.clone(),
+                poll: config.poll(),
+                max_observation_age: config.max_observation_age(),
                 settlement_key: provider_settlement(),
             },
             work.clone(),
@@ -498,11 +497,10 @@ impl Provider {
                                 hellas_rpc::services::work_setup::Open,
                             >::new(WorkSetupServer(setup), open);
                         while let Ok(Some(inbound)) = transport.accept().await {
-                            if Dispatcher::<IrohTransport>::dispatch(&dispatcher, inbound)
-                                .await
-                                .is_err()
+                            if let Err(error) =
+                                Dispatcher::<IrohTransport>::dispatch(&dispatcher, inbound).await
                             {
-                                break;
+                                eprintln!("fixture WorkSetup dispatch failed: {error}");
                             }
                         }
                     } else {
@@ -511,8 +509,7 @@ impl Provider {
                         };
                         while let Ok(Some(inbound)) = transport.accept().await {
                             if let Err(error) = dispatcher.dispatch(inbound).await {
-                                eprintln!("fixture Work dispatcher stopped: {error}");
-                                break;
+                                eprintln!("fixture Work dispatch failed: {error}");
                             }
                         }
                     }
@@ -724,7 +721,7 @@ async fn compute_and_settle_inner(
     options: PaidWorkOptions,
     endpoint: &Endpoint,
     key: &Secp256k1Signer,
-    root: &std::path::Path,
+    _root: &std::path::Path,
     provider: &Provider,
     original: &SignedPaidOffer,
 ) {
@@ -733,17 +730,16 @@ async fn compute_and_settle_inner(
         hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(FRIEND.passkey()),
             key.party_key(),
-            &root.join("client-funding"),
+            &options.config.chain,
         )
         .unwrap(),
     );
     let store = SetupStore::open(
-        &options.journal_root,
+        &options.journal_root(),
         devnet.network(),
         original.offer().proposal.bond_edge(),
         Role::Client,
         &hellas_kernel::Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -788,9 +784,9 @@ async fn compute_and_settle_inner(
     assert!(
         matches!(
             error,
-            hellas_sdk::paid_client::PaidClientError::Timeout {
-                stage: "offer availability"
-            }
+            hellas_sdk::paid_client::PaidClientError::OfferUnavailable { ref source }
+                if source.code() == hellas_wire::WireCode::Unavailable
+                    && source.message() == "held offer response"
         ),
         "bounded quote expiry: {error}"
     );
@@ -882,19 +878,21 @@ async fn compute_and_settle_inner(
     let (job, source) = compute_job(&increment(k), increment_plan(Arg::U64(41))).await;
     let first_job = job.clone();
     let terms = hellas_sdk::execution::ExecutionTerms::Paid { price: job.price() };
-    let mut attempt = hellas_sdk::execution::ExecutionAttempt::open(
-        &root.join("tracked-attempt"),
-        job.input(),
-        terms,
-    )
-    .unwrap();
+    let attempt_path = hellas_sdk::transact::PaidAttemptPath::new(
+        &options.config.chain,
+        options.provider,
+        owner.principal(),
+        job.digest(),
+    );
+    let mut attempt =
+        hellas_sdk::execution::ExecutionAttempt::open_paid(&attempt_path, job.input(), job.price())
+            .unwrap();
     attempt
         .bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
+            network: options.config.network(),
             provider: options.provider,
         })
         .unwrap();
-    attempt.retain_results(true);
     let result = hellas_sdk::execution::ExecutionSession::Paid(&mut session)
         .execute(
             job.input().clone(),
@@ -934,19 +932,19 @@ async fn compute_and_settle_inner(
     // A paid marker whose receipt was never written remains paid, with no
     // locally deliverable output, and cannot authorize another execution.
     let mut paid_without_receipt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("tracked-attempt")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
     paid_without_receipt["phase"] = serde_json::json!("Paid");
-    let paid_without_receipt_path = root.join("paid-without-receipt");
+    let paid_without_receipt_path = attempt_path.with_nonce([1; 16]);
     hellas_private::write_atomically(
-        &paid_without_receipt_path,
+        paid_without_receipt_path.as_path(),
         ".writing",
         &serde_json::to_vec(&paid_without_receipt).unwrap(),
     )
     .unwrap();
-    let mut paid_without_receipt = hellas_sdk::execution::ExecutionAttempt::open_existing(
+    let mut paid_without_receipt = hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
         &paid_without_receipt_path,
         job.input(),
-        terms,
+        job.price(),
     )
     .unwrap();
     let facts = paid_without_receipt.inspect().unwrap();
@@ -969,20 +967,20 @@ async fn compute_and_settle_inner(
     // A persisted proposal nonce survives an interrupted caller. Even if the
     // attempt has no recorded acceptance, it may only be recovered.
     let mut interrupted_record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("tracked-attempt")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
     interrupted_record["phase"] = serde_json::json!("Running");
     interrupted_record["work"] = serde_json::Value::Null;
-    let interrupted_path = root.join("interrupted-attempt");
+    let interrupted_path = attempt_path.with_nonce([2; 16]);
     hellas_private::write_atomically(
-        &interrupted_path,
+        interrupted_path.as_path(),
         ".writing",
         &serde_json::to_vec(&interrupted_record).unwrap(),
     )
     .unwrap();
-    let mut interrupted_attempt = hellas_sdk::execution::ExecutionAttempt::open_existing(
+    let mut interrupted_attempt = hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
         &interrupted_path,
         job.input(),
-        terms,
+        job.price(),
     )
     .unwrap();
     assert!(matches!(
@@ -1137,15 +1135,15 @@ async fn compute_and_settle_inner(
     assert_eq!(result.credited_cumulative, CREDITED - JOB_PRICE);
 
     // A different explicit attempt is a new purchase, even for identical input.
-    let mut second = hellas_sdk::execution::ExecutionAttempt::open(
-        &root.join("tracked-attempt-second"),
+    let mut second = hellas_sdk::execution::ExecutionAttempt::open_paid(
+        &attempt_path.with_nonce([3; 16]),
         first_job.input(),
-        terms,
+        first_job.price(),
     )
     .unwrap();
     second
         .bind_target(hellas_sdk::execution::ExecutionTarget {
-            network: options.config.chain.network,
+            network: options.config.network(),
             provider: options.provider,
         })
         .unwrap();
@@ -1370,7 +1368,6 @@ struct Case {
     first: Box<SignedPaidOffer>,
     second: Box<SignedPaidOffer>,
     third: Box<SignedPaidOffer>,
-    interrupted_root: std::path::PathBuf,
 }
 
 async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
@@ -1423,10 +1420,18 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     )
     .await;
     devnet.seal().await;
-    let chain = RemoteLightClient::connect(devnet.light_client_url(0))
+    let trust_config = work_config(&devnet, root.path().join("paid"));
+    let profile = trust_config.chain.profile();
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
+    let chain = RemoteLightClient::connect(devnet.light_client_url(0), verifier)
         .await
-        .unwrap()
-        .with_consensus_verifier(devnet.consensus_verifier());
+        .unwrap();
     let mut payment_coins = Vec::new();
     let mut alternate_funding = Vec::new();
     let mut short_funding = None;
@@ -1600,7 +1605,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .await
         .unwrap();
     drop(store);
-    let config = work_config(&devnet, root.path().join("paid"));
+    let config = trust_config;
     let compute = HostCompute::default();
     let mut provider = Provider::start(
         root.path(),
@@ -1627,7 +1632,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         OfferRefusalCode::NoPolicy,
     );
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let mut policy = paid_policy();
     policy.invocation_policy = InvocationPolicy {
         admissions: vec![Admission::Compute {
@@ -1670,7 +1675,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             "signed {field}"
         );
     }
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     refused(
         request(
             &endpoint,
@@ -1737,7 +1742,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             OfferRefusalCode::NeedsFunding,
         );
     }
-    assert_eq!(files(&config.journal_root), 0);
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let quote = request(
         &endpoint,
         &provider,
@@ -1753,8 +1758,13 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         panic!("quote")
     };
     assert_eq!(quote.funding_value, FUNDING);
-    assert_eq!(files(&config.journal_root), 0);
-    std::fs::write(&config.journal_root, b"blocked journal root").unwrap();
+    assert_eq!(files(&config.chain.provider().join("channels")), 0);
+    std::fs::create_dir_all(config.chain.provider()).unwrap();
+    std::fs::write(
+        config.chain.provider().join("channels"),
+        b"blocked journal root",
+    )
+    .unwrap();
     assert!(
         request(
             &endpoint,
@@ -1768,7 +1778,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .await
         .is_err()
     );
-    std::fs::remove_file(&config.journal_root).unwrap();
+    std::fs::remove_file(config.chain.provider().join("channels")).unwrap();
     assert!(
         request(
             &endpoint,
@@ -1813,7 +1823,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         )
         .unwrap()
     );
-    let before = files(&config.journal_root);
+    let before = files(&config.chain.provider().join("channels"));
     assert!(
         request(
             &endpoint,
@@ -1860,7 +1870,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         first.encode().unwrap()
     );
-    assert_eq!(files(&config.journal_root), before);
+    assert_eq!(files(&config.chain.provider().join("channels")), before);
     let other_peer = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
@@ -1976,14 +1986,19 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     // Simulate a client interrupted after accepting revision one. Its funding
     // stays live; recovery after the horizon must ask for a fresh offer.
-    let interrupted_root = root.path().join("interrupted-client");
+    let interrupted_chain = devnet.chain_dir(&root.path().join("interrupted-home"), 0);
+    let interrupted_root = interrupted_chain.client_journals(
+        &hellas_client::ProviderAddress::of(&provider.enrollment)
+            .unwrap()
+            .to_string(),
+    );
+    let location = StoreLocation::for_test(&interrupted_root);
     let mut interrupted = SetupStore::open(
-        &interrupted_root,
+        &location,
         devnet.network(),
         third.offer().proposal.bond_edge(),
         Role::Client,
         &hellas_kernel::Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -2094,7 +2109,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first,
         second,
         third,
-        interrupted_root,
     })
 }
 
@@ -2122,7 +2136,7 @@ fn grant_composition<'a>(
         let subject = principal(1).0;
         let cli_binary = std::env::var_os("HELLAS_CLI_TEST_BINARY");
         let data_root = root
-            .join("composition-cli-data")
+            .join("composition-cli-home/grants")
             .join(format!("p256-{}", hex::encode(subject.as_bytes())));
         let policies = composition_policies();
         let mut definition = definition(auth::GrantId([71; 16]), subject);
@@ -2174,6 +2188,7 @@ fn grant_composition<'a>(
                 apple_app_attest: None,
             })
             .unwrap();
+        let location = StoreLocation::for_test(&data_root.join("channels"));
         let options = GrantSessionOptions {
             target,
             principal: subject,
@@ -2184,7 +2199,7 @@ fn grant_composition<'a>(
                 credential,
                 local: None,
             }),
-            journal_root: data_root.join("channels"),
+            journal_root: location.clone(),
             control_timeout: Duration::from_secs(10),
         };
         let transport = bind_paid_endpoint(iroh::SecretKey::generate())
@@ -2235,7 +2250,7 @@ fn grant_composition<'a>(
             if cli_binary.is_some() { 2 } else { 1 },
         )
         .await;
-        other.options.journal_root = data_root.join("channels");
+        other.options.journal_root = location;
         if let Some(binary) = cli_binary.as_deref() {
             super::cli_composition::run_gateway(binary, root, &options, &other, &data_root).await;
         }
@@ -2354,12 +2369,11 @@ async fn finish(case: Box<Case>) {
         first,
         second,
         third,
-        interrupted_root,
     } = *case;
     let options = PaidWorkOptions {
         content: fresh_client_content(&root.path().join("client-store")).await,
         config: config.clone(),
-        journal_root: root.path().join("client"),
+        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,
@@ -2445,18 +2459,18 @@ async fn finish(case: Box<Case>) {
                 &transport, ExchangeSetupRequest { bond_edge: third.offer().proposal.bond_edge().to_bytes().to_vec(), bundle: vec![] }, Metadata::new(),
             ).await.unwrap();
             if matches!(response.outcome, Some(exchange_setup_response::Outcome::Refused(ref r)) if r.code == hellas_channel::work::WorkRefusal::Expired.code() as i32) { break; }
-            tokio::time::sleep(config.poll).await;
+            tokio::time::sleep(config.poll()).await;
         }
     }).await.expect("the unanswered offer durably expires at its horizon");
     drop(transport);
     provider.shutdown().await;
+    let location = StoreLocation::for_test(&config.chain.provider().join("channels"));
     let store = SetupStore::open(
-        &config.journal_root,
+        &location,
         devnet.network(),
         third.offer().proposal.bond_edge(),
         Role::Provider,
         &hellas_kernel::Secp256k1Verifier::new(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -2492,13 +2506,13 @@ async fn finish(case: Box<Case>) {
     policy.offers.max_stake_per_client = 12;
     provider.policy(&secret, 4, policy).await;
     let mut fresh_args = options;
-    fresh_args.journal_root = interrupted_root;
+    fresh_args.config.chain = devnet.chain_dir(&root.path().join("interrupted-home"), 0);
     fresh_args.provider_addrs = provider.endpoint.bound_sockets();
     let agent_owner = Arc::new(
         hellas_sdk::client_owner::ClientOwner::new(
             Arc::new(AGENT.passkey()),
             keys[3].party_key(),
-            &root.path().join("agent-funding"),
+            &fresh_args.config.chain,
         )
         .unwrap(),
     );

@@ -58,7 +58,8 @@ terms. Derived links must match those checked fields. A missing reverse associat
 is still an indexer-reported discovery claim, not authenticated absence.
 Both transports use the same generated message definitions and JSON
 adapters from `hellas-rpc`; no protobuf transcode sits between RPC and the index.
-The standalone block/address proof API remains schema 1 with its existing JSON.
+The standalone block/address proof API remains schema 1; address bundles carry a
+typed owner page in protobuf and the same page fields in JSON.
 
 Replay calls the chain's actual kernel execution and captures its public object
 and registry diffs. It checks the owner commitment, QMDB state root and complete
@@ -102,7 +103,7 @@ trusted block certificates, opening/closing inclusion, canonical terms and edge
 identity, decoded object fields and registry bindings. It returns ordinary
 reported-data types: discovery, current objects and completeness remain
 **indexer-reported**. An opening certificate does not prove that its edge is still
-open. Object membership and range proofs are not provided.
+open. For live object membership or absence, query `LightClient.GetObjectProofs` for the exact object IDs. Its ordered Current-QMDB proofs bind every key to one certified applied root; an old payload pin is unavailable and requires a whole-query retry.
 
 For deterministic integration fixtures, run:
 

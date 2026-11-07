@@ -12,9 +12,8 @@ use commonware_runtime::{Spawner, Supervisor as _, tokio::Context};
 use commonware_utils::{NZU64, NZUsize};
 use std::{
     num::{NonZeroU64, NonZeroUsize},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
 };
-use tokio::sync::watch;
 
 /// Finalized blocks of QMDB history kept behind the active range (decision 51).
 const RETAINED_QMDB_BLOCKS: usize = 256;
@@ -60,8 +59,8 @@ where
             },
             // QMDB must retain the ack window for crash recovery. The archive's
             // independent retention cap keeps the complete archive by default.
-            // QMDB keeps 256 blocks of history so a verified remote read of the
-            // latest certified range survives a prune landing mid-read (decision 51).
+            // QMDB keeps 256 blocks of history for full-node state sync and
+            // recovery across archive acknowledgments.
             // Stateful requires marshal to retain at least as many blocks as QMDB.
             prune_config: Some(stateful::PruneConfig {
                 max_pending_acks: NonZeroUsize::MIN,
@@ -84,7 +83,6 @@ pub(crate) struct Publication {
     pub(crate) archive: ChainIndexer,
     pub(crate) retention: Option<NonZeroU64>,
     pub(crate) readiness: Arc<crate::node::Readiness>,
-    pub(crate) progress: watch::Sender<u64>,
     #[cfg(feature = "indexer-api")]
     pub(crate) index: Option<crate::edge_index::Publication>,
 }
@@ -107,14 +105,7 @@ impl Publication {
                 block.height().get().saturating_sub(retain.get().max(2) - 1),
             );
         }
-        self.readiness
-            .applied
-            .fetch_max(block.height().get(), Ordering::AcqRel);
-        self.progress.send_if_modified(|height| {
-            let advanced = *height < block.height().get();
-            *height = (*height).max(block.height().get());
-            advanced
-        });
+        self.readiness.advance(None, block.height().get());
         let _ = database;
     }
 }
@@ -126,28 +117,6 @@ pub(crate) fn lock(directory: &std::path::Path) -> std::io::Result<std::fs::File
     file.try_lock().map_err(std::io::Error::other)?;
     Ok(file)
 }
-pub(crate) fn pin(
-    directory: &std::path::Path,
-    genesis: &hellas_genesis::Genesis,
-    threshold: &[u8],
-    payload: crate::domain::Digest,
-) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    let identity = serde_json::to_vec(&(genesis, threshold, hex::encode(payload)))?;
-    let path = directory.join("chain-identity.json");
-    match std::fs::read(&path) {
-        Ok(stored) if stored == identity => Ok(()),
-        Ok(_) => Err(Error::new(
-            ErrorKind::InvalidData,
-            "state directory belongs to another chain",
-        )),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            hellas_private::write_atomically(&path, ".tmp", &identity)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 pub(crate) fn verify_floor<P>(
     plan: &SyncPlan<Context, Scheme, Standard<HellasBlock>>,
     provider: &P,
@@ -204,7 +173,10 @@ pub(crate) async fn restore(
         };
         if let Some(block) = block
             && reader.root() == block.state_root()
-            && block.sync_target().root == reader.root()
+            && block.sync_target()
+                == <super::store::UtxoDb<Context> as commonware_glue::stateful::db::ManagedDb<
+                    Context,
+                >>::sync_target(&reader)
             && super::owner_tree::stored_root(&reader)
                 .await
                 .map_err(|e| crate::QueryError::StateUnavailable(e.to_string()))?

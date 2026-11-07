@@ -1,10 +1,10 @@
-use crate::domain::{Coin, Digest, ObjectId, SettlementKey, Transaction};
+use crate::domain::{Coin, Digest, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use crate::{
-    CoinListing, ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState,
-    FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
+    CoinListing, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
+    FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
-use hellas_kernel::{Decode as _, Encode as _, Move as KernelMove, Tx as KernelTx};
+use hellas_kernel::{Encode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::{
     SubmitTxOutcome as DomainSubmitTxOutcome,
     call::StreamingCall,
@@ -20,18 +20,14 @@ mod objects;
 #[derive(Clone)]
 pub struct RemoteLightClient {
     client: LightClientClientImpl<MuxTransport>,
-    verifier: Option<ConsensusVerifier>,
     finalized_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    applied_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    objects: std::sync::Arc<commonware_utils::sync::AsyncMutex<Option<objects::View>>>,
+    applied_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
 }
 
 impl RemoteLightClient {
     pub(crate) fn pinned_network(&self) -> Result<hellas_kernel::NetworkId, QueryError> {
-        self.verifier
-            .as_ref()
-            .map(ConsensusVerifier::network)
-            .ok_or_else(|| QueryError::Remote("a pinned consensus verifier is required".into()))
+        Ok(self.proof_verifier.network())
     }
 
     /// Notifications only wake the caller; subsequent reads verify their data.
@@ -44,30 +40,25 @@ impl RemoteLightClient {
             .map_err(QueryError::from)
     }
 
-    pub fn new(transport: MuxTransport) -> Self {
+    pub fn new(
+        transport: MuxTransport,
+        proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
+    ) -> Self {
         Self {
             client: LightClientClientImpl::new(transport),
-            verifier: None,
             finalized_height: Default::default(),
-            applied_height: Default::default(),
-            objects: Default::default(),
+            applied_progress: Default::default(),
+            proof_verifier,
         }
     }
 
     /// Connect to a WebSocket endpoint.
-    pub async fn connect(addr: impl Into<String>) -> Result<Self, QueryError> {
+    pub async fn connect(
+        addr: impl Into<String>,
+        proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
+    ) -> Result<Self, QueryError> {
         let addr = addr.into();
-        Ok(Self::new(connect_transport(&addr).await?))
-    }
-
-    /// Verify snapshots with an independently provisioned consensus authority.
-    /// Coin and edge records still need state proofs; this authenticates their snapshot only.
-    pub fn with_consensus_verifier(mut self, verifier: ConsensusVerifier) -> Self {
-        self.verifier = Some(verifier);
-        self.finalized_height = Default::default();
-        self.applied_height = Default::default();
-        self.objects = Default::default();
-        self
+        Ok(Self::new(connect_transport(&addr).await?, proof_verifier))
     }
 
     /// Subscribe to the consensus activity stream.
@@ -90,6 +81,31 @@ impl RemoteLightClient {
             .await
             .map_err(QueryError::from)
     }
+}
+
+// A point-read payload is a finalized floor, not a request to resurrect that
+// exact Current root. Verify the floor and the latest object proof independently.
+async fn current_at_finalized_floor(
+    client: &RemoteLightClient,
+    payload: Digest,
+    object_id: ObjectId,
+) -> Result<crate::light_client::ObjectSnapshot, QueryError> {
+    let floor = client
+        .get_finalized_block(FinalizedBlockQuery::Payload(payload))
+        .await?
+        .ok_or_else(|| QueryError::StateUnavailable("requested payload is not finalized".into()))?
+        .snapshot
+        .height;
+    let current = client
+        .get_objects(vec![object_id])
+        .await?
+        .ok_or_else(|| QueryError::StateUnavailable("current state is unavailable".into()))?;
+    if current.block.height < floor {
+        return Err(QueryError::StateUnavailable(
+            "requested payload is newer than the application state".into(),
+        ));
+    }
+    Ok(current)
 }
 
 fn record_progress(
@@ -134,18 +150,179 @@ impl RemoteLightClient {
         &self.client
     }
 
-    fn consensus_verifier(&self) -> Option<&ConsensusVerifier> {
-        self.verifier.as_ref()
+    async fn verified_owner_holdings(
+        &self,
+        owner: SettlementKey,
+        delegated: bool,
+        edges: bool,
+    ) -> Result<Option<(LatestBlock, Vec<(ObjectId, u64)>, Vec<EdgeRecord>)>, QueryError> {
+        let mut after = None;
+        let mut snapshot = None;
+        let mut listing = Vec::new();
+        let mut edge_listing = Vec::new();
+        loop {
+            let Some(verified) = self.verified_owner_page(owner, after).await? else {
+                return Ok(None);
+            };
+            let current = verified.block().view().payload();
+            if snapshot
+                .as_ref()
+                .is_some_and(|first: &LatestBlock| first.payload != current)
+            {
+                return Err(QueryError::StateUnavailable(
+                    "owner state changed; retry listing".into(),
+                ));
+            }
+            let (page, summary) = verified
+                .owner_page()
+                .ok_or_else(|| QueryError::Remote("verified owner page was missing".into()))?;
+            for holding in &page.holdings {
+                let id = ObjectId::from(holding.object_id);
+                let object = verified.objects().get(&id).ok_or_else(|| {
+                    QueryError::Remote("owner holding has no current object".into())
+                })?;
+                match crate::owner_proof::validate_holding(owner, holding, object)
+                    .map_err(|error| QueryError::Remote(error.to_string()))?
+                {
+                    crate::owner_proof::VerifiedHolding::OwnedCoin {
+                        value,
+                        delegated_to_owner,
+                    } if !edges && (!delegated || delegated_to_owner) => {
+                        listing.push((id, value));
+                    }
+                    crate::owner_proof::VerifiedHolding::DelegatedCoin(value)
+                        if !edges && delegated =>
+                    {
+                        listing.push((id, value));
+                    }
+                    crate::owner_proof::VerifiedHolding::Edge if edges => {
+                        let Object::Edge(edge) = object else {
+                            unreachable!()
+                        };
+                        let parties = edge.parties();
+                        edge_listing.push(EdgeRecord {
+                            object_id: id,
+                            maker: parties.maker().owner().into(),
+                            taker: parties.taker().owner().into(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            let next = page.holdings.last().map(|holding| holding.object_id);
+            let done = page.offset + page.holdings.len() as u64 == summary.count;
+            snapshot.get_or_insert_with(|| verified.block().view().snapshot().clone());
+            if done {
+                return Ok(Some((
+                    snapshot.expect("set by first page"),
+                    listing,
+                    edge_listing,
+                )));
+            }
+            after = next;
+        }
+    }
+
+    async fn verified_owner_page(
+        &self,
+        owner: SettlementKey,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<crate::proof_verify::VerifiedObjects>, QueryError> {
+        let floor = self
+            .applied_progress
+            .load(std::sync::atomic::Ordering::Acquire);
+        let response = self
+            .rpc_client()
+            .get_object_proofs(GetObjectProofsRequest {
+                object_ids: Vec::new(),
+                payload: None,
+                owner: Some(owner.to_bytes().to_vec()),
+                owner_offset: 0,
+                owner_limit: crate::proof_verify::MAX_CURRENT_KEYS as u32,
+                owner_after_key: after.map(|key| key.to_vec()),
+            })
+            .await
+            .map_err(QueryError::from)?;
+        if response.block.is_none() {
+            return Ok(None);
+        }
+        let verified = self
+            .proof_verifier
+            .verify_objects_after(
+                response,
+                &BTreeSet::new(),
+                FinalizedBlockQuery::Latest,
+                owner,
+                after,
+                crate::proof_verify::MAX_CURRENT_KEYS as u32,
+            )
+            .map_err(|error| QueryError::Remote(error.to_string()))?;
+        let height = verified.block().view().height();
+        if height < floor {
+            return Err(QueryError::StateUnavailable(format!(
+                "owner page {height} is behind verified height {floor}"
+            )));
+        }
+        record_progress(&self.applied_progress, height, false)?;
+        Ok(Some(verified))
+    }
+
+    async fn verified_coin_page(
+        &self,
+        owner: SettlementKey,
+        after: Option<ObjectId>,
+        delegated: bool,
+    ) -> Result<Option<crate::light_client::CoinPage>, QueryError> {
+        let Some(verified) = self
+            .verified_owner_page(owner, after.map(Into::into))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (page, summary) = verified.owner_page().expect("verified owner query");
+        let mut coins = Vec::new();
+        for holding in &page.holdings {
+            let id = ObjectId::from(holding.object_id);
+            let object = verified
+                .objects()
+                .get(&id)
+                .ok_or_else(|| QueryError::Remote("owner holding has no current object".into()))?;
+            match crate::owner_proof::validate_holding(owner, holding, object)
+                .map_err(|error| QueryError::Remote(error.to_string()))?
+            {
+                crate::owner_proof::VerifiedHolding::OwnedCoin {
+                    value,
+                    delegated_to_owner,
+                } if !delegated || delegated_to_owner => coins.push((id, value)),
+                crate::owner_proof::VerifiedHolding::DelegatedCoin(value) if delegated => {
+                    coins.push((id, value))
+                }
+                _ => {}
+            }
+        }
+        let next = (page.offset + (page.holdings.len() as u64) < summary.count)
+            .then(|| {
+                page.holdings
+                    .last()
+                    .map(|holding| ObjectId::from(holding.object_id))
+            })
+            .flatten();
+        Ok(Some(crate::light_client::CoinPage {
+            snapshot: verified.block().view().snapshot().clone(),
+            coins,
+            next,
+            owned_balance: Some(summary.balance),
+        }))
     }
 }
 
 impl LightClient for RemoteLightClient {
-    async fn get_operations(
+    async fn get_object_proofs(
         &self,
-        request: GetOperationsRequest,
-    ) -> Result<GetOperationsResponse, QueryError> {
+        request: GetObjectProofsRequest,
+    ) -> Result<GetObjectProofsResponse, QueryError> {
         self.rpc_client()
-            .get_operations(request)
+            .get_object_proofs(request)
             .await
             .map_err(QueryError::from)
     }
@@ -154,32 +331,24 @@ impl LightClient for RemoteLightClient {
         &self,
         keys: Vec<crate::domain::ObjectId>,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        objects::read(self, keys).await
+        Box::pin(objects::read(self, keys, FinalizedBlockQuery::Latest)).await
+    }
+
+    async fn get_objects_at(
+        &self,
+        keys: Vec<ObjectId>,
+        query: FinalizedBlockQuery,
+    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+        Box::pin(objects::read(self, keys, query)).await
     }
 
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
         let client = self.clone();
         async move {
-            if client.verifier.is_some() {
-                return Ok(client
-                    .get_latest_block()
-                    .await?
-                    .map(|snapshot| snapshot.state_root));
-            }
-            let response = client
-                .rpc_client()
-                .get_state_root(GetStateRootRequest {})
-                .await
-                .map_err(QueryError::from)?;
-            match response.state_root {
-                Some(bytes) => {
-                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-                        QueryError::Remote("state_root was not 32 bytes".to_string())
-                    })?;
-                    Ok(Some(Digest::from(arr)))
-                }
-                None => Ok(None),
-            }
+            Ok(client
+                .get_latest_block()
+                .await?
+                .map(|snapshot| snapshot.state_root))
         }
     }
 
@@ -204,25 +373,16 @@ impl LightClient for RemoteLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Coin>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let client = self.clone();
         async move {
-            let response = client
-                .get_coin(GetCoinRequest {
-                    payload: payload.to_vec(),
-                    object_id: object_id.to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            match (response.owner, response.value) {
-                (Some(owner), Some(value)) => Ok(Some(Coin {
-                    owner: settlement_key_from_wire(owner, "owner")?,
-                    delegate: response
-                        .delegate
-                        .map(|delegate| settlement_key_from_wire(delegate, "delegate"))
-                        .transpose()?,
-                    value,
-                })),
-                _ => Ok(None),
+            let snapshot = current_at_finalized_floor(&client, payload, object_id).await?;
+            match snapshot.objects.get(&object_id) {
+                Some(Object::Coin(coin)) => Ok(Some(*coin)),
+                Some(object) => Err(QueryError::WrongObjectKind {
+                    expected: ObjectKind::Coin,
+                    actual: object.kind(),
+                }),
+                None => Ok(None),
             }
         }
     }
@@ -232,16 +392,23 @@ impl LightClient for RemoteLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<EdgeLookup>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let client = self.clone();
         async move {
-            let response = client
-                .get_edge(GetEdgeRequest {
-                    payload: payload.to_vec(),
-                    object_id: object_id.to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            edge_lookup_from_proto(response)
+            let snapshot = current_at_finalized_floor(&client, payload, object_id).await?;
+            let edge = match snapshot.objects.get(&object_id) {
+                Some(Object::Edge(edge)) => Some(EdgeState::from(*edge)),
+                Some(object) => {
+                    return Err(QueryError::WrongObjectKind {
+                        expected: ObjectKind::Edge,
+                        actual: object.kind(),
+                    });
+                }
+                None => None,
+            };
+            Ok(Some(EdgeLookup {
+                state_root: snapshot.block.state_root,
+                edge,
+            }))
         }
     }
 
@@ -266,7 +433,7 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.proof_verifier.clone();
         async move {
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
@@ -274,10 +441,8 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let latest = response.latest.map(latest_block_from_proto).transpose()?;
             if let Some(snapshot) = &latest {
-                authenticate_snapshot(&client, snapshot, verifier.as_ref()).await?;
-                if verifier.is_some() {
-                    record_progress(&progress, snapshot.height, true)?;
-                }
+                authenticate_snapshot(&client, snapshot, &verifier).await?;
+                record_progress(&progress, snapshot.height, true)?;
             }
             Ok(latest)
         }
@@ -289,19 +454,17 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.proof_verifier.clone();
         async move {
             let response = client
                 .get_finalized_block(finalized_block_query_to_proto(query))
                 .await
                 .map_err(QueryError::from)?;
-            let block = response
-                .block
-                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
-                .transpose()?;
-            if let Some(block) = &block
-                && verifier.is_some()
-            {
+            let block = response.block.map(finalized_block_from_proto).transpose()?;
+            if let Some(block) = &block {
+                verifier
+                    .verify_finalized(block.clone(), crate::proof_verify::ProofQuery::Block(query))
+                    .map_err(|error| QueryError::Remote(error.to_string()))?;
                 record_progress(
                     &progress,
                     block.snapshot.height,
@@ -316,38 +479,22 @@ impl LightClient for RemoteLightClient {
         &self,
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
-        let progress = self.applied_height.clone();
+        let state = self.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.proof_verifier.clone();
         async move {
             let response = client
                 .get_applied_finalized_block(finalized_block_query_to_proto(query))
                 .await
                 .map_err(QueryError::from)?;
-            let block = response
-                .block
-                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
-                .transpose()?;
+            let block = response.block.map(finalized_block_from_proto).transpose()?;
             if let Some(block) = &block {
-                let matches = match query {
-                    FinalizedBlockQuery::Latest => true,
-                    FinalizedBlockQuery::Height(height) => block.snapshot.height == height,
-                    FinalizedBlockQuery::Payload(payload) => block.snapshot.payload == payload,
-                };
-                if !matches {
-                    return Err(QueryError::Remote(
-                        "applied checkpoint does not answer the requested query".into(),
-                    ));
+                verifier
+                    .verify_finalized(block.clone(), crate::proof_verify::ProofQuery::Block(query))
+                    .map_err(|error| QueryError::Remote(error.to_string()))?;
+                if matches!(query, FinalizedBlockQuery::Latest) {
+                    record_progress(&state.applied_progress, block.snapshot.height, true)?;
                 }
-            }
-            if let Some(block) = &block
-                && verifier.is_some()
-            {
-                record_progress(
-                    &progress,
-                    block.snapshot.height,
-                    matches!(query, FinalizedBlockQuery::Latest),
-                )?;
             }
             Ok(block)
         }
@@ -447,220 +594,101 @@ impl LightClient for RemoteLightClient {
         &self,
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let state = self.clone();
         async move {
-            let resp = client
-                .get_coins_by_owner(GetCoinsByOwnerRequest {
-                    owner: owner.to_bytes().to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            let listing = coin_listing_from_proto(resp)?;
-            if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
-            }
-            Ok(listing)
+            Ok(state
+                .verified_owner_holdings(owner, false, false)
+                .await?
+                .map(|(snapshot, coins, _)| CoinListing { snapshot, coins }))
         }
+    }
+
+    fn get_coins_by_owner_page(
+        &self,
+        owner: SettlementKey,
+        after: Option<ObjectId>,
+    ) -> impl Future<Output = Result<Option<crate::light_client::CoinPage>, QueryError>> + Send
+    {
+        Box::pin(self.verified_coin_page(owner, after, false))
     }
 
     fn get_coins_by_delegate(
         &self,
         delegate: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let state = self.clone();
         async move {
-            let resp = client
-                .get_coins_by_delegate(GetCoinsByDelegateRequest {
-                    delegate: delegate.to_bytes().to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            let listing = coin_listing_from_proto(resp)?;
-            if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
-            }
-            Ok(listing)
+            Ok(state
+                .verified_owner_holdings(delegate, true, false)
+                .await?
+                .map(|(snapshot, coins, _)| CoinListing { snapshot, coins }))
         }
+    }
+
+    fn get_coins_by_delegate_page(
+        &self,
+        delegate: SettlementKey,
+        after: Option<ObjectId>,
+    ) -> impl Future<Output = Result<Option<crate::light_client::CoinPage>, QueryError>> + Send
+    {
+        Box::pin(self.verified_coin_page(delegate, after, true))
     }
 
     fn get_edges_by_owner(
         &self,
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let state = self.clone();
         async move {
-            let resp = client
-                .get_edges_by_owner(GetEdgesByOwnerRequest {
-                    owner: owner.to_bytes().to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            let listing = owner_edges_from_proto(owner, resp)?;
-            if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
-            }
-            Ok(listing)
+            Ok(state
+                .verified_owner_holdings(owner, false, true)
+                .await?
+                .map(|(snapshot, _, edges)| OwnerEdges { snapshot, edges }))
         }
     }
-}
-
-fn coin_listing_from_proto(resp: GetCoinsResponse) -> Result<Option<CoinListing>, QueryError> {
-    let Some(snapshot) = resp.snapshot else {
-        if resp.coins.is_empty() {
-            return Ok(None);
-        }
-        return Err(QueryError::Remote(
-            "GetCoinsResponse had coins without a snapshot".to_string(),
-        ));
-    };
-    let snapshot = latest_block_from_proto(snapshot)?;
-    let coins = resp
-        .coins
-        .into_iter()
-        .map(|entry| {
-            let arr: [u8; 32] = entry
-                .object_id
-                .try_into()
-                .map_err(|_| QueryError::Remote("object_id was not 32 bytes".to_string()))?;
-            Ok((Digest::from(arr), entry.value))
-        })
-        .collect::<Result<Vec<_>, QueryError>>()?;
-    Ok(Some(CoinListing { snapshot, coins }))
-}
-
-fn edge_lookup_from_proto(response: GetEdgeResponse) -> Result<Option<EdgeLookup>, QueryError> {
-    match response.state_root {
-        Some(state_root) => Ok(Some(EdgeLookup {
-            state_root: digest_from_wire(state_root, "state_root")?,
-            edge: response.edge.map(edge_state_from_proto).transpose()?,
-        })),
-        None if response.edge.is_none() => Ok(None),
-        None => Err(QueryError::Remote(
-            "GetEdgeResponse had an edge without a state root".to_string(),
-        )),
-    }
-}
-
-fn owner_edges_from_proto(
-    owner: SettlementKey,
-    response: GetEdgesByOwnerResponse,
-) -> Result<Option<OwnerEdges>, QueryError> {
-    let Some(snapshot) = response.snapshot else {
-        if response.edges.is_empty() {
-            return Ok(None);
-        }
-        return Err(QueryError::Remote(
-            "GetEdgesByOwnerResponse had edges without a snapshot".to_string(),
-        ));
-    };
-    let snapshot = latest_block_from_proto(snapshot)?;
-    let mut seen = BTreeSet::new();
-    let mut edges = Vec::with_capacity(response.edges.len());
-    for edge in response.edges {
-        let edge = EdgeRecord {
-            object_id: digest_from_wire(edge.object_id, "object_id")?,
-            maker: settlement_key_from_wire(edge.maker, "maker")?,
-            taker: settlement_key_from_wire(edge.taker, "taker")?,
-        };
-        if edge.maker != owner && edge.taker != owner {
-            return Err(QueryError::Remote(
-                "GetEdgesByOwnerResponse contained an edge unrelated to the requested owner"
-                    .to_string(),
-            ));
-        }
-        if !seen.insert(edge.object_id) {
-            return Err(QueryError::Remote(
-                "GetEdgesByOwnerResponse contained a duplicate object_id".to_string(),
-            ));
-        }
-        edges.push(edge);
-    }
-    Ok(Some(OwnerEdges { snapshot, edges }))
-}
-
-fn digest_from_wire(bytes: Vec<u8>, field: &'static str) -> Result<Digest, QueryError> {
-    let actual = bytes.len();
-    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
-        QueryError::Remote(format!("{field} was expected to be 32 bytes, got {actual}"))
-    })?;
-    Ok(Digest::from(raw))
-}
-
-fn settlement_key_from_wire(
-    bytes: Vec<u8>,
-    field: &'static str,
-) -> Result<SettlementKey, QueryError> {
-    let actual = bytes.len();
-    let raw: [u8; SettlementKey::LENGTH] = bytes.try_into().map_err(|_| {
-        QueryError::Remote(format!(
-            "{field} settlement key was expected to be {} bytes, got {actual}",
-            SettlementKey::LENGTH
-        ))
-    })?;
-    Ok(SettlementKey::from_bytes(raw))
-}
-
-fn edge_state_from_proto(edge: hellas_rpc::pb::chain::EdgeState) -> Result<EdgeState, QueryError> {
-    let fees = edge
-        .close_fees
-        .ok_or_else(|| QueryError::Remote("edge close_fees were missing".to_string()))?;
-    let terms_hash = hellas_kernel::TermsHash::decode_exact(&edge.terms_hash)
-        .map_err(|_| QueryError::Remote("terms_hash was not 32 canonical bytes".to_string()))?;
-    Ok(EdgeState {
-        value: edge.value,
-        reserve: edge.reserve,
-        close_fees: hellas_kernel::Fees::new(fees.base, fees.slot, fees.proof, fees.lifetime),
-        timeout: hellas_kernel::BlockHeight::new(edge.timeout),
-        maker: settlement_key_from_wire(edge.maker, "maker")?,
-        taker: settlement_key_from_wire(edge.taker, "taker")?,
-        terms_hash,
-    })
 }
 
 async fn authenticate_snapshot(
     client: &LightClientClientImpl<MuxTransport>,
     snapshot: &LatestBlock,
-    verifier: Option<&ConsensusVerifier>,
+    verifier: &crate::proof_verify::ProofVerifier,
 ) -> Result<(), QueryError> {
-    let Some(verifier) = verifier else {
-        return Ok(());
-    };
     let response = client
         .get_finalized_block(finalized_block_query_to_proto(
             FinalizedBlockQuery::Payload(snapshot.payload),
         ))
         .await
         .map_err(QueryError::from)?;
-    let block = response
-        .block
-        .ok_or_else(|| QueryError::Remote("canonical snapshot block was missing".into()))?;
+    let block = finalized_block_from_proto(
+        response
+            .block
+            .ok_or_else(|| QueryError::Remote("canonical snapshot block was missing".into()))?,
+    )?;
     verifier
-        .verify_snapshot(snapshot, &block.block)
-        .map_err(QueryError::from)
+        .verify_finalized(
+            block.clone(),
+            crate::proof_verify::ProofQuery::Block(FinalizedBlockQuery::Payload(snapshot.payload)),
+        )
+        .map_err(|error| QueryError::Remote(error.to_string()))?;
+    if block.snapshot != *snapshot {
+        return Err(QueryError::Remote(
+            "listing snapshot differs from certified block".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn finalized_block_from_proto(
     block: hellas_rpc::pb::chain::FinalizedBlock,
-    verifier: Option<&ConsensusVerifier>,
 ) -> Result<FinalizedBlock, QueryError> {
-    let Some(snapshot) = block.snapshot else {
-        return Err(QueryError::Remote(
-            "FinalizedBlock had no snapshot".to_string(),
-        ));
-    };
+    let snapshot = block
+        .snapshot
+        .ok_or_else(|| QueryError::Remote("FinalizedBlock had no snapshot".into()))?;
     let snapshot = latest_block_from_proto(snapshot)?;
     if Sha256::hash(&block.block) != snapshot.payload {
         return Err(QueryError::Remote(
-            "block bytes did not match finalized payload".to_string(),
+            "block bytes did not match finalized payload".into(),
         ));
-    }
-    if let Some(verifier) = verifier {
-        verifier
-            .verify_snapshot(&snapshot, &block.block)
-            .map_err(QueryError::from)?;
     }
     Ok(FinalizedBlock {
         snapshot,

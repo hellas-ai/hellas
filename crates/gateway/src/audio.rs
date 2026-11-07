@@ -248,4 +248,8 @@ fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
     response
 }
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;

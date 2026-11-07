@@ -8,6 +8,7 @@ use hellas_auth::{
         ids,
     },
 };
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn the_authority_clock_floor_survives_reopening_at_an_older_time() {
@@ -47,15 +48,10 @@ async fn the_authority_clock_floor_survives_reopening_at_an_older_time() {
     store.commit(UnixMillis(6), change, true).await.unwrap();
     let before = store.state().clone();
     drop(store);
-    let mut store = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(1),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let mut store = NodeStore::open(&location, network(), None, UnixMillis(1))
+        .await
+        .unwrap();
     assert_eq!(store.state(), &before);
     assert_eq!(store.state().authority().now(), UnixMillis(6));
     assert_err!(
@@ -105,8 +101,9 @@ fn admin() -> GrantSpec {
     )
 }
 async fn bootstrap(path: &Path) -> (NodeStore, CredentialSecret) {
+    let location = StoreLocation::for_test(path);
     NodeStore::bootstrap(
-        path,
+        &location,
         network(),
         ids::ROOT_GRANT,
         crate::test_support::common_node::approval_for(
@@ -119,7 +116,6 @@ async fn bootstrap(path: &Path) -> (NodeStore, CredentialSecret) {
         ),
         None,
         UnixMillis(1),
-        Default::default(),
     )
     .await
     .unwrap()
@@ -175,15 +171,9 @@ fn machine() -> Change {
 #[tokio::test]
 async fn uninitialized_open_does_not_create_authority() {
     let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
     assert_err!(
-        NodeStore::open(
-            directory.path(),
-            network(),
-            None,
-            UnixMillis(1),
-            Default::default(),
-        )
-        .await,
+        NodeStore::open(&location, network(), None, UnixMillis(1)).await,
         NodeStoreError::Uninitialized
     );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -194,9 +184,10 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
     let directory = tempfile::tempdir().unwrap();
     let mut scope = admin();
     scope.subject = OPERATOR.principal();
+    let location = StoreLocation::for_test(directory.path());
     assert_err!(
         NodeStore::bootstrap(
-            directory.path(),
+            &location,
             network(),
             ids::ROOT_GRANT,
             crate::test_support::common_node::approval_for(
@@ -208,8 +199,7 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
                 scope
             ),
             None,
-            UnixMillis(1),
-            Default::default(),
+            UnixMillis(1)
         )
         .await,
         NodeStoreError::Authority(auth::AuthorityError::Invalid)
@@ -226,15 +216,10 @@ async fn a_providerless_authority_survives_reopen() {
     assert_eq!(store.state().authority().authority(), admin().authority);
     assert_err!(store.state().provider(), NodeStoreError::MissingProvider);
     drop(store);
-    let reopened = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(2),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(2))
+        .await
+        .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));
     crate::test_support::passkey_caller(reopened.state().authority(), &secret, UnixMillis(2));
     reopened
@@ -256,9 +241,10 @@ async fn a_providerless_authority_survives_reopen() {
 async fn an_existing_authority_cannot_be_bootstrapped_again() {
     let directory = tempfile::tempdir().unwrap();
     drop(bootstrap(directory.path()).await);
+    let location = StoreLocation::for_test(directory.path());
     assert_err!(
         NodeStore::bootstrap(
-            directory.path(),
+            &location,
             network(),
             ids::ROOT_GRANT,
             crate::test_support::common_node::approval_for(
@@ -270,8 +256,7 @@ async fn an_existing_authority_cannot_be_bootstrapped_again() {
                 admin()
             ),
             None,
-            UnixMillis(2),
-            Default::default(),
+            UnixMillis(2)
         )
         .await,
         NodeStoreError::AlreadyInitialized
@@ -312,15 +297,10 @@ async fn a_refused_composite_frame_is_atomic_on_disk() {
     );
     assert_eq!(store.state(), &before);
     drop(store);
-    let store = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(1),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let store = NodeStore::open(&location, network(), None, UnixMillis(1))
+        .await
+        .unwrap();
     assert_eq!(store.state(), &before);
 }
 
@@ -363,15 +343,9 @@ async fn the_identity_lock_excludes_another_writer_across_rotation() {
     let directory = tempfile::tempdir().unwrap();
     let (mut store, _secret) = bootstrap(directory.path()).await;
     for _ in 0..2 {
+        let location = StoreLocation::for_test(directory.path());
         assert_err!(
-            NodeStore::open(
-                directory.path(),
-                network(),
-                None,
-                UnixMillis(1),
-                Default::default(),
-            )
-            .await,
+            NodeStore::open(&location, network(), None, UnixMillis(1)).await,
             NodeStoreError::Journal(
                 hellas_channel::work_store::journal::JournalError::Locked { .. }
             )
@@ -379,15 +353,10 @@ async fn the_identity_lock_excludes_another_writer_across_rotation() {
         store.rotate().await.unwrap();
     }
     drop(store);
-    NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(2),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    NodeStore::open(&location, network(), None, UnixMillis(2))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -404,15 +373,10 @@ async fn inherited_identity_descriptors_cannot_outlive_the_writer() {
         .unwrap();
     let before = store.state().clone();
     drop(store);
-    let reopened = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(1),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(1))
+        .await
+        .unwrap();
     assert_eq!(reopened.state(), &before);
     drop(inherited);
 }
@@ -433,8 +397,8 @@ async fn damaged_initialization_never_opens_as_empty() {
     ] {
         let directory = tempfile::tempdir().unwrap();
         drop(bootstrap(directory.path()).await);
-        let journal =
-            hellas_channel::work_store::journal::Journal::path(directory.path(), "grants");
+        let location = StoreLocation::for_test(directory.path());
+        let journal = hellas_channel::work_store::journal::Journal::path(&location, "grants");
         match damage {
             Damage::MissingMarker => std::fs::remove_file(directory.path().join(MARKER)).unwrap(),
             Damage::MissingJournal => std::fs::remove_file(&journal).unwrap(),
@@ -442,14 +406,7 @@ async fn damaged_initialization_never_opens_as_empty() {
                 std::fs::write(directory.path().join(MARKER), b"broken").unwrap()
             }
         }
-        let result = NodeStore::open(
-            directory.path(),
-            network(),
-            None,
-            UnixMillis(2),
-            Default::default(),
-        )
-        .await;
+        let result = NodeStore::open(&location, network(), None, UnixMillis(2)).await;
         match damage {
             Damage::MissingMarker => assert_err!(result, NodeStoreError::Uninitialized),
             Damage::MissingJournal => assert_err!(
@@ -462,7 +419,7 @@ async fn damaged_initialization_never_opens_as_empty() {
         }
         assert_err!(
             NodeStore::bootstrap(
-                directory.path(),
+                &location,
                 network(),
                 ids::ROOT_GRANT,
                 crate::test_support::common_node::approval_for(
@@ -474,8 +431,7 @@ async fn damaged_initialization_never_opens_as_empty() {
                     admin()
                 ),
                 None,
-                UnixMillis(2),
-                Default::default(),
+                UnixMillis(2)
             )
             .await,
             NodeStoreError::AlreadyInitialized
@@ -492,8 +448,9 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
     let mut replacement = admin();
     replacement.subject = FRIEND.principal();
     let recover = async |expected| {
+        let location = StoreLocation::for_test(directory.path());
         NodeStore::recover_offline(
-            directory.path(),
+            &location,
             network(),
             expected,
             crate::test_support::common_node::approval_for(
@@ -502,7 +459,6 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
                 replacement.clone(),
             ),
             UnixMillis(2),
-            Default::default(),
         )
         .await
     };
@@ -519,14 +475,15 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
         recover(Revision(2)).await,
         NodeStoreError::Authority(auth::AuthorityError::Revision)
     );
-    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let location = StoreLocation::for_test(directory.path());
+    let store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
     assert_eq!(store.state(), &before);
     drop(store);
     let (receipt, _) = recover(Revision(1)).await.unwrap();
     assert_eq!(receipt.generation, 2);
-    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
     assert_eq!(store.state().authority().last_recovery(), Some(&receipt));
@@ -552,8 +509,9 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         .unwrap()
         .operations
         .insert(OperationId::new("host.reboot").unwrap());
+    let location = StoreLocation::for_test(directory.path());
     let (mut store, secret) = NodeStore::bootstrap(
-        directory.path(),
+        &location,
         network(),
         ids::ROOT_GRANT,
         crate::test_support::common_node::approval_for(
@@ -566,7 +524,6 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         ),
         None,
         UnixMillis(1),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -599,8 +556,10 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
     drop(store);
     let mut replacement = admin();
     replacement.subject = AGENT.principal();
+    let delayed_close =
+        hellas_channel::work_store::journal::test_support::DelayDropClose::new(&location);
     let (receipt, _) = NodeStore::recover_offline(
-        directory.path(),
+        &location,
         network(),
         before.authority().revision(),
         crate::test_support::common_node::approval_for(
@@ -611,13 +570,13 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
             replacement,
         ),
         UnixMillis(2),
-        Default::default(),
     )
     .await
     .unwrap();
-    let mut store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let mut store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
+    drop(delayed_close);
     assert_eq!(store.state().ledger(), before.ledger());
     assert_eq!(
         store.state().authority().grant(ids::OPERATOR_GRANT),
@@ -635,7 +594,7 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
     store.rotate().await.unwrap();
     let after = store.state().clone();
     drop(store);
-    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
     assert_eq!(store.state(), &after);
@@ -645,8 +604,9 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
 #[tokio::test]
 async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
     let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
     let (mut store, original) = NodeStore::bootstrap(
-        directory.path(),
+        &location,
         network(),
         ids::ROOT_GRANT,
         crate::test_support::common_node::approval_for(
@@ -659,7 +619,6 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         ),
         None,
         UnixMillis(1),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -683,7 +642,7 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
     let mut replacement = admin();
     replacement.subject = FRIEND.principal();
     let (_, replacement_secret) = NodeStore::recover_offline(
-        directory.path(),
+        &location,
         network(),
         before.authority().revision(),
         crate::test_support::common_node::approval_for(
@@ -694,11 +653,10 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
             replacement,
         ),
         UnixMillis(3),
-        Default::default(),
     )
     .await
     .unwrap();
-    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
     let authority = store.state().authority();
@@ -729,8 +687,9 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let (store, secret) = bootstrap(directory.path()).await;
     let query = auth::InspectionQuery::Credentials { after: None };
+    let location = StoreLocation::for_test(directory.path());
     assert!(
-        NodeStore::inspect_offline(directory.path(), network(), &query)
+        NodeStore::inspect_offline(&location, network(), &query)
             .await
             .is_err()
     );
@@ -738,8 +697,9 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     drop(store);
     // Inspect the actual copy helper while its private files still exist.
     {
-        let (_lock, _) = read_marker(directory.path(), network()).unwrap();
-        let snapshot = inspection_snapshot(directory.path()).unwrap();
+        let location = StoreLocation::for_test(directory.path());
+        let (_lock, _) = read_marker(&location, network()).unwrap();
+        let snapshot = inspection_snapshot(&location).unwrap();
         for path in hellas_channel::test_support::all_files(snapshot.path()) {
             assert!(hellas_private::is_private(&std::fs::File::open(path).unwrap()).unwrap());
         }
@@ -764,7 +724,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
         }
     }
     let before = inspection_files(directory.path());
-    let view = NodeStore::inspect_offline(directory.path(), network(), &query)
+    let view = NodeStore::inspect_offline(&location, network(), &query)
         .await
         .unwrap();
     assert_eq!(view.revision, expected_revision);
@@ -774,7 +734,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     assert!(records.iter().any(|c| c.id == secret.id()));
     assert_eq!(inspection_files(directory.path()), before);
     // Opening the live store after inspection still sees the exact same revision.
-    let store = NodeStore::open_initialized(directory.path(), network(), Default::default())
+    let store = NodeStore::open_initialized(&location, network())
         .await
         .unwrap();
     assert_eq!(store.state().authority().revision(), expected_revision);
@@ -786,14 +746,15 @@ async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt(
     drop(bootstrap(directory.path()).await);
     let query = auth::InspectionQuery::Credentials { after: None };
     for generation in [2, 3] {
-        let before = NodeStore::inspect_offline(directory.path(), network(), &query)
+        let location = StoreLocation::for_test(directory.path());
+        let before = NodeStore::inspect_offline(&location, network(), &query)
             .await
             .unwrap();
         let expected = before.revision;
         // Lose both the committed receipt and its unpublished credential.
         drop(
             NodeStore::recover_offline(
-                directory.path(),
+                &location,
                 network(),
                 expected,
                 crate::test_support::common_node::approval_for(
@@ -802,12 +763,11 @@ async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt(
                     admin(),
                 ),
                 UnixMillis(generation),
-                Default::default(),
             )
             .await
             .unwrap(),
         );
-        let after = NodeStore::inspect_offline(directory.path(), network(), &query)
+        let after = NodeStore::inspect_offline(&location, network(), &query)
             .await
             .unwrap();
         assert_eq!(after.generation, generation);
@@ -868,8 +828,9 @@ async fn offline_inspection_reads_a_crash_left_wal_without_creating_source_sidec
     }
     let before = inspection_files(crashed.path());
     {
-        let (_lock, _) = read_marker(crashed.path(), network()).unwrap();
-        let snapshot = inspection_snapshot(crashed.path()).unwrap();
+        let location = StoreLocation::for_test(crashed.path());
+        let (_lock, _) = read_marker(&location, network()).unwrap();
+        let snapshot = inspection_snapshot(&location).unwrap();
         let copied_wal = snapshot.path().join("journals/grants.sqlite-wal");
         let file = std::fs::File::open(&copied_wal).unwrap();
         assert!(hellas_private::is_private(&file).unwrap());
@@ -883,8 +844,9 @@ async fn offline_inspection_reads_a_crash_left_wal_without_creating_source_sidec
             std::fs::read(&wal).unwrap()
         );
     }
+    let location = StoreLocation::for_test(crashed.path());
     let view = NodeStore::inspect_offline(
-        crashed.path(),
+        &location,
         network(),
         &auth::InspectionQuery::Grant {
             id: ids::FRIEND_GRANT,
@@ -923,14 +885,15 @@ async fn offline_inspection_removes_only_stale_snapshot_directories() {
         std::os::unix::fs::symlink(&unrelated, stale.join("nested-link")).unwrap();
     }
     // Cleanup is also excluded while a writer owns the journal.
+    let location = StoreLocation::for_test(directory.path());
     assert!(
-        NodeStore::inspect_offline(directory.path(), network(), &query)
+        NodeStore::inspect_offline(&location, network(), &query)
             .await
             .is_err()
     );
     assert!(stale.exists());
     drop(store);
-    NodeStore::inspect_offline(directory.path(), network(), &query)
+    NodeStore::inspect_offline(&location, network(), &query)
         .await
         .unwrap();
     assert!(!stale.exists());
@@ -967,41 +930,34 @@ async fn client_prepared_bootstrap_survives_a_lost_reply() {
         admin(),
     );
     let (request, secret) = approval.prepare(None).unwrap();
+    let location = StoreLocation::for_test(directory.path());
     drop(
         NodeStore::bootstrap_prepared(
-            directory.path(),
+            &location,
             network(),
             ids::ROOT_GRANT,
             request.clone(),
             None,
             UnixMillis(1),
-            Default::default(),
         )
         .await
         .unwrap(),
     );
     assert_err!(
         NodeStore::bootstrap_prepared(
-            directory.path(),
+            &location,
             network(),
             ids::ROOT_GRANT,
             request,
             None,
             UnixMillis(2),
-            Default::default(),
         )
         .await,
         NodeStoreError::AlreadyInitialized
     );
-    let store = NodeStore::open(
-        directory.path(),
-        network(),
-        None,
-        UnixMillis(2),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let store = NodeStore::open(&location, network(), None, UnixMillis(2))
+        .await
+        .unwrap();
     crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(2));
 }
 
@@ -1013,28 +969,16 @@ async fn abandoned_staging_store_does_not_initialize_the_destination() {
     // journal in its staging directory, with no visible destination authority.
     let staging = parent.path().join(".bootstrap-interrupted");
     drop(bootstrap(&staging).await);
+    let location = StoreLocation::for_test(&destination);
     assert_err!(
-        NodeStore::open(
-            &destination,
-            network(),
-            None,
-            UnixMillis(2),
-            Default::default(),
-        )
-        .await,
+        NodeStore::open(&location, network(), None, UnixMillis(2)).await,
         NodeStoreError::Uninitialized
     );
     drop(bootstrap(&destination).await);
     assert!(
-        NodeStore::open(
-            &destination,
-            network(),
-            None,
-            UnixMillis(2),
-            Default::default(),
-        )
-        .await
-        .is_ok()
+        NodeStore::open(&location, network(), None, UnixMillis(2))
+            .await
+            .is_ok()
     );
     assert!(!staging.exists());
 }
@@ -1064,29 +1008,18 @@ async fn process_death_before_and_after_publication_never_exposes_partial_author
             .unwrap();
         assert_eq!(status.code(), Some(73));
         if phase == "staged" {
+            let location = StoreLocation::for_test(&destination);
             assert_err!(
-                NodeStore::open(
-                    &destination,
-                    network(),
-                    None,
-                    UnixMillis(2),
-                    Default::default(),
-                )
-                .await,
+                NodeStore::open(&location, network(), None, UnixMillis(2)).await,
                 NodeStoreError::Uninitialized
             );
             drop(bootstrap(&destination).await);
             assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
         }
-        let store = NodeStore::open(
-            &destination,
-            network(),
-            None,
-            UnixMillis(2),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        let location = StoreLocation::for_test(&destination);
+        let store = NodeStore::open(&location, network(), None, UnixMillis(2))
+            .await
+            .unwrap();
         assert_eq!(store.state().authority().revision(), Revision(1));
     }
 }
@@ -1109,9 +1042,10 @@ async fn cleanup_preserves_live_stages_and_inert_unmarked_directories() {
 async fn concurrent_bootstrap_commits_only_one_complete_store() {
     let parent = tempfile::tempdir().unwrap();
     let path = parent.path().join("node");
-    let initialize = || {
+    let initialize = || async {
+        let location = StoreLocation::for_test(&path);
         NodeStore::bootstrap(
-            &path,
+            &location,
             network(),
             ids::ROOT_GRANT,
             crate::test_support::common_node::approval(
@@ -1123,8 +1057,8 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
             ),
             None,
             UnixMillis(1),
-            Default::default(),
         )
+        .await
     };
     let (first, second) = tokio::join!(initialize(), initialize());
     assert_ne!(first.is_ok(), second.is_ok());
@@ -1136,7 +1070,8 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
         _ => panic!("one initialization must commit"),
     };
     assert!(matches!(error, NodeStoreError::AlreadyInitialized));
-    let reopened = NodeStore::open(&path, network(), None, UnixMillis(2), Default::default())
+    let location = StoreLocation::for_test(&path);
+    let reopened = NodeStore::open(&location, network(), None, UnixMillis(2))
         .await
         .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));

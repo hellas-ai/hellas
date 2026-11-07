@@ -547,7 +547,8 @@ fn hip_unseen_program_and_kill_respawn() {
     assert_eq!(lease.pid(), Some(first), "spin ran on the warm worker");
     let error = spun.unwrap_err();
     drop(lease);
-    assert!(elapsed < Duration::from_secs(5), "cancel took {elapsed:?}");
+    // Cancellation, not the execution timeout, ended the endless spin.
+    assert!(elapsed < timeout, "cancel took {elapsed:?}");
     assert!(
         !std::path::Path::new(&format!("/proc/{first}")).exists(),
         "cancelled worker {first} survived"
@@ -576,13 +577,12 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     };
     let root = tempfile::tempdir().unwrap();
     let node = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         None,
         Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

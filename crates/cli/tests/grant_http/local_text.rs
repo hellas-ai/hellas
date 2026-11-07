@@ -3,7 +3,7 @@
 //!
 //! ```sh
 //! nix develop .#rocm -c env HELLAS_TEST_TEXT_MODEL=/path/Qwen3-0.6B-BF16.gguf \
-//!   HELLAS_TEST_CONTENT_INDEX=/path/content-index.bin cargo test -p hellas-cli --test grant_http local_text -- --ignored --nocapture
+//!   cargo test -p hellas-cli --features integration-tests --test grant_http local_text -- --ignored --nocapture
 //! ```
 use super::*;
 

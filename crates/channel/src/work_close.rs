@@ -597,95 +597,29 @@ fn contest_after_block(
     pending.ok_or(Malformed)
 }
 
-/// Resume contest reconstruction from its canonical journal checkpoint.
-/// Every verified block is committed before the next result is consumed, so a
-/// bounded caller can cancel repeatedly without discarding completed progress.
-async fn finalized_contest<C, S, V>(
-    source: &S,
-    channel: &mut C,
-    verifier: &V,
-) -> Result<PendingPaymentClose, CatchUpError>
+/// The ordinary contiguous observer has already retained the contest through its
+/// latest relevant block. A gap cannot be repaired after archive pruning.
+async fn finalized_contest<C>(channel: &mut C) -> Result<PendingPaymentClose, CatchUpError>
 where
     C: CloseChannel,
-    S: FinalizedBlocks + ?Sized,
-    V: SigVerifier,
 {
-    let (descriptor, cursor, contest, mut history) = {
+    let (cursor, contest, history) = {
         let store = channel.store().await?;
         let state = store.state();
         (
-            state.channel().clone(),
             state.cursor(),
             state.open_contest().ok_or(CloseError::NoContest)?,
             state.close_history(),
         )
     };
-    let invalid =
-        || BlockSourceError::new("finalized contest history disagrees with the retained cursor");
-    let inclusion = contest
-        .response_deadline
-        .checked_sub(descriptor.payment_terms().omit_response_blocks)
-        .ok_or_else(invalid)?;
-    // No accepted response can change the contest after this deadline. Every
-    // historical block is independently authenticated on the same pinned chain;
-    // the ordinary cursor has already verified the irrelevant later tail.
     let end = cursor.0.min(contest.response_deadline);
-    if let Some(held) = history
-        && (held.height >= end || held.pending.responded())
-    {
-        return Ok(held.pending);
-    }
-    let next = history.map_or(inclusion, |held| held.height.saturating_add(1));
-    use futures::{StreamExt as _, stream};
-    let blocks = stream::iter(next..=end)
-        .map(|height| async move {
-            let block = source
-                .block_at(height)
-                .await?
-                .ok_or(CatchUpError::Missing { height })?;
-            Ok::<_, CatchUpError>((height, block))
-        })
-        .buffered(16);
-    futures::pin_mut!(blocks);
-    while let Some(block) = blocks.next().await {
-        let (height, block) = block?;
-        if block.height != height
-            || history.is_some_and(|held| block.parent != held.payload)
-            || (height == cursor.0 && block.payload != cursor.1)
-        {
-            return Err(invalid().into());
-        }
-        let pending = contest_after_block(
-            &descriptor,
-            history.map(|held| held.pending),
-            &block,
-            contest,
+    match history {
+        Some(held) if held.height >= end || held.pending.responded() => Ok(held.pending),
+        _ => Err(BlockSourceError::new(
+            "finalized contest history disagrees with the retained cursor",
         )
-        .map_err(WorkStoreError::from)?;
-        let verified = crate::work_store::CloseHistory {
-            height,
-            payload: block.payload,
-            pending,
-        };
-        channel
-            .store()
-            .await?
-            .commit(
-                ChannelRecord::CloseHistoryAdvanced {
-                    parent: block.parent,
-                    history: verified,
-                },
-                verifier,
-            )
-            .await?;
-        history = Some(verified);
-        if pending.responded() {
-            break;
-        }
+        .into()),
     }
-    history
-        .map(|held| held.pending)
-        .ok_or_else(|| invalid().into())
 }
 
 /// Reads the finalized tip, and samples what asking for it cost.
@@ -932,8 +866,8 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
             _ => {}
         }
     }
-    // New journals retain the canonical state as ordinary observation proceeds.
-    // Old journals with a gap are repaired incrementally by finalized_contest.
+    // Retain each canonical contest block before the cursor advances. Adjudication
+    // can then use this journal even after the origin prunes old blocks.
     if store.state().close_settled().is_none()
         && let Some(contest) = store.state().open_contest()
         && height <= contest.response_deadline
@@ -1210,7 +1144,7 @@ where
                     // catch-up rereads the opening block before adjudication.
                     return Ok(CloseProgress::Opened { start_id });
                 }
-                let pending = finalized_contest(source, channel, verifier).await?;
+                let pending = finalized_contest(channel).await?;
                 if pending.responded() || cursor.0 >= pending.response_deadline() {
                     let outcome = sink
                         .submit(adjudicated_close(&descriptor, settlement, &pending)?)

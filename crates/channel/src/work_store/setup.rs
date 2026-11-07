@@ -7,7 +7,7 @@
 use hellas_kernel::Cursor;
 use hex::encode as hex;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
@@ -251,7 +251,7 @@ pub enum SetupRecord {
         payload: [u8; 32],
     },
     /// An executable revision and everything close-only recovery needs,
-    /// committed together under the configured durability policy before export.
+    /// committed together before that revision is returned to the peer.
     ArmedBundle {
         /// The revision's exact canonical bytes.
         bundle: Vec<u8>,

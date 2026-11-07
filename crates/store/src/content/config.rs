@@ -249,13 +249,12 @@ pub struct Config {
     pub policy: Policies,
 }
 impl Config {
-    pub fn upper(&self) -> Result<PathBuf> {
-        self.upper
-            .clone()
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hellas/store"))
-            })
-            .ok_or(Error::Invalid("content.upper is required without HOME"))
+    /// The declared upper, or `<home>/store`; either way with home's durability.
+    pub fn upper(&self, home: &StoreLocation) -> StoreLocation {
+        match &self.upper {
+            Some(upper) => StoreLocation::from_home(upper, home.durability()),
+            None => home.child("store"),
+        }
     }
     pub fn validate(&self) -> Result<()> {
         for (name, declaration) in &self.pins {
@@ -273,19 +272,18 @@ impl Config {
     }
     pub async fn open(
         &self,
+        home: &StoreLocation,
         ram: Reservations,
         owner_only: bool,
-        durability: Durability,
     ) -> Result<DiskStore> {
         self.validate()?;
         DiskStore::open(
-            self.upper()?,
+            self.upper(home),
             self.lower.clone(),
             self.index,
             self.capacity.map(|bytes| bytes.0),
             ram,
             owner_only,
-            durability,
         )
         .await
     }
@@ -309,9 +307,12 @@ impl Reconciler {
         let store = store.clone();
         tokio::spawn(async move {
             let mut current = current.lock().await;
-            if current.upper()? != config.upper()?
+            if current.upper != config.upper
                 || current.capacity != config.capacity
-                || store.core.disk.as_ref().unwrap().root != config.upper()?
+                || config
+                    .upper
+                    .as_ref()
+                    .is_some_and(|upper| *upper != *store.core.disk.as_ref().unwrap().root)
                 || store.core.disk.as_ref().unwrap().quota.limit()
                     != config.capacity.map_or(u64::MAX, |bytes| bytes.0)
             {
@@ -471,8 +472,9 @@ mod tests {
         }
     }
     async fn node(config: &Config) -> DiskStore {
+        let home = StoreLocation::for_test(config.upper.as_ref().unwrap());
         config
-            .open(Reservations::ram(16 << 20), false, Default::default())
+            .open(&home, Reservations::ram(16 << 20), false)
             .await
             .unwrap()
     }

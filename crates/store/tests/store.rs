@@ -1,6 +1,10 @@
 //! Explicit indexing refuses special files before any blocking read.
 use std::path::Path;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Explicit paths may follow a symlink to ordinary content, but neither that
 /// convenience nor the adoption walk's earlier `file_type` observation may
 /// turn a FIFO or device into a blocking content read.
@@ -38,7 +42,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
         ));
     });
     let error = receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("indexing blocked while opening a FIFO")
         .expect_err("a FIFO is not content");
     assert!(

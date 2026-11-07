@@ -584,7 +584,7 @@ mod tests {
         let observed = published.clone();
         let missing_content = tempfile::tempdir().unwrap();
         let missing_store = hellas_store::content::DiskStore::open(
-            missing_content.path().into(),
+            hellas_private::StoreLocation::for_test(missing_content.path()),
             vec![],
             hellas_store::content::IndexMode::Resume,
             None,
@@ -592,7 +592,6 @@ mod tests {
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
             false,
-            Default::default(),
         )
         .await
         .unwrap();

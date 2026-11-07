@@ -1,11 +1,8 @@
 //! Exercise the real client factory with hostile process configuration in a child.
 //! No production endpoint, credential or machine trust store is changed.
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -36,7 +33,7 @@ where
         .unwrap();
         let control = reqwest::Client::builder()
             .tls_certs_only([ca])
-            .timeout(Duration::from_secs(10))
+            .timeout(super::HANG_GUARD)
             .build()
             .unwrap();
         let response = control.post(&url).body("CONTROL").send().await.unwrap();
@@ -125,11 +122,11 @@ where
     ] {
         child.env(variable, format!("http://{proxy_address}"));
     }
-    let result = tokio::time::timeout(Duration::from_secs(30), child.output())
+    let result = tokio::time::timeout(super::HANG_GUARD, child.output())
         .await
         .unwrap()
         .unwrap();
-    let requests = tokio::time::timeout(Duration::from_secs(5), upstream)
+    let requests = tokio::time::timeout(super::HANG_GUARD, upstream)
         .await
         .unwrap()
         .unwrap();

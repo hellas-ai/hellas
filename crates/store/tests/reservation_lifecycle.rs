@@ -15,13 +15,12 @@ fn job() -> JobId {
 }
 async fn store(root: &std::path::Path, capacity: u64) -> DiskStore {
     let store = DiskStore::open(
-        root.into(),
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
         vec![],
         IndexMode::Resume,
         Some(capacity),
         Reservations::ram(8 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -206,13 +205,12 @@ fn durable_private_output_survives_actual_process_exit_before_pin() {
     assert!(status.success());
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let store = DiskStore::open(
-            root.path().into(),
+            hellas_private::StoreLocation::for_test(root.path()),
             vec![],
             IndexMode::Resume,
             Some(64),
             Reservations::ram(8 << 20),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -324,13 +322,12 @@ async fn reopening_root_only_then_widening_does_not_reserve_recovered_inputs_twi
     store.close().await;
     drop(store);
     let store = DiskStore::open(
-        root.path().into(),
+        hellas_private::StoreLocation::for_test(root.path()),
         vec![],
         IndexMode::Resume,
         Some(16),
         Reservations::ram(8 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -442,13 +439,12 @@ fn authoritative_root_recovery_discards_unjournaled_output_before_restoring_exac
         .env(CHILD, root.path()).status().unwrap().success());
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let node = DiskStore::open(
-            root.path().into(),
+            hellas_private::StoreLocation::for_test(root.path()),
             vec![],
             IndexMode::Resume,
             Some(capacity),
             Reservations::ram(8 << 20),
             false,
-            Default::default(),
         )
         .await
         .unwrap();

@@ -97,7 +97,7 @@ combined with a provider credential; that restriction remains enforced by the
 provider. Private destinations also require its explicit egress opt-in.
 
 ```sh
-hellas --identity ./gateway.identity gateway \
+hellas --home ./gateway-home gateway \
   --http-fetch-config ./http-gateway.json \
   --paid-work-config /srv/hellas/paid-pool.json \
   --port 8080 --gateway-profile ./gateway-profile.json
@@ -163,7 +163,7 @@ Fetch journals are refused instead of silently changing their retention policy.
 The HTTP archive below is the gateway's separate payload persistence policy.
 
 CLI gateways archive authenticated requests and responses by default under
-`~/.hellas/gateway-archive`, or `--archive-dir DIRECTORY`. This applies to the
+`<home>/gateway-archive`. This applies to the
 existing inference routes as well as HTTP Fetch. Each exchange has owner-only
 `request.bin`, `response.bin` and `metadata.json` files. Metadata records status,
 size, content type/encoding, elapsed time, completion, selected backend and trace context; it excludes authentication

@@ -69,12 +69,10 @@ impl NodeCoordinator {
         }
     }
 
-    /// Release a standalone node's journal and identity writer after its services drain.
-    /// A host-shared node remains open across provider restarts.
-    pub async fn close(&self) -> Result<(), NodeStoreError> {
-        self.writer().await?.close().await;
+    /// Close a standalone writer after its services have drained.
+    pub async fn close(&self) {
+        self.store.lock_for_shutdown().await.close().await;
         self.changed.notify_waiters();
-        Ok(())
     }
 
     /// Composition identity: two services must retain the same writer, not

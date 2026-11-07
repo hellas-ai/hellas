@@ -275,12 +275,12 @@ impl<T> LightClientHandler for LightClientRpc<T>
 where
     T: LightClientApi,
 {
-    async fn get_operations(
+    async fn get_object_proofs(
         &self,
-        request: pb::GetOperationsRequest,
-    ) -> Result<pb::GetOperationsResponse, WireStatus> {
+        request: pb::GetObjectProofsRequest,
+    ) -> Result<pb::GetObjectProofsResponse, WireStatus> {
         self.client
-            .get_operations(request)
+            .get_object_proofs(request)
             .await
             .map_err(WireStatus::from)
     }
@@ -904,6 +904,10 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
 }
 
 #[cfg(all(test, feature = "validator"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;
 
 /// Shared finalized read semantics for LightClient and ChainSync.

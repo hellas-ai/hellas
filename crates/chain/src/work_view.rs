@@ -26,10 +26,9 @@
 //! its payload argument as a finalized *floor* and reads the
 //! then-current database root, which is a different question.
 //!
-//! Local readers hold one database snapshot. Remote readers verify a complete
-//! retained operation witness against the certified state root before deriving
-//! current values or absence. A block certificate alone cannot authenticate
-//! arbitrary object fields returned beside it.
+//! Local readers hold one database snapshot. Remote readers verify current
+//! inclusion or exclusion proofs against one certified state root. A block
+//! certificate alone cannot authenticate object fields returned beside it.
 //!
 //! # What it does not decide
 //!

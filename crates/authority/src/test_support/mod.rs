@@ -1,6 +1,7 @@
 use crate::work_store::grant::NodeStore;
 use hellas_auth::authority::{GrantId, PrincipalId, Revision, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, Signature};
+use hellas_private::StoreLocation;
 use hellas_rpc::*;
 use std::num::NonZeroU64;
 use {
@@ -390,7 +391,7 @@ pub mod credentials;
 /// An explicitly shared node store for test hosts, recovered before admission.
 pub async fn content_store(root: &std::path::Path) -> hellas_store::content::DiskStore {
     let store = hellas_store::content::DiskStore::open(
-        root.join("content"),
+        hellas_private::StoreLocation::for_test(&root.join("content")),
         vec![],
         hellas_store::content::IndexMode::Resume,
         None,
@@ -398,7 +399,6 @@ pub async fn content_store(root: &std::path::Path) -> hellas_store::content::Dis
             hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
         ),
         false,
-        Default::default(),
     )
     .await
     .unwrap();
@@ -523,14 +523,14 @@ pub async fn reopen(
     path: &std::path::Path,
     now: u64,
 ) -> Result<NodeStore, crate::work_store::grant::NodeStoreError> {
+    let location = StoreLocation::for_test(path);
     NodeStore::open(
-        path,
+        &location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],
         )),
         UnixMillis(now),
-        Default::default(),
     )
     .await
 }
@@ -550,7 +550,7 @@ pub mod ids {
 }
 mod node;
 pub use node::{
-    Allowance, Capacity, Node, Proposal, TestClock, TestNode, TestService, WAIT, authority,
+    Allowance, Capacity, HANG_GUARD, Node, Proposal, TestClock, TestNode, TestService, authority,
     provider_enrollment, within,
 };
 

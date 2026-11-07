@@ -471,7 +471,7 @@ mod waiter_tests {
         drop(held);
         ended.send_replace(true);
         assert!(response.next().await.unwrap().is_err());
-        let next = tokio::time::timeout(std::time::Duration::from_secs(1), authority.lock()).await;
+        let next = tokio::time::timeout(crate::HANG_GUARD, authority.lock()).await;
         assert!(
             next.is_ok(),
             "terminal response retained the queued Core effect"

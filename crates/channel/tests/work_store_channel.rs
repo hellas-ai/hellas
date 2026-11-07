@@ -10,6 +10,7 @@ use hellas_channel::test_support::channel as fixture;
 use hellas_channel::test_support::channel::{
     client, network, payload_at, provider, transcript_for as transcript_of,
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{InvocationRequest, PreparedInvocation};
 
 use hellas_auth::Digest;
@@ -110,8 +111,9 @@ async fn open(root: &std::path::Path, role: Role) -> ChannelStore {
 async fn open_on(root: &std::path::Path, channel: PaidChannel, role: Role) -> ChannelStore {
     let content = hellas_channel::test_support::channel::content_store(root).await;
     let origin = origin_of(&channel);
+    let location = StoreLocation::for_test(root);
     let store = match ChannelStore::open(
-        root,
+        &location,
         channel,
         settlement(),
         role,
@@ -967,8 +969,9 @@ async fn a_store_opens_anchored_at_the_channels_origin() {
 
     // And the origin is this channel's. One opened at another edge's
     // origin would be reading a height that is not about it.
+    let location = StoreLocation::for_test(dir.path().join("elsewhere").as_path());
     let error = ChannelStore::open(
-        dir.path().join("elsewhere").as_path(),
+        &location,
         channel(),
         settlement(),
         Role::Client,
@@ -1890,8 +1893,9 @@ async fn the_cursor_only_moves_to_the_contiguous_next_block() {
 async fn a_second_process_cannot_hold_the_same_channel() {
     let dir = temp();
     let held = open(dir.path(), Role::Provider).await;
+    let location = StoreLocation::for_test(dir.path());
     let error = ChannelStore::open(
-        dir.path(),
+        &location,
         channel(),
         settlement(),
         Role::Provider,
@@ -1912,7 +1916,8 @@ async fn a_second_process_cannot_hold_the_same_channel() {
 
 /// The stem of the one channel journal under a root.
 fn channel_stem(root: &std::path::Path) -> String {
-    Journal::stems(root)
+    let location = StoreLocation::for_test(root);
+    Journal::stems(&location)
         .unwrap()
         .into_iter()
         .find(|stem| stem.starts_with("channel-"))
@@ -2244,8 +2249,9 @@ async fn replay_checks_the_signatures_again() {
         retained_tree: None,
     };
     {
+        let location = StoreLocation::for_test(dir.path());
         let Ok(mut credulous) = ChannelStore::open(
-            dir.path(),
+            &location,
             channel.clone(),
             settlement(),
             Role::Provider,
@@ -2263,8 +2269,9 @@ async fn replay_checks_the_signatures_again() {
         }
         credulous.content_store().close().await;
     }
+    let location = StoreLocation::for_test(dir.path());
     let error = ChannelStore::open(
-        dir.path(),
+        &location,
         channel.clone(),
         settlement(),
         Role::Provider,
@@ -2431,7 +2438,7 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
         // Corrupt the private staged hard link too; a valid original must be recoverable.
         std::fs::write(&path, bundle_bytes(bundle_nonce)).unwrap();
         let content = hellas_store::content::DiskStore::open(
-            dir.path().join("content"),
+            hellas_private::StoreLocation::for_test(dir.path()).child("content"),
             vec![],
             hellas_store::content::IndexMode::Resume,
             None,
@@ -2439,7 +2446,6 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -2448,8 +2454,9 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             readable,
             "the substituted input is discarded"
         );
+        let location = StoreLocation::for_test(dir.path());
         let opened = ChannelStore::open(
-            dir.path(),
+            &location,
             channel.clone(),
             settlement(),
             Role::Provider,
@@ -2700,7 +2707,8 @@ async fn a_whole_job_opens_no_counterparty_loss_file() {
         "the job reached a certified terminal",
     );
 
-    let names = Journal::stems(dir.path()).expect("the journal directory reads");
+    let location = StoreLocation::for_test(dir.path());
+    let names = Journal::stems(&location).expect("the journal directory reads");
     assert!(
         names.iter().any(|name| name.starts_with("channel-")),
         "the one channel journal exists: {names:?}",
@@ -3105,15 +3113,14 @@ async fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
         store.content_store().close().await;
         drop(store);
         let stem = channel_stem(dir.path());
-        let (id, _) = Journal::inspect(dir.path(), &stem).await.unwrap();
-        let (mut journal, _) = Journal::open_existing(dir.path(), &stem, id, Default::default())
-            .await
-            .unwrap();
+        let location = StoreLocation::for_test(dir.path());
+        let (id, _) = Journal::inspect(&location, &stem).await.unwrap();
+        let (mut journal, _) = Journal::open_existing(&location, &stem, id).await.unwrap();
         journal.rotate(&bytes).await.unwrap();
         drop(journal);
         assert!(matches!(
             ChannelStore::open(
-                dir.path(),
+                &location,
                 channel.clone(),
                 settlement(),
                 role,

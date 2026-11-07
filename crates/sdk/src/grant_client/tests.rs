@@ -4,13 +4,14 @@ use hellas_authority::model::grant::budget::*;
 use hellas_authority::model::grant::records::{GrantDef, Offer};
 use hellas_authority::test_support::TestClock;
 use hellas_authority::work_store::grant::NodeStore;
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::GrantRefusal;
 use hellas_rpc::{Assurance, Retention};
 use hellas_wire::{MethodMarker, ServiceMarker, StreamTransport};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use {
-    hellas_authority::test_support::WAIT, hellas_authority::test_support::definition,
+    hellas_authority::test_support::HANG_GUARD, hellas_authority::test_support::definition,
     hellas_authority::test_support::policy, hellas_channel::test_support::assert_err,
     hellas_channel::test_support::network,
 };
@@ -146,12 +147,13 @@ impl Fixture {
         }
     }
     fn options(&self) -> GrantSessionOptions {
+        let location = StoreLocation::for_test(&self.root.path().join("client"));
         GrantSessionOptions {
             target: pinned_offer(self.grant.clone(), vec![]),
             principal: principal(1).0,
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
-            journal_root: self.root.path().join("client"),
+            journal_root: location,
             // Control calls stay bounded independently of the signed job limit.
             control_timeout: std::time::Duration::from_secs(5),
         }
@@ -669,7 +671,8 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
                 "unexpected Open response failure: {response:?}",
             );
             tokio::time::pause();
-            if let Ok(Ok(_)) = tokio::time::timeout(WAIT, transport.connection().accept_bi()).await
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(HANG_GUARD, transport.connection().accept_bi()).await
             {
                 panic!("client sent another request after failed Open");
             }
@@ -747,7 +750,7 @@ async fn stalled_transport_setup_keeps_its_control_timeout() {
     // Keep Open unanswered: timing out job execution is not needed to bound setup.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), opening)
+    let result = tokio::time::timeout(HANG_GUARD, opening)
         .await
         .expect("control deadline must end stalled setup")
         .unwrap();
@@ -774,4 +777,37 @@ async fn stalled_local_transport_setup_keeps_its_control_timeout() {
     tokio::time::resume();
     assert_err!(result, GrantClientError::Timeout);
     drop(held);
+}
+
+#[tokio::test]
+async fn prepared_resource_gets_fresh_admission_standing() {
+    let f = Fixture::new().await;
+    let mut session = f.session().await;
+    let input = f.input();
+    // The resource was selected and prepared from the previous standing.
+    f.clock.set(UnixMillis(61_000));
+    session
+        .run_current(
+            f.grant.policies[0].resource,
+            input,
+            &hellas_channel::test_support::channel::program_content().await,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    session.shutdown().await.unwrap();
+}
+
+/// Open while the journal holds its first durable acknowledgement.
+pub(crate) async fn delayed_open_keeps_response_arrival_clock(
+    arm: impl FnOnce(&std::path::Path) -> hellas_channel::work_store::journal::test_support::AppendHook,
+) {
+    let f = Fixture::new().await;
+    let _hook = arm(&f.options().journal_root);
+    let mut session = f.session().await;
+    assert!(session.now().0 >= session.standing_now.0 + 500);
+    session.shutdown().await.unwrap();
 }

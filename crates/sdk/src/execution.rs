@@ -1,7 +1,7 @@
 //! Native work execution and caller-owned attempt tracking.
 use crate::job::{Job, JobInput};
 use crate::paid_client::{PaidWorkOptions, PaidWorkResult, PaidWorkSession};
-use crate::transact::{Purchase, PurchaseTarget};
+use crate::transact::{PaidAttemptPath, Purchase, PurchaseTarget};
 use hellas_auth::{Digest, ProducerSigningKey, authority::ResourceId};
 use hellas_channel::model::grant::ChannelId;
 use hellas_channel::model::work::PrivateRecord;
@@ -33,6 +33,8 @@ pub enum ExecutionError {
     Identity,
     #[error("the original attempt is unresolved; recover it without proposing new work")]
     RecoveryRequired,
+    #[error("paid output is unavailable; recover the original attempt or explicitly buy again")]
+    ResultUnavailable,
     #[error(transparent)]
     Purchase(#[from] crate::transact::PurchaseError),
     #[error(transparent)]
@@ -164,20 +166,50 @@ pub struct ExecutionAttempt {
     terms: ExecutionTerms,
     record: AttemptRecord,
     newly_bound: bool,
-    retain_results: bool,
 }
 impl ExecutionAttempt {
     pub fn open(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
-        Self::open_inner(path, input, terms, true)
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
+        Self::open_inner(path, None, input, terms, true)
     }
 
     /// Open only an existing attempt, failing closed if its record was lost.
     pub fn open_existing(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
-        Self::open_inner(path, input, terms, false)
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
+        Self::open_inner(path, None, input, terms, false)
+    }
+
+    pub fn open_paid(path: &PaidAttemptPath, input: &JobInput, price: u64) -> Result<Self> {
+        Self::open_inner(
+            path.as_path(),
+            Some(path),
+            input,
+            ExecutionTerms::Paid { price },
+            true,
+        )
+    }
+
+    pub fn open_existing_paid(
+        path: &PaidAttemptPath,
+        input: &JobInput,
+        price: u64,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path.as_path(),
+            Some(path),
+            input,
+            ExecutionTerms::Paid { price },
+            false,
+        )
     }
 
     fn open_inner(
         path: &Path,
+        paid_path: Option<&PaidAttemptPath>,
         input: &JobInput,
         terms: ExecutionTerms,
         create: bool,
@@ -194,10 +226,11 @@ impl ExecutionAttempt {
         let record = match terms {
             ExecutionTerms::Paid { price } => {
                 let job = Job::from_input(price, input.clone())?;
+                let paid_path = paid_path.ok_or(ExecutionError::Identity)?;
                 AttemptRecord::Paid(if create {
-                    Purchase::open_tracked(path, &job)?
+                    Purchase::open_tracked(paid_path, &job)?
                 } else {
-                    Purchase::open_existing_tracked(path, &job)?
+                    Purchase::open_existing_tracked(paid_path, &job)?
                 })
             }
             ExecutionTerms::Grant { resource } => {
@@ -270,13 +303,7 @@ impl ExecutionAttempt {
             terms,
             record,
             newly_bound: false,
-            retain_results: false,
         })
-    }
-
-    /// Opt into private storage of verified output and transcript bytes.
-    pub fn retain_results(&mut self, retain: bool) {
-        self.retain_results = retain;
     }
 
     pub fn bind_target(&mut self, target: ExecutionTarget) -> Result<()> {
@@ -349,12 +376,15 @@ impl ExecutionAttempt {
         self.matches(input, terms)?;
         let job = Job::from_input(options.expected_price, input.clone())?;
         let target = PurchaseTarget {
-            network: options.config.chain.network.as_str().into(),
+            network: options.config.network().as_str().into(),
             provider: options.provider,
         };
         let AttemptRecord::Paid(purchase) = &mut self.record else {
             return Err(ExecutionError::Identity);
         };
+        purchase
+            .ensure_state_key(&options.config.chain.state_key())
+            .map_err(|_| ExecutionError::Identity)?;
         if purchase.has_target() && !purchase.matches_target(&target) {
             return Err(ExecutionError::Identity);
         }
@@ -428,9 +458,8 @@ impl<'a> ExecutionSession<'a> {
         observers: ExecutionObservers,
         mut attempt: Option<&mut ExecutionAttempt>,
     ) -> Result<ExecutionResult> {
-        if let Some(attempt) = attempt.as_deref_mut() {
+        if let Some(attempt) = attempt.as_deref() {
             attempt.matches(&input, terms)?;
-            attempt.newly_bound = false;
         }
         let result = match (self, terms) {
             (Self::Paid(session), ExecutionTerms::Paid { price }) => {
@@ -439,6 +468,9 @@ impl<'a> ExecutionSession<'a> {
                 let purchase = match attempt.as_deref_mut() {
                     Some(attempt) => match &mut attempt.record {
                         AttemptRecord::Paid(purchase) => {
+                            purchase
+                                .ensure_chain(session)
+                                .map_err(|_| ExecutionError::Identity)?;
                             let target = PurchaseTarget {
                                 network: target.network.as_str().into(),
                                 provider: target.provider,
@@ -446,6 +478,7 @@ impl<'a> ExecutionSession<'a> {
                             if !purchase.matches_target(&target) {
                                 return Err(ExecutionError::Identity);
                             }
+                            attempt.newly_bound = false;
                             purchase.bind_channel(
                                 session.descriptor().channel().id(),
                                 session.descriptor().bond_edge(),
@@ -544,6 +577,11 @@ impl<'a> ExecutionSession<'a> {
                     &result.output,
                     result.transcript.clone(),
                     true,
+                    Some(PaidDelivery {
+                        channel_id: result.channel_id,
+                        bond_edge: result.bond_edge.to_bytes(),
+                        provider_key: result.provider_key,
+                    }),
                 )?,
                 ExecutionResult::Grant(result) => {
                     let transcript = hellas_channel::model::work::encode_transcript(&result.events)
@@ -554,6 +592,7 @@ impl<'a> ExecutionSession<'a> {
                         transcript,
                         result.result.outcome
                             == hellas_channel::model::work::ResultOutcome::Finished,
+                        None,
                     )?;
                 }
             }
@@ -565,6 +604,8 @@ impl<'a> ExecutionSession<'a> {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paid: Option<PaidDelivery>,
     format: String,
     input: [u8; 32],
     terms: ExecutionTerms,
@@ -585,6 +626,23 @@ struct RetainedResult {
 pub struct RetainedExecutionResult {
     pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
     pub transcript: Vec<u8>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PaidDelivery {
+    channel_id: Digest,
+    bond_edge: [u8; 32],
+    provider_key: hellas_auth::PublicKey,
+}
+
+/// Retained paid output, without fabricating a new execution or settlement.
+pub struct PaidCompletion {
+    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
+    pub transcript: Vec<u8>,
+    pub work_id: Digest,
+    pub job_price: u64,
+    pub channel_id: Digest,
+    pub bond_edge: hellas_kernel::EdgeId,
+    pub provider_key: hellas_auth::PublicKey,
 }
 const MAX_RESULT_RECEIPT_BYTES: usize =
     2 * hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES + 4096;
@@ -630,6 +688,7 @@ impl ExecutionAttempt {
         output: &hellas_rpc::protocol::invocation::output::InvocationOutput,
         transcript: Vec<u8>,
         finished: bool,
+        paid: Option<PaidDelivery>,
     ) -> Result<()> {
         if self.read_receipt()?.is_some() {
             return Err(ExecutionError::RecoveryRequired);
@@ -639,19 +698,18 @@ impl ExecutionAttempt {
         }
         let output_id = output.content_id().map_err(|_| ExecutionError::Identity)?;
         let transcript_ref = hellas_rpc::ContentRef::for_bytes(&transcript);
-        if self.retain_results {
-            let artifact = RetainedResult {
-                output: output.clone(),
-                transcript: transcript.into(),
-            };
-            let bytes =
-                hellas_rpc::protocol::value::encode_bounded(&artifact, MAX_RESULT_RECEIPT_BYTES)
-                    .map_err(|_| ExecutionError::Identity)?;
-            let path = self.sidecar(".result")?;
-            hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
-            hellas_private::write_atomically(&path, ".writing", &bytes)?;
-        }
+        let artifact = RetainedResult {
+            output: output.clone(),
+            transcript: transcript.into(),
+        };
+        let bytes =
+            hellas_rpc::protocol::value::encode_bounded(&artifact, MAX_RESULT_RECEIPT_BYTES)
+                .map_err(|_| ExecutionError::Identity)?;
+        let path = self.sidecar(".result")?;
+        hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
+        hellas_private::write_atomically(&path, ".writing", &bytes)?;
         let receipt = CompletionReceipt {
+            paid,
             format: WORK_COMPLETION_FORMAT.into(),
             input: *self.input.as_bytes(),
             terms: self.terms,
@@ -659,7 +717,7 @@ impl ExecutionAttempt {
             output: output_id,
             transcript: transcript_ref,
             finished,
-            retained: self.retain_results,
+            retained: true,
             reported: false,
         };
         let path = self.sidecar(".receipt")?;
@@ -700,6 +758,38 @@ impl ExecutionAttempt {
             transcript: artifact.transcript.into_vec(),
         }))
     }
+    /// Load paid delivery without opening a channel or proposing work again.
+    pub fn retained_paid_result(&self) -> Result<Option<PaidCompletion>> {
+        let Some(retained) = self.retained_result()? else {
+            let facts = self.inspect()?;
+            if facts.payment == Payment::Paid || facts.reported || self.read_receipt()?.is_some() {
+                return Err(ExecutionError::ResultUnavailable);
+            }
+            return Ok(None);
+        };
+        let receipt = self.read_receipt()?.ok_or(ExecutionError::Identity)?;
+        let ExecutionTerms::Paid { price } = receipt.terms else {
+            return Err(ExecutionError::Identity);
+        };
+        let paid = receipt.paid.ok_or(ExecutionError::Identity)?;
+        let AttemptRecord::Paid(purchase) = &self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        let bond_edge = hellas_kernel::EdgeId::from_bytes(paid.bond_edge);
+        if purchase.bound_channel() != Some((paid.channel_id, bond_edge)) {
+            return Err(ExecutionError::Identity);
+        }
+        Ok(Some(PaidCompletion {
+            output: retained.output,
+            transcript: retained.transcript,
+            work_id: Digest::from_bytes(receipt.work),
+            job_price: price,
+            channel_id: paid.channel_id,
+            bond_edge,
+            provider_key: paid.provider_key,
+        }))
+    }
+
     /// Record delivery only after the caller has committed its own result.
     pub fn reported(&mut self) -> Result<()> {
         let mut receipt = self
@@ -875,9 +965,11 @@ impl<'a> ExecutionSession<'a> {
     /// is ambiguous even for identical input. Recovery then returns
     /// `PurchaseError::Unfinished` and leaves the attempt unchanged.
     pub async fn recover(&mut self, attempt: &mut ExecutionAttempt) -> Result<ExecutionFacts> {
-        attempt.newly_bound = false;
         match (self, &mut attempt.record) {
             (Self::Paid(session), AttemptRecord::Paid(purchase)) => {
+                purchase
+                    .ensure_chain(session)
+                    .map_err(|_| ExecutionError::Identity)?;
                 let target = session.execution_target();
                 if !purchase.matches_target(&PurchaseTarget {
                     network: target.network.as_str().into(),
@@ -885,6 +977,7 @@ impl<'a> ExecutionSession<'a> {
                 }) {
                     return Err(ExecutionError::Identity);
                 }
+                attempt.newly_bound = false;
                 purchase.bind_channel(
                     session.descriptor().channel().id(),
                     session.descriptor().bond_edge(),
@@ -914,6 +1007,7 @@ impl<'a> ExecutionSession<'a> {
                 }
             }
             (Self::Grant(session), AttemptRecord::Grant(tracker)) => {
+                attempt.newly_bound = false;
                 let target = session.execution_target()?;
                 if tracker.record.target.as_ref()
                     != Some(&GrantTarget {
@@ -1010,7 +1104,9 @@ impl ExecutionAttempt {
             generation: offer.generation,
             client,
         };
-        let directory = options.journal_root.join(hex::encode(channel.0.as_bytes()));
+        let directory = options
+            .journal_root
+            .child(hex::encode(channel.0.as_bytes()));
         let observed = hellas_authority::work_store::grant::GrantClientStore::inspect_work(
             &directory,
             offer.network,

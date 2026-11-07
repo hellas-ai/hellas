@@ -6,6 +6,7 @@ use hellas_authority::authenticator::Authenticator;
 use hellas_authority::model::grant::records::{
     MAX_CONTACT_CARD_BYTES, SignedOffer, decode_contact_card, encode_contact_card,
 };
+use hellas_private::StoreLocation;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -67,11 +68,8 @@ pub fn require_principal(passkey: Option<&dyn Authenticator>) -> CliResult<Princ
     })?)
 }
 /// One private tree per principal, named by its curve and compressed key.
-pub(crate) fn data_root(principal: &PrincipalId) -> CliResult<PathBuf> {
-    let base = match std::env::var_os("HELLAS_GRANT_DATA_DIR") {
-        Some(path) => PathBuf::from(path),
-        None => crate::identity::default_grant_data_path()?,
-    };
+pub(crate) fn data_root(home: &Path, principal: &PrincipalId) -> CliResult<PathBuf> {
+    let base = crate::identity::grant_data_path(home);
     Ok(base.join(format!("p256-{}", hex::encode(principal.as_bytes()))))
 }
 fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
@@ -92,6 +90,7 @@ pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
 pub async fn contact(
     command: ContactCommand,
     passkey: Option<&dyn Authenticator>,
+    home: &Path,
 ) -> CliResult<()> {
     match command {
         ContactCommand::Export { display_name, out } => {
@@ -118,7 +117,11 @@ pub async fn contact(
         } => {
             let bytes = read_bounded_regular_file(&file, "contact card", MAX_CONTACT_CARD_BYTES)?;
             let imported = decode_contact_card(&bytes)?;
-            let path = alias(&data_root(&require_principal(passkey)?)?, "contacts", &name)?;
+            let path = alias(
+                &data_root(home, &require_principal(passkey)?)?,
+                "contacts",
+                &name,
+            )?;
             if path.exists() && !replace {
                 let previous = decode_contact_card(&read_bounded_regular_file(
                     &path,
@@ -149,9 +152,10 @@ pub fn offer(
     command: OfferCommand,
     passkey: Option<&dyn Authenticator>,
     identity_node: Option<&hellas_auth::ProducerSigningKey>,
+    home: &Path,
 ) -> CliResult<()> {
     let identity = require_principal(passkey)?;
-    let root = data_root(&identity)?;
+    let root = data_root(home, &identity)?;
     let store = hellas_sdk::grant_store::GrantStore::new(root);
     match command {
         OfferCommand::Import {
@@ -201,13 +205,16 @@ pub(super) fn offer_fingerprints(offer: &SignedOffer) -> CliResult<()> {
     Ok(())
 }
 
-pub fn client_journal_root(identity: &PrincipalId) -> CliResult<PathBuf> {
-    Ok(data_root(identity)?.join("channels"))
+pub fn client_journal_root(
+    home: &StoreLocation,
+    identity: &PrincipalId,
+) -> CliResult<StoreLocation> {
+    Ok(home.child(data_root(home, identity)?).child("channels"))
 }
 /// Saved Offer terms may have expired; only use this as a signed locator.
 /// GrantSession obtains fresh authenticated standing before proposing a job.
-pub fn load_offer(identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
-    Ok(hellas_sdk::grant_store::GrantStore::new(data_root(identity)?).load_offer(name)?)
+pub fn load_offer(home: &Path, identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
+    Ok(hellas_sdk::grant_store::GrantStore::new(data_root(home, identity)?).load_offer(name)?)
 }
 
 #[cfg(test)]
@@ -231,6 +238,7 @@ mod tests {
                 out: Some(out.clone()),
             },
             Some(&friend),
+            root.path(),
         )
         .await
         .unwrap();
@@ -256,6 +264,7 @@ mod tests {
                     out: None,
                 },
                 None,
+                root.path(),
             )
             .await
             .is_err()
@@ -263,9 +272,10 @@ mod tests {
     }
     #[test]
     fn data_roots_name_the_principal_by_curve_and_key() {
+        let home = tempfile::tempdir().unwrap();
         let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([0x42; 32]).unwrap();
         let principal = principal(&passkey).unwrap();
-        let root = data_root(&principal).unwrap();
+        let root = data_root(home.path(), &principal).unwrap();
         assert_eq!(
             root.file_name().unwrap().to_str().unwrap(),
             format!("p256-{}", hex::encode(principal.as_bytes()))

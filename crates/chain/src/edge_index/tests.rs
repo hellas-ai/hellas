@@ -25,11 +25,10 @@ use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
-use commonware_utils::non_empty_range;
-use hellas_genesis::{
-    Genesis, GenesisAllocation, GenesisValidator, HELLAS_DEVNET_1_ID, TrustDocument, TrustEpoch,
-};
+use hellas_genesis::{Genesis, GenesisAllocation, GenesisValidator, TrustDocument, TrustEpoch};
+use hellas_private::Durability::Crash;
+
+const EDGE_TEST_NETWORK_ID: &str = "edge-index-test-1";
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
     PartyAuth, PartyKeys, Payout, ProtocolCode, Secp256k1Signer, Terms, Tx,
@@ -112,11 +111,11 @@ impl Harness {
         allocations: Vec<(SettlementKey, u64)>,
         name: &'static str,
     ) -> Self {
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let committee = consensus_fixture(7191);
         let mut genesis = Genesis {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: EDGE_TEST_NETWORK_ID.into(),
             validators: committee
                 .leaders
                 .iter()
@@ -148,7 +147,7 @@ impl Harness {
         let genesis_json = serde_json::to_vec(&genesis).unwrap();
         let trust = TrustDocument {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: EDGE_TEST_NETWORK_ID.into(),
             genesis_sha256: hex::encode(Sha256::hash(&genesis_json)),
             epochs: vec![TrustEpoch {
                 epoch: 0,
@@ -166,32 +165,22 @@ impl Harness {
         )
         .await;
         let leader = committee.leaders.iter().min().unwrap().clone();
-        let head = HellasBlock::genesis(
-            leader,
-            root,
-            target.clone(),
-            crate::genesis_digest(&genesis),
-        );
-        let origin_genesis = HellasBlock::genesis(
-            crate::indexer_api::genesis_leader(&genesis).unwrap(),
-            root,
-            target,
-            crate::genesis_digest(&genesis),
-        );
+        let head = HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
         let allocations = crate::config::genesis_allocations(&genesis).unwrap();
         let directory = tempfile::tempdir().unwrap();
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+            trust: trust.clone(),
+            validators: vec!["ws://unused.invalid".into()],
+            genesis_json: String::from_utf8(genesis_json.clone()).unwrap(),
+        })
+        .unwrap();
         let node = crate::node::FullNode::start_indexed(
-            crate::node::Config {
-                genesis: genesis.clone(),
-                threshold_identity: committee.assembler.identity().encode().to_vec(),
-                genesis_payload: origin_genesis.digest(),
-                storage_dir: directory.path().join("node"),
-                validators: Vec::new(),
-                peers: Vec::new(),
-                archive_blocks: None,
-            },
-            trust.clone(),
-            genesis_json.clone(),
+            crate::node::Config::for_indexed_profile(
+                crate::chain_dir::ChainDir::open(directory.path(), &profile, Crash).unwrap(),
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
             "edge-test".into(),
         )
         .await
@@ -243,11 +232,7 @@ impl Harness {
         .unwrap();
         let owner_root = crate::execution::owner_tree::root(&batch).await.unwrap();
         let merkleized = batch.merkleize().await.unwrap();
-        let bounds = merkleized.bounds();
-        let target = Target {
-            root: merkleized.root(),
-            range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
-        };
+        let target = crate::execution::store::sync_target(&merkleized);
         let block = HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -274,12 +259,16 @@ impl Harness {
     fn certify(&self, block: &HellasBlock) -> ProofBundle {
         ProofBundle {
             schema_version: PROOF_SCHEMA_VERSION,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: self.network.as_str().into(),
             trust_sha256: self.verifier.trust_sha256().into(),
             height: block.height().get(),
             payload: hex::encode(block.digest()),
             state_root: hex::encode(block.state_root()),
-            finalization: finalization(&self.committee, block).encode().to_vec(),
+            finalization: crate::finality_proof::encode(
+                &finalization(&self.committee, block).encode(),
+                &[],
+            )
+            .unwrap(),
             canonical_block: block.encode().to_vec(),
             observed_at_ms: block.height().get(),
             epoch: 0,
@@ -296,13 +285,12 @@ impl Harness {
             block: block.encode().to_vec(),
         };
         self.node.accept_finalized(&incoming).await?;
-        ::tokio::time::timeout(std::time::Duration::from_secs(10), self.node.wait_ready())
-            .await??;
+        self.node.wait_ready().await?;
         Ok(())
     }
 
     fn index_path(&self) -> std::path::PathBuf {
-        let mut paths = std::fs::read_dir(self.node.config().storage_dir.clone())
+        let mut paths = std::fs::read_dir(self.node.config().storage_dir())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "redb"));
@@ -317,14 +305,9 @@ impl Harness {
         self.node.shutdown().await.unwrap();
         drop(self.index);
         edit(&index_path);
-        self.node = crate::node::FullNode::start_indexed(
-            config,
-            self.trust.clone(),
-            self.genesis_json.clone(),
-            "edge-test".into(),
-        )
-        .await
-        .unwrap();
+        self.node = crate::node::FullNode::start_indexed(config, "edge-test".into())
+            .await
+            .unwrap();
         self.index = self.node.publication().unwrap().index;
         // A fresh certified observation restores live-read readiness after restart.
         self.node
@@ -333,7 +316,11 @@ impl Harness {
                     height: self.head.height().get(),
                     payload: self.head.digest(),
                     state_root: self.head.state_root(),
-                    finalization: finalization(&self.committee, &self.head).encode().to_vec(),
+                    finalization: crate::finality_proof::encode(
+                        &finalization(&self.committee, &self.head).encode(),
+                        &[],
+                    )
+                    .unwrap(),
                 },
                 block: self.head.encode().to_vec(),
             })
@@ -727,7 +714,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let owner = SettlementKey::from(maker2.party_key());
         let committed_owner = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
@@ -771,13 +758,18 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let before = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(before.bundle().page, committed_owner.bundle().page);
         h.verifier
-            .verify_address(before.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                before.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         {
             let read = h.index.store.read(None).unwrap();
@@ -823,14 +815,19 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let after = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
         assert_ne!(after.bundle().page, committed_owner.bundle().page);
         assert_eq!(after.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(after.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                after.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         let events = h
             .index
@@ -917,7 +914,7 @@ fn work_pair(
 #[test]
 fn native_edge_index_bond_reverse_link_requires_payment_opening_evidence() {
     run_qmdb(|runtime| async move {
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let allocations = vec![
             (SettlementKey::from(signer(31).party_key()), 100),
             (SettlementKey::from(signer(32).party_key()), 12),
@@ -981,7 +978,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             EarnedCertificate, Move, Party, PaymentCloseResponse, PaymentCloseStart, PendingSlot,
             Proof, RegistryChunk,
         };
-        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let network = hellas_kernel::NetworkId::new(EDGE_TEST_NETWORK_ID).unwrap();
         let allocations = vec![
             (SettlementKey::from(signer(31).party_key()), 100),
             (SettlementKey::from(signer(32).party_key()), 12),
@@ -1477,13 +1474,18 @@ fn native_edge_index_cold_open_serves_current_owners_without_remote_history() {
         );
         for (address, balance, count) in [(owner, 0, 1), (untouched, 1000, 1), (absent, 0, 0)] {
             let bundle = recovered
-                .owner_proof(address, 0, 64, None)
+                .owner_proof(address, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
                 .await
                 .unwrap()
                 .unwrap();
             let verified = h
                 .verifier
-                .verify_address(bundle.bundle().clone(), address, 0, 64)
+                .verify_address(
+                    bundle.bundle().clone(),
+                    address,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                )
                 .unwrap();
             assert_eq!(verified.block().bundle().payload, latest.payload);
             assert_eq!(verified.summary().balance, balance);
@@ -1491,13 +1493,23 @@ fn native_edge_index_cold_open_serves_current_owners_without_remote_history() {
         }
         assert!(
             recovered
-                .owner_proof(owner, 0, 64, Some(&first.payload))
+                .owner_proof(
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    Some(&first.payload)
+                )
                 .await
                 .unwrap()
                 .is_none()
         );
         let pinned = recovered
-            .owner_proof(owner, 0, 64, Some(&latest.payload))
+            .owner_proof(
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                Some(&latest.payload),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1552,7 +1564,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .prepare(proof.clone(), changes)
             .unwrap();
         let before = publication
-            .owner_proof(&h.producer, owner, 0, 64, None)
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1561,13 +1579,24 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         // Stop exactly after the QMDB commit, before publishing EdgeIndex.
         h.producer.finalize(batch).await;
         let during = publication
-            .owner_proof(&h.producer, owner, 0, 64, Some(&proof.payload))
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                Some(&proof.payload),
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(during.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(during.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                during.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         assert_eq!(
             publication.index.store.latest().unwrap().unwrap().payload,
@@ -1575,7 +1604,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         );
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, Some(&previous.payload))
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    Some(&previous.payload)
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -1591,7 +1626,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, None)
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1604,7 +1645,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, None)
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1615,7 +1662,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         publication.finalized(&block, &h.producer).await.unwrap();
         let after = publication
-            .owner_proof(&h.producer, owner, 0, 64, None)
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1647,19 +1700,16 @@ fn indexed_restart_replays_published_unacknowledged_checkpoint_before_backlog() 
         let mut h = Harness::new(runtime, Vec::new(), "published-before-ack").await;
         h.append(Vec::new()).await;
         let archive = h.node.publication().unwrap().archive;
-        ::tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while archive
-                .marshal
-                .get_processed_height()
-                .await
-                .map_or(0, |height| height.get())
-                < 1
-            {
-                ::tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // `run_qmdb` bounds a hang for the whole fixture.
+        while archive
+            .marshal
+            .get_processed_height()
+            .await
+            .map_or(0, |height| height.get())
+            < 1
+        {
+            ::tokio::task::yield_now().await;
+        }
         let mut acknowledged = Vec::new();
         let mut sync_metadata = Vec::new();
         h = h

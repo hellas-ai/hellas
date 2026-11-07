@@ -1,8 +1,5 @@
 use super::{AdminArgs, AdminCommand, OfflineArgs};
-use crate::{
-    commands::contributions::{data_root, offer_fingerprints, principal},
-    identity::LocalIdentity,
-};
+use crate::{commands::contributions::offer_fingerprints, identity::LocalIdentity};
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
@@ -12,6 +9,7 @@ use hellas_authority::model::grant::admin::{
     MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply,
 };
 use hellas_authority::model::grant::records::{decode_enrollment, grant_transport};
+use hellas_private::StoreLocation;
 use hellas_rpc::{
     pb::host::{
         BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
@@ -33,7 +31,7 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 /// Offline inspection neither loads nor creates a machine identity or passkey.
-pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
+pub async fn inspect_offline(args: AdminArgs, home: &StoreLocation) -> Result<()> {
     if let AdminCommand::InspectOffline { journal, command } = &args.command {
         ensure!(
             args.profile.is_none()
@@ -44,7 +42,7 @@ pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
         );
         let query: hellas_auth::authority::InspectionQuery = read(command)?;
         let inspection = NodeStore::inspect_offline(
-            journal,
+            &home.child(journal),
             hellas_authority::model::grant::grant_network(),
             &query,
         )
@@ -62,6 +60,7 @@ pub async fn run(
     args: AdminArgs,
     identity: &LocalIdentity,
     passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
         ensure!(
@@ -88,7 +87,7 @@ pub async fn run(
                 "offline initialization does not connect to a daemon"
             );
             let passkey = passkey.context("offline initialization requires --passkey")?;
-            return offline(args.command, identity, passkey).await;
+            return offline(args.command, identity, passkey, home).await;
         }
         _ => {}
     }
@@ -130,11 +129,11 @@ pub async fn run(
             challenge.generation,
         )
         .await;
-        endpoint.close().await;
+        hellas_wire::iroh::close(&endpoint).await;
         result
     } else {
         let authorization = profile.authorization;
-        let (client, challenge) = connect_local(profile, args.control_socket, passkey, key).await?;
+        let (client, challenge) = connect_local(profile, args.control_socket, home, key).await?;
         command(args.command, client, authorization, challenge.generation).await
     }
 }
@@ -176,7 +175,7 @@ pub(in crate::commands) async fn connect_remote(
     match result {
         Ok((client, challenge)) => Ok((endpoint, client, challenge)),
         Err(error) => {
-            endpoint.close().await;
+            hellas_wire::iroh::close(&endpoint).await;
             Err(error)
         }
     }
@@ -184,7 +183,7 @@ pub(in crate::commands) async fn connect_remote(
 pub(in crate::commands) async fn connect_local(
     profile: profile::ClientProfile,
     socket: Option<std::path::PathBuf>,
-    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
     key: SessionKey<'_>,
 ) -> Result<(
     HostControlClientImpl<hellas_wire::mux::MuxTransport>,
@@ -195,10 +194,7 @@ pub(in crate::commands) async fn connect_local(
         .context("profile requires local daemon trust")?;
     let socket = match socket {
         Some(socket) => socket,
-        None => data_root(&principal(passkey.context(
-            "default control socket requires --passkey; otherwise use --control-socket",
-        )?)?)?
-        .join("control.sock"),
+        None => hellas_sdk::grant_config::GrantConfig::provider_dir(home).join("control.sock"),
     };
     Ok(node_control::connect_local(
         socket,
@@ -462,6 +458,7 @@ async fn offline(
     command: AdminCommand,
     identity: &LocalIdentity,
     passkey: &dyn Authenticator,
+    home: &StoreLocation,
 ) -> Result<()> {
     let (state, root, revision, bearer) = match command {
         AdminCommand::Bootstrap {
@@ -508,13 +505,12 @@ async fn offline(
     let (secret, revision) = match (root, revision) {
         (Some(root), None) => {
             let (store, secret) = NodeStore::bootstrap(
-                &journal,
+                &home.child(&journal),
                 network,
                 root,
                 approve(Ownership::Bootstrap { root, target: None }).await?,
                 Some(identity.enrollment.clone()),
                 now,
-                Default::default(),
             )
             .await?;
             let mut revision = store.state().authority().revision();
@@ -541,12 +537,11 @@ async fn offline(
         }
         (None, Some(expected)) => {
             let (record, secret) = NodeStore::recover_offline(
-                &journal,
+                &home.child(&journal),
                 network,
                 expected,
                 approve(Ownership::Recover { expected }).await?,
                 now,
-                Default::default(),
             )
             .await?;
             (secret, record.revision)
@@ -641,7 +636,7 @@ async fn bootstrap_remote(
         .bind()
         .await?;
     let result = node_control::bootstrap::connect(&endpoint, &invitation, root, approval).await;
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;
     println!(
         "{}",

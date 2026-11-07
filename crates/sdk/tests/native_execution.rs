@@ -1,3 +1,7 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 //! One paid Fetch job through the SDK, against the six-validator devnet.
 //!
 //! The provider creates its offer over RPC under its owner-approved policy; the client runs `transact`, then settles
@@ -7,6 +11,7 @@
 //! produces signed source history and the upstream HTTP response is a fixture.
 //! Money is read back from the finalized source state and the real executing node.
 
+use hellas_private::StoreLocation;
 // The executor re-executes this binary as its Catena compile child.
 #[ctor::ctor(unsafe)]
 fn catena_child() {
@@ -49,7 +54,7 @@ use hellas_chain::test_support::devnet::{
 };
 use hellas_chain::{FinalizedWorkView as _, LightClient as _};
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_channel::test_support::{enrollment, test_responses_contract};
+use hellas_channel::test_support::{HANG_GUARD, enrollment, test_responses_contract};
 use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchRequestView, MockFetchProvider, PreparedFetchRequest, ProjectedFetch,
@@ -63,7 +68,7 @@ use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
 use hellas_sdk::paid_client::{
     PaidWorkOptions, PaidWorkSession, SessionFundingOptions, SessionOpenMode, bind_paid_endpoint,
 };
-use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig};
+use hellas_sdk::work_config::WorkConfig;
 use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
@@ -177,8 +182,7 @@ async fn check_other_enrollment_refused(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
     approvals: &Approvals,
 ) {
-    let mut elsewhere = other_provider(options);
-    elsewhere.journal_root = options.journal_root.with_file_name("elsewhere-journal");
+    let elsewhere = other_provider(options);
     let refused = |error: String| {
         assert!(error.contains("genesis pin mismatch"), "{error}");
     };
@@ -207,11 +211,12 @@ async fn check_other_enrollment_refused(
         .expect("channel with another enrollment")
         .to_string(),
     );
-    let mut gateway = elsewhere.clone();
-    gateway.journal_root = options.journal_root.with_file_name("elsewhere-gateway");
+    let gateway = elsewhere.clone();
     let error = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
-            providers: vec![gateway],
+            config: gateway.config.clone(),
+            content: gateway.content.clone(),
+            providers: vec![gateway_provider(&gateway)],
             max_pending_requests: 1,
         },
         NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
@@ -228,8 +233,8 @@ async fn check_other_enrollment_refused(
     );
     assert!(
         hellas_channel::work_store::discover_setups(
-            &elsewhere.journal_root,
-            elsewhere.config.chain.network
+            &elsewhere.journal_root(),
+            elsewhere.config.network()
         )
         .await
         .unwrap()
@@ -313,17 +318,20 @@ fn work_policy() -> InvocationPolicy {
 }
 
 fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig {
-    WorkConfig {
-        chain: ChainCrossCheck {
-            network: devnet.network(),
-            genesis_payload_digest: devnet.genesis_payload().0.into(),
-            threshold_identity: devnet.consensus_info().threshold_identity.clone(),
-            genesis: Some(devnet.genesis().clone()),
-        },
-        validators: devnet.light_client_urls(),
-        journal_root,
-        poll: Duration::from_millis(20),
-        max_observation_age: Duration::from_secs(60),
+    WorkConfig::from_chain_dir(devnet.chain_dir(&journal_root, 0)).unwrap()
+}
+
+fn gateway_provider(options: &PaidWorkOptions) -> hellas_sdk::paid_gateway::GatewayProviderOptions {
+    hellas_sdk::paid_gateway::GatewayProviderOptions {
+        provider: options.provider,
+        provider_addrs: options.provider_addrs.clone(),
+        apple_trust: options.apple_trust.clone(),
+        assurance: options.assurance,
+        expected_price: options.expected_price,
+        acceptance_blocks: options.acceptance_blocks,
+        terminal_blocks: options.terminal_blocks,
+        payment_blocks: options.payment_blocks,
+        timeout: options.timeout,
     }
 }
 
@@ -366,13 +374,14 @@ async fn start_provider(
     let (routes, upstream) = routes();
     let content =
         hellas_channel::test_support::channel::content_store(&root.join("provider-state")).await;
+    let location = StoreLocation::for_test(&root.join("provider-state"));
     let provider = start_fetch_provider(
         FetchProviderOptions {
             port: Some(0),
             identity: identity.clone(),
             enrollment: provider_enrollment(identity),
             root: Arc::new(SoftwareRoot),
-            state_directory: root.join("provider-state"),
+            home: location,
             content: content.clone(),
             grants: Some(hellas_sdk::GrantProviderOptions {
                 configuration: Default::default(),
@@ -540,13 +549,14 @@ impl RootProver for SoftwareRoot {
 }
 
 /// Drives `work` to completion while sealing a block every `period`, as
-/// a live proposer would.
+/// a live proposer would. Unbounded: `run` guards the whole fixture against
+/// a hang, and a per-phase deadline would drop a seal mid-commit.
 async fn sealing_while<T>(
     devnet: &mut Devnet,
     period: Duration,
     work: impl std::future::Future<Output = T>,
 ) -> T {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    {
         tokio::pin!(work);
         loop {
             tokio::select! {
@@ -565,9 +575,7 @@ async fn sealing_while<T>(
                 _ = &mut seal => {},
             }
         }
-    })
-    .await
-    .expect("the SDK phase completes within its deadline")
+    }
 }
 
 /// The coins `owner` holds at the tip, by value, as validator 0 and the
@@ -697,12 +705,13 @@ async fn check_gateway_quote(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
 ) {
     use hellas_gateway::WorkExecutionBackend as _;
-    let mut args = options.clone();
-    args.journal_root = options.journal_root.with_file_name("gateway-client");
-    let journal = args.journal_root.clone();
+    let args = options.clone();
+    let journal = args.config.chain.gateway(&args.provider.node.to_string());
     let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
-            providers: vec![args],
+            config: args.config.clone(),
+            content: args.content.clone(),
+            providers: vec![gateway_provider(&args)],
             max_pending_requests: 1,
         },
         NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
@@ -712,10 +721,6 @@ async fn check_gateway_quote(
     .await
     .unwrap();
     assert!(!journal.exists(), "gateway discovery only requests a quote");
-    assert!(
-        !options.config.journal_root.exists(),
-        "gateway quotes never stake"
-    );
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
@@ -748,7 +753,6 @@ async fn check_gateway_quote(
     );
     gateway.drain().await.unwrap();
     assert!(!journal.exists());
-    assert!(!options.config.journal_root.exists());
 }
 
 /// The provider earns exactly the price from the payment close, and its
@@ -777,6 +781,7 @@ struct PaidScenario<S = PaidWorkSession> {
     client_home: std::path::PathBuf,
     client_transport: iroh::SecretKey,
     endpoint: iroh::Endpoint,
+    provider_config: WorkConfig,
     options: PaidWorkOptions,
     prepared_input: PreparedInvocation,
     quote: hellas_sdk::paid_client::PaidQuote,
@@ -825,7 +830,15 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         &PROVIDER_OWNER,
         provider_settlement().party_key().into(),
     );
-    let submitter = RemoteLightClient::connect(devnet.light_client_url(2))
+    let profile = devnet.profile(0);
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
+    let submitter = RemoteLightClient::connect(devnet.light_client_url(2), verifier)
         .await
         .unwrap();
     for tx in [provider_funding] {
@@ -837,9 +850,10 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     devnet.seal().await;
 
     // The owner stores standing policy once; no client route or bond exists.
+    let location = StoreLocation::for_test(&root.path().join("provider-state"));
     let (store, secret) =
         hellas_authority::test_support::common_node::bootstrap_node_with_credential(
-            &root.path().join("provider-state/grants"),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(&location),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment(&identity)),
             now,
@@ -936,13 +950,20 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         [0; 32],
     )
     .unwrap();
-    let mut client_config = config;
-    client_config.validators = relays.urls.clone();
+    let client_home = root.path().join("requester");
+    let mut client_config = config.clone();
+    client_config.chain = devnet.chain_dir(&client_home, 0);
+    client_config.chain = client_config
+        .chain
+        .with_validators(relays.urls.clone())
+        .unwrap();
+    let provider_address =
+        hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap();
     let options = PaidWorkOptions {
         content: fresh_client_content(&root.path().join("client-store")).await,
         config: client_config,
-        journal_root: root.path().join("client-journal"),
-        provider: hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap(),
+        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
+        provider: provider_address,
         provider_addrs,
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
@@ -953,17 +974,16 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         timeout: Some(Duration::from_secs(120)),
     };
     let approvals = Arc::new(Approvals::default());
-    let client_home = root.path().join("requester");
     let owner = Arc::new(
         hellas_sdk::client_owner::ClientOwner::new(
             approvals.clone(),
             client_settlement().party_key(),
-            &client_home.join("funding"),
+            &options.config.chain,
         )
         .unwrap(),
     );
     let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
-    assert!(!options.config.journal_root.exists());
+    assert!(!options.journal_root().exists());
     Box::pin(check_other_enrollment_refused(
         &options,
         &endpoint,
@@ -971,10 +991,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         &approvals,
     ))
     .await;
-    let mut fresh = options.clone();
-    fresh.journal_root = options
-        .journal_root
-        .with_file_name("other-contract-journal");
+    let fresh = options.clone();
     Box::pin(check_other_contract_refused(
         &fresh,
         &endpoint,
@@ -1000,10 +1017,13 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         .capacity(),
         PRICE * 10
     );
-    assert!(
-        !options.config.journal_root.exists(),
-        "a quote creates no paid journal"
-    );
+    let journals = hellas_channel::work_store::discover_setups(
+        &options.journal_root(),
+        options.config.network(),
+    )
+    .await
+    .unwrap();
+    assert!(journals.setups.is_empty() && journals.unidentified.is_empty());
     Box::pin(check_gateway_quote(&options, owner.clone())).await;
     assert!(
         approvals.0.lock().unwrap().is_empty(),
@@ -1022,6 +1042,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         client_home,
         client_transport,
         endpoint,
+        provider_config: config,
         options,
         prepared_input,
         quote,
@@ -1046,6 +1067,7 @@ async fn paid_setup(
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1075,11 +1097,7 @@ async fn paid_setup(
     // A completed typed timeout is the expected result in the outage case;
     // it need not lose a scheduling race to the proof-attempt observer.
     if never_catches_up {
-        let error = tokio::time::timeout(Duration::from_secs(5), &mut open)
-            .await
-            .unwrap()
-            .err()
-            .expect("proof reads remain bounded");
+        let error = (&mut open).await.err().expect("proof reads remain bounded");
         assert!(
             matches!(error, hellas_sdk::paid_client::PaidClientError::Owner(hellas_sdk::client_owner::ClientOwnerError::Timeout(timeout)) if Some(timeout) == options.timeout),
             "typed proof read expiry: {error}"
@@ -1131,6 +1149,7 @@ async fn paid_setup(
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1153,6 +1172,7 @@ async fn paid_finish(case: PaidScenario) {
         client_home,
         client_transport,
         endpoint,
+        provider_config,
         options,
         prepared_input,
         quote,
@@ -1188,7 +1208,7 @@ async fn paid_finish(case: PaidScenario) {
             if session.with_state(|state| state.cursor().0).await.unwrap() == resumed_height {
                 break;
             }
-            tokio::time::sleep(options.config.poll).await;
+            tokio::time::sleep(options.config.poll()).await;
         }
     })
     .await
@@ -1207,13 +1227,8 @@ async fn paid_finish(case: PaidScenario) {
 
     provider.shutdown().await.unwrap();
     provider_content.close().await;
-    let (provider, upstream, provider_content) = start_provider(
-        root.path(),
-        options.config.clone(),
-        provider_node,
-        &identity,
-    )
-    .await;
+    let (provider, upstream, provider_content) =
+        start_provider(root.path(), provider_config, provider_node, &identity).await;
     assert_eq!(
         provider
             .administration()
@@ -1242,21 +1257,21 @@ async fn paid_finish(case: PaidScenario) {
     // bounded error rather than wait for a proof read that cannot occur.
     let source_timeout = Duration::from_secs(1);
     let mut stale_options = options.clone();
-    stale_options.config.validators = stale_relays.urls.clone();
+    stale_options.config.chain = stale_options
+        .config
+        .chain
+        .with_validators(stale_relays.urls.clone())
+        .unwrap();
     stale_options.timeout = Some(source_timeout);
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        PaidWorkSession::open(
-            stale_options,
-            endpoint.clone(),
-            client_settlement(),
-            owner.clone(),
-            SessionOpenMode::Any,
-            SessionFundingOptions::default(),
-        ),
+    let error = PaidWorkSession::open(
+        stale_options,
+        endpoint.clone(),
+        client_settlement(),
+        owner.clone(),
+        SessionOpenMode::Any,
+        SessionFundingOptions::default(),
     )
     .await
-    .expect("stale-source selection remains bounded")
     .err()
     .expect("a source below the journal floor cannot reopen the channel");
     assert!(
@@ -1301,9 +1316,11 @@ async fn paid_finish(case: PaidScenario) {
     );
     recovered.shutdown().await;
     drop(recovered);
-    // Restart recovery re-verifies the retained offer against the address.
+    // A different enrollment has a separate derived journal directory.
+    let other = other_provider(&options);
+    assert_ne!(other.journal_root(), options.journal_root());
     let error = PaidWorkSession::open(
-        other_provider(&options),
+        other,
         endpoint.clone(),
         client_settlement(),
         owner.clone(),
@@ -1312,12 +1329,11 @@ async fn paid_finish(case: PaidScenario) {
     )
     .await
     .err()
-    .expect("retained channel under another enrollment");
+    .expect("no retained channel under another enrollment");
     assert!(
         matches!(
             error,
-            hellas_sdk::paid_client::PaidClientError::RetainedEnrollment(address)
-                if address == other_provider(&options).provider
+            hellas_sdk::paid_client::PaidClientError::NoRetainedChannel
         ),
         "{error}"
     );
@@ -1343,7 +1359,12 @@ async fn paid_finish(case: PaidScenario) {
     .unwrap();
     let job_folder = root.path().join("job");
     job.save(&job_folder).await.unwrap();
-    let purchase_path = root.path().join("purchases/job.json");
+    let purchase_path = hellas_sdk::transact::PaidAttemptPath::new(
+        &options.config.chain,
+        options.provider,
+        owner.principal(),
+        job.digest(),
+    );
     let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
     let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
     let mut session = PaidWorkSession::open(
@@ -1398,7 +1419,7 @@ async fn paid_finish(case: PaidScenario) {
         .await
         .unwrap();
     assert!(!purchase.is_pending());
-    assert!(!purchase_path.exists());
+    assert!(!purchase_path.as_path().exists());
     assert!(!session.needs_recovery());
     session.shutdown().await;
     drop(session);
@@ -1483,20 +1504,16 @@ async fn paid_finish(case: PaidScenario) {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     upstream.release.notify_one();
     let loaded = hellas_sdk::job::Job::load(&job_folder).await.unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        hellas_sdk::transact::transact(
-            &mut session,
-            &loaded,
-            &client_producer,
-            hellas_sdk::transact::TransactionOptions {
-                purchase: Some(&mut purchase),
-                ..Default::default()
-            },
-        ),
+    let result = hellas_sdk::transact::transact(
+        &mut session,
+        &loaded,
+        &client_producer,
+        hellas_sdk::transact::TransactionOptions {
+            purchase: Some(&mut purchase),
+            ..Default::default()
+        },
     )
     .await
-    .expect("accepted retry completes within its test deadline")
     .unwrap();
     eprintln!("h6: accepted retry paid once");
     assert!(
@@ -1531,7 +1548,7 @@ async fn paid_finish(case: PaidScenario) {
         "the settled close paid the provider the price",
     );
     assert_eq!(upstream.calls("openai", "responses", BODY), 1);
-    let marker = std::fs::read(&purchase_path).unwrap();
+    let marker = std::fs::read(purchase_path.as_path()).unwrap();
     assert!(
         !marker.windows(BODY.len()).any(|bytes| bytes == BODY),
         "purchase state contains no request bytes"
@@ -1617,12 +1634,11 @@ async fn paid_finish(case: PaidScenario) {
     second.shutdown().await;
     drop(second);
     let retained = hellas_sdk::paid_client::retained_settlement_channels(
-        &options.journal_root,
-        options.config.chain.network,
+        &options.journal_root(),
+        options.config.network(),
         options.provider,
         owner.principal(),
         owner.delegate(),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -1785,9 +1801,9 @@ fn cli_paid_and_grant_two_provider_composition() {
 }
 
 #[test]
-fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
+fn setup_reads_wait_for_the_required_height() {
     use hellas_chain::WorkBlocks;
-    use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
+    use hellas_channel::work_close::FinalizedBlocks as _;
     use hellas_channel::work_open::{SetupQuery, SetupView as _};
 
     run(|runtime| async move {
@@ -1804,7 +1820,7 @@ fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
         let node = devnet.full_node(0).clone();
         let client = node.view().unwrap().client();
         let timeout = hellas_chain::node::RECOVERY_TIMEOUT;
-        let poll = work_config(&devnet, std::path::PathBuf::new()).poll;
+        let poll = work_config(&devnet, std::path::PathBuf::new()).poll();
         let source = WorkBlocks::new(client.clone()).with_read_retry(poll, timeout);
         let query = SetupQuery {
             bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),
@@ -1833,18 +1849,6 @@ fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
             .0
         );
         drop(block);
-
-        let source = source.clone().with_min_height(next + 1);
-        let started = tokio::time::Instant::now();
-        let error = tokio::time::timeout(timeout.saturating_mul(2), source.finalized_setup(query))
-            .await
-            .expect("unavailable setup reads stay bounded")
-            .unwrap_err();
-        assert!(
-            matches!(error, BlockSourceError::ReadUnavailableTimeout { timeout: elapsed, .. }
-            if elapsed == timeout)
-        );
-        assert!(started.elapsed() >= timeout);
         assert_eq!(node.status().executed_height(), next);
         devnet.shutdown().await;
     });

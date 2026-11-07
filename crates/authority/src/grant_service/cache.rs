@@ -92,6 +92,7 @@ impl ResultCache {
 
     /// A weak timer never owns the node writer, service, body or execution across
     /// a wait. Cache drop wakes it; deadline changes are installed by the writer.
+    #[expect(clippy::disallowed_methods, reason = "inventory class C: cache expiry")]
     pub(super) fn monitor(self: &Arc<Self>, clock: GrantClock) {
         let weak = Arc::downgrade(self);
         let changed = self.changed.clone();

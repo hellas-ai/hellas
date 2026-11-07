@@ -89,7 +89,7 @@ pub struct LatestBlock {
     pub height: u64,
     pub payload: Digest,
     pub state_root: Digest,
-    /// Raw Simplex certificate or a bounded `finality_proof` ancestry envelope.
+    /// Bounded finality envelope containing a Simplex certificate and descendants.
     pub finalization: Vec<u8>,
 }
 
@@ -112,9 +112,37 @@ pub struct CoinListing {
     pub coins: Vec<(ObjectId, u64)>,
 }
 
+/// One authenticated Latest owner page. `next` is the last holding key, not
+/// necessarily a coin: subsequent pages skip all earlier owner-tree ranks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoinPage {
+    pub snapshot: LatestBlock,
+    pub coins: Vec<(ObjectId, u64)>,
+    pub next: Option<ObjectId>,
+    /// Total balance of coins owned by this key; delegated coins are excluded.
+    pub owned_balance: Option<u128>,
+}
+
+fn page_from_local_listing(listing: CoinListing, after: Option<ObjectId>, owned: bool) -> CoinPage {
+    let mut all = listing.coins;
+    all.sort_unstable_by_key(|(id, _)| *id);
+    let balance = owned.then(|| all.iter().map(|(_, value)| u128::from(*value)).sum());
+    let coins: Vec<_> = all
+        .into_iter()
+        .filter(|(id, _)| after.is_none_or(|key| *id > key))
+        .take(33)
+        .collect();
+    let next = (coins.len() > 32).then(|| coins[31].0);
+    CoinPage {
+        snapshot: listing.snapshot,
+        coins: coins.into_iter().take(32).collect(),
+        next,
+        owned_balance: balance,
+    }
+}
+
 /// Requested current objects at one finalized root. Missing keys are absent.
-/// Remote clients verify the complete retained operation witness; local clients
-/// hold one coherent database reader for the entire result.
+/// Remote clients verify one ordered current-state proof per requested key.
 #[derive(Debug, Clone)]
 pub struct ObjectSnapshot {
     pub network: hellas_kernel::NetworkId,
@@ -255,14 +283,14 @@ impl From<WireStatus> for QueryError {
 
 /// Transport-agnostic query interface for light clients.
 pub trait LightClient: Clone + Send + Sync + 'static {
-    fn get_operations(
+    fn get_object_proofs(
         &self,
-        _request: hellas_rpc::pb::chain::GetOperationsRequest,
-    ) -> impl Future<Output = Result<hellas_rpc::pb::chain::GetOperationsResponse, QueryError>> + Send
+        _request: hellas_rpc::pb::chain::GetObjectProofsRequest,
+    ) -> impl Future<Output = Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError>> + Send
     {
         async {
             Err(QueryError::StateUnavailable(
-                "operation proofs are unavailable".into(),
+                "current object proofs are unavailable".into(),
             ))
         }
     }
@@ -275,6 +303,23 @@ pub trait LightClient: Clone + Send + Sync + 'static {
             Err(QueryError::StateUnavailable(
                 "finalized objects are unavailable".into(),
             ))
+        }
+    }
+
+    /// Read the exact current root selected by a payload or height. An older
+    /// root is unavailable after execution advances; point reads use a floor.
+    fn get_objects_at(
+        &self,
+        keys: Vec<ObjectId>,
+        query: FinalizedBlockQuery,
+    ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
+        async move {
+            if !matches!(query, FinalizedBlockQuery::Latest) {
+                return Err(QueryError::StateUnavailable(
+                    "pinned object reads are unavailable".into(),
+                ));
+            }
+            self.get_objects(keys).await
         }
     }
 
@@ -335,12 +380,38 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
 
+    fn get_coins_by_owner_page(
+        &self,
+        owner: SettlementKey,
+        after: Option<ObjectId>,
+    ) -> impl Future<Output = Result<Option<CoinPage>, QueryError>> + Send {
+        async move {
+            let Some(listing) = self.get_coins_by_owner(owner).await? else {
+                return Ok(None);
+            };
+            Ok(Some(page_from_local_listing(listing, after, true)))
+        }
+    }
+
     /// Coins whose committed delegate is this node. Values are spendable funding,
     /// not the node's owned balance.
     fn get_coins_by_delegate(
         &self,
         delegate: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
+
+    fn get_coins_by_delegate_page(
+        &self,
+        delegate: SettlementKey,
+        after: Option<ObjectId>,
+    ) -> impl Future<Output = Result<Option<CoinPage>, QueryError>> + Send {
+        async move {
+            let Some(listing) = self.get_coins_by_delegate(delegate).await? else {
+                return Ok(None);
+            };
+            Ok(Some(page_from_local_listing(listing, after, false)))
+        }
+    }
 
     fn get_edges_by_owner(
         &self,

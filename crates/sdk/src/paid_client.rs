@@ -1,8 +1,8 @@
 //! Reusable paid-work sessions: provider authentication, admission, verified delivery,
 //! journal recovery, payment, and finalized settlement. Journals are client-owned.
+use hellas_private::StoreLocation;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
@@ -55,11 +55,18 @@ use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
 
+/// Client purchases and gateway pools own distinct journal layouts.
+#[derive(Clone, Copy, Debug)]
+pub enum PaidJournalKind {
+    Client,
+    Gateway,
+}
+
 /// Options shared by all jobs on a paid channel.
 #[derive(Clone)]
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
-    pub journal_root: PathBuf,
+    pub journal_kind: PaidJournalKind,
     pub content: hellas_store::content::DiskStore,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
@@ -145,6 +152,16 @@ async fn within<T>(
 }
 
 impl PaidWorkOptions {
+    pub fn journal_root(&self) -> StoreLocation {
+        match self.journal_kind {
+            PaidJournalKind::Client => self
+                .config
+                .chain
+                .client_journals(&self.provider.to_string()),
+            PaidJournalKind::Gateway => self.config.chain.gateway(&self.provider.node.to_string()),
+        }
+    }
+
     /// Reject impossible deadlines and collateral before connecting or signing.
     pub fn validate(&self) -> Result<()> {
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
@@ -307,7 +324,7 @@ fn spawn_observer(
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
                 finalized = None;
-                source_config.validators.rotate_left(1);
+                source_config.chain.rotate_validators();
                 match crate::client_chain::connect_at(
                     &source_config,
                     config.max_observation_age,
@@ -318,17 +335,29 @@ fn spawn_observer(
                     Ok(next) => remote = next,
                     Err(error) => {
                         tracing::debug!(%error, "waiting for a verified remote chain source");
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class B: remote source recovery"
+                        )]
                         tokio::time::sleep(config.poll).await;
                         continue;
                     }
                 }
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B/C: finalized/freshness; rollout 2/3"
+            )]
             if let Some(stream) = &mut finalized {
                 tokio::select! {
                     item = stream.next() => if !matches!(item, Some(Ok(_))) { finalized = None; },
                     _ = tokio::time::sleep(config.poll) => {},
                 }
             } else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: remote subscription retry"
+                )]
                 tokio::time::sleep(config.poll).await;
                 finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
                     .await
@@ -368,9 +397,13 @@ pub enum SessionOpenMode<'a> {
 }
 
 impl PaidWorkSession {
+    pub(crate) fn state_key(&self) -> String {
+        self.args.config.chain.state_key()
+    }
+
     pub(crate) fn execution_target(&self) -> crate::execution::ExecutionTarget {
         crate::execution::ExecutionTarget {
-            network: self.args.config.chain.network,
+            network: self.args.config.network(),
             provider: self.args.provider,
         }
     }
@@ -473,28 +506,29 @@ impl PaidWorkSession {
         args.validate()?;
         let config = &args.config;
         config.clone().validate()?;
+        if owner.chain().as_path() != config.chain.as_path() {
+            return Err(PaidClientError::InvalidOptions(
+                "funding owner belongs to another chain directory",
+            ));
+        }
         if owner.delegate() != settlement_key.party_key() {
             return Err(PaidClientError::InvalidOptions(
                 "funding delegate differs from the settlement key",
             ));
         }
         let read_timeout = read_timeout(args.timeout);
-        std::fs::create_dir_all(&args.journal_root).map_err(|source| {
+        let journal_root = args.journal_root();
+        std::fs::create_dir_all(&journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
-                path: args.journal_root.clone(),
+                path: journal_root.clone().into_path_buf(),
                 source,
             }
         })?;
         // Retained journals can already depend on a height a fast validator
         // has not reached. Establish that floor before a source is chosen;
         // recovery reads below it would only be refused by the same guard.
-        let setups = offer::RetainedSetups::discover(
-            &args.journal_root,
-            config.chain.network,
-            args.provider,
-            args.content.durability(),
-        )
-        .await?;
+        let setups =
+            offer::RetainedSetups::discover(&journal_root, config.network(), args.provider).await?;
         let floor = setups.floor();
         let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
         let chain = WorkBlocks::new(remote.clone())
@@ -535,12 +569,11 @@ impl PaidWorkSession {
                 .await?;
                 check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
-                    &args.journal_root,
-                    config.chain.network,
+                    &args.journal_root(),
+                    config.network(),
                     signed.offer().proposal.bond_edge(),
                     Role::Client,
                     &Secp256k1Verifier::new(),
-                    args.content.durability(),
                 )
                 .await?;
                 (store, signed)
@@ -579,9 +612,7 @@ impl PaidWorkSession {
                 .import_offer(*args.provider.node.as_bytes(), signed)
                 .await?;
         }
-        owner
-            .claim(config.chain.network, args.provider.node, &payment_funding)
-            .await?;
+        owner.claim(args.provider.node, &payment_funding).await?;
         let bundle = setup
             .state()
             .bundle()
@@ -630,8 +661,9 @@ impl PaidWorkSession {
         }
 
         let setup_service = SetupService::new(setup);
-        let (mounted, descriptor) =
-            drive_setup(&setup_service, &policy, &chain, config.poll).await?;
+        let result = drive_setup(&setup_service, &policy, &chain, config.poll).await;
+        setup_service.close().await;
+        let (mounted, descriptor) = result?;
         // A completed setup journal stops at the height that finished the
         // handshake, while the channel journal it mounted keeps advancing.
         // The source chosen for the setup floor can therefore be behind the
@@ -639,8 +671,12 @@ impl PaidWorkSession {
         // at that cursor before the readiness read: a source below it is
         // refused by the journal's own height guard, and waiting for the
         // same fast source to catch up would never mount.
+        // One unretried read: a source that cannot report its tip, or whose tip
+        // regressed below state it already proved, is reselected like one that is
+        // merely behind, rather than retried until the open deadline.
         let channel_floor = mounted.state().cursor().0;
-        let (mut remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
+        let tip = WorkBlocks::new(remote.clone()).latest_height().await;
+        let (mut remote, chain) = if !matches!(tip, Ok(Some(height)) if height >= channel_floor) {
             let remote =
                 crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
             let chain = WorkBlocks::new(remote.clone())
@@ -680,7 +716,7 @@ impl PaidWorkSession {
                     ).await {
                         client.observer().suspend().await?;
                         tracing::debug!(%error, "paid client observation unavailable");
-                        source_config.validators.rotate_left(1);
+                        source_config.chain.rotate_validators();
                         match crate::client_chain::connect_at(
                             &source_config, config.max_observation_age, floor,
                         ).await {
@@ -689,6 +725,10 @@ impl PaidWorkSession {
                         }
                     }
                     if client.readiness().await.is_err() {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class A: channel readiness; rollout 2"
+                        )]
                         tokio::time::sleep(config.poll).await;
                     }
                 }
@@ -723,6 +763,9 @@ impl PaidWorkSession {
         self.observer = None;
         // The observer can no longer renew readiness after suspension.
         let _ = self.client.observer().suspend().await;
+        if let Err(error) = self.client.close().await {
+            tracing::warn!(%error, "paid client journal did not close cleanly");
+        }
     }
 
     /// Identifies the funded channel and its admitted execution policy.
@@ -815,6 +858,10 @@ impl PaidWorkSession {
                     Ok(remote) => remote,
                     Err(error) => {
                         tracing::debug!(%error, "paid settlement is waiting for a chain source");
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class C: chain connection backoff"
+                        )]
                         tokio::time::sleep(poll).await;
                         continue;
                     }
@@ -828,6 +875,10 @@ impl PaidWorkSession {
                 )) => {
                     // The observer may still reach finality through another
                     // source; reconnect and let the shared loop observe it.
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class B: chain catch-up; rollout 3"
+                    )]
                     tokio::time::sleep(poll).await;
                 }
                 Err(error) => return Err(error),
@@ -1195,6 +1246,10 @@ async fn propose_when_ready(
         let remaining = deadline.map_or(delay, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class C: proposal backoff"
+        )]
         tokio::time::sleep(delay.min(remaining)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(10));
     }
@@ -1220,6 +1275,10 @@ async fn pay_when_ready(
                     if status.code() == hellas_wire::WireCode::Unavailable => {}
                 Err(error) => return Err(error.into()),
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: payment backoff"
+            )]
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(Duration::from_secs(10));
         }
@@ -1388,6 +1447,10 @@ async fn execute_paid_job(
             }
             check_payment_window(client, work_id).await?;
             tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: result-stream retry"
+            )]
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
         check_payment_window(client, work_id).await?;
@@ -1478,7 +1541,7 @@ fn payment_terms(
         bond_edge: bundle.bond_edge(),
         bond_terms: bundle.bond_terms().clone(),
         private_policy_commitment: private_policy_commitment(
-            config.chain.network,
+            config.network(),
             &policy.policy_salt,
             &policy.channel_policy,
         ),
@@ -1509,6 +1572,10 @@ async fn drive_setup(
             end @ (SetupProgress::Aborted(_)
             | SetupProgress::Faulted(_)
             | SetupProgress::TimeoutBond) => return Err(PaidClientError::SetupEnded(end)),
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: setup finalization; rollout 3"
+            )]
             _ => tokio::time::sleep(poll).await,
         }
     }
@@ -1585,6 +1652,10 @@ async fn exchange_setup(
         loop {
             let response = send_setup_exchange(dialer.setup().await?, request.clone()).await?;
             match apply_setup_exchange(setup, response).await {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: retryable setup refusal"
+                )]
                 Err(hellas_channel::work_handshake::SetupExchangeError::Refused {
                     refusal,
                     ..

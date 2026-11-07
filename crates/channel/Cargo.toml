@@ -8,7 +8,11 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-test-support = ["hellas-auth/test-support", "hellas-wire/mux"]
+test-support = [
+    "hellas-auth/test-support",
+    "hellas-private/test-support",
+    "hellas-wire/mux",
+]
 
 [dependencies]
 async-stream.workspace = true

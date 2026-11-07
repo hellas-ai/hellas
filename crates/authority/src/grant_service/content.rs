@@ -243,6 +243,14 @@ impl GrantWork {
                     ));
                 }
                 let prior_cleanup = prior.as_ref().map(|job| work.pending_content_cleanup(job));
+                // Refresh after the durable probe: a new admission past its
+                // acceptance deadline is refused explicitly.
+                if work.service.node.observed_time(&store) > a.acceptance_deadline_ms {
+                    return Err(WireStatus::new(
+                        hellas_wire::WireCode::DeadlineExceeded,
+                        "grant acceptance expired",
+                    ));
+                }
                 let policy = store
                     .state()
                     .policy_for(&a)

@@ -99,13 +99,12 @@ async fn an_hf_cache_is_an_ordinary_read_only_lower() {
     std::fs::write(&debris, b"unfinished").unwrap();
     let upper = tempfile::tempdir().unwrap();
     let store = DiskStore::open(
-        upper.path().into(),
+        hellas_private::StoreLocation::for_test(upper.path()),
         vec![cache.0.clone()],
         IndexMode::Resume,
         None,
         Reservations::ram(32 << 20),
         false,
-        Default::default(),
     )
     .await
     .unwrap();

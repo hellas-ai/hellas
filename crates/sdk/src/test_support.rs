@@ -1,8 +1,56 @@
 //! A funded, metadata-only Fetch channel for SDK boundary tests.
+use hellas_private::Durability::Crash;
+use hellas_private::StoreLocation;
 // Client and provider feature suites use different parts of this fixture.
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
-use crate::work_config::{ChainCrossCheck, WorkConfig};
+use crate::work_config::WorkConfig;
 use hellas_auth::ProducerSigningKey;
+use hellas_chain::genesis::{ChainProfile, CustomChainFile};
+
+pub(crate) fn chain_dir(
+    home: &std::path::Path,
+    network: NetworkId,
+) -> hellas_chain::chain_dir::ChainDir {
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    if network.as_str() == known.network_id() {
+        return hellas_chain::chain_dir::ChainDir::open(home, &known, Crash).unwrap();
+    }
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = network.as_str().into();
+    chain_dir_with_genesis(home, &genesis)
+}
+
+pub(crate) fn chain_dir_with_genesis(
+    home: &std::path::Path,
+    genesis: &hellas_chain::genesis::Genesis,
+) -> hellas_chain::chain_dir::ChainDir {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let genesis_json = serde_json::to_string(genesis).unwrap();
+    let mut trust = known.trust().clone();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    let profile = ChainProfile::custom(CustomChainFile {
+        trust,
+        validators: vec!["ws://unused.invalid".into()],
+        genesis_json,
+    })
+    .unwrap();
+    hellas_chain::chain_dir::ChainDir::open(home, &profile, Crash).unwrap()
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+pub(crate) fn chain_dir_with_variant(
+    home: &std::path::Path,
+    network: NetworkId,
+    variant: u64,
+) -> hellas_chain::chain_dir::ChainDir {
+    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let mut genesis = known.genesis().clone();
+    genesis.network_id = network.as_str().into();
+    genesis.allocations[0].balance += variant;
+    chain_dir_with_genesis(home, &genesis)
+}
 use hellas_channel::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
@@ -79,53 +127,23 @@ impl PaidFixture {
     /// A real idle node for SDK startup/admission tests. The fixture supplies
     /// genesis itself; no network endpoint is trusted to choose its execution inputs.
     pub async fn node(&mut self) -> crate::FullNode {
-        use commonware_codec::DecodeExt as _;
-        use commonware_cryptography::Digestible as _;
-        use commonware_runtime::Runner as _;
         let mut genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
-        genesis.network_id = self.config.chain.network.as_str().into();
+            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
+        genesis.network_id = self.config.network().as_str().into();
         genesis.allocations.clear();
-        let leader = genesis
-            .validators
-            .iter()
-            .map(|validator| {
-                hellas_chain::domain::PublicKey::decode(
-                    hex::decode(&validator.public_key).unwrap().as_slice(),
-                )
-                .unwrap()
-            })
-            .min()
-            .unwrap();
-        let directory = self.root.path().join("genesis-probe");
-        let network = self.config.chain.network;
-        let genesis_document = hellas_chain::genesis_digest(&genesis);
-        let digest = tokio::task::spawn_blocking(move || {
-            let runtime = commonware_runtime::tokio::Runner::new(
-                commonware_runtime::tokio::Config::new().with_storage_directory(directory),
-            );
-            runtime.start(move |context| async move {
-                let application = hellas_chain::Application::new(
-                    context,
-                    network,
-                    genesis_document,
-                    leader,
-                    vec![],
-                    "fixture",
-                    Default::default(),
-                )
-                .await;
-                application.genesis_block().digest()
-            })
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
+        let mut trust = self.config.chain.trust().clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        let profile = ChainProfile::custom(CustomChainFile {
+            trust,
+            validators: self.config.chain.validators().to_vec(),
+            genesis_json,
         })
-        .await
         .unwrap();
-        self.config.chain.genesis = Some(genesis);
-        self.config.chain.genesis_payload_digest = digest.0.into();
-        let mut config = self
-            .config
-            .node_config(self.root.path().join("chain"), None)
-            .unwrap();
+        self.config.chain =
+            hellas_chain::chain_dir::ChainDir::open(self.root.path(), &profile, Crash).unwrap();
+        let mut config = self.config.node_config(None).unwrap();
         config.validators.clear();
         crate::FullNode::start(config).await.unwrap()
     }
@@ -251,9 +269,9 @@ impl PaidFixture {
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         let config = WorkConfig {
-            chain: ChainCrossCheck { network, genesis: None, genesis_payload_digest: [0; 32].into(), threshold_identity: hex::decode("97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb").unwrap() },
-            validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"),
-            poll: std::time::Duration::from_millis(10), max_observation_age: std::time::Duration::from_secs(60),
+            chain: chain_dir(root.path(), network),
+            poll: std::time::Duration::from_millis(10),
+            max_observation_age: std::time::Duration::from_secs(60),
         };
         Self {
             root,
@@ -272,9 +290,10 @@ impl PaidFixture {
             "provider"
         };
         let root = self.root.path().join(name);
+        let location = StoreLocation::for_test(&root);
         let content = hellas_channel::test_support::channel::content_store(&root).await;
         let store = ChannelStore::open(
-            &root,
+            &location,
             self.ready.channel().clone(),
             work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
             role,
@@ -453,7 +472,7 @@ pub async fn accept_uploaded(
     .expect("fresh positive acceptance completes its content upload");
     let response = service.accept(&wire).await;
     connection.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }

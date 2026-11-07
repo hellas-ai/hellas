@@ -52,13 +52,12 @@ impl Fixture {
             [7; 32],
         );
         let node = DiskStore::open(
-            root.path().join("content"),
+            hellas_private::StoreLocation::for_test(&root.path().join("content")),
             vec![],
             hellas_store::content::IndexMode::Resume,
             None,
             hellas_store::content::Reservations::ram(capacity),
             false,
-            Default::default(),
         )
         .await
         .unwrap();
@@ -580,7 +579,7 @@ async fn grant_and_paid_openings_share_the_node_ram_reservation_and_close_releas
     drop(probe);
     let f = Fixture::with_ram_capacity(capacity).await;
     let mut store = ChannelStore::open(
-        &f.root.path().join("paid"),
+        &hellas_private::StoreLocation::for_test(&f.root.path().join("paid")),
         ready.channel().clone(),
         paid::settlement(),
         Role::Provider,

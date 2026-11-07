@@ -28,30 +28,27 @@ let
     || lib.hasPrefix "${normalizedRoot}/" normalizedPath;
   pathsOverlap = first: second: pathWithin first second || pathWithin second first;
   outsideManagedRoots = roots: path: !(lib.any (root: pathWithin root path) roots);
-  providerManagedWritableRoots = [
-    hellasLib.defaultStateDir
-    "/var/cache/hellas"
-  ];
   gatewayManagedWritableRoots = [
     "/var/lib/hellas-gateway"
+    gateway.home
     "/var/cache/hellas-gateway"
   ];
   providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content.lower or [ ]));
-  providerUpper = normalizeRuntimePath (
-    cfg.content.upper or "${hellasLib.defaultStateDir}/.hellas/store"
+  providerUpper = normalizeRuntimePath (cfg.content.upper or "${cfg.home}/store");
+  providerWriteRoots = lib.unique [
+    (normalizeRuntimePath cfg.home)
+    providerUpper
+  ];
+  providerWritablePaths = lib.unique (
+    lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
+      normalizeRuntimePath cfg.home
+    )
+    ++ lib.optional (outsideManagedRoots [
+      hellasLib.defaultStateDir
+      cfg.home
+    ] providerUpper) providerUpper
   );
-  providerWritablePaths = lib.optional (outsideManagedRoots providerManagedWritableRoots providerUpper) providerUpper;
   gatewayContentPaths = lib.unique (map normalizeRuntimePath (gateway.content.lower or [ ]));
-  # The principal component of the dedicated local upper is runtime data.
-  # Its existing grant-data base protects every such authority-local upper.
-  gatewayGrantData = toString (
-    cfg.environment.HELLAS_GRANT_DATA_DIR or "/var/lib/hellas-gateway/.hellas/grants"
-  );
-  gatewayGrantDataPath =
-    if lib.hasPrefix "/" gatewayGrantData then
-      gatewayGrantData
-    else
-      "/var/lib/hellas-gateway/${gatewayGrantData}";
   gatewayPaidUpper =
     if gateway.paidWorkConfig == null then
       null
@@ -64,21 +61,25 @@ let
       "${builtins.dirOf gateway.paidWorkConfig}/${stem}.content";
   gatewayWriteRoots = lib.unique (
     map normalizeRuntimePath (
-      gateway.paidWorkJournalRoots
+      [ gateway.home ]
       ++ lib.optional (gateway.content ? upper) gateway.content.upper
       ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
       ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
-      ++ lib.optional (gateway.localGrant != null) gatewayGrantDataPath
     )
   );
-  gatewayWritablePaths = lib.filter (outsideManagedRoots gatewayManagedWritableRoots) gatewayWriteRoots;
+  gatewayWritablePaths = lib.unique (
+    lib.optional (outsideManagedRoots [ "/var/lib/hellas-gateway" ] gateway.home) (
+      normalizeRuntimePath gateway.home
+    )
+    ++ lib.filter (outsideManagedRoots gatewayManagedWritableRoots) gatewayWriteRoots
+  );
   providerWritablePathsAreDisjoint = lib.all (
-    content: !pathsOverlap providerUpper content
-  ) providerContentPaths;
+    writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
+  ) providerWriteRoots;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
   providerLocalExecutionEnabled =
     hellas.catenaConfigured cfg
-    && (cfg.workConfigFile != null || cfg.grantConfigFile != null || cfg.awaitOwner != null);
+    && (cfg.workConfigFile != null || cfg.grantConfigFile != null || cfg.awaitOwner);
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
   # The gateway runs the same native executor in process for --local-grant.
   gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.localGrant != null;
@@ -123,31 +124,30 @@ let
   outsideStoreString = hellas.runtimeStringIsOutsideStore lib;
   userEnvironmentStrings = lib.filter builtins.isString (lib.attrValues cfg.environment);
   providerRuntimePaths = [
-    cfg.identityPath
+    cfg.home
   ]
   ++ (cfg.content.lower or [ ])
   ++ lib.optional (cfg.content ? upper) cfg.content.upper
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
+  ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
   ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
-  ++ lib.optional (cfg.awaitOwner != null) cfg.awaitOwner
   ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
     lib.optional (gateway.textModel != null) gateway.textModel
-    ++ [ gateway.identityPath ]
+    ++ [ gateway.home ]
     ++ (gateway.content.lower or [ ])
     ++ lib.optional (gateway.content ? upper) gateway.content.upper
     ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
-    ++ lib.optional (gateway.localGrant != null) gatewayGrantDataPath
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
+    ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
     ++ lib.optional (gateway.grantPoolConfig != null) gateway.grantPoolConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
     ++ lib.optional (gateway.workProfile != null) gateway.workProfile
     ++ lib.optional (gateway.passkey != null) gateway.passkey
     ++ lib.optional (gateway.gatewayProfile != null) gateway.gatewayProfile
-    ++ gateway.paidWorkJournalRoots
     ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
   );
   gpuDeviceAccess = {
@@ -255,7 +255,7 @@ in
       }
       {
         assertion = !cfg.enable || lib.all (path: path != "/") providerWritablePaths;
-        message = "services.hellas content.upper must not expose the filesystem root as writable.";
+        message = "services.hellas.home and content.upper must not expose the filesystem root as writable.";
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
@@ -275,7 +275,7 @@ in
       }
       {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
-        message = "services.hellas content.upper must be disjoint from content.lower.";
+        message = "services.hellas.home and content.upper must be disjoint from content.lower.";
       }
       {
         assertion = cfg.memoryMaxBytes == null || cfg.memoryMaxBytes > effectiveGpuSessionAssetBytes;
@@ -284,6 +284,14 @@ in
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedServeExtraArgs cfg.extraArgs;
         message = "services.hellas.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
+      }
+      {
+        assertion = cfg.chain == null || cfg.chainConfig == null;
+        message = "services.hellas.chain and chainConfig are mutually exclusive.";
+      }
+      {
+        assertion = gateway.chain == null || gateway.chainConfig == null;
+        message = "services.hellas.gateway.chain and chainConfig are mutually exclusive.";
       }
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedGatewayExtraArgs gateway.extraArgs;
@@ -412,7 +420,7 @@ in
       }
       // lib.optionalAttrs (providerWritablePaths != [ ]) {
         # DynamicUser implies ProtectSystem=strict. Permit only the dedicated
-        # external publication boundaries. These mount-namespace rules do not
+        # external home. These mount-namespace rules do not
         # grant Unix ownership, so operators must provision the external paths
         # as described by the corresponding options.
         ReadWritePaths = providerWritablePaths;

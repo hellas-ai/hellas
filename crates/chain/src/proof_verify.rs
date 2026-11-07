@@ -8,20 +8,30 @@
 //!
 //! A trust document must be authenticated independently of the indexer. An embedded bundle
 //! proves consensus finality, not that its observation timestamp or latest-block claim is fresh.
-use crate::domain::Digest;
+use crate::domain::{Digest, Object, ObjectId};
 use crate::{
     ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, FinalizedBlockView,
     LatestBlock, genesis_digest,
 };
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::{Decode as _, DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::{Hasher as _, Sha256};
-#[cfg(feature = "indexer-api")]
-use hellas_auth::authority::UnixMillis;
-use hellas_genesis::{HELLAS_DEVNET_1_JSON, TrustDocument};
+use commonware_storage::{
+    mmr,
+    qmdb::{
+        any::{
+            ordered::{Operation, Update},
+            value::FixedEncoding,
+        },
+        current::ordered::{ExclusionProof, fixed::KeyValueProof},
+    },
+};
+use hellas_genesis::TrustDocument;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CURRENT_KEYS: usize = crate::owner_proof::OWNER_PAGE_LIMIT as usize;
 
 pub use hellas_rpc::edge_index::{PROOF_SCHEMA_VERSION, ProofBundle};
 
@@ -54,6 +64,46 @@ pub enum VerificationError {
     Round,
     #[error("proof does not answer the requested route")]
     Query,
+    #[error("invalid current-state proof")]
+    InvalidProof,
+}
+
+type CurrentInclusion = KeyValueProof<mmr::Family, ObjectId, Digest, 32>;
+type CurrentExclusion = ExclusionProof<mmr::Family, ObjectId, FixedEncoding<Object>, Digest, 32>;
+type CurrentOperation = Operation<mmr::Family, ObjectId, FixedEncoding<Object>>;
+
+pub struct VerifiedObjects {
+    block: VerifiedBlock,
+    objects: BTreeMap<ObjectId, Object>,
+    owner_page: Option<(
+        crate::owner_proof::OwnerPageProof,
+        crate::owner_proof::OwnerCommitment,
+    )>,
+}
+
+impl VerifiedObjects {
+    pub fn block(&self) -> &VerifiedBlock {
+        &self.block
+    }
+    pub fn objects(&self) -> &BTreeMap<ObjectId, Object> {
+        &self.objects
+    }
+    pub fn owner_page(
+        &self,
+    ) -> Option<&(
+        crate::owner_proof::OwnerPageProof,
+        crate::owner_proof::OwnerCommitment,
+    )> {
+        self.owner_page.as_ref()
+    }
+    pub fn into_snapshot(self) -> crate::light_client::ObjectSnapshot {
+        crate::light_client::ObjectSnapshot {
+            network: hellas_kernel::NetworkId::new(&self.block.bundle.network_id)
+                .expect("verified trust network"),
+            block: self.block.view.snapshot().clone(),
+            objects: self.objects,
+        }
+    }
 }
 
 pub struct ProofVerifier {
@@ -63,11 +113,6 @@ pub struct ProofVerifier {
 }
 
 impl ProofVerifier {
-    /// `trust` is an authenticated deployment input, never a document accepted from a query peer.
-    pub fn new(trust: TrustDocument) -> Result<Self, VerificationError> {
-        Self::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes())
-    }
-
     /// Both inputs must be authenticated deployment inputs, never accepted from a query peer.
     /// The digest covers the exact JSON bytes, including whitespace and trailing newlines.
     pub fn with_genesis(
@@ -83,6 +128,15 @@ impl ProofVerifier {
         {
             return Err(VerificationError::Genesis);
         }
+        Self::with_digest(trust, genesis_digest(&genesis).into())
+    }
+
+    /// Authenticated canonical digest permits light verification without allocations.
+    pub fn with_digest(
+        trust: TrustDocument,
+        canonical_digest: [u8; 32],
+    ) -> Result<Self, VerificationError> {
+        trust.validate()?;
         let trust_sha256 = hex::encode(Sha256::hash(
             &serde_json::to_vec(&trust).expect("trust serializes"),
         ));
@@ -97,7 +151,7 @@ impl ProofVerifier {
                         threshold_identity: hex::decode(&epoch.threshold_identity)
                             .expect("validated hex"),
                     },
-                    genesis_digest(&genesis),
+                    canonical_digest.into(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -123,13 +177,17 @@ impl ProofVerifier {
             state_root: hex::encode(finalized.snapshot.state_root),
             finalization: finalized.snapshot.finalization,
             canonical_block: finalized.block,
-            observed_at_ms: UnixMillis::now().unwrap_or_default().0,
+            observed_at_ms: 0,
             epoch,
         }
     }
 
     pub fn trust_sha256(&self) -> &str {
         &self.trust_sha256
+    }
+
+    pub fn network(&self) -> hellas_kernel::NetworkId {
+        hellas_kernel::NetworkId::new(&self.trust.network_id).expect("validated trust network")
     }
 
     pub fn verify(
@@ -143,24 +201,6 @@ impl ProofVerifier {
         {
             return Err(VerificationError::Identity);
         }
-        if bundle.canonical_block.len() > MAX_PROOF_BYTES
-            || bundle.finalization.len() > crate::finality_proof::MAX_FINALITY_PROOF_BYTES
-        {
-            return Err(VerificationError::Size);
-        }
-        let proof = crate::finality_proof::FinalityProof::decode(&bundle.finalization)?;
-        let epoch = self
-            .trust
-            .epoch_at(proof.certified_height(bundle.height)?)?;
-        if bundle.epoch != epoch.epoch {
-            return Err(VerificationError::Epoch);
-        }
-        let position = self
-            .trust
-            .epochs
-            .iter()
-            .position(|candidate| candidate.epoch == epoch.epoch)
-            .expect("selected epoch");
         let finalized = FinalizedBlock {
             snapshot: LatestBlock {
                 height: bundle.height,
@@ -170,14 +210,51 @@ impl ProofVerifier {
             },
             block: bundle.canonical_block.clone(),
         };
-        if proof.certificate_epoch() != epoch.epoch {
+        self.verify_finalized_inner(finalized, query, Some(bundle))
+    }
+
+    /// Verify locally fetched canonical block evidence without a self-built hex envelope.
+    pub fn verify_finalized(
+        &self,
+        finalized: FinalizedBlock,
+        query: ProofQuery,
+    ) -> Result<VerifiedBlock, VerificationError> {
+        self.verify_finalized_inner(finalized, query, None)
+    }
+
+    fn verify_finalized_inner(
+        &self,
+        finalized: FinalizedBlock,
+        query: ProofQuery,
+        bundle: Option<ProofBundle>,
+    ) -> Result<VerifiedBlock, VerificationError> {
+        if finalized.block.len() > MAX_PROOF_BYTES
+            || finalized.snapshot.finalization.len()
+                > crate::finality_proof::MAX_FINALITY_PROOF_BYTES
+        {
+            return Err(VerificationError::Size);
+        }
+        let proof = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)?;
+        let epoch = self
+            .trust
+            .epoch_at(proof.certified_height(finalized.snapshot.height)?)?;
+        if bundle
+            .as_ref()
+            .is_some_and(|bundle| bundle.epoch != epoch.epoch)
+            || proof.certificate_epoch() != epoch.epoch
+        {
             return Err(VerificationError::Epoch);
         }
+        let position = self
+            .trust
+            .epochs
+            .iter()
+            .position(|candidate| candidate.epoch == epoch.epoch)
+            .expect("selected epoch");
         proof.verify(&self.verifiers[position], &finalized.snapshot)?;
         let view = FinalizedBlockView::decode(&finalized)?;
-        let block = crate::HellasBlock::decode(finalized.block.as_slice())
-            .map_err(|_| VerificationError::Round)?;
-        for candidate in std::iter::once(&block).chain(proof.descendants.iter()) {
+        let block = view.block();
+        for candidate in std::iter::once(block).chain(proof.descendants.iter()) {
             use commonware_consensus::Heightable as _;
             if self.trust.epoch_at(candidate.height().get())?.epoch
                 != candidate.context().round.epoch().get()
@@ -186,7 +263,7 @@ impl ProofVerifier {
             }
         }
         proof
-            .verify_terminal_context(proof.descendants.last().unwrap_or(&block))
+            .verify_terminal_context(proof.descendants.last().unwrap_or(block))
             .map_err(|_| VerificationError::Round)?;
         let transaction_index = match query {
             ProofQuery::Block(FinalizedBlockQuery::Latest) => None,
@@ -206,11 +283,164 @@ impl ProofVerifier {
             ),
             _ => return Err(VerificationError::Query),
         };
+        let bundle = bundle.unwrap_or_else(|| ProofBundle {
+            schema_version: PROOF_SCHEMA_VERSION,
+            network_id: self.trust.network_id.clone(),
+            trust_sha256: self.trust_sha256.clone(),
+            height: finalized.snapshot.height,
+            payload: hex::encode(finalized.snapshot.payload),
+            state_root: hex::encode(finalized.snapshot.state_root),
+            finalization: finalized.snapshot.finalization,
+            canonical_block: finalized.block,
+            observed_at_ms: 0,
+            epoch: epoch.epoch,
+        });
         Ok(VerifiedBlock {
             bundle,
             view,
             transaction_index,
         })
+    }
+
+    /// Verify an exact key set at one certified Current-QMDB root.
+    pub fn verify_objects(
+        &self,
+        response: hellas_rpc::pb::chain::GetObjectProofsResponse,
+        requested: &BTreeSet<ObjectId>,
+        query: FinalizedBlockQuery,
+        owner: Option<(crate::domain::SettlementKey, u64, u32)>,
+    ) -> Result<VerifiedObjects, VerificationError> {
+        self.verify_objects_inner(response, requested, query, owner, None)
+    }
+
+    pub fn verify_objects_after(
+        &self,
+        response: hellas_rpc::pb::chain::GetObjectProofsResponse,
+        requested: &BTreeSet<ObjectId>,
+        query: FinalizedBlockQuery,
+        owner: crate::domain::SettlementKey,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<VerifiedObjects, VerificationError> {
+        self.verify_objects_inner(response, requested, query, Some((owner, 0, limit)), after)
+    }
+
+    fn verify_objects_inner(
+        &self,
+        response: hellas_rpc::pb::chain::GetObjectProofsResponse,
+        requested: &BTreeSet<ObjectId>,
+        query: FinalizedBlockQuery,
+        owner: Option<(crate::domain::SettlementKey, u64, u32)>,
+        after: Option<[u8; 32]>,
+    ) -> Result<VerifiedObjects, VerificationError> {
+        let block = response.block.ok_or(VerificationError::Query)?;
+        let finalized = crate::client::finalized_block_from_proto(block)
+            .map_err(|_| VerificationError::Query)?;
+        let verified = self.verify_finalized(finalized, ProofQuery::Block(query))?;
+        let owner_page = match (owner, response.owner_page) {
+            (Some((owner, offset, limit)), Some(page)) => {
+                let page = crate::owner_proof::OwnerPageProof::from_proto(page)
+                    .map_err(|_| VerificationError::Query)?;
+                let summary = if after.is_some() {
+                    crate::owner_proof::verify_owner_page_after(
+                        verified.view().owner_root(),
+                        owner,
+                        after,
+                        limit,
+                        &page,
+                    )
+                } else {
+                    crate::owner_proof::verify_owner_page(
+                        verified.view().owner_root(),
+                        owner,
+                        offset,
+                        limit,
+                        &page,
+                    )
+                }
+                .map_err(|_| VerificationError::Query)?;
+                Some((page, summary))
+            }
+            (None, None) => None,
+            _ => return Err(VerificationError::Query),
+        };
+        let mut expected = requested.clone();
+        if let Some((page, _)) = &owner_page {
+            expected.extend(
+                page.holdings
+                    .iter()
+                    .map(|holding| ObjectId::from(holding.object_id)),
+            );
+        }
+        if expected.len() > MAX_CURRENT_KEYS || response.proofs.len() != expected.len() {
+            return Err(VerificationError::Query);
+        }
+        let root = verified.view().state_root();
+        let mut seen = BTreeSet::new();
+        let mut objects = BTreeMap::new();
+        for entry in response.proofs {
+            let key = ObjectId::from(
+                <[u8; 32]>::try_from(entry.object_id.as_slice())
+                    .map_err(|_| VerificationError::Query)?,
+            );
+            if !expected.contains(&key) || !seen.insert(key) {
+                return Err(VerificationError::Query);
+            }
+            match entry.object {
+                Some(value) => {
+                    let object = Object::decode(value.as_slice())
+                        .map_err(|_| VerificationError::InvalidProof)?;
+                    let proof = CurrentInclusion::decode_cfg(entry.proof.as_slice(), &(128, ()))
+                        .map_err(|_| VerificationError::InvalidProof)?;
+                    let operation = CurrentOperation::Update(Update {
+                        key,
+                        value: object,
+                        next_key: proof.next_key,
+                    });
+                    if !proof.proof.verify::<Sha256, _>(operation, &root) {
+                        return Err(VerificationError::InvalidProof);
+                    }
+                    objects.insert(key, object);
+                }
+                None => {
+                    let proof =
+                        CurrentExclusion::decode_cfg(entry.proof.as_slice(), &(128, (), ()))
+                            .map_err(|_| VerificationError::InvalidProof)?;
+                    let (op_proof, operation) = match proof {
+                        ExclusionProof::KeyValue(op_proof, data) => {
+                            if data.key == key
+                                || !current_span_contains(&data.key, &data.next_key, &key)
+                            {
+                                return Err(VerificationError::InvalidProof);
+                            }
+                            (op_proof, CurrentOperation::Update(data))
+                        }
+                        ExclusionProof::Commit(op_proof, value) => {
+                            let loc = op_proof.loc;
+                            (op_proof, CurrentOperation::CommitFloor(value, loc))
+                        }
+                    };
+                    if !op_proof.verify::<Sha256, _>(operation, &root) {
+                        return Err(VerificationError::InvalidProof);
+                    }
+                }
+            }
+        }
+        Ok(VerifiedObjects {
+            block: verified,
+            objects,
+            owner_page,
+        })
+    }
+}
+
+// Matches Commonware's ordered circular span rule; the proof below still
+// authenticates both adjacent active keys and their activity bit.
+fn current_span_contains(start: &ObjectId, end: &ObjectId, key: &ObjectId) -> bool {
+    if start >= end {
+        key >= start || key < end
+    } else {
+        key >= start && key < end
     }
 }
 
@@ -317,7 +547,7 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::{N3f1, non_empty_range, ordered::Set};
-    use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_2_ID, HELLAS_DEVNET_2_JSON, TrustEpoch};
     use rand::{SeedableRng, rngs::StdRng};
 
     fn immediate<F: std::future::Future>(future: F) -> F::Output {
@@ -351,13 +581,13 @@ mod tests {
         let (verifier, _) = fixture();
         let mut trust = verifier.trust.clone();
         let mut genesis: hellas_genesis::Genesis =
-            serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+            serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
         genesis.validators[0].label = "disposable-demo".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
         assert!(ProofVerifier::with_genesis(trust.clone(), &document).is_ok());
         assert!(matches!(
-            ProofVerifier::new(trust.clone()),
+            ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_2_JSON.as_bytes()),
             Err(VerificationError::Genesis)
         ));
         let mut changed = document.clone();
@@ -379,7 +609,7 @@ mod tests {
     fn shared_threshold_proof_cannot_cross_genesis() {
         let (source, mut bundle) = fixture();
         let mut genesis: hellas_genesis::Genesis =
-            serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+            serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
         genesis.validators[0].label = "different-generation".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         let mut trust = source.trust.clone();
@@ -388,6 +618,28 @@ mod tests {
         bundle.trust_sha256 = target.trust_sha256().into();
         assert!(
             target
+                .verify(bundle, ProofQuery::Block(FinalizedBlockQuery::Latest))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn digest_only_light_pin_verifies_the_same_certificate_and_rejects_another_digest() {
+        let (full, bundle) = fixture();
+        let genesis: hellas_genesis::Genesis = serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
+        let digest_only =
+            ProofVerifier::with_digest(full.trust.clone(), genesis_digest(&genesis).0).unwrap();
+        assert!(
+            digest_only
+                .verify(
+                    bundle.clone(),
+                    ProofQuery::Block(FinalizedBlockQuery::Latest)
+                )
+                .is_ok()
+        );
+        let other = ProofVerifier::with_digest(full.trust.clone(), [0x42; 32]).unwrap();
+        assert!(
+            other
                 .verify(bundle, ProofQuery::Block(FinalizedBlockQuery::Latest))
                 .is_err()
         );
@@ -415,8 +667,8 @@ mod tests {
             .map(|key| {
                 Scheme::signer(
                     &crate::consensus_namespace(
-                        hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
-                        crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+                        hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
+                        crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
                     ),
                     participants.clone(),
                     polynomial.clone(),
@@ -427,16 +679,16 @@ mod tests {
             .collect::<Vec<_>>();
         let assembler = Scheme::verifier(
             &crate::consensus_namespace(
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
             ),
             participants,
             polynomial,
         );
         let trust = TrustDocument {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
-            genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_1_JSON.as_bytes())),
+            network_id: HELLAS_DEVNET_2_ID.into(),
+            genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_2_JSON.as_bytes())),
             epochs: vec![TrustEpoch {
                 epoch: 0,
                 start_height: 0,
@@ -444,7 +696,7 @@ mod tests {
                 threshold_identity: hex::encode(assembler.identity().encode()),
             }],
         };
-        let verifier = ProofVerifier::new(trust).unwrap();
+        let verifier = ProofVerifier::with_genesis(trust, HELLAS_DEVNET_2_JSON.as_bytes()).unwrap();
         let block = crate::HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -478,12 +730,12 @@ mod tests {
             NativeFinalization::from_finalizes(&assembler, &votes, &Sequential).unwrap();
         let bundle = ProofBundle {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_1_ID.into(),
+            network_id: HELLAS_DEVNET_2_ID.into(),
             trust_sha256: verifier.trust_sha256().into(),
             height: block.height().get(),
             payload: hex::encode(block.digest()),
             state_root: hex::encode(block.state_root()),
-            finalization: certificate.encode().to_vec(),
+            finalization: crate::finality_proof::encode(&certificate.encode(), &[]).unwrap(),
             canonical_block: block.encode().to_vec(),
             observed_at_ms: 1000,
             epoch: 0,
@@ -498,14 +750,20 @@ mod tests {
             std::env::var("HELLAS_EXPLORER_FIXTURE_DIR").expect("set fixture output directory");
         let directory = std::path::Path::new(&directory);
         std::fs::create_dir_all(directory).unwrap();
-        std::fs::write(directory.join("genesis.json"), HELLAS_DEVNET_1_JSON).unwrap();
+        std::fs::write(directory.join("genesis.json"), HELLAS_DEVNET_2_JSON).unwrap();
         let (verifier, bundle) = fixture();
         let (owner, tree) = owner_fixture();
-        let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 64)).unwrap();
+        let page = immediate(crate::owner_proof::prove_owner_page(
+            &tree,
+            owner,
+            0,
+            crate::owner_proof::OWNER_PAGE_LIMIT,
+        ))
+        .unwrap();
         let address = AddressProofBundle {
             schema_version: 1,
             block: Some(bundle.clone()),
-            page: serde_json::to_vec(&page).unwrap(),
+            page: Some(page.clone().into_proto()),
         };
         std::fs::write(
             directory.join("address.json"),
@@ -544,7 +802,12 @@ mod tests {
             ..address
         };
         next_verifier
-            .verify_address(next_address.clone(), owner, 0, 64)
+            .verify_address(
+                next_address.clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         std::fs::write(
             directory.join("proof-next.pb"),
@@ -558,7 +821,7 @@ mod tests {
         .unwrap();
         let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 1)).unwrap();
         let next_small_page = AddressProofBundle {
-            page: serde_json::to_vec(&page).unwrap(),
+            page: Some(page.clone().into_proto()),
             ..next_address
         };
         next_verifier
@@ -575,14 +838,32 @@ mod tests {
     fn address_bundle_binds_owner_summary_and_page_to_certified_block() {
         let (verifier, bundle) = fixture();
         let (owner, tree) = owner_fixture();
-        let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 64)).unwrap();
+        let page = immediate(crate::owner_proof::prove_owner_page(
+            &tree,
+            owner,
+            0,
+            crate::owner_proof::OWNER_PAGE_LIMIT,
+        ))
+        .unwrap();
         let bundle = AddressProofBundle {
             schema_version: 1,
             block: Some(bundle),
-            page: serde_json::to_vec(&page).unwrap(),
+            page: Some(page.clone().into_proto()),
         };
+        let proto = <AddressProofBundle as prost::Message>::decode(
+            prost::Message::encode_to_vec(&bundle).as_slice(),
+        )
+        .unwrap();
+        let json: AddressProofBundle =
+            serde_json::from_slice(&serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert_eq!(proto.page, json.page);
         let verified = verifier
-            .verify_address(bundle.clone(), owner, 0, 64)
+            .verify_address(
+                bundle.clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         assert_eq!(verified.summary().balance, 123);
         assert_eq!(verified.summary().count, 1);
@@ -592,9 +873,24 @@ mod tests {
             kind: 0,
             balance: 999,
         });
-        bad.page = serde_json::to_vec(&page).unwrap();
-        assert!(verifier.verify_address(bad, owner, 0, 64).is_err());
-        assert!(verifier.verify_address(bundle, owner, 1, 64).is_err());
+        bad.page = Some(page.into_proto());
+        assert!(
+            verifier
+                .verify_address(bad, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .is_err()
+        );
+        let mut missing = bundle.clone();
+        missing.page = None;
+        assert!(
+            verifier
+                .verify_address(missing, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_address(bundle, owner, 1, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .is_err()
+        );
     }
 
     #[test]
@@ -701,9 +997,8 @@ mod tests {
     }
 }
 
-/// Address evidence uses the identical canonical block bundle plus a bounded typed owner proof.
-/// The `page` bytes are serde JSON for `OwnerPageProof`; all claims are reconstructed and checked
-/// against the owner root in the certified block, independent of the serialization's spelling.
+/// Address evidence uses the identical canonical block bundle and typed owner proof.
+/// Claims are checked against the owner root in the certified block.
 #[derive(Clone, PartialEq, Serialize, Deserialize, prost::Message)]
 #[serde(deny_unknown_fields)]
 pub struct AddressProofBundle {
@@ -711,8 +1006,34 @@ pub struct AddressProofBundle {
     pub schema_version: u32,
     #[prost(message, optional, tag = "2")]
     pub block: Option<ProofBundle>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub page: Vec<u8>,
+    #[prost(message, optional, tag = "3")]
+    #[serde(with = "address_page_serde")]
+    pub page: Option<hellas_rpc::pb::chain::OwnerPageProof>,
+}
+
+// The JSON HTTP representation keeps the native page shape; protobuf carries the same
+// typed message directly. Conversion is structural and never round-trips through JSON.
+mod address_page_serde {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<hellas_rpc::pb::chain::OwnerPageProof>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .as_ref()
+            .map(|page| crate::owner_proof::OwnerPageProof::from_proto(page.clone()))
+            .transpose()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<hellas_rpc::pb::chain::OwnerPageProof>, D::Error> {
+        Option::<crate::owner_proof::OwnerPageProof>::deserialize(deserializer)
+            .map(|page| page.map(crate::owner_proof::OwnerPageProof::into_proto))
+    }
 }
 
 pub struct VerifiedAddress {
@@ -743,14 +1064,20 @@ impl ProofVerifier {
         offset: u64,
         limit: u32,
     ) -> Result<VerifiedAddress, VerificationError> {
-        if bundle.schema_version != PROOF_SCHEMA_VERSION || bundle.page.len() > MAX_PROOF_BYTES {
+        if bundle.schema_version != PROOF_SCHEMA_VERSION {
             return Err(VerificationError::Identity);
         }
+        let page = bundle.page.as_ref().ok_or(VerificationError::Query)?;
+        if prost::Message::encoded_len(page) > MAX_PROOF_BYTES {
+            return Err(VerificationError::Size);
+        }
+        let page = crate::owner_proof::OwnerPageProof::from_proto(page.clone())
+            .map_err(|_| VerificationError::Query)?;
         let block = self.verify(
             bundle.block.clone().ok_or(VerificationError::Query)?,
             ProofQuery::Block(FinalizedBlockQuery::Latest),
         )?;
-        block.verify_owner_page(bundle.page, owner, offset, limit)
+        block.verify_owner_page(&page, owner, offset, limit)
     }
 }
 
@@ -759,32 +1086,31 @@ impl VerifiedBlock {
     /// The typed block keeps certificate admission separate from page generation.
     pub(crate) fn verify_owner_page(
         self,
-        page: Vec<u8>,
+        page: &crate::owner_proof::OwnerPageProof,
         owner: crate::domain::SettlementKey,
         offset: u64,
         limit: u32,
     ) -> Result<VerifiedAddress, VerificationError> {
-        if page.len() > MAX_PROOF_BYTES {
-            return Err(VerificationError::Identity);
+        let encoded_page = page.clone().into_proto();
+        if prost::Message::encoded_len(&encoded_page) > MAX_PROOF_BYTES {
+            return Err(VerificationError::Size);
         }
         let bundle = AddressProofBundle {
             schema_version: PROOF_SCHEMA_VERSION,
             block: Some(self.bundle.clone()),
-            page,
+            page: Some(encoded_page),
         };
-        let page: crate::owner_proof::OwnerPageProof =
-            serde_json::from_slice(&bundle.page).map_err(|_| VerificationError::Query)?;
         let summary = crate::owner_proof::verify_owner_page(
             self.view().owner_root(),
             owner,
             offset,
             limit,
-            &page,
+            page,
         )
         .map_err(|_| VerificationError::Query)?;
         Ok(VerifiedAddress {
             block: self,
-            page,
+            page: page.clone(),
             summary,
             bundle,
         })

@@ -6,6 +6,7 @@ use crate::model::grant::{
 use crate::test_support::*;
 use hellas_auth::Digest;
 use hellas_auth::authority::{AdministrationCommand, GrantCommand};
+use hellas_private::StoreLocation;
 use {
     crate::work_store::grant::GrantOutcome, crate::work_store::grant::NodeStore,
     crate::work_store::grant::state::Change, crate::work_store::grant::state::Frame,
@@ -188,15 +189,10 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
     .unwrap();
     store.rotate().await.unwrap();
     drop(store);
-    let mut store = NodeStore::open(
-        dir.path(),
-        network(),
-        None,
-        UnixMillis(1003),
-        Default::default(),
-    )
-    .await
-    .unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let mut store = NodeStore::open(&location, network(), None, UnixMillis(1003))
+        .await
+        .unwrap();
     assert_eq!(store.state().admission(a.channel_id, work), Some(&running));
     assert_eq!(
         store

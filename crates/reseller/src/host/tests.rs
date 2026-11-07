@@ -1,6 +1,7 @@
 use super::*;
 use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
+use hellas_private::StoreLocation;
 use hellas_rpc::{Assurance, RootProof};
 use hellas_sdk::{
     GrantProviderOptions, grant_client::UnpinnedOffer, grant_gateway::GrantServeOptions,
@@ -99,7 +100,7 @@ async fn tls_fixture(mode: UpstreamMode) -> TlsFixture {
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_der(ca.as_ref().der()).unwrap())
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(WAIT * 6)
+        .timeout(HANG_GUARD)
         .build()
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -159,8 +160,8 @@ use hellas_auth::authority::{CredentialSecret, GrantId, Revision};
 use hellas_authority::model::grant::admin::{WorkControlCommand, WorkControlReply};
 use {
     hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,
-    hellas_authority::test_support::Node, hellas_authority::test_support::TestClock,
-    hellas_authority::test_support::WAIT, hellas_authority::test_support::authority,
+    hellas_authority::test_support::HANG_GUARD, hellas_authority::test_support::Node,
+    hellas_authority::test_support::TestClock, hellas_authority::test_support::authority,
     hellas_authority::test_support::ids, hellas_channel::test_support::Rights,
     hellas_channel::test_support::actors::FRIEND, hellas_channel::test_support::actors::PROVIDER,
     hellas_channel::test_support::actors::ROOT,
@@ -209,12 +210,13 @@ impl ResellerBuilder {
                     .unwrap(),
                 )
                 .unwrap();
+            let location = StoreLocation::for_test(root.path());
             FetchProviderOptions {
                 port: Some(0),
                 identity: provider_identity.clone(),
                 enrollment: provider_bundle.clone(),
                 root: Arc::new(UnusedRoot),
-                state_directory: root.path().join("provider"),
+                home: location,
                 content: content.clone(),
                 routes,
                 fetch_max_in_flight: 2,
@@ -249,25 +251,28 @@ impl ResellerBuilder {
         allowance.definition.policies =
             options().grants.unwrap().configuration.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
-        let world = Node::bootstrap(&root.path().join("provider/grants"))
-            .with_network(hellas_authority::model::grant::grant_network())
-            .with_provider(provider_bundle.clone())
-            .with_clock(clock.clone())
-            .with_capacity(Capacity::new(1))
-            .with_allowance(allowance)
-            .with_grant(
-                ids::FRIEND_GRANT,
-                Rights::new(authority(), FRIEND)
-                    .allow(
-                        hellas_authority::grant_service::WORK_EXECUTE,
-                        hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
-                    )
-                    .valid_from(clock.now())
-                    .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
-                    .build(),
-            )
-            .build()
-            .await;
+        let location = StoreLocation::for_test(root.path());
+        let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
+            &location,
+        ))
+        .with_network(hellas_authority::model::grant::grant_network())
+        .with_provider(provider_bundle.clone())
+        .with_clock(clock.clone())
+        .with_capacity(Capacity::new(1))
+        .with_allowance(allowance)
+        .with_grant(
+            ids::FRIEND_GRANT,
+            Rights::new(authority(), FRIEND)
+                .allow(
+                    hellas_authority::grant_service::WORK_EXECUTE,
+                    hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
+                )
+                .valid_from(clock.now())
+                .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
+                .build(),
+        )
+        .build()
+        .await;
         let root_secret = world.secret(ROOT);
         let secret = CredentialSecret::from_parts(root_secret.id(), *root_secret.expose_secret());
         let app_secret = world.secret(FRIEND);
@@ -344,6 +349,7 @@ impl ResellerBuilder {
                 .await
                 .unwrap()
         };
+        let other_location = StoreLocation::for_test(&root.path().join("client"));
         let gateway = controlled_gateway(
             GrantServeOptions {
                 serve: hellas_sdk::GatewayServeOptions {
@@ -373,7 +379,7 @@ impl ResellerBuilder {
                     principal: hellas_channel::test_support::subject_of(client_identity.node_key()),
                     signer: Arc::new(client_identity.node_key().clone()),
                     application: application.clone(),
-                    journal_root: root.path().join("client"),
+                    journal_root: other_location,
                 },
             },
             client_identity.transport_key(),
@@ -420,7 +426,7 @@ impl Reseller {
 async fn controlled_gateway_projects_the_reseller_tls_response() {
     let fixture = ResellerBuilder::default().start().await;
     let before = fixture.upstream.calls.load(Ordering::SeqCst);
-    let response = tokio::time::timeout(WAIT, fixture.request().send())
+    let response = tokio::time::timeout(HANG_GUARD, fixture.request().send())
         .await
         .unwrap()
         .unwrap();
@@ -440,14 +446,14 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
         .start()
         .await;
     let pending = tokio::spawn(fixture.request().send());
-    tokio::time::timeout(WAIT, held.started.notified())
+    tokio::time::timeout(HANG_GUARD, held.started.notified())
         .await
         .unwrap();
     fixture.revoke_application().await;
-    tokio::time::timeout(WAIT, held.dropped.notified())
+    tokio::time::timeout(HANG_GUARD, held.dropped.notified())
         .await
         .expect("revocation closes the upstream body");
-    let response = tokio::time::timeout(WAIT, pending)
+    let response = tokio::time::timeout(HANG_GUARD, pending)
         .await
         .unwrap()
         .unwrap()
@@ -491,12 +497,13 @@ impl OpenAiFixture {
         let root = self.root.path();
         let identity = &self.identity;
         let enrollment = &self.enrollment;
+        let location = StoreLocation::for_test(root);
         OpenAiProviderOptions {
             port: Some(0),
             identity: identity.clone(),
             enrollment: enrollment.clone(),
             root: Arc::new(UnusedRoot),
-            state_directory: root.join("provider"),
+            home: location,
             content: {
                 let content = hellas_channel::test_support::channel::content_store(root).await;
                 content.finish_recovery().await.unwrap();
@@ -534,13 +541,16 @@ async fn openai_host_refuses_an_empty_upstream_key() {
 #[tokio::test]
 async fn host_control_starts_the_openai_reseller_factory() {
     let fixture = OpenAiFixture::new();
-    let world = Node::bootstrap(&fixture.root.path().join("provider/grants"))
-        .with_provider(fixture.enrollment.clone())
-        .with_clock(TestClock::new(
-            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-        ))
-        .build()
-        .await;
+    let location = StoreLocation::for_test(fixture.root.path());
+    let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
+        &location,
+    ))
+    .with_provider(fixture.enrollment.clone())
+    .with_clock(TestClock::new(
+        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+    ))
+    .build()
+    .await;
     let secret = world.secret(ROOT);
     let secret = CredentialSecret::from_parts(secret.id(), *secret.expose_secret());
     let node = hellas_authority::node::NodeCoordinator::new(

@@ -1,16 +1,28 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 /// The durable setup journal: the state above, plus the file it is
 /// replayed from.
 #[derive(Debug)]
 pub struct SetupStore {
-    root: PathBuf,
+    root: StoreLocation,
     journal: Journal,
     state: SetupState,
     content: Option<hellas_store::content::DiskStore>,
 }
 
 impl SetupStore {
+    /// Release the journal before another owner opens it.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+    }
+
+    /// Return replayed metadata after releasing the writer.
+    pub async fn into_state(mut self) -> SetupState {
+        self.close().await;
+        self.state
+    }
+
     /// Opens the setup journal for one bond, replaying and re-checking
     /// every record it holds.
     ///
@@ -24,36 +36,33 @@ impl SetupStore {
     /// some other journal, and [`WorkStoreError::Setup`] when a
     /// replayed record does not obey the transition rules.
     pub async fn open<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
         verifier: &V,
-        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, network, bond_edge, role, verifier, false, durability).await
+        Self::open_inner(root, network, bond_edge, role, verifier, false).await
     }
 
     /// Reopen an existing setup without creating a replacement journal.
     pub async fn open_existing<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
         verifier: &V,
-        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, network, bond_edge, role, verifier, true, durability).await
+        Self::open_inner(root, network, bond_edge, role, verifier, true).await
     }
 
     async fn open_inner<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         network: NetworkId,
         bond_edge: EdgeId,
         role: Role,
         verifier: &V,
         existing: bool,
-        durability: hellas_private::Durability,
     ) -> Result<Self, WorkStoreError> {
         let key = setup_key(network, bond_edge);
         let id = JournalId {
@@ -63,9 +72,9 @@ impl SetupStore {
         };
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = if existing {
-            Journal::open_existing(root, &setup_stem(key), id, durability).await?
+            Journal::open_existing(root, &setup_stem(key), id).await?
         } else {
-            Journal::open_latest(root, &setup_stem(key), id, durability).await?
+            Journal::open_latest(root, &setup_stem(key), id).await?
         };
         let mut state = match &replay.checkpoint {
             Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
@@ -78,7 +87,7 @@ impl SetupStore {
         }
         journal.observe_replay(replayed, replay.records.len());
         Ok(Self {
-            root: root.to_path_buf(),
+            root: root.clone(),
             journal,
             state,
             content: None,
@@ -103,7 +112,7 @@ impl SetupStore {
 
     /// Returns the root under which recovered channel journals are mounted.
     #[must_use]
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &StoreLocation {
         &self.root
     }
 
@@ -342,7 +351,7 @@ pub struct SetupDiscovery {
 /// [`SetupDiscovery::unidentified`], because the journals beside it are
 /// still this node's to open.
 pub async fn discover_setups(
-    root: &Path,
+    root: &StoreLocation,
     network: NetworkId,
 ) -> Result<SetupDiscovery, WorkStoreError> {
     let mut discovery = SetupDiscovery::default();
@@ -369,7 +378,7 @@ fn setup_stem_key(stem: &str) -> Option<[u8; 32]> {
 
 /// Recovers what one setup journal is about, or says why it cannot.
 async fn identify_setup(
-    root: &Path,
+    root: &StoreLocation,
     stem: &str,
     named: [u8; 32],
     network: NetworkId,

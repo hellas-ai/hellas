@@ -1,7 +1,7 @@
 //! One software-passkey selection for the whole invocation.
 use anyhow::{Context as _, anyhow};
 use clap::Args;
-use hellas_chain::genesis::{FaucetAccount, HELLAS_DEVNET_1_FAUCET_JSON};
+use hellas_chain::genesis::{ChainProfile, FaucetAccount};
 use hellas_kernel::SoftPasskey;
 use std::path::PathBuf;
 
@@ -23,32 +23,23 @@ impl OwnerArgs {
         self.faucet || self.faucet_account.is_some()
     }
 
-    fn faucet_root(identity: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
-        let mut path = identity
-            .map(PathBuf::from)
-            .map(Ok)
-            .unwrap_or_else(crate::identity::default_path)?
-            .into_os_string();
-        path.push(".faucet");
-        Ok(PathBuf::from(path))
-    }
-
     /// Keep the selected public owner with this identity across restarts.
     pub(crate) fn load_persistent(
         &self,
-        identity: Option<&std::path::Path>,
+        home: &std::path::Path,
+        chain: &ChainProfile,
     ) -> anyhow::Result<Option<SoftPasskey>> {
         if !self.is_faucet() {
-            return self.load();
+            return self.load(chain);
         }
-        let root = Self::faucet_root(identity)?;
-        hellas_private::create_dir_all_durable(&root)?;
-        let path = root.join("account");
+        let path = hellas_chain::chain_dir::ChainDir::open(home, chain, Default::default())?
+            .faucet_account();
+        let root = path.parent().expect("faucet account has a chain directory");
         if !path.try_exists()? {
             let index = self
                 .faucet_account
                 .unwrap_or_else(|| rand::random_range(0..100));
-            let temporary = hellas_private::private_tempfile(&root, ".account-", ".new")?;
+            let temporary = hellas_private::private_tempfile(root, ".account-", ".new")?;
             match hellas_sdk::node_control::profile::publish_private(temporary, &path, &[index]) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -64,7 +55,7 @@ impl OwnerArgs {
                 .is_none_or(|requested| requested == *index),
             "this provider already uses a different faucet account"
         );
-        let account = faucet_account(*index)?;
+        let account = faucet_account(chain, *index)?;
         eprintln!(
             "devnet faucet account {}: {}",
             account.index, account.address
@@ -72,12 +63,12 @@ impl OwnerArgs {
         Ok(Some(faucet_passkey(&account)?))
     }
 
-    pub(crate) fn load(&self) -> anyhow::Result<Option<SoftPasskey>> {
+    pub(crate) fn load(&self, chain: &ChainProfile) -> anyhow::Result<Option<SoftPasskey>> {
         let index = self
             .faucet_account
             .or_else(|| self.faucet.then(|| rand::random_range(0..100)));
         if let Some(index) = index {
-            let account = faucet_account(index)?;
+            let account = faucet_account(chain, index)?;
             let key = faucet_passkey(&account)?;
             eprintln!(
                 "devnet faucet account {}: {}",
@@ -93,8 +84,11 @@ impl OwnerArgs {
     }
 }
 
-fn faucet_account(index: u8) -> anyhow::Result<FaucetAccount> {
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON)?;
+fn faucet_account(chain: &ChainProfile, index: u8) -> anyhow::Result<FaucetAccount> {
+    let faucet_json = chain
+        .faucet_json()
+        .ok_or_else(|| anyhow!("selected chain has no faucet accounts"))?;
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(faucet_json)?;
     accounts
         .into_iter()
         .find(|account| account.index == index)
@@ -115,17 +109,19 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use hellas_chain::domain::SettlementKey;
+    use hellas_chain::genesis::Chain;
 
     #[test]
     fn every_selected_faucet_passkey_controls_its_genesis_allocation() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
+            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
         for index in 0..100 {
             let options = OwnerArgs {
                 faucet_account: Some(index),
                 ..Default::default()
             };
-            let key = options.load().unwrap().unwrap();
+            let key = options.load(&chain).unwrap().unwrap();
             let address = SettlementKey::from(key.party_key()).to_string();
             let allocation = genesis
                 .allocations
@@ -133,20 +129,20 @@ mod tests {
                 .find(|a| a.address == address)
                 .unwrap();
             assert_eq!(allocation.balance, 931_145);
-            assert_eq!(address, faucet_account(index).unwrap().address);
+            assert_eq!(address, faucet_account(&chain, index).unwrap().address);
         }
-        assert!(faucet_account(100).is_err());
+        assert!(faucet_account(&chain, 100).is_err());
     }
 
     #[test]
     fn a_selected_account_stays_with_its_identity() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let root = tempfile::tempdir().unwrap();
-        let identity = root.path().join("identity");
         let load = |args: &[&str]| {
             crate::Cli::try_parse_from(args)
                 .unwrap()
                 .owner
-                .load_persistent(Some(&identity))
+                .load_persistent(root.path(), &chain)
         };
         let first = load(&["hellas", "serve", "--faucet-account", "7"])
             .unwrap()
@@ -158,13 +154,14 @@ mod tests {
 
     #[test]
     fn random_selection_is_funded_and_explicit_credentials_are_exclusive() {
+        let chain = ChainProfile::known(Chain::Devnet);
         let options = OwnerArgs {
             faucet: true,
             ..Default::default()
         };
-        let key = options.load().unwrap().unwrap();
+        let key = options.load(&chain).unwrap().unwrap();
         let accounts: Vec<FaucetAccount> =
-            serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+            serde_json::from_str(chain.faucet_json().unwrap()).unwrap();
         assert!(
             accounts
                 .iter()

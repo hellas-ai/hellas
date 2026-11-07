@@ -4,6 +4,7 @@ use hellas_auth::authority::{
     AuthorityId, CredentialHolder, CredentialSecret, GrantId, GrantSpec, NodeKey, Ownership,
 };
 use hellas_authority::test_support::common_node;
+use hellas_private::StoreLocation;
 use hellas_sdk::grant_client::GrantSessionOptions;
 use hellas_sdk::trust_policy::{TrustPolicy, TrustPolicyStore};
 use std::path::Path;
@@ -53,8 +54,8 @@ pub(super) fn run_gateway<'a>(
                         return;
                     };
                     while let Ok(Some(inbound)) = transport.accept().await {
-                        if dispatcher.dispatch(inbound).await.is_err() {
-                            break;
+                        if let Err(error) = dispatcher.dispatch(inbound).await {
+                            eprintln!("fixture Work dispatch failed: {error}");
                         }
                     }
                 });
@@ -125,7 +126,8 @@ pub(super) fn run_gateway<'a>(
         )
         .unwrap();
 
-        let identity_path = root.join("composition-cli-identity");
+        let home = data_root.parent().unwrap().parent().unwrap();
+        let identity_path = home.join("identity");
         let root_key = ProducerSigningKey::from_secret_bytes([0x41; 32]).unwrap();
         let node_key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
         let transport = iroh::SecretKey::from_bytes(&[0x42; 32]);
@@ -177,9 +179,10 @@ pub(super) fn run_gateway<'a>(
         };
         let gateway_root = root.join("composition-http-authority");
         let root_grant = GrantId([0; 16]);
+        let location = StoreLocation::for_test(&gateway_root);
         let (node_store, administrator_secret) =
             hellas_authority::work_store::grant::NodeStore::bootstrap(
-                &gateway_root,
+                &location,
                 hellas_authority::model::grant::grant_network(),
                 root_grant,
                 common_node::approval(
@@ -191,7 +194,6 @@ pub(super) fn run_gateway<'a>(
                 ),
                 None,
                 now,
-                Default::default(),
             )
             .await
             .unwrap();
@@ -224,9 +226,8 @@ pub(super) fn run_gateway<'a>(
         let log_path = root.join("composition-cli.log");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut child = tokio::process::Command::new(binary)
-            .env("HELLAS_GRANT_DATA_DIR", data_root.parent().unwrap())
-            .arg("--identity")
-            .arg(&identity_path)
+            .arg("--home")
+            .arg(home)
             .arg("--passkey")
             .arg(&passkey)
             .arg("gateway")
@@ -238,8 +239,6 @@ pub(super) fn run_gateway<'a>(
             .arg(address.port().to_string())
             .arg("--gateway-profile")
             .arg(&profile)
-            .arg("--archive-dir")
-            .arg(root.join("composition-cli-archive"))
             .arg("--zdr")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(log))

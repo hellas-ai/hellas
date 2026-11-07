@@ -1,4 +1,5 @@
 use super::*;
+use hellas_authority::test_support::HANG_GUARD;
 
 #[tokio::test]
 async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
@@ -33,7 +34,7 @@ async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
         if seed == 63 {
             accepted.unwrap_err();
             if let Ok(connection) = client_connection {
-                tokio::time::timeout(hellas_authority::test_support::WAIT, connection.closed())
+                tokio::time::timeout(HANG_GUARD, connection.closed())
                     .await
                     .unwrap();
             }
