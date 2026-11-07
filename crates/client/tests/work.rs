@@ -269,7 +269,7 @@ async fn model_job_restart_inner(provider_held: bool) {
     use futures::StreamExt as _;
     use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
     use hellas_channel::test_support::channel::{advance, deadlines, origin, settlement};
-    use hellas_channel::work::{ClientChannel as _, JobProposal, propose_work, resume_work_proposal};
+    use hellas_channel::work::{ClientChannel, JobProposal, propose_work, resume_work_proposal};
     use hellas_channel::work_store::ChannelStore;
     use hellas_client::model::{ModelPackage, ModelRequest};
     use hellas_kernel::Secp256k1Verifier;
@@ -552,8 +552,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         probes.lock().unwrap().values().all(|count| *count == 1),
         "retaining client content must not probe assets a second time"
     );
-    let id = endpoint
-        .client()
+    let id = ClientChannel::client(&mut endpoint)
         .await
         .unwrap()
         .state()
@@ -562,8 +561,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         .expect("the proposal is journaled")
         .work_id();
     assert_eq!(
-        endpoint
-            .client()
+        ClientChannel::client(&mut endpoint)
             .await
             .unwrap()
             .state()
@@ -579,8 +577,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         provider_held.then_some(JobPhase::Accepted),
         "the failure is after acceptance only for the provider-held case",
     );
-    let client_node = endpoint
-        .client()
+    let client_node = ClientChannel::client(&mut endpoint)
         .await
         .unwrap()
         .store()
@@ -672,8 +669,7 @@ async fn model_job_restart_inner(provider_held: bool) {
     let _ = serving.await;
     assert_eq!(resumed.expect("the retained proposal is accepted"), id);
     assert_eq!(
-        endpoint
-            .client()
+        ClientChannel::client(&mut endpoint)
             .await
             .unwrap()
             .state()
@@ -682,8 +678,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         Some(JobPhase::Accepted),
     );
     assert_eq!(
-        endpoint
-            .client()
+        ClientChannel::client(&mut endpoint)
             .await
             .unwrap()
             .state()
