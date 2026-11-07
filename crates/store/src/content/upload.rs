@@ -374,6 +374,9 @@ impl UploadSession {
         }
         self.published = true;
         self.previous = Vec::new();
+        self.chunks = Vec::new();
+        self.descriptor_charge = None;
+        self.copy_charge = None;
         Ok(())
     }
     fn accept_inner(&mut self, bytes: &[u8]) -> Result<()> {
