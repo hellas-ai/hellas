@@ -648,6 +648,14 @@ const MAX_RESULT_RECEIPT_BYTES: usize =
     2 * hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES + 4096;
 
 impl ExecutionAttempt {
+    /// Paid sidecars follow the selected store's policy. Grant attempts live at
+    /// a caller-chosen path with no store policy and keep the durable write.
+    fn sidecar_durability(&self) -> hellas_private::Durability {
+        match &self.record {
+            AttemptRecord::Paid(purchase) => purchase.durability(),
+            AttemptRecord::Grant(_) => hellas_private::Durability::Power,
+        }
+    }
     fn sidecar(&self, suffix: &str) -> Result<PathBuf> {
         let name = self.path.file_name().ok_or(ExecutionError::Identity)?;
         let digest = Digest::hash(name.as_encoded_bytes());
@@ -705,9 +713,10 @@ impl ExecutionAttempt {
         let bytes =
             hellas_rpc::protocol::value::encode_bounded(&artifact, MAX_RESULT_RECEIPT_BYTES)
                 .map_err(|_| ExecutionError::Identity)?;
+        let durability = self.sidecar_durability();
         let path = self.sidecar(".result")?;
-        hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
-        hellas_private::write_atomically(&path, ".writing", &bytes)?;
+        durability.create_dir_all(path.parent().ok_or(ExecutionError::Identity)?)?;
+        durability.write_atomically(&path, ".writing", &bytes)?;
         let receipt = CompletionReceipt {
             paid,
             format: WORK_COMPLETION_FORMAT.into(),
@@ -721,8 +730,7 @@ impl ExecutionAttempt {
             reported: false,
         };
         let path = self.sidecar(".receipt")?;
-        hellas_private::create_dir_all_durable(path.parent().ok_or(ExecutionError::Identity)?)?;
-        hellas_private::write_atomically(&path, ".writing", &serde_json::to_vec(&receipt)?)?;
+        durability.write_atomically(&path, ".writing", &serde_json::to_vec(&receipt)?)?;
         Ok(())
     }
     /// Read retained bytes locally; missing bytes are distinct from execution status.
@@ -797,7 +805,7 @@ impl ExecutionAttempt {
             .ok_or(ExecutionError::RecoveryRequired)?;
         if !receipt.reported {
             receipt.reported = true;
-            hellas_private::write_atomically(
+            self.sidecar_durability().write_atomically(
                 &self.sidecar(".receipt")?,
                 ".writing",
                 &serde_json::to_vec(&receipt)?,

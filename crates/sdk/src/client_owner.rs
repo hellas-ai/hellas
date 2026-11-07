@@ -14,6 +14,7 @@ use hellas_kernel::{
     CoinId, Decode as _, Encode as _, Funding, Key, List, NetworkId, Reshape, Secp256k1Verifier,
     SigVerifier, Tx,
 };
+use hellas_private::StoreLocation;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -55,7 +56,7 @@ pub struct ClientOwner {
     principal: PrincipalId,
     owner: Key,
     delegate: Key,
-    root: PathBuf,
+    root: StoreLocation,
     serial: tokio::sync::Mutex<()>,
     _writer: std::fs::File,
 }
@@ -217,12 +218,12 @@ impl ClientOwner {
         let principal =
             PrincipalId::from_public_key(hellas_auth::PublicKey::P256(public.to_compressed()))?;
         let owner = Key::from_bytes(public.to_compressed());
-        let root = chain.client().join("owners").join(format!(
+        let root = chain.client().child("owners").child(format!(
             "{}-{}",
             hex::encode(owner.to_bytes()),
             hex::encode(delegate.to_bytes())
         ));
-        hellas_private::create_dir_all_durable(&root)?;
+        root.durability().create_dir_all(&root)?;
         let writer = hellas_private::open_lock_beside(&root.join("writer"))?;
         writer
             .try_lock()
@@ -314,8 +315,10 @@ impl ClientOwner {
         Ok(records)
     }
 
-    fn write(path: &Path, record: &Record) -> Result<(), ClientOwnerError> {
-        hellas_private::write_atomically(path, ".pending", &serde_json::to_vec(record)?)?;
+    fn write(&self, path: &Path, record: &Record) -> Result<(), ClientOwnerError> {
+        self.root
+            .durability()
+            .write_atomically(path, ".pending", &serde_json::to_vec(record)?)?;
         Ok(())
     }
 
@@ -339,7 +342,7 @@ impl ClientOwner {
                 return Err(ClientOwnerError::Record("offer funding differs"));
             }
             record.state = FundingState::Offered;
-            Self::write(&path, &record)?;
+            self.write(&path, &record)?;
         }
         Ok(())
     }
@@ -454,7 +457,7 @@ impl ClientOwner {
                         .as_ref()
                         .is_none_or(|active| active.reservation != Some(reservation))
                     {
-                        Self::write(&path, &record)?;
+                        self.write(&path, &record)?;
                     }
                 }
             }
@@ -494,7 +497,7 @@ impl ClientOwner {
                         {
                             Err(ClientOwnerError::InputsSpent) => {
                                 record.state = FundingState::Conflicted;
-                                Self::write(&path, &record)?;
+                                self.write(&path, &record)?;
                                 return Err(ClientOwnerError::InputsSpent);
                             }
                             result => result?,
@@ -566,20 +569,20 @@ impl ClientOwner {
             };
             if let Some(reservation) = reservation {
                 let history = self.root.join("funding-intents");
-                hellas_private::create_dir_all_durable(&history)?;
+                self.root.durability().create_dir_all(&history)?;
                 let archive = history.join(format!("{}.json", hex::encode(reservation)));
                 if archive.try_exists()? {
                     return Err(ClientOwnerError::Record("reservation identity reused"));
                 }
-                Self::write(&archive, &record)?;
+                self.write(&archive, &record)?;
             }
-            Self::write(&path, &record)?;
+            self.write(&path, &record)?;
             let result = self.finish(chain, network, &reshape, floor, poll).await;
             if matches!(result, Err(ClientOwnerError::InputsSpent)) {
                 for (found, mut record, _) in self.records()? {
                     if found == path {
                         record.state = FundingState::Conflicted;
-                        Self::write(&path, &record)?;
+                        self.write(&path, &record)?;
                     }
                 }
             }
