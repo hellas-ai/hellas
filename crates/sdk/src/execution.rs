@@ -960,10 +960,6 @@ impl ExecutionAttempt {
 impl<'a> ExecutionSession<'a> {
     /// Reconcile only the bound work. This never allocates a nonce or proposes
     /// another execution, though a previously verified paid result may be paid.
-    /// Original-format markers with a work ID retain exact-work recovery.
-    /// Without that ID or a per-attempt request binding, a reused channel nonce
-    /// is ambiguous even for identical input. Recovery then returns
-    /// `PurchaseError::Unfinished` and leaves the attempt unchanged.
     pub async fn recover(&mut self, attempt: &mut ExecutionAttempt) -> Result<ExecutionFacts> {
         match (self, &mut attempt.record) {
             (Self::Paid(session), AttemptRecord::Paid(purchase)) => {

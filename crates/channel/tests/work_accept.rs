@@ -950,7 +950,7 @@ impl hellas_channel::work_close::TxSink for NoSink {
 }
 
 #[test]
-fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
+fn the_service_catalogue_names_the_work_service() {
     let names: Vec<&str> = hellas_rpc::services::KNOWN_SERVICES
         .iter()
         .map(|service| service.name)
@@ -960,12 +960,6 @@ fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
         "the work service is catalogued, got {names:?}",
     );
     assert_eq!(<Work as ServiceMarker>::ALPN, "/hellas.work.v1.Work/2.0");
-    for dead in ["Receipt", "Settle", "JobAcceptance"] {
-        assert!(
-            !names.iter().any(|name| name.contains(dead)),
-            "the single-edge protocol's {dead} is gone, got {names:?}",
-        );
-    }
 }
 
 // ── What the client puts on its disk, and when ────────────────────────

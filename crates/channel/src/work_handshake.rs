@@ -611,9 +611,9 @@ impl DerefMut for SetupGuard<'_> {
 /// Positive rather than absent, exactly as `WorkService`'s channel
 /// driver is: a step submits an Open, records a marker, or mounts a
 /// channel, and two of them running at once would do those things twice.
-/// The `&mut SetupStore` a caller used to hold said the same thing by
-/// owning the store; this says it while the store stays behind the lock
-/// that keeps the ALPN answering.
+/// A `&mut SetupStore` would say the same thing by owning the store; this
+/// says it while the store stays behind the lock that keeps the ALPN
+/// answering.
 ///
 /// The slot is returned by [`Drop`], which covers success, error, unwind
 /// and a dropped future.

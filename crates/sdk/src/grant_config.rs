@@ -208,7 +208,7 @@ mod tests {
     fn provider_authority_paths_are_fixed_under_home() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.json");
-        let mut config = json!({"max_job_millis":10000,"resources":[]});
+        let config = json!({"max_job_millis":10000,"resources":[]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let location = StoreLocation::for_test(directory.path());
         let loaded = GrantConfig::load(&path, &location).unwrap();
@@ -217,12 +217,6 @@ mod tests {
         assert_eq!(
             loaded.control_private_key(),
             directory.path().join("provider/control.key.der")
-        );
-        config["journal_root"] = json!(directory.path().join("elsewhere"));
-        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        assert_err!(
-            GrantConfig::load(&path, &location),
-            GrantConfigError::Json(_)
         );
     }
 

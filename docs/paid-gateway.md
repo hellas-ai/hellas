@@ -431,9 +431,10 @@ encoding, consensus rule, or response deadline. Live object-proof RPCs are not
 required. Funding is returned to application accounting only after verification
 of the finalized close receipt.
 
-For older journals, contest reconstruction covers the accepted start through
-the response deadline, or stops sooner after an accepted response. Each verified
-block advances durable `CloseHistoryAdvanced` journal progress. Cancellation,
+Contest history is retained as the channel is observed, from the start's
+inclusion block through the response deadline; adjudication can use it as soon
+as it holds an accepted response. Each verified block advances durable
+`CloseHistoryAdvanced` journal progress. Cancellation,
 restart, and checkpoint rotation preserve that progress, so repeated bounded
 attempts resume at the next unread block even with the maximum legal response
 window. Missing or inconsistent evidence remains an error. A source used as
@@ -441,11 +442,5 @@ window. Missing or inconsistent evidence remains an error. A source used as
 same pinned consensus chain; an unverified remote RPC connection does not meet
 that contract.
 
-The channel journal adds record tag **14** and an optional checkpoint tail for
-verified contest history. Existing checkpoints remain readable and require no
-separate migration. Once a new binary writes these records or checkpoints,
-binaries predating this extension cannot read that journal and fail closed.
-A software rollback must therefore retain support for this journal extension;
-replacing the binary with an older release is not a compatible rollback. Merely
-building or integrating this change does not upgrade running deployments or
-rewrite their journals.
+The channel journal records verified contest history under record tag **14**
+and in an optional checkpoint tail.
