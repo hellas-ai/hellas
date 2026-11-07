@@ -19,10 +19,6 @@ pub(crate) struct TrustedEpochs {
     verifiers: Arc<Vec<ConsensusVerifier>>,
 }
 impl TrustedEpochs {
-    #[cfg(test)]
-    pub fn new(trust: TrustDocument) -> Result<Self, TrustError> {
-        Self::with_genesis(trust, hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes())
-    }
     pub fn with_genesis(trust: TrustDocument, genesis_json: &[u8]) -> Result<Self, TrustError> {
         crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)
             .map_err(|error| TrustError::Schedule(error.to_string()))?;
@@ -142,7 +138,9 @@ mod tests {
                     },
                 ],
             };
-            let schedule = TrustedEpochs::new(trust.clone()).unwrap();
+            let schedule =
+                TrustedEpochs::with_genesis(trust.clone(), HELLAS_DEVNET_1_JSON.as_bytes())
+                    .unwrap();
             assert_eq!(schedule.first(Epoch::new(1)), Some(Height::new(2)));
             assert_eq!(schedule.last(Epoch::zero()), Some(Height::new(1)));
             assert!(schedule.scoped(Epoch::new(2)).is_none());
@@ -162,7 +160,11 @@ mod tests {
                 base.sync_target(),
                 Vec::new(),
             );
-            let verifier = crate::proof_verify::ProofVerifier::new(trust).unwrap();
+            let verifier = crate::proof_verify::ProofVerifier::with_genesis(
+                trust,
+                HELLAS_DEVNET_1_JSON.as_bytes(),
+            )
+            .unwrap();
             let check = |block: &HellasBlock, committee| {
                 let bundle = verifier.bundle(super::finalized_block(
                     block.clone(),

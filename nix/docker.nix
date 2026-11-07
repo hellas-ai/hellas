@@ -80,6 +80,7 @@ let
       ExposedPorts."31145/udp" = { };
       Env = [
         "HOME=/var/lib/hellas"
+        "HELLAS_HOME=/var/lib/hellas/.hellas"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       ]

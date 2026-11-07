@@ -54,21 +54,8 @@ impl FullNode {
         Self::start_inner(config, Indexing::Off).await
     }
     #[cfg(feature = "indexer-api")]
-    pub(crate) async fn start_indexed(
-        config: Config,
-        trust: hellas_genesis::TrustDocument,
-        genesis_json: Vec<u8>,
-        partition: String,
-    ) -> Result<Self, Error> {
-        Self::start_inner(
-            config,
-            Indexing::On {
-                trust,
-                genesis_json,
-                partition,
-            },
-        )
-        .await
+    pub(crate) async fn start_indexed(config: Config, partition: String) -> Result<Self, Error> {
+        Self::start_inner(config, Indexing::On { partition }).await
     }
     async fn start_inner(config: Config, indexing: Indexing) -> Result<Self, Error> {
         config.info()?;
@@ -78,7 +65,7 @@ impl FullNode {
         let thread = std::thread::Builder::new()
             .name("hellas-chain".into())
             .spawn(move || {
-                let runtime = runtime::Config::new().with_storage_directory(&config.storage_dir);
+                let runtime = runtime::Config::new().with_storage_directory(config.storage_dir());
                 runtime::Runner::new(runtime).start(move |context| async move {
                     let mut serving = tokio::task::JoinSet::new();
                     let opened = async {
@@ -86,19 +73,18 @@ impl FullNode {
                             .alpns(vec![ChainSync::ALPN.as_bytes().to_vec(), Node::ALPN.as_bytes().to_vec()])
                             .bind().await.map_err(storage)?;
                         let trust = match &indexing {
-                            Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(&config.genesis)).map_err(invalid)?)),
+                            Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(config.genesis())).map_err(invalid)?)),
                             #[cfg(feature = "indexer-api")]
-                            Indexing::On { trust, genesis_json, .. } => {
-                                let supplied: hellas_genesis::Genesis = serde_json::from_slice(genesis_json).map_err(invalid)?;
-                                if supplied != config.genesis || trust.epochs.first().is_none_or(|epoch| hex::decode(&epoch.threshold_identity).ok().as_ref() != Some(&config.threshold_identity)) {
-                                    return Err(invalid("index authority differs from node configuration"));
-                                }
-                                Trust::Schedule(crate::indexer::trusted_epochs::TrustedEpochs::with_genesis(trust.clone(), genesis_json).map_err(invalid)?, Arc::new(crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json).map_err(invalid)?))
+                            Indexing::On { .. } => {
+                                let profile = config.chain.profile();
+                                let trust = profile.trust().clone();
+                                let genesis_json = profile.genesis_json().as_bytes();
+                                Trust::Schedule(crate::indexer::trusted_epochs::TrustedEpochs::with_genesis(trust.clone(), genesis_json).map_err(invalid)?, Arc::new(crate::proof_verify::ProofVerifier::with_genesis(trust, genesis_json).map_err(invalid)?))
                             }
                         };
                         let network = Network::new(endpoint.clone(), trust);
                         for address in &config.peers { network.seed(address.clone()); }
-                        for validator in &config.genesis.validators {
+                        for validator in &config.genesis().validators {
                             if let Ok(raw) = hex::decode(&validator.public_key)
                                 && let Ok(raw) = <[u8; 32]>::try_from(raw.as_slice())
                                 && let Ok(id) = iroh::EndpointId::from_bytes(&raw) { network.add(id.into()); }
@@ -183,6 +169,10 @@ impl FullNode {
     }
     pub fn config(&self) -> &Config {
         &self.0.config
+    }
+
+    pub fn genesis_payload(&self) -> crate::domain::Digest {
+        self.0.core.genesis_payload
     }
     pub fn peer_registry(
         &self,

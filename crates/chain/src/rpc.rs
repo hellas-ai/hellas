@@ -825,10 +825,7 @@ impl LightClient for LocalLightClient {
                     for address in validators.iter() {
                         let result =
                             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                                crate::client::RemoteLightClient::connect(address.clone())
-                                    .await?
-                                    .submit_tx(tx.clone())
-                                    .await
+                                crate::client::forward_submission(address, tx.clone()).await
                             })
                             .await;
                         match result {

@@ -20,18 +20,15 @@ mod objects;
 #[derive(Clone)]
 pub struct RemoteLightClient {
     client: LightClientClientImpl<MuxTransport>,
-    verifier: Option<ConsensusVerifier>,
+    verifier: ConsensusVerifier,
     finalized_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
     applied_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
     objects: std::sync::Arc<commonware_utils::sync::AsyncMutex<Option<objects::View>>>,
 }
 
 impl RemoteLightClient {
-    pub(crate) fn pinned_network(&self) -> Result<hellas_kernel::NetworkId, QueryError> {
-        self.verifier
-            .as_ref()
-            .map(ConsensusVerifier::network)
-            .ok_or_else(|| QueryError::Remote("a pinned consensus verifier is required".into()))
+    pub(crate) fn pinned_network(&self) -> hellas_kernel::NetworkId {
+        self.verifier.network()
     }
 
     /// Notifications only wake the caller; subsequent reads verify their data.
@@ -44,10 +41,10 @@ impl RemoteLightClient {
             .map_err(QueryError::from)
     }
 
-    pub fn new(transport: MuxTransport) -> Self {
+    pub fn new(transport: MuxTransport, verifier: ConsensusVerifier) -> Self {
         Self {
             client: LightClientClientImpl::new(transport),
-            verifier: None,
+            verifier,
             finalized_height: Default::default(),
             applied_height: Default::default(),
             objects: Default::default(),
@@ -55,19 +52,12 @@ impl RemoteLightClient {
     }
 
     /// Connect to a WebSocket endpoint.
-    pub async fn connect(addr: impl Into<String>) -> Result<Self, QueryError> {
+    pub async fn connect(
+        addr: impl Into<String>,
+        verifier: ConsensusVerifier,
+    ) -> Result<Self, QueryError> {
         let addr = addr.into();
-        Ok(Self::new(connect_transport(&addr).await?))
-    }
-
-    /// Verify snapshots with an independently provisioned consensus authority.
-    /// Coin and edge records still need state proofs; this authenticates their snapshot only.
-    pub fn with_consensus_verifier(mut self, verifier: ConsensusVerifier) -> Self {
-        self.verifier = Some(verifier);
-        self.finalized_height = Default::default();
-        self.applied_height = Default::default();
-        self.objects = Default::default();
-        self
+        Ok(Self::new(connect_transport(&addr).await?, verifier))
     }
 
     /// Subscribe to the consensus activity stream.
@@ -134,8 +124,8 @@ impl RemoteLightClient {
         &self.client
     }
 
-    fn consensus_verifier(&self) -> Option<&ConsensusVerifier> {
-        self.verifier.as_ref()
+    fn consensus_verifier(&self) -> &ConsensusVerifier {
+        &self.verifier
     }
 }
 
@@ -160,26 +150,10 @@ impl LightClient for RemoteLightClient {
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
         let client = self.clone();
         async move {
-            if client.verifier.is_some() {
-                return Ok(client
-                    .get_latest_block()
-                    .await?
-                    .map(|snapshot| snapshot.state_root));
-            }
-            let response = client
-                .rpc_client()
-                .get_state_root(GetStateRootRequest {})
-                .await
-                .map_err(QueryError::from)?;
-            match response.state_root {
-                Some(bytes) => {
-                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-                        QueryError::Remote("state_root was not 32 bytes".to_string())
-                    })?;
-                    Ok(Some(Digest::from(arr)))
-                }
-                None => Ok(None),
-            }
+            Ok(client
+                .get_latest_block()
+                .await?
+                .map(|snapshot| snapshot.state_root))
         }
     }
 
@@ -266,7 +240,7 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
@@ -274,10 +248,8 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let latest = response.latest.map(latest_block_from_proto).transpose()?;
             if let Some(snapshot) = &latest {
-                authenticate_snapshot(&client, snapshot, verifier.as_ref()).await?;
-                if verifier.is_some() {
-                    record_progress(&progress, snapshot.height, true)?;
-                }
+                authenticate_snapshot(&client, snapshot, Some(&verifier)).await?;
+                record_progress(&progress, snapshot.height, true)?;
             }
             Ok(latest)
         }
@@ -289,7 +261,7 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let response = client
                 .get_finalized_block(finalized_block_query_to_proto(query))
@@ -297,11 +269,9 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let block = response
                 .block
-                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
+                .map(|block| finalized_block_from_proto(block, Some(&verifier)))
                 .transpose()?;
-            if let Some(block) = &block
-                && verifier.is_some()
-            {
+            if let Some(block) = &block {
                 record_progress(
                     &progress,
                     block.snapshot.height,
@@ -318,7 +288,7 @@ impl LightClient for RemoteLightClient {
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
         let progress = self.applied_height.clone();
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let response = client
                 .get_applied_finalized_block(finalized_block_query_to_proto(query))
@@ -326,7 +296,7 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let block = response
                 .block
-                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
+                .map(|block| finalized_block_from_proto(block, Some(&verifier)))
                 .transpose()?;
             if let Some(block) = &block {
                 let matches = match query {
@@ -340,9 +310,7 @@ impl LightClient for RemoteLightClient {
                     ));
                 }
             }
-            if let Some(block) = &block
-                && verifier.is_some()
-            {
+            if let Some(block) = &block {
                 record_progress(
                     &progress,
                     block.snapshot.height,
@@ -375,26 +343,7 @@ impl LightClient for RemoteLightClient {
                 })
             );
             let called = Timing::start();
-            let outcome = async {
-                if let Transaction::Kernel(KernelTx::Move {
-                    action: KernelMove::RespondPaymentClose(response),
-                }) = tx
-                {
-                    let mut bytes =
-                        vec![0_u8; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
-                    let written = response.write_to(&mut bytes);
-                    bytes.truncate(written);
-                    let response = client
-                        .submit_work_response(SubmitWorkResponseRequest { response: bytes })
-                        .await
-                        .map_err(QueryError::from)?;
-                    return submit_tx_outcome_from_proto(response.outcome);
-                }
-                let req = transaction_to_proto(tx)?;
-                let response = client.submit_tx(req).await.map_err(QueryError::from)?;
-                submit_tx_outcome_from_proto(response.outcome)
-            }
-            .await;
+            let outcome = submit_over(&client, tx).await;
             if let Some(ms) = called.ms() {
                 tracing::event!(
                     name: "rpc_ms",
@@ -448,7 +397,7 @@ impl LightClient for RemoteLightClient {
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let resp = client
                 .get_coins_by_owner(GetCoinsByOwnerRequest {
@@ -458,7 +407,7 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let listing = coin_listing_from_proto(resp)?;
             if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+                authenticate_snapshot(&client, &listing.snapshot, Some(&verifier)).await?;
             }
             Ok(listing)
         }
@@ -469,7 +418,7 @@ impl LightClient for RemoteLightClient {
         delegate: SettlementKey,
     ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let resp = client
                 .get_coins_by_delegate(GetCoinsByDelegateRequest {
@@ -479,7 +428,7 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let listing = coin_listing_from_proto(resp)?;
             if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+                authenticate_snapshot(&client, &listing.snapshot, Some(&verifier)).await?;
             }
             Ok(listing)
         }
@@ -490,7 +439,7 @@ impl LightClient for RemoteLightClient {
         owner: SettlementKey,
     ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send {
         let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
+        let verifier = self.consensus_verifier().clone();
         async move {
             let resp = client
                 .get_edges_by_owner(GetEdgesByOwnerRequest {
@@ -500,11 +449,58 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             let listing = owner_edges_from_proto(owner, resp)?;
             if let Some(listing) = &listing {
-                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+                authenticate_snapshot(&client, &listing.snapshot, Some(&verifier)).await?;
             }
             Ok(listing)
         }
     }
+}
+
+async fn submit_over(
+    client: &LightClientClientImpl<MuxTransport>,
+    tx: Transaction,
+) -> Result<DomainSubmitTxOutcome, QueryError> {
+    if let Transaction::Kernel(KernelTx::Move {
+        action: KernelMove::RespondPaymentClose(response),
+    }) = tx
+    {
+        let mut bytes = vec![0_u8; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
+        let written = response.write_to(&mut bytes);
+        bytes.truncate(written);
+        let response = client
+            .submit_work_response(SubmitWorkResponseRequest { response: bytes })
+            .await
+            .map_err(QueryError::from)?;
+        return submit_tx_outcome_from_proto(response.outcome);
+    }
+    let response = client
+        .submit_tx(transaction_to_proto(tx)?)
+        .await
+        .map_err(QueryError::from)?;
+    submit_tx_outcome_from_proto(response.outcome)
+}
+
+/// Full nodes only forward submissions; this path cannot return chain reads.
+pub(crate) async fn forward_submission(
+    address: &str,
+    tx: Transaction,
+) -> Result<DomainSubmitTxOutcome, QueryError> {
+    let transport = connect_transport(address).await?;
+    submit_over(&LightClientClientImpl::new(transport), tx).await
+}
+
+#[cfg(test)]
+pub(crate) fn test_consensus_verifier() -> ConsensusVerifier {
+    let profile = crate::genesis::ChainProfile::known(crate::genesis::Chain::Devnet);
+    ConsensusVerifier::new(
+        &ConsensusInfo {
+            network_id: profile.network_id().to_owned(),
+            validators: profile.validators().to_vec(),
+            threshold_identity: profile.static_threshold_identity().unwrap(),
+        },
+        profile.consensus_digest().into(),
+    )
+    .unwrap()
 }
 
 fn coin_listing_from_proto(resp: GetCoinsResponse) -> Result<Option<CoinListing>, QueryError> {

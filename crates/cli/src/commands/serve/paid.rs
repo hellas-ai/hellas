@@ -27,8 +27,6 @@ use {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PaidWorkFile {
-    /// JSON chain configuration for a custom network; omit for the shipped devnet.
-    chain_config: Option<PathBuf>,
     jobs_per_channel: u64,
     min_omit_response_blocks: u64,
     payment: JobPaymentPolicyV2,
@@ -156,17 +154,17 @@ impl PaidWork {
     /// not an assumed one.
     pub fn load(
         path: &Path,
-        root: PathBuf,
+        home: PathBuf,
         owner: Option<SoftPasskey>,
         fetch_config: Option<&Path>,
+        profile: hellas_chain::genesis::ChainProfile,
     ) -> CliResult<Self> {
         let file = PaidWorkFile::read(path)?;
-        let chain = match &file.chain_config {
-            Some(chain) => load_work_config(&path.parent().unwrap_or(Path::new(".")).join(chain))?,
-            None => hellas_sdk::client_chain::devnet(&root)?,
-        };
+        let chain = WorkConfig::for_chain(profile, &home)?;
+        let root = hellas_sdk::grant_config::GrantConfig::provider_dir(&home);
         let policy = file.checked_policy(path, fetch_config)?;
         hellas_private::create_dir_all_durable(&root)?;
+        hellas_private::create_dir_all_durable(&chain.chain.provider())?;
         Ok(Self {
             chain,
             root,
@@ -192,8 +190,9 @@ impl PaidWork {
             .context("paid startup requires a chain node")?;
         let chain = chain.clone();
         let key = work.settlement_key.clone();
-        let grants = grants
-            .unwrap_or_else(|| hellas_sdk::grant_config::GrantConfig::unconfigured(&self.root));
+        let grants = grants.unwrap_or_else(|| {
+            hellas_sdk::grant_config::GrantConfig::unconfigured(self.chain.chain.home())
+        });
         let credential = self
             .prepare(
                 &grants,
@@ -215,8 +214,14 @@ impl PaidWork {
             )?;
         }
         self.validate_fetch_admission(&provider.executor.fetch_routes)?;
-        let host =
-            super::configuration::start_host(provider, Some(grants), path, transport).await?;
+        let host = super::configuration::start_host(
+            provider,
+            Some(grants),
+            path,
+            transport,
+            self.chain.chain.home(),
+        )
+        .await?;
         let ready = async {
             self.preflight_stake(&chain, &key).await?;
             let admin = host
@@ -279,7 +284,7 @@ impl PaidWork {
             return Ok(());
         };
         let cap = self.policy.offers.max_stake_per_client;
-        let path = self.root.join("delegation.json");
+        let path = self.chain.chain.provider().join("delegation.json");
         if !path.try_exists()? {
             return Ok(());
         }
@@ -322,7 +327,7 @@ impl PaidWork {
         let network = hellas_authority::model::grant::grant_network();
         let bootstrap_path = self.root.join("bootstrap.json");
         let store = match NodeStore::open(
-            &config.journal_root,
+            &config.journal_root(),
             network,
             Some(enrollment.clone()),
             now,
@@ -391,21 +396,21 @@ impl PaidWork {
                     };
                     let (approval, secret) = approval.prepare(None)?;
                     let (certificate, private_key) = match (
-                        config.control_certificate.try_exists()?,
-                        config.control_private_key.try_exists()?,
+                        config.control_certificate().try_exists()?,
+                        config.control_private_key().try_exists()?,
                     ) {
                         (true, true) => {
                             profile::server_identity(
-                                &config.control_certificate,
-                                &config.control_private_key,
+                                &config.control_certificate(),
+                                &config.control_private_key(),
                             )?;
                             (
                                 hellas_private::read_bounded_regular_file(
-                                    &config.control_certificate,
+                                    &config.control_certificate(),
                                     64 * 1024,
                                 )?,
                                 hellas_private::read_bounded_regular_file(
-                                    &config.control_private_key,
+                                    &config.control_private_key(),
                                     64 * 1024,
                                 )?,
                             )
@@ -432,20 +437,20 @@ impl PaidWork {
                 )?;
                 // Resume either file publication from the same prepared pair.
                 for (path, bytes) in [
-                    (&config.control_certificate, &data.certificate),
-                    (&config.control_private_key, &data.private_key),
+                    (config.control_certificate(), &data.certificate),
+                    (config.control_private_key(), &data.private_key),
                 ] {
                     if path.try_exists()? {
                         ensure!(
-                            hellas_private::read_bounded_regular_file(path, 64 * 1024)? == *bytes,
+                            hellas_private::read_bounded_regular_file(&path, 64 * 1024)? == *bytes,
                             "paid control TLS differs from its saved initialization"
                         );
                     } else {
-                        publish(path, bytes)?;
+                        publish(&path, bytes)?;
                     }
                 }
                 NodeStore::bootstrap_prepared(
-                    &config.journal_root,
+                    &config.journal_root(),
                     network,
                     GrantId([0; 16]),
                     data.approval,
@@ -491,7 +496,7 @@ impl PaidWork {
         }
         let admin = self.root.join("admin.json");
         let bytes = serde_json::to_vec(
-            &serde_json::json!({ "authority": id, "authorization": authorization, "credential": std::path::absolute(&credential)?, "local": { "certificate": std::path::absolute(&config.control_certificate)?, "server_name": "localhost" } }),
+            &serde_json::json!({ "authority": id, "authorization": authorization, "credential": std::path::absolute(&credential)?, "local": { "certificate": std::path::absolute(config.control_certificate())?, "server_name": "localhost" } }),
         )?;
         hellas_private::write_atomically(&admin, ".new", &bytes)?;
         eprintln!("paid administration profile: {}", admin.display());
@@ -591,10 +596,10 @@ impl PaidWork {
             .as_ref()
             .context("stake delegation requires an owner passkey")?;
         let owner = signer.party_key();
-        let path = self.root.join("delegation.json");
-        let mut pins = Vec::from(hellas_chain::genesis_digest(&chain.config().genesis).as_ref());
-        pins.extend_from_slice(chain.config().genesis_payload.as_ref());
-        pins.extend_from_slice(&chain.config().threshold_identity);
+        let path = self.chain.chain.provider().join("delegation.json");
+        let mut pins = Vec::from(hellas_chain::genesis_digest(chain.config().genesis()).as_ref());
+        pins.extend_from_slice(chain.genesis_payload().as_ref());
+        pins.extend_from_slice(&chain.config().threshold_identity());
         let genesis = hex::encode(Digest::hash(&pins).as_bytes());
         let mut receipt: Delegation = if path.try_exists()? {
             serde_json::from_slice(&hellas_private::read_bounded_regular_file(
@@ -627,7 +632,7 @@ impl PaidWork {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
             let input = CoinId::from_bytes(input.0);
-            let network = hellas_kernel::NetworkId::new(&chain.config().genesis.network_id)
+            let network = hellas_kernel::NetworkId::new(&chain.config().genesis().network_id)
                 .context("invalid chain network")?;
             let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
                 &client,

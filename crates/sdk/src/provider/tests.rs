@@ -54,7 +54,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
         let state = fixture.root.path().join("state");
         drop(
             crate::test_node::bootstrap_node(
-                &state.join("grants"),
+                &crate::grant_config::GrantConfig::journal_dir(&state),
                 hellas_authority::model::grant::grant_network(),
                 Some(enrollment.clone()),
                 hellas_auth::authority::UnixMillis::now().unwrap(),
@@ -68,7 +68,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 identity,
                 enrollment,
                 root: root.clone(),
-                state_directory: state,
+                home: state,
                 routes,
                 fetch_max_in_flight: 1,
                 fetch_queue_capacity: 1,

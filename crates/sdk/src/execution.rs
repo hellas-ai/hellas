@@ -1,7 +1,7 @@
 //! Native work execution and caller-owned attempt tracking.
 use crate::job::{Job, JobInput};
 use crate::paid_client::{PaidWorkOptions, PaidWorkResult, PaidWorkSession};
-use crate::transact::{Purchase, PurchaseTarget};
+use crate::transact::{PaidAttemptPath, Purchase, PurchaseTarget};
 use hellas_auth::{Digest, ProducerSigningKey, authority::ResourceId};
 use hellas_channel::model::grant::ChannelId;
 use hellas_channel::model::work::PrivateRecord;
@@ -169,16 +169,47 @@ pub struct ExecutionAttempt {
 }
 impl ExecutionAttempt {
     pub fn open(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
-        Self::open_inner(path, input, terms, true)
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
+        Self::open_inner(path, None, input, terms, true)
     }
 
     /// Open only an existing attempt, failing closed if its record was lost.
     pub fn open_existing(path: &Path, input: &JobInput, terms: ExecutionTerms) -> Result<Self> {
-        Self::open_inner(path, input, terms, false)
+        if matches!(terms, ExecutionTerms::Paid { .. }) {
+            return Err(ExecutionError::Identity);
+        }
+        Self::open_inner(path, None, input, terms, false)
+    }
+
+    pub fn open_paid(path: &PaidAttemptPath, input: &JobInput, price: u64) -> Result<Self> {
+        Self::open_inner(
+            path.as_path(),
+            Some(path),
+            input,
+            ExecutionTerms::Paid { price },
+            true,
+        )
+    }
+
+    pub fn open_existing_paid(
+        path: &PaidAttemptPath,
+        input: &JobInput,
+        price: u64,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path.as_path(),
+            Some(path),
+            input,
+            ExecutionTerms::Paid { price },
+            false,
+        )
     }
 
     fn open_inner(
         path: &Path,
+        paid_path: Option<&PaidAttemptPath>,
         input: &JobInput,
         terms: ExecutionTerms,
         create: bool,
@@ -195,10 +226,11 @@ impl ExecutionAttempt {
         let record = match terms {
             ExecutionTerms::Paid { price } => {
                 let job = Job::from_input(price, input.clone())?;
+                let paid_path = paid_path.ok_or(ExecutionError::Identity)?;
                 AttemptRecord::Paid(if create {
-                    Purchase::open_tracked(path, &job)?
+                    Purchase::open_tracked(paid_path, &job)?
                 } else {
-                    Purchase::open_existing_tracked(path, &job)?
+                    Purchase::open_existing_tracked(paid_path, &job)?
                 })
             }
             ExecutionTerms::Grant { resource } => {
@@ -344,12 +376,15 @@ impl ExecutionAttempt {
         self.matches(input, terms)?;
         let job = Job::from_input(options.expected_price, input.clone())?;
         let target = PurchaseTarget {
-            network: options.config.chain.network.as_str().into(),
+            network: options.config.network().as_str().into(),
             provider: options.provider,
         };
         let AttemptRecord::Paid(purchase) = &mut self.record else {
             return Err(ExecutionError::Identity);
         };
+        purchase
+            .ensure_state_key(&options.config.chain.state_key())
+            .map_err(|_| ExecutionError::Identity)?;
         if purchase.has_target() && !purchase.matches_target(&target) {
             return Err(ExecutionError::Identity);
         }
@@ -423,9 +458,8 @@ impl<'a> ExecutionSession<'a> {
         observers: ExecutionObservers,
         mut attempt: Option<&mut ExecutionAttempt>,
     ) -> Result<ExecutionResult> {
-        if let Some(attempt) = attempt.as_deref_mut() {
+        if let Some(attempt) = attempt.as_deref() {
             attempt.matches(&input, terms)?;
-            attempt.newly_bound = false;
         }
         let result = match (self, terms) {
             (Self::Paid(session), ExecutionTerms::Paid { price }) => {
@@ -434,6 +468,9 @@ impl<'a> ExecutionSession<'a> {
                 let purchase = match attempt.as_deref_mut() {
                     Some(attempt) => match &mut attempt.record {
                         AttemptRecord::Paid(purchase) => {
+                            purchase
+                                .ensure_chain(session)
+                                .map_err(|_| ExecutionError::Identity)?;
                             let target = PurchaseTarget {
                                 network: target.network.as_str().into(),
                                 provider: target.provider,
@@ -441,6 +478,7 @@ impl<'a> ExecutionSession<'a> {
                             if !purchase.matches_target(&target) {
                                 return Err(ExecutionError::Identity);
                             }
+                            attempt.newly_bound = false;
                             purchase.bind_channel(
                                 session.descriptor().channel().id(),
                                 session.descriptor().bond_edge(),
@@ -927,9 +965,11 @@ impl<'a> ExecutionSession<'a> {
     /// is ambiguous even for identical input. Recovery then returns
     /// `PurchaseError::Unfinished` and leaves the attempt unchanged.
     pub async fn recover(&mut self, attempt: &mut ExecutionAttempt) -> Result<ExecutionFacts> {
-        attempt.newly_bound = false;
         match (self, &mut attempt.record) {
             (Self::Paid(session), AttemptRecord::Paid(purchase)) => {
+                purchase
+                    .ensure_chain(session)
+                    .map_err(|_| ExecutionError::Identity)?;
                 let target = session.execution_target();
                 if !purchase.matches_target(&PurchaseTarget {
                     network: target.network.as_str().into(),
@@ -937,6 +977,7 @@ impl<'a> ExecutionSession<'a> {
                 }) {
                     return Err(ExecutionError::Identity);
                 }
+                attempt.newly_bound = false;
                 purchase.bind_channel(
                     session.descriptor().channel().id(),
                     session.descriptor().bond_edge(),
@@ -966,6 +1007,7 @@ impl<'a> ExecutionSession<'a> {
                 }
             }
             (Self::Grant(session), AttemptRecord::Grant(tracker)) => {
+                attempt.newly_bound = false;
                 let target = session.execution_target()?;
                 if tracker.record.target.as_ref()
                     != Some(&GrantTarget {

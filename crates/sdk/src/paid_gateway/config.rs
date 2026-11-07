@@ -1,6 +1,6 @@
 use super::{PaidWorkOptions, PoolError, Result};
 use crate::trust_policy::TrustPolicyStore;
-use crate::work_config::load_work_config;
+use crate::work_config::WorkConfig;
 use hellas_rpc::Assurance;
 use serde::Deserialize;
 use std::{
@@ -10,9 +10,42 @@ use std::{
     time::Duration,
 };
 
+/// Per-provider routing and payment terms; the pool owns one shared chain.
+#[derive(Clone)]
+pub struct GatewayProviderOptions {
+    pub provider: hellas_client::ProviderAddress,
+    pub provider_addrs: Vec<SocketAddr>,
+    pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
+    pub assurance: Assurance,
+    pub expected_price: u64,
+    pub acceptance_blocks: u64,
+    pub terminal_blocks: u64,
+    pub payment_blocks: u64,
+    pub timeout: Option<Duration>,
+}
+
+impl GatewayProviderOptions {
+    pub fn with_config(self, config: WorkConfig) -> PaidWorkOptions {
+        PaidWorkOptions {
+            config,
+            journal_kind: crate::paid_client::PaidJournalKind::Gateway,
+            provider: self.provider,
+            provider_addrs: self.provider_addrs,
+            apple_trust: self.apple_trust,
+            assurance: self.assurance,
+            expected_price: self.expected_price,
+            acceptance_blocks: self.acceptance_blocks,
+            terminal_blocks: self.terminal_blocks,
+            payment_blocks: self.payment_blocks,
+            timeout: self.timeout,
+        }
+    }
+}
+
 /// Typed funding and admission options for an application-owned paid pool.
 pub struct PaidGatewayOptions {
-    pub providers: Vec<PaidWorkOptions>,
+    pub config: WorkConfig,
+    pub providers: Vec<GatewayProviderOptions>,
     pub max_pending_requests: usize,
 }
 
@@ -32,10 +65,13 @@ impl PaidGatewayOptions {
                 "max_pending_requests must be a positive supported semaphore capacity",
             ));
         }
-        let mut journals = BTreeSet::new();
+        self.config.clone().validate()?;
         let mut endpoints = BTreeSet::new();
         for provider in &self.providers {
-            provider.validate()?;
+            provider
+                .clone()
+                .with_config(self.config.clone())
+                .validate()?;
             if provider.timeout.is_none_or(|timeout| timeout.is_zero())
                 || provider.acceptance_blocks == 0
                 || provider.terminal_blocks == 0
@@ -43,14 +79,6 @@ impl PaidGatewayOptions {
             {
                 return Err(PoolError::Invalid(
                     "timeouts and deadline spans must be positive",
-                ));
-            }
-            if !provider.journal_root.is_absolute() {
-                return Err(PoolError::Invalid("journal_root must be absolute"));
-            }
-            if !journals.insert(&provider.journal_root) {
-                return Err(PoolError::Invalid(
-                    "paid providers must have distinct journal roots",
                 ));
             }
             if !endpoints.insert(provider.provider.node) {
@@ -62,8 +90,12 @@ impl PaidGatewayOptions {
 }
 
 /// Load the operator JSON format used by both CLI and native hosts. File paths
-/// must be absolute; existing assertion counters stay beside each channel journal.
-pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewayOptions> {
+/// must be absolute; assertion counters live in the shared process home.
+pub fn load_pool_options(
+    path: &Path,
+    assurance: Assurance,
+    config: WorkConfig,
+) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
         hellas_channel::work_store::journal::MAX_RECORD_BYTES,
@@ -80,17 +112,13 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
         .providers
         .into_iter()
         .map(|p| {
-            if !p.chain_config.is_absolute() {
-                return Err(PoolError::Invalid("chain_config must be absolute"));
-            }
-            let config = load_work_config(&p.chain_config)?;
             let apple_trust = match (&file.trust_store, &p.trust_policy) {
                 (Some(directory), Some(id)) if directory.is_absolute() => {
                     Some(TrustPolicyStore::new(directory).resolve(
                         id,
                         assurance,
                         std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-                            p.journal_root.join("apple-counters"),
+                            config.chain.home().join("apple-app-attest-open-counters"),
                         )),
                     )?)
                 }
@@ -102,9 +130,7 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                 }
             };
             let provider_addrs = p.provider_addrs;
-            Ok(PaidWorkOptions {
-                config,
-                journal_root: p.journal_root,
+            Ok(GatewayProviderOptions {
                 provider: p.provider,
                 provider_addrs,
                 apple_trust,
@@ -118,6 +144,7 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
         })
         .collect::<Result<_>>()?;
     let options = PaidGatewayOptions {
+        config,
         providers,
         max_pending_requests: file.max_pending_requests,
     };
@@ -160,8 +187,6 @@ const fn max_pending_requests() -> usize {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderFile {
-    chain_config: PathBuf,
-    journal_root: PathBuf,
     provider: hellas_client::ProviderAddress,
     #[serde(default)]
     provider_addrs: Vec<SocketAddr>,
@@ -173,8 +198,7 @@ struct ProviderFile {
 mod tests {
     use super::*;
     fn provider() -> serde_json::Value {
-        serde_json::json!({"chain_config":"/config/chain.json", "journal_root":"/state/client",
-            "provider":crate::test_support::address(iroh::SecretKey::from_bytes(&[4;32]).public()),
+        serde_json::json!({"provider":crate::test_support::address(iroh::SecretKey::from_bytes(&[4;32]).public()),
             "payment":10})
     }
     #[test]

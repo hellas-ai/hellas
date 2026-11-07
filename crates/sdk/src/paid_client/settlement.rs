@@ -230,7 +230,7 @@ async fn open_settlement(
     args.validate()?;
     args.config.clone().validate()?;
     let found =
-        hellas_channel::work_store::discover_setups(&args.journal_root, args.config.chain.network)
+        hellas_channel::work_store::discover_setups(&args.journal_root(), args.config.network())
             .await?;
     if !found.unidentified.is_empty()
         || !found
@@ -242,8 +242,8 @@ async fn open_settlement(
     }
     let verifier = Secp256k1Verifier::new();
     let setup = SetupStore::open_existing(
-        &args.journal_root,
-        args.config.chain.network,
+        &args.journal_root(),
+        args.config.network(),
         bond,
         Role::Client,
         &verifier,
@@ -270,7 +270,7 @@ async fn open_settlement(
         .origin()
         .ok_or(PaidClientError::MissingState("settlement channel origin"))?;
     let journal = ChannelStore::open_existing(
-        &args.journal_root,
+        &args.journal_root(),
         channel.clone(),
         descriptor.expected_settlement()?,
         Role::Client,

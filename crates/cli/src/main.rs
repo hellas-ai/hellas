@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate tracing;
 
-use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
@@ -43,7 +42,7 @@ fn validate_serve_assurance(
 /// commands create a local signing identity on first use.
 fn load_command_identity(
     command: &Commands,
-    path: Option<&Path>,
+    path: &Path,
 ) -> anyhow::Result<identity::LocalIdentity> {
     let grant_identity = matches!(
         command,
@@ -89,7 +88,7 @@ struct RemoteTrustArgs {
 }
 
 impl RemoteTrustArgs {
-    fn load(&self) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
+    fn load(&self, home: &Path) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
         let directory = self
             .trust_store
             .as_ref()
@@ -102,7 +101,7 @@ impl RemoteTrustArgs {
             hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
                 id,
                 self.assurance,
-                identity::assertion_counters()?,
+                identity::assertion_counters(home)?,
             )?,
         )
     }
@@ -113,10 +112,16 @@ impl RemoteTrustArgs {
 #[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Path to the versioned local identity for commands that use one
-    /// (default: $HOME/.hellas/identity).
-    #[arg(long = "identity", global = true)]
-    identity: Option<PathBuf>,
+    /// Select a compiled chain (default: the most senior compiled chain).
+    #[arg(long, global = true, conflicts_with = "chain_config")]
+    chain: Option<String>,
+
+    /// Complete independently authenticated custom chain profile.
+    #[arg(long, global = true, value_name = "FILE")]
+    chain_config: Option<PathBuf>,
+    /// Process state home (default: HELLAS_HOME or $HOME/.hellas).
+    #[arg(long, global = true, value_name = "DIR")]
+    home: Option<PathBuf>,
 
     /// Choose the software platform root when a command creates an identity.
     #[arg(long = "software-root", global = true)]
@@ -158,26 +163,15 @@ enum IdentityCommand {
 #[derive(Subcommand)]
 enum CodexAuthCommand {
     /// Sign in to Codex with device-code OAuth and store credentials locally
-    Login {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
-    },
+    Login,
     /// Import credentials from an existing Codex CLI auth file
     Import {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
         /// Source auth file (default: $HOME/.codex/auth.json)
         #[arg(long = "from")]
         source_path: Option<PathBuf>,
     },
     /// Show whether local Codex credentials are configured
-    Status {
-        /// Codex auth store path (default: $HOME/.hellas/codex-auth.json)
-        #[arg(long = "auth-path")]
-        auth_path: Option<PathBuf>,
-    },
+    Status,
 }
 
 // Parsed once at startup and immediately destructured; boxing the large
@@ -238,9 +232,9 @@ enum Commands {
         /// Serve a converted Whisper model with model-pinned grants and one concurrent job.
         #[arg(long, requires = "await_owner", conflicts_with = "grant_config_file")]
         audio_model: Option<PathBuf>,
-        /// Wait for one owner pairing if uninitialized; use this directory for node state.
-        #[arg(long, num_args = 0..=1, default_missing_value = ".")]
-        await_owner: Option<PathBuf>,
+        /// Wait for one owner pairing if the home provider authority is uninitialized.
+        #[arg(long)]
+        await_owner: bool,
         #[cfg(feature = "otel")]
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
@@ -316,9 +310,6 @@ enum Commands {
         /// resource supplies its own routes.
         #[arg(long, value_name = "FILE")]
         http_fetch_config: Option<PathBuf>,
-        /// Request/response archive directory (default: ~/.hellas/gateway-archive).
-        #[arg(long, value_name = "DIRECTORY")]
-        archive_dir: Option<PathBuf>,
         /// Disable payload archives and require ZDR for every HTTP request.
         #[arg(long)]
         zdr: bool,
@@ -403,9 +394,6 @@ enum Commands {
     Image(commands::transact::ImageArgs),
     /// Inspect and fill the content store
     Store {
-        /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
-        #[arg(long, global = true)]
-        store_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: commands::store::StoreCommand,
     },
@@ -435,11 +423,7 @@ enum Commands {
     },
 }
 
-fn validate_identity_options(
-    command: &Commands,
-    identity: Option<&Path>,
-    software_root: bool,
-) -> Result<(), String> {
+fn validate_identity_options(command: &Commands, software_root: bool) -> Result<(), String> {
     let identity_free = match command {
         Commands::Admin(commands::admin::AdminArgs {
             command: commands::admin::AdminCommand::InspectOffline { .. },
@@ -461,16 +445,10 @@ fn validate_identity_options(
         _ => None,
     };
     if let Some(name) = identity_free
-        && (identity.is_some() || software_root)
+        && software_root
     {
-        let options = match (identity.is_some(), software_root) {
-            (true, true) => "--identity and --software-root",
-            (true, false) => "--identity",
-            (false, true) => "--software-root",
-            (false, false) => unreachable!("an identity option was present"),
-        };
         return Err(format!(
-            "{options} cannot be used with `{name}`; that command does not use a Hellas identity"
+            "--software-root cannot be used with `{name}`; that command does not use a Hellas identity"
         ));
     }
 
@@ -539,9 +517,33 @@ async fn async_main() {
     // (which print to stderr regardless) are the only thing that
     // bypasses the requested log file.
     let cli = Cli::parse();
-    if let Err(error) =
-        validate_identity_options(&cli.command, cli.identity.as_deref(), cli.software_root)
-    {
+    let home = match identity::resolve_home(cli.home.as_deref()) {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(2);
+        }
+    };
+    let identity_path = home.join("identity");
+    let selected_chain = if let Some(path) = &cli.chain_config {
+        hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
+    } else if let Some(name) = &cli.chain {
+        hellas_chain::genesis::Chain::parse(name)
+            .map(hellas_chain::genesis::ChainProfile::known)
+            .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}"))
+    } else {
+        Ok(hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Chain::default(),
+        ))
+    };
+    let selected_chain = match selected_chain {
+        Ok(chain) => chain,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = validate_identity_options(&cli.command, cli.software_root) {
         eprintln!("error: {error}");
         std::process::exit(2);
     }
@@ -595,20 +597,16 @@ async fn async_main() {
         fetch_config_file,
         grant_config_file,
         audio_model,
-        await_owner,
         ..
     } = &cli.command
     {
         let result = if let Some(model) = audio_model {
-            commands::serve::audio_model::configure(
-                model,
-                await_owner.as_deref().unwrap_or(Path::new(".")),
-            )
-            .map(|_| ())
+            commands::serve::audio_model::configure(model, &home).map(|_| ())
         } else {
             commands::serve::validate_provider_config(
                 fetch_config_file.as_deref(),
                 grant_config_file.as_deref(),
+                &home,
             )
         };
         tracer_provider.shutdown();
@@ -634,9 +632,9 @@ async fn async_main() {
             }
     );
     let owner = match if persistent_owner {
-        cli.owner.load_persistent(cli.identity.as_deref())
+        cli.owner.load_persistent(&home, &selected_chain)
     } else {
-        cli.owner.load()
+        cli.owner.load(&selected_chain)
     } {
         Ok(owner) => owner,
         Err(error) => {
@@ -650,18 +648,14 @@ async fn async_main() {
 
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {
-            CodexAuthCommand::Login { auth_path } => {
-                commands::codex_auth::login(auth_path.as_deref()).await
+            CodexAuthCommand::Login => {
+                commands::codex_auth::login(&home.join("codex-auth.json")).await
             }
-            CodexAuthCommand::Import {
-                auth_path,
-                source_path,
-            } => {
-                commands::codex_auth::import_codex_cli(auth_path.as_deref(), source_path.as_deref())
-            }
-            CodexAuthCommand::Status { auth_path } => {
-                commands::codex_auth::status(auth_path.as_deref())
-            }
+            CodexAuthCommand::Import { source_path } => commands::codex_auth::import_codex_cli(
+                &home.join("codex-auth.json"),
+                source_path.as_deref(),
+            ),
+            CodexAuthCommand::Status => commands::codex_auth::status(&home.join("codex-auth.json")),
         };
         tracer_provider.shutdown();
         if let Err(err) = result {
@@ -707,10 +701,10 @@ async fn async_main() {
             let result: anyhow::Result<()> = async {
                 match command {
                     Commands::Contact { command } => {
-                        commands::contributions::contact(command, passkey).await
+                        commands::contributions::contact(command, passkey, &home).await
                     }
                     Commands::Offer { command } => {
-                        commands::contributions::offer(command, passkey, None)
+                        commands::contributions::offer(command, passkey, None, &home)
                     }
                     _ => Ok(()),
                 }
@@ -764,8 +758,8 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Store { command, store_dir } => {
-            let result = commands::store::run(command, store_dir).await;
+        Commands::Store { command } => {
+            let result = commands::store::run(command, &home).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -778,7 +772,8 @@ async fn async_main() {
 
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command, owner.as_ref()).await;
+            let result =
+                commands::chain::run(command, owner.as_ref(), &selected_chain, &home).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -791,7 +786,7 @@ async fn async_main() {
 
     // Before anything binds, and before any other startup work: a
     // command that cannot have an identity has nothing further to do.
-    let local_identity = match load_command_identity(&command, cli.identity.as_deref()) {
+    let local_identity = match load_command_identity(&command, &identity_path) {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -812,12 +807,12 @@ async fn async_main() {
 
     let result = match command {
         Commands::Offer { command } => {
-            commands::contributions::offer(command, passkey, Some(&local_identity.node_key))
+            commands::contributions::offer(command, passkey, Some(&local_identity.node_key), &home)
         }
         Commands::Contact { .. } => {
             unreachable!("contact commands handled before identity load")
         }
-        Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
+        Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey, &home).await,
 
         Commands::Serve {
             mut native,
@@ -848,9 +843,10 @@ async fn async_main() {
                 .map(|path| {
                     commands::serve::paid::PaidWork::load(
                         path,
-                        identity::provider_root(cli.identity.as_deref())?,
+                        home.clone(),
                         owner.clone(),
                         fetch_config_file.as_deref(),
+                        selected_chain.clone(),
                     )
                 })
                 .transpose()
@@ -868,49 +864,39 @@ async fn async_main() {
                                 assurance == hellas_rpc::Assurance::ProducerSigned,
                                 "grants require producer-signed assurance"
                             );
-                            let root = passkey
-                                .map(commands::contributions::principal)
-                                .transpose()?
-                                .map(|owner| commands::contributions::data_root(&owner))
-                                .transpose()?;
-                            let config =
-                                hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
+                            let config = hellas_sdk::grant_config::GrantConfig::load(path, &home)?;
                             Some(config)
                         } else if let Some(model) = audio_model.as_deref() {
                             anyhow::ensure!(
                                 assurance == hellas_rpc::Assurance::ProducerSigned,
                                 "grants require producer-signed assurance"
                             );
-                            let root = std::path::absolute(
-                                await_owner
-                                    .as_ref()
-                                    .context("--audio-model requires --await-owner")?,
-                            )?;
                             native
                                 .content_paths
                                 .push(model.join(hellas_client::model::whisper::WEIGHTS_FILE));
-                            Some(commands::serve::audio_model::configure(model, &root)?)
+                            Some(commands::serve::audio_model::configure(model, &home)?)
                         } else {
                             None
                         };
 
-                        let (grants, transport) = match await_owner.as_deref() {
-                            Some(root) => {
-                                let (grants, transport) = commands::serve::bootstrap::prepare(
-                                    root,
-                                    &local_identity,
-                                    port,
-                                    grants,
-                                )
-                                .await?;
-                                (Some(grants), transport)
-                            }
-                            None => (grants, None),
+                        let (grants, transport) = if await_owner {
+                            let (grants, transport) = commands::serve::bootstrap::prepare(
+                                &home,
+                                &local_identity,
+                                port,
+                                grants,
+                            )
+                            .await?;
+                            (Some(grants), transport)
+                        } else {
+                            (grants, None)
                         };
-                        let fetch_config_file = match (fetch_config_file, await_owner.as_deref()) {
+                        let fetch_config_file = match (fetch_config_file, await_owner) {
                             (Some(path), _) => Some(path),
-                            (None, Some(root)) => {
-                                let path = std::path::absolute(root)?.join("fetch.json");
+                            (None, true) => {
+                                let path =
+                                    hellas_sdk::grant_config::GrantConfig::provider_dir(&home)
+                                        .join("fetch.json");
                                 if !path.try_exists()? {
                                     hellas_private::write_atomically(
                                         &path,
@@ -920,9 +906,10 @@ async fn async_main() {
                                 }
                                 Some(path)
                             }
-                            (None, None) => None,
+                            (None, false) => None,
                         };
                         commands::serve::run(commands::serve::ServeOptions {
+                            home: home.clone(),
                             transport,
                             port,
                             discovery: !no_discovery,
@@ -961,7 +948,6 @@ async fn async_main() {
             grant_policy,
             work_profile,
             http_fetch_config,
-            archive_dir,
             zdr,
             paid_work_config,
             gateway_profile,
@@ -982,13 +968,14 @@ async fn async_main() {
             let assurance = remote_trust.assurance;
             let pool_options = if let Some(path) = grant_pool_config.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
-                let root = commands::contributions::data_root(&client)?;
+                let root = commands::contributions::data_root(&home, &client)?;
                 let trust_directory = remote_trust
                     .trust_store
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("--trust-store is required for a grant pool"))?;
                 Some(commands::grant_gateway::load_pool(
                     path,
+                    &home,
                     &root,
                     trust_directory,
                     &local_identity,
@@ -1022,18 +1009,19 @@ async fn async_main() {
             };
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
-                let offer = commands::contributions::load_offer(&client, name)?;
+                let offer = commands::contributions::load_offer(&home, &client, name)?;
                 let target = hellas_sdk::grant_client::UnpinnedOffer::decode(
                     &offer.encode()?,
                     hellas_auth::authority::UnixMillis(0),
                 )?
-                .pin(&remote_trust.load()?)?;
+                .pin(&remote_trust.load(&home)?)?;
                 anyhow::ensure!(
                     assurance == target.trust().required_assurance,
                     "requested assurance differs from the pinned grant provider"
                 );
                 Some((
                     commands::grant_gateway::session(
+                        &home,
                         target,
                         &local_identity,
                         client,
@@ -1050,12 +1038,13 @@ async fn async_main() {
                 );
                 Some(
                     commands::grant_gateway::local::prepare(
+                        &home,
                         grant,
                         native,
                         &local_identity,
                         commands::contributions::require_principal(passkey)?,
                         work_application()?,
-                        remote_trust.load()?,
+                        remote_trust.load(&home)?,
                     )
                     .await?,
                 )
@@ -1122,9 +1111,7 @@ async fn async_main() {
                 server: hellas_gateway::ServerOptions {
                     access,
                     archive: hellas_gateway::ArchiveOptions {
-                        directory: archive_dir
-                            .map(Ok)
-                            .unwrap_or_else(identity::default_gateway_archive_path)?,
+                        directory: home.join("gateway-archive"),
                         zdr,
                     },
                     allow_remote,
@@ -1174,14 +1161,17 @@ async fn async_main() {
                     serve.http.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                     "token-native paid work uses producer-signed assurance"
                 );
-                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                let config =
+                    hellas_sdk::work_config::WorkConfig::for_chain(selected_chain.clone(), &home)?;
+                let client_chain = config.chain.clone();
+                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance, config)?;
                 let passkey = owner.clone().ok_or_else(|| {
                     anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
                 })?;
                 let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
                     std::sync::Arc::new(passkey),
                     identity::settlement_signer(&local_identity)?.party_key(),
-                    &identity::funding_root(cli.identity.as_deref())?,
+                    &client_chain,
                 )?);
                 let paid = hellas_sdk::paid_gateway::PaidGateway::open(
                     options,
@@ -1218,7 +1208,8 @@ async fn async_main() {
                     commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
-                        cli.identity.as_deref(),
+                        &home,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1232,7 +1223,8 @@ async fn async_main() {
                     commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
-                        cli.identity.as_deref(),
+                        &home,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1246,7 +1238,8 @@ async fn async_main() {
                     commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
-                        cli.identity.as_deref(),
+                        &home,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1260,7 +1253,8 @@ async fn async_main() {
                     commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
-                        cli.identity.as_deref(),
+                        &home,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -1274,7 +1268,8 @@ async fn async_main() {
                     commands::transact::Context::new(
                         &local_identity,
                         owner.as_ref(),
-                        cli.identity.as_deref(),
+                        &home,
+                        &selected_chain,
                     )?,
                 )
                 .await

@@ -23,7 +23,7 @@ pub(super) struct CodexResponsesFetchProvider {
 }
 
 impl CodexResponsesFetchProvider {
-    pub(super) fn new(auth_path: Option<&Path>) -> anyhow::Result<Self> {
+    pub(super) fn new(auth_path: &Path) -> anyhow::Result<Self> {
         let auth = CodexAuthStore::new(auth_path)?;
         let account_id = auth.account_id()?;
         Ok(Self {

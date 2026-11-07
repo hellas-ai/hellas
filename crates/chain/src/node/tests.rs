@@ -75,15 +75,27 @@ impl Fixture {
             target,
             crate::genesis_digest(&genesis),
         );
-        let config = Config {
-            genesis,
-            threshold_identity: committee.assembler.identity().encode().to_vec(),
-            genesis_payload: head.digest(),
-            storage_dir: directory.to_path_buf(),
-            validators: vec![],
-            peers: vec![],
-            archive_blocks: None,
-        };
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
+        let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+            .trust()
+            .clone();
+        trust.network_id = genesis.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+            trust,
+            validators: vec!["ws://unused.invalid".into()],
+            genesis_json,
+        })
+        .unwrap();
+        let mut config = Config::for_profile(
+            crate::chain_dir::ChainDir::open(directory, &profile).unwrap(),
+            vec![],
+            None,
+        )
+        .unwrap();
+        config.validators.clear();
         let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(
             runtime.child("producer"),
             utxo_db_config(&runtime, "producer", 4096, 128),
@@ -101,7 +113,7 @@ impl Fixture {
         let height = self.head.height().get() + 1;
         let batch = crate::execution::execute_all(
             hellas_kernel::Context::with_fees(
-                crate::domain::network_id(&self.config.genesis).unwrap(),
+                crate::domain::network_id(self.config.genesis()).unwrap(),
                 hellas_kernel::BlockHeight::new(height),
                 hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
                 domain::KERNEL_FEES,
@@ -286,7 +298,11 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         apply(&seed, block.clone()).await.unwrap();
         let block2 = fixture.next().await;
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("relay");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("relay"),
+            config.chain.profile(),
+        )
+        .unwrap();
         config.peers = vec![seed.endpoint_addr()];
         let a = FullNode::start(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(20), a.wait_ready())
@@ -303,7 +319,9 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         .unwrap();
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("b");
+        config.chain =
+            crate::chain_dir::ChainDir::open(&directory.path().join("b"), config.chain.profile())
+                .unwrap();
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
         let b = FullNode::start(config).await.unwrap();
@@ -470,12 +488,6 @@ fn a_state_directory_has_one_writer_and_retained_views_stop_on_shutdown() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong_genesis = fixture.config.clone();
-        wrong_genesis.genesis_payload = [0xff; 32].into();
-        assert!(matches!(
-            FullNode::start(wrong_genesis).await,
-            Err(Error::Config(_))
-        ));
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         assert!(matches!(
             FullNode::start(fixture.config.clone()).await,
@@ -620,11 +632,15 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
                 None,
             );
             let (endpoint, serving) = serve_source(server).await;
-            fixture.config.storage_dir = directory.path().join(if corrupt_certificate {
-                "bad-certificate"
-            } else {
-                "bad-block"
-            });
+            fixture.config.chain = crate::chain_dir::ChainDir::open(
+                &directory.path().join(if corrupt_certificate {
+                    "bad-certificate"
+                } else {
+                    "bad-block"
+                }),
+                fixture.config.chain.profile(),
+            )
+            .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
             let node = FullNode::start(fixture.config.clone()).await.unwrap();
             tokio::time::timeout(Duration::from_secs(15), async {
@@ -669,37 +685,19 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
 #[cfg(feature = "indexer-api")]
 #[test]
 fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state() {
-    use commonware_cryptography::{Hasher as _, Sha256};
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new_in(
             runtime,
             directory.path(),
-            hellas_kernel::NetworkId::new(hellas_genesis::HELLAS_DEVNET_1_ID).unwrap(),
+            hellas_kernel::NetworkId::new("custom-indexed-node").unwrap(),
             5000,
         )
         .await;
         fixture.config.archive_blocks = NonZeroU64::new(1);
-        let json = serde_json::to_vec(&fixture.config.genesis).unwrap();
-        let trust = hellas_genesis::TrustDocument {
-            schema_version: 1,
-            network_id: fixture.config.genesis.network_id.clone(),
-            genesis_sha256: hex::encode(Sha256::hash(&json)),
-            epochs: vec![hellas_genesis::TrustEpoch {
-                epoch: 0,
-                start_height: 0,
-                end_height: None,
-                threshold_identity: hex::encode(&fixture.config.threshold_identity),
-            }],
-        };
-        let node = FullNode::start_indexed(
-            fixture.config.clone(),
-            trust.clone(),
-            json.clone(),
-            "read".into(),
-        )
-        .await
-        .unwrap();
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
+            .await
+            .unwrap();
         let mut last = fixture.next().await;
         apply(&node, last.clone()).await.unwrap();
         for _ in 1..3 {
@@ -721,7 +719,7 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
         assert_eq!(coins.coins.len(), 1);
         assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
-        let node = FullNode::start_indexed(fixture.config.clone(), trust, json, "read".into())
+        let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
             .await
             .unwrap();
         assert!(node.view().is_err());
@@ -867,7 +865,11 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
             endpoints.push(endpoint);
         }
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("replica");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("replica"),
+            config.chain.profile(),
+        )
+        .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
         let starting = tokio::spawn(FullNode::start(config));
         tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
@@ -928,28 +930,25 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
 }
 
 #[test]
-fn provisioned_anchor_and_directory_identity_cannot_be_replaced_by_a_peer() {
+fn provisioned_anchor_ignores_legacy_chain_directory() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(runtime, directory.path()).await;
-        let mut wrong = fixture.config.clone();
-        wrong.genesis_payload = Digest::from([99; 32]);
-        assert!(matches!(
-            FullNode::start(wrong).await,
-            Err(Error::Config(_))
-        ));
+        let legacy = directory.path().join("chain/legacy-network");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old-state"), b"obsolete").unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.shutdown().await.unwrap();
-        let mut wrong = fixture.config;
-        wrong.threshold_identity = consensus_fixture(100)
-            .assembler
-            .identity()
-            .encode()
-            .to_vec();
-        assert!(matches!(
-            FullNode::start(wrong).await,
-            Err(Error::Storage(_))
-        ));
+        assert_eq!(
+            std::fs::read(legacy.join("old-state")).unwrap(),
+            b"obsolete"
+        );
+        assert!(
+            fixture
+                .config
+                .storage_dir()
+                .starts_with(directory.path().join("chains"))
+        );
     });
 }
 
@@ -980,18 +979,18 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         // the full node's directory. Feed a committee certificate without
         // starting a second consensus network inside this storage-role test.
         tokio::task::spawn_blocking(move || {
-            let _lock = pipeline::lock(&config.storage_dir).unwrap();
+            let _lock = pipeline::lock(&config.storage_dir()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(&config.storage_dir),
+                runtime::Config::new().with_storage_directory(config.storage_dir()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
                 let mut app = crate::Application::new(
                     context.child("app"),
-                    domain::network_id(&config.genesis).unwrap(),
-                    crate::genesis_digest(&config.genesis),
+                    domain::network_id(config.genesis()).unwrap(),
+                    crate::genesis_digest(config.genesis()),
                     signer.participants().iter().min().unwrap().clone(),
-                    genesis_allocations(&config.genesis).unwrap(),
+                    genesis_allocations(config.genesis()).unwrap(),
                     "chain",
                     crate::ApplicationConfig::default(),
                 )
@@ -1000,13 +999,6 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let mempool = app.mempool();
                 let owner = app.owner_index();
                 let genesis = app.genesis_block();
-                pipeline::pin(
-                    &config.storage_dir,
-                    &config.genesis,
-                    &config.threshold_identity,
-                    genesis.digest(),
-                )
-                .unwrap();
                 let plan = SyncPlan::<_, domain::Scheme, Standard<HellasBlock>>::init(
                     &context.child("startup"),
                     "chain",
@@ -1082,7 +1074,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 );
                 assert_eq!(
                     client
-                        .get_coins_by_owner(genesis_allocations(&config.genesis).unwrap()[0].0)
+                        .get_coins_by_owner(genesis_allocations(config.genesis()).unwrap()[0].0)
                         .await
                         .unwrap()
                         .unwrap()
@@ -1181,17 +1173,21 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         ))
         .await;
         let mut config = fixture.config.clone();
-        config.storage_dir = directory.path().join("replica");
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("replica"),
+            config.chain.profile(),
+        )
+        .unwrap();
         config.peers = vec![endpoint.addr()];
         let starting = tokio::spawn(FullNode::start(config.clone()));
         tokio::time::timeout(Duration::from_secs(20), requested.requested.notified())
             .await
             .unwrap();
-        assert!(crate::execution::pipeline::lock(&config.storage_dir).is_err());
+        assert!(crate::execution::pipeline::lock(&config.storage_dir()).is_err());
         starting.abort();
         let _ = starting.await;
         tokio::time::timeout(Duration::from_secs(10), async {
-            while crate::execution::pipeline::lock(&config.storage_dir).is_err() {
+            while crate::execution::pipeline::lock(&config.storage_dir()).is_err() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1258,12 +1254,12 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
             let verifier = ConsensusVerifier::new(
                 &target.config.info().unwrap(),
-                crate::genesis_digest(&target.config.genesis),
+                crate::genesis_digest(target.config.genesis()),
             )
             .unwrap();
             let trust = Trust::Genesis(Arc::new(verifier));
@@ -1295,7 +1291,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
 }
 
 #[test]
-fn genesis_payload_pin_distinguishes_allocations_and_networks() {
+fn genesis_digest_distinguishes_allocations_and_networks() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let source = Fixture::new(runtime.child("source"), &directory.path().join("source")).await;
@@ -1315,10 +1311,88 @@ fn genesis_payload_pin_distinguishes_allocations_and_networks() {
             )
             .await;
             assert_eq!(
-                source.config.threshold_identity,
-                target.config.threshold_identity
+                source.config.threshold_identity(),
+                target.config.threshold_identity()
             );
-            assert_ne!(source.config.genesis_payload, target.config.genesis_payload);
+            assert_ne!(
+                crate::genesis_digest(source.config.genesis()),
+                crate::genesis_digest(target.config.genesis())
+            );
         }
+    });
+}
+
+#[test]
+fn full_node_derives_h0_from_the_selected_custom_genesis() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let expected = fixture.head.digest();
+        let node = FullNode::start(fixture.config).await.unwrap();
+        assert_eq!(node.genesis_payload(), expected);
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let mut genesis: hellas_genesis::Genesis =
+        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_1_JSON).unwrap();
+    genesis.network_id = "custom-node-rotating-1".into();
+    let genesis_json = serde_json::to_string(&genesis).unwrap();
+    let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+        .trust()
+        .clone();
+    trust.network_id = genesis.network_id.clone();
+    trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+    trust.epochs[0].end_height = Some(2);
+    let mut next = trust.epochs[0].clone();
+    next.epoch = 1;
+    next.start_height = 2;
+    next.end_height = None;
+    trust.epochs.push(next);
+    let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+        trust,
+        validators: vec!["ws://127.0.0.1:9080".into()],
+        genesis_json,
+    })
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile).unwrap();
+    let error = Config::for_profile(chain, vec![], None).unwrap_err();
+    assert!(error.to_string().contains("one open trusted epoch"));
+}
+
+#[test]
+fn one_home_keeps_each_chains_state_across_a_switch_and_back() {
+    run_qmdb(|runtime| async move {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("identity"), b"device identity").unwrap();
+        let mut a =
+            Fixture::new_in(runtime.child("a"), home.path(), domain::TEST_NETWORK, 5000).await;
+        let first = a.next().await;
+        let second = a.next().await;
+        let node = FullNode::start(a.config.clone()).await.unwrap();
+        apply(&node, first).await.unwrap();
+        node.shutdown().await.unwrap();
+
+        // A different genesis under the same home gets its own, empty state.
+        let b = Fixture::new_in(runtime.child("b"), home.path(), domain::TEST_NETWORK, 6000).await;
+        assert_ne!(a.config.storage_dir(), b.config.storage_dir());
+        let node = FullNode::start(b.config.clone()).await.unwrap();
+        assert_eq!(node.status().executed_height(), 0);
+        assert!(apply(&node, second.clone()).await.is_err());
+        node.shutdown().await.unwrap();
+
+        // Back on A, its executed state is intact: the next block extends it.
+        let node = FullNode::start(a.config.clone()).await.unwrap();
+        apply(&node, second).await.unwrap();
+        assert_eq!(node.status().executed_height(), 2);
+        node.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read(home.path().join("identity")).unwrap(),
+            b"device identity"
+        );
     });
 }

@@ -26,6 +26,7 @@ domain = [
 ]
 # Consensus wiring aliases in the domain module (threshold scheme types).
 domain-consensus = ["domain", "dep:commonware-consensus"]
+chain-dir = ["domain", "dep:hellas-private", "dep:hex"]
 client = ["client-core", "hellas-wire/ws-rustls"]
 client-core = [
     "dep:futures-util",
@@ -91,6 +92,7 @@ proof-verify = [
     "dep:url",
 ]
 indexer = [
+    "chain-dir",
     "block-view",
     "client",
     "dep:bytes",
@@ -108,8 +110,6 @@ indexer = [
     "dep:dirs",
     "dep:futures",
     "dep:futures-util",
-    "dep:hellas-private",
-    "dep:hex",
     "dep:p256",
     "dep:prometheus-client",
     "dep:rand",

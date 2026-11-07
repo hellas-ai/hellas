@@ -26,7 +26,7 @@ can still correspond to an allocated, billable resource.
 
 The ordinary image does not enable bootstrap by default. Its entrypoint is
 `serve --port 31145`; configure the provider template's additional arguments as
-`--await-owner /var/lib/hellas/authority` to opt in. Preserve the persistent mount.
+`--await-owner` to opt in. Preserve the persistent home mount.
 
 RunPod does not expose inbound UDP ([port documentation](https://docs.runpod.io/pods/configuration/expose-ports)).
 Do not request `31145/udp` or substitute a TCP mapping into a QUIC invitation.
@@ -65,8 +65,8 @@ and its matching backend, including CUDA driver-library setup where needed. In R
 `dockerStartCmd`, pass only additional arguments, for example:
 
 ```json
-["--identity", "/var/lib/hellas/worker.identity", "--software-root",
- "--await-owner", "/var/lib/hellas/authority",
+["--home", "/var/lib/hellas/.hellas", "--software-root",
+ "--await-owner",
  "--grant-config", "/var/lib/hellas/resources.json",
  "--content-root", "/var/lib/hellas/content"]
 ```

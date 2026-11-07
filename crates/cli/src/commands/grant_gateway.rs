@@ -22,6 +22,7 @@ struct PoolChannelFile {
 /// Resolve a static pool from private stores without contacting a provider.
 pub fn load_pool(
     path: &Path,
+    home: &Path,
     root: &Path,
     trust_directory: &Path,
     identity: &LocalIdentity,
@@ -33,7 +34,7 @@ pub fn load_pool(
     let store = hellas_sdk::grant_store::GrantStore::new(root);
     let trust = hellas_sdk::trust_policy::TrustPolicyStore::new(trust_directory);
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
-    let counters = crate::identity::assertion_counters()?;
+    let counters = crate::identity::assertion_counters(home)?;
     let mut channels = Vec::with_capacity(file.channels.len());
     for entry in file.channels {
         let offer = store.load_offer(&entry.offer)?;
@@ -72,6 +73,7 @@ pub fn load_pool(
 }
 
 pub fn session(
+    home: &Path,
     target: PinnedOffer,
     identity: &LocalIdentity,
     client: hellas_auth::authority::PrincipalId,
@@ -82,7 +84,7 @@ pub fn session(
         principal: client,
         signer: Arc::new(identity.node_key.clone()),
         application,
-        journal_root: super::contributions::client_journal_root(&client)?,
+        journal_root: super::contributions::client_journal_root(home, &client)?,
         control_timeout: Duration::from_secs(90),
     })
 }
@@ -105,7 +107,7 @@ mod tests {
     #[test]
     fn offline_pool_loads_real_private_stores_and_rejects_wrong_device_and_resource() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = crate::identity::load_or_create(Some(&dir.path().join("identity"))).unwrap();
+        let identity = crate::identity::load_or_create(&dir.path().join("identity")).unwrap();
         let subject = principal(7).0;
         let holder = NodeKey::from_public_key(identity.node_key.public_key()).unwrap();
         let transport = iroh::SecretKey::from_bytes(&[2; 32]).public();
@@ -161,6 +163,7 @@ mod tests {
         write_config(resource.0.to_string());
         let pool = load_pool(
             &config,
+            dir.path(),
             &root,
             &trust,
             &identity,
@@ -170,10 +173,11 @@ mod tests {
         .unwrap();
         assert_eq!(pool.channels.len(), 1);
         assert_eq!(pool.channels[0].resources, vec![resource]);
-        let other = crate::identity::load_or_create(Some(&dir.path().join("other"))).unwrap();
+        let other = crate::identity::load_or_create(&dir.path().join("other")).unwrap();
         assert!(
             load_pool(
                 &config,
+                dir.path(),
                 &root,
                 &trust,
                 &other,
@@ -186,6 +190,7 @@ mod tests {
         assert!(
             load_pool(
                 &config,
+                dir.path(),
                 &root,
                 &trust,
                 &identity,

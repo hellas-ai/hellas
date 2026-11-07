@@ -249,7 +249,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             let mut session = PaidWorkSession {
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
-                    journal_root: fixture.root.path().join("client"),
+                    journal_kind: crate::paid_client::PaidJournalKind::Client,
                     provider: crate::test_support::address(server.id()),
                     provider_addrs: server.bound_sockets(),
                     apple_trust: None,

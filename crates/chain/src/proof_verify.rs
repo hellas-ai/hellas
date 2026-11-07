@@ -18,7 +18,7 @@ use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::{Hasher as _, Sha256};
 #[cfg(feature = "indexer-api")]
 use hellas_auth::authority::UnixMillis;
-use hellas_genesis::{HELLAS_DEVNET_1_JSON, TrustDocument};
+use hellas_genesis::TrustDocument;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
@@ -63,11 +63,6 @@ pub struct ProofVerifier {
 }
 
 impl ProofVerifier {
-    /// `trust` is an authenticated deployment input, never a document accepted from a query peer.
-    pub fn new(trust: TrustDocument) -> Result<Self, VerificationError> {
-        Self::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes())
-    }
-
     /// Both inputs must be authenticated deployment inputs, never accepted from a query peer.
     /// The digest covers the exact JSON bytes, including whitespace and trailing newlines.
     pub fn with_genesis(
@@ -83,6 +78,15 @@ impl ProofVerifier {
         {
             return Err(VerificationError::Genesis);
         }
+        Self::with_digest(trust, genesis_digest(&genesis).into())
+    }
+
+    /// Authenticated canonical digest permits light verification without allocations.
+    pub fn with_digest(
+        trust: TrustDocument,
+        canonical_digest: [u8; 32],
+    ) -> Result<Self, VerificationError> {
+        trust.validate()?;
         let trust_sha256 = hex::encode(Sha256::hash(
             &serde_json::to_vec(&trust).expect("trust serializes"),
         ));
@@ -97,7 +101,7 @@ impl ProofVerifier {
                         threshold_identity: hex::decode(&epoch.threshold_identity)
                             .expect("validated hex"),
                     },
-                    genesis_digest(&genesis),
+                    canonical_digest.into(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -317,7 +321,7 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::{N3f1, non_empty_range, ordered::Set};
-    use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustEpoch};
     use rand::{SeedableRng, rngs::StdRng};
 
     fn immediate<F: std::future::Future>(future: F) -> F::Output {
@@ -357,7 +361,7 @@ mod tests {
         trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
         assert!(ProofVerifier::with_genesis(trust.clone(), &document).is_ok());
         assert!(matches!(
-            ProofVerifier::new(trust.clone()),
+            ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_1_JSON.as_bytes()),
             Err(VerificationError::Genesis)
         ));
         let mut changed = document.clone();
@@ -388,6 +392,28 @@ mod tests {
         bundle.trust_sha256 = target.trust_sha256().into();
         assert!(
             target
+                .verify(bundle, ProofQuery::Block(FinalizedBlockQuery::Latest))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn digest_only_light_pin_verifies_the_same_certificate_and_rejects_another_digest() {
+        let (full, bundle) = fixture();
+        let genesis: hellas_genesis::Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+        let digest_only =
+            ProofVerifier::with_digest(full.trust.clone(), genesis_digest(&genesis).0).unwrap();
+        assert!(
+            digest_only
+                .verify(
+                    bundle.clone(),
+                    ProofQuery::Block(FinalizedBlockQuery::Latest)
+                )
+                .is_ok()
+        );
+        let other = ProofVerifier::with_digest(full.trust.clone(), [0x42; 32]).unwrap();
+        assert!(
+            other
                 .verify(bundle, ProofQuery::Block(FinalizedBlockQuery::Latest))
                 .is_err()
         );
@@ -444,7 +470,7 @@ mod tests {
                 threshold_identity: hex::encode(assembler.identity().encode()),
             }],
         };
-        let verifier = ProofVerifier::new(trust).unwrap();
+        let verifier = ProofVerifier::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes()).unwrap();
         let block = crate::HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),

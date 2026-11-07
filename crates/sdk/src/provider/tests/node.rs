@@ -476,9 +476,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let setup_mount = MountedSetup::default();
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: dir.path().to_path_buf(),
+            chain: crate::test_support::chain_dir(dir.path(), network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -605,9 +603,7 @@ async fn discover_two_route_runner(
 ) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -1345,6 +1341,10 @@ fn origin() -> SetupOrigin {
 
 /// A provider's setup journal, complete and recording where its
 /// channel begins — which is exactly what a restarting node finds.
+fn provider_journals(home: &Path) -> std::path::PathBuf {
+    crate::test_support::chain_dir(home, network()).provider_journals()
+}
+
 async fn write_setup_journal(root: &Path) {
     OfferFixture::first()
         .write_completed_setup_for(root, default_route_peer())
@@ -1354,8 +1354,9 @@ async fn write_setup_journal(root: &Path) {
 /// Reopens the channel journal the mount opens, under exactly the
 /// channel, settlement, role and origin the descriptor fixes.
 async fn open_channel(root: &Path) -> ChannelStore {
+    let journals = provider_journals(root);
     match ChannelStore::open(
-        root,
+        &journals,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
@@ -2293,9 +2294,7 @@ impl TxSink for NodeChain {
 async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
-            network: network(),
-
-            journal_root: root.to_path_buf(),
+            chain: crate::test_support::chain_dir(root, network()),
 
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
@@ -2347,7 +2346,7 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
         panic!("admitting fixture policy")
     };
     let mut store = SetupStore::open(
-        root,
+        &provider_journals(root),
         network(),
         bond_edge(),
         Role::Provider,
@@ -2504,13 +2503,19 @@ impl OfferFixture {
     /// The same journal, routed to `peer`.
     async fn write_completed_setup_for(self, root: &Path, peer: PeerId) {
         let verifier = Secp256k1Verifier::new();
-        let mut store =
-            match SetupStore::open(root, network(), self.bond_edge(), Role::Provider, &verifier)
-                .await
-            {
-                Ok(store) => store,
-                Err(error) => panic!("the routed setup journal opens: {error}"),
-            };
+        let journals = provider_journals(root);
+        let mut store = match SetupStore::open(
+            &journals,
+            network(),
+            self.bond_edge(),
+            Role::Provider,
+            &verifier,
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(error) => panic!("the routed setup journal opens: {error}"),
+        };
         let one = self.proposed();
         let two = self.countersigned(one.clone());
         let three = self.completed(two.clone());
@@ -2695,7 +2700,7 @@ impl OfferFixture {
             panic!("admitting fixture policy")
         };
         let mut store = SetupStore::open(
-            root,
+            &provider_journals(root),
             network(),
             self.bond_edge(),
             Role::Provider,
@@ -2776,9 +2781,7 @@ impl RunningPaidNode {
         });
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
-                network: network(),
-
-                journal_root: root.to_path_buf(),
+                chain: crate::test_support::chain_dir(root, network()),
 
                 poll: Duration::from_millis(1),
                 max_observation_age: TEST_TIMEOUT,
@@ -3922,7 +3925,7 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     // Both files are released, and both replay to what the clock
     // left in them.
     let setup = match SetupStore::open(
-        dir.path(),
+        &provider_journals(dir.path()),
         network(),
         bond_edge(),
         Role::Provider,
@@ -4179,17 +4182,18 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let (enrollment, producer_key) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
     let provider = enrollment;
+    let journal = crate::grant_config::GrantConfig::journal_dir(root.path());
     let config = || ProviderGrants {
         config: crate::GrantProviderOptions {
             configuration: Default::default(),
             max_job_millis: std::num::NonZeroU64::MIN,
         },
         authority: ProviderAuthority::Journal {
-            root: root.path().join("provider"),
+            root: journal.clone(),
         },
     };
     let (store, secret) = common_node::bootstrap_node_with_credential(
-        &root.path().join("provider"),
+        &journal,
         grant_network(),
         Some(provider.clone()),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
@@ -4223,7 +4227,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         }],
     );
     let store = common_node::provision(
-        &root.path().join("provider"),
+        &journal,
         store,
         &secret,
         producer_key.clone(),
@@ -4290,6 +4294,16 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         assert_eq!(allowances[0].revision, hellas_auth::authority::Revision(1));
         assert_eq!(allowances[0].policies, vec!["initial".to_owned()]);
     }
+    // The local-grant CLI opens this same authority journal after provider restart.
+    let local = hellas_authority::work_store::grant::NodeStore::open(
+        &crate::grant_config::GrantConfig::journal_dir(root.path()),
+        grant_network(),
+        Some(provider),
+        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+    )
+    .await
+    .unwrap();
+    assert!(local.state().generation(id).is_some());
 }
 
 #[tokio::test]

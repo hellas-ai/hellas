@@ -376,7 +376,7 @@ impl FinalizedWorkView for crate::client::RemoteLightClient {
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
         use crate::LightClient as _;
-        let network = self.pinned_network()?;
+        let network = self.pinned_network();
         self.get_objects(query.object_keys(network))
             .await?
             .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))

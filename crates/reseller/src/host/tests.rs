@@ -212,7 +212,7 @@ impl ResellerBuilder {
                 identity: provider_identity.clone(),
                 enrollment: provider_bundle.clone(),
                 root: Arc::new(UnusedRoot),
-                state_directory: root.path().join("provider"),
+                home: root.path().to_path_buf(),
                 routes,
                 fetch_max_in_flight: 2,
                 fetch_queue_capacity: 2,
@@ -246,25 +246,27 @@ impl ResellerBuilder {
         allowance.definition.policies =
             options().grants.unwrap().configuration.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
-        let world = Node::bootstrap(&root.path().join("provider/grants"))
-            .with_network(hellas_authority::model::grant::grant_network())
-            .with_provider(provider_bundle.clone())
-            .with_clock(clock.clone())
-            .with_capacity(Capacity::new(1))
-            .with_allowance(allowance)
-            .with_grant(
-                ids::FRIEND_GRANT,
-                Rights::new(authority(), FRIEND)
-                    .allow(
-                        hellas_authority::grant_service::WORK_EXECUTE,
-                        hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
-                    )
-                    .valid_from(clock.now())
-                    .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
-                    .build(),
-            )
-            .build()
-            .await;
+        let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
+            root.path(),
+        ))
+        .with_network(hellas_authority::model::grant::grant_network())
+        .with_provider(provider_bundle.clone())
+        .with_clock(clock.clone())
+        .with_capacity(Capacity::new(1))
+        .with_allowance(allowance)
+        .with_grant(
+            ids::FRIEND_GRANT,
+            Rights::new(authority(), FRIEND)
+                .allow(
+                    hellas_authority::grant_service::WORK_EXECUTE,
+                    hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
+                )
+                .valid_from(clock.now())
+                .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
+                .build(),
+        )
+        .build()
+        .await;
         let root_secret = world.secret(ROOT);
         let secret = CredentialSecret::from_parts(root_secret.id(), *root_secret.expose_secret());
         let app_secret = world.secret(FRIEND);
@@ -493,7 +495,7 @@ impl OpenAiFixture {
             identity: identity.clone(),
             enrollment: enrollment.clone(),
             root: Arc::new(UnusedRoot),
-            state_directory: root.join("provider"),
+            home: root.to_path_buf(),
             service: "openai".into(),
             method: "responses".into(),
             bearer_token: "fixture".into(),
@@ -526,13 +528,15 @@ async fn openai_host_refuses_an_empty_upstream_key() {
 #[tokio::test]
 async fn host_control_starts_the_openai_reseller_factory() {
     let fixture = OpenAiFixture::new();
-    let world = Node::bootstrap(&fixture.root.path().join("provider/grants"))
-        .with_provider(fixture.enrollment.clone())
-        .with_clock(TestClock::new(
-            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-        ))
-        .build()
-        .await;
+    let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
+        fixture.root.path(),
+    ))
+    .with_provider(fixture.enrollment.clone())
+    .with_clock(TestClock::new(
+        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+    ))
+    .build()
+    .await;
     let secret = world.secret(ROOT);
     let secret = CredentialSecret::from_parts(secret.id(), *secret.expose_secret());
     let node = hellas_authority::node::NodeCoordinator::new(

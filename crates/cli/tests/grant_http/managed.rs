@@ -33,8 +33,6 @@ impl ManagedWorker {
         let https = Https::start(None).await;
         let resources = root.join("resources.json");
         std::fs::write(&resources, json!({
-            "journal_root":state.join("provider"),"control_socket":state.join("control.sock"),
-            "control_certificate":state.join("control.cert.der"),"control_private_key":state.join("control.key.der"),
             "max_job_millis":10000,
             "machine":{"max_in_flight":2,"limits":[{"meter":"OutputTokens","window":"Total","amount":10}]},
             "accounts":[{"account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],
@@ -63,9 +61,10 @@ impl ManagedWorker {
             &[
                 "serve",
                 "--await-owner",
-                string(&state),
                 "--grant-config",
                 string(&resources),
+                "--fetch-config",
+                string(&state.join("fetch.json")),
                 "--port",
                 "0",
                 "--no-discovery",
@@ -274,8 +273,6 @@ impl ManagedWorker {
                 "0",
                 "--gateway-profile",
                 string(&self.gateway_profile),
-                "--archive-dir",
-                string(&self.root.path().join("archive")),
                 "--zdr",
             ],
             "managed-gateway.log",
@@ -304,7 +301,7 @@ impl ManagedWorker {
 }
 
 async fn invitation(node: &mut Process) -> Invitation {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
     loop {
         let log = std::fs::read_to_string(&node.log).unwrap();
         if let Some(invitation) = log
@@ -552,7 +549,7 @@ async fn host_shutdown_finishes_remote_work_before_closing_its_transport() {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         response.text().await.unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while worker._upstream.calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
@@ -570,13 +567,13 @@ async fn host_shutdown_finishes_remote_work_before_closing_its_transport() {
     );
     assert!(!response.is_finished());
     worker._upstream.finish.add_permits(1);
-    let body = tokio::time::timeout(Duration::from_secs(10), response)
+    let body = tokio::time::timeout(HANG_GUARD, response)
         .await
         .unwrap()
         .unwrap();
     assert!(body.contains("hello"));
     assert!(body.contains("[DONE]"));
-    let status = tokio::time::timeout(Duration::from_secs(15), worker.node.child.wait())
+    let status = tokio::time::timeout(HANG_GUARD, worker.node.child.wait())
         .await
         .unwrap()
         .unwrap();

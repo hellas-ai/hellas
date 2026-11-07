@@ -1328,9 +1328,12 @@ fn delegated_coin_rpc_lists_funding_without_owned_balance() {
         )
         .await
         .unwrap();
-        let remote = crate::client::RemoteLightClient::connect(format!("ws://{address}"))
-            .await
-            .unwrap();
+        let remote = crate::client::RemoteLightClient::connect(
+            format!("ws://{address}"),
+            consensus_fixture(91).verifier,
+        )
+        .await
+        .unwrap();
         let held = remote.get_coins_by_delegate(node).await.unwrap().unwrap();
         assert_eq!(held.snapshot.payload, block.digest());
         assert_eq!(held.coins, vec![(ids[0], 70)]);

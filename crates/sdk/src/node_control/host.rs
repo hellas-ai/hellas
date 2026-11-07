@@ -812,18 +812,18 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
     }
     let control = if let Some(config) = grants {
         let tls = super::profile::server_identity(
-            &config.control_certificate,
-            &config.control_private_key,
+            &config.control_certificate(),
+            &config.control_private_key(),
         )
         .map_err(ProviderError::from)?;
+        let journal_root = config.journal_root();
+        let control_socket = config.control_socket();
         let grants = crate::ProviderGrants {
             config: crate::GrantProviderOptions {
                 configuration: config.configuration,
                 max_job_millis: config.max_job_millis,
             },
-            authority: crate::ProviderAuthority::Journal {
-                root: config.journal_root,
-            },
+            authority: crate::ProviderAuthority::Journal { root: journal_root },
         };
         let resources = if provider.executor.supports_compute() {
             crate::grant_provider::ProviderResources::ComputeAndFetch(
@@ -839,7 +839,7 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
         Some((
             node,
             ProviderControl {
-                socket: config.control_socket,
+                socket: control_socket,
                 tls,
                 remote: config.remote_control,
             },

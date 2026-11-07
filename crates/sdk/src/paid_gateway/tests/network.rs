@@ -23,7 +23,13 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
             .await;
             devnet.seal().await;
             let fixture = PaidFixture::on_network(devnet.network());
-            let mut args = pool_options(&fixture).providers.remove(0);
+            let pool = pool_options(&fixture);
+            let mut args = pool
+                .providers
+                .into_iter()
+                .next()
+                .unwrap()
+                .with_config(pool.config);
             args.timeout = Some(hellas_chain::node::RECOVERY_TIMEOUT);
             let signed = SignedPaidOffer::sign(
                 PaidOffer {
@@ -44,7 +50,7 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
             )
             .unwrap();
             let mut store = SetupStore::open(
-                &args.journal_root,
+                &args.journal_root(),
                 devnet.network(),
                 signed.offer().proposal.bond_edge(),
                 Role::Client,
@@ -76,8 +82,8 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 let read = provider_policy(
                     &args,
                     crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root,
-                        args.config.chain.network,
+                        &args.journal_root(),
+                        args.config.network(),
                         args.provider,
                     )
                     .await
@@ -105,8 +111,8 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 provider_policy(
                     &args,
                     crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root,
-                        args.config.chain.network,
+                        &args.journal_root(),
+                        args.config.network(),
                         args.provider,
                     )
                     .await

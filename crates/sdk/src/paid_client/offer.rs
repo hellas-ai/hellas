@@ -69,7 +69,7 @@ impl OfferConnection {
             .open_exporter
             .ok_or(PaidClientError::MissingState("offer exporter"))?;
         let digest = request_digest(
-            args.config.chain.network,
+            args.config.network(),
             args.provider.enrollment,
             &request,
             &exporter,
@@ -187,7 +187,7 @@ pub(super) fn check_policy(
     policy: &ProviderChannelPolicy,
     omission_bond: u64,
 ) -> Result<()> {
-    if policy.network != args.config.chain.network {
+    if policy.network != args.config.network() {
         return Err(PaidClientError::InputMismatch("quoted network"));
     }
     if policy.payment_policy.fixed_price != args.expected_price {
@@ -231,13 +231,7 @@ pub(super) async fn fund_offer(
 ) -> Result<SignedPaidOffer> {
     let principal = owner.principal();
     let funding = owner
-        .fund_with_approval(
-            chain,
-            args.config.chain.network,
-            args.provider.node,
-            quote.funding_value,
-            controls,
-        )
+        .fund_with_approval(chain, args.provider.node, quote.funding_value, controls)
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;
     let offer = match connection

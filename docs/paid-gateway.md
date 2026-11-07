@@ -102,7 +102,7 @@ For an existing fleet daemon, keep the owner key on the administration machine.
 Approve the same TOML file remotely with its owner profile:
 
 ```sh
-hellas --identity laptop.identity --passkey owner.key admin \
+hellas --home laptop-home --passkey owner.key admin \
   --profile node-admin.json --node NODE_ID --address HOST:31145 \
   set-paid-policy --terms paid.toml --expected-revision 0
 ```
@@ -116,7 +116,7 @@ session cannot change paid terms.
 Stake must belong to the authority owner and be delegated to the daemon's
 settlement key. From the owner's machine, use `chain delegate --coin COIN_ID
 --node SETTLEMENT_KEY --split 12` with `--passkey owner.key`, the independently
-pinned `--trust` document and `--rpc` endpoint. Use the stake value configured in
+pinned `--chain` or `--chain-config` selection and `--rpc` endpoint. Use the stake value configured in
 `offers.max_stake_per_client`; the example uses 12. `chain send --coin COIN_ID
 --to OWNER_KEY --amount 1000` can fund the owner from a public
 `--faucet-account N`. It returns any change to the sender without delegation.
@@ -124,9 +124,8 @@ These commands print submission status and resulting coin IDs; submission is
 not finalization. Check finalized coin state before relying on the funding.
 
 The first paid daemon startup synchronizes authenticated devnet state before
-serving requests. This can take several minutes. Retain its `--chain-store-dir`
-across restarts; the CLI reports the wait. A buyer's `--faucet` chooses a public
-devnet account and records that choice beside its identity. Use a dedicated
+serving requests. This can take several minutes. Retain its `--home` directory across restarts; the CLI reports the wait. Chain state is stored under `<home>/chains/<full consensus digest>/`. A buyer's `--faucet` chooses a public
+devnet account and records that choice in its selected chain directory. Use a dedicated
 identity and retain its wallet/channel state through settlement.
 
 Paid CLI jobs default to 300 admission blocks, 3000 execution/delivery blocks,
@@ -160,8 +159,6 @@ The pool selects providers and expected prices. It obtains each policy with
 {
   "providers": [
     {
-      "chain_config": "/srv/hellas/chain.json",
-      "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "ENROLLMENT_ID@NODE_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "payment": 20
@@ -175,12 +172,13 @@ The pool selects providers and expected prices. It obtains each policy with
 }
 ```
 
-`chain_config` contains the chain cross-check, six validator URLs, journal root,
-`poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
-client routes. The requester and gateway start no chain node. They authenticate
-remote state against independently configured genesis and consensus pins; relay
-URLs supply transport only. `transact` defaults to the embedded devnet trust
-and `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
+The process selects one chain with `--chain devnet` or `--chain-config FILE`.
+The custom JSON file contains the exact `genesis_json` bytes as a JSON string,
+`trust`, and a nonempty `validators` URL list. The requester and gateway start
+no chain node. They authenticate remote state against the selected genesis and
+trust; relay URLs supply transport only.
+`transact` defaults to the embedded devnet trust and
+`wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
 keys are created on first use and retained with the identity.
 
 Use `--passkey owner.key`, `--faucet`, or `--faucet-account N` for channel funding.
@@ -227,11 +225,11 @@ need them. Grant gateways keep their existing independent approval requirements.
 Owners delegate or reclaim coins through the global passkey:
 
 ```sh
-hellas --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
-  --trust ./chain-trust.json --network devnet --node NODE_SETTLEMENT_KEY \
+hellas --chain-config ./chain.json --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
+  --node NODE_SETTLEMENT_KEY \
   --coin COIN_ID --split 12
-hellas --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
-  --trust ./chain-trust.json --network devnet --coin COIN_ID
+hellas --chain-config ./chain.json --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
+  --coin COIN_ID
 ```
 
 `--split VALUE` creates up to three delegated coins of that value and returns the
@@ -324,7 +322,7 @@ Every request checks current credential and grant rights. Non-loopback listeners
 also require `--allow-remote`; use a trusted network or a TLS reverse proxy.
 
 The NixOS options are `services.hellas.gateway.paidWorkConfig`,
-`paidWorkJournalRoots` (writable client journals), `gatewayProfile`, and
+`home` (containing client journals), `gatewayProfile`, and
 `authorityJournal` when the authority journal is outside the managed state directory.
 
 

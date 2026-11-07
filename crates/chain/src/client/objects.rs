@@ -28,10 +28,8 @@ pub(super) async fn read(
     client: &RemoteLightClient,
     keys: Vec<ObjectId>,
 ) -> Result<Option<ObjectSnapshot>, QueryError> {
-    if client.verifier.is_none() || keys.len() > 32 {
-        return Err(invalid(
-            "a pinned verifier and at most 32 keys are required",
-        ));
+    if keys.len() > 32 {
+        return Err(invalid("at most 32 keys are supported"));
     }
     let keys: BTreeSet<_> = keys.into_iter().collect();
     // Clones share one verified view, including reads for previously unseen keys.
@@ -162,7 +160,7 @@ pub(super) async fn read(
     }
     view.target = target.clone();
     Ok(Some(ObjectSnapshot {
-        network: client.pinned_network()?,
+        network: client.pinned_network(),
         block: finalized.snapshot,
         objects: keys
             .into_iter()

@@ -53,6 +53,9 @@ let
         validator.addresses != [ ]
       ) "--addresses ${escapeShellArg (concatStringsSep "," validator.addresses)}";
       seedFlag = optionalString (validator.seed != null) "--seed ${toString validator.seed}";
+      networkIdFlag = optionalString (
+        validator.networkId != null
+      ) "--network-id ${escapeShellArg validator.networkId}";
       genesisFlag = optionalString (
         validator.genesis != null
       ) "--genesis ${escapeShellArg validator.genesis}";
@@ -77,6 +80,7 @@ let
         --validator ${toString index} \
         --start-port ${toString validator.startPort} \
         ${seedFlag} \
+        ${networkIdFlag} \
         ${addressesFlag} \
         ${relayFlags} \
         --metrics-port ${toString (validator.metricsBasePort + index)} \
@@ -212,6 +216,11 @@ let
           default = null;
           description = "Canonical genesis JSON embedded in every validator config.";
         };
+        networkId = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Network ID for generated genesis when genesis is not supplied.";
+        };
         addresses = mkOption {
           type = types.listOf types.str;
           default = [ ];
@@ -258,9 +267,24 @@ let
           type = types.int;
           default = 0;
           description = ''
-            Idempotent state reset generation. A positive generation wipes a
-            validator's state exactly once when it changes.
+            Idempotent state reset generation. A positive generation resets only
+            the selected chain's validator state once when it changes.
           '';
+        };
+        home = mkOption {
+          type = types.nullOr (types.strMatching "/.*");
+          default = null;
+          description = "Optional home base for this cluster. Each validator uses a distinct nodeN subdirectory; null uses its systemd StateDirectory.";
+        };
+        chain = mkOption {
+          type = types.nullOr (types.enum [ "devnet" ]);
+          default = null;
+          description = "Compiled chain; null uses the binary default.";
+        };
+        chainConfig = mkOption {
+          type = types.nullOr (types.strMatching "/.*");
+          default = null;
+          description = "Authenticated custom chain profile outside the Nix store.";
         };
         memoryMax = mkOption {
           type = types.nullOr types.str;
@@ -298,6 +322,23 @@ in
         {
           assertion = validator.genesis == null || validator.seed != null;
           message = "services.hellas-chain-validators.${name}.genesis requires a deterministic seed.";
+        }
+        {
+          assertion = validator.genesis == null || validator.networkId == null;
+          message = "services.hellas-chain-validators.${name}.networkId cannot be combined with genesis.";
+        }
+        {
+          assertion = validator.chain == null || validator.chainConfig == null;
+          message = "services.hellas-chain-validators.${name}.chain and chainConfig are mutually exclusive.";
+        }
+        {
+          assertion =
+            validator.chainConfig == null || hellas.runtimePathIsOutsideStore lib validator.chainConfig;
+          message = "services.hellas-chain-validators.${name}.chainConfig must be runtime data outside the Nix store.";
+        }
+        {
+          assertion = validator.home == null || hellas.runtimePathIsOutsideStore lib validator.home;
+          message = "services.hellas-chain-validators.${name}.home must be runtime data outside the Nix store.";
         }
         {
           assertion = validator.genesis == null || validator.genesisAllocations == [ ];
@@ -396,13 +437,27 @@ in
               index = validator.nodeOffset + localIndex;
               serviceName = "hellas-validator-${name}-node${toString index}";
               stateDirectory = "hellas-validator-${name}/node${toString index}";
+              home =
+                if validator.home == null then
+                  "/var/lib/${stateDirectory}"
+                else
+                  "${validator.home}/node${toString index}";
               usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
               configFile = if usesRuntimeConfig then "%d/validator-config" else mkConfigFile validator index;
+              chainArgs =
+                optionalString (validator.chain != null) " --chain ${escapeShellArg validator.chain}"
+                + optionalString (
+                  validator.chainConfig != null
+                ) " --chain-config ${escapeShellArg validator.chainConfig}";
             in
             {
               name = serviceName;
               value = {
                 description = "Hellas Validator ${name} Node ${toString index}";
+                unitConfig.RequiresMountsFor = [
+                  home
+                ]
+                ++ lib.optional (validator.chainConfig != null) validator.chainConfig;
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network-online.target" ];
                 wants = [ "network-online.target" ];
@@ -410,13 +465,13 @@ in
                 startLimitBurst = 5;
                 startLimitIntervalSec = 60;
                 serviceConfig = {
-                  ExecStart = "${getExe validator.package} chain validator run --config ${configFile}";
+                  ExecStart = "${getExe validator.package} --home ${escapeShellArg home} chain validator run --config ${configFile}${chainArgs}";
                   Type = "simple";
                   Restart = "on-failure";
                   RestartSec = 5;
                   DynamicUser = true;
                   StateDirectory = stateDirectory;
-                  Environment = [ "XDG_DATA_HOME=%S/${stateDirectory}" ];
+                  ReadWritePaths = lib.optional (validator.home != null) home;
                   CapabilityBoundingSet = [ "" ];
                   AmbientCapabilities = [ "" ];
                   NoNewPrivileges = true;
@@ -462,20 +517,7 @@ in
                 }
                 // optionalAttrs (validator.memoryMax != null) { MemoryMax = validator.memoryMax; }
                 // optionalAttrs (validator.stateGeneration > 0) {
-                  ExecStartPre =
-                    let
-                      resetState = pkgs.writeShellScript "hellas-validator-state-check" ''
-                        set -eu
-                        stamp="$STATE_DIRECTORY/.state-generation"
-                        target=${toString validator.stateGeneration}
-                        current=$(${pkgs.coreutils}/bin/cat "$stamp" 2>/dev/null || echo 0)
-                        if [ "$current" != "$target" ]; then
-                          ${pkgs.findutils}/bin/find -L "$STATE_DIRECTORY" -mindepth 1 -delete
-                          echo "$target" > "$stamp"
-                        fi
-                      '';
-                    in
-                    "+${resetState}";
+                  ExecStartPre = "${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain validator state-generation --generation ${toString validator.stateGeneration}";
                 };
               };
             }

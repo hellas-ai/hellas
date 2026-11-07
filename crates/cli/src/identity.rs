@@ -15,10 +15,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const IDENTITY_DIR: &str = ".hellas";
-const IDENTITY_FILE: &str = "identity";
 const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
 const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
+
+pub(crate) fn resolve_home(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let selected = explicit
+        .map(Path::to_owned)
+        .or_else(|| std::env::var_os("HELLAS_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(IDENTITY_DIR)))
+        .ok_or_else(|| anyhow::anyhow!("set --home or HELLAS_HOME"))?;
+    std::path::absolute(selected).map_err(Into::into)
+}
 
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
@@ -70,14 +78,10 @@ fn build_open_identity(
     )?))
 }
 
-pub(crate) fn load_or_create(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
-    let path = path
-        .map(Path::to_owned)
-        .map(Ok)
-        .unwrap_or_else(default_path)?;
-    match fs::read(&path) {
-        Ok(bytes) => decode(&path, &bytes),
-        Err(error) if error.kind() == ErrorKind::NotFound => create(&path),
+pub(crate) fn load_or_create(path: &Path) -> anyhow::Result<LocalIdentity> {
+    match fs::read(path) {
+        Ok(bytes) => decode(path, &bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => create(path),
         Err(error) => {
             Err(error).with_context(|| format!("failed to read identity file {}", path.display()))
         }
@@ -93,67 +97,22 @@ pub(crate) fn settlement_signer(
         .map_err(|_| anyhow::anyhow!("the node key is not a valid secp256k1 scalar"))
 }
 
-pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
-    let path = path
-        .map(Path::to_owned)
-        .map(Ok)
-        .unwrap_or_else(default_path)?;
-    let bytes = fs::read(&path)
+pub(crate) fn load_existing(path: &Path) -> anyhow::Result<LocalIdentity> {
+    let bytes = fs::read(path)
         .with_context(|| format!("failed to read identity file {}", path.display()))?;
-    decode(&path, &bytes)
+    decode(path, &bytes)
 }
 
-pub(crate) fn default_grant_data_path() -> anyhow::Result<PathBuf> {
-    default_hellas_path("grants", "HELLAS_GRANT_DATA_DIR")
+pub(crate) fn grant_data_path(home: &Path) -> PathBuf {
+    home.join("grants")
 }
 
-pub(crate) fn default_path() -> anyhow::Result<PathBuf> {
-    default_hellas_path(IDENTITY_FILE, "--identity")
-}
-
-pub(crate) fn funding_root(identity: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let mut path = identity
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(default_path)?
-        .into_os_string();
-    path.push(".funding");
-    Ok(PathBuf::from(path))
-}
-
-/// Paid-provider owner state beside the identity.
-pub(crate) fn provider_root(identity: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let mut path = identity
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(default_path)?
-        .into_os_string();
-    path.push(".provider");
-    Ok(PathBuf::from(path))
-}
-
-pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
-    default_hellas_path("gateway-archive", "--archive-dir")
-}
-
-pub(crate) fn assertion_counters() -> anyhow::Result<Arc<dyn AssertionCounterStore + Send + Sync>> {
+pub(crate) fn assertion_counters(
+    home: &Path,
+) -> anyhow::Result<Arc<dyn AssertionCounterStore + Send + Sync>> {
     Ok(Arc::new(FilesystemAssertionCounterStore::new(
-        default_hellas_path(
-            APPLE_OPEN_COUNTER_STORE_DIR,
-            "caller assertion-counter directory",
-        )?,
+        home.join(APPLE_OPEN_COUNTER_STORE_DIR),
     )))
-}
-
-fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME").with_context(|| {
-        format!("HOME environment variable not set; use {flag} to specify path")
-    })?;
-    Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
-}
-
-pub(crate) fn default_chain_path(network: &str) -> anyhow::Result<PathBuf> {
-    Ok(default_hellas_path("chain", "--chain-store-dir")?.join(network))
 }
 
 fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
@@ -189,7 +148,7 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
         open_identity,
     };
     if !persist(path, &stored)? {
-        return load_existing(Some(path));
+        return load_existing(path);
     }
     info!(
         node_id = %identity.transport_key.public(),

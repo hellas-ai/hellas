@@ -125,7 +125,8 @@ pub(super) fn run_gateway<'a>(
         )
         .unwrap();
 
-        let identity_path = root.join("composition-cli-identity");
+        let home = data_root.parent().unwrap().parent().unwrap();
+        let identity_path = home.join("identity");
         let root_key = ProducerSigningKey::from_secret_bytes([0x41; 32]).unwrap();
         let node_key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
         let transport = iroh::SecretKey::from_bytes(&[0x42; 32]);
@@ -223,9 +224,8 @@ pub(super) fn run_gateway<'a>(
         let log_path = root.join("composition-cli.log");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut child = tokio::process::Command::new(binary)
-            .env("HELLAS_GRANT_DATA_DIR", data_root.parent().unwrap())
-            .arg("--identity")
-            .arg(&identity_path)
+            .arg("--home")
+            .arg(home)
             .arg("--passkey")
             .arg(&passkey)
             .arg("gateway")
@@ -237,8 +237,6 @@ pub(super) fn run_gateway<'a>(
             .arg(address.port().to_string())
             .arg("--gateway-profile")
             .arg(&profile)
-            .arg("--archive-dir")
-            .arg(root.join("composition-cli-archive"))
             .arg("--zdr")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(log))

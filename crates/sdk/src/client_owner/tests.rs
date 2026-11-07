@@ -3,6 +3,14 @@ use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, Own
 use hellas_kernel::{Payout, Secp256k1Signer, SoftPasskey};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+fn consensus_verifier(devnet: &Devnet) -> hellas_chain::ConsensusVerifier {
+    hellas_chain::ConsensusVerifier::new(
+        devnet.consensus_info(),
+        hellas_chain::genesis_digest(devnet.genesis()),
+    )
+    .unwrap()
+}
+
 struct Approval {
     key: SoftPasskey,
     count: AtomicUsize,
@@ -117,6 +125,21 @@ fn delegate() -> Key {
 fn provider(n: u8) -> iroh::EndpointId {
     iroh::SecretKey::from_bytes(&[n; 32]).public()
 }
+
+#[test]
+fn owner_state_uses_the_consensus_digest() {
+    let home = tempfile::tempdir().unwrap();
+    let network = NetworkId::new("same-sdk-network").unwrap();
+    let first = crate::test_support::chain_dir_with_variant(home.path(), network, 1);
+    let second = crate::test_support::chain_dir_with_variant(home.path(), network, 2);
+    assert_eq!(first.network_id(), second.network_id());
+    let approval = Arc::new(Approval::new());
+    let a = ClientOwner::new(approval.clone(), delegate(), &first).unwrap();
+    let b = ClientOwner::new(approval, delegate(), &second).unwrap();
+    assert_ne!(a.root, b.root);
+    assert_eq!(a.chain().as_path(), first.as_path());
+    assert_eq!(b.chain().as_path(), second.as_path());
+}
 async fn sealing<T>(devnet: &mut Devnet, work: impl Future<Output = T>) -> T {
     tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(2), async {
         tokio::pin!(work);
@@ -141,23 +164,23 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                 },
             )
             .await;
+            let state = crate::test_support::chain_dir_with_genesis(root.path(), devnet.genesis());
             devnet.seal().await;
-            let chain = RemoteLightClient::connect(devnet.light_client_url(0))
-                .await
-                .unwrap()
-                .with_consensus_verifier(devnet.consensus_verifier());
+            let chain =
+                RemoteLightClient::connect(devnet.light_client_url(0), consensus_verifier(&devnet))
+                    .await
+                    .unwrap();
             let approval = Arc::new(Approval::new());
             let gate = Gate::default();
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             assert!(matches!(
-                ClientOwner::new(approval.clone(), delegate(), root.path()),
+                ClientOwner::new(approval.clone(), delegate(), &state),
                 Err(ClientOwnerError::Locked(_))
             ));
             assert!(
                 owner
                     .fund_with_approval(
                         &chain,
-                        devnet.network(),
                         provider(3),
                         200,
                         FundingControls {
@@ -176,7 +199,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             {
                 let funding = owner.fund_with_approval(
                     &chain,
-                    devnet.network(),
                     provider(3),
                     200,
                     FundingControls {
@@ -198,7 +220,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             {
                 let funding = owner.fund_with_approval(
                     &chain,
-                    devnet.network(),
                     provider(3),
                     200,
                     FundingControls {
@@ -249,15 +270,14 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             assert_eq!(gate.requests.load(Ordering::SeqCst), 2);
             // Simulate interruption after the signed archive but before
             // publishing the active record.
-            std::fs::remove_file(owner.path(devnet.network(), provider(3))).unwrap();
+            std::fs::remove_file(owner.path(provider(3))).unwrap();
             drop(owner);
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             let network = devnet.network();
             let first = sealing(
                 &mut devnet,
                 owner.fund_with_approval(
                     &chain,
-                    network,
                     provider(3),
                     200,
                     FundingControls {
@@ -288,7 +308,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             let recovered = owner
                 .recover_funding_intent(
                     &chain,
-                    network,
                     provider(3),
                     [7; 16],
                     FundingControls {
@@ -307,7 +326,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             let (parallel_a, parallel_b) = tokio::join!(
                 owner.fund_with_approval(
                     &chain,
-                    network,
                     provider(3),
                     200,
                     FundingControls {
@@ -319,7 +337,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                 ),
                 owner.fund_with_approval(
                     &chain,
-                    network,
                     provider(3),
                     200,
                     FundingControls {
@@ -335,12 +352,10 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             assert_eq!(gate.approved.load(Ordering::SeqCst), 1);
             assert_eq!(gate.requests.load(Ordering::SeqCst), 2);
             assert_eq!(approval.count.load(Ordering::SeqCst), 2);
-            let network = devnet.network();
             let (second, third) = sealing(&mut devnet, async {
                 tokio::join!(
                     owner.fund(
                         &chain,
-                        network,
                         provider(4),
                         200,
                         Duration::from_millis(10),
@@ -348,7 +363,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     ),
                     owner.fund(
                         &chain,
-                        network,
                         provider(5),
                         200,
                         Duration::from_millis(10),
@@ -405,11 +419,12 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                 },
             )
             .await;
+            let state = crate::test_support::chain_dir_with_genesis(root.path(), devnet.genesis());
             devnet.seal().await;
-            let chain = RemoteLightClient::connect(devnet.light_client_url(0))
-                .await
-                .unwrap()
-                .with_consensus_verifier(devnet.consensus_verifier());
+            let chain =
+                RemoteLightClient::connect(devnet.light_client_url(0), consensus_verifier(&devnet))
+                    .await
+                    .unwrap();
             let genesis =
                 hellas_chain::test_support::devnet::genesis_coin(devnet.allocations(), OWNER.key());
             let inputs = List::take([genesis; hellas_kernel::MAX_EDGE_INPUTS], 1);
@@ -425,10 +440,9 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             devnet.seal().await;
             let approval = Arc::new(Approval::new());
             approval.pause.store(true, Ordering::SeqCst);
-            let owner = ClientOwner::new(approval.clone(), delegate(), root.path()).unwrap();
+            let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
             let funding = owner.fund(
                 &chain,
-                devnet.network(),
                 provider(3),
                 300,
                 Duration::from_millis(10),
@@ -473,12 +487,10 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                     .iter()
                     .any(|(_, record, _)| record.state == FundingState::Conflicted)
             );
-            let network = devnet.network();
             let other = sealing(
                 &mut devnet,
                 owner.fund(
                     &chain,
-                    network,
                     provider(4),
                     100,
                     Duration::from_millis(10),
@@ -502,7 +514,6 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
                 &mut devnet,
                 owner.fund(
                     &chain,
-                    network,
                     provider(3),
                     100,
                     Duration::from_millis(10),

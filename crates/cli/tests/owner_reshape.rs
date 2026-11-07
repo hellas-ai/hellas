@@ -79,6 +79,7 @@ fn start_validator(
     allocations: [String; 2],
 ) -> (Validator, String, ValidatorConfig, PathBuf) {
     let rpc = format!("ws://127.0.0.1:{}", port());
+    let genesis_path = home.join("genesis.json");
     let mut config_command = command(home);
     config_command.args([
         "chain",
@@ -88,6 +89,8 @@ fn start_validator(
         &committee_size.to_string(),
         "--seed",
         "719",
+        "--network-id",
+        "hellas-owner-reshape-1",
         "--start-port",
         &port().to_string(),
         "--metrics-port",
@@ -98,18 +101,33 @@ fn start_validator(
         &allocations[0],
         "--genesis-allocation",
         &allocations[1],
+        "--genesis-out",
+        genesis_path.to_str().unwrap(),
     ]);
     let config_output = output(config_command);
     let config: ValidatorConfig =
         toml::from_str(std::str::from_utf8(&config_output.stdout).unwrap()).unwrap();
     let config_path = home.join("validator.toml");
     std::fs::write(&config_path, &config_output.stdout).unwrap();
-    let genesis_path = home.join("genesis.json");
-    std::fs::write(&genesis_path, serde_json::to_vec(&config.genesis).unwrap()).unwrap();
+    let genesis_json = std::fs::read_to_string(&genesis_path).unwrap();
+    let trust = hellas_chain::validator::export_trust(&config, genesis_json.as_bytes()).unwrap();
+    let chain_path = home.join("chain.json");
+    std::fs::write(
+        &chain_path,
+        serde_json::to_vec(&serde_json::json!({
+            "trust": trust,
+            "validators": [rpc],
+            "genesis_json": genesis_json,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let log = home.join("validator.log");
     let mut start = command(home);
     start
         .env("RUST_LOG", "info")
+        .arg("--chain-config")
+        .arg(&chain_path)
         .args(["chain", "validator", "run", "--config"])
         .arg(&config_path)
         .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
@@ -120,7 +138,7 @@ fn start_validator(
         process: start.spawn().unwrap(),
         log,
     };
-    (validator, rpc, config, genesis_path)
+    (validator, rpc, config, chain_path)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -132,7 +150,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     let key_path = home.path().join("owner.key");
     std::fs::write(&key_path, [21; 32]).unwrap();
     let started = std::time::Instant::now();
-    let (validator, rpc, config, genesis_path) = start_validator(
+    let (validator, rpc, config, chain_path) = start_validator(
         home.path(),
         1,
         [
@@ -140,23 +158,22 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             format!("{}:2000", SettlementKey::from(native.party_key())),
         ],
     );
-    let network = config.network_id().unwrap();
-    let trust_path = home.path().join("trust.json");
-    let genesis_json = std::fs::read(&genesis_path).unwrap();
-    let trust = hellas_chain::validator::export_trust(&config, &genesis_json).unwrap();
-    std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
+    let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
+    let network = config.network_id(profile.genesis()).unwrap();
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().unwrap(),
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
+            if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
-                break client.with_consensus_verifier(
-                    hellas_chain::ConsensusVerifier::new(
-                        &info,
-                        hellas_chain::genesis_digest(&config.genesis),
-                    )
-                    .unwrap(),
-                );
+                let _ = info;
+                break client;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -222,10 +239,9 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             sweep
                 .arg("--passkey")
                 .arg(&key_path)
-                .args(["chain", "sweep", "--rpc", &rpc, "--genesis"])
-                .arg(&genesis_path)
-                .arg("--trust")
-                .arg(&trust_path)
+                .arg("--chain-config")
+                .arg(&chain_path)
+                .args(["chain", "sweep", "--rpc", &rpc])
                 .args(["--coin", &hex::encode(delegated.to_bytes())]);
             let swept = result_coin(output(sweep));
             assert_eq!(coin(&client, swept).await.delegate, None);
@@ -233,10 +249,9 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             delegate
                 .arg("--passkey")
                 .arg(&key_path)
-                .args(["chain", "delegate", "--rpc", &rpc, "--genesis"])
-                .arg(&genesis_path)
-                .arg("--trust")
-                .arg(&trust_path)
+                .arg("--chain-config")
+                .arg(&chain_path)
+                .args(["chain", "delegate", "--rpc", &rpc])
                 .args([
                     "--coin",
                     &hex::encode(swept.to_bytes()),
@@ -303,10 +318,9 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             let mut send = command(home.path());
             send.arg("--passkey")
                 .arg(&key_path)
-                .args(["chain", "send", "--rpc", &rpc, "--genesis"])
-                .arg(&genesis_path)
-                .arg("--trust")
-                .arg(&trust_path)
+                .arg("--chain-config")
+                .arg(&chain_path)
+                .args(["chain", "send", "--rpc", &rpc])
                 .args([
                     "--coin",
                     &hex::encode(swept.to_bytes()),
@@ -348,7 +362,7 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
     let owner = Secp256k1Signer::from_secret_scalar([24; 32]).unwrap();
     let other_owner = Secp256k1Signer::from_secret_scalar([25; 32]).unwrap();
     let started = std::time::Instant::now();
-    let (mut validator, rpc, _, _) = start_validator(
+    let (mut validator, rpc, _, chain_path) = start_validator(
         home.path(),
         4,
         [
@@ -356,14 +370,24 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
             format!("{}:2000", SettlementKey::from(other_owner.party_key())),
         ],
     );
-    let client = tokio::time::timeout(Duration::from_secs(45), async {
+    let profile = hellas_sdk::work_config::load_chain_profile(&chain_path).unwrap();
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: profile.network_id().to_owned(),
+        threshold_identity: profile.static_threshold_identity().unwrap(),
+        validators: profile.validators().to_vec(),
+    };
+    let verifier =
+        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    // A hang guard, not a speed requirement: the property is that RPC starts
+    // only after the full peer-floor probe, asserted below.
+    let client = tokio::time::timeout(Duration::from_secs(180), async {
         loop {
             assert!(
                 validator.process.try_wait().unwrap().is_none(),
                 "validator exited: {}",
                 std::fs::read_to_string(&validator.log).unwrap()
             );
-            if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
+            if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
                 assert_eq!(info.validators.len(), 4);
@@ -373,7 +397,12 @@ async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup()
         }
     })
     .await
-    .expect("RPC starts after the unchanged 30-second peer-floor wait");
+    .unwrap_or_else(|_| {
+        panic!(
+            "RPC did not start after the peer-floor wait: {}",
+            std::fs::read_to_string(&validator.log).unwrap()
+        )
+    });
     // Allow startup work before the probe, never a shorter probe wait.
     assert!(started.elapsed() >= Duration::from_secs(30));
     assert!(

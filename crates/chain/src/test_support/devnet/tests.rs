@@ -208,9 +208,10 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
         devnet.seal().await;
         let node_key = SettlementKey::from(native_signer([0x42; 32]).party_key());
         let (tx, delegated) = delegate_allocation(devnet.allocations(), &owner, node_key);
-        let submitter = RemoteLightClient::connect(devnet.light_client_url(3))
-            .await
-            .unwrap();
+        let submitter =
+            RemoteLightClient::connect(devnet.light_client_url(3), devnet.consensus_verifier())
+                .await
+                .unwrap();
         assert_eq!(
             submitter.submit_tx(tx).await.unwrap(),
             crate::SubmitTxOutcome::Enqueued,
@@ -228,10 +229,9 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
             .unwrap()
             .unwrap();
         for url in devnet.light_client_urls() {
-            let remote = RemoteLightClient::connect(url.clone())
+            let remote = RemoteLightClient::connect(url.clone(), devnet.consensus_verifier())
                 .await
-                .unwrap()
-                .with_consensus_verifier(devnet.consensus_verifier());
+                .unwrap();
             assert_eq!(
                 remote.get_latest_block().await.unwrap().as_ref(),
                 Some(&latest),
@@ -263,10 +263,9 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
                 TEST_NETWORK,
                 crate::genesis_digest(devnet.genesis()),
             );
-            let refused = RemoteLightClient::connect(url.clone())
+            let refused = RemoteLightClient::connect(url.clone(), stranger.verifier)
                 .await
-                .unwrap()
-                .with_consensus_verifier(stranger.verifier);
+                .unwrap();
             assert!(
                 refused.get_latest_block().await.is_err(),
                 "another committee's verifier refuses {url}",

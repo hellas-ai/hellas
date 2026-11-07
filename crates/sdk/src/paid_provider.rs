@@ -82,10 +82,7 @@ pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
 #[derive(Clone)]
 pub struct WorkRunnerConfig {
-    /// The network the journals are keyed and the signatures bound to.
-    pub network: NetworkId,
-    /// The configured root the setup journals live under.
-    pub journal_root: PathBuf,
+    pub chain: hellas_chain::chain_dir::ChainDir,
     /// How often the clock ticks.
     pub poll: Duration,
     /// Bounds observer stalls and the age of local admission evidence.
@@ -110,6 +107,12 @@ impl std::fmt::Debug for AdmissionNode {
 }
 
 impl WorkRunnerConfig {
+    pub fn network(&self) -> NetworkId {
+        NetworkId::new(self.chain.network_id()).expect("validated chain profile")
+    }
+    pub fn journal_root(&self) -> PathBuf {
+        self.chain.provider_journals()
+    }
     /// Validate observation policy before startup performs I/O.
     pub fn validate(&self) -> Result<(), PaidProviderError> {
         if self.poll.is_zero() || self.max_observation_age <= self.poll {
@@ -962,10 +965,10 @@ impl WorkRunner {
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
         config.validate()?;
-        let found = discover_setups(&config.journal_root, config.network)
+        let found = discover_setups(&config.journal_root(), config.network())
             .await
             .map_err(|source| PaidProviderError::Discover {
-                path: config.journal_root.clone(),
+                path: config.journal_root(),
                 source,
             })?;
         if !found.unidentified.is_empty() {
@@ -979,8 +982,8 @@ impl WorkRunner {
             .filter(|s| s.role == Role::Provider)
         {
             let store = SetupStore::open(
-                &config.journal_root,
-                config.network,
+                &config.journal_root(),
+                config.network(),
                 setup.bond_edge,
                 Role::Provider,
                 &Secp256k1Verifier::new(),
@@ -1396,8 +1399,7 @@ mod tests {
         let config = &fixture.config;
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
-                network: config.chain.network,
-                journal_root: config.journal_root.clone(),
+                chain: config.chain.clone(),
                 poll: Duration::ZERO,
                 max_observation_age: config.max_observation_age,
                 settlement_key: crate::test_support::signer(2),
@@ -1409,6 +1411,6 @@ mod tests {
             runner.await,
             Err(PaidProviderError::InvalidObservationPolicy)
         ));
-        assert!(!config.journal_root.exists());
+        assert!(!config.chain.provider_journals().exists());
     }
 }

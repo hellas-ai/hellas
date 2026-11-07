@@ -126,28 +126,6 @@ pub(crate) fn lock(directory: &std::path::Path) -> std::io::Result<std::fs::File
     file.try_lock().map_err(std::io::Error::other)?;
     Ok(file)
 }
-pub(crate) fn pin(
-    directory: &std::path::Path,
-    genesis: &hellas_genesis::Genesis,
-    threshold: &[u8],
-    payload: crate::domain::Digest,
-) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    let identity = serde_json::to_vec(&(genesis, threshold, hex::encode(payload)))?;
-    let path = directory.join("chain-identity.json");
-    match std::fs::read(&path) {
-        Ok(stored) if stored == identity => Ok(()),
-        Ok(_) => Err(Error::new(
-            ErrorKind::InvalidData,
-            "state directory belongs to another chain",
-        )),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            hellas_private::write_atomically(&path, ".tmp", &identity)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 pub(crate) fn verify_floor<P>(
     plan: &SyncPlan<Context, Scheme, Standard<HellasBlock>>,
     provider: &P,

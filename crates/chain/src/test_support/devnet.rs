@@ -503,17 +503,38 @@ impl Devnet {
 
     /// A full-node configuration that submits through `validator` and
     /// syncs from it. The caller owns the node it starts.
-    pub fn full_node_config(&self, storage_dir: PathBuf, validator: usize) -> crate::node::Config {
+    pub fn profile(&self, validator: usize) -> crate::genesis::ChainProfile {
+        use crate::genesis::{Chain, ChainProfile, CustomChainFile};
+        use commonware_cryptography::{Hasher as _, Sha256};
         let validator = &self.validators[validator];
-        crate::node::Config {
-            genesis: self.document.clone(),
-            threshold_identity: self.consensus_info.threshold_identity.clone(),
-            genesis_payload: self.genesis_payload,
-            storage_dir,
+        let genesis_json = serde_json::to_string(&self.document).unwrap();
+        let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+        trust.network_id = self.document.network_id.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
+        trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
+        ChainProfile::custom(CustomChainFile {
+            trust,
             validators: vec![validator.light_client_url.clone()],
-            peers: vec![validator.chain_sync.clone()],
-            archive_blocks: None,
-        }
+            genesis_json,
+        })
+        .unwrap()
+    }
+
+    pub fn chain_dir(
+        &self,
+        home: &std::path::Path,
+        validator: usize,
+    ) -> crate::chain_dir::ChainDir {
+        crate::chain_dir::ChainDir::open(home, &self.profile(validator)).unwrap()
+    }
+
+    pub fn full_node_config(&self, home: PathBuf, validator: usize) -> crate::node::Config {
+        crate::node::Config::for_profile(
+            self.chain_dir(&home, validator),
+            vec![self.validators[validator].chain_sync.clone()],
+            None,
+        )
+        .unwrap()
     }
 
     /// The `node`th full node this devnet started.

@@ -31,6 +31,51 @@ let
     ];
   };
 
+  # This test-only example provisions a signed local allowance and an
+  # independent bearer authority inside the VM's managed StateDirectory.
+  gatewayFixture = package.overrideAttrs (_: {
+    pname = "hellas-gateway-vm-fixture";
+    cargoBuildFlags = [
+      "-p"
+      "hellas-cli"
+      "--example"
+      "gateway-fixture"
+      "--features"
+      "gateway-vm-fixture"
+    ];
+    doCheck = false;
+    installPhase = ''
+      mkdir -p "$out/bin"
+      mapfile -t binaries < <(find target -type f -name 'gateway-fixture' -executable)
+      test "''${#binaries[@]}" -eq 1
+      install -m 755 "''${binaries[0]}" "$out/bin/gateway-fixture"
+    '';
+  });
+
+  gatewayFixtureRunner = pkgs.writeShellScript "provision-fresh-hellas-gateway" ''
+    export HELLAS_GATEWAY_FIXTURE_ROOT=/var/lib/hellas-gateway
+    export HELLAS_CLI_BIN=${package}/bin/hellas
+    exec ${gatewayFixture}/bin/gateway-fixture
+  '';
+
+  validatorResetProbe = pkgs.writeShellScript "probe-validator-reset-identity" ''
+    set -eu
+    home=/var/lib/hellas-validator-reset/node0
+    if [ ! -e "$home/seeded" ]; then
+      state="$(find "$home/chains" -mindepth 2 -maxdepth 2 -type d -name validator -print -quit)"
+      test -n "$state"
+      id -u > "$home/uid"
+      printf 'shared identity\n' > "$home/identity"
+      printf 'selected state\n' > "$state/retained"
+      mkdir -p "$home/chains/other/validator"
+      printf 'other chain\n' > "$home/chains/other/validator/retained"
+      touch "$home/seeded"
+    fi
+    # The service identity must be able to write the selected state on every start.
+    selected="$(find "$home/chains" -mindepth 2 -maxdepth 2 -type d -name validator ! -path '*/other/*' -print -quit)"
+    date +%s%N > "$selected/written-by-service"
+  '';
+
   chainValidatorFollowerPrelude =
     {
       homePrefix,
@@ -50,10 +95,10 @@ let
     ''
       import shlex
       import time
-      import tomllib
+      import json
 
       cli = "${validatorPackage}/bin/hellas"
-      trust_args = "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json"
+      trust_args = "--chain-config ${homePrefix}/chain.json"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
       follower_api = "http://127.0.0.1:31247/api/v1/blocks"
       home = "HOME=${homePrefix}/client-home OTEL_SERVICE_NAME=hellas-test-client"
@@ -101,23 +146,29 @@ let
           "printf 'chain_sync_bind = \"127.0.0.1:31248\"\\n' > ${homePrefix}/validator.toml; "
           f"HOME=${homePrefix}/validator-home {cli} chain validator config "
           "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
+          "--network-id hellas-e2e-1 "
           "--light-client-bind 127.0.0.1:${toString chainRpcPort} "
           "--metrics-port ${toString metricsPort} ${allocationArgs} "
+          "--genesis-out ${homePrefix}/genesis.json "
           ">> ${homePrefix}/validator.toml"
       )
-      machine.succeed(
-          f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
-      )
-      config = tomllib.loads(machine.succeed("cat ${homePrefix}/validator.toml"))
-      peer_id = config["genesis"]["validators"][0]["public_key"]
-      genesis = shlex.quote(json.dumps(config["genesis"]))
-      machine.succeed(f"printf %s {genesis} > ${homePrefix}/genesis.json")
+      genesis_document = json.loads(machine.succeed("cat ${homePrefix}/genesis.json"))
+      peer_id = genesis_document["validators"][0]["public_key"]
       machine.succeed(
           f"{cli} chain validator export-trust --config ${homePrefix}/validator.toml "
           "--genesis ${homePrefix}/genesis.json > ${homePrefix}/trust.json"
       )
+      profile = {
+          "trust": json.loads(machine.succeed("cat ${homePrefix}/trust.json")),
+          "validators": [rpc],
+          "genesis_json": machine.succeed("cat ${homePrefix}/genesis.json"),
+      }
+      machine.succeed(f"printf %s {shlex.quote(json.dumps(profile))} > ${homePrefix}/chain.json")
       machine.succeed(
-          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} chain validator run "
+          f"{cli} {trust_args} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
+      )
+      machine.succeed(
+          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} --home ${homePrefix}/validator-home/.hellas {trust_args} chain validator run "
           f"--config ${homePrefix}/validator.toml "
           f"> {validator_log} 2>&1 & echo $! > ${homePrefix}/validator.pid"
       )
@@ -127,11 +178,10 @@ let
           print(machine.succeed(f"cat {validator_log} || true"))
           raise
       machine.succeed(
-          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer serve "
-          f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
+          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} --home ${homePrefix}/follower-store {trust_args} chain indexer serve "
+          f"--rpc {rpc} "
           f"--peer {peer_id}@127.0.0.1:31248 "
           "--partition-prefix ${followerPartitionPrefix} "
-          "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json "
           "--listen 127.0.0.1:31247 "
           f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
       )
@@ -143,6 +193,132 @@ let
     '';
 in
 {
+  # Exercise the generated validator prestart as its DynamicUser. The main
+  # consensus command is replaced with a state probe for this test.
+  # Unit-semantics test: no long-running hellas process, so no trace
+  # export is expected from it.
+  validator-reset-service-identity = pkgs.testers.runNixOSTest {
+    name = "hellas-validator-reset-service-identity";
+    nodes.machine = _: {
+      imports = [ self.nixosModules.validators ];
+      config = lib.mkMerge [
+        (mkBaseNode validatorPackage)
+        {
+          services.hellas-chain-validators.reset = {
+            enable = true;
+            package = validatorPackage;
+            nodes = 1;
+            stateGeneration = 1;
+          };
+          systemd.services.hellas-validator-reset-node0 = {
+            wantedBy = lib.mkForce [ ];
+            serviceConfig = {
+              Type = lib.mkForce "oneshot";
+              Restart = lib.mkForce "no";
+              ExecStart = lib.mkForce validatorResetProbe;
+            };
+          };
+        }
+      ];
+    };
+    testScript = ''
+      import shlex
+
+      start_all()
+      service = "hellas-validator-reset-node0.service"
+      home = "/var/lib/hellas-validator-reset/node0"
+      machine.succeed(f"systemctl start {service}")
+      uid = int(machine.succeed(f"cat {home}/uid"))
+      assert uid != 0, uid
+      state = machine.succeed(
+          f"find {home}/chains -mindepth 2 -maxdepth 2 -type d -name validator "
+          "! -path '*/other/*' -print -quit"
+      ).strip()
+      assert state, "native state-generation did not create selected validator state"
+      assert machine.succeed(f"cat {state}/.state-generation").strip() == "1"
+      # DynamicUser with PrivateUsers: prove access by the service identity itself
+      # (the probe writes into the reset state), and that root did not create it.
+      machine.succeed(f"test -s {state}/written-by-service")
+      assert machine.succeed(f"stat -c %u {state}").strip() != "0"
+      assert machine.succeed(f"stat -c %a {state}/retained").strip() == "600"
+      assert machine.succeed(f"cat {home}/identity").strip() == "shared identity"
+      assert machine.succeed(f"cat {home}/chains/other/validator/retained").strip() == "other chain"
+      settings = machine.succeed(f"systemctl show {service} -p DynamicUser -p UMask")
+      assert "DynamicUser=yes" in settings, settings
+      assert "UMask=0077" in settings, settings
+
+      # Keep the generated unit and its DynamicUser settings. Change only the
+      # generation token in its actual ExecStartPre command for a second start.
+      unit = machine.succeed(f"systemctl cat {service}")
+      prestart = next(line for line in unit.splitlines() if line.startswith("ExecStartPre="))
+      assert "state-generation --generation 1" in prestart, prestart
+      changed = prestart.replace("state-generation --generation 1", "state-generation --generation 2")
+      dropin = f"/run/systemd/system/{service}.d/generation.conf"
+      machine.succeed(f"mkdir -p /run/systemd/system/{service}.d")
+      machine.succeed(
+          f"printf '%s\\n' '[Service]' 'ExecStartPre=' {shlex.quote(changed)} > {dropin}"
+      )
+      machine.succeed("systemctl daemon-reload")
+      machine.succeed(f"systemctl start {service}")
+      machine.fail(f"test -e {state}/retained")
+      machine.succeed(f"test -s {state}/written-by-service")
+      assert machine.succeed(f"cat {state}/.state-generation").strip() == "2"
+      assert machine.succeed(f"cat {home}/identity").strip() == "shared identity"
+      assert machine.succeed(f"cat {home}/chains/other/validator/retained").strip() == "other chain"
+      assert machine.succeed(f"stat -c %u {state}").strip() != "0"
+    '';
+  };
+
+  gateway-fresh-home = runTest {
+    name = "hellas-gateway-fresh-home";
+    nodes.machine = _: {
+      imports = [ hellasModule ];
+      config = lib.mkMerge [
+        (mkBaseNode package)
+        {
+          services.hellas.gateway = {
+            enable = true;
+            inherit package;
+            gatewayProfile = "/var/lib/hellas-gateway/gateway-profile.json";
+            localGrant = "07070707070707070707070707070707";
+            passkey = "/var/lib/hellas-gateway/principal.passkey";
+            workProfile = "/var/lib/hellas-gateway/work-profile.json";
+            trustStore = "/var/lib/hellas-gateway/local-trust";
+            trustPolicy = "local";
+            port = 18080;
+          };
+          systemd.services.hellas-gateway = {
+            wantedBy = lib.mkForce [ ];
+            serviceConfig.ExecStartPre = gatewayFixtureRunner;
+          };
+          virtualisation.cores = 2;
+          virtualisation.memorySize = 2048;
+        }
+      ];
+    };
+    testScript = ''
+      start_all()
+      machine.fail("test -e /var/lib/hellas-gateway/.hellas")
+      machine.succeed("systemctl start hellas-gateway.service")
+      machine.wait_for_unit("hellas-gateway.service")
+      machine.wait_for_open_port(18080)
+      machine.succeed("test -f /var/lib/hellas-gateway/gateway-profile.json")
+      machine.succeed("test -f /var/lib/hellas-gateway/.hellas/identity")
+      unit = machine.succeed("systemctl show hellas-gateway.service --property=WorkingDirectory")
+      assert "WorkingDirectory=/var/lib/hellas-gateway" in unit
+      unauth = machine.succeed(
+          "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/responses"
+      ).strip()
+      assert unauth == "401", unauth
+      authorized = machine.succeed(
+          "curl -sS -o /dev/null -w '%{http_code}' "
+          "-H \"Authorization: Bearer $(cat /var/lib/hellas-gateway/gateway.token)\" "
+          "http://127.0.0.1:18080/v1/responses"
+      ).strip()
+      assert authorized == "405", authorized
+    '';
+  };
+
   discovery-monitor = runTest {
     name = "hellas-discovery-monitor";
     nodes.machine = _: {
@@ -150,19 +326,23 @@ in
       config = lib.mkMerge [
         (mkBaseNode package)
         {
-          systemd.tmpfiles.rules = [
-            # Keeping only an empty runtime root here proves the provider did
-            # not receive a model through Nix evaluation or the store.
-            "d /srv/hellas-content 0755 root root -"
-          ];
-          systemd.services.hellas-monitor = {
-            environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
-            serviceConfig = {
-              ExecStart = "${package}/bin/hellas --identity /tmp/hellas-monitor.key monitor";
-              KillSignal = "SIGINT";
-              StandardOutput = "file:/tmp/hellas-monitor.log";
-              StandardError = "inherit";
+          systemd = {
+            tmpfiles.rules = [
+              # Keeping only an empty runtime root here proves the provider did
+              # not receive a model through Nix evaluation or the store.
+              "d /srv/hellas-content 0755 root root -"
+            ];
+            services.hellas-monitor = {
+              environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
+              serviceConfig = {
+                ExecStart = "${package}/bin/hellas --home /tmp/hellas-monitor monitor";
+                KillSignal = "SIGINT";
+                StandardOutput = "file:/tmp/hellas-monitor.log";
+                StandardError = "inherit";
+              };
             };
+            # Start explicitly so the test observes a genuinely empty home.
+            services.hellas.wantedBy = lib.mkForce [ ];
           };
           services.hellas = {
             enable = true;
@@ -173,7 +353,6 @@ in
             openFirewall = true;
             queueSize = 2;
             contentRoots = [ "/srv/hellas-content" ];
-            contentIndex = "/var/lib/hellas/content-index.bin";
             gpuSessionPrograms = 3;
             gpuSessionAssetBytes = 1073741824;
             memoryMaxBytes = 1879048192;
@@ -188,24 +367,26 @@ in
     };
     testScript = ''
       start_all()
+      machine.fail("test -e /var/lib/hellas/.hellas")
+      machine.succeed("systemctl start hellas.service")
       machine.wait_for_unit("hellas.service")
-      machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
+      machine.wait_until_succeeds("test -e /var/lib/hellas/.hellas/store/fastresume.bin", timeout=30)
 
       machine.fail("${package}/bin/hellas llm --help")
 
       unit = machine.succeed(
           "systemctl show hellas.service "
-          "--property=Environment --property=ExecStart --property=LimitMEMLOCK "
+          "--property=Environment --property=ExecStart --property=WorkingDirectory --property=LimitMEMLOCK "
           "--property=MemoryMax --property=MemorySwapMax --property=OOMPolicy"
       )
       assert "--content-root /srv/hellas-content" in unit
-      assert "--content-index /var/lib/hellas/content-index.bin" in unit
       assert "--gpu-session-programs 3" in unit
       assert "--gpu-session-asset-bytes 1073741824" in unit
       assert "MemoryMax=1879048192" in unit
       assert "MemorySwapMax=0" in unit
       assert "OOMPolicy=kill" in unit
       assert "TMPDIR=/run/hellas" in unit
+      assert "WorkingDirectory=/var/lib/hellas" in unit
       machine.succeed(
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.oom.group)\" = 1"
       )

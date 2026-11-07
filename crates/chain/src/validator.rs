@@ -135,6 +135,7 @@ pub enum Command {
         output_dir: PathBuf,
     },
     Config {
+        network_id: Option<String>,
         validators: u32,
         validator: u32,
         start_port: u16,
@@ -147,13 +148,17 @@ pub enum Command {
         chain_sync_bind: Option<SocketAddr>,
         archive_blocks: Option<NonZeroU64>,
         genesis: Option<PathBuf>,
+        genesis_out: Option<PathBuf>,
         genesis_allocations: Vec<String>,
     },
     Run {
         config: PathBuf,
+        profile: hellas_genesis::ChainProfile,
+        home: PathBuf,
     },
     CheckConfig {
         config: PathBuf,
+        profile: hellas_genesis::ChainProfile,
     },
 }
 
@@ -189,6 +194,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             output_dir,
         }),
         Command::Config {
+            network_id,
             validators,
             validator,
             start_port,
@@ -201,8 +207,10 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         } => setup(SetupArgs {
+            network_id,
             validators,
             validator,
             start_port,
@@ -215,14 +223,20 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             chain_sync_bind,
             archive_blocks,
             genesis,
+            genesis_out,
             genesis_allocations,
         }),
-        Command::Run { config } => run(config),
-        Command::CheckConfig { config } => check_config(config),
+        Command::Run {
+            config,
+            profile,
+            home,
+        } => run(config, profile, home),
+        Command::CheckConfig { config, profile } => check_config(config, profile),
     }
 }
 
 struct SetupArgs {
+    network_id: Option<String>,
     validators: u32,
     validator: u32,
     start_port: u16,
@@ -235,6 +249,7 @@ struct SetupArgs {
     chain_sync_bind: Option<SocketAddr>,
     archive_blocks: Option<NonZeroU64>,
     genesis: Option<PathBuf>,
+    genesis_out: Option<PathBuf>,
     genesis_allocations: Vec<String>,
 }
 
@@ -380,7 +395,6 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
             chain_sync_bind: None,
             archive_blocks: None,
             relay_urls: relay_urls.clone(),
-            genesis: genesis.clone(),
             peers,
         };
         let rendered = toml::to_string_pretty(&config)?;
@@ -394,6 +408,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
 
 fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
     let SetupArgs {
+        network_id,
         validators,
         validator,
         start_port,
@@ -406,6 +421,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         chain_sync_bind,
         archive_blocks,
         genesis,
+        genesis_out,
         genesis_allocations,
     } = args;
 
@@ -498,7 +514,8 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         }
         None => Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-            network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
+            network_id: network_id
+                .unwrap_or_else(|| crate::genesis::Chain::default().network().id.to_string()),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()
@@ -518,10 +535,16 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         chain_sync_bind,
         archive_blocks,
         relay_urls,
-        genesis,
         peers,
     };
-    config.genesis_allocations()?;
+    config.validate_genesis(&genesis)?;
+    config.genesis_allocations(&genesis)?;
+
+    if let Some(path) = genesis_out {
+        let mut bytes = serde_json::to_vec_pretty(&genesis)?;
+        bytes.push(b'\n');
+        hellas_private::write_atomically(&path, ".tmp", &bytes)?;
+    }
 
     let rendered = toml::to_string_pretty(&config)?;
     println!("{rendered}");
@@ -590,8 +613,8 @@ mod genesis_allocation_tests {
             trust.genesis_sha256,
             export_trust(&config, &changed).unwrap().genesis_sha256
         );
-        let mut wrong = config.genesis.clone();
-        wrong.validators[0].label = "other".into();
+        let mut wrong: Genesis = serde_json::from_slice(&document).unwrap();
+        wrong.validators[0].public_key = "00".into();
         assert!(export_trust(&config, &serde_json::to_vec(&wrong).unwrap()).is_err());
     }
 
@@ -740,13 +763,14 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
 /// Used by `validator check-config` and by `nix build` via runCommand.
 fn validate_relay_urls(
     validator_config: &ValidatorConfig,
+    genesis: &Genesis,
     private_key: &ed25519::PrivateKey,
 ) -> Result<(), ValidatorError> {
     let mut seen = BTreeSet::new();
     for relay_url in &validator_config.relay_urls {
         let request = authenticated_relay_request(
             relay_url,
-            &validator_config.genesis,
+            genesis,
             private_key,
             0,
             [0; hellas_wire::relay_auth::NONCE_BYTES],
@@ -769,16 +793,14 @@ pub fn export_trust(
 ) -> Result<hellas_genesis::TrustDocument, ValidatorError> {
     use commonware_cryptography::{Hasher as _, Sha256};
     let genesis: Genesis = serde_json::from_slice(genesis_json)?;
-    config.validate_genesis()?;
-    if genesis != config.genesis || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID {
-        return Err(ValidatorError::InvalidSetup(
-            "genesis file must match the validator's devnet genesis".into(),
-        ));
-    }
+    config.validate_genesis(&genesis)?;
     let scheme = Scheme::signer(
-        &crate::consensus_namespace(config.network_id()?, crate::genesis_digest(&config.genesis)),
-        config.participants()?,
-        config.decode_threshold_polynomial()?,
+        &crate::consensus_namespace(
+            config.network_id(&genesis)?,
+            crate::genesis_digest(&genesis),
+        ),
+        config.participants(&genesis)?,
+        config.decode_threshold_polynomial(&genesis)?,
         config.decode_threshold_share()?,
     )
     .ok_or_else(|| ValidatorError::Scheme("threshold share does not match polynomial".into()))?;
@@ -799,21 +821,29 @@ pub fn export_trust(
     Ok(trust)
 }
 
-fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
+fn check_config(
+    config_path: PathBuf,
+    profile: hellas_genesis::ChainProfile,
+) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let validator_config: ValidatorConfig = toml::from_str(&config_str)?;
+    let genesis = profile.genesis();
     let private_key = validator_config.decode_private_key()?;
     validator_config.decode_threshold_share()?;
-    validator_config.decode_threshold_polynomial()?;
-    validator_config.participants()?;
-    validator_config.peer_address_map()?;
-    validator_config.genesis_allocations()?;
-    validate_relay_urls(&validator_config, &private_key)?;
+    validator_config.decode_threshold_polynomial(genesis)?;
+    validator_config.participants(genesis)?;
+    validator_config.peer_address_map(genesis)?;
+    validator_config.genesis_allocations(genesis)?;
+    validate_relay_urls(&validator_config, genesis, &private_key)?;
     println!("ok");
     Ok(())
 }
 
-fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
+fn run(
+    config_path: PathBuf,
+    profile: hellas_genesis::ChainProfile,
+    home: PathBuf,
+) -> Result<(), ValidatorError> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut validator_config: ValidatorConfig = toml::from_str(&config_str)?;
 
@@ -831,23 +861,28 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         );
     }
 
-    let network_id = validator_config.network_id()?;
+    let selected_genesis = profile.genesis().clone();
+    let expected_threshold_identity = profile
+        .static_threshold_identity()
+        .map_err(|error| ValidatorError::InvalidSetup(error.to_string()))?;
+
+    let network_id = validator_config.network_id(&selected_genesis)?;
     let private_key = validator_config.decode_private_key()?;
     let me = private_key.public_key();
     let threshold_share = validator_config.decode_threshold_share()?;
-    let threshold_polynomial = validator_config.decode_threshold_polynomial()?;
-    let genesis_allocations = validator_config.genesis_allocations()?;
+    let threshold_polynomial = validator_config.decode_threshold_polynomial(&selected_genesis)?;
+    let genesis_allocations = validator_config.genesis_allocations(&selected_genesis)?;
 
     let git_rev = option_env!("GIT_REV").unwrap_or("unknown");
 
-    let participants = validator_config.participants()?;
-    let peer_map = validator_config.peer_address_map()?;
-    validate_relay_urls(&validator_config, &private_key)?;
+    let participants = validator_config.participants(&selected_genesis)?;
+    let peer_map = validator_config.peer_address_map(&selected_genesis)?;
+    validate_relay_urls(&validator_config, &selected_genesis, &private_key)?;
     let relay_private_key = private_key.clone();
 
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", validator_config.listen_port).parse()?;
 
-    let genesis_digest = crate::genesis_digest(&validator_config.genesis);
+    let genesis_digest = crate::genesis_digest(&selected_genesis);
     let namespace = crate::consensus_namespace(network_id, genesis_digest);
 
     // Build consensus scheme
@@ -864,6 +899,16 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             ));
         }
     };
+    if scheme.identity().encode().as_ref() != expected_threshold_identity.as_slice() {
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
+            ),
+            None => "threshold identity differs from selected chain".into(),
+        };
+        return Err(ValidatorError::Scheme(reason));
+    }
     let consensus_info = ConsensusInfo {
         validators: scheme
             .participants()
@@ -871,11 +916,11 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             .map(|public_key| hex::encode(public_key.encode()))
             .collect(),
         threshold_identity: scheme.identity().encode().to_vec(),
-        network_id: validator_config.genesis.network_id.clone(),
+        network_id: selected_genesis.network_id.clone(),
     };
 
     // Configure tokio runtime
-    let storage_dir = validator_config.storage_directory()?;
+    let storage_dir = crate::chain_dir::ChainDir::open(&home, &profile)?.validator();
     let _directory_lock = crate::execution::pipeline::lock(&storage_dir)?;
     let storage_dir_utf8 = storage_dir
         .to_str()
@@ -959,7 +1004,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let mut application = Application::new(
             context.child("app"),
             network_id,
-            crate::genesis_digest(&validator_config.genesis),
+            crate::genesis_digest(&selected_genesis),
             genesis_leader,
             genesis_allocations.clone(),
             &partition_prefix,
@@ -972,13 +1017,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let mempool = application.mempool();
         let owner_index = application.owner_index();
         let genesis_block = application.genesis_block();
-        crate::execution::pipeline::pin(
-            &storage_dir,
-            &validator_config.genesis,
-            &consensus_info.threshold_identity,
-            genesis_block.digest(),
-        )
-        .expect("provisioned chain identity");
         let stateful_startup_context = context.child("stateful_startup");
         let mut plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
             &stateful_startup_context,
@@ -1218,7 +1256,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             .iter()
             .cloned()
             .map(|relay_url| {
-                let genesis = validator_config.genesis.clone();
+                let genesis = selected_genesis.clone();
                 let private_key = relay_private_key.clone();
                 let light_client = light_client.clone();
                 let activity_tx = activity_tx.clone();

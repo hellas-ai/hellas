@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 mod config;
 mod error;
-pub use config::{PaidGatewayOptions, load_pool_options};
+pub use config::{GatewayProviderOptions, PaidGatewayOptions, load_pool_options};
 pub use error::PoolError;
 type Result<T, E = PoolError> = std::result::Result<T, E>;
 
@@ -173,8 +173,10 @@ impl PaidGateway {
         funding: crate::paid_client::SessionFundingOptions,
     ) -> Result<Arc<Self>> {
         options.validate()?;
-        for provider in &options.providers {
-            provider.config.clone().validate()?;
+        if owner.chain().as_path() != options.config.chain.as_path() {
+            return Err(PoolError::Invalid(
+                "funding owner belongs to another chain directory",
+            ));
         }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
@@ -185,12 +187,13 @@ impl PaidGateway {
             ));
         }
         let mut providers = Vec::with_capacity(options.providers.len());
-        for args in options.providers {
+        for provider in options.providers {
+            let args = provider.with_config(options.config.clone());
             // Retained policy journals can depend on a height behind a fast
             // validator; select a source that already serves it.
             let setups = crate::paid_client::offer::RetainedSetups::discover(
-                &args.journal_root,
-                args.config.chain.network,
+                &args.journal_root(),
+                args.config.network(),
                 args.provider,
             )
             .await?;
@@ -458,8 +461,8 @@ fn empty_content() -> InvocationContent {
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
     let found = hellas_channel::work_store::discover_setups(
-        &options.journal_root,
-        options.config.chain.network,
+        &options.journal_root(),
+        options.config.network(),
     )
     .await?;
     // Counter files and other metadata alone must never trigger channel funding.
@@ -678,10 +681,9 @@ mod tests {
 
     fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
         PaidGatewayOptions {
+            config: fixture.config.clone(),
             max_pending_requests: 4,
-            providers: vec![PaidWorkOptions {
-                config: fixture.config.clone(),
-                journal_root: fixture.root.path().join("client"),
+            providers: vec![GatewayProviderOptions {
                 provider: crate::test_support::address(
                     iroh::SecretKey::from_bytes(&[3; 32]).public(),
                 ),
@@ -710,8 +712,7 @@ mod tests {
         assert!(matches!(zero.validate(), Err(PoolError::Invalid(_))));
 
         let mut duplicate = pool_options(&fixture);
-        let mut second = duplicate.providers[0].clone();
-        second.journal_root = fixture.root.path().join("second");
+        let second = duplicate.providers[0].clone();
         duplicate.providers.push(second);
         assert!(matches!(
             duplicate.validate(),
@@ -720,7 +721,6 @@ mod tests {
 
         let mut shared = pool_options(&fixture);
         let mut other = shared.providers[0].clone();
-        other.journal_root = fixture.root.path().join("other");
         other.provider =
             crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
         shared.providers.push(other);
@@ -731,7 +731,9 @@ mod tests {
         fixture: &crate::test_support::PaidFixture,
         policy: ProviderChannelPolicy,
     ) -> PaidPool {
-        let args = pool_options(fixture).providers.remove(0);
+        let mut options = pool_options(fixture);
+        let config = options.config.clone();
+        let args = options.providers.remove(0).with_config(config);
         PaidPool {
             funding: Default::default(),
             owner: Arc::new(
@@ -740,7 +742,7 @@ mod tests {
                     Secp256k1Signer::from_secret_scalar([7; 32])
                         .unwrap()
                         .party_key(),
-                    &fixture.root.path().join("funding"),
+                    &fixture.config.chain,
                 )
                 .unwrap(),
             ),
@@ -856,20 +858,22 @@ mod tests {
     async fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
         let fixture = crate::test_support::PaidFixture::new();
         let options = pool_options(&fixture);
-        let provider = &options.providers[0];
+        let provider = &options.providers[0]
+            .clone()
+            .with_config(options.config.clone());
         assert!(!has_retained_setup(provider).await.unwrap());
-        std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
+        std::fs::create_dir_all(provider.journal_root().join("apple-counters")).unwrap();
         std::fs::write(
             provider
-                .journal_root
+                .journal_root()
                 .join("apple-counters/producer.counter"),
             [1],
         )
         .unwrap();
         assert!(!has_retained_setup(provider).await.unwrap());
         let store = hellas_channel::work_store::SetupStore::open(
-            &provider.journal_root,
-            provider.config.chain.network,
+            &provider.journal_root(),
+            provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
@@ -882,8 +886,8 @@ mod tests {
             "an unsigned header carries no recovery obligation"
         );
         let store = hellas_channel::work_store::SetupStore::open(
-            &provider.journal_root,
-            provider.config.chain.network,
+            &provider.journal_root(),
+            provider.config.network(),
             fixture.descriptor.bond_edge(),
             hellas_channel::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
@@ -900,35 +904,6 @@ mod tests {
         endpoint.import(&fixture.proposal.encode()).await.unwrap();
         drop(endpoint);
         assert!(has_retained_setup(provider).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn shared_pool_rejects_reused_journal_before_opening_or_writing() {
-        let fixture = crate::test_support::PaidFixture::new();
-        let mut options = pool_options(&fixture);
-        let mut second = options.providers[0].clone();
-        second.provider =
-            crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
-        options.providers.push(second);
-        let identity = crate::NodeIdentity::generate();
-        let owner = Arc::new(
-            crate::client_owner::ClientOwner::new(
-                Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
-                Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
-                    .unwrap()
-                    .party_key(),
-                &fixture.root.path().join("funding"),
-            )
-            .unwrap(),
-        );
-        let result = PaidGateway::open(options, identity, owner).await;
-        assert!(matches!(
-            result,
-            Err(PoolError::Invalid(
-                "paid providers must have distinct journal roots"
-            ))
-        ));
-        assert!(!fixture.root.path().join("client").exists());
     }
 
     #[tokio::test]

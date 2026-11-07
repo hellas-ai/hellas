@@ -3,17 +3,17 @@
 A principal is a person or bot, identified by one P-256 passkey. A node holds
 only machine keys: an iroh transport key for QUIC and a secp256k1 node key. The
 CLI acts for the principal of a software passkey file given with `--passkey`
-(32 raw bytes or 64 hex digits); `--identity` names the node's own keys.
+(32 raw bytes or 64 hex digits); `--home` selects the directory holding the node's keys and state (`<home>/identity`).
 
 For first setup, `hellas --software-root identity init --passkey-out owner.passkey`
 creates both the client device identity and a fresh private owner key. It never
 overwrites an existing key. Start a model worker with `serve --audio-model DIR
---await-owner STATE`: the converted Whisper package supplies a model-pinned
+--await-owner`: the converted Whisper package supplies a model-pinned
 resource, a machine/account budget, and the indexed weights. The directory's
 basename is its resource name; one job may run at a time. Use `--grant-config`
 instead for custom resources or budgets.
 
-The worker writes a private `STATE/invitation.json`. Pair with
+The worker writes a private `<home>/provider/invitation.json`. Pair with
 `hellas --passkey owner.passkey admin bootstrap-remote --invitation FILE
 --profile-out operator`. Without custom scopes, the pairing owner receives
 one year of full node administration; `--administrator` and `--credential-scope`
@@ -39,17 +39,17 @@ It grants no application rights. The node writer rechecks current credentials an
 grants before each effect.
 
 Online commands take a private `--profile` file. With `--passkey` the session is a
-passkey session; without it, the node key of `--identity` opens a daily session:
+passkey session; without it, the node key in `<home>/identity` opens a daily session:
 
 ```sh
-hellas --identity node.identity admin --profile operator.json status
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
-hellas --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
-hellas --identity node.identity admin --profile operator.json work allowance.json
-hellas --identity node.identity admin --profile operator.json work export.json --offer-out recipient.offer
-hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
+hellas --home node-home admin --profile operator.json status
+hellas --home node-home --passkey operator.passkey admin --profile operator.json grant change.json
+hellas --home node-home --passkey operator.passkey admin --profile operator.json issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
+hellas --home node-home --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
+hellas --home node-home --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
+hellas --home node-home admin --profile operator.json work allowance.json
+hellas --home node-home admin --profile operator.json work export.json --offer-out recipient.offer
+hellas --home laptop-home admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
 `status` requires `host.status` on this authority's host resource. It includes the
@@ -78,7 +78,7 @@ table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
 credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
-the device that will hold it. `hellas --identity node.identity identity
+the device that will hold it. `hellas --home node-home identity
 show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
 the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The client prepares the credential using the
@@ -333,14 +333,14 @@ On the receiving device, export its principal's contact card and device holder:
 
 ```sh
 hellas --passkey me.passkey contact export --display-name me --out me.contact
-hellas --identity laptop.identity identity show-holder > me.holder
+hellas --home laptop-home identity show-holder > me.holder
 ```
 
 Give both files to the node administrator. The administrator selects the
 configured resource name; its account comes from the node's configuration:
 
 ```sh
-hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+hellas --home admin-home --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
   share --contact me.contact --holder me.holder --resource klein \
   --limit requests:total:100 --max-job 15m --expires 1h --label "My node" --out me.access
 ```
@@ -385,7 +385,7 @@ ID before distributing it or retrying issuance.
 On the receiving device:
 
 ```sh
-hellas --identity laptop.identity --passkey me.passkey offer import-bundle me.access --name box
+hellas --home laptop-home --passkey me.passkey offer import-bundle me.access --name box
 ```
 
 Import refuses a different principal or device and verifies the provider's offer
@@ -398,7 +398,7 @@ Use the imported offer directly; its signed policy selects the resource and
 its bundle alias locates the bound profile:
 
 ```sh
-hellas --identity laptop.identity --passkey me.passkey image \
+hellas --home laptop-home --passkey me.passkey image \
   --offer box.klein --model ./klein --prompt "a fox"
 ```
 
@@ -421,7 +421,7 @@ renew earlier, choose a different duration that fits the administrator's issuanc
 ceiling, and repeat the desired limits and job duration:
 
 ```sh
-hellas --identity admin.identity --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
+hellas --home admin-home --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
   share --contact me.contact --holder me.holder --resource klein \
   --limit requests:total:100 --max-job 15m --expires 2h --out me-renewed.access
 ```
@@ -435,8 +435,8 @@ On that device, import the renewed bundle under a new alias. An existing profile
 directory is never overwritten, including with `--replace`:
 
 ```sh
-hellas --identity laptop.identity --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
-hellas --identity laptop.identity --passkey me.passkey transact --job ./saved-job \
+hellas --home laptop-home --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
+hellas --home laptop-home --passkey me.passkey transact --job ./saved-job \
   --offer box-renewed.klein \
   --attempt ./renewed-attempt.json --output ./renewed-result
 ```
@@ -475,8 +475,8 @@ Work inspection and standing queries calculate current windows without writing c
 ticks. Existing spending and reservations are preserved.
 
 ```sh
-hellas --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
-hellas --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
+hellas --home node-home --passkey operator.passkey admin bootstrap --journal node-home/provider/authority --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas --home node-home --passkey operator.passkey admin recover --journal node-home/provider/authority --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
 
 Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
@@ -493,12 +493,12 @@ subject fingerprint, never the secret. Build the caller profile using the initia
 authority and grant values.
 
 For local service startup, independently provision `control.cert.der` and its
-PKCS#8 `control.key.der` under the node state root. The grant configuration can
-select absolute `control_certificate` and `control_private_key` paths alongside
-`journal_root` and `control_socket`. The daemon validates TLS identity before
+PKCS#8 `control.key.der` under `<home>/provider`. The control socket and TLS files
+use that directory; the grant authority journal is `<home>/provider/authority`.
+The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
 After explicit initialization, start the daemon with `--grant-config`. Its file
-contains `max_job_millis`, optional listener/state paths, machine/account budgets
+contains `max_job_millis`, optional listener settings, machine/account budgets
 and complete resource policies. Resource entries require the full invocation
 policy and pricing fields accepted by the strict grant-config loader. The
 [README walkthrough](../README.md#own-a-worker-and-share-access) describes the
@@ -557,7 +557,7 @@ shown in [machine provider configuration](machine-provider-config.md). Provision
 passes no owner credential or transport secret to the provider.
 
 The ordinary node image runs `serve --port 31145`. Owner bootstrap is an explicit
-opt-in: append `--await-owner STATE_DIRECTORY` to its arguments. An unowned
+opt-in: append `--await-owner` to its arguments. An unowned
 node prints a pairing document containing its public transport pin, direct
 addresses, expiry and a fresh random secret. Obtain that document through the
 provider's authenticated console/output and keep it private. Before ownership,
