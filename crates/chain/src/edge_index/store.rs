@@ -531,7 +531,7 @@ mod tests {
     async fn locator_uses_admission_and_preserves_storage_failures() {
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
-            &directory.path().join("index.redb"),
+            &hellas_private::StoreLocation::for_test(&directory.path().join("index.redb")),
             "test".into(),
             "01".repeat(32),
             "02".repeat(32),
@@ -560,7 +560,7 @@ mod tests {
         use hellas_rpc::pb::services::edge_index::EdgeIndexHandler;
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
-            &directory.path().join("index.redb"),
+            &hellas_private::StoreLocation::for_test(&directory.path().join("index.redb")),
             "test".into(),
             "01".repeat(32),
             "02".repeat(32),
@@ -626,7 +626,7 @@ mod tests {
         // prefix, and the open query must never visit any of its rows.
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
-            &directory.path().join("index.redb"),
+            &hellas_private::StoreLocation::for_test(&directory.path().join("index.redb")),
             "test".into(),
             "01".repeat(32),
             "02".repeat(32),

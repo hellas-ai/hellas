@@ -12,7 +12,7 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio as runtime};
-use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
+use std::{num::NonZeroU64, sync::Arc};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -117,11 +117,11 @@ impl Config {
         }
     }
 
-    pub fn storage_dir(&self) -> PathBuf {
+    pub fn storage_dir(&self) -> hellas_private::StoreLocation {
         if self.indexed {
-            self.chain.indexer().into_path_buf()
+            self.chain.indexer()
         } else {
-            self.chain.node().into_path_buf()
+            self.chain.node()
         }
     }
 
@@ -507,7 +507,7 @@ impl Core {
                     verifier.trust_sha256(),
                 );
                 let index = crate::edge_index::EdgeIndex::open(
-                    &storage_dir.join(format!(
+                    &storage_dir.child(format!(
                         "{partition}-edge-index-v{}-{scope}.redb",
                         crate::edge_index::SCHEMA_VERSION
                     )),

@@ -1538,7 +1538,7 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         std::fs::copy(h.index_path(), &snapshot).unwrap();
         let identity = &h.index.store.identity;
         publication.index = EdgeIndex::open(
-            &snapshot,
+            &hellas_private::StoreLocation::for_test(&snapshot),
             identity.network_id.clone(),
             identity.genesis_sha256.clone(),
             identity.trust_sha256.clone(),

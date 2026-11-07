@@ -1076,7 +1076,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         tokio::task::spawn_blocking(move || {
             let _lock = pipeline::lock(&config.storage_dir()).unwrap();
             runtime::Runner::new(
-                runtime::Config::new().with_storage_directory(config.storage_dir()),
+                runtime::Config::new().with_storage_directory(config.storage_dir().into_path_buf()),
             )
             .start(move |context| async move {
                 let settings = ArchiveConfig::default();
