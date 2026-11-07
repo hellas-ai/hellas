@@ -1,5 +1,6 @@
 //! Reusable paid-work sessions: provider authentication, admission, verified delivery,
 //! journal recovery, payment, and finalized settlement. Journals are client-owned.
+use hellas_private::StoreLocation;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,7 +149,7 @@ async fn within<T>(
 }
 
 impl PaidWorkOptions {
-    pub fn journal_root(&self) -> std::path::PathBuf {
+    pub fn journal_root(&self) -> StoreLocation {
         match self.journal_kind {
             PaidJournalKind::Client => self
                 .config
@@ -490,7 +491,7 @@ impl PaidWorkSession {
         let journal_root = args.journal_root();
         std::fs::create_dir_all(&journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
-                path: journal_root.clone(),
+                path: journal_root.clone().into_path_buf(),
                 source,
             }
         })?;
@@ -630,8 +631,9 @@ impl PaidWorkSession {
         }
 
         let setup_service = SetupService::new(setup);
-        let (mounted, descriptor) =
-            drive_setup(&setup_service, &policy, &chain, config.poll).await?;
+        let result = drive_setup(&setup_service, &policy, &chain, config.poll).await;
+        setup_service.close().await;
+        let (mounted, descriptor) = result?;
         // A completed setup journal stops at the height that finished the
         // handshake, while the channel journal it mounted keeps advancing.
         // The source chosen for the setup floor can therefore be behind the
@@ -716,6 +718,7 @@ impl PaidWorkSession {
         self.observer = None;
         // The observer can no longer renew readiness after suspension.
         let _ = self.client.observer().suspend().await;
+        self.client.close().await;
     }
 
     /// Identifies the funded channel and its admitted execution policy.

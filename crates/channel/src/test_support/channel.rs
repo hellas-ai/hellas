@@ -8,6 +8,7 @@ use crate::work::{
     fetch_result_stream, run_accepted_work,
 };
 use hellas_kernel::PendingSlot;
+use hellas_private::StoreLocation;
 use hellas_rpc::services::work::WorkServer;
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
@@ -496,8 +497,9 @@ pub async fn store_at(
     role: Role,
     height: u64,
 ) -> ChannelStore {
+    let location = StoreLocation::for_test(root);
     let mut store = match ChannelStore::open(
-        root,
+        &location,
         ready.channel().clone(),
         settlement(),
         role,
@@ -946,7 +948,8 @@ pub async fn open_setup_store(
     bond: EdgeId,
     role: Role,
 ) -> crate::work_store::SetupStore {
-    crate::work_store::SetupStore::open(root, network, bond, role, &Secp256k1Verifier::new())
+    let location = StoreLocation::for_test(root);
+    crate::work_store::SetupStore::open(&location, network, bond, role, &Secp256k1Verifier::new())
         .await
         .expect("the setup journal opens")
 }

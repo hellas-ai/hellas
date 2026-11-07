@@ -26,6 +26,7 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio};
 use hellas_genesis::{Genesis, GenesisAllocation, GenesisValidator, TrustDocument, TrustEpoch};
+use hellas_private::Durability::Crash;
 
 const EDGE_TEST_NETWORK_ID: &str = "edge-index-test-1";
 use hellas_kernel::{
@@ -175,7 +176,7 @@ impl Harness {
         .unwrap();
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config::for_indexed_profile(
-                crate::chain_dir::ChainDir::open(directory.path(), &profile).unwrap(),
+                crate::chain_dir::ChainDir::open(directory.path(), &profile, Crash).unwrap(),
                 Vec::new(),
                 None,
             )

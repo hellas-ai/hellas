@@ -4,13 +4,14 @@ use crate::{commands::CliResult, compute::ServeArgs, identity::LocalIdentity};
 use anyhow::Context as _;
 use hellas_authority::model::grant::grant_network;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
+use hellas_private::StoreLocation;
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTarget, GrantTransport};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 /// Opens this node's own provider store and serves `grant` from an in-process
 /// executor. The allowance must already be configured on this node.
 pub async fn prepare(
-    home: &Path,
+    home: &StoreLocation,
     grant: &str,
     native: ServeArgs,
     identity: &LocalIdentity,

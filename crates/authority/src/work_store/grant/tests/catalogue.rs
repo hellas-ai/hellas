@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn signed_model_and_settings_limits_reject_before_client_signing_and_provider_reservation() {
@@ -10,8 +11,9 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
     let offer = standing(&mut store).await.offer;
     let (template, _, valid_input) = proposal(&store, 1);
     let original = store.state().clone();
+    let location = StoreLocation::for_test(&directory.path().join("client"));
     let mut client = GrantClientStore::open(
-        &directory.path().join("client"),
+        &location,
         network(),
         hellas_channel::test_support::software_enrollment(2, [2; 32]),
         GrantChannelState {
@@ -115,8 +117,9 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
     assert_eq!(store.state().policy_for(&template).unwrap(), &policy());
     store.rotate().await.unwrap();
     drop(store);
+    let other_location = StoreLocation::for_test(&directory.path().join("provider"));
     let store = NodeStore::open(
-        &directory.path().join("provider"),
+        &other_location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],
@@ -245,8 +248,9 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
     );
     store.rotate().await.unwrap();
     drop(store);
+    let location = StoreLocation::for_test(directory.path());
     let store = NodeStore::open(
-        directory.path(),
+        &location,
         network(),
         Some(hellas_channel::test_support::software_enrollment(
             2, [2; 32],

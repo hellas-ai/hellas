@@ -5,6 +5,7 @@ use hellas_auth::Digest;
 use hellas_auth::authority as auth;
 use hellas_auth::test_support::actors::ROOT;
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::ProviderEnrollmentBundle;
 
 /// Administrative rights with fixture-specific validity, delegation and extra operations.
@@ -70,8 +71,9 @@ pub async fn bootstrap_node_with_credential(
         &[crate::grant_service::WORK_EXECUTE],
     );
     let root = auth::GrantId([0; 16]);
+    let location = StoreLocation::for_test(path);
     NodeStore::bootstrap(
-        path,
+        &location,
         network,
         root,
         approval(
@@ -394,7 +396,8 @@ pub async fn provision(
     service.drain().await.unwrap();
     drop(admin);
     drop(service);
-    NodeStore::open(path, network, Some(provider), now)
+    let location = StoreLocation::for_test(path);
+    NodeStore::open(&location, network, Some(provider), now)
         .await
         .unwrap()
 }

@@ -1,4 +1,5 @@
 use hellas_authority::model::grant::records::{check_grant_provider, grant_transport};
+use hellas_private::StoreLocation;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -83,7 +84,7 @@ pub struct FetchProviderOptions<R> {
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     /// Process home for chain-agnostic grant authority state.
-    pub home: PathBuf,
+    pub home: StoreLocation,
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -171,7 +172,7 @@ pub struct ProviderGrants {
 /// to the host's existing control service and writer.
 #[derive(Clone)]
 pub enum ProviderAuthority {
-    Journal { root: PathBuf },
+    Journal { root: StoreLocation },
     Host(Box<crate::node_control::NodeControl>),
 }
 impl ProviderAuthority {
@@ -302,6 +303,7 @@ pub struct ProviderHandle {
     owns_endpoint: bool,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
+    owned_authority: Option<hellas_authority::node::NodeCoordinator>,
 }
 
 impl ProviderHandle {
@@ -351,7 +353,7 @@ impl ProviderHandle {
             discovery.shutdown().await;
         }
         if let Some(grants) = self.router.as_ref().and_then(WorkRouter::grant_service) {
-            let drained = grants.drain().await.map_err(ProviderError::from);
+            let drained = grants.shutdown().await.map_err(ProviderError::from);
             result = result.and(drained);
         }
         if let Some(work) = &mut self.work {
@@ -369,6 +371,9 @@ impl ProviderHandle {
         result = result.and(joined);
         if self.owns_endpoint {
             self.endpoint.close().await;
+        }
+        if let Some(node) = self.owned_authority.take() {
+            node.close().await;
         }
         result
     }
@@ -416,6 +421,11 @@ where
 {
     if let Some((work, _)) = &config.work {
         work.validate()?;
+        if work.chain.home().durability() == hellas_private::Durability::Crash {
+            tracing::warn!(
+                r#"paid channel state may be lost on power failure; set durability = "power""#
+            );
+        }
     }
     let enrollment = &config.open_identity.enrollment;
     check_grant_provider(enrollment)?;
@@ -439,6 +449,9 @@ where
         }
         None => None,
     };
+    let owned_authority = prepared_grants.as_ref().and_then(|(grants, node)| {
+        matches!(grants.authority, ProviderAuthority::Journal { .. }).then(|| node.clone())
+    });
     let signer = config.executor.producer_key.clone();
     let content = config.executor.content_store.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
@@ -662,6 +675,7 @@ where
         accept_task,
         endpoint,
         owns_endpoint,
+        owned_authority,
         work,
     })
 }

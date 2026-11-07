@@ -125,9 +125,9 @@ impl Config {
 
     pub fn storage_dir(&self) -> PathBuf {
         if self.indexed {
-            self.chain.indexer()
+            self.chain.indexer().into_path_buf()
         } else {
-            self.chain.node()
+            self.chain.node().into_path_buf()
         }
     }
 

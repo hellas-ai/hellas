@@ -5,6 +5,7 @@ use anyhow::ensure;
 use hellas_auth::{Digest, authority::*};
 use hellas_chain::{LightClient as _, domain::Transaction};
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     Admission, ComputePrograms, InvocationPolicy, Limits,
     fetch::{FetchAdmission, FetchLimits},
@@ -48,7 +49,7 @@ struct FetchFile {
 
 pub struct PaidWork {
     pub chain: WorkConfig,
-    root: PathBuf,
+    root: StoreLocation,
     owner: Option<SoftPasskey>,
     policy: PaidPolicy,
 }
@@ -154,7 +155,7 @@ impl PaidWork {
     /// not an assumed one.
     pub fn load(
         path: &Path,
-        home: PathBuf,
+        home: StoreLocation,
         owner: Option<SoftPasskey>,
         fetch_config: Option<&Path>,
         profile: hellas_chain::genesis::ChainProfile,
@@ -465,17 +466,17 @@ impl PaidWork {
             }
             Err(error) => return Err(error.into()),
         };
+        let store = store.into_state().await;
         let Some(owner) = &self.owner else {
             ensure!(
                 store
-                    .state()
                     .paid_policy()
                     .is_some_and(|current| current.policy == self.policy),
                 "paid terms differ from the owner-approved policy; approve the exact policy with the owner's admin profile before starting"
             );
             return Ok(None);
         };
-        let authority = store.state().authority();
+        let authority = store.authority();
         let principal = crate::commands::contributions::principal(owner)?;
         ensure!(
             authority
@@ -485,7 +486,6 @@ impl PaidWork {
         );
         let id = authority.authority();
         let authorization = authority.root_grant();
-        drop(store);
         if !bootstrap_path.try_exists()? {
             return Ok(None);
         }

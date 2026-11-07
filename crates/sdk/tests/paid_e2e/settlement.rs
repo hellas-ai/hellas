@@ -1,5 +1,7 @@
 use super::*;
 use commonware_cryptography::{Hasher as _, Sha256};
+use hellas_private::Durability::Crash;
+use hellas_private::StoreLocation;
 use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 
 #[test]
@@ -84,9 +86,10 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 .await
                 .is_err()
             );
+            let location = StoreLocation::for_test(&case.root.path().join("no-journals"));
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &case.root.path().join("no-journals"),
+                    &location,
                     case.options.config.network(),
                     case.options.provider,
                     case.owner.principal(),
@@ -116,9 +119,10 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 b"not a journal",
             )
             .unwrap();
+            let other_location = StoreLocation::for_test(&corrupt);
             assert!(
                 hellas_sdk::paid_client::retained_settlement_channels(
-                    &corrupt,
+                    &other_location,
                     case.options.config.network(),
                     case.options.provider,
                     case.owner.principal(),
@@ -402,7 +406,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             )
             .unwrap();
             case.options.config.chain =
-                hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile).unwrap();
+                hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile, Crash).unwrap();
             assert_ne!(case.options.journal_root(), a_journals);
             let mut cross_chain_attempt =
                 hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
@@ -688,6 +692,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             missing.config.chain = hellas_chain::chain_dir::ChainDir::open(
                 &case.root.path().join("missing-journals"),
                 missing.config.chain.profile(),
+                Crash,
             )
             .unwrap();
             assert!(
@@ -716,7 +721,8 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             )
             .unwrap();
             wrong_network.config.chain =
-                hellas_chain::chain_dir::ChainDir::open(case.root.path(), &wrong_profile).unwrap();
+                hellas_chain::chain_dir::ChainDir::open(case.root.path(), &wrong_profile, Crash)
+                    .unwrap();
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &wrong_network,
@@ -832,6 +838,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             let cli_chain = hellas_chain::chain_dir::ChainDir::open(
                 &state,
                 case.options.config.chain.profile(),
+                Crash,
             )
             .unwrap();
             let journals = cli_chain.client_journals(&case.options.provider.to_string());

@@ -1,4 +1,6 @@
 //! A funded, metadata-only Fetch channel for SDK boundary tests.
+use hellas_private::Durability::Crash;
+use hellas_private::StoreLocation;
 // Client and provider feature suites use different parts of this fixture.
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::WorkConfig;
@@ -11,7 +13,7 @@ pub(crate) fn chain_dir(
 ) -> hellas_chain::chain_dir::ChainDir {
     let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     if network.as_str() == known.network_id() {
-        return hellas_chain::chain_dir::ChainDir::open(home, &known).unwrap();
+        return hellas_chain::chain_dir::ChainDir::open(home, &known, Crash).unwrap();
     }
     let mut genesis = known.genesis().clone();
     genesis.network_id = network.as_str().into();
@@ -34,7 +36,7 @@ pub(crate) fn chain_dir_with_genesis(
         genesis_json,
     })
     .unwrap();
-    hellas_chain::chain_dir::ChainDir::open(home, &profile).unwrap()
+    hellas_chain::chain_dir::ChainDir::open(home, &profile, Crash).unwrap()
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
@@ -138,7 +140,7 @@ impl PaidFixture {
         })
         .unwrap();
         self.config.chain =
-            hellas_chain::chain_dir::ChainDir::open(self.root.path(), &profile).unwrap();
+            hellas_chain::chain_dir::ChainDir::open(self.root.path(), &profile, Crash).unwrap();
         let mut config = self.config.node_config(None).unwrap();
         config.validators.clear();
         crate::FullNode::start(config).await.unwrap()
@@ -285,8 +287,9 @@ impl PaidFixture {
         } else {
             "provider"
         };
+        let location = StoreLocation::for_test(&self.root.path().join(name));
         ChannelStore::open(
-            &self.root.path().join(name),
+            &location,
             self.ready.channel().clone(),
             work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
             role,

@@ -32,7 +32,8 @@ impl OwnerArgs {
         if !self.is_faucet() {
             return self.load(chain);
         }
-        let path = hellas_chain::chain_dir::ChainDir::open(home, chain)?.faucet_account();
+        let path = hellas_chain::chain_dir::ChainDir::open(home, chain, Default::default())?
+            .faucet_account();
         let root = path.parent().expect("faucet account has a chain directory");
         if !path.try_exists()? {
             let index = self

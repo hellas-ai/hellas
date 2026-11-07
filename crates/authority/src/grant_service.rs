@@ -74,6 +74,7 @@ pub type GrantClock = Arc<dyn Fn() -> UnixMillis + Send + Sync>;
 
 #[derive(Clone)]
 pub struct GrantService {
+    owns_node: bool,
     node: crate::node::NodeCoordinator,
     inner: Arc<Mutex<Runtime>>,
     signer: Arc<ProducerSigningKey>,
@@ -236,12 +237,14 @@ impl GrantService {
         {
             return Err(GrantError::Signature.into());
         }
-        Ok(Self::build(
+        let mut service = Self::build(
             crate::node::NodeCoordinator::new(store, clock),
             signer,
             backend,
             addresses,
-        ))
+        );
+        service.owns_node = true;
+        Ok(service)
     }
 
     /// Attach execution to the host's existing writer. Restarting a provider
@@ -290,6 +293,7 @@ impl GrantService {
             },
         );
         Self {
+            owns_node: false,
             node,
             inner: Arc::new(Mutex::new(Runtime {
                 uploads: BTreeMap::new(),
@@ -1108,6 +1112,16 @@ impl GrantService {
             Poll::Ready(result)
         })
         .await
+    }
+
+    /// Drain physical work, then release a standalone service's journal owner.
+    /// A host-attached service leaves its writer with the host.
+    pub async fn shutdown(&self) -> Result<(), NodeStoreError> {
+        let result = self.drain().await;
+        if self.owns_node {
+            self.node.close().await;
+        }
+        result
     }
 }
 fn terminal_refusal(id: Digest, terminal: &GrantTerminal) -> WorkRefused {

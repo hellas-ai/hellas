@@ -4,6 +4,7 @@ use hellas_chain::{
     chain_dir::ChainDir,
     genesis::{Chain, ChainProfile, CustomChainFile},
 };
+use hellas_private::Durability::Crash;
 use sha2::Digest as _;
 use std::{
     net::TcpListener,
@@ -127,8 +128,8 @@ fn state_generation_resets_only_the_selected_validator_and_keeps_shared_identity
         validators: vec!["ws://127.0.0.1:9080".into()],
     })
     .unwrap();
-    let a_state = ChainDir::open(&home, &a).unwrap().validator();
-    let b_state = ChainDir::open(&home, &b).unwrap().validator();
+    let a_state = ChainDir::open(&home, &a, Crash).unwrap().validator();
+    let b_state = ChainDir::open(&home, &b, Crash).unwrap().validator();
     assert_ne!(a_state, b_state);
 
     let reset = |config: Option<&Path>, generation: &str| {

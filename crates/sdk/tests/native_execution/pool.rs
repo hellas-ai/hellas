@@ -15,6 +15,7 @@ use hellas_channel::test_support::{
     network, principal, software_enrollment,
 };
 use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
+use hellas_private::StoreLocation;
 use hellas_sdk::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
 use std::{
     path::Path,
@@ -130,6 +131,7 @@ pub(super) async fn provider_with_limit(
             apple_app_attest: None,
         })
         .unwrap();
+    let location = StoreLocation::for_test(&root.join("client"));
     let options = GrantSessionOptions {
         target,
         principal: principal(1).0,
@@ -140,7 +142,7 @@ pub(super) async fn provider_with_limit(
             credential,
             local: None,
         }),
-        journal_root: root.join("client"),
+        journal_root: location,
         control_timeout: Duration::from_secs(5),
     };
     Provider {

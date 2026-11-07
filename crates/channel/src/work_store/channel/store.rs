@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 /// The durable channel journal: the state above and the file it is
 /// replayed from.
@@ -11,6 +12,11 @@ pub struct ChannelStore {
 }
 
 impl ChannelStore {
+    /// Release the journal before another owner opens it.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+    }
+
     /// Opens one channel's journal, replaying and re-checking every
     /// record it holds.
     ///
@@ -40,7 +46,7 @@ impl ChannelStore {
     /// is another channel's or a replayed record does not obey the
     /// transition rules.
     pub async fn open<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
@@ -57,7 +63,7 @@ impl ChannelStore {
     /// Replays an initialized channel without creating an empty replacement.
     /// Settlement callers must never forget a previously signed payment.
     pub async fn open_existing<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
@@ -73,7 +79,7 @@ impl ChannelStore {
 
     #[allow(clippy::too_many_arguments)]
     async fn open_inner<V: SigVerifier>(
-        root: &Path,
+        root: &StoreLocation,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
         role: Role,
@@ -389,6 +395,12 @@ impl ChannelStore {
         Ok(())
     }
 
+    /// Inspect the actual owned connection, rather than a fresh SQLite connection.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn synchronous_for_test(&mut self) -> i64 {
+        self.journal.synchronous_for_test().await
+    }
+
     #[cfg(test)]
     pub(crate) async fn pause_next_statement_for_test(
         &mut self,
@@ -399,7 +411,7 @@ impl ChannelStore {
         self.journal.pause_next_statement().await
     }
 
-    /// Journals one step, and returns only once it is on the disk.
+    /// Journals one committed step under the configured durability policy.
     ///
     /// The rule this exists to enforce: call it *before* the bytes it
     /// records leave the process, and before the side effect it

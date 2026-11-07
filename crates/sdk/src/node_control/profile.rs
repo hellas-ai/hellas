@@ -6,6 +6,7 @@ use super::HostControl;
 use hellas_auth::authority::{
     AuthorityId, CredentialId, CredentialSecret, GrantId, NodeKey, PrincipalId,
 };
+use hellas_private::StoreLocation;
 use hellas_wire::ServiceMarker;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::*};
 use serde::{Deserialize, Serialize};
@@ -308,14 +309,15 @@ pub struct GatewayHost {
 }
 
 impl GatewayProfile {
-    pub async fn load(path: &Path) -> hellas_gateway::GatewayResult<GatewayHost> {
+    pub async fn load(path: &StoreLocation) -> hellas_gateway::GatewayResult<GatewayHost> {
         let profile: Self = serde_json::from_slice(&read_private(path)?)
             .map_err(|_| invalid("invalid gateway profile"))?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| invalid("profile needs a parent"))?;
+        let parent = path.child(
+            path.parent()
+                .ok_or_else(|| invalid("profile needs a parent"))?,
+        );
         let store = hellas_authority::work_store::grant::NodeStore::open(
-            &parent.join(profile.journal),
+            &parent.child(profile.journal),
             hellas_authority::model::grant::grant_network(),
             None,
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),

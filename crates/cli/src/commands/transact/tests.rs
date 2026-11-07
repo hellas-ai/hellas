@@ -1,5 +1,7 @@
 use super::*;
 use clap::Parser as _;
+use hellas_private::Durability::Crash;
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn paid_output_is_flushed_before_a_failed_settlement() {
@@ -66,10 +68,11 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
         ))
         .unwrap()
         .unwrap();
+    let location = StoreLocation::for_test(root.path());
     let context = Context::new(
         &identity,
         Some(&owner),
-        root.path(),
+        &location,
         &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
@@ -88,6 +91,7 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
         ),
     ] {
         let args = fetch_args(&extra).client;
+        let location = StoreLocation::for_test(root.path());
         let options = args
             .options_with_config(
                 &context,
@@ -97,7 +101,7 @@ fn paid_deadline_options_reach_the_signed_job_configuration() {
                     hellas_chain::genesis::ChainProfile::known(
                         hellas_chain::genesis::Chain::Devnet,
                     ),
-                    root.path(),
+                    &location,
                 )
                 .unwrap(),
             )
@@ -129,6 +133,7 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     let chain = hellas_chain::chain_dir::ChainDir::open(
         root.path(),
         &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+        Crash,
     )
     .unwrap();
     let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();

@@ -5,6 +5,7 @@ use hellas_auth::authority::{
     AuthorityId, AuthorityState, Credential, CredentialHolder, CredentialSecret, GrantId,
     GrantSpec, NodeKey, PasskeyAssertion, RecoveryCommand, RecoveryRecord,
 };
+use hellas_private::StoreLocation;
 use serde::Deserialize;
 use std::fs::{File, TryLockError};
 use std::io::Write as _;
@@ -85,55 +86,60 @@ impl NodeStore {
     /// The replacement credential's verifier is part of the same commit. Its
     /// secret is returned only after sync; lost output requires another recovery.
     pub async fn recover_offline(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         expected: Revision,
         approval: OwnerApproval,
         now: UnixMillis,
     ) -> Result<(RecoveryRecord, CredentialSecret), NodeStoreError> {
         let mut store = Self::open_initialized(directory, network).await?;
-        let generation = store
-            .state
-            .authority
-            .generation()
-            .checked_add(1)
-            .ok_or(hellas_auth::authority::AuthorityError::Capacity)?;
-        let (credential, secret) = Credential::prepare(
-            approval.credential,
-            CredentialHolder::Node(approval.holder),
-            generation,
-        )?;
-        let revoke = store
-            .state
-            .authority
-            .grants()
-            .filter(|grant| {
-                grant.spec().permissions.iter().any(|permission| {
-                    permission.operation.as_str() != crate::grant_service::WORK_EXECUTE
+        let result = async {
+            let generation = store
+                .state
+                .authority
+                .generation()
+                .checked_add(1)
+                .ok_or(hellas_auth::authority::AuthorityError::Capacity)?;
+            let (credential, secret) = Credential::prepare(
+                approval.credential,
+                CredentialHolder::Node(approval.holder),
+                generation,
+            )?;
+            let revoke = store
+                .state
+                .authority
+                .grants()
+                .filter(|grant| {
+                    grant.spec().permissions.iter().any(|permission| {
+                        permission.operation.as_str() != crate::grant_service::WORK_EXECUTE
+                    })
                 })
-            })
-            .map(|grant| grant.id())
-            .collect();
-        store
-            .commit(
-                now,
-                Change::Recover(RecoveryCommand {
-                    expected,
-                    administrator: approval.administrator,
-                    credential,
-                    revoke,
-                    owner: approval.assertion,
-                }),
-                true,
-            )
-            .await?;
-        let receipt = store
-            .state
-            .authority
-            .last_recovery()
-            .cloned()
-            .ok_or(NodeStoreError::Malformed)?;
-        Ok((receipt, secret))
+                .map(|grant| grant.id())
+                .collect();
+            store
+                .commit(
+                    now,
+                    Change::Recover(RecoveryCommand {
+                        expected,
+                        administrator: approval.administrator,
+                        credential,
+                        revoke,
+                        owner: approval.assertion,
+                    }),
+                    true,
+                )
+                .await?;
+            let receipt = store
+                .state
+                .authority
+                .last_recovery()
+                .cloned()
+                .ok_or(NodeStoreError::Malformed)?;
+            Ok((receipt, secret))
+        }
+        .await;
+        store.close().await;
+        result
     }
 
     /// Explicit offline creation only. No listener may serve this node until
@@ -141,7 +147,7 @@ impl NodeStore {
     /// The requested credential scope must fit the administrator's grant. Only
     /// its verifier is journaled; ordinary open can never reproduce the secret.
     pub async fn bootstrap(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         root_grant: GrantId,
         approval: OwnerApproval,
@@ -158,7 +164,7 @@ impl NodeStore {
     /// Publish the marker and initial journal together. Until the directory
     /// rename commits, opening the destination cannot observe partial authority.
     pub async fn bootstrap_prepared(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         root_grant: GrantId,
         approval: PreparedBootstrap,
@@ -218,12 +224,17 @@ impl NodeStore {
             .map_err(|error| NodeStoreError::Io(error.error))?;
         identity_lock.0.write_all(&encode(&marker)?)?;
         identity_lock.0.sync_all()?;
-        let (mut journal, _) =
-            Journal::open_latest(staging.path(), "grants", marker.journal_id()).await?;
-        journal.append(&bytes).await?;
+        let (mut journal, _) = Journal::open_latest(
+            &directory.child(staging.path()),
+            "grants",
+            marker.journal_id(),
+        )
+        .await?;
+        let appended = journal.append(&bytes).await;
         // Close SQLite before moving its directory: subsequent connections and
         // WAL recovery must use the published path, never the temporary name.
         journal.close().await;
+        appended?;
         drop(journal);
         hellas_private::sync_directory(staging.path())?;
         #[cfg(test)]
@@ -252,7 +263,7 @@ impl NodeStore {
         let (journal, _) = Journal::open_existing(directory, "grants", marker.journal_id()).await?;
         Ok(Self {
             clock,
-            _identity_lock: identity_lock,
+            _identity_lock: Some(identity_lock),
             journal,
             state,
             executions: Default::default(),
@@ -263,13 +274,13 @@ impl NodeStore {
     /// Read metadata with the daemon stopped, without recovery, clock ticks,
     /// schema migration or journal writes. Uses the same identity lock as writers.
     pub async fn inspect_offline(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         query: &hellas_auth::authority::InspectionQuery,
     ) -> Result<hellas_auth::authority::AuthorityInspection, NodeStoreError> {
         let (_identity_lock, marker) = read_marker(directory, network)?;
         let snapshot = inspection_snapshot(directory)?;
-        let (id, replay) = Journal::inspect(snapshot.path(), "grants").await?;
+        let (id, replay) = Journal::inspect(&directory.child(snapshot.path()), "grants").await?;
         if id != marker.journal_id() {
             return Err(NodeStoreError::Malformed);
         }
@@ -278,17 +289,23 @@ impl NodeStore {
     }
 
     pub(super) async fn open_initialized(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
     ) -> Result<Self, NodeStoreError> {
         let clock = super::super::clock::ClockBound::new();
         let (identity_lock, marker) = read_marker(directory, network)?;
-        let (journal, replay) =
+        let (mut journal, replay) =
             Journal::open_existing(directory, "grants", marker.journal_id()).await?;
-        let state = restore_replay(replay, network, marker.authority)?;
+        let state = match restore_replay(replay, network, marker.authority) {
+            Ok(state) => state,
+            Err(error) => {
+                journal.close().await;
+                return Err(error);
+            }
+        };
         Ok(Self {
             clock,
-            _identity_lock: identity_lock,
+            _identity_lock: Some(identity_lock),
             journal,
             state,
             executions: Default::default(),
@@ -327,7 +344,7 @@ fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError
 }
 
 /// Called while the store's identity lock excludes every writer.
-fn inspection_snapshot(directory: &Path) -> Result<tempfile::TempDir, NodeStoreError> {
+fn inspection_snapshot(directory: &StoreLocation) -> Result<tempfile::TempDir, NodeStoreError> {
     // The identity lock excludes live inspections. Only our scratch directories
     // can be stale; DirEntry::file_type and remove_dir_all do not follow symlinks.
     for entry in std::fs::read_dir(directory)? {
@@ -349,7 +366,7 @@ fn inspection_snapshot(directory: &Path) -> Result<tempfile::TempDir, NodeStoreE
         .tempdir_in(directory)?;
     hellas_private::restrict_directory(snapshot.path())?;
     let source = Journal::path(directory, "grants");
-    let target = Journal::path(snapshot.path(), "grants");
+    let target = Journal::path(&directory.child(snapshot.path()), "grants");
     let parent = target.parent().ok_or(NodeStoreError::Malformed)?;
     hellas_private::create_dir_all_durable(parent)?;
     hellas_private::restrict_directory(parent)?;
@@ -378,7 +395,7 @@ fn inspection_snapshot(directory: &Path) -> Result<tempfile::TempDir, NodeStoreE
 }
 
 fn read_marker(
-    directory: &Path,
+    directory: &StoreLocation,
     network: NetworkId,
 ) -> Result<(IdentityLock, Marker), NodeStoreError> {
     let path = directory.join(MARKER);

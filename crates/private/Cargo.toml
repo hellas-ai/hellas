@@ -14,6 +14,9 @@ dbus-secret-service-keyring-store = { version = "1", features = [
     "vendored",
 ] }
 
+[features]
+test-support = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
@@ -33,5 +36,6 @@ windows-sys = { version = "0.61", features = [
 
 [dependencies]
 keyring-core = "1"
+serde.workspace = true
 tempfile.workspace = true
 zeroize = "1.9"

@@ -1111,6 +1111,9 @@ in
     '';
 
   validator-module-eval =
+    assert lib.hasInfix "--durability crash" defaultProviderService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--durability power"
+      (evalProvider { durability = "power"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
     assert
       paidWorkValidators.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
         9092

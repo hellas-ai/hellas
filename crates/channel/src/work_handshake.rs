@@ -667,6 +667,11 @@ impl SetupDriver<'_> {
 }
 
 impl SetupService {
+    /// Stop using this setup before handing its journal to another owner.
+    pub async fn close(&self) {
+        self.endpoint.lock_for_shutdown().await.store.close().await;
+    }
+
     /// Read retained setup facts through the same writer used by dispatch and driving.
     pub async fn state(&self) -> Result<SetupState, SetupDriveError> {
         Ok(self.store().await?.state().clone())

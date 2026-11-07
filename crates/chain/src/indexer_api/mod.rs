@@ -32,7 +32,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         return Err("private indexer api must bind to loopback".into());
     }
     let runtime = tokio::Config::new()
-        .with_storage_directory(options.chain.indexer())
+        .with_storage_directory(options.chain.indexer().into_path_buf())
         .with_tcp_nodelay(Some(true));
     tokio::Runner::new(runtime).start(move |_context| async move {
         let node = crate::node::FullNode::start_indexed(

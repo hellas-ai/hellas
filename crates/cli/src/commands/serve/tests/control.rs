@@ -6,6 +6,7 @@ use hellas_authority::{
     node::{HOST_STATUS, host_resource},
     test_support::{WAIT, common_node, ids},
 };
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use hellas_sdk::{grant_config::GrantConfig, node_control};
 use std::path::Path;
@@ -60,13 +61,14 @@ async fn run(
         .as_deref()
         .map(crate::commands::chain::passkey)
         .transpose()?;
+    let location = StoreLocation::for_test(Path::new("."));
     crate::commands::admin::run(
         args,
         identity,
         passkey
             .as_ref()
             .map(|key| key as &dyn hellas_authority::authenticator::Authenticator),
-        Path::new("."),
+        &location,
     )
     .await
 }
@@ -110,7 +112,8 @@ impl Daemon {
             (3_600_000, 8),
             &[],
         );
-        let mut grant_config = GrantConfig::unconfigured(&root.path().canonicalize().unwrap());
+        let location = StoreLocation::for_test(&root.path().canonicalize().unwrap());
+        let mut grant_config = GrantConfig::unconfigured(&location);
         grant_config.remote_control = node_control::RemoteControlAdmission::new(vec![
             identity.transport_key.public(),
             wrong_identity.transport_key.public(),
@@ -180,6 +183,7 @@ impl Daemon {
         executor.queue_capacity = 4;
         executor.fetch_max_in_flight = 1;
         executor.fetch_queue_capacity = 1;
+        let other_location = StoreLocation::for_test(root.path());
         let daemon = super::super::configuration::start_host(
             hellas_sdk::ProviderOptions {
                 executor,
@@ -195,7 +199,7 @@ impl Daemon {
             Some(grant_config),
             None,
             None,
-            root.path(),
+            &other_location,
         )
         .await
         .unwrap();
@@ -359,8 +363,9 @@ impl Daemon {
         assert!(!self.socket.exists(), "shutdown removes the control socket");
     }
     async fn store(&self) -> hellas_authority::work_store::grant::NodeStore {
+        let location = StoreLocation::for_test(&self.journal);
         hellas_authority::work_store::grant::NodeStore::open(
-            &self.journal,
+            &location,
             hellas_authority::model::grant::grant_network(),
             Some(self.provider_identity.enrollment.clone()),
             auth::UnixMillis::now().unwrap_or_default(),
@@ -646,8 +651,9 @@ async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
     let admin = node_control::profile::read_credential(&admin_out).unwrap();
     let bearer = node_control::profile::read_credential(&bearer_out).unwrap();
     assert_ne!(admin.id(), bearer.id());
+    let location = StoreLocation::for_test(&journal);
     let store = hellas_authority::work_store::grant::NodeStore::open(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         None,
         now,

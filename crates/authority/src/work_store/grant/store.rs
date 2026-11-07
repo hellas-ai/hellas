@@ -1,5 +1,6 @@
 //! Node authority and Work accounting share one durable writer. Every exported
-//! acceptance is backed by one fsynced frame covering its entire budget path.
+//! acceptance is backed by one committed frame covering its entire budget path;
+//! power mode also flushes that commit before export.
 use super::state::{Change, Frame, JOURNAL_NAMESPACE, Snapshot, State};
 use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
@@ -21,6 +22,7 @@ use hellas_channel::work_store::journal::{
 };
 use hellas_channel::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
+use hellas_private::StoreLocation;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
@@ -39,15 +41,27 @@ const DUTY_FRAMES: u64 = 2 * MAX_OPEN_JOBS as u64 + 1;
 /// Both profiles deliberately keep bodies outside this store.
 pub struct NodeStore {
     clock: super::clock::ClockBound,
-    _identity_lock: bootstrap::IdentityLock,
     journal: Journal,
+    _identity_lock: Option<bootstrap::IdentityLock>,
     pub(super) state: State,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
     pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
 }
 impl NodeStore {
+    /// Release the database before returning identity ownership to another opener.
+    pub async fn close(&mut self) {
+        self.journal.close().await;
+        self._identity_lock.take();
+    }
+
+    /// Read a replayed snapshot without retaining database ownership.
+    pub async fn into_state(mut self) -> State {
+        self.close().await;
+        self.state
+    }
+
     pub async fn open(
-        directory: &Path,
+        directory: &StoreLocation,
         network: NetworkId,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
@@ -57,6 +71,7 @@ impl NodeStore {
             .as_ref()
             .is_some_and(|expected| store.state.provider.as_ref() != Some(expected))
         {
+            store.close().await;
             return Err(GrantError::Audience.into());
         }
         let now = now.max(store.state.now());

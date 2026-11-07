@@ -10,6 +10,7 @@ use hellas_channel::{
     work_store::{ChannelStore, Role},
 };
 use hellas_kernel::{PendingSlot, Secp256k1Verifier};
+use hellas_private::StoreLocation;
 use hellas_rpc::Retention;
 use hellas_rpc::protocol::invocation::{Artifact, InvocationPolicy, PreparedInvocation};
 use hellas_rpc::{
@@ -224,8 +225,9 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         .find(|path| path.to_string_lossy().ends_with(".staging"))
         .unwrap();
     std::fs::write(staging.join(".proposal.crash.pending"), &bytes).unwrap();
+    let location = StoreLocation::for_test(&provider_root);
     let mut store = ChannelStore::open(
-        &provider_root,
+        &location,
         r.channel().clone(),
         settlement(),
         Role::Provider,
@@ -254,7 +256,7 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
     assert!(!provider_root.join("content").exists());
     drop(store); // Crash after JobProposed, before JobAccepted.
     let mut store = ChannelStore::open(
-        &provider_root,
+        &location,
         r.channel().clone(),
         settlement(),
         Role::Provider,
@@ -270,7 +272,7 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
     // No proposal was installed before the first atomic staging rename.
     std::fs::write(staging.join(".proposal.first.pending"), &bytes).unwrap();
     let _store = ChannelStore::open(
-        &provider_root,
+        &location,
         r.channel().clone(),
         settlement(),
         Role::Provider,
@@ -306,8 +308,9 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
     drop(provider);
     let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     let id = work_id(r.channel(), &a);
+    let location = StoreLocation::for_test(&provider_root);
     let mut store = ChannelStore::open(
-        &provider_root,
+        &location,
         r.channel().clone(),
         settlement(),
         Role::Provider,
@@ -331,9 +334,9 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
         .await
         .unwrap();
     drop(store);
-    let stem = Journal::stems(&provider_root).unwrap().pop().unwrap();
-    let (header, _) = Journal::inspect(&provider_root, &stem).await.unwrap();
-    let (mut journal, _) = Journal::open_existing(&provider_root, &stem, header)
+    let stem = Journal::stems(&location).unwrap().pop().unwrap();
+    let (header, _) = Journal::inspect(&location, &stem).await.unwrap();
+    let (mut journal, _) = Journal::open_existing(&location, &stem, header)
         .await
         .unwrap();
     // Persist precisely the terminal and cursor records, then die before
@@ -368,8 +371,9 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
     }
     drop(journal);
     for _ in 0..2 {
+        let location = StoreLocation::for_test(&provider_root);
         let store = ChannelStore::open(
-            &provider_root,
+            &location,
             r.channel().clone(),
             settlement(),
             Role::Provider,
@@ -567,15 +571,16 @@ async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_stagin
     let service = service(&root.path().join("provider"), &r).await;
     let (_, request, bytes) = proposal(&root.path().join("client"), &r, bundle(1)).await;
     drop(service);
-    let stem = hellas_channel::work_store::journal::Journal::stems(&root.path().join("provider"))
+    let location = StoreLocation::for_test(&root.path().join("provider"));
+    let stem = hellas_channel::work_store::journal::Journal::stems(&location)
         .unwrap()
         .pop()
         .unwrap();
-    let before =
-        hellas_channel::work_store::journal::Journal::inspect(&root.path().join("provider"), &stem)
-            .await
-            .unwrap()
-            .1;
+    let other_location = StoreLocation::for_test(&root.path().join("provider"));
+    let before = hellas_channel::work_store::journal::Journal::inspect(&other_location, &stem)
+        .await
+        .unwrap()
+        .1;
     let service = self::service(&root.path().join("provider"), &r).await;
     assert!(
         service
@@ -589,11 +594,10 @@ async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_stagin
             .is_some()
     );
     drop(service);
-    let after =
-        hellas_channel::work_store::journal::Journal::inspect(&root.path().join("provider"), &stem)
-            .await
-            .unwrap()
-            .1;
+    let after = hellas_channel::work_store::journal::Journal::inspect(&other_location, &stem)
+        .await
+        .unwrap()
+        .1;
     assert_eq!(before.records, after.records);
     assert_eq!(before.checkpoint, after.checkpoint);
     assert!(!root.path().join("provider/content").exists());
@@ -655,8 +659,9 @@ async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_stagin
 fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bounds() {
     let root = tempfile::tempdir().unwrap();
     let quota = UploadQuota::new(16);
+    let location = StoreLocation::for_test(root.path());
     let mut first = UploadStore::durable(
-        root.path(),
+        &location,
         "first",
         Digest::hash(b"first"),
         hellas_store::ContentStore::new(),
@@ -688,7 +693,7 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     let directory = first.directory().unwrap().to_owned();
     drop(first);
     let mut resumed = UploadStore::durable(
-        root.path(),
+        &location,
         "first",
         Digest::hash(b"first"),
         hellas_store::ContentStore::new(),
@@ -795,8 +800,9 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
     caller.accepted(&accepted).await.unwrap();
     assert!(content.have(reference.id().digest()));
     drop(service);
+    let location = StoreLocation::for_test(&provider_root);
     let mut store = ChannelStore::open(
-        &provider_root,
+        &location,
         r.channel().clone(),
         settlement(),
         Role::Provider,
@@ -921,8 +927,9 @@ async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_c
                 content.index(&path).unwrap();
             }
         }
+        let location = StoreLocation::for_test(&provider_root);
         let mut store = ChannelStore::open(
-            &provider_root,
+            &location,
             r.channel().clone(),
             settlement(),
             Role::Provider,
@@ -1006,8 +1013,9 @@ async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_c
                 Some(accept_work_response::Outcome::Accepted(_))
             ));
             drop(provider);
+            let location = StoreLocation::for_test(&provider_root);
             let mut store = ChannelStore::open(
-                &provider_root,
+                &location,
                 r.channel().clone(),
                 settlement(),
                 Role::Provider,

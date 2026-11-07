@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reserves() {
@@ -237,12 +238,11 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
             drop(work);
             drop(node);
             drop(service);
-            let reopened = NodeStore::open(
-                dir.path(),
+            let location = StoreLocation::for_test(dir.path());
+            let reopened = NodeStore::open(&location,
                 network(),
                 Some(hellas_channel::test_support::software_enrollment(2, [2; 32])),
-                UnixMillis(1000),
-            )
+                UnixMillis(1000),)
             .await
             .unwrap();
             assert_eq!(

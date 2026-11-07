@@ -1,3 +1,4 @@
+use hellas_private::StoreLocation;
 use std::fs;
 mod control;
 use super::*;
@@ -50,7 +51,8 @@ fn load_fetch_config_parses_route_capabilities() {
         }),
     );
 
-    let registry = load_fetch_config(&path, dir.path()).unwrap();
+    let location = StoreLocation::for_test(dir.path());
+    let registry = load_fetch_config(&path, &location).unwrap();
 
     let capabilities = &registry
         .entry(&FetchRoute::new("codex", "responses"))
@@ -79,7 +81,8 @@ fn load_fetch_config_rejects_duplicate_route() {
         }),
     );
 
-    let err = load_fetch_config(&path, dir.path()).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let err = load_fetch_config(&path, &location).unwrap_err();
 
     assert!(err.to_string().contains("registered twice"));
 }
@@ -90,7 +93,8 @@ fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
     let mut route = codex_route(serde_json::json!({}));
     route["adaptor"] = serde_json::json!("codex-0.0.1");
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let err = load_fetch_config(&path, dir.path()).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let err = load_fetch_config(&path, &location).unwrap_err();
     assert!(format!("{err:#}").contains("unknown field `adaptor`"));
 
     let mut route = codex_route(serde_json::json!({}));
@@ -100,7 +104,7 @@ fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
         "build": "03"
     });
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let err = load_fetch_config(&path, dir.path()).unwrap_err();
+    let err = load_fetch_config(&path, &location).unwrap_err();
     assert!(format!("{err:#}").contains("unknown field `environment`"));
 }
 
@@ -110,7 +114,8 @@ fn load_fetch_config_rejects_operator_selected_destination() {
     let mut route = codex_route(serde_json::json!({}));
     route["destination"]["base_url"] = serde_json::json!("https://example.invalid/codex");
     let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let error = load_fetch_config(&path, dir.path()).unwrap_err();
+    let location = StoreLocation::for_test(dir.path());
+    let error = load_fetch_config(&path, &location).unwrap_err();
 
     assert!(format!("{error:#}").contains("unknown field `base_url`"));
 }

@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 #[tokio::test]
 async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_reexecution() {
@@ -106,8 +107,9 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                 .unwrap();
         }
         drop(store);
+        let location = StoreLocation::for_test(dir.path());
         let store = NodeStore::open(
-            dir.path(),
+            &location,
             network(),
             Some(hellas_channel::test_support::software_enrollment(
                 2, [2; 32],

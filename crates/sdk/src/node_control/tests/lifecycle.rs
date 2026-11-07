@@ -1,5 +1,6 @@
 use super::*;
 use crate::node_control::host::{HostHandle, HostOptions};
+use hellas_private::StoreLocation;
 use std::sync::atomic::AtomicUsize;
 use {hellas_authority::test_support::within, hellas_channel::test_support::assert_err};
 
@@ -64,6 +65,7 @@ impl Harness {
                             starting.notify_one();
                             release.acquire().await.unwrap().forget();
                         }
+                        let location = StoreLocation::for_test(&forbidden_journal);
                         Ok(crate::start_fetch_provider(
                             crate::FetchProviderOptions {
                                 port: Some(0),
@@ -77,7 +79,7 @@ impl Harness {
                                 root: Arc::new(
                                     hellas_channel::test_support::actors::PROVIDER.node_key(),
                                 ),
-                                home: forbidden_journal,
+                                home: location,
                                 grants: Some(crate::GrantProviderOptions {
                                     configuration: Default::default(),
                                     max_job_millis: std::num::NonZeroU64::MIN,
@@ -205,8 +207,9 @@ fn access_request() -> GetGatewayAccessRequest {
 
 async fn unbound_fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
     let (store, secret) = NodeStore::bootstrap(
-        directory.path(),
+        &location,
         hellas_channel::test_support::network(),
         ROOT_GRANT,
         hellas_authority::test_support::common_node::approval_for(
@@ -510,9 +513,10 @@ async fn provider_restart_retains_the_host_control_writer() {
             );
         }
         assert_eq!(h.status().await.machine.unwrap().max_in_flight, 4);
+        let location = StoreLocation::for_test(h.fixture.directory.path());
         assert_err!(
             NodeStore::open(
-                h.fixture.directory.path(),
+                &location,
                 hellas_channel::test_support::network(),
                 Some(crate::test_support::provider_enrollment()),
                 UnixMillis(1000)
@@ -532,8 +536,9 @@ async fn provider_restart_retains_the_host_control_writer() {
     h.host.shutdown().await.unwrap();
     drop(h.fixture.service);
     drop(h.fixture.node);
+    let location = StoreLocation::for_test(h.fixture.directory.path());
     NodeStore::open(
-        h.fixture.directory.path(),
+        &location,
         hellas_channel::test_support::network(),
         Some(crate::test_support::provider_enrollment()),
         UnixMillis(1000),

@@ -920,11 +920,12 @@ fn run(
     };
 
     // Configure tokio runtime
-    let storage_dir = crate::chain_dir::ChainDir::open(&home, &profile)?.validator();
+    let storage_dir =
+        crate::chain_dir::ChainDir::open(&home, &profile, Default::default())?.validator();
     let _directory_lock = crate::execution::pipeline::lock(&storage_dir)?;
-    let storage_dir_utf8 = storage_dir
-        .to_str()
-        .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
+    let storage_dir_utf8 = storage_dir.to_str().ok_or_else(|| {
+        ValidatorError::NonUtf8StorageDirectory(storage_dir.clone().into_path_buf())
+    })?;
     let metrics_addr = validator_config.metrics_address();
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)

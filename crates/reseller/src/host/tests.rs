@@ -1,6 +1,7 @@
 use super::*;
 use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
+use hellas_private::StoreLocation;
 use hellas_rpc::{Assurance, RootProof};
 use hellas_sdk::{
     GrantProviderOptions, grant_client::UnpinnedOffer, grant_gateway::GrantServeOptions,
@@ -207,12 +208,13 @@ impl ResellerBuilder {
                     .unwrap(),
                 )
                 .unwrap();
+            let location = StoreLocation::for_test(root.path());
             FetchProviderOptions {
                 port: Some(0),
                 identity: provider_identity.clone(),
                 enrollment: provider_bundle.clone(),
                 root: Arc::new(UnusedRoot),
-                home: root.path().to_path_buf(),
+                home: location,
                 routes,
                 fetch_max_in_flight: 2,
                 fetch_queue_capacity: 2,
@@ -246,8 +248,9 @@ impl ResellerBuilder {
         allowance.definition.policies =
             options().grants.unwrap().configuration.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
+        let location = StoreLocation::for_test(root.path());
         let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
-            root.path(),
+            &location,
         ))
         .with_network(hellas_authority::model::grant::grant_network())
         .with_provider(provider_bundle.clone())
@@ -343,6 +346,7 @@ impl ResellerBuilder {
                 .await
                 .unwrap()
         };
+        let other_location = StoreLocation::for_test(&root.path().join("client"));
         let gateway = controlled_gateway(
             GrantServeOptions {
                 serve: hellas_sdk::GatewayServeOptions {
@@ -372,7 +376,7 @@ impl ResellerBuilder {
                     principal: hellas_channel::test_support::subject_of(client_identity.node_key()),
                     signer: Arc::new(client_identity.node_key().clone()),
                     application: application.clone(),
-                    journal_root: root.path().join("client"),
+                    journal_root: other_location,
                 },
             },
             client_identity.transport_key(),
@@ -490,12 +494,13 @@ impl OpenAiFixture {
         let root = self.root.path();
         let identity = &self.identity;
         let enrollment = &self.enrollment;
+        let location = StoreLocation::for_test(root);
         OpenAiProviderOptions {
             port: Some(0),
             identity: identity.clone(),
             enrollment: enrollment.clone(),
             root: Arc::new(UnusedRoot),
-            home: root.to_path_buf(),
+            home: location,
             service: "openai".into(),
             method: "responses".into(),
             bearer_token: "fixture".into(),
@@ -528,8 +533,9 @@ async fn openai_host_refuses_an_empty_upstream_key() {
 #[tokio::test]
 async fn host_control_starts_the_openai_reseller_factory() {
     let fixture = OpenAiFixture::new();
+    let location = StoreLocation::for_test(fixture.root.path());
     let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
-        fixture.root.path(),
+        &location,
     ))
     .with_provider(fixture.enrollment.clone())
     .with_clock(TestClock::new(

@@ -5,6 +5,7 @@ use hellas_executor::{
     ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
 };
 use hellas_kernel::Secp256k1Signer;
+use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ pub mod paid;
 pub use hellas_sdk::work_config::WorkConfig;
 
 pub struct ServeOptions {
-    pub home: PathBuf,
+    pub home: StoreLocation,
     pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
@@ -69,7 +70,7 @@ fn provider_resources(
 pub fn validate_provider_config(
     fetch: Option<&std::path::Path>,
     grant: Option<&std::path::Path>,
-    home: &std::path::Path,
+    home: &StoreLocation,
 ) -> CliResult<()> {
     anyhow::ensure!(
         fetch.is_some() || grant.is_some(),
@@ -276,7 +277,7 @@ fn paid_fetch_contract(
 
 fn load_fetch_config(
     path: &std::path::Path,
-    home: &std::path::Path,
+    home: &StoreLocation,
 ) -> CliResult<FetchRouteRegistry> {
     let file = read_fetch_config(path)?;
 
@@ -347,7 +348,7 @@ impl FetchDestination {
     fn into_entry(
         self,
         capabilities: FetchRoutePolicy,
-        home: &std::path::Path,
+        home: &StoreLocation,
     ) -> CliResult<FetchRouteEntry> {
         let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
             Self::Http { config } => return Ok(config.into_entry(capabilities)?),

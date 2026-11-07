@@ -1,4 +1,5 @@
 use super::*;
+use hellas_private::StoreLocation;
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -50,8 +51,9 @@ async fn native_secret_store_child() {
 async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
     let f = fixture().await;
     let root = f.directory.path().to_owned();
+    let location = StoreLocation::for_test(&root);
     let error = NodeStore::open(
-        &root,
+        &location,
         hellas_channel::test_support::network(),
         None,
         UnixMillis(1000),
@@ -65,8 +67,9 @@ async fn provider_start_projects_locked_store_failure_to_rpc_and_status() {
         start: Arc::new(move |_| {
             let root = root.clone();
             Box::pin(async move {
+                let location = StoreLocation::for_test(&root);
                 NodeStore::open(
-                    &root,
+                    &location,
                     hellas_channel::test_support::network(),
                     None,
                     UnixMillis(1000),

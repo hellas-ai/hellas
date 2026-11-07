@@ -1,24 +1,27 @@
 //! Native storage paths for one validated chain profile.
 use crate::genesis::{ChainProfile, ChainProfileError};
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use hellas_private::StoreLocation;
+use std::{io, path::Path};
 
 /// The one chain-owned directory under a process home.
 #[derive(Clone, Debug)]
 pub struct ChainDir {
-    home: PathBuf,
-    root: PathBuf,
+    home: StoreLocation,
+    root: StoreLocation,
     profile: ChainProfile,
 }
 
 impl ChainDir {
-    pub fn open(home: &Path, profile: &ChainProfile) -> io::Result<Self> {
-        let root = home.join("chains").join(profile.state_key());
+    pub fn open(
+        home: &Path,
+        profile: &ChainProfile,
+        durability: hellas_private::Durability,
+    ) -> io::Result<Self> {
+        let home = StoreLocation::from_home(home, durability);
+        let root = home.child("chains").child(profile.state_key());
         hellas_private::create_dir_all_durable(&root)?;
         Ok(Self {
-            home: home.to_path_buf(),
+            home,
             root,
             profile: profile.clone(),
         })
@@ -27,7 +30,7 @@ impl ChainDir {
     pub fn as_path(&self) -> &Path {
         &self.root
     }
-    pub fn home(&self) -> &Path {
+    pub fn home(&self) -> &StoreLocation {
         &self.home
     }
     pub fn profile(&self) -> &ChainProfile {
@@ -40,34 +43,34 @@ impl ChainDir {
     pub fn rotate_validators(&mut self) {
         self.profile.rotate_validators();
     }
-    pub fn node(&self) -> PathBuf {
-        self.root.join("node")
+    pub fn node(&self) -> StoreLocation {
+        self.root.child("node")
     }
-    pub fn client(&self) -> PathBuf {
-        self.root.join("client")
+    pub fn client(&self) -> StoreLocation {
+        self.root.child("client")
     }
     /// `provider` is the canonical display form of a typed ProviderAddress.
-    pub fn client_journals(&self, provider: &str) -> PathBuf {
-        self.client().join("channels").join(provider)
+    pub fn client_journals(&self, provider: &str) -> StoreLocation {
+        self.client().child("channels").child(provider)
     }
-    pub fn provider(&self) -> PathBuf {
-        self.root.join("provider")
+    pub fn provider(&self) -> StoreLocation {
+        self.root.child("provider")
     }
-    pub fn provider_journals(&self) -> PathBuf {
-        self.provider().join("channels")
+    pub fn provider_journals(&self) -> StoreLocation {
+        self.provider().child("channels")
     }
     /// `provider` is the canonical display form of a typed endpoint ID.
-    pub fn gateway(&self, provider: &str) -> PathBuf {
-        self.root.join("gateway").join(provider)
+    pub fn gateway(&self, provider: &str) -> StoreLocation {
+        self.root.child("gateway").child(provider)
     }
-    pub fn indexer(&self) -> PathBuf {
-        self.root.join("indexer")
+    pub fn indexer(&self) -> StoreLocation {
+        self.root.child("indexer")
     }
-    pub fn validator(&self) -> PathBuf {
-        self.root.join("validator")
+    pub fn validator(&self) -> StoreLocation {
+        self.root.child("validator")
     }
-    pub fn faucet_account(&self) -> PathBuf {
-        self.root.join("faucet-account")
+    pub fn faucet_account(&self) -> StoreLocation {
+        self.root.child("faucet-account")
     }
 }
 
@@ -82,7 +85,29 @@ impl std::ops::Deref for ChainDir {
 mod tests {
     use super::*;
     use crate::genesis::{Chain, CustomChainFile, Genesis};
+    use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn store_locations_keep_the_selected_durability() {
+        use hellas_private::Durability;
+        let home = tempfile::tempdir().unwrap();
+        let profile = ChainProfile::known(Chain::Devnet);
+        for durability in [Durability::Crash, Durability::Power] {
+            let chain = ChainDir::open(home.path(), &profile, durability).unwrap();
+            for location in [
+                chain.home().clone(),
+                chain.node(),
+                chain.client_journals("client"),
+                chain.provider_journals(),
+                chain.gateway("provider"),
+                chain.indexer(),
+                chain.validator(),
+            ] {
+                assert_eq!(location.durability(), durability);
+            }
+        }
+    }
 
     #[test]
     fn same_genesis_with_another_initial_authority_cannot_read_state() {
@@ -103,7 +128,7 @@ mod tests {
             .unwrap()
         };
         let first = make(trust.clone());
-        let a = ChainDir::open(home.path(), &first).unwrap();
+        let a = ChainDir::open(home.path(), &first, Crash).unwrap();
         std::fs::create_dir_all(a.client()).unwrap();
         std::fs::write(a.client().join("wallet.json"), b"a-only").unwrap();
 
@@ -111,7 +136,7 @@ mod tests {
         let mut key = hex::decode(&changed.epochs[0].threshold_identity).unwrap();
         key[0] ^= 1;
         changed.epochs[0].threshold_identity = hex::encode(key);
-        let b = ChainDir::open(home.path(), &make(changed)).unwrap();
+        let b = ChainDir::open(home.path(), &make(changed), Crash).unwrap();
         assert_ne!(a.as_path(), b.as_path());
         assert!(!b.client().join("wallet.json").exists());
 
@@ -121,7 +146,7 @@ mod tests {
         next.start_height = 10;
         next.end_height = None;
         trust.epochs.push(next);
-        let resumed = ChainDir::open(home.path(), &make(trust)).unwrap();
+        let resumed = ChainDir::open(home.path(), &make(trust), Crash).unwrap();
         assert_eq!(resumed.as_path(), a.as_path());
         assert_eq!(
             std::fs::read(resumed.client().join("wallet.json")).unwrap(),

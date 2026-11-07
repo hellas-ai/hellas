@@ -6,6 +6,7 @@
 //! one meant to do.
 
 use hellas_channel::test_support::channel::{client, network, provider};
+use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::InvocationPolicy;
 
 use std::collections::BTreeSet;
@@ -246,8 +247,9 @@ fn journal_name(bond_edge: EdgeId) -> std::path::PathBuf {
 }
 
 async fn store(root: &std::path::Path, role: Role) -> SetupStore {
+    let location = StoreLocation::for_test(root);
     match SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         role,
@@ -262,8 +264,15 @@ async fn store(root: &std::path::Path, role: Role) -> SetupStore {
 
 /// A provider store that has durably retained the complete handshake.
 async fn completed_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Provider).await;
+    let location = StoreLocation::for_test(root);
+    completed_store_at(&location).await
+}
+
+async fn completed_store_at(location: &StoreLocation) -> SetupStore {
     let verifier = Secp256k1Verifier::new();
+    let mut store = SetupStore::open(location, network(), bond_edge(), Role::Provider, &verifier)
+        .await
+        .unwrap();
     let one = proposed();
     let two = countersigned(one.clone());
     let three = completed(two.clone());
@@ -788,8 +797,8 @@ async fn a_journal_belongs_to_one_network_and_one_bond() {
         // A different key is a different file name, so this is a fresh
         // empty journal rather than this one misread — which is the
         // point: no state crosses over.
-        let Ok(other) =
-            SetupStore::open(dir.path(), network, bond, Role::Provider, &verifier).await
+        let location = StoreLocation::for_test(dir.path());
+        let Ok(other) = SetupStore::open(&location, network, bond, Role::Provider, &verifier).await
         else {
             panic!("a fresh journal opens");
         };
@@ -807,7 +816,8 @@ async fn a_journal_belongs_to_one_network_and_one_bond() {
     if let Err(error) = std::fs::copy(journal_path(dir.path(), network(), bond_edge()), &theirs) {
         panic!("the copy succeeds: {error}");
     }
-    let error = SetupStore::open(dir.path(), network(), elsewhere, Role::Provider, &verifier)
+    let location = StoreLocation::for_test(dir.path());
+    let error = SetupStore::open(&location, network(), elsewhere, Role::Provider, &verifier)
         .await
         .expect_err("this file is not that channel's journal");
     assert!(
@@ -829,30 +839,19 @@ async fn a_second_holder_is_refused() {
     let dir = temp();
     let held = store(dir.path(), Role::Provider).await;
     let verifier = Secp256k1Verifier::new();
-    let error = SetupStore::open(
-        dir.path(),
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &verifier,
-    )
-    .await
-    .expect_err("the journal is already held");
+    let location = StoreLocation::for_test(dir.path());
+    let error = SetupStore::open(&location, network(), bond_edge(), Role::Provider, &verifier)
+        .await
+        .expect_err("the journal is already held");
     assert!(
         matches!(error, WorkStoreError::Journal(JournalError::Locked { .. })),
         "unexpected error: {error}"
     );
     drop(held);
     assert!(
-        SetupStore::open(
-            dir.path(),
-            network(),
-            bond_edge(),
-            Role::Provider,
-            &verifier
-        )
-        .await
-        .is_ok(),
+        SetupStore::open(&location, network(), bond_edge(), Role::Provider, &verifier)
+            .await
+            .is_ok(),
         "the lock is released with the store"
     );
 }
@@ -860,7 +859,8 @@ async fn a_second_holder_is_refused() {
 /// The file one setup journal is kept in, derived the way the store
 /// derives it rather than by looking for whatever is in the directory.
 fn journal_path(root: &std::path::Path, network: NetworkId, bond: EdgeId) -> std::path::PathBuf {
-    Journal::path(root, &setup_stem(network, bond))
+    let location = StoreLocation::for_test(root);
+    Journal::path(&location, &setup_stem(network, bond))
 }
 
 fn setup_stem(network: NetworkId, bond: EdgeId) -> String {
@@ -895,8 +895,9 @@ async fn a_restart_finds_every_journal_its_root_holds() {
                 panic!("the provider's revision commits: {error}");
             }
         }
+        let location = StoreLocation::for_test(dir.path());
         let mut client_store = match SetupStore::open(
-            dir.path(),
+            &location,
             network(),
             funded.bond_edge(),
             Role::Client,
@@ -912,7 +913,8 @@ async fn a_restart_finds_every_journal_its_root_holds() {
         }
     }
 
-    let found = match discover_setups(dir.path(), network()).await {
+    let location = StoreLocation::for_test(dir.path());
+    let found = match discover_setups(&location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -932,8 +934,9 @@ async fn a_restart_finds_every_journal_its_root_holds() {
             "discovery did not recover {expected:?} from {:?}",
             found.setups,
         );
+        let location = StoreLocation::for_test(dir.path());
         let reopened = match SetupStore::open(
-            dir.path(),
+            &location,
             network(),
             expected.bond_edge,
             expected.role,
@@ -960,9 +963,10 @@ async fn a_root_holding_no_journals_yields_none() {
     let dir = temp();
     // A channel journal beside them is the other store's, and is not a
     // setup this discovery has anything to say about.
+    let location = StoreLocation::for_test(dir.path());
     drop(
         Journal::open_latest(
-            dir.path(),
+            &location,
             &format!("channel-{}", "00".repeat(32)),
             JournalId {
                 kind: JournalKind::Channel,
@@ -974,7 +978,7 @@ async fn a_root_holding_no_journals_yields_none() {
         .unwrap(),
     );
 
-    let found = match discover_setups(dir.path(), network()).await {
+    let found = match discover_setups(&location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("an empty root is not a failure: {error}"),
     };
@@ -982,7 +986,8 @@ async fn a_root_holding_no_journals_yields_none() {
     assert!(found.unidentified.is_empty());
 
     let unopened = dir.path().join("never-opened");
-    let found = match discover_setups(&unopened, network()).await {
+    let other_location = StoreLocation::for_test(&unopened);
+    let found = match discover_setups(&other_location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("a root that does not exist yet owns nothing: {error}"),
     };
@@ -1006,8 +1011,9 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
     // before its first revision: the file is this endpoint's, and the
     // bond it is keyed to is nowhere inside it.
     {
+        let location = StoreLocation::for_test(dir.path());
         let mut store = match SetupStore::open(
-            dir.path(),
+            &location,
             network(),
             armed.bond_edge(),
             Role::Provider,
@@ -1023,7 +1029,8 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
         }
     }
     // And a file wearing a setup journal's name that is not one.
-    let counterfeit = Journal::path(dir.path(), &format!("setup-{}", "ab".repeat(32)));
+    let location = StoreLocation::for_test(dir.path());
+    let counterfeit = Journal::path(&location, &format!("setup-{}", "ab".repeat(32)));
     std::fs::write(&counterfeit, b"not a journal at all").unwrap();
     // And one complete journal beside them.
     {
@@ -1035,7 +1042,7 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
         }
     }
 
-    let found = match discover_setups(dir.path(), network()).await {
+    let found = match discover_setups(&location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("one unreadable journal does not stop the root: {error}"),
     };
@@ -1094,8 +1101,9 @@ async fn a_revision_that_is_not_this_journals_bond_is_refused() {
     let dir = temp();
     let key = setup_key(network(), bond_edge());
     {
+        let location = StoreLocation::for_test(dir.path());
         let (mut journal, _) = match Journal::open_latest(
-            dir.path(),
+            &location,
             &setup_stem(network(), bond_edge()),
             JournalId {
                 kind: JournalKind::Setup,
@@ -1120,7 +1128,8 @@ async fn a_revision_that_is_not_this_journals_bond_is_refused() {
         }
     }
 
-    let found = match discover_setups(dir.path(), network()).await {
+    let location = StoreLocation::for_test(dir.path());
+    let found = match discover_setups(&location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -2084,6 +2093,39 @@ async fn setup_completes_without_waiting_for_a_quiet_chain() {
     );
 }
 
+#[tokio::test]
+async fn provider_setup_preserves_power_durability_when_mounting_the_channel() {
+    let dir = temp();
+    let location =
+        StoreLocation::for_test(dir.path()).with_durability(hellas_private::Durability::Power);
+    let mut setup = completed_store_at(&location).await;
+    let blocks = Blocks {
+        blocks: vec![FinalizedWork {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: [0xa1; 32],
+            txs: vec![completed(countersigned(proposed())).payment_open().unwrap()],
+        }],
+    };
+    let view = LiveChannel::at(scan().height + 1, payment_object());
+    let advance = advance_setup(
+        &view,
+        &blocks,
+        &NoSink,
+        &mut setup,
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(advance.progress, SetupProgress::Complete(_)));
+    let mut channel = advance.mounted.expect("provider setup mounts its channel");
+    assert_eq!(
+        channel.synchronous_for_test().await,
+        2,
+        "channel journal is FULL"
+    );
+}
+
 /// A completed setup hands back the channel it mounted, opened at the
 /// origin it recorded and settled against the edge it read.
 ///
@@ -2263,8 +2305,9 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
 
     // Why this has to go through the service at all: the journal is
     // held, and a runner cannot open a second one to drive from.
+    let location = StoreLocation::for_test(dir.path());
     match SetupStore::open(
-        dir.path(),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
@@ -2965,8 +3008,9 @@ async fn replay_checks_the_signatures_again() {
         panic!("the bundle assembles");
     };
     {
+        let location = StoreLocation::for_test(dir.path());
         let Ok(mut credulous) = SetupStore::open(
-            dir.path(),
+            &location,
             network(),
             bond_edge(),
             Role::Provider,
@@ -2983,8 +3027,9 @@ async fn replay_checks_the_signatures_again() {
             panic!("a credulous verifier accepts it: {error}");
         }
     }
+    let location = StoreLocation::for_test(dir.path());
     let error = SetupStore::open(
-        dir.path(),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
@@ -3193,7 +3238,8 @@ async fn a_rotated_setup_is_still_discovered() {
             panic!("the rotation completes: {error}");
         }
     }
-    let found = match discover_setups(dir.path(), network()).await {
+    let location = StoreLocation::for_test(dir.path());
+    let found = match discover_setups(&location, network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -3311,8 +3357,9 @@ async fn a_terminal_decision_waits_for_the_block_explaining_spent_funding() {
 #[tokio::test]
 async fn existing_only_setup_never_creates_a_missing_journal() {
     let dir = temp();
+    let location = StoreLocation::for_test(dir.path());
     let error = SetupStore::open_existing(
-        dir.path(),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,

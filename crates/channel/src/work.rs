@@ -1762,6 +1762,11 @@ impl CloseChannel for ClientEndpoint {
 }
 
 impl ClientEndpoint {
+    /// Release a locally owned channel after its observer and requests stop.
+    pub async fn close(&mut self) {
+        self.store.close().await;
+    }
+
     /// Applies one finalized block: every transition it carries, then
     /// the cursor that says it was read.
     ///
@@ -2596,6 +2601,17 @@ impl WorkService {
     }
 
     /// Ends admission and delivery after accepted work and the observer have stopped.
+    /// Release the journal after request execution and observation have drained.
+    pub async fn close(&self) {
+        self.endpoint
+            .lock_for_shutdown()
+            .await
+            .close
+            .store
+            .close()
+            .await;
+    }
+
     pub async fn stop(&self) -> Result<(), EndpointError> {
         let mut endpoint = self.endpoint().await?;
         let height = endpoint.state().cursor().0;

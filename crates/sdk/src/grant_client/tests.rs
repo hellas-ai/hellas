@@ -4,6 +4,7 @@ use hellas_authority::model::grant::budget::*;
 use hellas_authority::model::grant::records::{GrantDef, Offer};
 use hellas_authority::test_support::TestClock;
 use hellas_authority::work_store::grant::NodeStore;
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::GrantRefusal;
 use hellas_rpc::{Assurance, Retention};
 use hellas_wire::{MethodMarker, ServiceMarker, StreamTransport};
@@ -141,12 +142,13 @@ impl Fixture {
         }
     }
     fn options(&self) -> GrantSessionOptions {
+        let location = StoreLocation::for_test(&self.root.path().join("client"));
         GrantSessionOptions {
             target: pinned_offer(self.grant.clone(), vec![]),
             principal: principal(1).0,
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
-            journal_root: self.root.path().join("client"),
+            journal_root: location,
             // Control calls stay bounded independently of the signed job limit.
             control_timeout: std::time::Duration::from_secs(5),
         }

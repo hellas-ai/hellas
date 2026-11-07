@@ -1,6 +1,7 @@
 use super::*;
 use hellas_authority::model::grant::records::decode_enrollment;
 use hellas_channel::test_support::actors::{FRIEND, ROOT};
+use hellas_private::StoreLocation;
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -74,8 +75,9 @@ impl OfferHost {
         let exported = provider.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider_enrollment = decode_enrollment(&exported.stdout).unwrap();
+        let location = StoreLocation::for_test(&provider.home);
         let (store, app_secret) = common_node::bootstrap_node_with_credential(
-            &hellas_sdk::grant_config::GrantConfig::journal_dir(&provider.home),
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(&location),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
@@ -671,8 +673,9 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     };
     let journal = root.join("controlled-authority");
     let root_grant = GrantId([0; 16]);
+    let location = StoreLocation::for_test(&journal);
     let (store, admin_secret) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &journal,
+        &location,
         hellas_authority::model::grant::grant_network(),
         root_grant,
         common_node::approval(
@@ -940,8 +943,9 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         ])
         .await;
     let secret = hellas_sdk::node_control::profile::read_credential(&credential_file).unwrap();
+    let location = StoreLocation::for_test(&host.provider.home);
     let administrator_profile = profile(
-        &hellas_sdk::grant_config::GrantConfig::provider_dir(&host.provider.home),
+        &hellas_sdk::grant_config::GrantConfig::provider_dir(&location),
         "sharing-admin-control",
         authority,
         authorization,

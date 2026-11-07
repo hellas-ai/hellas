@@ -717,3 +717,17 @@ the committed revision; credential publication failures report it too.
 An authorized stale revision returns `FailedPrecondition`, requiring inspection
 before retrying. Invalid authority records and invalid Work limits return
 `InvalidArgument`; authorization failures remain non-disclosing.
+
+## Node durability
+
+`hellas --durability crash <command>` (the default) commits journals, including
+payment and authority journals, using SQLite WAL with `synchronous=NORMAL`.
+Committed work survives a **process crash**. An OS crash or power loss may roll
+back recent commits with **no time bound**. Content publication skips file and
+directory fsync. The setting applies to every command, including serve, gateway,
+transact, fetch and settle.
+
+Use `--durability power` (Nix: `services.hellas.serve.durability = "power"`)
+for WAL with `synchronous=FULL`, macOS `fullfsync=ON`, and flushed content
+publication. Identity, key, profile and configuration writes always keep their
+durable writes. A journal already owned by another process is refused immediately.

@@ -2,6 +2,7 @@
 
 use hellas_channel::work_store::Role;
 use hellas_channel::work_store::journal::{Journal, JournalId, JournalKind};
+use hellas_private::StoreLocation;
 use hellas_rpc::observe::Samples;
 use tracing::instrument::WithSubscriber;
 
@@ -16,7 +17,8 @@ const MEASURED_CHECKPOINT: &[u8] = b"the state the predecessor reached";
 /// with an observer and without one" is the same call and not two
 /// hand-copied ones.
 async fn measured_run(dir: &std::path::Path) {
-    let (mut journal, _) = match Journal::open_latest(dir, "duty", measured_id()).await {
+    let location = StoreLocation::for_test(dir);
+    let (mut journal, _) = match Journal::open_latest(&location, "duty", measured_id()).await {
         Ok(opened) => opened,
         Err(error) => panic!("the journal opens: {error}"),
     };
@@ -41,7 +43,7 @@ const fn measured_id() -> JournalId {
     }
 }
 
-/// Every append is one `fsync_tail_ms`, every rotation is one
+/// Every append is one `append_commit_ms`, every rotation is one
 /// `rotation_tail_ms`, and neither is ever a summary of the other.
 ///
 /// §4 divides a lower tail by a block time, and a lower tail cannot be
@@ -59,24 +61,29 @@ async fn each_append_and_each_rotation_is_its_own_sample() {
         .with_subscriber(samples.clone())
         .await;
 
-    let fsyncs = samples.of("fsync_tail_ms");
+    let commits = samples.of("append_commit_ms");
     assert_eq!(
-        fsyncs.len(),
+        commits.len(),
         4,
         "three predecessor appends and one successor append",
     );
-    let seqs: Vec<Option<&str>> = fsyncs.iter().map(|sample| sample.field("seq")).collect();
+    let seqs: Vec<Option<&str>> = commits.iter().map(|sample| sample.field("seq")).collect();
     assert_eq!(
         seqs,
         vec![Some("0"), Some("1"), Some("2"), Some("0")],
         "each sample says which append it was, so none of them is a total",
     );
-    assert_eq!(fsyncs[0].field("kind"), Some("Setup"));
-    assert_eq!(fsyncs[0].field("role"), Some("Provider"));
-    assert_eq!(fsyncs[0].field("key"), Some("5a".repeat(32).as_str()));
-    assert_eq!(fsyncs[0].field("generation"), Some("0"));
+    assert!(
+        commits
+            .iter()
+            .all(|sample| sample.field("mode") == Some("crash"))
+    );
+    assert_eq!(commits[0].field("kind"), Some("Setup"));
+    assert_eq!(commits[0].field("role"), Some("Provider"));
+    assert_eq!(commits[0].field("key"), Some("5a".repeat(32).as_str()));
+    assert_eq!(commits[0].field("generation"), Some("0"));
     assert_eq!(
-        fsyncs[3].field("generation"),
+        commits[3].field("generation"),
         Some("1"),
         "an append after a rotation is the successor's",
     );
@@ -94,7 +101,7 @@ async fn each_append_and_each_rotation_is_its_own_sample() {
         Some(MEASURED_CHECKPOINT.len().to_string().as_str()),
     );
     assert!(
-        fsyncs
+        commits
             .iter()
             .chain(&rotations)
             .all(|sample| sample.ms >= 0.0),
@@ -104,7 +111,7 @@ async fn each_append_and_each_rotation_is_its_own_sample() {
 
 /// Nothing that did not happen is sampled.
 ///
-/// A journal that is opened and never written emits no `fsync_tail_ms`
+/// A journal that is opened and never written emits no `append_commit_ms`
 /// — creating it is not an append — and a rotation refused
 /// before it writes anything emits no `rotation_tail_ms`, because no
 /// generation moved.
@@ -117,7 +124,8 @@ async fn work_that_was_not_done_is_not_sampled() {
     };
     let samples = std::sync::Arc::new(Samples::new());
     async {
-        let (mut journal, _) = match Journal::open_latest(dir.path(), "idle", measured_id()).await {
+        let location = StoreLocation::for_test(dir.path());
+        let (mut journal, _) = match Journal::open_latest(&location, "idle", measured_id()).await {
             Ok(opened) => opened,
             Err(error) => panic!("the journal opens: {error}"),
         };
@@ -136,7 +144,7 @@ async fn work_that_was_not_done_is_not_sampled() {
     .with_subscriber(samples.clone())
     .await;
     assert!(
-        samples.of("fsync_tail_ms").is_empty(),
+        samples.of("append_commit_ms").is_empty(),
         "no record was appended",
     );
     assert!(
@@ -175,7 +183,8 @@ async fn an_unobserved_journal_holds_the_same_records_as_an_observed_one() {
 
     let mut held = Vec::new();
     for root in [watched.path(), unwatched.path()] {
-        let Ok((id, replay)) = Journal::inspect(root, "duty").await else {
+        let location = StoreLocation::for_test(root);
+        let Ok((id, replay)) = Journal::inspect(&location, "duty").await else {
             panic!("the journal reads");
         };
         held.push((id, replay.checkpoint, replay.records));

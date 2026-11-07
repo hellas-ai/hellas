@@ -6,6 +6,7 @@ use hellas_authority::authenticator::Authenticator;
 use hellas_authority::model::grant::records::{
     MAX_CONTACT_CARD_BYTES, SignedOffer, decode_contact_card, encode_contact_card,
 };
+use hellas_private::StoreLocation;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -204,8 +205,11 @@ pub(super) fn offer_fingerprints(offer: &SignedOffer) -> CliResult<()> {
     Ok(())
 }
 
-pub fn client_journal_root(home: &Path, identity: &PrincipalId) -> CliResult<PathBuf> {
-    Ok(data_root(home, identity)?.join("channels"))
+pub fn client_journal_root(
+    home: &StoreLocation,
+    identity: &PrincipalId,
+) -> CliResult<StoreLocation> {
+    Ok(home.child(data_root(home, identity)?).child("channels"))
 }
 /// Saved Offer terms may have expired; only use this as a signed locator.
 /// GrantSession obtains fresh authenticated standing before proposing a job.

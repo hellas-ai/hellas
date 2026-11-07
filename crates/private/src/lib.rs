@@ -20,7 +20,7 @@ pub use regular::{
 
 use std::fs::File;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
@@ -33,6 +33,108 @@ use unix as imp;
 pub mod windows;
 #[cfg(windows)]
 use windows as imp;
+
+/// Durability of hot node journals and content publication. Identity, key and
+/// configuration helpers always retain their existing durable writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Survives process crashes. OS crashes or power loss may roll back commits
+    /// with no time bound, including payment and authority journals.
+    #[default]
+    Crash,
+    /// Flush transactions and published content before returning.
+    Power,
+}
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Crash => "crash",
+            Self::Power => "power",
+        })
+    }
+}
+impl std::str::FromStr for Durability {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "crash" => Ok(Self::Crash),
+            "power" => Ok(Self::Power),
+            _ => Err("durability must be crash or power"),
+        }
+    }
+}
+impl Durability {
+    pub fn sync_file(self, file: &File) -> io::Result<()> {
+        match self {
+            Self::Crash => Ok(()),
+            Self::Power => file.sync_all(),
+        }
+    }
+    pub fn sync_directory(self, path: &Path) -> io::Result<()> {
+        match self {
+            Self::Crash => Ok(()),
+            Self::Power => sync_directory(path),
+        }
+    }
+    pub fn create_dir_all(self, path: &Path) -> io::Result<()> {
+        match self {
+            Self::Crash => imp::create_dir_all(path),
+            Self::Power => create_dir_all_durable(path).map(drop),
+        }
+    }
+}
+
+/// A resolved store path with its node's storage policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreLocation {
+    path: PathBuf,
+    durability: Durability,
+}
+impl StoreLocation {
+    /// Root construction belongs to home and chain resolution.
+    pub fn from_home(path: &Path, durability: Durability) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            durability,
+        }
+    }
+    pub fn child(&self, path: impl AsRef<Path>) -> Self {
+        Self {
+            path: self.path.join(path),
+            durability: self.durability,
+        }
+    }
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+    pub fn into_path_buf(self) -> PathBuf {
+        self.path
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(path: &Path) -> Self {
+        Self::from_home(path, Durability::default())
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+}
+impl std::ops::Deref for StoreLocation {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+impl AsRef<Path> for StoreLocation {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// Opens `path` for reading without following a final symlink (Unix) or
 /// reparse point (Windows). `NotFound` passes through unchanged.
@@ -160,27 +262,34 @@ pub fn open_lock_beside(path: &Path) -> io::Result<File> {
 /// caller can recognise its own debris), flushed before the rename, with the
 /// directory entry flushed after it. The temporary is removed on any failure.
 pub fn write_atomically(path: &Path, suffix: &str, bytes: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} has no file name", path.display()),
-        )
-    })?;
-    let mut temporary = private_tempfile(parent, &format!(".{}.", name.to_string_lossy()), suffix)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    // Close first, keeping the TempPath as the guard that removes the file if
-    // the rename fails. std's rename, not TempPath::persist: on Windows it
-    // uses POSIX semantics and replaces a destination another handle has
-    // open, where MoveFileEx reports access denied.
-    let temporary = temporary.into_temp_path();
-    std::fs::rename(&temporary, path)?;
-    let _published = temporary.keep();
-    sync_directory(parent)
+    Durability::Power.write_atomically(path, suffix, bytes)
+}
+
+impl Durability {
+    pub fn write_atomically(self, path: &Path, suffix: &str, bytes: &[u8]) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no file name", path.display()),
+            )
+        })?;
+        let mut temporary =
+            private_tempfile(parent, &format!(".{}.", name.to_string_lossy()), suffix)?;
+        temporary.write_all(bytes)?;
+        self.sync_file(temporary.as_file())?;
+        // Close first, keeping the TempPath as the guard that removes the file if
+        // the rename fails. std's rename, not TempPath::persist: on Windows it
+        // uses POSIX semantics and replaces a destination another handle has
+        // open, where MoveFileEx reports access denied.
+        let temporary = temporary.into_temp_path();
+        std::fs::rename(&temporary, path)?;
+        let _published = temporary.keep();
+        self.sync_directory(parent)
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
+use hellas_private::Durability::Crash;
 use std::time::Duration;
 
 struct Fixture {
@@ -57,7 +58,7 @@ fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
             profile.known_genesis_payload_pin().unwrap()
         );
         let home = tempfile::tempdir().unwrap();
-        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile).unwrap();
+        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
         let mut config = Config::for_profile(chain, vec![], None).unwrap();
         config.validators.clear();
         let node = FullNode::start(config).await.unwrap();
@@ -127,7 +128,7 @@ impl Fixture {
         })
         .unwrap();
         let mut config = Config::for_profile(
-            crate::chain_dir::ChainDir::open(directory, &profile).unwrap(),
+            crate::chain_dir::ChainDir::open(directory, &profile, Crash).unwrap(),
             vec![],
             None,
         )
@@ -344,6 +345,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         config.chain = crate::chain_dir::ChainDir::open(
             &directory.path().join("relay"),
             config.chain.profile(),
+            Crash,
         )
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
@@ -362,9 +364,12 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         .unwrap();
         seed.shutdown().await.unwrap();
         let mut config = fixture.config.clone();
-        config.chain =
-            crate::chain_dir::ChainDir::open(&directory.path().join("b"), config.chain.profile())
-                .unwrap();
+        config.chain = crate::chain_dir::ChainDir::open(
+            &directory.path().join("b"),
+            config.chain.profile(),
+            Crash,
+        )
+        .unwrap();
         config.peers = vec![a.endpoint_addr()];
         config.archive_blocks = NonZeroU64::new(1);
         let b = FullNode::start(config).await.unwrap();
@@ -682,6 +687,7 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
                     "bad-block"
                 }),
                 fixture.config.chain.profile(),
+                Crash,
             )
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
@@ -953,6 +959,7 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         config.chain = crate::chain_dir::ChainDir::open(
             &directory.path().join("replica"),
             config.chain.profile(),
+            Crash,
         )
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
@@ -1261,6 +1268,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         config.chain = crate::chain_dir::ChainDir::open(
             &directory.path().join("replica"),
             config.chain.profile(),
+            Crash,
         )
         .unwrap();
         config.peers = vec![endpoint.addr()];
@@ -1444,7 +1452,7 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     })
     .unwrap();
     let home = tempfile::tempdir().unwrap();
-    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile).unwrap();
+    let chain = crate::chain_dir::ChainDir::open(home.path(), &profile, Crash).unwrap();
     let error = Config::for_profile(chain, vec![], None).unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }

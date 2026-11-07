@@ -69,6 +69,12 @@ impl NodeCoordinator {
         }
     }
 
+    /// Close a standalone writer after its services have drained.
+    pub async fn close(&self) {
+        self.store.lock_for_shutdown().await.close().await;
+        self.changed.notify_waiters();
+    }
+
     /// Composition identity: two services must retain the same writer, not
     /// independently open the same authority journal.
     pub fn shares_writer(&self, other: &Self) -> bool {

@@ -834,7 +834,8 @@ async fn run_indexer(
             } else {
                 profile.clone().with_validators(rpc)?
             };
-            let chain = hellas_chain::chain_dir::ChainDir::open(home, &selected)?;
+            let chain =
+                hellas_chain::chain_dir::ChainDir::open(home, &selected, Default::default())?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
                     chain,
@@ -953,7 +954,7 @@ fn reset_validator_generation(
     generation: u64,
 ) -> CliResult {
     anyhow::ensure!(generation > 0, "generation must be positive");
-    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile)?;
+    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile, Default::default())?;
     let state = chain.validator();
     let stamp = state.join(".state-generation");
     let current = match fs::read_to_string(&stamp) {

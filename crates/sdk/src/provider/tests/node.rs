@@ -11,6 +11,7 @@ use hellas_channel::work_open::SetupView;
 use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
@@ -1342,7 +1343,7 @@ fn origin() -> SetupOrigin {
 /// A provider's setup journal, complete and recording where its
 /// channel begins — which is exactly what a restarting node finds.
 fn provider_journals(home: &Path) -> std::path::PathBuf {
-    crate::test_support::chain_dir(home, network()).provider_journals()
+    (crate::test_support::chain_dir(home, network()).provider_journals()).into_path_buf()
 }
 
 async fn write_setup_journal(root: &Path) {
@@ -1355,8 +1356,9 @@ async fn write_setup_journal(root: &Path) {
 /// channel, settlement, role and origin the descriptor fixes.
 async fn open_channel(root: &Path) -> ChannelStore {
     let journals = provider_journals(root);
+    let location = StoreLocation::for_test(&journals);
     match ChannelStore::open(
-        &journals,
+        &location,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
@@ -2360,8 +2362,9 @@ async fn seed_provider_offer(root: &Path, admission: PaymentAdmission) {
     let PaymentAdmission::Admits(policy) = admission else {
         panic!("admitting fixture policy")
     };
+    let location = StoreLocation::for_test(&provider_journals(root));
     let mut store = SetupStore::open(
-        &provider_journals(root),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
@@ -2519,8 +2522,9 @@ impl OfferFixture {
     async fn write_completed_setup_for(self, root: &Path, peer: PeerId) {
         let verifier = Secp256k1Verifier::new();
         let journals = provider_journals(root);
+        let location = StoreLocation::for_test(&journals);
         let mut store = match SetupStore::open(
-            &journals,
+            &location,
             network(),
             self.bond_edge(),
             Role::Provider,
@@ -2714,8 +2718,9 @@ impl OfferFixture {
         let PaymentAdmission::Admits(policy) = admission else {
             panic!("admitting fixture policy")
         };
+        let location = StoreLocation::for_test(&provider_journals(root));
         let mut store = SetupStore::open(
-            &provider_journals(root),
+            &location,
             network(),
             self.bond_edge(),
             Role::Provider,
@@ -2734,8 +2739,9 @@ impl OfferFixture {
 }
 
 async fn client_setup(root: &Path, policy: ProviderChannelPolicy) -> SetupEndpoint {
+    let location = StoreLocation::for_test(root);
     let store = match SetupStore::open(
-        root,
+        &location,
         network(),
         bond_edge(),
         Role::Client,
@@ -3939,8 +3945,9 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
 
     // Both files are released, and both replay to what the clock
     // left in them.
+    let location = StoreLocation::for_test(&provider_journals(dir.path()));
     let setup = match SetupStore::open(
-        &provider_journals(dir.path()),
+        &location,
         network(),
         bond_edge(),
         Role::Provider,
@@ -4197,7 +4204,8 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let (enrollment, producer_key) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
     let provider = enrollment;
-    let journal = crate::grant_config::GrantConfig::journal_dir(root.path());
+    let location = StoreLocation::for_test(root.path());
+    let journal = crate::grant_config::GrantConfig::journal_dir(&location);
     let config = || ProviderGrants {
         config: crate::GrantProviderOptions {
             configuration: Default::default(),
@@ -4311,7 +4319,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     }
     // The local-grant CLI opens this same authority journal after provider restart.
     let local = hellas_authority::work_store::grant::NodeStore::open(
-        &crate::grant_config::GrantConfig::journal_dir(root.path()),
+        &crate::grant_config::GrantConfig::journal_dir(&location),
         grant_network(),
         Some(provider),
         hellas_auth::authority::UnixMillis::now().unwrap_or_default(),

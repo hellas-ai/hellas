@@ -1,5 +1,6 @@
 use super::*;
 use hellas_channel::model::offer::{SignedPaidOffer, request_digest};
+use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{Quote, RequestOfferRequest, request_offer_response::Outcome};
 use hellas_wire::{Metadata, StreamTransport};
 use iroh::{EndpointAddr, TransportAddr};
@@ -281,7 +282,7 @@ pub(crate) struct RetainedSetups {
 
 impl RetainedSetups {
     pub(crate) async fn discover(
-        journal_root: &std::path::Path,
+        journal_root: &StoreLocation,
         network: hellas_kernel::NetworkId,
         provider: hellas_client::ProviderAddress,
     ) -> Result<Self> {

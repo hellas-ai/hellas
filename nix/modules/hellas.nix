@@ -184,6 +184,7 @@ rec {
   # typed runtime-path options that the platform modules verify stay outside
   # the store.
   protectedServeExtraArgs = [
+    "--durability"
     "--home"
     "--log-file"
     "--assurance"
@@ -371,6 +372,14 @@ rec {
         default = "${hellasLib.defaultStateDir}/.hellas";
         example = "/var/lib/hellas/.hellas";
         description = "Provider home passed as --home. Identity and all Hellas state live below this operator-managed directory.";
+      };
+      durability = mkOption {
+        type = types.enum [
+          "crash"
+          "power"
+        ];
+        default = "crash";
+        description = "Crash survives process crashes; OS crashes or power loss may roll back recent payment and authority commits with no time bound. Power flushes journal commits and content publication.";
       };
       queueSize = mkOption {
         type = types.nullOr types.ints.unsigned;
@@ -737,6 +746,10 @@ rec {
       "serve"
       "--home"
       serve.home
+    ]
+    ++ [
+      "--durability"
+      serve.durability
     ]
     ++ optArg "--port" serve.port
     ++ optArg "--queue-size" serve.queueSize

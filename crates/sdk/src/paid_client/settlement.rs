@@ -6,6 +6,7 @@ use hellas_channel::work::ClientChannel;
 use hellas_channel::work_close::{FinalizedBlocks, FinalizedWork, TxSink, catch_up};
 use hellas_channel::work_store::ChannelStore;
 use hellas_kernel::{Key, NetworkId, Tx};
+use hellas_private::StoreLocation;
 
 /// Drives one client close to finality.
 ///
@@ -68,7 +69,7 @@ pub struct RetainedSettlementChannel {
 /// live object proofs. Unidentified, incomplete or mismatched journals fail
 /// closed so an existing obligation is never silently ignored.
 pub async fn retained_settlement_channels(
-    root: &std::path::Path,
+    root: &StoreLocation,
     network: NetworkId,
     provider: hellas_client::ProviderAddress,
     owner: PrincipalId,
@@ -84,8 +85,8 @@ pub async fn retained_settlement_channels(
         let setup =
             SetupStore::open_existing(root, network, entry.bond_edge, Role::Client, &verifier)
                 .await?;
+        let setup = setup.into_state().await;
         let (_, signed) = setup
-            .state()
             .offer()
             .ok_or(PaidClientError::MissingState("settlement signed offer"))?;
         signed.check()?;
@@ -97,7 +98,7 @@ pub async fn retained_settlement_channels(
             return Err(PaidClientError::RetainedEnrollment(provider));
         }
         if matches!(
-            setup.state().end(),
+            setup.end(),
             Some(hellas_channel::work_store::SetupEnd::Aborted(_))
         ) {
             continue;
@@ -141,10 +142,15 @@ async fn finalized_channel_settlement_inner(
     let verifier = Secp256k1Verifier::new();
     // Observing finalized blocks can expire jobs and record closure, but cannot
     // approve, sign, submit, or pay for any work.
-    if recovery.journal.state().close_settled().is_none() {
-        catch_up(&recovery.chain, &mut recovery.journal, &verifier).await?;
+    let result = async {
+        if recovery.journal.state().close_settled().is_none() {
+            catch_up(&recovery.chain, &mut recovery.journal, &verifier).await?;
+        }
+        settlement_receipt(&recovery).await
     }
-    settlement_receipt(&recovery).await
+    .await;
+    recovery.journal.close().await;
+    result
 }
 
 /// Close exactly this retained funded channel using its signed journal and
@@ -159,33 +165,38 @@ pub async fn settle_channel(
 ) -> Result<FinalizedChannelSettlement> {
     let recovery = open_settlement(args, bond, owner, signer.party_key()).await?;
     let mut endpoint = ClientEndpoint::recover(recovery.journal, signer.clone())?;
-    settle_close(
-        &mut endpoint,
-        &recovery.chain,
-        &recovery.chain,
-        args.config.poll,
-    )
-    .await?;
-    // The finalized receipt is verified through the same recovery reader used
-    // after a crash. No requested or merely enqueued close releases funding.
-    let channel = endpoint.state().channel();
-    let settled = endpoint
-        .state()
-        .close_settled()
-        .expect("loop observed finality");
-    let pending = endpoint
-        .state()
-        .close_history()
-        .map(|history| history.pending);
-    receipt(
-        &recovery.chain,
-        channel,
-        recovery.bond,
-        recovery.funding_value,
-        settled,
-        pending,
-    )
-    .await
+    let result = async {
+        settle_close(
+            &mut endpoint,
+            &recovery.chain,
+            &recovery.chain,
+            args.config.poll,
+        )
+        .await?;
+        // The finalized receipt is verified through the same recovery reader used
+        // after a crash. No requested or merely enqueued close releases funding.
+        let channel = endpoint.state().channel();
+        let settled = endpoint
+            .state()
+            .close_settled()
+            .expect("loop observed finality");
+        let pending = endpoint
+            .state()
+            .close_history()
+            .map(|history| history.pending);
+        receipt(
+            &recovery.chain,
+            channel,
+            recovery.bond,
+            recovery.funding_value,
+            settled,
+            pending,
+        )
+        .await
+    }
+    .await;
+    endpoint.close().await;
+    result
 }
 
 struct SettlementRecovery {
@@ -196,13 +207,12 @@ struct SettlementRecovery {
 }
 
 fn checked_descriptor(
-    setup: &SetupStore,
+    setup: &hellas_channel::work_store::SetupState,
     bond: EdgeId,
     owner: PrincipalId,
     delegate: Key,
 ) -> Result<&hellas_channel::model::setup::CloseDescriptor> {
     let descriptor = setup
-        .state()
         .close_descriptor()
         .ok_or(PaidClientError::MissingState(
             "settlement channel descriptor",
@@ -215,7 +225,7 @@ fn checked_descriptor(
     {
         return Err(PaidClientError::InputMismatch("settlement client identity"));
     }
-    if setup.state().origin().is_none() {
+    if setup.origin().is_none() {
         return Err(PaidClientError::MissingState("settlement channel origin"));
     }
     Ok(descriptor)
@@ -249,8 +259,8 @@ async fn open_settlement(
         &verifier,
     )
     .await?;
+    let setup = setup.into_state().await;
     let (_, signed) = setup
-        .state()
         .offer()
         .ok_or(PaidClientError::MissingState("settlement signed offer"))?;
     signed.check()?;
@@ -266,10 +276,9 @@ async fn open_settlement(
         .checked_add(values.reserve())
         .ok_or(PaidClientError::InputMismatch("settlement funding value"))?;
     let origin = setup
-        .state()
         .origin()
         .ok_or(PaidClientError::MissingState("settlement channel origin"))?;
-    let journal = ChannelStore::open_existing(
+    let mut journal = ChannelStore::open_existing(
         &args.journal_root(),
         channel.clone(),
         descriptor.expected_settlement()?,
@@ -279,17 +288,28 @@ async fn open_settlement(
         &verifier,
     )
     .await?;
-    if !journal.state().origin_observed() {
-        return Err(PaidClientError::MissingState(
-            "settlement origin observation",
-        ));
+    let chain = async {
+        if !journal.state().origin_observed() {
+            return Err(PaidClientError::MissingState(
+                "settlement origin observation",
+            ));
+        }
+        let timeout = super::read_timeout(args.timeout);
+        let remote =
+            crate::client_chain::connect_at(&args.config, timeout, journal.state().cursor().0)
+                .await?;
+        Ok(WorkBlocks::new(remote)
+            .with_read_retry(args.config.poll, timeout)
+            .with_min_height(journal.state().cursor().0))
     }
-    let timeout = super::read_timeout(args.timeout);
-    let remote =
-        crate::client_chain::connect_at(&args.config, timeout, journal.state().cursor().0).await?;
-    let chain = WorkBlocks::new(remote)
-        .with_read_retry(args.config.poll, timeout)
-        .with_min_height(journal.state().cursor().0);
+    .await;
+    let chain = match chain {
+        Ok(chain) => chain,
+        Err(error) => {
+            journal.close().await;
+            return Err(error);
+        }
+    };
     Ok(SettlementRecovery {
         journal,
         chain,
