@@ -108,7 +108,7 @@ impl FullNode {
                     core.readiness.halt(reason);
                     serving.shutdown().await;
                     tasks.stop(&context).await;
-                    network.endpoint.close().await;
+                    hellas_wire::iroh::close(&network.endpoint).await;
                 });
             })
             .map_err(storage)?;
@@ -535,7 +535,7 @@ pub(crate) async fn serve_validator_endpoint(
         _ = serve(service, network) => {},
         _ = notify => {},
     }
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
 }
 
 /// ChainSync admission is shared across connections, including the host mount.

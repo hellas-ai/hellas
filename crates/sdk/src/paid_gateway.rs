@@ -625,7 +625,7 @@ impl WorkSource for PaidPool {
                     session.shutdown().await;
                 }
             }
-            self.endpoint.close().await;
+            hellas_wire::iroh::close(&self.endpoint).await;
             Ok(())
         })
     }
