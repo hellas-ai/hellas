@@ -146,7 +146,7 @@ pub(super) async fn execute(
         let mut session = match session {
             Ok(session) => session,
             Err(error) => {
-                endpoint.close().await;
+                hellas_wire::iroh::close(&endpoint).await;
                 return Err(error.into());
             }
         };
@@ -168,7 +168,7 @@ pub(super) async fn execute(
         let closed = session.shutdown().await;
         // Closing acknowledges the provider's final frames; dropping the
         // endpoint would leave it waiting for them until its write timeout.
-        endpoint.close().await;
+        hellas_wire::iroh::close(&endpoint).await;
         let result = result?;
         closed?;
         result

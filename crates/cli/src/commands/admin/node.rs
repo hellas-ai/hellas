@@ -151,7 +151,7 @@ pub async fn run(
             .await
         }
         .await;
-        endpoint.close().await;
+        hellas_wire::iroh::close(&endpoint).await;
         result
     } else {
         let (tls, server_name) = profile
@@ -608,7 +608,7 @@ async fn bootstrap_remote(
         .bind()
         .await?;
     let result = node_control::bootstrap::connect(&endpoint, &invitation, root, approval).await;
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;
     println!(
         "{}",

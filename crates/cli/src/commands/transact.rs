@@ -455,7 +455,7 @@ async fn purchase_and_execute(
         &mut purchase,
     )
     .await;
-    endpoint.close().await;
+    hellas_wire::iroh::close(&endpoint).await;
     deliver_paid(args, context, &options, &mut purchase, &result?, deliver).await
 }
 
@@ -618,7 +618,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 }).await
             }
             .await;
-            endpoint.close().await;
+            hellas_wire::iroh::close(&endpoint).await;
             result
         },
         |timeout| {

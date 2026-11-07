@@ -258,7 +258,7 @@ impl HostHandle {
             .and_then(|result| result);
         // Accepted remote Work drains while the host-owned endpoint is alive.
         if let Some((endpoint, task)) = self.transport.take() {
-            endpoint.close().await;
+            hellas_wire::iroh::close(&endpoint).await;
             task.await?;
         }
         listener.and(stopped)
