@@ -31,8 +31,9 @@ message StatRequest { Path at = 1; }
 message StatResponse { Target target = 1; }
 message ChunksRequest { Path at = 1; Cursor cursor = 2; }
 message ChunksResponse { ContentRef object = 1; repeated Chunk chunks = 2; Cursor next = 3; }
+// Read streams the store's verified slices. RemoteStore requests whole chunks.
 message ReadRequest { Path at = 1; uint64 start = 2; uint64 end = 3; ContentRef expect = 4; }
-// Each data item contains a whole verified chunk; the client slices the range.
+// Verified slices at their object offsets; aligned requests return whole chunks.
 message ReadResponse { ContentRef object = 1; uint64 offset = 2; bytes data = 3; }
 // The host authenticates this opaque application opening before minting Work.
 // The root is a reference, never embedded root bytes.

@@ -325,7 +325,7 @@ where
         let mut selected = Vec::new();
         for chunk in chunks {
             let end = offset + chunk.data_len;
-            if offset < range.end && end > range.start {
+            if !range.is_empty() && offset < range.end && end > range.start {
                 selected.push((offset, chunk));
             }
             offset = end;
@@ -334,8 +334,10 @@ where
             .client
             .read(pb::ReadRequest {
                 at: Some(w::path(at)),
-                start: range.start,
-                end: range.end,
+                start: selected.first().map_or(range.start, |(offset, _)| *offset),
+                end: selected
+                    .last()
+                    .map_or(range.end, |(offset, chunk)| offset + chunk.data_len),
                 expect: Some(super::page::wire_ref(object)),
             })
             .await

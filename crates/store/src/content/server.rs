@@ -1,7 +1,6 @@
 //! One Content adapter. The host authenticates the opening and supplies the
 //! scope; request fields never select Owner, Grant or Work authority.
 use super::{wire as w, *};
-use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use hellas_rpc::{call::ResponseStream, pb::content as pb, services::content::ContentHandler};
 use hellas_wire::{TransportContext, WireCode, WireStatus};
@@ -179,14 +178,12 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
     ) -> std::result::Result<ResponseStream<pb::ReadResponse>, WireStatus> {
         let at = w::path_from(required(r.at)?).map_err(status)?;
         let scope = self.scope()?;
-        let object = self
+        let mut read = self
             .store
-            .stat(&scope, &at)
+            .read(&scope, &at, r.start..r.end)
             .await
-            .map_err(status)?
-            .ok_or_else(|| status(Error::Missing))?
-            .target
-            .object();
+            .map_err(status)?;
+        let object = read.object;
         if r.expect
             .as_ref()
             .map(w::object)
@@ -196,126 +193,34 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
         {
             return Err(status(Error::Conflict));
         }
-        if r.start > r.end || r.end > object.bytes() {
-            return Err(status(Error::Invalid("read range")));
-        }
-        let (mut start, mut end, mut first) = (r.start, r.end, 0u64);
-        if start != end {
-            let mut cursor = Cursor {
-                object: Some(object),
-                ..Default::default()
-            };
-            let mut offset = 0u64;
-            let mut found = false;
-            'pages: loop {
-                let page = self
-                    .store
-                    .chunks(&self.scope()?, &at, cursor.clone())
-                    .await
-                    .map_err(status)?;
-                if page.object != object {
-                    return Err(status(Error::Conflict));
-                }
-                for (index, chunk) in page.chunks.iter().enumerate() {
-                    let next = offset
-                        .checked_add(chunk.data_len)
-                        .ok_or_else(|| status(Error::Invalid("chunk offsets")))?;
-                    if !found && next > r.start {
-                        start = offset;
-                        first = cursor.offset + index as u64;
-                        found = true;
-                    }
-                    if offset < r.end && next >= r.end {
-                        end = next;
-                        break 'pages;
-                    }
-                    offset = next;
-                }
-                cursor = page
-                    .next
-                    .ok_or_else(|| status(Error::Invalid("incomplete chunk list")))?;
-            }
-        }
-        let mut read = self
-            .store
-            .read(&scope, &at, start..end)
-            .await
-            .map_err(status)?;
-        if read.object != object {
-            return Err(status(Error::Conflict));
-        }
-        let service = self.clone();
         Ok(self.stream(ResponseStream::new(async_stream::try_stream! {
-            if start == end {
-                if let Some(bytes) = read.bytes.next().await {
-                    bytes.map_err(status)?;
-                    Err(status(Error::Invalid("extra read bytes")))?;
+            let mut offset = r.start;
+            while let Some(bytes) = read.bytes.next().await {
+                let data = bytes.map_err(status)?;
+                if data.is_empty() {
+                    continue;
                 }
+                let end = offset.checked_add(data.len() as u64)
+                    .filter(|end| *end <= r.end)
+                    .ok_or_else(|| status(Error::Invalid("extra read bytes")))?;
                 yield pb::ReadResponse {
                     object: Some(super::page::wire_ref(object)),
-                    offset: start,
+                    offset,
+                    data: data.to_vec(),
+                };
+                offset = end;
+            }
+            if offset != r.end {
+                Err(status(Error::Invalid("short read")))?;
+            }
+            if r.start == r.end {
+                yield pb::ReadResponse {
+                    object: Some(super::page::wire_ref(object)),
+                    offset,
                     data: vec![],
                 };
-            } else {
-                let mut cursor = Cursor {
-                    offset: first,
-                    object: Some(object),
-                    ..Default::default()
-                };
-                let mut offset = start;
-                let mut pending = Bytes::new();
-                while offset < end {
-                    let page = service
-                        .store
-                        .chunks(&service.scope()?, &at, cursor.clone())
-                        .await
-                        .map_err(status)?;
-                    if page.object != object {
-                        Err(status(Error::Conflict))?;
-                    }
-                    for chunk in page.chunks {
-                        if offset >= end {
-                            break;
-                        }
-                        if chunk.data_len == 0 || chunk.data_len > hellas_xet::MAX_CHUNK_SIZE as u64 {
-                            Err(status(Error::Invalid("chunk length")))?;
-                        }
-                        let mut data = Vec::with_capacity(chunk.data_len as usize);
-                        while data.len() < chunk.data_len as usize {
-                            if pending.is_empty() {
-                                pending = read
-                                    .bytes
-                                    .next()
-                                    .await
-                                    .ok_or_else(|| status(Error::Invalid("short read")))?
-                                    .map_err(status)?;
-                                if pending.is_empty() {
-                                    Err(status(Error::Invalid("empty data chunk")))?;
-                                }
-                            }
-                            let count = (chunk.data_len as usize - data.len()).min(pending.len());
-                            data.extend_from_slice(&pending.split_to(count));
-                        }
-                        if hellas_xet::chunk(&data).as_slice() != [chunk] {
-                            Err(status(Error::Invalid("unverified backend chunk")))?;
-                        }
-                        yield pb::ReadResponse {
-                            object: Some(super::page::wire_ref(object)),
-                            offset,
-                            data,
-                        };
-                        offset += chunk.data_len;
-                    }
-                    if offset < end {
-                        cursor = page
-                            .next
-                            .ok_or_else(|| status(Error::Invalid("incomplete chunk list")))?;
-                    }
-                }
-                if !pending.is_empty() || read.bytes.next().await.is_some() {
-                    Err(status(Error::Invalid("extra read bytes")))?;
-                }
             }
+
         })))
     }
     async fn upload(
