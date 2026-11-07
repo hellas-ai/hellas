@@ -396,7 +396,7 @@ async fn send_frames(
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     // Direct-service fixtures run sequentially; concurrent callers use serve_work.
     assert_eq!(
-        service.content_upload_count().unwrap(),
+        service.content_upload_count().await.unwrap(),
         0,
         "acceptance fixture needs its own upload carrier"
     );
@@ -420,7 +420,7 @@ async fn send_frames(
     let response = service.accept(wire).await;
     connection.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while service.content_upload_count().unwrap() != 0 {
+        while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
     })

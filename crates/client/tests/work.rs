@@ -415,7 +415,7 @@ async fn model_job_restart_inner(provider_held: bool) {
                 .with_state(|state| work_id(state.channel(), &authorization))
                 .await
                 .unwrap();
-            if !self.service.completed_content_upload(id).unwrap() {
+            if !self.service.completed_content_upload(id).await.unwrap() {
                 return self
                     .service
                     .accept_work(request, context)

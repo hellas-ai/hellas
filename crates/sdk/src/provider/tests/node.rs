@@ -5251,7 +5251,7 @@ async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handler
     })
     .await
     .unwrap();
-    assert!(held.completed_content_upload(id).unwrap());
+    assert!(held.completed_content_upload(id).await.unwrap());
     assert!(
         held.with_state(|state| state.job_by_id(id).is_none())
             .await

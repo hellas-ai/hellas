@@ -454,7 +454,7 @@ pub async fn accept_uploaded(
     let response = service.accept(&wire).await;
     connection.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while service.content_upload_count().unwrap() != 0 {
+        while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
     })

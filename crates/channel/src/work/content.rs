@@ -394,32 +394,30 @@ impl ProviderEndpoint {
 
 impl WorkService {
     #[cfg(any(test, feature = "test-support"))]
-    pub fn content_upload_count(&self) -> Result<usize, WireStatus> {
-        self.content_uploads
-            .lock()
-            .map(|uploads| uploads.len())
-            .map_err(|_| status(Error::Denied))
+    pub async fn content_upload_count(&self) -> Result<usize, WireStatus> {
+        Ok(self
+            .endpoint()
+            .await
+            .map_err(status)?
+            .close
+            .store
+            .contents
+            .values()
+            .filter(|(_, _, upload)| upload.is_some())
+            .count())
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub fn completed_content_upload(&self, work: Digest) -> Result<bool, WireStatus> {
-        self.content_uploads
-            .lock()
-            .map(|uploads| uploads.get(&work).is_some_and(|(_, _, active)| !*active))
-            .map_err(|_| status(Error::Denied))
-    }
-    fn complete_content_upload(&self, work: Digest, reservation: u64) -> Result<(), WireStatus> {
-        let mut uploads = self
-            .content_uploads
-            .lock()
-            .map_err(|_| status(Error::Denied))?;
-        let (current, _, active) = uploads
-            .get_mut(&work)
-            .ok_or_else(|| status(Error::Denied))?;
-        if *current != reservation {
-            return Err(status(Error::Denied));
-        }
-        *active = false;
-        Ok(())
+    pub async fn completed_content_upload(&self, work: Digest) -> Result<bool, WireStatus> {
+        Ok(self
+            .endpoint()
+            .await
+            .map_err(status)?
+            .close
+            .store
+            .contents
+            .get(&work)
+            .and_then(|content| content.2)
+            .is_some_and(|(_, active)| !active))
     }
     pub(super) fn content_scope(
         &self,
@@ -494,17 +492,13 @@ impl WorkService {
     }
     async fn discard_pending_content(&self, work: Digest, reservation: u64) {
         if let Ok(mut endpoint) = self.endpoint().await {
-            let _ = endpoint
-                .close
-                .store
-                .discard_unaccepted_content(work, reservation)
-                .await;
-            if let Ok(mut uploads) = self.content_uploads.lock()
-                && uploads
-                    .get(&work)
-                    .is_some_and(|(current, _, _)| *current == reservation)
+            let store = &mut endpoint.close.store;
+            let cleaned = store.discard_unaccepted_content(work, reservation).await;
+            if (cleaned.is_ok() || store.check_authority().is_err())
+                && store.has_content_scope(work, reservation)
+                && let Some(content) = store.contents.get_mut(&work)
             {
-                uploads.remove(&work);
+                content.2 = None;
             }
         }
         self.changed.notify_waiters();
@@ -609,26 +603,19 @@ impl WorkService {
                         "work is already accepted",
                     ));
                 }
-                {
-                    let uploads = host
-                        .content_uploads
-                        .lock()
-                        .map_err(|_| status(Error::Denied))?;
-                    if uploads
-                        .get(&work)
-                        .is_some_and(|(_, owner, active)| *owner != exporter || *active)
-                    {
-                        return Err(status(Error::Conflict));
-                    }
+                let upload = endpoint
+                    .close
+                    .store
+                    .contents
+                    .get(&work)
+                    .and_then(|content| content.2);
+                if upload.is_some_and(|(owner, active)| owner != exporter || active) {
+                    return Err(status(Error::Conflict));
                 }
                 if endpoint.close.store.other_pending_content(work) {
                     return Err(status(Error::Conflict));
                 }
-                let fresh = !host
-                    .content_uploads
-                    .lock()
-                    .map_err(|_| status(Error::Denied))?
-                    .contains_key(&work);
+                let fresh = upload.is_none();
                 let (store, scope) = endpoint
                     .close
                     .store
@@ -641,13 +628,13 @@ impl WorkService {
                     .await
                     .map_err(status)?;
                 let cleanup = host.pending_content_cleanup(&scope);
-                let ScopeKind::Work { reservation, .. } = scope.kind else {
-                    return Err(status(Error::Denied));
-                };
-                host.content_uploads
-                    .lock()
-                    .map_err(|_| status(Error::Denied))?
-                    .insert(work, (reservation, exporter, true));
+                endpoint
+                    .close
+                    .store
+                    .contents
+                    .get_mut(&work)
+                    .ok_or_else(|| status(Error::Denied))?
+                    .2 = Some((exporter, true));
                 Ok::<_, WireStatus>((
                     authorization,
                     manifest,
@@ -723,12 +710,13 @@ impl WorkService {
                 yield reply;
             }
             {
-                let endpoint = host.endpoint().await.map_err(status)?;
+                let mut endpoint = host.endpoint().await.map_err(status)?;
                 let (local, scope) = endpoint.close.store.invocation_content(id).map_err(status)?;
                 let ScopeKind::Work { closure, .. } = &scope.kind else { Err(status(Error::Denied))?; unreachable!() };
                 if !local.missing_refs(&scope, closure.clone()).await.map_err(status)?.is_empty() { Err(status(Error::Missing))?; }
+                if !endpoint.close.store.has_content_scope(id, reservation) { Err(status(Error::Denied))?; }
+                endpoint.close.store.contents.get_mut(&id).and_then(|content|content.2.as_mut()).ok_or_else(||status(Error::Denied))?.1 = false;
             }
-            host.complete_content_upload(id, reservation)?;
             cleanup.0.clear();
         }).with_write_authority(writer))
     }

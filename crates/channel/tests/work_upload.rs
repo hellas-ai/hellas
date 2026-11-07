@@ -106,7 +106,7 @@ async fn upload(
 }
 async fn claims_released(service: &WorkService) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while service.content_upload_count().unwrap() != 0 {
+        while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -114,7 +114,7 @@ async fn claims_released(service: &WorkService) {
     .unwrap();
 }
 async fn shutdown(service: WorkService, node: DiskStore) {
-    assert_eq!(service.content_upload_count().unwrap(), 0);
+    assert_eq!(service.content_upload_count().await.unwrap(), 0);
     drop(service);
     node.close().await;
     drop(node);

@@ -709,10 +709,10 @@ async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
         ),
         "{response:?}"
     );
-    assert_eq!(service.content_upload_count().unwrap(), 1);
+    assert_eq!(service.content_upload_count().await.unwrap(), 1);
     connection.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while service.content_upload_count().unwrap() != 0 {
+        while service.content_upload_count().await.unwrap() != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -724,7 +724,7 @@ async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
         .await
         .unwrap();
     service.end_run(work).await.unwrap();
-    assert_eq!(service.content_upload_count().unwrap(), 0);
+    assert_eq!(service.content_upload_count().await.unwrap(), 0);
 }
 
 #[tokio::test]

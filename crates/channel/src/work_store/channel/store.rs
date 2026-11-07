@@ -1,17 +1,17 @@
 use super::*;
 
+type ContentEntry = (
+    hellas_store::content::LocalStore,
+    hellas_store::content::Scope,
+    Option<([u8; 32], bool)>,
+);
+
 /// The durable channel journal: the state above and the file it is
 /// replayed from.
 pub struct ChannelStore {
     journal: Journal,
     pub(super) state: Channel,
-    pub(super) contents: BTreeMap<
-        Digest,
-        (
-            hellas_store::content::LocalStore,
-            hellas_store::content::Scope,
-        ),
-    >,
+    pub(crate) contents: BTreeMap<Digest, ContentEntry>,
     pub(super) content: hellas_store::content::DiskStore,
 }
 
@@ -31,7 +31,7 @@ impl ChannelStore {
             .contents
             .iter()
             .filter(|_| self.state.role == Role::Provider)
-            .filter_map(|(work, (_, scope))| {
+            .filter_map(|(work, (_, scope, _))| {
                 if let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind {
                     Some((*work, reservation))
                 } else {

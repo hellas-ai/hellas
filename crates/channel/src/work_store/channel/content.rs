@@ -25,12 +25,13 @@ impl ChannelStore {
         if let Some(job) = self.state.book.jobs.get_mut(&work) {
             job.prepared_input = bytes::Bytes::new();
         }
-        if let Some((store, scope)) = self.contents.remove(&work) {
+        if let Some((store, scope, _)) = self.contents.get(&work).cloned() {
             match store {
                 LocalStore::Disk(node) => node.end_work(&scope).await?,
                 LocalStore::Job(job) => job.end().await?,
                 LocalStore::Memory(_) => return Err(Error::Denied.into()),
             }
+            self.contents.remove(&work);
         }
         Ok(())
     }
@@ -44,7 +45,7 @@ impl ChannelStore {
         Ok(())
     }
     pub(crate) fn has_content_scope(&self, work: Digest, reservation: u64) -> bool {
-        self.contents.get(&work).is_some_and(|(_, scope)| matches!(&scope.kind, ScopeKind::Work { reservation: current, .. } if *current == reservation))
+        self.contents.get(&work).is_some_and(|(_, scope, _)| matches!(&scope.kind, ScopeKind::Work { reservation: current, .. } if *current == reservation))
     }
     pub(crate) fn other_pending_content(&self, work: Digest) -> bool {
         self.contents.keys().any(|id| {
@@ -66,7 +67,7 @@ impl ChannelStore {
         self.check_authority()?;
         self.contents
             .get(&work)
-            .cloned()
+            .map(|(store, scope, _)| (store.clone(), scope.clone()))
             .ok_or_else(|| Error::Missing.into())
     }
 
@@ -79,7 +80,11 @@ impl ChannelStore {
             .state()
             .retained_roots()
             .contains_key(&work)
-            .then(|| self.contents.get(&work).cloned())
+            .then(|| {
+                self.contents
+                    .get(&work)
+                    .map(|(store, scope, _)| (store.clone(), scope.clone()))
+            })
             .flatten())
     }
 
@@ -95,7 +100,7 @@ impl ChannelStore {
             if content.0.retention() != retention {
                 return Err(Error::Denied.into());
             }
-            return Ok(content.clone());
+            return Ok((content.0.clone(), content.1.clone()));
         }
         let job = JobId {
             channel: self.state().channel().id(),
@@ -115,7 +120,8 @@ impl ChannelStore {
                 (LocalStore::Job(job), scope)
             }
         };
-        self.contents.insert(work, content.clone());
+        self.contents
+            .insert(work, (content.0.clone(), content.1.clone(), None));
         Ok(content)
     }
 
@@ -139,7 +145,9 @@ impl ChannelStore {
                 (LocalStore::Job(job), scope)
             }
         };
-        self.contents.insert(work, content.clone());
+        let upload = self.contents.get(&work).and_then(|content| content.2);
+        self.contents
+            .insert(work, (content.0.clone(), content.1.clone(), upload));
         Ok(content)
     }
 
@@ -365,7 +373,7 @@ impl ChannelStore {
             })
             .collect::<Vec<_>>();
         for work in ended {
-            let Some((store, scope)) = self.contents.remove(&work) else {
+            let Some((store, scope, _)) = self.contents.get(&work).cloned() else {
                 continue;
             };
             match store {
@@ -373,6 +381,7 @@ impl ChannelStore {
                 LocalStore::Job(job) => job.end().await?,
                 LocalStore::Memory(_) => return Err(Error::Denied.into()),
             }
+            self.contents.remove(&work);
         }
         Ok(())
     }
