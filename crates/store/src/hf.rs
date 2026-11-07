@@ -31,10 +31,7 @@
 //! Whole-file: the reassembled bytes are re-chunked and their file hash
 //! compared with the id that was asked for, so a wrong or tampered
 //! response cannot be written into the store under a name it does not
-//! own. Per-chunk: [`crate::xorb::decode_range`] additionally checks
-//! every chunk against our own chunk list when we have one, which is
-//! what makes a *partial* fetch verifiable at all — HuggingFace returns
-//! no chunk hashes.
+//! own.
 
 use std::io::Read as _;
 
@@ -758,7 +755,7 @@ impl HfCas {
                         .read_exact(&mut frame[header.len()..])
                         .map_err(|_| FetchError::Malformed("truncated xorb payload".into()))?;
                     let in_term = term.chunks.contains(&index);
-                    let decoded = crate::xorb::decode_chunk_bounded(&frame, None)?;
+                    let decoded = crate::xorb::decode_chunk(&frame)?;
                     if !in_term {
                         continue;
                     }

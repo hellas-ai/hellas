@@ -42,8 +42,8 @@
 //! is preceded by a non-zero `offset_into_first_range` (the fixtures are
 //! whole chunks), and the HTTP layer itself, which no fixture can test.
 
-use hellas_store::xorb::{decode_chunk, decode_chunks, decode_range};
-use hellas_xet::{Chunk, XetHash, chunk_hash};
+use hellas_store::xorb::decode_chunk;
+use hellas_xet::{XetHash, chunk_hash};
 
 /// Bytes as served: a xorb range covering chunk indices [0, 2).
 const RANGE: &[u8] = include_bytes!("vectors/reference-xorb-chunks-0-2.bin");
@@ -61,38 +61,16 @@ const PUBLISHED: [(&str, u64); 2] = [
     ),
 ];
 
-fn published() -> Vec<Chunk> {
-    PUBLISHED
-        .iter()
-        .map(|(hash, len)| Chunk::new(hash.parse::<XetHash>().expect("vector hash"), *len))
-        .collect()
-}
-
 #[test]
 fn a_real_xorb_range_decodes_to_the_published_chunks() {
-    let decoded = decode_range(RANGE, &published()).expect("real xorb decodes");
-
-    assert_eq!(decoded.len(), 2);
-    for (data, (hash, len)) in decoded.iter().zip(PUBLISHED) {
-        assert_eq!(data.len() as u64, len);
-        assert_eq!(chunk_hash(data).to_string(), hash);
+    let mut offset = 0;
+    for (hash, len) in PUBLISHED {
+        let frame = decode_chunk(&RANGE[offset..]).expect("real xorb decodes");
+        assert_eq!(frame.data.len() as u64, len);
+        assert_eq!(chunk_hash(&frame.data).to_string(), hash);
+        offset += frame.consumed;
     }
-}
-
-/// The framing must locate the second chunk purely by decoding the
-/// first — a xorb carries no index.
-#[test]
-fn chunk_boundaries_are_found_by_decoding_not_by_an_index() {
-    let first = decode_chunk(RANGE).expect("first chunk");
-    assert_eq!(first.data.len(), 131_072);
-
-    let second = decode_chunk(&RANGE[first.consumed..]).expect("second chunk");
-    assert_eq!(second.data.len(), 106_099);
-    assert_eq!(
-        first.consumed + second.consumed,
-        RANGE.len(),
-        "the two chunks must account for the whole served range",
-    );
+    assert_eq!(offset, RANGE.len(), "frames account for the complete range");
 }
 
 /// Byte grouping (scheme 2) against bytes xet-core produced.
@@ -113,7 +91,7 @@ fn chunk_boundaries_are_found_by_decoding_not_by_an_index() {
 /// term's `unpacked_length` of 111240. It is the same content by a
 /// different code path, which is the whole point.
 mod bg4 {
-    use super::{Chunk, XetHash, chunk_hash, decode_chunk, decode_chunks, decode_range};
+    use super::{XetHash, chunk_hash, decode_chunk};
 
     /// Bytes as served: a xorb range covering chunk indices [1100, 1102).
     const RANGE: &[u8] = include_bytes!("vectors/bg4-xorb-chunks-1100-1102.bin");
@@ -145,7 +123,13 @@ mod bg4 {
     /// HuggingFace's own reconstruction serves for the same span.
     #[test]
     fn ungrouped_chunks_match_the_plaintext_huggingface_serves() {
-        let decoded = decode_chunks(RANGE, 2, None).expect("bg4 xorb decodes");
+        let mut remaining = RANGE;
+        let decoded = LENGTHS.map(|_| {
+            let frame = decode_chunk(remaining).expect("bg4 xorb decodes");
+            remaining = &remaining[frame.consumed..];
+            frame.data
+        });
+        assert!(remaining.is_empty());
         assert_eq!(
             decoded.iter().map(Vec::len).collect::<Vec<_>>(),
             LENGTHS.to_vec(),
@@ -155,23 +139,6 @@ mod bg4 {
             PLAIN,
             "decoded bytes differ from the file"
         );
-    }
-
-    /// With the chunk list derived from the oracle rather than from our
-    /// own decoding, the verifying path must accept the fixture.
-    #[test]
-    fn per_chunk_verification_accepts_the_real_range() {
-        let mut expected = Vec::new();
-        let mut at = 0;
-        for len in LENGTHS {
-            let data = &PLAIN[at..at + len];
-            expected.push(Chunk::new(chunk_hash(data), len as u64));
-            at += len;
-        }
-        assert_eq!(at, PLAIN.len(), "lengths must account for the oracle");
-
-        let decoded = decode_range(RANGE, &expected).expect("bg4 range verifies");
-        assert_eq!(decoded.concat(), PLAIN);
     }
 
     /// Hashes pinned so a change in `chunk_hash` itself is caught, not

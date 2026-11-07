@@ -72,22 +72,6 @@ fn an_unknown_version_or_scheme_is_refused() {
     assert_eq!(decode_chunk(&bad), Err(XorbError::UnknownScheme { tag: 9 }));
 }
 
-/// The check that makes a partial fetch safe: bytes that decode
-/// cleanly but are not the bytes we asked for must be rejected.
-#[test]
-fn a_chunk_that_decodes_to_the_wrong_bytes_is_rejected() {
-    let real = sample(5_000);
-    let mut lie = real.clone();
-    lie[0] ^= 1;
-    let expected = [Chunk::new(chunk_hash(&real), real.len() as u64)];
-
-    assert!(decode_range(&framed(&real, Scheme::Lz4), &expected).is_ok());
-    assert!(matches!(
-        decode_range(&framed(&lie, Scheme::Lz4), &expected),
-        Err(XorbError::HashMismatch { .. }),
-    ));
-}
-
 /// A header is a claim, and the payload is the sender's. Decoding
 /// must be bounded by what the header declared, not by what the
 /// payload turns out to expand to — otherwise the length check that
@@ -126,29 +110,8 @@ fn a_byte_grouped_chunk_is_bounded_by_its_declared_length_too() {
     ));
 }
 
-/// Bytes after the chunks that were asked for are bytes nobody
-/// accounted for. The range was requested by byte offsets covering
-/// exactly those chunks.
 #[test]
-fn bytes_after_the_requested_chunks_are_refused() {
-    let data = sample(1_000);
-    let expected = [Chunk::new(chunk_hash(&data), data.len() as u64)];
-    let mut xorb = framed(&data, Scheme::Lz4);
-    let honest = xorb.len();
-    xorb.extend_from_slice(&framed(&sample(50), Scheme::None));
-
-    assert_eq!(
-        decode_range(&xorb, &expected),
-        Err(XorbError::Trailing {
-            count: 1,
-            trailing: xorb.len() - honest,
-        }),
-    );
-    assert!(decode_range(&xorb[..honest], &expected).is_ok());
-}
-
-#[test]
-fn descriptor_lengths_and_cold_caps_are_checked_from_the_header_before_payload() {
+fn cold_caps_are_checked_from_the_header_before_payload() {
     let mut header = [0u8; HEADER];
     header[1..4].copy_from_slice(&1000usize.to_le_bytes()[..3]);
     header[5..8].copy_from_slice(&1usize.to_le_bytes()[..3]);
@@ -160,10 +123,6 @@ fn descriptor_lengths_and_cold_caps_are_checked_from_the_header_before_payload()
         })
     );
     header[4] = 1;
-    assert!(matches!(
-        decode_chunk_bounded(&header, Some(&Chunk::new(XetHash::ZERO, 2))),
-        Err(XorbError::UnexpectedLength { .. })
-    ));
     header[5..8].copy_from_slice(&(hellas_xet::MAX_CHUNK_SIZE + 1).to_le_bytes()[..3]);
     assert_eq!(decode_chunk(&header), Err(XorbError::TooLarge));
 }

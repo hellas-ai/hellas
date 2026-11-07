@@ -26,16 +26,8 @@
 //! and concatenated, so recovering the original means interleaving them
 //! back. Remainder bytes go one each to the first groups.
 //!
-//! # What verification this can and cannot do
-//!
-//! Each decoded chunk is hashed and checked against the chunk hash the
-//! caller expects, so a xorb that decodes into the wrong bytes is
-//! caught here. That check is only possible because *we* hold the chunk
-//! list — a reconstruction response carries no chunk hashes, so a client
-//! without an index cannot verify anything until it has reassembled a
-//! whole file.
-
-use hellas_xet::{Chunk, XetHash, chunk_hash};
+//! Decoding validates framing and expansion bounds. The acquired file is
+//! canonically hashed against its advertised identity before publication.
 
 /// Bytes of header before each chunk's payload.
 pub(crate) const HEADER: usize = 8;
@@ -80,14 +72,8 @@ pub enum XorbError {
     Decompress,
     #[error("chunk decompressed to {actual} bytes, header declared {declared}")]
     LengthMismatch { declared: usize, actual: usize },
-    #[error("chunk header length {declared} differs from expected {expected}")]
-    UnexpectedLength { expected: u64, declared: usize },
     #[error("chunk header length exceeds canonical maximum")]
     TooLarge,
-    #[error("chunk hashed to {actual}, expected {expected}")]
-    HashMismatch { expected: XetHash, actual: XetHash },
-    #[error("{trailing} bytes follow the {count} chunks that were asked for")]
-    Trailing { count: usize, trailing: usize },
 }
 
 /// One decoded chunk and how many bytes of the xorb it occupied.
@@ -101,13 +87,6 @@ pub struct Decoded {
 
 /// Decodes the chunk beginning at the start of `bytes`.
 pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
-    decode_chunk_bounded(bytes, None)
-}
-
-pub(crate) fn decode_chunk_bounded(
-    bytes: &[u8],
-    expected: Option<&Chunk>,
-) -> Result<Decoded, XorbError> {
     let header = bytes.get(..HEADER).ok_or(XorbError::Truncated)?;
     let version = header[0];
     if version != 0 {
@@ -119,15 +98,6 @@ pub(crate) fn decode_chunk_bounded(
     if uncompressed_size > hellas_xet::MAX_CHUNK_SIZE {
         return Err(XorbError::TooLarge);
     }
-    if let Some(expected) = expected
-        && uncompressed_size as u64 != expected.data_len
-    {
-        return Err(XorbError::UnexpectedLength {
-            expected: expected.data_len,
-            declared: uncompressed_size,
-        });
-    }
-
     if matches!(scheme, Scheme::None) && compressed_size != uncompressed_size {
         return Err(XorbError::LengthMismatch {
             declared: uncompressed_size,
@@ -154,62 +124,10 @@ pub(crate) fn decode_chunk_bounded(
             actual: data.len(),
         });
     }
-    if let Some(expected) = expected {
-        let actual = chunk_hash(&data);
-        if actual != expected.hash {
-            return Err(XorbError::HashMismatch {
-                expected: expected.hash,
-                actual,
-            });
-        }
-    }
     Ok(Decoded {
         data,
         consumed: HEADER + compressed_size,
     })
-}
-
-/// Decodes a xorb range into chunks, checking each against `expected`.
-///
-/// `expected` is the slice of our own chunk list covering this range.
-/// Checking here is what makes a partial fetch safe: without it the only
-/// verification available is the file hash, which needs every byte.
-pub fn decode_range(bytes: &[u8], expected: &[Chunk]) -> Result<Vec<Vec<u8>>, XorbError> {
-    decode_chunks(bytes, expected.len(), Some(expected))
-}
-
-/// Decodes `count` consecutive chunks, verifying each against
-/// `expected` when the caller has a chunk list to check against.
-///
-/// `None` is not laxity for its own sake: a client fetching content it
-/// has never indexed genuinely has nothing to check against, because a
-/// reconstruction response carries no chunk hashes. Such a fetch is
-/// verified once, whole, against the file hash.
-pub fn decode_chunks(
-    bytes: &[u8],
-    count: usize,
-    expected: Option<&[Chunk]>,
-) -> Result<Vec<Vec<u8>>, XorbError> {
-    let mut decoded = Vec::with_capacity(count);
-    let mut offset = 0;
-    for index in 0..count {
-        let next = decode_chunk_bounded(
-            bytes.get(offset..).ok_or(XorbError::Truncated)?,
-            expected.and_then(|chunks| chunks.get(index)),
-        )?;
-        offset += next.consumed;
-        decoded.push(next.data);
-    }
-    // The range was requested by byte offsets covering exactly these
-    // chunks, so anything after them is something we did not ask for and
-    // cannot account for.
-    if offset != bytes.len() {
-        return Err(XorbError::Trailing {
-            count,
-            trailing: bytes.len() - offset,
-        });
-    }
-    Ok(decoded)
 }
 
 fn u24(bytes: &[u8]) -> usize {
