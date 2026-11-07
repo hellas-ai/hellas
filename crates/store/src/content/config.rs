@@ -49,7 +49,7 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Policy {
     Name(String),
@@ -74,14 +74,14 @@ impl Policy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum Declaration {
     Hf(String),
     Object(Object),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Object {
     pub url: Option<String>,
@@ -348,6 +348,25 @@ impl Reconciler {
             for (name, declaration) in &config.pins {
                 let name = PinName::new(name.clone())?;
                 let (source, expected) = declaration.specification()?;
+                let declared_policy = declaration.policy()?;
+                let policy_changed = current
+                    .pins
+                    .get(name.as_str())
+                    .map(Declaration::policy)
+                    .transpose()?
+                    != Some(declared_policy.clone());
+                if expected.is_none()
+                    && current.pins.get(name.as_str()) == Some(declaration)
+                    && let Some(previous) = pin(&store, &name).await?
+                    && store
+                        .core
+                        .access(&Scope::Owner, move |core| {
+                            core.target_present(previous.target)
+                        })
+                        .await?
+                {
+                    continue;
+                }
                 let target = expected.map(|object| match &source {
                     Some(Source::HfXet { path: None, .. }) => Target::Tree(object),
                     _ => Target::Object(object),
@@ -401,10 +420,14 @@ impl Reconciler {
                     let previous = pin(&store, &name).await?;
                     let next = PinValue {
                         target,
-                        policy: previous
-                            .as_ref()
-                            .map(|pin| pin.policy.clone())
-                            .unwrap_or(declaration.policy()?),
+                        policy: if policy_changed {
+                            declared_policy
+                        } else {
+                            previous
+                                .as_ref()
+                                .map(|pin| pin.policy.clone())
+                                .unwrap_or(declared_policy)
+                        },
                         expires: previous.as_ref().and_then(|pin| pin.expires),
                     };
                     if previous.as_ref() != Some(&next) {
@@ -579,6 +602,17 @@ mod tests {
             .target;
         assert!(matches!(target, Target::Tree(_)));
         let object = target.object();
+        store.core.hf_hub = Some("http://127.0.0.1:1".into());
+        reconciler.apply(&store, config.clone()).await.unwrap();
+        store.close().await;
+        store = node(&config).await;
+        store.finish_recovery().await.unwrap();
+        store.core.hf_hub = Some("http://127.0.0.1:1".into());
+        Reconciler::new(config.clone())
+            .unwrap()
+            .apply(&store, config.clone())
+            .await
+            .unwrap();
         config.pins.insert(
             "config/model".into(),
             Declaration::Object(Object {
@@ -644,6 +678,19 @@ mod tests {
             Some(private)
         );
         assert!(snapshot(&store, STAGING).await.unwrap().is_empty());
+        config.pins.insert(
+            "config/model".into(),
+            declaration(bytes, Some(Policy::Name("public".into()))),
+        );
+        reconciler.apply(&store, config.clone()).await.unwrap();
+        assert_eq!(
+            pin(&store, &name("config/model"))
+                .await
+                .unwrap()
+                .unwrap()
+                .policy,
+            PinPolicy::Public
+        );
         config.pins.clear();
         reconciler.apply(&store, config).await.unwrap();
         assert!(pin(&store, &name("config/model")).await.unwrap().is_none());

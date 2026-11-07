@@ -41,7 +41,7 @@ select `owner`, `jobs`, `granted` or `public`; Channel policy uses
 `policy = { channel = "ID" }`. A job reads only its
 declared closure through Jobs or its own Channel pins. Public visibility alone
 does not grant job access. Configuration changes reconcile managed pins; Owner
-CAS commands can override their policy or expiry without a reload erasing it.
+CAS policy overrides survive unchanged declarations; editing a declared policy applies the new policy, while expiry overrides remain.
 
 HF files using legacy (pre-2026) Xet chunking are refused; content identity stays canonical CDC.
 
