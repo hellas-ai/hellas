@@ -478,8 +478,7 @@ struct ItemSnapshot {
 
 #[derive(Debug, PartialEq, Eq)]
 enum SnapshotBody {
-    Message(String),
-    Reasoning(String),
+    Text(TextKind, String),
     Function {
         call_id: String,
         name: String,
@@ -523,7 +522,7 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
             Ok(ItemSnapshot {
                 id,
                 status,
-                body: SnapshotBody::Message(text),
+                body: SnapshotBody::Text(TextKind::Message, text),
             })
         }
         WireOutputItem::Reasoning {
@@ -546,7 +545,7 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
             Ok(ItemSnapshot {
                 id,
                 status,
-                body: SnapshotBody::Reasoning(text),
+                body: SnapshotBody::Text(TextKind::Reasoning, text),
             })
         }
         WireOutputItem::Function {
@@ -568,10 +567,25 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ItemKind {
+enum TextKind {
     Message,
     Reasoning,
-    Function,
+}
+
+impl TextKind {
+    fn part_index_field(self) -> &'static str {
+        match self {
+            Self::Message => "content_index",
+            Self::Reasoning => "summary_index",
+        }
+    }
+
+    fn channel(self) -> TextChannel {
+        match self {
+            Self::Message => TextChannel::Output,
+            Self::Reasoning => TextChannel::Reasoning,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -592,12 +606,8 @@ struct TextState {
 
 #[derive(Debug)]
 enum ItemState {
-    Message {
-        id: String,
-        text: TextState,
-        done_status: Option<String>,
-    },
-    Reasoning {
+    Text {
+        kind: TextKind,
         id: String,
         text: TextState,
         done_status: Option<String>,
@@ -617,23 +627,15 @@ enum ItemState {
 impl ItemState {
     fn id(&self) -> &str {
         match self {
-            Self::Message { id, .. } | Self::Reasoning { id, .. } | Self::Function { id, .. } => id,
-        }
-    }
-
-    fn kind(&self) -> ItemKind {
-        match self {
-            Self::Message { .. } => ItemKind::Message,
-            Self::Reasoning { .. } => ItemKind::Reasoning,
-            Self::Function { .. } => ItemKind::Function,
+            Self::Text { id, .. } | Self::Function { id, .. } => id,
         }
     }
 
     fn done_status(&self) -> Option<&str> {
         match self {
-            Self::Message { done_status, .. }
-            | Self::Reasoning { done_status, .. }
-            | Self::Function { done_status, .. } => done_status.as_deref(),
+            Self::Text { done_status, .. } | Self::Function { done_status, .. } => {
+                done_status.as_deref()
+            }
         }
     }
 }
@@ -724,17 +726,17 @@ impl ResponsesFetchProjector {
             "response.created" => self.lifecycle(event, false),
             "response.in_progress" => self.lifecycle(event, true),
             "response.output_item.added" => self.item_added(event),
-            "response.content_part.added" => self.text_part(event, ItemKind::Message, false),
-            "response.output_text.delta" => self.text_delta(event, ItemKind::Message),
-            "response.output_text.done" => self.text_done(event, ItemKind::Message),
-            "response.content_part.done" => self.text_part(event, ItemKind::Message, true),
+            "response.content_part.added" => self.text_part(event, TextKind::Message, false),
+            "response.output_text.delta" => self.text_delta(event, TextKind::Message),
+            "response.output_text.done" => self.text_done(event, TextKind::Message),
+            "response.content_part.done" => self.text_part(event, TextKind::Message, true),
             "response.reasoning_summary_part.added" => {
-                self.text_part(event, ItemKind::Reasoning, false)
+                self.text_part(event, TextKind::Reasoning, false)
             }
-            "response.reasoning_summary_text.delta" => self.text_delta(event, ItemKind::Reasoning),
-            "response.reasoning_summary_text.done" => self.text_done(event, ItemKind::Reasoning),
+            "response.reasoning_summary_text.delta" => self.text_delta(event, TextKind::Reasoning),
+            "response.reasoning_summary_text.done" => self.text_done(event, TextKind::Reasoning),
             "response.reasoning_summary_part.done" => {
-                self.text_part(event, ItemKind::Reasoning, true)
+                self.text_part(event, TextKind::Reasoning, true)
             }
             "response.function_call_arguments.delta" => self.arguments_delta(event),
             "response.function_call_arguments.done" => self.arguments_done(event),
@@ -849,12 +851,8 @@ impl ResponsesFetchProjector {
 
         let mut output = Vec::new();
         let state = match snapshot.body {
-            SnapshotBody::Message(text) if text.is_empty() => ItemState::Message {
-                id: snapshot.id,
-                text: TextState::default(),
-                done_status: None,
-            },
-            SnapshotBody::Reasoning(text) if text.is_empty() => ItemState::Reasoning {
+            SnapshotBody::Text(kind, text) if text.is_empty() => ItemState::Text {
+                kind,
                 id: snapshot.id,
                 text: TextState::default(),
                 done_status: None,
@@ -898,19 +896,15 @@ impl ResponsesFetchProjector {
     fn text_part(
         &mut self,
         event: &JsonMap<String, JsonValue>,
-        kind: ItemKind,
+        kind: TextKind,
         done: bool,
     ) -> Result<Vec<OutputEvent>, FetchAdaptorError> {
-        let index_field = if kind == ItemKind::Reasoning {
-            "summary_index"
-        } else {
-            "content_index"
-        };
+        let index_field = kind.part_index_field();
         exact_event_fields(event, &["item_id", "output_index", index_field, "part"])?;
         let (output_index, item_id) = self.item_identity(event)?;
         require_zero_index(event, index_field)?;
         let part_text = match kind {
-            ItemKind::Message => {
+            TextKind::Message => {
                 let part: WireOutputText = serde_json::from_value(
                     event
                         .get("part")
@@ -925,7 +919,7 @@ impl ResponsesFetchProjector {
                     }
                 }
             }
-            ItemKind::Reasoning => {
+            TextKind::Reasoning => {
                 let part: WireSummaryText = serde_json::from_value(
                     event
                         .get("part")
@@ -936,11 +930,6 @@ impl ResponsesFetchProjector {
                 match part {
                     WireSummaryText::Text { text } => text,
                 }
-            }
-            ItemKind::Function => {
-                return Err(fetch_failed(
-                    "content-part event cannot target a function output item",
-                ));
             }
         };
         let text = text_state_mut(self.item_mut(output_index, &item_id)?, kind)?;
@@ -960,13 +949,9 @@ impl ResponsesFetchProjector {
     fn text_delta(
         &mut self,
         event: &JsonMap<String, JsonValue>,
-        kind: ItemKind,
+        kind: TextKind,
     ) -> Result<Vec<OutputEvent>, FetchAdaptorError> {
-        let index_field = if kind == ItemKind::Reasoning {
-            "summary_index"
-        } else {
-            "content_index"
-        };
+        let index_field = kind.part_index_field();
         exact_event_fields(
             event,
             &["item_id", "output_index", index_field, "delta", "logprobs"],
@@ -990,24 +975,16 @@ impl ResponsesFetchProjector {
         Ok(vec![OutputEvent::TextDelta {
             index: output_index,
             delta: delta.to_string(),
-            channel: if kind == ItemKind::Reasoning {
-                TextChannel::Reasoning
-            } else {
-                TextChannel::Output
-            },
+            channel: kind.channel(),
         }])
     }
 
     fn text_done(
         &mut self,
         event: &JsonMap<String, JsonValue>,
-        kind: ItemKind,
+        kind: TextKind,
     ) -> Result<Vec<OutputEvent>, FetchAdaptorError> {
-        let index_field = if kind == ItemKind::Reasoning {
-            "summary_index"
-        } else {
-            "content_index"
-        };
+        let index_field = kind.part_index_field();
         exact_event_fields(
             event,
             &["item_id", "output_index", index_field, "text", "logprobs"],
@@ -1039,11 +1016,7 @@ impl ResponsesFetchProjector {
                 output.push(OutputEvent::TextDelta {
                     index: output_index,
                     delta: done.to_string(),
-                    channel: if kind == ItemKind::Reasoning {
-                        TextChannel::Reasoning
-                    } else {
-                        TextChannel::Output
-                    },
+                    channel: kind.channel(),
                 });
             }
         }
@@ -1177,17 +1150,14 @@ impl ResponsesFetchProjector {
         let mut output = Vec::new();
         match (item, snapshot.body) {
             (
-                ItemState::Message {
-                    text, done_status, ..
+                ItemState::Text {
+                    kind,
+                    text,
+                    done_status,
+                    ..
                 },
-                SnapshotBody::Message(done),
-            )
-            | (
-                ItemState::Reasoning {
-                    text, done_status, ..
-                },
-                SnapshotBody::Reasoning(done),
-            ) => {
+                SnapshotBody::Text(done_kind, done),
+            ) if *kind == done_kind => {
                 if text.phase != TextPhase::PartDone || text.value != done {
                     return Err(fetch_failed("output_item.done contradicted streamed text"));
                 }
@@ -1277,7 +1247,7 @@ impl ResponsesFetchProjector {
         } else if self
             .items
             .iter()
-            .any(|item| item.kind() == ItemKind::Function)
+            .any(|item| matches!(item, ItemState::Function { .. }))
         {
             StopReason::ToolCall
         } else {
@@ -1426,11 +1396,14 @@ impl FetchProjector for ResponsesFetchProjector {
 
 fn text_state_mut(
     item: &mut ItemState,
-    kind: ItemKind,
+    kind: TextKind,
 ) -> Result<&mut TextState, FetchAdaptorError> {
-    match (item, kind) {
-        (ItemState::Message { text, .. }, ItemKind::Message)
-        | (ItemState::Reasoning { text, .. }, ItemKind::Reasoning) => Ok(text),
+    match item {
+        ItemState::Text {
+            kind: item_kind,
+            text,
+            ..
+        } if *item_kind == kind => Ok(text),
         _ => Err(fetch_failed("text event targeted incompatible output item")),
     }
 }
@@ -1442,9 +1415,8 @@ fn compare_terminal(item: &ItemState, snapshot: &ItemSnapshot) -> Result<(), Fet
         ));
     }
     match (item, &snapshot.body) {
-        (ItemState::Message { text, .. }, SnapshotBody::Message(done))
-        | (ItemState::Reasoning { text, .. }, SnapshotBody::Reasoning(done))
-            if text.phase == TextPhase::PartDone && &text.value == done =>
+        (ItemState::Text { kind, text, .. }, SnapshotBody::Text(done_kind, done))
+            if kind == done_kind && text.phase == TextPhase::PartDone && &text.value == done =>
         {
             Ok(())
         }
