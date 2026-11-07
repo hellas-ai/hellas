@@ -310,7 +310,7 @@ async fn failed_promotion_remains_scope_protected_until_retry_or_journal_recover
     sqlx::raw_sql("CREATE TRIGGER reject_pin BEFORE INSERT ON pins BEGIN SELECT RAISE(ABORT,'injected'); END;").execute(&store.core.disk.as_ref().unwrap().db).await.unwrap();
     assert!(
         store
-            .promote_work(&scope, Target::Object(object), pin("retained"))
+            .restore_root(job, Target::Object(object), pin("retained"), None)
             .await
             .is_err()
     );
@@ -463,7 +463,7 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
     fs::write(&destination, b"corrupt bytes").unwrap();
     assert!(
         store
-            .promote_work(&scope, Target::Object(object), pin("retained"))
+            .restore_root(job, Target::Object(object), pin("retained"), None)
             .await
             .is_err()
     );
@@ -482,7 +482,7 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
     // must use the original verified staging rather than downloading again.
     fs::remove_file(destination).unwrap();
     store
-        .promote_work(&scope, Target::Object(object), pin("retained"))
+        .restore_root(job, Target::Object(object), pin("retained"), None)
         .await
         .unwrap();
     store.close().await;

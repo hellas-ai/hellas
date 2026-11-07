@@ -320,7 +320,7 @@ async fn private_completed_work_survives_reopen_and_rescan_without_becoming_publ
     assert_eq!(store.stats().unwrap().outstanding, 0);
     assert!(store.upload(&scope, object, None).await.is_err());
     store
-        .promote_work(&scope, Target::Object(object), pin("accepted"))
+        .restore_root(job(), Target::Object(object), pin("accepted"), None)
         .await
         .unwrap();
     store.finish_recovery().await.unwrap();

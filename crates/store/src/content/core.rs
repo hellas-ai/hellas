@@ -420,32 +420,6 @@ impl Core {
             }
         }
     }
-    /// Own upper objects are available to the executor only within the live closure.
-    pub fn own_bytes(&self, scope: &Scope, object: ContentRef) -> Result<Option<Bytes>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
-        state.check(scope)?;
-        let ScopeKind::Work {
-            reservation,
-            closure,
-            ..
-        } = &scope.kind
-        else {
-            return Err(Error::Denied);
-        };
-        if !closure.contains(&object) {
-            return Err(Error::Denied);
-        }
-        let result = state
-            .work
-            .get(reservation)
-            .and_then(|work| work.staged.get(&object.id()));
-        result
-            .map(|stored| checked_bytes(stored, object))
-            .transpose()
-    }
 }
 pub(super) fn canonical_closure(closure: Closure) -> Result<Closure> {
     let mut objects = BTreeMap::new();

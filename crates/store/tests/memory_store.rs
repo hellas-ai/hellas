@@ -143,15 +143,6 @@ async fn private_objects_and_other_scopes_progress_do_not_count_as_missing_answe
         .unwrap();
     one.accept_chunk(payload).await.unwrap();
     assert!(one.complete());
-    assert_eq!(
-        store
-            .own_bytes(&first, object)
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        payload
-    );
     let two = store.upload(&second, object, None).await.unwrap();
     assert!(!two.complete());
     assert!(
@@ -314,21 +305,11 @@ async fn acceptance_transfers_staging_charge_to_live_ram_without_losing_bytes() 
     ));
     store.accept_work(&scope).await.unwrap();
     assert_eq!(pool.held(), 0);
-    assert_eq!(
-        store
-            .own_bytes(&scope, object)
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        bytes
-    );
     store
         .open_work(job(2, 1), vec![ContentRef::for_bytes(&vec![1; 600])], 600)
         .await
         .unwrap();
     store.end_work(&scope).await.unwrap();
-    assert!(store.own_bytes(&scope, object).await.is_err());
 }
 
 #[tokio::test]
@@ -483,7 +464,7 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
 }
 
 #[tokio::test]
-async fn retained_read_and_upper_handles_keep_their_ram_charge_until_drop() {
+async fn retained_reads_keep_their_ram_charge_until_drop() {
     let pool = Reservations::ram(512);
     let store = MemoryStore::new(pool.clone());
     let object = put(&store, "read", &vec![5; 512], PinPolicy::Public).await;
@@ -500,19 +481,6 @@ async fn retained_read_and_upper_handles_keep_their_ram_charge_until_drop() {
         store.open_work(job(1, 1), vec![object], 512).await,
         Err(Error::Capacity)
     ));
-    drop(held);
-    assert_eq!(pool.held(), 0);
-    let scope = store.open_work(job(1, 1), vec![object], 512).await.unwrap();
-    let mut session = store.upload(&scope, object, None).await.unwrap();
-    session
-        .declare(&hellas_xet::chunk(&vec![5; 512]), true)
-        .await
-        .unwrap();
-    session.accept_chunk(&vec![5; 512]).await.unwrap();
-    drop(session);
-    let held = store.own_bytes(&scope, object).await.unwrap().unwrap();
-    store.end_work(&scope).await.unwrap();
-    assert_eq!(pool.held(), 512);
     drop(held);
     assert_eq!(pool.held(), 0);
 }
@@ -639,10 +607,6 @@ async fn globally_pinning_a_private_copy_cannot_reuse_its_ram_for_another_object
         Err(Error::Capacity)
     ));
     assert_eq!(pool.held(), 12);
-    assert_eq!(
-        store.own_bytes(&scope, a).await.unwrap().unwrap().as_ref(),
-        b"aaaa"
-    );
     store.end_work(&scope).await.unwrap();
     drop(session);
     assert_eq!(pool.held(), 8);

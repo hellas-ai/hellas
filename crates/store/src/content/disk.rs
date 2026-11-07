@@ -993,14 +993,6 @@ impl DiskStore {
         .await
         .map_err(|_| Error::Invalid("root recovery task"))?
     }
-    pub async fn promote_work(&self, scope: &Scope, target: Target, pin: PinTarget) -> Result<()> {
-        let scope = scope.clone();
-        self.core
-            .effect(&scope.clone(), move |core| {
-                core.promote_work(&scope, target, pin)
-            })
-            .await
-    }
 }
 
 #[cfg(test)]

@@ -100,7 +100,7 @@ async fn input_conversion_keeps_output_reserved_and_parallel_outputs_cannot_over
         Err(Error::Capacity)
     ));
     store
-        .promote_work(&scope, Target::Object(output), pin("transcript"))
+        .restore_root(job(), Target::Object(output), pin("transcript"), None)
         .await
         .unwrap();
     store.end_work(&scope).await.unwrap();
@@ -228,7 +228,7 @@ fn durable_private_output_survives_actual_process_exit_before_pin() {
             .unwrap();
         assert_eq!(store.stats().unwrap().outstanding, 0);
         store
-            .promote_work(&scope, Target::Object(output), pin("transcript"))
+            .restore_root(job(), Target::Object(output), pin("transcript"), None)
             .await
             .unwrap();
         store.finish_recovery().await.unwrap();
@@ -407,7 +407,7 @@ fn authoritative_root_recovery_discards_unjournaled_output_before_restoring_exac
             )
             .await;
             store
-                .promote_work(&scope, Target::Tree(initial_ref), job_pin.clone())
+                .restore_root(job(), Target::Tree(initial_ref), job_pin.clone(), None)
                 .await
                 .unwrap();
             fill(
@@ -456,7 +456,7 @@ fn authoritative_root_recovery_discards_unjournaled_output_before_restoring_exac
         // The application's durable root is still the initial tree, even though
         // the private directory also holds a complete unjournaled replacement.
         let recovery = node.open_work(job(), vec![], 0).await.unwrap();
-        node.promote_work(&recovery, Target::Tree(initial_ref), job_pin)
+        node.restore_root(job(), Target::Tree(initial_ref), job_pin, None)
             .await
             .unwrap();
         node.end_work(&recovery).await.unwrap();

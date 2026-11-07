@@ -210,7 +210,12 @@ async fn exact_pin_grant_follows_cas_and_recreation_but_respects_current_policy(
             .await
             .is_err()
     );
-    assert!(reader.content_owner(ACQUIRE).await.is_err());
+    assert!(
+        reader
+            .bind_content(Scope::Owner, ACQUIRE, Cancellation::new(), None)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -297,7 +302,10 @@ async fn owner_upload_rechecks_after_declaration_and_rejects_revoked_payload() {
     let owner = f
         .service
         .for_caller(common::session(&node, &secret).await, GrantId([0; 16]));
-    let (scope, _) = owner.content_owner(UPLOAD).await.unwrap();
+    let (scope, _) = owner
+        .bind_content(Scope::Owner, UPLOAD, Cancellation::new(), None)
+        .await
+        .unwrap();
     let pool = Reservations::ram(100);
     let store = MemoryStore::new(pool.clone());
     let bytes = b"private owner upload";
@@ -410,7 +418,12 @@ async fn idle_work_upload_ends_on_its_proposal_cancellation_or_deadline() {
             .unwrap();
         let cancellation = Cancellation::new();
         let (scope, writer) = work
-            .content_work(local.clone(), authorization, cancellation.clone())
+            .bind_content(
+                local.clone(),
+                crate::grant_service::WORK_EXECUTE,
+                cancellation.clone(),
+                Some(authorization),
+            )
             .await
             .unwrap();
         let service = ContentService::new(store.clone(), scope).with_write_authority(writer);
@@ -523,7 +536,10 @@ async fn revoked_owner_cannot_publish_an_acquisition_that_finishes_after_revocat
         common::session(&f.service.node(), &f.secret).await,
         GrantId([0; 16]),
     );
-    let (scope, _) = owner.content_owner(ACQUIRE).await.unwrap();
+    let (scope, _) = owner
+        .bind_content(Scope::Owner, ACQUIRE, Cancellation::new(), None)
+        .await
+        .unwrap();
     let source = Arc::new(MemoryStore::new(Reservations::ram(1 << 20)));
     let value = put(
         &source,
@@ -671,7 +687,12 @@ async fn accepted_work_reads_past_the_proposal_deadline_and_stops_at_terminal() 
         .await
         .unwrap();
     let (scope, _) = work
-        .content_work(local.clone(), authorization, Cancellation::new())
+        .bind_content(
+            local.clone(),
+            crate::grant_service::WORK_EXECUTE,
+            Cancellation::new(),
+            Some(authorization),
+        )
         .await
         .unwrap();
     let accepted = common::accept_grant(

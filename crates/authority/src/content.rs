@@ -158,20 +158,6 @@ impl GrantWork {
         )
         .with_write_authority(writer))
     }
-    /// The host selects this from the actual RPC method, never from request data.
-    pub async fn content_owner(
-        &self,
-        operation: &'static str,
-    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
-        if !matches!(
-            operation,
-            READ | UPLOAD | ACQUIRE | SET_PIN | COLLECT | RESOLVE
-        ) {
-            return Err(AuthorityError::Denied.into());
-        }
-        self.bind_content(Scope::Owner, operation, Cancellation::new(), None)
-            .await
-    }
     pub async fn content_read(
         &self,
         pin: PinName,
@@ -184,24 +170,6 @@ impl GrantWork {
             READ,
             Cancellation::new(),
             None,
-        )
-        .await
-    }
-    /// Only the trusted admission path supplies a scope minted by the local store.
-    pub async fn content_work(
-        &self,
-        scope: Scope,
-        work: crate::model::grant::GrantJobAuthorizationV1,
-        cancellation: Cancellation,
-    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
-        if !matches!(scope.kind, ScopeKind::Work { .. }) {
-            return Err(AuthorityError::Denied.into());
-        }
-        self.bind_content(
-            scope,
-            crate::grant_service::WORK_EXECUTE,
-            cancellation,
-            Some(work),
         )
         .await
     }

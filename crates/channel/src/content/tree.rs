@@ -207,7 +207,7 @@ async fn metadata_reservation_fits_real_input_and_transcript_publications_at_exa
         policy: PinPolicy::Channel(job.channel),
     };
     store
-        .promote_work(&scope, Target::Tree(initial.root), pin.clone())
+        .restore_root(job, Target::Tree(initial.root), pin.clone(), None)
         .await
         .unwrap();
     stage(&store, &scope, output).await;
@@ -216,7 +216,7 @@ async fn metadata_reservation_fits_real_input_and_transcript_publications_at_exa
         stage(&store, &scope, bytes).await;
     }
     store
-        .promote_work(&scope, Target::Tree(finished.root), pin)
+        .restore_root(job, Target::Tree(finished.root), pin, None)
         .await
         .unwrap();
     assert_eq!(store.stats().unwrap().used, capacity);

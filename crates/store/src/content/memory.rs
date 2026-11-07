@@ -52,16 +52,6 @@ impl MemoryStore {
             .access(&Scope::Owner, move |core| core.end_work(&scope))
             .await
     }
-    pub async fn own_bytes(
-        &self,
-        scope: &Scope,
-        object: hellas_rpc::ContentRef,
-    ) -> Result<Option<bytes::Bytes>> {
-        let scope = scope.clone();
-        self.core
-            .access(&scope.clone(), move |core| core.own_bytes(&scope, object))
-            .await
-    }
     pub async fn resolve_hf(
         &self,
         scope: &Scope,
