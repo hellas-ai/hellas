@@ -203,7 +203,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     };
 
     // Provider startup restores every journal before completing the shared
-    // recovery barrier. Declarations and eviction may run only after that.
+    // recovery barrier. Declarations may be reconciled only after that.
     let content_reload = match content_configuration.start(content.clone()).await {
         Ok(reload) => reload,
         Err(error) => {
