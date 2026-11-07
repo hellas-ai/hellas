@@ -1,36 +1,34 @@
-use super::{TranscriptionError::*, TranscriptionFormat::*, *};
+use super::*;
 
-fn form(fields: &[(&str, &[u8])]) -> Result<TranscriptionRequest, TranscriptionError> {
+type Parsed = (Vec<u8>, Option<String>, bool);
+fn form(fields: &[(&str, &[u8])]) -> Result<Parsed, TranscriptionError> {
     let mut form = TranscriptionForm::default();
     for (name, bytes) in fields {
-        form.insert(form.field(name)?, bytes.to_vec())?;
+        form.admit(name)?;
+        form.insert(name, bytes.to_vec())?;
     }
     form.finish("tiny")
 }
 
 #[test]
-fn transcription_forms_parse_reject_and_render() {
-    let request = form(&[("file", b"w"), ("language", b"en"), ("model", b"tiny")]).unwrap();
-    assert_eq!(request.file, b"w");
-    assert_eq!(request.language.as_deref(), Some("en"));
+fn transcription_forms_parse_or_reject_with_their_status() {
+    let parsed = form(&[("file", b"w"), ("language", b"en"), ("model", b"tiny")]);
+    assert_eq!(parsed, Ok((b"w".to_vec(), Some("en".into()), false)));
     let (tiny, file) = (("model", &b"tiny"[..]), ("file", &b""[..]));
     let long = [b'a'; MAX_FIELD_BYTES + 1];
-    let format = |value: &'static [u8]| ("response_format", value);
-    for (fields, result) in [
-        (&[tiny, file][..], Ok(Json)),
-        (&[tiny, file, format(b"text")], Ok(Text)),
-        (&[tiny, tiny], Err(DuplicateField("model".into()))),
-        (&[("prompt", b"")], Err(UnsupportedField("prompt".into()))),
-        (&[("language", &long[..])], Err(FieldTooLong)),
-        (&[("model", b"\xff")], Err(InvalidUtf8)),
-        (&[("model", b"no"), format(b"srt")], Err(UnknownModel)),
-        (&[tiny, format(b"srt")], Err(UnsupportedResponseFormat)),
-        (&[tiny], Err(MissingFile)),
+    let srt = ("response_format", &b"srt"[..]);
+    let text = form(&[tiny, file, ("response_format", b"text")]);
+    assert_eq!(text.map(|(.., text)| text), Ok(true));
+    for (fields, status, message) in [
+        (&[tiny, tiny][..], 400, "duplicate model field"),
+        (&[("prompt", b"")], 400, "unsupported field prompt"),
+        (&[("language", &long[..])], 400, "form field too long"),
+        (&[("model", b"\xff")], 400, "invalid UTF-8 form field"),
+        (&[("model", b"no"), srt], 404, "unknown model"),
+        (&[tiny, srt], 400, "response_format must be json or text"),
+        (&[tiny], 400, "file field is required"),
     ] {
-        assert_eq!(form(fields).map(|request| request.response_format), result);
+        let message = message.into();
+        assert_eq!(form(fields), Err(TranscriptionError { status, message }));
     }
-    assert_eq!((UnknownModel.status(), MissingFile.status()), (404, 400));
-    assert_eq!(json_body("hi").to_string(), r#"{"text":"hi"}"#);
-    let error = error_body("no").to_string();
-    assert_eq!(error, r#"{"error":{"message":"no"}}"#);
 }

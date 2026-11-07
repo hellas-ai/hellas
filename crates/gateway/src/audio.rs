@@ -10,10 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use hellas_adaptors::openai::audio_transcriptions::{
-    self, TranscriptionError, TranscriptionField, TranscriptionForm, TranscriptionFormat,
-    TranscriptionRequest,
-};
+use hellas_adaptors::openai::audio_transcriptions::{self, TranscriptionError, TranscriptionForm};
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
@@ -54,9 +51,9 @@ pub(super) async fn router(
 fn bad(message: impl Into<String>) -> Response {
     json_error(StatusCode::BAD_REQUEST, message)
 }
-fn transcription_error(error: &TranscriptionError) -> Response {
-    let status = StatusCode::from_u16(error.status()).expect("a transcription status is valid");
-    json_error(status, error.to_string())
+fn transcription_error(error: TranscriptionError) -> Response {
+    let status = StatusCode::from_u16(error.status).expect("a transcription status is valid");
+    json_error(status, error.message)
 }
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response {
     json_error(error.status(), error.body_text())
@@ -94,29 +91,24 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
         Ok(field) => field,
         Err(error) => return multipart_error(error),
     } {
-        let name = match fields.field(field.name().unwrap_or_default()) {
-            Ok(name) => name,
-            Err(error) => return transcription_error(&error),
-        };
+        let name = field.name().unwrap_or_default().to_owned();
+        if let Err(error) = fields.admit(&name) {
+            return transcription_error(error);
+        }
         let bytes = match field.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => return multipart_error(error),
         };
-        if name == TranscriptionField::File && bytes.len() > wav::MAX_WAV_BYTES {
+        if name == "file" && bytes.len() > wav::MAX_WAV_BYTES {
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
         }
-        if let Err(error) = fields.insert(name, bytes.into()) {
-            return transcription_error(&error);
+        if let Err(error) = fields.insert(&name, bytes.into()) {
+            return transcription_error(error);
         }
     }
-    let TranscriptionRequest {
-        file,
-        language,
-        response_format,
-        ..
-    } = match fields.finish(&state.options.model_name) {
-        Ok(request) => request,
-        Err(error) => return transcription_error(&error),
+    let (file, language, text) = match fields.finish(&state.options.model_name) {
+        Ok(fields) => fields,
+        Err(error) => return transcription_error(error),
     };
     let deadline = state
         .work
@@ -166,9 +158,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     .await;
     let mut response = match output {
         Ok(output) => match state.package.decode(&output) {
-            Ok(ModelResponse::Transcription(result))
-                if response_format == TranscriptionFormat::Text =>
-            {
+            Ok(ModelResponse::Transcription(result)) if text => {
                 text_response(result.text, transcript.as_deref())
             }
             Ok(ModelResponse::Transcription(result)) => json_response(
@@ -208,7 +198,7 @@ fn audio_error(
 ) -> Response {
     json_response(
         status,
-        audio_transcriptions::error_body(&message.into()),
+        serde_json::json!({"error": {"message": message.into()}}),
         accepted,
         transcript,
     )
@@ -235,7 +225,7 @@ fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
     let mut response = Response::new(Body::new(http_body_util::StreamBody::new(frames)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(audio_transcriptions::TEXT_CONTENT_TYPE),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response.headers_mut().insert(header::TRAILER, trailer);
     response
