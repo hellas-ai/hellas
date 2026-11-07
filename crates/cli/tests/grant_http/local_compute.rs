@@ -236,7 +236,7 @@ fn prepare_content(root: &Path, journal: &Path, content: &Path) -> PathBuf {
                 }
             }
         } else if !hellas_store::fastresume::is_cache_debris(&path) {
-            let indexed = records.index_file(&path, &ram).unwrap();
+            let indexed = records.index_file(&path, &ram, false).unwrap();
             if content.is_dir() || path == content {
                 pins.insert(
                     format!("config/model/{}", indexed.id),

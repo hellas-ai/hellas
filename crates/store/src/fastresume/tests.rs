@@ -56,7 +56,9 @@ async fn forged_persisted_identity_cannot_supply_content_or_chunks() {
     let records = Records::default();
     let ram = crate::content::Reservations::ram(crate::STREAM_BUFFER as u64);
     let loaded = records.load(&index);
-    let indexed = records.index_file(&path, &ram).expect("index content");
+    let indexed = records
+        .index_file(&path, &ram, false)
+        .expect("index content");
     assert_eq!(indexed.id, XetHash::hash(bytes));
     assert_eq!(loaded, 0);
     assert_ne!(indexed.chunks, forged.chunks);
@@ -68,7 +70,7 @@ async fn forged_persisted_identity_cannot_supply_content_or_chunks() {
     );
     assert_eq!(
         records
-            .index_file(&path, &ram)
+            .index_file(&path, &ram, false)
             .expect("reuse verified record")
             .id,
         indexed.id
@@ -133,7 +135,9 @@ fn private_persisted_index_skips_rehashing_after_restart() {
     std::fs::write(&path, b"unchanged model weights").expect("write content");
     let records = Records::default();
     let ram = crate::content::Reservations::ram(crate::STREAM_BUFFER as u64);
-    let indexed = records.index_file(&path, &ram).expect("initial hash");
+    let indexed = records
+        .index_file(&path, &ram, false)
+        .expect("initial hash");
     records.save(&index).expect("save private index");
     drop(records);
 
@@ -141,7 +145,7 @@ fn private_persisted_index_skips_rehashing_after_restart() {
     assert_eq!(restarted.load(&index), 1);
     let before = crate::HASH_CALLS.with(std::cell::Cell::get);
     let remembered = restarted
-        .index_file(&path, &ram)
+        .index_file(&path, &ram, false)
         .expect("index after restart");
     assert_eq!(remembered.id, indexed.id);
     assert_eq!(remembered.chunks, indexed.chunks);
@@ -424,20 +428,20 @@ fn explicit_lower_index_reuses_verified_identity_and_refuses_debris() {
     let records = Records::default();
     let ram = crate::content::Reservations::ram(32 << 20);
     crate::HASH_CALLS.with(|calls| calls.set(0));
-    let original = records.index_file(&path, &ram).unwrap();
+    let original = records.index_file(&path, &ram, false).unwrap();
     assert_eq!(original.id, hellas_xet::XetHash::hash(b"weights one"));
-    assert_eq!(records.index_file(&path, &ram).unwrap(), original);
+    assert_eq!(records.index_file(&path, &ram, false).unwrap(), original);
     crate::HASH_CALLS
         .with(|calls| assert_eq!(calls.get(), if FileIdentity::REMEMBERS { 1 } else { 2 }));
     let replacement = root.path().join("replacement");
     std::fs::write(&replacement, b"weights two").unwrap();
     std::fs::rename(replacement, &path).unwrap();
-    let changed = records.index_file(&path, &ram).unwrap();
+    let changed = records.index_file(&path, &ram, false).unwrap();
     assert_eq!(changed.id, hellas_xet::XetHash::hash(b"weights two"));
     assert_ne!(changed.id, original.id);
     let debris = root.path().join("weights.lock");
     std::fs::write(&debris, b"lock bytes").unwrap();
-    assert!(records.index_file(&debris, &ram).is_err());
+    assert!(records.index_file(&debris, &ram, false).is_err());
     assert!(records.get(&std::fs::metadata(&debris).unwrap()).is_none());
     assert_eq!(ram.held(), 0);
 }

@@ -445,38 +445,22 @@ async fn index(
         hellas_private::create_dir_all_durable(&upper)?;
         let path = upper.join("fastresume.bin");
         let records = hellas_store::fastresume::Records::default();
-        if !recheck {
-            let _ = records.load(&path);
-        }
-        let mut pending = if paths.is_empty() {
+        let _ = records.load(&path);
+        let paths = if paths.is_empty() {
             config.lower
         } else {
             paths
         };
         ensure!(
-            !pending.is_empty(),
+            !paths.is_empty(),
             "store index requires paths or configured lower layers"
         );
         let pool = ram();
-        while let Some(path) = pending.pop() {
-            if hellas_store::fastresume::is_cache_debris(&path) {
-                continue;
-            }
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
-                    if entry.file_type()?.is_dir() || entry.file_type()?.is_file() {
-                        pending.push(entry.path());
-                    }
-                }
-            } else if metadata.is_file() {
-                let indexed = records.index_file(&path, &pool)?;
-                println!("{}\t{}\t{}", indexed.id, indexed.len, path.display());
-            } else {
-                anyhow::bail!("not an ordinary lower file: {}", path.display());
-            }
-        }
+        hellas_store::fastresume::walk_lower(&paths, |path| {
+            let indexed = records.index_file(path, &pool, recheck)?;
+            println!("{}\t{}\t{}", indexed.id, indexed.len, path.display());
+            Ok(())
+        })?;
         let saved = records.save(&upper.join("fastresume.bin"))?;
         eprintln!("indexed {saved} file identities");
         Ok(())

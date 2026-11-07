@@ -17,7 +17,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
     let records = hellas_store::fastresume::Records::default();
     let ram = hellas_store::content::Reservations::ram(1 << 20);
     let indexed = records
-        .index_file(&regular_link, &ram)
+        .index_file(&regular_link, &ram, false)
         .expect("an explicit symlink to a regular file remains supported");
     assert_eq!(indexed.id, hellas_xet::XetHash::hash(content));
 
@@ -34,6 +34,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
         let _ = sender.send(hellas_store::fastresume::Records::default().index_file(
             &fifo_link,
             &hellas_store::content::Reservations::ram(1 << 20),
+            false,
         ));
     });
     let error = receiver
@@ -46,7 +47,7 @@ fn explicit_indexing_opens_only_regular_file_descriptors() {
 
     if Path::new("/dev/zero").exists() {
         let error = records
-            .index_file(Path::new("/dev/zero"), &ram)
+            .index_file(Path::new("/dev/zero"), &ram, false)
             .expect_err("a character device is not content");
         assert!(
             matches!(error, hellas_store::content::Error::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput)

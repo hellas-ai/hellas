@@ -283,7 +283,7 @@ impl Disk {
         tx.commit().await.map_err(database)
     }
     fn index(&self, path: &FsPath, mode: IndexMode) -> Result<(Indexed, Entry)> {
-        self.records.index_entry(path, mode, &self.ram)
+        self.records.index_entry(path, mode, &self.ram, false)
     }
     fn discard_corrupt_upper(&self, path: &FsPath) -> Result<bool> {
         if path.parent() != Some(self.root.join("objects").as_path()) {
@@ -332,54 +332,57 @@ impl Disk {
         // Load local index changes only at the explicit rescan boundary.
         let _ = self.records.load(&self.root.join("fastresume.bin"));
         let mut objects: BTreeMap<ContentId, Arc<Stored>> = BTreeMap::new();
-        let mut directories = vec![(self.root.join("objects"), false)];
-        directories.extend(lowers.iter().cloned().map(|path| (path, true)));
-        while let Some((directory, lower)) = directories.pop() {
-            for entry in fs::read_dir(&directory)? {
-                let entry = entry?;
-                let kind = entry.file_type()?;
-                let path = entry.path();
-                if kind.is_dir() && lower {
-                    directories.push((path, true));
-                    continue;
-                }
-                if !kind.is_file() || crate::fastresume::is_cache_debris(&path) {
-                    continue;
-                }
-                let (indexed, location) =
-                    self.index(&path, if lower { mode } else { IndexMode::Resume })?;
-                let id = ContentId::from_bytes(indexed.id.into_bytes());
-                if !lower
-                    && path.file_name().and_then(|name| name.to_str())
-                        != Some(id.to_string().as_str())
-                {
-                    self.records.forget(location.identity);
-                    self.discard_corrupt_upper(&path)?;
-                    continue;
-                }
-                if let Some(stored) = objects.get(&id) {
-                    if let Data::File(file) = &stored.data {
-                        file.entries.lock().unwrap().push(location);
-                    }
-                } else {
-                    objects.insert(
-                        id,
-                        Arc::new(Stored::new(
-                            Data::File(Arc::new(FileObject {
-                                object: ContentRef::new(id, indexed.len),
-                                disk: self.clone(),
-                                entries: Mutex::new(vec![location]),
-                                staged: Mutex::new(None),
-                                private: Mutex::new(None),
-                            })),
-                            indexed.chunks,
-                        )),
-                    );
-                }
+        for entry in fs::read_dir(self.root.join("objects"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                self.scan_file(&entry.path(), false, mode, &mut objects)?;
             }
         }
+        crate::fastresume::walk_lower(lowers, |path| {
+            self.scan_file(path, true, mode, &mut objects)
+        })?;
         self.records.save(&self.root.join("fastresume.bin"))?;
         Ok(objects)
+    }
+    fn scan_file(
+        self: &Arc<Self>,
+        path: &FsPath,
+        lower: bool,
+        mode: IndexMode,
+        objects: &mut BTreeMap<ContentId, Arc<Stored>>,
+    ) -> Result<()> {
+        if crate::fastresume::is_cache_debris(path) {
+            return Ok(());
+        }
+        let (indexed, location) = self.index(path, if lower { mode } else { IndexMode::Resume })?;
+        let id = ContentId::from_bytes(indexed.id.into_bytes());
+        if !lower
+            && path.file_name().and_then(|name| name.to_str()) != Some(id.to_string().as_str())
+        {
+            self.records.forget(location.identity);
+            self.discard_corrupt_upper(path)?;
+            return Ok(());
+        }
+        if let Some(stored) = objects.get(&id) {
+            if let Data::File(file) = &stored.data {
+                file.entries.lock().unwrap().push(location);
+            }
+        } else {
+            objects.insert(
+                id,
+                Arc::new(Stored::new(
+                    Data::File(Arc::new(FileObject {
+                        object: ContentRef::new(id, indexed.len),
+                        disk: self.clone(),
+                        entries: Mutex::new(vec![location]),
+                        staged: Mutex::new(None),
+                        private: Mutex::new(None),
+                    })),
+                    indexed.chunks,
+                )),
+            );
+        }
+        Ok(())
     }
 }
 impl FileObject {

@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::Indexed;
@@ -139,6 +139,43 @@ pub struct Records {
     entries: Mutex<HashMap<FileIdentity, Indexed>>,
 }
 
+/// Walk regular lower files without following nested symlinks; an explicitly
+/// supplied symlinked root is followed, as it is for daemon lower scans.
+pub fn walk_lower(
+    paths: &[PathBuf],
+    mut visit: impl FnMut(&Path) -> crate::content::Result<()>,
+) -> crate::content::Result<()> {
+    let mut pending = paths.to_vec();
+    while let Some(path) = pending.pop() {
+        if is_cache_debris(&path) {
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_file() {
+            visit(&path)?;
+        } else if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                let path = entry.path();
+                if is_cache_debris(&path) {
+                    continue;
+                }
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() {
+                    visit(&path)?;
+                }
+            }
+        } else {
+            return Err(crate::content::Error::Invalid(
+                "lower root is not an ordinary file or directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Records {
     /// Explicit owner indexing for lower files. Uses the same verified identity
     /// and bounded hashing path as the DiskStore scanner.
@@ -146,8 +183,9 @@ impl Records {
         &self,
         path: &Path,
         ram: &crate::content::Reservations,
+        recheck: bool,
     ) -> crate::content::Result<Indexed> {
-        self.index_entry(path, crate::content::IndexMode::Resume, ram)
+        self.index_entry(path, crate::content::IndexMode::Resume, ram, recheck)
             .map(|(indexed, _)| indexed)
     }
     pub(crate) fn index_entry(
@@ -155,6 +193,7 @@ impl Records {
         path: &Path,
         mode: crate::content::IndexMode,
         ram: &crate::content::Reservations,
+        recheck: bool,
     ) -> crate::content::Result<(Indexed, crate::Entry)> {
         use crate::{
             Entry,
@@ -166,6 +205,9 @@ impl Records {
         let mut file = crate::open_regular_file(path)?;
         let metadata = file.metadata()?;
         let identity = FileIdentity::of(&metadata);
+        if recheck {
+            self.forget(identity);
+        }
         let indexed = match self.get(&metadata) {
             Some(indexed) => indexed,
             None if matches!(mode, IndexMode::Require) => {

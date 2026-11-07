@@ -28,16 +28,20 @@ fn required_records_never_hash_missing_changed_or_replaced_content() {
     let ram = Reservations::ram(STREAM_BUFFER as u64);
     let empty = fastresume::Records::default();
     let before = HASH_CALLS.get();
-    assert!(empty.index_entry(&path, IndexMode::Require, &ram).is_err());
+    assert!(
+        empty
+            .index_entry(&path, IndexMode::Require, &ram, false)
+            .is_err()
+    );
     assert_eq!(HASH_CALLS.get(), before);
     let prepared = fastresume::Records::default();
-    let expected = prepared.index_file(&path, &ram).unwrap();
+    let expected = prepared.index_file(&path, &ram, false).unwrap();
     prepared.save(&records).unwrap();
     let resumed = fastresume::Records::default();
     assert_eq!(resumed.load(&records), 1);
     let before = HASH_CALLS.get();
     let (indexed, entry) = resumed
-        .index_entry(&path, IndexMode::Require, &ram)
+        .index_entry(&path, IndexMode::Require, &ram, false)
         .unwrap();
     assert_eq!(indexed.id, expected.id);
     assert!(
@@ -49,22 +53,22 @@ fn required_records_never_hash_missing_changed_or_replaced_content() {
     std::fs::write(&path, b"changed weights").unwrap();
     assert!(
         resumed
-            .index_entry(&path, IndexMode::Require, &ram)
+            .index_entry(&path, IndexMode::Require, &ram, false)
             .is_err()
     );
     std::fs::write(dir.join("replacement"), b"weights").unwrap();
     std::fs::rename(dir.join("replacement"), &path).unwrap();
     assert!(
         resumed
-            .index_entry(&path, IndexMode::Require, &ram)
+            .index_entry(&path, IndexMode::Require, &ram, false)
             .is_err()
     );
     assert_eq!(HASH_CALLS.get(), before);
-    resumed.index_file(&path, &ram).unwrap();
+    resumed.index_file(&path, &ram, false).unwrap();
     assert_eq!(HASH_CALLS.get(), before + 1);
     assert_eq!(
         resumed
-            .index_entry(&path, IndexMode::Require, &ram)
+            .index_entry(&path, IndexMode::Require, &ram, false)
             .unwrap()
             .0
             .id,
@@ -280,6 +284,7 @@ fn a_path_replacement_cannot_change_the_inode_being_lent() {
             &link,
             content::IndexMode::Resume,
             &content::Reservations::ram(STREAM_BUFFER as u64),
+            false,
         )
         .expect("index through link");
 
@@ -321,6 +326,7 @@ fn a_fifo_replacing_an_indexed_name_is_refused_before_reading() {
             &path,
             content::IndexMode::Resume,
             &content::Reservations::ram(STREAM_BUFFER as u64),
+            false,
         )
         .unwrap();
     let object = XetHash::hash(b"ordinary bytes");
