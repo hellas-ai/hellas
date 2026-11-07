@@ -12,7 +12,7 @@ fn a_single_authenticated_route_is_usable() {
         .unwrap();
     let config = config.validate().unwrap();
     assert_eq!(config.chain.validators(), ["wss://example.com/"]);
-    assert_eq!(config.network().as_str(), "hellas-devnet-1");
+    assert_eq!(config.network().as_str(), "hellas-devnet-2");
     assert!(config.node_config(None).is_ok());
 }
 
@@ -21,7 +21,7 @@ fn custom_full_genesis_can_derive_h0_at_node_start() {
     use commonware_cryptography::{Hasher as _, Sha256};
     let root = tempfile::tempdir().unwrap();
     let mut genesis: hellas_chain::genesis::Genesis =
-        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
+        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
     genesis.network_id = "custom-execution-1".into();
     let genesis_json = serde_json::to_string(&genesis).unwrap();
     let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
@@ -70,7 +70,7 @@ fn a_registered_id_cannot_rebind_pins_but_can_change_routes() {
 }
 
 #[test]
-fn static_paid_client_rejects_a_rotating_trust_schedule() {
+fn paid_client_accepts_scheduled_keys_while_static_node_rejects_them() {
     let root = tempfile::tempdir().unwrap();
     let known = ChainProfile::known(Chain::Devnet);
     let mut genesis = known.genesis().clone();
@@ -92,6 +92,8 @@ fn static_paid_client_rejects_a_rotating_trust_schedule() {
         genesis_json,
     })
     .unwrap();
-    let error = WorkConfig::for_chain(profile, root.path()).unwrap_err();
+    let config = WorkConfig::for_chain(profile, root.path()).unwrap();
+    assert!(config.node_config(None).is_err());
+    let error = config.threshold_identity().unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }

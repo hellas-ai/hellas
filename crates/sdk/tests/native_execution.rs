@@ -788,13 +788,13 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         provider_settlement().party_key().into(),
     );
     let profile = devnet.profile(0);
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity().unwrap(),
-        validators: profile.validators().to_vec(),
-    };
-    let verifier =
-        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).unwrap();
+    let verifier = std::sync::Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            profile.trust().clone(),
+            profile.consensus_digest(),
+        )
+        .unwrap(),
+    );
     let submitter = RemoteLightClient::connect(devnet.light_client_url(2), verifier)
         .await
         .unwrap();

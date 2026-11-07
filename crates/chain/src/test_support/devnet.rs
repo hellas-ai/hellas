@@ -17,8 +17,6 @@ use commonware_consensus::{
 use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
-use commonware_utils::non_empty_range;
 use hellas_kernel::{Auth, BlockHash, BlockHeight, CoinId, Context as KernelContext, PayloadHash};
 
 use crate::HellasBlock;
@@ -79,7 +77,7 @@ impl GenesisOwner {
     /// Panics if `index` is not in 0..100.
     pub fn faucet(index: u8) -> Self {
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON)
                 .expect("the shipped faucet list parses");
         let account = accounts
             .into_iter()
@@ -455,6 +453,26 @@ impl Devnet {
         }
     }
 
+    pub fn proof_verifier(&self) -> std::sync::Arc<crate::proof_verify::ProofVerifier> {
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let genesis_json = serde_json::to_vec(&self.document).expect("fixture genesis encodes");
+        let trust = crate::genesis::TrustDocument {
+            schema_version: crate::genesis::TRUST_SCHEMA_VERSION,
+            network_id: self.consensus_info.network_id.clone(),
+            genesis_sha256: hex::encode(Sha256::hash(&genesis_json)),
+            epochs: vec![crate::genesis::TrustEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: None,
+                threshold_identity: hex::encode(&self.consensus_info.threshold_identity),
+            }],
+        };
+        std::sync::Arc::new(
+            crate::proof_verify::ProofVerifier::with_genesis(trust, &genesis_json)
+                .expect("fixture trust verifies fixture genesis"),
+        )
+    }
+
     /// The genesis owners, as configured.
     pub fn owners(&self) -> &[GenesisOwner] {
         &self.owners
@@ -609,14 +627,7 @@ impl Devnet {
                 }
                 owner_root = Some(owners);
                 let merkleized = batches.merkleize().await.expect("state merkleizes");
-                let bounds = merkleized.bounds();
-                let validator_target = Target {
-                    root: merkleized.root(),
-                    range: non_empty_range!(
-                        bounds.inactivity_floor,
-                        Location::new(bounds.total_size)
-                    ),
-                };
+                let validator_target = crate::execution::store::sync_target(&merkleized);
                 if let Some(expected) = &target {
                     assert_eq!(&validator_target, expected);
                 }
@@ -654,7 +665,10 @@ impl Devnet {
             for (validator, executed) in self.validators.iter().zip(executed) {
                 validator
                     .indexer
-                    .publish_proof(block.clone(), &certificate.clone().encode())
+                    .publish_proof(
+                        block.clone(),
+                        &crate::finality_proof::encode(&certificate.clone().encode(), &[]).unwrap(),
+                    )
                     .await
                     .expect("a certified block is ingested");
                 validator.database.finalize(executed).await;

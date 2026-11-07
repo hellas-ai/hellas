@@ -1,7 +1,7 @@
 //! A Simplex finalization certifies its block and every hash-linked ancestor.
 //!
-//! Direct certificates retain their existing wire encoding. An ancestor proof carries
-//! each canonical child block through a directly certified descendant. Full blocks are
+//! A proof carries a certificate and zero or more canonical child blocks through a
+//! directly certified descendant. Full blocks are
 //! necessary because Hellas hashes the complete encoding, rather than a separate header.
 use crate::{
     ConsensusVerificationError as Error, ConsensusVerifier, Finalization, HellasBlock, LatestBlock,
@@ -10,7 +10,6 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{Block as _, CertifiableBlock as _, Heightable as _};
 use commonware_cryptography::Digestible as _;
 
-// Ten continuation bytes cannot begin a valid legacy u64 epoch varint.
 const MAGIC: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffHLSF\x01";
 pub const MAX_FINALITY_PROOF_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_FINALITY_DESCENDANTS: usize = 256;
@@ -26,22 +25,16 @@ impl FinalityProof {
         if encoded.len() > MAX_FINALITY_PROOF_BYTES {
             return Err(Error::InvalidFinalization);
         }
-        let Some(mut reader) = encoded.strip_prefix(MAGIC) else {
-            if encoded.len() > MAX_CERTIFICATE_BYTES {
-                return Err(Error::InvalidFinalization);
-            }
-            return Ok(Self {
-                certificate: ConsensusVerifier::decode_finalization(encoded)?,
-                descendants: Vec::new(),
-            });
-        };
+        let mut reader = encoded
+            .strip_prefix(MAGIC)
+            .ok_or(Error::InvalidFinalization)?;
         let certificate_bytes = take_bytes(&mut reader)?;
         if certificate_bytes.len() > MAX_CERTIFICATE_BYTES {
             return Err(Error::InvalidFinalization);
         }
         let certificate = ConsensusVerifier::decode_finalization(certificate_bytes)?;
         let count = take_u32(&mut reader)? as usize;
-        if !(1..=MAX_FINALITY_DESCENDANTS).contains(&count) {
+        if count > MAX_FINALITY_DESCENDANTS {
             return Err(Error::InvalidFinalization);
         }
         let mut descendants = Vec::with_capacity(count);
@@ -119,9 +112,6 @@ impl FinalityProof {
 
 #[cfg(any(feature = "indexer", feature = "validator", test))]
 pub(crate) fn encode(certificate: &[u8], descendants: &[HellasBlock]) -> Result<Vec<u8>, Error> {
-    if descendants.is_empty() {
-        return Ok(certificate.to_vec());
-    }
     if descendants.len() > MAX_FINALITY_DESCENDANTS {
         return Err(Error::InvalidFinalization);
     }

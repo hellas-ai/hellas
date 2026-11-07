@@ -4,7 +4,7 @@
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
-`schema_version: 1`, `network_id: "hellas-devnet-1"`, the SHA-256 of the exact
+`schema_version: 1`, `network_id: "hellas-devnet-2"`, the SHA-256 of the exact
 genesis JSON bytes, and a nonempty contiguous epoch schedule. Each epoch supplies
 an ID, a height range, and the 96-character compressed BLS MinPk threshold
 identity. Schedules start at height zero, have no gaps or overlaps, and use
@@ -32,19 +32,23 @@ cannot erase it. Reverify stored evidence against independently provisioned trus
 before rendering; the shared storage interface permits native and Worker backends.
 
 Address summaries and holdings pages use `AddressProofBundle`. Its bounded page
-is a JSON-encoded `OwnerPageProof` linked to the owner root in the certified
-block. `verify_address` checks the certificate and proof before exposing a
+is a typed `OwnerPageProof` linked to the owner root in the certified
+block. JSON and protobuf responses carry the same page fields. `verify_address` checks the certificate and proof before exposing a
 `VerifiedAddress`. Summary `balance` is the sum of spendable coins; `count`
 includes coins and edges, while edges contribute zero balance. It makes no claim
 about complete transaction history.
 
 Consensus updates the sparse owner tree in the same speculative QMDB batch as
-coin and edge mutations. Canonical `HLS2` blocks commit both the QMDB state root
+coin and edge mutations. Canonical `HLS3` blocks commit both the QMDB state root
 and the owner root.
 
-Owner paths prove membership or absence. Holdings paths include authenticated
-subtree counts, so a page cannot omit, reorder, duplicate, or substitute a
-holding. Limits are 1 through 64. The origin reads owner nodes from the durable
+Owner paths prove membership or absence. A Latest page carries an authenticated
+after-key path, including when that key has been removed; subtree counts prove
+the exact next rank. A page cannot omit, reorder, duplicate, or substitute a
+holding. Financial selection reads pages until it finds enough candidates and
+rechecks selected objects together at one current root. Complete human listings
+report a changed root and can be retried. Limits are 1 through 32, matching the Current proof key budget. The
+origin reads owner nodes from the durable
 QMDB checkpoint shared with finalized EdgeIndex replay. It publishes a checkpoint
 only after deterministic replay matches the certified state and owner roots.
 
@@ -80,9 +84,10 @@ provisioned genesis bytes when calculating its exact-file SHA-256.
 CLI chain queries and signing commands for this custom network also require
 `--chain-config network/chain.json`. The RPC client authenticates snapshot
 height and roots by fetching the canonical
-block committed by its certificate. Coin and edge records remain unverified;
-the CLI labels them accordingly. RPC snapshot verification currently accepts
-one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
+block committed by its certificate. Coin, edge, and owner listings carry
+Current-state inclusion, exclusion, and owner-rank proofs checked by
+`ProofVerifier` against the selected epoch schedule. The CLI labels raw
+validator and finalization metadata as unverified.
 
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
 `ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
@@ -114,7 +119,7 @@ Block and transaction evidence is reverified before serving. Owner checkpoints
 are certified on admission and reverified on disk recovery; address pages are
 verified against that immutable checkpoint without repeating its signature check.
 
-`/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address
+`/api/v1/addresses/{base58-owner}/proof?offset=0&limit=32` returns an address
 bundle. `payload=...` pins the current durable owner checkpoint. The origin serves
 only that checkpoint, so a new finalized block makes an older pin unavailable,
 including between pagination requests. EdgeIndex and owner proofs both use the

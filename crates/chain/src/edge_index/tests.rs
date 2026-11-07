@@ -25,8 +25,6 @@ use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
-use commonware_utils::non_empty_range;
 use hellas_genesis::{Genesis, GenesisAllocation, GenesisValidator, TrustDocument, TrustEpoch};
 
 const EDGE_TEST_NETWORK_ID: &str = "edge-index-test-1";
@@ -233,11 +231,7 @@ impl Harness {
         .unwrap();
         let owner_root = crate::execution::owner_tree::root(&batch).await.unwrap();
         let merkleized = batch.merkleize().await.unwrap();
-        let bounds = merkleized.bounds();
-        let target = Target {
-            root: merkleized.root(),
-            range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
-        };
+        let target = crate::execution::store::sync_target(&merkleized);
         let block = HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -269,7 +263,11 @@ impl Harness {
             height: block.height().get(),
             payload: hex::encode(block.digest()),
             state_root: hex::encode(block.state_root()),
-            finalization: finalization(&self.committee, block).encode().to_vec(),
+            finalization: crate::finality_proof::encode(
+                &finalization(&self.committee, block).encode(),
+                &[],
+            )
+            .unwrap(),
             canonical_block: block.encode().to_vec(),
             observed_at_ms: block.height().get(),
             epoch: 0,
@@ -318,7 +316,11 @@ impl Harness {
                     height: self.head.height().get(),
                     payload: self.head.digest(),
                     state_root: self.head.state_root(),
-                    finalization: finalization(&self.committee, &self.head).encode().to_vec(),
+                    finalization: crate::finality_proof::encode(
+                        &finalization(&self.committee, &self.head).encode(),
+                        &[],
+                    )
+                    .unwrap(),
                 },
                 block: self.head.encode().to_vec(),
             })
@@ -712,7 +714,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let owner = SettlementKey::from(maker2.party_key());
         let committed_owner = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
@@ -756,13 +758,18 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let before = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(before.bundle().page, committed_owner.bundle().page);
         h.verifier
-            .verify_address(before.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                before.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         {
             let read = h.index.store.read(None).unwrap();
@@ -808,14 +815,19 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let after = h
             .node
-            .owner_proof(owner, 0, 64, None)
+            .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
             .await
             .unwrap()
             .unwrap();
         assert_ne!(after.bundle().page, committed_owner.bundle().page);
         assert_eq!(after.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(after.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                after.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         let events = h
             .index
@@ -1462,13 +1474,18 @@ fn native_edge_index_cold_open_serves_current_owners_without_remote_history() {
         );
         for (address, balance, count) in [(owner, 0, 1), (untouched, 1000, 1), (absent, 0, 0)] {
             let bundle = recovered
-                .owner_proof(address, 0, 64, None)
+                .owner_proof(address, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
                 .await
                 .unwrap()
                 .unwrap();
             let verified = h
                 .verifier
-                .verify_address(bundle.bundle().clone(), address, 0, 64)
+                .verify_address(
+                    bundle.bundle().clone(),
+                    address,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                )
                 .unwrap();
             assert_eq!(verified.block().bundle().payload, latest.payload);
             assert_eq!(verified.summary().balance, balance);
@@ -1476,13 +1493,23 @@ fn native_edge_index_cold_open_serves_current_owners_without_remote_history() {
         }
         assert!(
             recovered
-                .owner_proof(owner, 0, 64, Some(&first.payload))
+                .owner_proof(
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    Some(&first.payload)
+                )
                 .await
                 .unwrap()
                 .is_none()
         );
         let pinned = recovered
-            .owner_proof(owner, 0, 64, Some(&latest.payload))
+            .owner_proof(
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                Some(&latest.payload),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1537,7 +1564,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .prepare(proof.clone(), changes)
             .unwrap();
         let before = publication
-            .owner_proof(&h.producer, owner, 0, 64, None)
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1546,13 +1579,24 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         // Stop exactly after the QMDB commit, before publishing EdgeIndex.
         h.producer.finalize(batch).await;
         let during = publication
-            .owner_proof(&h.producer, owner, 0, 64, Some(&proof.payload))
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                Some(&proof.payload),
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(during.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(during.bundle().clone(), owner, 0, 64)
+            .verify_address(
+                during.bundle().clone(),
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
             .unwrap();
         assert_eq!(
             publication.index.store.latest().unwrap().unwrap().payload,
@@ -1560,7 +1604,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
         );
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, Some(&previous.payload))
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    Some(&previous.payload)
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -1576,7 +1626,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, None)
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1589,7 +1645,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         assert!(
             publication
-                .owner_proof(&h.producer, owner, 0, 64, None)
+                .owner_proof(
+                    &h.producer,
+                    owner,
+                    0,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1600,7 +1662,13 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         publication.finalized(&block, &h.producer).await.unwrap();
         let after = publication
-            .owner_proof(&h.producer, owner, 0, 64, None)
+            .owner_proof(
+                &h.producer,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();

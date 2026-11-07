@@ -7,7 +7,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
     run(|runtime| async move {
         let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
         let published: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
         for (owner, account) in owners.iter().zip(&published) {
             assert_eq!(owner.key().to_string(), account.address);
         }
@@ -209,7 +209,7 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
         let node_key = SettlementKey::from(native_signer([0x42; 32]).party_key());
         let (tx, delegated) = delegate_allocation(devnet.allocations(), &owner, node_key);
         let submitter =
-            RemoteLightClient::connect(devnet.light_client_url(3), devnet.consensus_verifier())
+            RemoteLightClient::connect(devnet.light_client_url(3), devnet.proof_verifier())
                 .await
                 .unwrap();
         assert_eq!(
@@ -229,7 +229,7 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
             .unwrap()
             .unwrap();
         for url in devnet.light_client_urls() {
-            let remote = RemoteLightClient::connect(url.clone(), devnet.consensus_verifier())
+            let remote = RemoteLightClient::connect(url.clone(), devnet.proof_verifier())
                 .await
                 .unwrap();
             assert_eq!(
@@ -263,7 +263,15 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
                 TEST_NETWORK,
                 crate::genesis_digest(devnet.genesis()),
             );
-            let refused = RemoteLightClient::connect(url.clone(), stranger.verifier)
+            let profile = devnet.profile(0);
+            let mut trust = profile.trust().clone();
+            trust.epochs[0].threshold_identity =
+                hex::encode(stranger.assembler.identity().encode());
+            let foreign = std::sync::Arc::new(
+                crate::proof_verify::ProofVerifier::with_digest(trust, profile.consensus_digest())
+                    .unwrap(),
+            );
+            let refused = RemoteLightClient::connect(url.clone(), foreign)
                 .await
                 .unwrap();
             assert!(

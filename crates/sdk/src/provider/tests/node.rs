@@ -1609,6 +1609,21 @@ async fn write_contested_channel(root: &Path) -> StartId {
         },
     )
     .await;
+    let pending =
+        PendingPaymentClose::from_accepted_start(network(), CONTEST_HEIGHT, &contest_start())
+            .expect("the fixture contest start creates pending state");
+    commit(
+        &mut store,
+        ChannelRecord::CloseHistoryAdvanced {
+            parent: payload_at(ORIGIN),
+            history: hellas_channel::work_store::CloseHistory {
+                height: CONTEST_HEIGHT,
+                payload: payload_at(CONTEST_HEIGHT),
+                pending,
+            },
+        },
+    )
+    .await;
     commit(
         &mut store,
         ChannelRecord::CursorAdvanced {

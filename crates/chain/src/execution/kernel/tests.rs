@@ -2246,10 +2246,22 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
                 crate::owner_proof::owner_root(&rebuilt).await.unwrap(),
                 expected
             );
-            let page = crate::owner_proof::prove_owner_page(&rebuilt, owner_key(25), 0, 64)
-                .await
-                .unwrap();
-            crate::owner_proof::verify_owner_page(expected, owner_key(25), 0, 64, &page).unwrap();
+            let page = crate::owner_proof::prove_owner_page(
+                &rebuilt,
+                owner_key(25),
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
+            .await
+            .unwrap();
+            crate::owner_proof::verify_owner_page(
+                expected,
+                owner_key(25),
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                &page,
+            )
+            .unwrap();
             parent = block;
         }
     });

@@ -3,7 +3,7 @@ use crate::domain::{
     ThresholdShare,
 };
 pub use crate::genesis::{
-    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
+    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_2_JSON,
 };
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;

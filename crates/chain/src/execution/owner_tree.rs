@@ -81,6 +81,20 @@ where
     crate::owner_proof::prove_owner_page(&StoredOwnerTree(database), owner, offset, limit).await
 }
 
+#[cfg(any(feature = "validator", feature = "full-node"))]
+pub async fn prove_stored_owner_page_after<E>(
+    database: &UtxoDb<E>,
+    owner: SettlementKey,
+    after: Option<[u8; 32]>,
+    limit: u32,
+) -> Result<OwnerPageProof, OwnerProofError>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    crate::owner_proof::prove_owner_page_after(&StoredOwnerTree(database), owner, after, limit)
+        .await
+}
+
 struct BatchStore<E: StorageContext + Spawner> {
     batch: Option<Batch<E>>,
 }
@@ -249,8 +263,18 @@ mod tests {
 
             let guard = database.read().await;
             assert_eq!(stored_root(&guard).await.unwrap(), expected_root);
-            let page = prove_stored_owner_page(&guard, owner, 0, 64).await.unwrap();
-            let summary = verify_owner_page(expected_root, owner, 0, 64, &page).unwrap();
+            let page =
+                prove_stored_owner_page(&guard, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                    .await
+                    .unwrap();
+            let summary = verify_owner_page(
+                expected_root,
+                owner,
+                0,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+                &page,
+            )
+            .unwrap();
             assert_eq!(summary.balance, 321);
             assert_eq!(summary.count, 1);
             assert_eq!(page.holdings[0].object_id, id.0);

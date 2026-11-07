@@ -689,6 +689,13 @@ impl Core {
             indexer.clone(),
             info,
             config.validators.clone(),
+            Arc::new(
+                crate::proof_verify::ProofVerifier::with_genesis(
+                    config.chain.profile().trust().clone(),
+                    config.chain.profile().genesis_json().as_bytes(),
+                )
+                .map_err(|error| Error::Config(error.to_string()))?,
+            ),
             readiness.clone(),
         );
         Ok(Arc::new(Self {

@@ -238,7 +238,11 @@ async fn response_fixture_with_contests(
     .expect("chain indexer");
     for block in [&floor, &contest] {
         chain_indexer
-            .publish_proof(block.clone(), &finalization(&consensus, block).encode())
+            .publish_proof(
+                block.clone(),
+                &crate::finality_proof::encode(&finalization(&consensus, block).encode(), &[])
+                    .unwrap(),
+            )
             .await
             .expect("finalized ingest");
     }
@@ -486,7 +490,8 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
             .chain_indexer
             .publish_proof(
                 answered.clone(),
-                &finalization(&consensus, &answered).encode(),
+                &crate::finality_proof::encode(&finalization(&consensus, &answered).encode(), &[])
+                    .unwrap(),
             )
             .await
             .expect("answered block finalizes");
@@ -595,7 +600,8 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             .chain_indexer
             .publish_proof(
                 answered.clone(),
-                &finalization(&consensus, &answered).encode(),
+                &crate::finality_proof::encode(&finalization(&consensus, &answered).encode(), &[])
+                    .unwrap(),
             )
             .await
             .expect("answered block finalizes");
@@ -650,7 +656,8 @@ async fn finalized_payload_indexer(
     indexer
         .publish_proof(
             finalized.clone(),
-            &finalization(&fixture, &finalized).encode(),
+            &crate::finality_proof::encode(&finalization(&fixture, &finalized).encode(), &[])
+                .unwrap(),
         )
         .await
         .expect("finalized floor ingest");
@@ -818,7 +825,11 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         .expect("chain indexer");
         for block in [&floor_block, &open_block] {
             chain_indexer
-                .publish_proof(block.clone(), &finalization(&fixture, block).encode())
+                .publish_proof(
+                    block.clone(),
+                    &crate::finality_proof::encode(&finalization(&fixture, block).encode(), &[])
+                        .unwrap(),
+                )
                 .await
                 .expect("finalized ingest");
         }
@@ -1283,109 +1294,6 @@ fn every_judged_response_is_one_validation_sample() {
     });
 }
 
-#[cfg(feature = "client")]
-#[test]
-fn delegated_coin_rpc_lists_funding_without_owned_balance() {
-    run_qmdb(|runtime| async move {
-        let indexer_context = runtime.child("delegate_indexer");
-        let config = utxo_db_config(&runtime, "delegate_rpc", 1024, 8);
-        let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
-        let owner = owner_key(41);
-        let node = owner_key(42);
-        let allocations = vec![(owner, 100)];
-        let genesis = index_genesis();
-        let (reshape, ids) = crate::execution::test_support::reshape(
-            41,
-            &[genesis_object_id(0)],
-            &[(owner, Some(node), 70), (owner, None, 30)],
-        );
-        let root = apply(&database, &allocations, 1, std::slice::from_ref(&reshape)).await;
-        let block = index_block(&genesis, root, vec![reshape]);
-        let (chain_indexer, _handle) =
-            finalized_payload_indexer(indexer_context, genesis.clone(), block.clone()).await;
-        let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations);
-        index.apply_finalized(&block).unwrap();
-        let local = LocalLightClient::new(
-            database.clone(),
-            index.clone(),
-            Mempool::default(),
-            chain_indexer.archive.clone(),
-            ConsensusInfo {
-                validators: vec![],
-                threshold_identity: vec![],
-                network_id: crate::domain::TEST_NETWORK.as_str().into(),
-            },
-        );
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
-        let (activity, _) = tokio::sync::broadcast::channel(8);
-        let server = crate::server::spawn_light_client_server(
-            address,
-            local,
-            activity,
-            crate::server::LightClientRpcState::default(),
-        )
-        .await
-        .unwrap();
-        let remote = crate::client::RemoteLightClient::connect(
-            format!("ws://{address}"),
-            consensus_fixture(91).verifier,
-        )
-        .await
-        .unwrap();
-        let held = remote.get_coins_by_delegate(node).await.unwrap().unwrap();
-        assert_eq!(held.snapshot.payload, block.digest());
-        assert_eq!(held.coins, vec![(ids[0], 70)]);
-        assert!(
-            remote
-                .get_coins_by_owner(node)
-                .await
-                .unwrap()
-                .unwrap()
-                .coins
-                .is_empty()
-        );
-        assert!(
-            remote
-                .get_coins_by_delegate(owner)
-                .await
-                .unwrap()
-                .unwrap()
-                .coins
-                .is_empty()
-        );
-        assert_eq!(
-            remote
-                .get_coins_by_owner(owner)
-                .await
-                .unwrap()
-                .unwrap()
-                .coins
-                .iter()
-                .map(|(_, value)| value)
-                .sum::<u64>(),
-            100
-        );
-        let (sweep, _) =
-            crate::execution::test_support::reshape(41, &[ids[0]], &[(owner, None, 70)]);
-        let next_root = apply(&database, &[(owner, 100)], 2, std::slice::from_ref(&sweep)).await;
-        let next = index_block(&block, next_root, vec![sweep]);
-        chain_indexer
-            .publish_proof(
-                next.clone(),
-                &finalization(&consensus_fixture(91), &next).encode(),
-            )
-            .await
-            .unwrap();
-        index.apply_finalized(&next).unwrap();
-        let swept = remote.get_coins_by_delegate(node).await.unwrap().unwrap();
-        assert_eq!(swept.snapshot.payload, next.digest());
-        assert!(swept.coins.is_empty());
-        server.abort();
-    });
-}
-
 #[test]
 fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_block() {
     run_qmdb(|runtime| async move {
@@ -1424,7 +1332,11 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         chain_indexer
             .publish_proof(
                 next.clone(),
-                &finalization(&consensus_fixture(91), &next).encode(),
+                &crate::finality_proof::encode(
+                    &finalization(&consensus_fixture(91), &next).encode(),
+                    &[],
+                )
+                .unwrap(),
             )
             .await
             .unwrap();

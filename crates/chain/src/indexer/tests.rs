@@ -87,7 +87,11 @@ fn pruning_reclaims_old_marshal_sections() {
         for height in 1..=260 {
             let next = block(&parent, fixture.leaders[0].clone(), height, 1);
             indexer
-                .publish_proof(next.clone(), &finalization(&fixture, &next).encode())
+                .publish_proof(
+                    next.clone(),
+                    &crate::finality_proof::encode(&finalization(&fixture, &next).encode(), &[])
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             parent = next;

@@ -1,39 +1,22 @@
 use crate::work_config::WorkConfig;
 use futures::StreamExt as _;
-use hellas_chain::genesis::ChainProfile;
-use hellas_chain::{
-    ConsensusInfo, ConsensusVerifier, LightClient as _, QueryError, client::RemoteLightClient,
-};
-use std::time::Duration;
+use hellas_chain::{LightClient as _, QueryError, client::RemoteLightClient};
+use std::{sync::Arc, time::Duration};
 
 fn invalid(error: impl std::fmt::Display) -> QueryError {
     QueryError::Remote(error.to_string())
 }
 
-pub fn pinned_consensus_verifier(
-    profile: &ChainProfile,
-    reported: &ConsensusInfo,
-) -> Result<ConsensusVerifier, QueryError> {
-    let pinned = ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity().map_err(invalid)?,
-        validators: profile.validators().to_vec(),
-    };
-    if reported.network_id != pinned.network_id
-        || reported.threshold_identity != pinned.threshold_identity
-    {
-        let reason = match profile.known_chain() {
-            Some(chain) => format!(
-                "this binary is out of date for {}; please update",
-                chain.name()
-            ),
-            None => {
-                "endpoint consensus identity differs from the authenticated trust document".into()
-            }
-        };
-        return Err(invalid(reason));
+/// A known chain whose endpoint reports another network id means this binary
+/// predates a devnet reset (G19 bumps the id); say so instead of a proof error.
+fn stale_reason(config: &WorkConfig) -> String {
+    match config.chain.known_chain() {
+        Some(chain) => format!(
+            "this binary is out of date for {}; please update",
+            chain.name()
+        ),
+        None => "endpoint consensus identity differs from the configured chain".into(),
     }
-    ConsensusVerifier::new(&pinned, profile.consensus_digest().into()).map_err(invalid)
 }
 
 pub async fn connect(
@@ -56,13 +39,13 @@ pub async fn connect_at(
     timeout: Duration,
     min_height: u64,
 ) -> Result<RemoteLightClient, QueryError> {
-    let pinned = ConsensusInfo {
-        network_id: config.chain.network_id().to_owned(),
-        threshold_identity: config.threshold_identity().map_err(invalid)?,
-        validators: config.chain.validators().to_vec(),
-    };
-    let verifier =
-        ConsensusVerifier::new(&pinned, config.chain.consensus_digest().into()).map_err(invalid)?;
+    let verifier = Arc::new(
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            config.chain.trust().clone(),
+            config.chain.consensus_digest(),
+        )
+        .map_err(invalid)?,
+    );
     let mut reason = "no finalized remote snapshot is available".to_owned();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -71,25 +54,16 @@ pub async fn connect_at(
         }
         let attempts = futures::stream::iter(config.chain.validators().iter().cloned())
             .map(|url| {
-                let pinned = pinned.clone();
-                let verifier = verifier.clone();
+                let verifier = Arc::clone(&verifier);
                 async move {
                     tokio::time::timeout(timeout.min(Duration::from_secs(5)), async {
                         let client = RemoteLightClient::connect(url, verifier).await?;
-                        let reported = client.get_consensus_info().await?;
-                        if reported.network_id != pinned.network_id
-                            || reported.threshold_identity != pinned.threshold_identity
+                        // Unauthenticated, used only to explain a mismatch: proofs
+                        // remain the sole source of accepted state.
+                        if client.get_consensus_info().await?.network_id
+                            != config.chain.network_id()
                         {
-                            return Err(invalid(match config.chain.known_chain() {
-                                Some(chain) => format!(
-                                    "this binary is out of date for {}; please update",
-                                    chain.name()
-                                ),
-                                None => {
-                                    "endpoint consensus identity differs from the configured chain"
-                                        .into()
-                                }
-                            }));
+                            return Err(invalid(stale_reason(config)));
                         }
                         let latest = client.get_latest_block().await?.ok_or_else(|| {
                             QueryError::StateUnavailable("chain is catching up".into())

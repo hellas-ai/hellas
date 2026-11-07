@@ -17,7 +17,7 @@ fn config_with_genesis(address: String) -> (ValidatorConfig, Genesis) {
     let public_key = hex::encode(private_key.public_key().encode());
     let genesis = Genesis {
         schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-        network_id: crate::genesis::HELLAS_DEVNET_1_ID.to_string(),
+        network_id: crate::genesis::HELLAS_DEVNET_2_ID.to_string(),
         validators: vec![GenesisValidator {
             public_key,
             label: "validator-0".to_string(),

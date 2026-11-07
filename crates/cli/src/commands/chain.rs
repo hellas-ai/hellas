@@ -434,14 +434,9 @@ async fn run_query(rpc: Option<String>, profile: &ChainProfile, query: QueryComm
     let client = connect_with_verified_snapshots(rpc, profile).await?;
     if matches!(
         query,
-        QueryCommand::Coin { .. }
-            | QueryCommand::Edge { .. }
-            | QueryCommand::CoinsByOwner { .. }
-            | QueryCommand::EdgesByOwner { .. }
-            | QueryCommand::Validators
-            | QueryCommand::Finalization { .. }
+        QueryCommand::Validators | QueryCommand::Finalization { .. }
     ) {
-        eprintln!("records are unverified; only finalized block snapshots are authenticated");
+        eprintln!("this RPC record is unverified; use finalized block evidence for authentication");
     }
     match query {
         QueryCommand::LatestBlock => match client.get_latest_block().await? {
@@ -690,30 +685,11 @@ async fn connect_with_verified_snapshots(
     let rpc = rpc
         .or_else(|| profile.validators().first().cloned())
         .context("selected chain has no validator routes")?;
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: profile.network_id().to_owned(),
-        threshold_identity: profile.static_threshold_identity()?,
-        validators: profile.validators().to_vec(),
-    };
-    let verifier =
-        hellas_chain::ConsensusVerifier::new(&pinned, profile.consensus_digest().into())?;
-    let client = RemoteLightClient::connect(rpc, verifier).await?;
-    let reported = client.get_consensus_info().await?;
-    if reported.network_id != pinned.network_id
-        || reported.threshold_identity != pinned.threshold_identity
-    {
-        let reason = match profile.known_chain() {
-            Some(chain) => format!(
-                "this binary is out of date for {}; please update",
-                chain.name()
-            ),
-            None => {
-                "endpoint consensus identity differs from the authenticated trust document".into()
-            }
-        };
-        anyhow::bail!("{reason}");
-    }
-    Ok(client)
+    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::with_digest(
+        profile.trust().clone(),
+        profile.consensus_digest(),
+    )?);
+    Ok(RemoteLightClient::connect(rpc, verifier).await?)
 }
 
 /// Refuses if the node on the other end is not on `network`.

@@ -76,6 +76,13 @@ pub struct FinalizedBlockView {
 }
 
 impl FinalizedBlockView {
+    pub(crate) fn block(&self) -> &HellasBlock {
+        &self.block
+    }
+
+    pub(crate) fn snapshot(&self) -> &LatestBlock {
+        &self.snapshot
+    }
     /// Decodes one finalized block and checks it is the block its
     /// snapshot names.
     ///
@@ -187,7 +194,7 @@ mod tests {
     fn owner_layout_requires_the_new_canonical_block_format() {
         let block = index_genesis().with_owner_root([7; 32]);
         let bytes = block.encode();
-        assert!(bytes.starts_with(b"HLS2"));
+        assert!(bytes.starts_with(b"HLS3"));
         let decoded = HellasBlock::decode(bytes.as_ref()).unwrap();
         assert_eq!(decoded.owner_root(), [7; 32]);
         assert!(HellasBlock::decode(&bytes[4..]).is_err());

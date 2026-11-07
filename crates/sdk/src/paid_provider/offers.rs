@@ -315,42 +315,33 @@ impl OfferAllocator {
         if coins.is_empty() {
             return quote(&policy, current.policy.offers.omission_bond);
         }
-        let owned = chain
-            .get_coins_by_owner(Key::from_bytes(principal).into())
+        // The request names at most four funding inputs. Verify those exact
+        // objects together at one current root instead of listing an owner.
+        let funding = chain
+            .get_objects(
+                coins
+                    .iter()
+                    .copied()
+                    .map(hellas_chain::domain::coin_object_id)
+                    .collect(),
+            )
             .await
             .map_err(unavailable)?
-            .ok_or_else(|| unavailable("client ownership unavailable"))?;
-        let delegated = chain
-            .get_coins_by_delegate(Key::from_bytes(key).into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("client delegation unavailable"))?;
-        if owned.snapshot.payload != delegated.snapshot.payload
-            || owned.snapshot.state_root != delegated.snapshot.state_root
-        {
-            return Err(unavailable(
-                "client funding snapshot advanced; retry offer request",
-            ));
-        }
+            .ok_or_else(|| unavailable("client funding unavailable"))?;
         let mut total = 0_u64;
         for coin in &coins {
-            let id: hellas_chain::domain::ObjectId = coin.to_bytes().into();
-            let value = owned
-                .coins
-                .iter()
-                .find(|(held, _)| *held == id)
-                .map(|(_, value)| *value);
-            if value.is_none()
-                || !delegated
-                    .coins
-                    .iter()
-                    .any(|(held, delegated_value)| *held == id && Some(*delegated_value) == value)
+            let Some(hellas_chain::domain::Object::Coin(state)) = funding
+                .objects
+                .get(&hellas_chain::domain::coin_object_id(*coin))
+            else {
+                return Ok(refused(OfferRefusalCode::NeedsFunding, required));
+            };
+            if state.owner != Key::from_bytes(principal).into()
+                || state.delegate != Some(Key::from_bytes(key).into())
             {
                 return Ok(refused(OfferRefusalCode::NeedsFunding, required));
             }
-            total = total
-                .checked_add(value.ok_or_else(invalid)?)
-                .ok_or_else(invalid)?;
+            total = total.checked_add(state.value).ok_or_else(invalid)?;
         }
         if total != required {
             return Ok(refused(OfferRefusalCode::NeedsFunding, required));
@@ -359,39 +350,40 @@ impl OfferAllocator {
             return Ok(refused(OfferRefusalCode::OfferLimit, 0));
         }
         let owner = self.authority.owner().await.map_err(unavailable)?;
-        let listing = chain
-            .get_coins_by_delegate(self.config.settlement_key.party_key().into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("delegated stake unavailable"))?;
-        let owned_stake = chain
-            .get_coins_by_owner(Key::from_bytes(*owner.as_bytes()).into())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("stake ownership unavailable"))?;
-        if owned_stake.snapshot.payload != listing.snapshot.payload
-            || owned_stake.snapshot.state_root != listing.snapshot.state_root
-        {
-            return Err(unavailable("stake snapshot advanced; retry offer request"));
-        }
-        let mut available = Vec::new();
-        for (id, value) in listing.coins {
-            let coin_id = CoinId::from_bytes(id.0);
-            if !reserved.contains(&coin_id)
-                && value > 0
-                && value <= current.policy.offers.max_stake_per_client
-                && owned_stake
-                    .coins
-                    .iter()
-                    .any(|(held, owned_value)| *held == id && *owned_value == value)
-            {
-                available.push((coin_id, value));
+        let mut after = None;
+        let stake = loop {
+            let page = chain
+                .get_coins_by_delegate_page(self.config.settlement_key.party_key().into(), after)
+                .await
+                .map_err(unavailable)?
+                .ok_or_else(|| unavailable("delegated stake unavailable"))?;
+            let mut found = None;
+            for (id, _) in page.coins {
+                let coin_id = CoinId::from_bytes(id.0);
+                if reserved.contains(&coin_id) {
+                    continue;
+                }
+                let snapshot = chain
+                    .get_objects(vec![id])
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("stake object unavailable"))?;
+                if let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot.objects.get(&id)
+                    && coin.owner == Key::from_bytes(*owner.as_bytes()).into()
+                    && coin.delegate == Some(self.config.settlement_key.party_key().into())
+                    && coin.value > 0
+                    && coin.value <= current.policy.offers.max_stake_per_client
+                {
+                    found = Some((coin_id, coin.value));
+                    break;
+                }
             }
-        }
-        // A positive stake insures the protocol's price cap; omission collateral
-        // belongs to the payment edge. One eligible coin is the fewest possible.
-        available.sort_by_key(|(id, value)| (*value, *id));
-        let Some((stake, stake_value)) = available.first().copied() else {
+            if found.is_some() || page.next.is_none() {
+                break found;
+            }
+            after = page.next;
+        };
+        let Some((stake, stake_value)) = stake else {
             return Ok(refused(OfferRefusalCode::NoStakeAvailable, 0));
         };
         let timeout = tip

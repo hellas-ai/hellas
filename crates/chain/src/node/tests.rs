@@ -27,6 +27,43 @@ struct Fixture {
     config: Config,
     allocations: Vec<(SettlementKey, u64)>,
 }
+
+#[test]
+fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
+    use commonware_runtime::Supervisor as _;
+    run_qmdb(|runtime| async move {
+        let profile = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet);
+        let genesis = profile.genesis();
+        let leader = genesis
+            .validators
+            .iter()
+            .map(|validator| {
+                PublicKey::decode(hex::decode(&validator.public_key).unwrap().as_slice()).unwrap()
+            })
+            .min()
+            .unwrap();
+        let application = crate::Application::new(
+            runtime.child("known_genesis"),
+            crate::domain::network_id(genesis).unwrap(),
+            crate::genesis_digest(genesis),
+            leader,
+            genesis_allocations(genesis).unwrap(),
+            "known_genesis",
+            crate::ApplicationConfig::default(),
+        )
+        .await;
+        assert_eq!(
+            application.genesis_block().digest().0,
+            profile.known_genesis_payload_pin().unwrap()
+        );
+        let home = tempfile::tempdir().unwrap();
+        let chain = crate::chain_dir::ChainDir::open(home.path(), &profile).unwrap();
+        let mut config = Config::for_profile(chain, vec![], None).unwrap();
+        config.validators.clear();
+        let node = FullNode::start(config).await.unwrap();
+        node.shutdown().await.unwrap();
+    });
+}
 impl Fixture {
     async fn new(runtime: runtime::Context, directory: &std::path::Path) -> Self {
         Self::new_in(runtime, directory, domain::TEST_NETWORK, 5000).await
@@ -127,7 +164,6 @@ impl Fixture {
         .unwrap();
         let owner_root = crate::execution::owner_tree::root(&batch).await.unwrap();
         let executed = batch.merkleize().await.unwrap();
-        let bounds = executed.bounds();
         let block = HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -139,8 +175,11 @@ impl Fixture {
             height,
             executed.root(),
             Target {
-                root: executed.root(),
-                range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
+                root: executed.ops_root(),
+                range: non_empty_range!(
+                    executed.sync_boundary(),
+                    Location::new(executed.bounds().total_size)
+                ),
             },
             vec![],
         )
@@ -155,7 +194,11 @@ impl Fixture {
                 height: block.height().get(),
                 payload: block.digest(),
                 state_root: block.state_root(),
-                finalization: finalization(&self.committee, &block).encode().to_vec(),
+                finalization: crate::finality_proof::encode(
+                    &finalization(&self.committee, &block).encode(),
+                    &[],
+                )
+                .unwrap(),
             },
             block: block.encode().to_vec(),
         }
@@ -835,6 +878,48 @@ async fn archived(node: &FullNode, height: u64) -> bool {
 }
 
 #[test]
+fn current_state_root_and_operation_sync_target_survive_node_restart() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start(fixture.config.clone()).await.unwrap();
+        let finalized = fixture.next().await;
+        let block = HellasBlock::decode(finalized.block.as_slice()).unwrap();
+        let target = block.sync_target();
+        assert_ne!(block.state_root(), target.root);
+        {
+            let producer = fixture.database.read().await;
+            assert_eq!(block.state_root(), producer.root());
+        }
+        apply(&node, finalized.clone()).await.unwrap();
+        node.shutdown().await.unwrap();
+        let node = FullNode::start(fixture.config).await.unwrap();
+        node.accept_finalized(&finalized).await.unwrap();
+        // Acceptance queues the block; the published watch marks executed state.
+        let mut executed = node.finalized();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            executed
+                .wait_for(|height| *height >= block.height().get())
+                .await
+                .expect("execution progress remains published");
+        })
+        .await
+        .expect("the accepted block executes");
+        assert_eq!(node.status().executed_height(), block.height().get());
+        assert_eq!(
+            node.view()
+                .unwrap()
+                .client()
+                .get_state_root()
+                .await
+                .unwrap(),
+            Some(block.state_root())
+        );
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -1338,7 +1423,7 @@ fn full_node_derives_h0_from_the_selected_custom_genesis() {
 fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     use commonware_cryptography::{Hasher as _, Sha256};
     let mut genesis: hellas_genesis::Genesis =
-        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_1_JSON).unwrap();
+        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_2_JSON).unwrap();
     genesis.network_id = "custom-node-rotating-1".into();
     let genesis_json = serde_json::to_string(&genesis).unwrap();
     let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)

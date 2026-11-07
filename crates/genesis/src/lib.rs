@@ -18,20 +18,20 @@ use serde::{Deserialize, Serialize};
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
 /// The in-tree development network's document.
-pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1/genesis.json");
+pub const HELLAS_DEVNET_2_JSON: &str = include_str!("../networks/hellas-devnet-2/genesis.json");
 
 /// The id that document names.
-pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
+pub const HELLAS_DEVNET_2_ID: &str = "hellas-devnet-2";
 
 /// Offline seed-100 finality trust bound to the shipped devnet genesis.
-pub const HELLAS_DEVNET_1_TRUST_JSON: &str = include_str!("../networks/hellas-devnet-1/trust.json");
+pub const HELLAS_DEVNET_2_TRUST_JSON: &str = include_str!("../networks/hellas-devnet-2/trust.json");
 /// Genesis block payload independently derived from the shipped document.
-pub const HELLAS_DEVNET_1_GENESIS_PAYLOAD: &str =
-    include_str!("../networks/hellas-devnet-1/genesis-payload.hex");
+pub const HELLAS_DEVNET_2_GENESIS_PAYLOAD: &str =
+    include_str!("../networks/hellas-devnet-2/genesis-payload.hex");
 
 /// Intentionally public software-passkey credentials for the development network.
-pub const HELLAS_DEVNET_1_FAUCET_JSON: &str =
-    include_str!("../networks/hellas-devnet-1/faucet.json");
+pub const HELLAS_DEVNET_2_FAUCET_JSON: &str =
+    include_str!("../networks/hellas-devnet-2/faucet.json");
 
 /// One public development account. Cryptographic consumers validate its key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub struct KnownNetwork {
     pub chain: Chain,
     /// Short name to select it by, e.g. `devnet`.
     pub name: &'static str,
-    /// Full network id the document declares, e.g. `hellas-devnet-1`.
+    /// Full network id the document declares, e.g. `hellas-devnet-2`.
     pub id: &'static str,
     /// The document itself.
     pub json: &'static str,
@@ -110,10 +110,10 @@ impl Chain {
 pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
     chain: Chain::Devnet,
     name: "devnet",
-    id: HELLAS_DEVNET_1_ID,
-    json: HELLAS_DEVNET_1_JSON,
-    trust_json: HELLAS_DEVNET_1_TRUST_JSON,
-    genesis_payload_hex: HELLAS_DEVNET_1_GENESIS_PAYLOAD,
+    id: HELLAS_DEVNET_2_ID,
+    json: HELLAS_DEVNET_2_JSON,
+    trust_json: HELLAS_DEVNET_2_TRUST_JSON,
+    genesis_payload_hex: HELLAS_DEVNET_2_GENESIS_PAYLOAD,
     validators: &[
         "wss://devnet.hellas.ai/ws/validator-0",
         "wss://devnet.hellas.ai/ws/validator-1",
@@ -122,11 +122,11 @@ pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
         "wss://devnet.hellas.ai/ws/validator-4",
         "wss://devnet.hellas.ai/ws/validator-5",
     ],
-    faucet_json: Some(HELLAS_DEVNET_1_FAUCET_JSON),
+    faucet_json: Some(HELLAS_DEVNET_2_FAUCET_JSON),
 }];
 
 /// Looks up a shipped network by its short name (`devnet`) or its full
-/// id (`hellas-devnet-1`).
+/// id (`hellas-devnet-2`).
 #[must_use]
 pub fn known_network(selector: &str) -> Option<&'static KnownNetwork> {
     KNOWN_NETWORKS

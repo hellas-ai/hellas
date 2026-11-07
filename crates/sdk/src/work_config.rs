@@ -47,14 +47,14 @@ impl WorkConfig {
     }
 
     pub fn validate(self) -> Result<Self> {
-        hellas_chain::ConsensusVerifier::new(
-            &hellas_chain::light_client::ConsensusInfo {
-                validators: self.chain.validators().to_vec(),
-                threshold_identity: self.threshold_identity()?,
-                network_id: self.chain.network_id().to_owned(),
-            },
-            self.chain.consensus_digest().into(),
-        )?;
+        hellas_chain::proof_verify::ProofVerifier::with_digest(
+            self.chain.trust().clone(),
+            self.chain.consensus_digest(),
+        )
+        .map_err(|_| WorkConfigError::Invalid {
+            field: "chain.trust",
+            reason: "trusted epoch schedule and consensus digest must be usable",
+        })?;
         Ok(self)
     }
 

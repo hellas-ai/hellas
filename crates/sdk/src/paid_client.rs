@@ -639,8 +639,12 @@ impl PaidWorkSession {
         // at that cursor before the readiness read: a source below it is
         // refused by the journal's own height guard, and waiting for the
         // same fast source to catch up would never mount.
+        // One unretried read: a source that cannot report its tip, or whose tip
+        // regressed below state it already proved, is reselected like one that is
+        // merely behind, rather than retried until the open deadline.
         let channel_floor = mounted.state().cursor().0;
-        let (remote, chain) = if channel_floor > finalized_floor(&chain).await?.height {
+        let tip = WorkBlocks::new(remote.clone()).latest_height().await;
+        let (remote, chain) = if !matches!(tip, Ok(Some(height)) if height >= channel_floor) {
             let remote =
                 crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
             let chain = WorkBlocks::new(remote.clone())
