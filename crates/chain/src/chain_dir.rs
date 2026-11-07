@@ -16,6 +16,7 @@ impl ChainDir {
     pub fn open(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
         let root = home.child("chains").child(profile.state_key());
         hellas_private::create_dir_all_durable(&root)?;
+        tracing::info!("chain {} state: {}", profile.network_id(), root.display());
         Ok(Self {
             home: home.clone(),
             root,
