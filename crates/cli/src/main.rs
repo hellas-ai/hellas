@@ -1012,6 +1012,7 @@ async fn async_main() {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
             };
+            let mut local_service = None;
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
                 let offer = commands::contributions::load_offer(&home, &client, name)?;
@@ -1041,18 +1042,21 @@ async fn async_main() {
                     assurance == hellas_rpc::Assurance::ProducerSigned,
                     "local Work requires producer-signed assurance"
                 );
-                Some(
-                    commands::grant_gateway::local::prepare(
-                        &home,
-                        grant,
-                        native,
-                        &local_identity,
-                        commands::contributions::require_principal(passkey)?,
-                        work_application()?,
-                        remote_trust.load(&home)?,
-                    )
-                    .await?,
+                let (session, service) = commands::grant_gateway::local::prepare(
+                    &home,
+                    grant,
+                    native,
+                    &local_identity,
+                    commands::contributions::require_principal(passkey)?,
+                    work_application()?,
+                    remote_trust.load(&home)?,
                 )
+                .await?;
+                local_service = Some(service.clone());
+                Some((
+                    session,
+                    hellas_sdk::grant_client::GrantTransport::Local(service),
+                ))
             } else {
                 None
             };
@@ -1201,6 +1205,11 @@ async fn async_main() {
             let stopped = match control {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,
+            };
+            // The gateway's session only drained the local service it borrowed.
+            let stopped = match local_service {
+                Some(service) => stopped.and(service.shutdown().await.map_err(anyhow::Error::from)),
+                None => stopped,
             };
             node.close().await;
             stopped

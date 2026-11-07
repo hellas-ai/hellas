@@ -132,7 +132,7 @@ async fn granted_compute_executes_through_the_native_facade() {
     )
     .unwrap();
     let mut session = attempt
-        .open_grant_session(options, GrantTransport::Local(service))
+        .open_grant_session(options, GrantTransport::Local(service.clone()))
         .await
         .unwrap();
     let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
@@ -155,6 +155,7 @@ async fn granted_compute_executes_through_the_native_facade() {
         hellas_sdk::execution::Terminal::Verified
     );
     session.shutdown().await.unwrap();
+    service.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -538,7 +539,7 @@ async fn local_grant_session_executes_without_http() {
     assert!(!pending.result_available);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     let mut recovered_session = third
-        .open_grant_session(options.clone(), GrantTransport::Local(service))
+        .open_grant_session(options.clone(), GrantTransport::Local(service.clone()))
         .await
         .unwrap();
     let recovered = hellas_sdk::execution::ExecutionSession::Grant(&mut recovered_session)
@@ -564,6 +565,7 @@ async fn local_grant_session_executes_without_http() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     recovered_session.shutdown().await.unwrap();
+    service.shutdown().await.unwrap();
 }
 
 #[test]
