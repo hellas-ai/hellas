@@ -13,7 +13,7 @@ use hellas_channel::test_support::channel::{
     store_at,
 };
 
-use hellas_channel::work::{ClientChannel as _, ClientEndpoint, ProviderEndpoint, WorkService};
+use hellas_channel::work::{ClientEndpoint, ProviderEndpoint, WorkService};
 use hellas_channel::work_close::{
     BlockSourceError, CloseChannel as _, FinalizedBlocks, FinalizedWork,
 };
