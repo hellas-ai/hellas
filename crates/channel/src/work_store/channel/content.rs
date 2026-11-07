@@ -302,7 +302,10 @@ impl ChannelStore {
                 .is_some_and(|job| job.phase() == JobPhase::HalfSigned)
     }
 
-    pub(crate) async fn reconcile_content(&mut self) -> Result<(), WorkStoreError> {
+    pub(crate) async fn reconcile_content(
+        &mut self,
+        recovering: bool,
+    ) -> Result<(), WorkStoreError> {
         self.check_authority()?;
         let channel = self.state().channel().id();
         let existing =
@@ -324,7 +327,7 @@ impl ChannelStore {
                 expires: None,
             };
             desired.insert(pin.name.clone(), expected.clone());
-            if existing.get(&pin.name) == Some(&expected) {
+            if !recovering && existing.get(&pin.name) == Some(&expected) {
                 continue;
             }
             self.content
@@ -375,20 +378,8 @@ impl ChannelStore {
     }
 
     pub(super) async fn restore_content(&mut self) -> Result<(), WorkStoreError> {
-        self.reconcile_content().await?;
-        for (work, root) in self.state().retained_roots() {
-            let channel = self.state().channel().id();
-            let pin = channel_pin(channel, *work, self.proposal_pin(*work))?;
-            let previous = channel_pin(channel, *work, !self.proposal_pin(*work))?;
-            self.content
-                .restore_root(
-                    JobId { channel, id: *work },
-                    Target::Tree(*root),
-                    pin,
-                    Some(previous.name),
-                )
-                .await?;
-        }
+        // Recovery restores obligations even when the current pin already matches.
+        self.reconcile_content(true).await?;
         let jobs = self
             .state()
             .jobs()
@@ -524,14 +515,7 @@ impl ChannelStore {
             return Ok(());
         };
         let authorization = *job.authorization();
-        let store = LocalStore::Disk(self.content.clone());
-        let job = self
-            .state()
-            .job_by_id(work)
-            .ok_or(ChannelStateError::Malformed)?;
-        if job.transcript().is_empty()
-            && let Some((result, _)) = job.result()
-        {
+        if job.transcript().is_empty() && job.result().is_some() {
             let input = PreparedInvocation::from_canonical_bytes(
                 job.prepared_input(),
                 crate::content::MAX_CONTENT_BYTES,
@@ -549,19 +533,8 @@ impl ChannelStore {
                 &input,
             )
             .map_err(ChannelStateError::from)?;
-            let transcript = read(
-                &store,
-                &Scope::Owner,
-                result.transcript_content,
-                facts.max_spool_bytes,
-            )
-            .await?;
-            self.state
-                .book
-                .jobs
-                .get_mut(&work)
-                .ok_or(ChannelStateError::Malformed)?
-                .transcript = transcript;
+            self.load_retained_transcript(work, facts.max_spool_bytes, true)
+                .await?;
         }
         Ok(())
     }
@@ -570,6 +543,7 @@ impl ChannelStore {
         &mut self,
         work: Digest,
         maximum: u64,
+        keep_input: bool,
     ) -> Result<(), WorkStoreError> {
         self.check_authority()?;
         if !self.state().retained_roots().contains_key(&work) {
@@ -586,7 +560,9 @@ impl ChannelStore {
                 if id != work {
                     job.transcript = bytes::Bytes::new();
                 }
-                job.prepared_input = bytes::Bytes::new();
+                if !keep_input {
+                    job.prepared_input = bytes::Bytes::new();
+                }
             }
         }
         let Some(job) = self.state().job_by_id(work) else {

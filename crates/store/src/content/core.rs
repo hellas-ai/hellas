@@ -63,6 +63,10 @@ pub(crate) struct State {
     reads: std::sync::atomic::AtomicU64,
 }
 impl Core {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, State>> {
+        self.state.lock().map_err(|_| Error::Invalid("store lock"))
+    }
+
     pub fn new(pool: Reservations) -> Self {
         Self {
             pool,
@@ -106,10 +110,7 @@ impl Core {
             })
             .transpose()?;
         let name = pin.name.clone();
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         let objects = objects
             .into_iter()
             .map(|(object, data, chunks)| (object.id(), Arc::new(Stored::new(data, chunks))))
@@ -123,10 +124,7 @@ impl Core {
     }
     /// Called by the authenticated application opening, first with the root only.
     pub fn open_work(&self, job: JobId, closure: Closure, max_upload_bytes: u64) -> Result<Scope> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         if let Some((id, work)) = state.work.iter().find(|(_, work)| work.job == job) {
             if work.root_recovery {
                 return Err(Error::Denied);
@@ -181,10 +179,7 @@ impl Core {
         closure: Closure,
         max_upload_bytes: u64,
     ) -> Result<Scope> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work {
             job, reservation, ..
@@ -227,10 +222,7 @@ impl Core {
         Ok(new_scope)
     }
     pub(crate) fn work_bytes(&self, scope: &Scope) -> Result<u64> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -247,10 +239,7 @@ impl Core {
     }
     /// The host has atomically taken these bytes into live job RAM accounting.
     pub fn accept_work(&self, scope: &Scope) -> Result<()> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -270,10 +259,7 @@ impl Core {
         else {
             return Err(Error::Denied);
         };
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         if state
             .work
             .get(reservation)
@@ -298,10 +284,7 @@ impl Core {
         Ok(())
     }
     pub(crate) fn check(&self, scope: &Scope) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?
-            .check(scope)
+        self.state()?.check(scope)
     }
     fn session(
         &self,
@@ -365,10 +348,7 @@ impl Core {
         session: &mut super::upload::LocalSession,
         chunks: Vec<Chunk>,
     ) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(&session.scope)?;
         if session.pin.is_some() && state.generation == u64::MAX {
             return Err(Error::Capacity);
@@ -687,17 +667,12 @@ use prost::Message;
 impl Core {
     fn stat_sync(&self, scope: &Scope, at: &Path) -> Result<Option<Stat>> {
         Ok(self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?
+            .state()?
             .resolve(scope, at)?
             .map(|target| Stat { target }))
     }
     fn chunks_sync(&self, scope: &Scope, at: &Path, cursor: Cursor) -> Result<ChunkPage> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         let target = state.resolve(scope, at)?.ok_or(Error::Missing)?;
         let object = state
             .objects
@@ -711,10 +686,7 @@ impl Core {
         at: &Path,
         range: std::ops::Range<u64>,
     ) -> Result<ByteStream> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         let target = state.resolve(scope, at)?.ok_or(Error::Missing)?;
         let object = target.object();
         if range.start > range.end || range.end > object.bytes() {
@@ -735,10 +707,7 @@ impl Core {
                 };
                 {
                     let _gate = store.effect_gate(&scope).await?;
-                    let state = store
-                        .state
-                        .lock()
-                        .map_err(|_| Error::Invalid("store lock"))?;
+                    let state = store.state()?;
                     state.check(&scope)?;
                     if state
                         .pins
@@ -764,10 +733,7 @@ impl Core {
     ) -> Result<UploadSession> {
         self.require_ready()?;
         let local = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?;
+            let mut state = self.state()?;
             state.check(scope)?;
             match &scope.kind {
                 ScopeKind::Owner if pin.is_some() => {}
@@ -818,10 +784,7 @@ impl Core {
             return Err(Error::Denied);
         }
         PinName::new(name.as_str().to_owned())?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         if state.pins.get(name).filter(|pin| live(pin)) != expected {
             return Err(Error::Conflict);
         }
@@ -834,10 +797,7 @@ impl Core {
         Ok(())
     }
     fn pins_sync(&self, scope: &Scope, prefix: &str, cursor: Cursor) -> Result<PinPage> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         state.check(scope)?;
         if cursor.offset != 0 && cursor.generation != state.generation {
             return Err(Error::Conflict);
@@ -894,10 +854,7 @@ impl Core {
         })
     }
     fn watch_sync(&self, scope: &Scope, prefix: &str, from: Cursor) -> Result<PinEvents> {
-        self.state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?
-            .check(scope)?;
+        self.state()?.check(scope)?;
         let store = self.clone();
         let scope = scope.clone();
         let prefix = prefix.to_owned();
@@ -1010,10 +967,7 @@ impl Core {
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         let mut reached: BTreeSet<ContentId> = state
             .walk(
                 state
@@ -1116,10 +1070,7 @@ impl Core {
         tokio::spawn(async move {
             let gate = core.effect_gate(&scope).await?;
             let before = {
-                let state = core
-                    .state
-                    .lock()
-                    .map_err(|_| Error::Invalid("store lock"))?;
+                let state = core.state()?;
                 (
                     state.pins.clone(),
                     state.generation,
@@ -1287,10 +1238,7 @@ impl Core {
 
 impl Core {
     pub(crate) fn target_present(&self, target: Target) -> Result<bool> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         let objects = match state.walk([target]) {
             Ok(objects) => objects,
             Err(Error::Missing) => return Ok(false),
@@ -1310,9 +1258,7 @@ impl Core {
         if let Some((requester, scope)) = requester {
             requester.check(scope)?;
             if self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?
+                .state()?
                 .pins
                 .get(&pin.name)
                 .is_some_and(|value| value.policy != PinPolicy::Jobs)
@@ -1371,10 +1317,7 @@ impl Core {
         scope: &Scope,
         closure: &[ContentRef],
     ) -> Result<Vec<ContentRef>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work {
             closure: admitted,
@@ -1402,19 +1345,13 @@ impl Core {
     }
 
     pub(crate) fn clear_acquired(&self, owner: AcquiredOwner) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?
-            .unpin_acquired(&owner)
+        self.state()?.unpin_acquired(&owner)
     }
     pub(crate) fn clear_orphan_acquired(&self) -> Result<()> {
         if self.disk.as_ref().is_none_or(|disk| disk.ready()) {
             return Ok(());
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         let live = state
             .work
             .iter()
@@ -1445,10 +1382,7 @@ impl Core {
     pub(crate) fn restore_output(&self, scope: &Scope, total: u64, consumed: u64) -> Result<()> {
         let recovering = !self.disk.as_ref().ok_or(Error::Denied)?.ready();
         let remaining = total.checked_sub(consumed).ok_or(Error::Capacity)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -1471,10 +1405,7 @@ impl Core {
         Ok(())
     }
     pub(crate) fn reserve_output(&self, scope: &Scope, bytes: u64) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -1516,10 +1447,7 @@ impl Core {
         at: Option<&Path>,
         job_upper: bool,
     ) -> Result<Option<super::local::VerifiedReader>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let state = self.state()?;
         state.check(scope)?;
         if let ScopeKind::Work {
             reservation,
@@ -1575,10 +1503,7 @@ impl Core {
 
 impl Core {
     pub(crate) fn stage_output(&self, scope: &Scope, object: ContentRef) -> Result<UploadSession> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -1615,10 +1540,7 @@ impl Core {
 
 impl Core {
     pub(crate) fn promote_work(&self, scope: &Scope, target: Target, pin: PinTarget) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?;
+        let mut state = self.state()?;
         state.check(scope)?;
         let ScopeKind::Work { reservation, .. } = &scope.kind else {
             return Err(Error::Denied);
@@ -1640,10 +1562,7 @@ impl Core {
         previous: Option<PinName>,
     ) -> Result<Option<Scope>> {
         let existing = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?;
+            let state = self.state()?;
             state
                 .work
                 .iter()
@@ -1662,9 +1581,7 @@ impl Core {
                 let ScopeKind::Work { reservation, .. } = scope.kind else {
                     return Err(Error::Denied);
                 };
-                self.state
-                    .lock()
-                    .map_err(|_| Error::Invalid("store lock"))?
+                self.state()?
                     .work
                     .get_mut(&reservation)
                     .ok_or(Error::Denied)?
@@ -1673,10 +1590,7 @@ impl Core {
             }
         };
         {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?;
+            let state = self.state()?;
             if let Some(value) = state
                 .pins
                 .get(&pin.name)
@@ -1688,19 +1602,13 @@ impl Core {
         let name = pin.name.clone();
         self.promote_work(&scope, target, pin)?;
         if let Some(previous) = previous.filter(|previous| *previous != name) {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?;
+            let mut state = self.state()?;
             if state.pins.contains_key(&previous) {
                 state.change_pin(previous, None)?;
             }
         }
         if temporary {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?;
+            let mut state = self.state()?;
             let closure = state.walk([target])?.into_iter().collect();
             let ScopeKind::Work { reservation, .. } = scope.kind else {
                 return Err(Error::Denied);
@@ -1714,14 +1622,7 @@ impl Core {
         Ok(temporary.then_some(scope))
     }
     pub(crate) fn live_jobs(&self) -> Result<BTreeSet<JobId>> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| Error::Invalid("store lock"))?
-            .work
-            .values()
-            .map(|work| work.job)
-            .collect())
+        Ok(self.state()?.work.values().map(|work| work.job).collect())
     }
 }
 

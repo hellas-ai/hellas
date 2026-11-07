@@ -767,7 +767,7 @@ impl ProviderEndpoint {
 
     async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
-        self.close.store.reconcile_content().await?;
+        self.close.store.reconcile_content(false).await?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
             return Ok((work_id, retained));
         }
@@ -2972,7 +2972,7 @@ impl WorkService {
         endpoint
             .close
             .store
-            .load_retained_transcript(work_id, facts.max_spool_bytes)
+            .load_retained_transcript(work_id, facts.max_spool_bytes, false)
             .await
             .map_err(|e| Refusal::from(DeliverError::from(e)))?;
         // The endpoint remains locked from authorization through this snapshot.
@@ -3395,7 +3395,7 @@ impl ClientEndpoint {
         )
         .map_err(ChannelStateError::from)?;
         self.store
-            .load_retained_transcript(work, facts.max_spool_bytes)
+            .load_retained_transcript(work, facts.max_spool_bytes, false)
             .await
     }
 

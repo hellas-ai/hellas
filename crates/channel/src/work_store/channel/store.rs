@@ -230,7 +230,7 @@ impl ChannelStore {
         }
         store.restore_content().await?;
         store.release_unresumable_proposal(verifier).await?;
-        store.reconcile_content().await?;
+        store.reconcile_content(false).await?;
         Ok(Some(store))
     }
 
@@ -358,14 +358,14 @@ impl ChannelStore {
                         job.prepared_input = bytes::Bytes::new();
                     }
                     if matches!(record, ChannelRecord::ResultVerified { .. }) {
-                        self.load_retained_transcript(*work_id, facts.max_spool_bytes)
+                        self.load_retained_transcript(*work_id, facts.max_spool_bytes, false)
                             .await?;
                     }
                 } else {
                     self.load_retained_content(*work_id).await?;
                 }
             }
-            self.reconcile_content().await?;
+            self.reconcile_content(false).await?;
             let staged = self.prepare_record(&mut record)?;
             // Applied to a copy first: a record the rules refuse must leave
             // neither the file nor the state touched. A cheap exact check
@@ -398,12 +398,12 @@ impl ChannelStore {
                 self.stage_record(&record, staged).await?;
                 self.journal.append(&record.encode_for_storage()).await?;
                 self.state = next;
-                self.reconcile_content().await?;
+                self.reconcile_content(false).await?;
                 if self.state.jobs().count() < previous_jobs {
                     self.rotate().await?;
                 }
             }
-            self.reconcile_content().await?;
+            self.reconcile_content(false).await?;
             Ok(&self.state)
         })
     }

@@ -865,7 +865,7 @@ mod tests {
         provider
             .close
             .store
-            .load_retained_transcript(ids[0], facts.max_spool_bytes)
+            .load_retained_transcript(ids[0], facts.max_spool_bytes, false)
             .await
             .unwrap();
         assert_eq!(
