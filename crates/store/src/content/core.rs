@@ -705,16 +705,30 @@ impl Core {
                 let Some(bytes) = chunks.next().await else {
                     return Ok(None);
                 };
-                let bytes = match bytes {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        // Recheck the current backing under the owned effect gate;
-                        // a failed old reader must not unlink a healthy replacement.
+                {
+                    let gate = store.effect_gate(&scope).await?;
+                    let damaged = {
+                        let state = store.state()?;
+                        state.check(&scope)?;
+                        if state
+                            .pins
+                            .get(&pin)
+                            .is_none_or(|value| !readable(&scope, &pin, value))
+                        {
+                            return Err(Error::Denied);
+                        }
+                        if bytes.is_err() {
+                            state.objects.get(&object.id()).cloned()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(stored) = damaged {
+                        // Keep current-state repair and its authority guard owned through IO.
                         store
-                            .effect(&scope, move |core| {
-                                if let Some(stored) = core.state()?.objects.get(&object.id())
-                                    && let super::storage::Data::File(file) = &stored.data
-                                {
+                            .run(move |_| {
+                                let _gate = gate;
+                                if let super::storage::Data::File(file) = &stored.data {
                                     match file.open() {
                                         Ok(_) | Err(Error::Missing) => {}
                                         Err(error) => return Err(error),
@@ -723,22 +737,9 @@ impl Core {
                                 Ok(())
                             })
                             .await?;
-                        return Err(error);
-                    }
-                };
-                {
-                    let _gate = store.effect_gate(&scope).await?;
-                    let state = store.state()?;
-                    state.check(&scope)?;
-                    if state
-                        .pins
-                        .get(&pin)
-                        .is_none_or(|value| !readable(&scope, &pin, value))
-                    {
-                        return Err(Error::Denied);
                     }
                 }
-                Ok(Some((bytes, (chunks, store, scope, pin, object))))
+                Ok(Some((bytes?, (chunks, store, scope, pin, object))))
             },
         );
         Ok(ByteStream {

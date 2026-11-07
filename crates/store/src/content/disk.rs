@@ -156,9 +156,8 @@ impl Disk {
             })
             .await
             .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
-            let used = Self::owned_bytes(&root)?;
             Ok(Arc::new(Self {
-                quota: Reservations::disk(root.clone(), capacity, used),
+                quota: Reservations::disk(root.clone(), capacity, 0),
                 root,
                 ram,
                 records,
@@ -234,43 +233,49 @@ impl Disk {
     fn index(&self, path: &FsPath, mode: IndexMode) -> Result<(Indexed, Entry)> {
         self.records.index_entry(path, mode, &self.ram)
     }
-    fn discard_corrupt_upper(&self, path: &FsPath, accounted: u64) -> Result<()> {
+    fn discard_corrupt_upper(&self, path: &FsPath) -> Result<bool> {
         if path.parent() != Some(self.root.join("objects").as_path()) {
             return Err(Error::Invalid("conflicting owned backing"));
         }
-        let identity = match fs::symlink_metadata(path) {
-            Ok(metadata) => FileIdentity::of(&metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         let name = path
             .file_name()
             .ok_or(Error::Invalid("upper object path"))?;
-        let mut shared = false;
-        for entry in fs::read_dir(self.root.join("staging"))? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && Self::same_file(path, &entry.path().join(name)) {
-                shared = true;
-                break;
+        #[cfg(unix)]
+        let shared = {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.nlink() > 1
+        };
+        // Stable Windows metadata does not expose the link count.
+        #[cfg(not(unix))]
+        let shared = {
+            let mut shared = false;
+            for entry in fs::read_dir(self.root.join("staging"))? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() && Self::same_file(path, &entry.path().join(name)) {
+                    shared = true;
+                    break;
+                }
             }
-        }
+            shared
+        };
         match fs::remove_file(path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         }
         tracing::error!(id = %name.to_string_lossy(), path = %path.display(), "discarded corrupt upper object");
-        self.records.forget(identity);
-        if !shared {
-            self.quota.remove_owned(accounted);
-        }
-        Ok(())
+        self.records.forget(FileIdentity::of(&metadata));
+        Ok(!shared)
     }
     pub(crate) fn scan(
         self: &Arc<Self>,
         lowers: &[PathBuf],
         mode: IndexMode,
-        known: Option<&BTreeMap<ContentId, Arc<Stored>>>,
     ) -> Result<BTreeMap<ContentId, Arc<Stored>>> {
         // Load local index changes only at the explicit rescan boundary.
         let _ = self.records.load(&self.root.join("fastresume.bin"));
@@ -289,30 +294,6 @@ impl Disk {
                 if !kind.is_file() || crate::fastresume::is_cache_debris(&path) {
                     continue;
                 }
-                let length = if lower {
-                    0
-                } else if let Some(known) = known {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .and_then(|name| name.parse::<ContentId>().ok())
-                        .and_then(|id| known.get(&id))
-                        .and_then(|stored| match &stored.data {
-                            Data::File(file)
-                                if file
-                                    .entries
-                                    .lock()
-                                    .unwrap()
-                                    .iter()
-                                    .any(|entry| entry.path == path) =>
-                            {
-                                Some(file.object.bytes())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(0)
-                } else {
-                    entry.metadata()?.len()
-                };
                 let (indexed, location) =
                     self.index(&path, if lower { mode } else { IndexMode::Resume })?;
                 let id = ContentId::from_bytes(indexed.id.into_bytes());
@@ -321,7 +302,7 @@ impl Disk {
                         != Some(id.to_string().as_str())
                 {
                     self.records.forget(location.identity);
-                    self.discard_corrupt_upper(&path, length)?;
+                    self.discard_corrupt_upper(&path)?;
                     continue;
                 }
                 if let Some(stored) = objects.get(&id) {
@@ -390,66 +371,48 @@ impl FileObject {
         self.open_location().map(|(file, _)| file)
     }
     fn open_location(&self) -> Result<(crate::VerifiedFile, Entry)> {
+        let upper = self
+            .disk
+            .root
+            .join("objects")
+            .join(self.object.id().to_string());
+        let (before, tracked) = {
+            let entries = self
+                .entries
+                .lock()
+                .map_err(|_| Error::Invalid("file index lock"))?;
+            (
+                entries.len(),
+                entries.iter().any(|entry| entry.path == upper),
+            )
+        };
+        if tracked {
+            let refreshed = self.verify_upper(&upper)?;
+            let mut entries = self.entries.lock().unwrap();
+            entries.retain(|entry| entry.path != upper);
+            if let Some(refreshed) = refreshed {
+                entries.insert(0, refreshed);
+            }
+        }
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| Error::Invalid("file index lock"))?;
         let mut chosen = None;
         let mut failure = None;
-        let before = entries.len();
-        entries.retain_mut(|entry| {
-            let mut opened =
-                crate::open_indexed_file(self.object.id().digest(), self.object.bytes(), entry);
-            // Store-owned hard-link publication/removal changes ctime. Reverify
-            // that upper backing before refreshing its identity; changed lowers
-            // are still marked bad and require an explicit rescan.
-            let upper = entry.path.parent() == Some(self.disk.root.join("objects").as_path());
-            if !matches!(opened, Ok(Some(_))) && upper {
-                match self.disk.index(&entry.path, IndexMode::Resume) {
-                    Ok((indexed, refreshed))
-                        if indexed.id == self.object.id().digest()
-                            && indexed.len == self.object.bytes() =>
-                    {
-                        *entry = refreshed;
-                        opened = crate::open_indexed_file(
-                            self.object.id().digest(),
-                            self.object.bytes(),
-                            entry,
-                        );
-                    }
-                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        self.disk.records.forget(entry.identity);
-                        return false;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        return true;
-                    }
-                    Ok(_) => {
-                        if let Err(error) = self
-                            .disk
-                            .discard_corrupt_upper(&entry.path, self.object.bytes())
-                        {
-                            failure = Some(error);
-                            return true;
-                        }
-                        self.disk.records.forget(entry.identity);
-                        return false;
-                    }
-                }
-            }
-            match opened {
+        entries.retain(|entry| {
+            match crate::open_indexed_file(self.object.id().digest(), self.object.bytes(), entry) {
                 Ok(Some(file)) => {
                     if chosen.is_none() {
                         chosen = Some((file, entry.clone()));
                     }
                     true
                 }
-                Err(error) if upper => {
+                Err(error) if entry.path == upper => {
                     failure = Some(std::io::Error::other(error).into());
                     true
                 }
-                Ok(None) if upper => true,
+                Ok(None) if entry.path == upper => true,
                 _ => {
                     self.disk.records.forget(entry.identity);
                     false
@@ -529,21 +492,7 @@ impl FileObject {
     fn invalidate(&self, entry: &Entry) -> Result<()> {
         let upper = entry.path.parent() == Some(self.disk.root.join("objects").as_path());
         let refreshed = if upper {
-            match self.disk.index(&entry.path, IndexMode::Resume) {
-                Ok((indexed, refreshed))
-                    if indexed.id == self.object.id().digest()
-                        && indexed.len == self.object.bytes() =>
-                {
-                    Some(refreshed)
-                }
-                Ok(_) => {
-                    self.disk
-                        .discard_corrupt_upper(&entry.path, self.object.bytes())?;
-                    None
-                }
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            }
+            self.verify_upper(&entry.path)?
         } else {
             None
         };
@@ -582,7 +531,7 @@ impl FileObject {
             .join(self.object.id().to_string());
         let private = self.private.lock().unwrap().clone();
         if let Some(path) = private {
-            let entry = if let Some(entry) = self.existing(&destination)? {
+            let entry = if let Some(entry) = self.verify_upper(&destination)? {
                 entry
             } else {
                 fs::hard_link(&path, &destination)?;
@@ -611,36 +560,30 @@ impl FileObject {
         }
         self.link_temp(destination.parent().unwrap())
     }
-    fn existing(&self, path: &FsPath) -> Result<Option<Entry>> {
-        match path.symlink_metadata() {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        match self.disk.index(path, IndexMode::Resume) {
+    fn verify_upper(&self, path: &FsPath) -> Result<Option<Entry>> {
+        let released = match self.disk.index(path, IndexMode::Resume) {
             Ok((indexed, entry))
                 if indexed.id == self.object.id().digest()
                     && indexed.len == self.object.bytes() =>
             {
-                Ok(Some(entry))
+                return Ok(Some(entry));
             }
-            Err(error) => Err(error),
-            _ => {
-                let accounted = if self
-                    .entries
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry.path == path)
-                {
-                    self.object.bytes()
-                } else {
-                    0
-                };
-                self.disk.discard_corrupt_upper(path, accounted)?;
-                Ok(None)
-            }
+            Ok(_) => self.disk.discard_corrupt_upper(path)?,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        let mut entries = self.entries.lock().unwrap();
+        if released && entries.iter().any(|entry| entry.path == path) {
+            self.disk.quota.remove_owned(self.object.bytes());
         }
+        entries.retain(|entry| {
+            if entry.path != path {
+                return true;
+            }
+            self.disk.records.forget(entry.identity);
+            false
+        });
+        Ok(None)
     }
     fn link_temp(&self, directory: &FsPath) -> Result<()> {
         self.disk.durability.create_dir_all(directory)?;
@@ -652,7 +595,7 @@ impl FileObject {
         let Some((file, charge)) = staged.as_ref() else {
             return Ok(());
         };
-        let existing = self.existing(&path)?;
+        let existing = self.verify_upper(&path)?;
         let chunks = self.entries.lock().unwrap()[0].chunks.clone();
         if existing.is_none() {
             fs::hard_link(file.path(), &path)?;
@@ -762,9 +705,16 @@ impl DiskStore {
             let core = Core::new(ram);
             let (generation, pins) = disk.pins().await?;
             let scanning = disk.clone();
-            let objects = tokio::task::spawn_blocking(move || scanning.scan(&lower, mode, None))
-                .await
-                .map_err(|_| Error::Invalid("lower scan worker"))??;
+            let objects = tokio::task::spawn_blocking(move || {
+                let objects = scanning.scan(&lower, mode)?;
+                // No store or staging writer is exposed until this constructor returns.
+                scanning
+                    .quota
+                    .reconcile_used(Disk::owned_bytes(&scanning.root)?);
+                Ok::<_, Error>(objects)
+            })
+            .await
+            .map_err(|_| Error::Invalid("lower scan worker"))??;
             {
                 let mut state = core.state.lock().unwrap();
                 state.objects = objects;
@@ -885,11 +835,18 @@ impl DiskStore {
         self.core
             .access(&Scope::Owner, move |core| {
                 let mut state = core.state.lock().unwrap();
-                let objects =
-                    core.disk
-                        .as_ref()
-                        .unwrap()
-                        .scan(&lower, mode, Some(&state.objects))?;
+                for stored in state.objects.values() {
+                    if let Data::File(file) = &stored.data {
+                        file.verify_upper(
+                            &file
+                                .disk
+                                .root
+                                .join("objects")
+                                .join(file.object.id().to_string()),
+                        )?;
+                    }
+                }
+                let objects = core.disk.as_ref().unwrap().scan(&lower, mode)?;
                 state.reload(objects);
                 Ok(())
             })
