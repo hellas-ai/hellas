@@ -455,6 +455,32 @@ fn metadata_readable(scope: &Scope, name: &PinName, pin: &PinValue) -> bool {
 }
 
 impl State {
+    fn pin_generation(
+        &self,
+        scope: &Scope,
+        prefix: &str,
+        before: Option<(&PinName, Option<&PinValue>)>,
+    ) -> u64 {
+        use sha2::{Digest, Sha256};
+
+        if matches!(scope.kind, ScopeKind::Owner) {
+            return self.generation;
+        }
+        // Non-owner cursors describe only their visible snapshot, never global activity.
+        let mut hash = Sha256::new();
+        for (name, pin) in &self.pins {
+            let pin = before
+                .filter(|(changed, _)| *changed == name)
+                .map_or(Some(pin), |(_, pin)| pin);
+            if let Some(pin) = pin
+                && name.as_str().starts_with(prefix)
+                && metadata_readable(scope, name, pin)
+            {
+                hash.update(super::wire::pin(name, pin).encode_length_delimited_to_vec());
+            }
+        }
+        u64::from_le_bytes(hash.finalize()[..8].try_into().unwrap())
+    }
     fn check(&self, scope: &Scope) -> Result<()> {
         if let ScopeKind::Work {
             job,
@@ -884,13 +910,11 @@ impl Core {
                     && cursor.after.as_ref().is_none_or(|after| *name > after)
             })
             .collect();
-        // Owner snapshots can resume the existing watch; other scopes start a
-        // bounded replay/resync without disclosing node activity in ListPins.
         let current = Cursor {
-            generation: match (&scope.kind, cursor.after.is_some()) {
-                (ScopeKind::Owner, true) => cursor.generation,
-                (ScopeKind::Owner, false) => state.generation,
-                _ => 0,
+            generation: if cursor.after.is_some() {
+                cursor.generation
+            } else {
+                state.pin_generation(scope, prefix, None)
             },
             ..Default::default()
         };
@@ -938,45 +962,46 @@ impl Core {
         let store = self.clone();
         let scope = scope.clone();
         let prefix = prefix.to_owned();
-        Ok(Box::pin(futures::stream::unfold(
-            (store, scope, prefix, Some(from.generation)),
-            |(store, scope, prefix, seen)| async move {
-                let mut seen = seen?;
+        Ok(Box::pin(futures::stream::try_unfold(
+            (store, scope, prefix, from.generation),
+            |(store, scope, prefix, mut seen)| async move {
                 loop {
                     let wake = store.changed.clone().notified_owned();
                     tokio::pin!(wake);
                     wake.as_mut().enable();
                     let next = {
-                        let _gate = match store.effect_gate(&scope).await {
-                            Ok(gate) => gate,
-                            Err(error) => {
-                                return Some((Err(error), (store.clone(), scope, prefix, None)));
-                            }
+                        let _gate = store.effect_gate(&scope).await?;
+                        let state = store.state()?;
+                        state.check(&scope)?;
+                        let owner = matches!(scope.kind, ScopeKind::Owner);
+                        let current = state.pin_generation(&scope, &prefix, None);
+                        let resync = || PinEvent::Resync {
+                            cursor: Cursor {
+                                generation: current,
+                                ..Default::default()
+                            },
                         };
-                        let state = store.state.lock().unwrap();
-                        if let Err(error) = state.check(&scope) {
-                            return Some((Err(error), (store.clone(), scope, prefix, None)));
-                        }
                         let oldest =
                             state
                                 .events
                                 .front()
-                                .map_or(state.generation, |(event, _, _)| match event {
-                                    PinEvent::Set { cursor, .. } | PinEvent::Resync { cursor } => {
-                                        cursor.generation.saturating_sub(1)
-                                    }
+                                .map_or(state.generation, |(event, _, _)| {
+                                    let (PinEvent::Set { cursor, .. }
+                                    | PinEvent::Resync { cursor }) = event;
+                                    cursor.generation.saturating_sub(1)
                                 });
-                        if seen < oldest || seen > state.generation {
-                            seen = state.generation;
-                            Some(PinEvent::Resync {
-                                cursor: Cursor {
-                                    generation: seen,
-                                    ..Default::default()
-                                },
-                            })
+                        let mut next = if !owner && seen == current {
+                            None
+                        } else if owner && (seen < oldest || seen > state.generation) {
+                            Some(resync())
                         } else {
                             let mut next = None;
-                            for (event, old, _) in &state.events {
+                            let mut events = state.events.iter();
+                            while let Some((event, old, _)) = if owner {
+                                events.next()
+                            } else {
+                                events.next_back()
+                            } {
                                 let PinEvent::Set {
                                     cursor,
                                     name,
@@ -985,45 +1010,54 @@ impl Core {
                                 else {
                                     continue;
                                 };
-                                if cursor.generation <= seen {
-                                    continue;
-                                }
-                                seen = cursor.generation;
-                                if !name.as_str().starts_with(&prefix) {
-                                    continue;
-                                }
-                                let current = state.pins.get(name);
-                                if current == value.as_ref()
-                                    && current
-                                        .is_some_and(|pin| metadata_readable(&scope, name, pin))
+                                if (owner && cursor.generation <= seen)
+                                    || !name.as_str().starts_with(&prefix)
                                 {
-                                    next = Some(event.clone());
-                                    break;
+                                    continue;
                                 }
-                                let formerly_visible = old
-                                    .as_ref()
-                                    .is_some_and(|old| metadata_readable(&scope, name, old))
-                                    || value.as_ref().is_some_and(|value| {
-                                        metadata_readable(&scope, name, value)
-                                    });
-                                if formerly_visible {
-                                    // A replay must not disclose a pin's old target after its
-                                    // authority changes. Resync carries no private name or value.
-                                    seen = state.generation;
-                                    next = Some(PinEvent::Resync {
-                                        cursor: Cursor {
-                                            generation: seen,
-                                            ..Default::default()
+                                let visible = |pin: &PinValue| metadata_readable(&scope, name, pin);
+                                let pin = state.pins.get(name);
+                                if pin == value.as_ref() && pin.is_some_and(visible) {
+                                    // A Set must account for the entire snapshot change,
+                                    // including expirations that have no event of their own.
+                                    next = Some(
+                                        if owner
+                                            || state.pin_generation(
+                                                &scope,
+                                                &prefix,
+                                                Some((name, old.as_ref())),
+                                            ) == seen
+                                        {
+                                            event.clone()
+                                        } else {
+                                            resync()
                                         },
-                                    });
+                                    );
+                                    break;
+                                } else if owner
+                                    && (old.as_ref().is_some_and(visible)
+                                        || value.as_ref().is_some_and(visible))
+                                {
+                                    // Never replay an old target after its authority changes.
+                                    next = Some(resync());
                                     break;
                                 }
                             }
-                            next
+                            next.or_else(|| (!owner).then(resync))
+                        };
+                        seen = match &next {
+                            Some(PinEvent::Set { cursor, .. }) if owner => cursor.generation,
+                            _ => current,
+                        };
+                        if !owner && let Some(event) = &mut next {
+                            let (PinEvent::Set { cursor, .. } | PinEvent::Resync { cursor }) =
+                                event;
+                            cursor.generation = seen;
                         }
+                        next
                     };
                     if let Some(next) = next {
-                        return Some((Ok(next), (store, scope, prefix, Some(seen))));
+                        return Ok::<_, Error>(Some((next, (store, scope, prefix, seen))));
                     }
                     wake.await;
                 }
