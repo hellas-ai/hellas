@@ -28,6 +28,25 @@ impl Drop for LocalSession {
         }
     }
 }
+pub(super) fn verify_list(object: ContentRef, chunks: &[Chunk]) -> Result<()> {
+    if chunks
+        .iter()
+        .try_fold(0u64, |bytes, chunk| bytes.checked_add(chunk.data_len))
+        != Some(object.bytes())
+        || file_hash(chunks) != object.id().digest()
+        || chunks
+            .iter()
+            .any(|chunk| chunk.data_len == 0 || chunk.data_len > MAX_CHUNK_SIZE as u64)
+        || chunks
+            .iter()
+            .rev()
+            .skip(1)
+            .any(|chunk| chunk.data_len < MIN_CHUNK_SIZE as u64)
+    {
+        return Err(Error::Invalid("descriptor commitment"));
+    }
+    Ok(())
+}
 enum Destination {
     Verify,
     Local(Box<LocalSession>),
@@ -147,9 +166,7 @@ impl UploadSession {
                 return Err(Error::Invalid("upload source grew"));
             }
             let chunks = hash.finalize_chunks();
-            if hellas_xet::file_hash(&chunks) != object.id().digest() {
-                return Err(Error::Invalid("upload source changed"));
-            }
+            verify_list(object, &chunks)?;
             reader.rewind()?;
             Ok((reader, chunks, charge))
         })
@@ -278,19 +295,7 @@ impl UploadSession {
         self.chunks.extend_from_slice(chunks);
         self.declared_bytes = total;
         if complete {
-            if total != self.object.bytes() || file_hash(&self.chunks) != self.object.id().digest()
-            {
-                return Err(Error::Invalid("descriptor commitment"));
-            }
-            if self
-                .chunks
-                .iter()
-                .rev()
-                .skip(1)
-                .any(|chunk| chunk.data_len < MIN_CHUNK_SIZE as u64)
-            {
-                return Err(Error::Invalid("short nonfinal chunk"));
-            }
+            verify_list(self.object, &self.chunks)?;
             self.declared = true;
         }
         Ok(())

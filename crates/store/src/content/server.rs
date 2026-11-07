@@ -271,14 +271,8 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
                         let chunks = list
                             .chunks
                             .into_iter()
-                            .map(|chunk| {
-                                Ok(hellas_xet::Chunk::new(
-                                    hellas_xet::XetHash::from_slice(&chunk.hash)
-                                        .map_err(|_| status(Error::Invalid("chunk hash")))?,
-                                    chunk.bytes,
-                                ))
-                            })
-                            .collect::<std::result::Result<Vec<_>, WireStatus>>()?;
+                            .map(w::chunk_from)
+                            .collect::<Result<Vec<_>>>().map_err(status)?;
                         upload
                             .declare(&chunks, list.complete)
                             .await

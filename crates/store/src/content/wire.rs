@@ -244,3 +244,13 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
         },
     })
 }
+
+pub(crate) fn chunk_from(chunk: pb::Chunk) -> Result<hellas_xet::Chunk> {
+    if chunk.bytes == 0 || chunk.bytes > hellas_xet::MAX_CHUNK_SIZE as u64 {
+        return Err(Error::Invalid("chunk length"));
+    }
+    Ok(hellas_xet::Chunk::new(
+        hellas_xet::XetHash::from_slice(&chunk.hash).map_err(|_| Error::Invalid("chunk hash"))?,
+        chunk.bytes,
+    ))
+}

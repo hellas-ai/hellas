@@ -5,7 +5,7 @@ use hellas_rpc::{
     ContentRef, call::BidiStreamingCall, pb::content as pb, services::content::ContentClientImpl,
 };
 use hellas_wire::StreamTransport;
-use hellas_xet::{Chunk, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
+use hellas_xet::{Chunk, MIN_CHUNK_SIZE};
 use std::sync::Arc;
 
 type UploadCall = BidiStreamingCall<pb::UploadRequest, pb::UploadResponse>;
@@ -239,16 +239,7 @@ where
                 None => break,
             }
         }
-        if chunks
-            .iter()
-            .rev()
-            .skip(1)
-            .any(|chunk| chunk.data_len < MIN_CHUNK_SIZE as u64)
-            || bytes != object.bytes()
-            || hellas_xet::file_hash(&chunks) != object.id().digest()
-        {
-            return Err(Error::Invalid("remote manifest commitment"));
-        }
+        super::upload::verify_list(object, &chunks)?;
         Ok((object, chunks, charges))
     }
 }
@@ -294,17 +285,11 @@ where
         if cursor.object.is_some_and(|old| old != object) {
             return Err(Error::Conflict);
         }
-        let mut chunks = Vec::new();
-        for chunk in response.chunks {
-            if chunk.bytes == 0 || chunk.bytes > MAX_CHUNK_SIZE as u64 {
-                return Err(Error::Invalid("remote chunk length"));
-            }
-            chunks.push(Chunk::new(
-                hellas_xet::XetHash::from_slice(&chunk.hash)
-                    .map_err(|_| Error::Invalid("remote chunk hash"))?,
-                chunk.bytes,
-            ));
-        }
+        let chunks = response
+            .chunks
+            .into_iter()
+            .map(w::chunk_from)
+            .collect::<Result<Vec<_>>>()?;
         Ok(ChunkPage {
             object,
             chunks,
