@@ -116,8 +116,8 @@ pub fn load_pool_options(
                     Some(TrustPolicyStore::new(directory).resolve(
                         id,
                         assurance,
-                        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-                            config.chain.home().join("apple-app-attest-open-counters"),
+                        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::in_home(
+                            config.chain.home(),
                         )),
                     )?)
                 }
