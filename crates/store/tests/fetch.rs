@@ -100,7 +100,7 @@ fn a_range_that_ends_before_it_starts_does_not_parse() {
 
     // The control: the same shapes, the right way round.
     let forwards = format!(
-        r#"{{"terms":[{{"hash":"{XORB}","unpacked_length":1,"range":{{"start":2,"end":9}}}}],
+        r#"{{"terms":[{{"hash":"{XORB}","unpacked_length":1,"range":{{"start":0,"end":1}}}}],
             "xorbs":{{"{XORB}":[{{"url":"http://example.invalid",
               "ranges":[{{"chunks":{{"start":0,"end":1}},
                           "bytes":{{"start":0,"end":100}}}}]}}]}}}}"#

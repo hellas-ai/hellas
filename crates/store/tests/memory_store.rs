@@ -390,7 +390,15 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
         .unwrap()
         .cursor;
     let mut watch = store
-        .watch(&Scope::Public, "", cursor.clone())
+        .watch(
+            &Scope::Public,
+            "",
+            store
+                .pins(&Scope::Public, "", Cursor::default())
+                .await
+                .unwrap()
+                .cursor,
+        )
         .await
         .unwrap();
     let value = PinValue {
@@ -468,7 +476,8 @@ async fn watch_filters_private_changes_and_resyncs_instead_of_unbounded_history(
 
 #[tokio::test]
 async fn retained_reads_keep_their_ram_charge_until_drop() {
-    let pool = Reservations::ram(512);
+    // One transient chunk descriptor coexists with the reserved payload.
+    let pool = Reservations::ram(512 + std::mem::size_of::<hellas_xet::Chunk>() as u64);
     let store = MemoryStore::new(pool.clone());
     let object = put(&store, "read", &vec![5; 512], PinPolicy::Public).await;
     let mut read = store
@@ -490,7 +499,8 @@ async fn retained_reads_keep_their_ram_charge_until_drop() {
 
 #[tokio::test]
 async fn own_progress_retries_do_not_allocate_again_and_undeclared_metadata_is_hidden() {
-    let pool = Reservations::ram(512);
+    // One transient chunk descriptor coexists with the reserved payload.
+    let pool = Reservations::ram(512 + std::mem::size_of::<hellas_xet::Chunk>() as u64);
     let store = MemoryStore::new(pool.clone());
     let payload = vec![6; 512];
     let object = ContentRef::for_bytes(&payload);
@@ -578,17 +588,23 @@ async fn own_progress_retries_do_not_allocate_again_and_undeclared_metadata_is_h
 
 #[tokio::test]
 async fn globally_pinning_a_private_copy_cannot_reuse_its_ram_for_another_object() {
-    let pool = Reservations::ram(12);
+    let descriptor = std::mem::size_of::<hellas_xet::Chunk>();
+    // Each missing object must exceed the transient descriptor headroom.
+    let payload = descriptor + 1;
+    let pool = Reservations::ram((3 * payload + descriptor) as u64);
     let store = MemoryStore::new(pool.clone());
-    let a = put(&store, "a", b"aaaa", PinPolicy::Owner).await;
-    let b = put(&store, "b", b"bbbb", PinPolicy::Jobs).await;
-    let scope = store.open_work(job(1, 2), vec![a, b], 8).await.unwrap();
-    let mut session = store.upload(&scope, a, None).await.unwrap();
-    session
-        .declare(&hellas_xet::chunk(b"aaaa"), true)
+    let a = put(&store, "a", &vec![b'a'; payload], PinPolicy::Owner).await;
+    let b = put(&store, "b", &vec![b'b'; payload], PinPolicy::Jobs).await;
+    let scope = store
+        .open_work(job(1, 2), vec![a, b], a.bytes() + b.bytes())
         .await
         .unwrap();
-    session.accept_chunk(b"aaaa").await.unwrap();
+    let mut session = store.upload(&scope, a, None).await.unwrap();
+    session
+        .declare(&hellas_xet::chunk(&vec![b'a'; payload]), true)
+        .await
+        .unwrap();
+    session.accept_chunk(&vec![b'a'; payload]).await.unwrap();
     let old = store
         .pins(&Scope::Owner, "a", Cursor::default())
         .await
@@ -609,8 +625,8 @@ async fn globally_pinning_a_private_copy_cannot_reuse_its_ram_for_another_object
         store.upload(&scope, b, None).await,
         Err(Error::Capacity)
     ));
-    assert_eq!(pool.held(), 12);
+    assert_eq!(pool.held(), 3 * a.bytes());
     store.end_work(&scope).await.unwrap();
     drop(session);
-    assert_eq!(pool.held(), 8);
+    assert_eq!(pool.held(), a.bytes() + b.bytes());
 }
