@@ -29,8 +29,6 @@ service LightClient {
   rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
-  rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);
-  rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
@@ -39,10 +37,6 @@ service LightClient {
   rpc SubmitWorkResponse(SubmitWorkResponseRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
-  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsResponse);
-  // Coins delegated to this node, without counting them as its owned balance.
-  rpc GetCoinsByDelegate(GetCoinsByDelegateRequest) returns (GetCoinsResponse);
-  rpc GetEdgesByOwner(GetEdgesByOwnerRequest) returns (GetEdgesByOwnerResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
   rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
 }
@@ -122,44 +116,6 @@ message GetProofRequest {
 }
 message GetProofResponse {
   optional bytes proof = 1;
-}
-
-message GetCoinRequest {
-  bytes payload = 1;
-  bytes object_id = 2;
-}
-message GetCoinResponse {
-  optional bytes owner = 1;
-  optional uint64 value = 2;
-  // The key the coin is delegated to, absent for an undelegated coin.
-  optional bytes delegate = 3;
-}
-
-message GetEdgeRequest {
-  bytes payload = 1;
-  bytes object_id = 2;
-}
-
-message KernelFees {
-  uint64 base = 1;
-  uint64 slot = 2;
-  uint64 proof = 3;
-  uint64 lifetime = 4;
-}
-
-message EdgeState {
-  uint64 value = 1;
-  uint64 reserve = 2;
-  KernelFees close_fees = 3;
-  uint64 timeout = 4;
-  bytes maker = 5;
-  bytes taker = 6;
-  bytes terms_hash = 7;
-}
-
-message GetEdgeResponse {
-  EdgeState edge = 1;
-  optional bytes state_root = 2;
 }
 
 message GetFinalizationRequest {
@@ -251,39 +207,6 @@ message GetConsensusInfoResponse {
   // verifies, and learns it here for the same reason it learns the
   // validator set here.
   string network_id = 3;
-}
-
-message GetCoinsByOwnerRequest {
-  bytes owner = 1;
-}
-
-message GetCoinsByDelegateRequest {
-  bytes delegate = 1;
-}
-
-message CoinEntry {
-  bytes object_id = 1;
-  uint64 value = 2;
-}
-
-message GetCoinsResponse {
-  FinalizedSnapshot snapshot = 1;
-  repeated CoinEntry coins = 2;
-}
-
-message GetEdgesByOwnerRequest {
-  bytes owner = 1;
-}
-
-message EdgeEntry {
-  bytes object_id = 1;
-  bytes maker = 2;
-  bytes taker = 3;
-}
-
-message GetEdgesByOwnerResponse {
-  FinalizedSnapshot snapshot = 1;
-  repeated EdgeEntry edges = 2;
 }
 
 message ProposalInfo {

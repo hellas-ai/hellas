@@ -237,9 +237,9 @@ mod id_pins {
             GetAppliedFinalizedBlock, GetStateRoot, LightClient, SubmitWorkResponse,
             SubscribeFinalized,
         };
-        // Fixing the owner page size and dropping the echoed cursor on
-        // GetObjectProofs deliberately rotates the LightClient service.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xed50_ce06);
+        // Removing the unverified coin and edge reads, which GetObjectProofs
+        // replaces, deliberately rotates the LightClient service.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x6a5a_dd5a);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974

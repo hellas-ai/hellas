@@ -1,6 +1,6 @@
 use super::*;
-use crate::domain::ObjectId;
-use crate::{CoinListing, Mempool, light_client::QueryError};
+use crate::domain::{Coin, ObjectId, SettlementKey};
+use crate::{CoinListing, EdgeLookup, Mempool, OwnerEdges, light_client::QueryError};
 use bytes::Bytes;
 use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::test_support::valid_open_tx;
@@ -37,8 +37,6 @@ impl Default for ResponseBlocker {
 struct MempoolClient {
     mempool: Mempool,
     height: Arc<AtomicU64>,
-    edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
-    owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
     response_blocker: Option<Arc<ResponseBlocker>>,
     validators_blocker: Option<Arc<ResponseBlocker>>,
     forced_submit_outcome: Arc<std::sync::Mutex<Option<SubmitTxOutcome>>>,
@@ -66,7 +64,7 @@ impl LightClientApi for MempoolClient {
         _payload: Digest,
         _object_id: ObjectId,
     ) -> Result<Option<EdgeLookup>, QueryError> {
-        self.edge_result.clone().unwrap_or(Ok(None))
+        panic!("unused test method")
     }
 
     async fn get_finalization(&self, _payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -135,7 +133,7 @@ impl LightClientApi for MempoolClient {
         &self,
         _owner: SettlementKey,
     ) -> Result<Option<OwnerEdges>, QueryError> {
-        self.owner_edges_result.clone().unwrap_or(Ok(None))
+        panic!("unused test method")
     }
 }
 
@@ -561,219 +559,6 @@ async fn activity_stream_does_not_block_unary_requests() {
     assert_eq!(validators, ["validator-a"]);
 
     server.abort();
-}
-
-#[tokio::test]
-async fn get_edge_endpoint_preserves_full_state_root_absence_and_wrong_kind() {
-    let open = valid_open_tx().expect("valid kernel open fixture");
-    let KernelTx::Open { terms, .. } = open else {
-        panic!("fixture must be an open")
-    };
-    let parties = terms.parties();
-    let state_root = Digest::from([0x31; 32]);
-    let edge = EdgeState {
-        value: 101,
-        reserve: 9,
-        close_fees: hellas_kernel::Fees::new(1, 2, 3, 4),
-        timeout: hellas_kernel::BlockHeight::new(55),
-        maker: SettlementKey::from(parties.maker().owner()),
-        taker: SettlementKey::from(parties.taker().owner()),
-        terms_hash: terms.hash(),
-    };
-    let (activity_tx, _activity_rx) = broadcast::channel(1);
-    let found_rpc = LightClientRpc::new(
-        MempoolClient {
-            edge_result: Some(Ok(Some(EdgeLookup {
-                state_root,
-                edge: Some(edge),
-            }))),
-            ..MempoolClient::default()
-        },
-        activity_tx.clone(),
-    );
-    let request = pb::GetEdgeRequest {
-        payload: vec![0x11; 32],
-        object_id: vec![0x22; 32],
-    };
-    let response = LightClientHandler::get_edge(&found_rpc, request.clone())
-        .await
-        .expect("edge response");
-    assert_eq!(response.state_root, Some(state_root.to_vec()));
-    let response_edge = response.edge.expect("full edge state");
-    assert_eq!(response_edge.value, edge.value);
-    assert_eq!(response_edge.reserve, edge.reserve);
-    assert_eq!(response_edge.timeout, edge.timeout.get());
-    assert_eq!(response_edge.maker, edge.maker.to_bytes());
-    assert_eq!(response_edge.taker, edge.taker.to_bytes());
-    assert_eq!(response_edge.terms_hash, edge.terms_hash.to_bytes());
-    assert_eq!(
-        response_edge.close_fees,
-        Some(KernelFees {
-            base: 1,
-            slot: 2,
-            proof: 3,
-            lifetime: 4,
-        })
-    );
-
-    let absent_rpc = LightClientRpc::new(MempoolClient::default(), activity_tx.clone());
-    let absent = LightClientHandler::get_edge(&absent_rpc, request.clone())
-        .await
-        .expect("absent edge response");
-    assert_eq!(absent.edge, None);
-    assert_eq!(absent.state_root, None);
-
-    let wrong_kind_rpc = LightClientRpc::new(
-        MempoolClient {
-            edge_result: Some(Err(QueryError::WrongObjectKind {
-                expected: crate::domain::ObjectKind::Edge,
-                actual: crate::domain::ObjectKind::Coin,
-            })),
-            ..MempoolClient::default()
-        },
-        activity_tx,
-    );
-    let error = LightClientHandler::get_edge(&wrong_kind_rpc, request)
-        .await
-        .expect_err("coin in edge slot is typed");
-    assert!(matches!(
-        QueryError::from(error),
-        QueryError::WrongObjectKind {
-            expected: crate::domain::ObjectKind::Edge,
-            actual: crate::domain::ObjectKind::Coin,
-        }
-    ));
-}
-
-#[cfg(feature = "validator")]
-#[tokio::test]
-async fn get_edges_by_owner_endpoint_tracks_open_close_and_empty_owner() {
-    use crate::execution::test_support::{index_block, index_genesis, kernel_fixture};
-    use crate::owner_index::ApplyOutcome;
-    use commonware_cryptography::Digestible as _;
-
-    fn response_from_index(
-        index: &crate::OwnerIndex,
-        owner: SettlementKey,
-        finalization: Vec<u8>,
-    ) -> OwnerEdges {
-        let (cursor, edges) = index.get_edges_by_owner_snapshot(&owner);
-        OwnerEdges {
-            snapshot: LatestBlock {
-                height: cursor.height,
-                payload: cursor.payload,
-                state_root: cursor.state_root,
-                finalization,
-            },
-            edges: edges
-                .into_iter()
-                .map(|(object_id, edge)| crate::EdgeRecord {
-                    object_id,
-                    maker: SettlementKey::from(edge.maker().owner()),
-                    taker: SettlementKey::from(edge.taker().owner()),
-                })
-                .collect(),
-        }
-    }
-
-    fn rpc_with_owner_edges(owner_edges: OwnerEdges) -> LightClientRpc<MempoolClient> {
-        let (activity_tx, _activity_rx) = broadcast::channel(1);
-        LightClientRpc::new(
-            MempoolClient {
-                owner_edges_result: Some(Ok(Some(owner_edges))),
-                ..MempoolClient::default()
-            },
-            activity_tx,
-        )
-    }
-
-    let genesis = index_genesis();
-    let fixture = kernel_fixture(10).expect("kernel fixture");
-    let index = crate::OwnerIndex::new(
-        crate::domain::TEST_NETWORK,
-        &genesis,
-        fixture.allocations.clone(),
-    );
-    let finalization = vec![0xfa, 0xce];
-    let request = pb::GetEdgesByOwnerRequest {
-        owner: fixture.maker.to_bytes().to_vec(),
-    };
-
-    let open_block = index_block(
-        &genesis,
-        Digest::from([0x41; 32]),
-        vec![Transaction::Kernel(fixture.open.clone())],
-    );
-    assert_eq!(
-        index.apply_finalized(&open_block),
-        Ok(ApplyOutcome::Applied)
-    );
-    let open_rpc = rpc_with_owner_edges(response_from_index(
-        &index,
-        fixture.maker,
-        finalization.clone(),
-    ));
-    let open_response = LightClientHandler::get_edges_by_owner(&open_rpc, request.clone())
-        .await
-        .expect("open owner listing");
-    let open_snapshot = open_response.snapshot.expect("indexed snapshot");
-    assert_eq!(open_snapshot.finalization, finalization);
-    assert_eq!(open_snapshot.payload, open_block.digest().to_vec());
-    assert!(matches!(
-        open_response.edges.as_slice(),
-        [edge] if edge.object_id == crate::domain::edge_object_id(fixture.edge).to_vec()
-            && edge.maker == fixture.maker.to_bytes()
-    ));
-
-    let empty_owner = SettlementKey::from_bytes([0x99; SettlementKey::LENGTH]);
-    let empty_rpc = rpc_with_owner_edges(response_from_index(
-        &index,
-        empty_owner,
-        finalization.clone(),
-    ));
-    let empty_response = LightClientHandler::get_edges_by_owner(
-        &empty_rpc,
-        pb::GetEdgesByOwnerRequest {
-            owner: empty_owner.to_bytes().to_vec(),
-        },
-    )
-    .await
-    .expect("empty owner listing");
-    assert!(empty_response.snapshot.is_some());
-    assert!(empty_response.edges.is_empty());
-
-    let close_block = index_block(
-        &open_block,
-        Digest::from([0x42; 32]),
-        vec![Transaction::Kernel(fixture.mutual_close)],
-    );
-    assert_eq!(
-        index.apply_finalized(&close_block),
-        Ok(ApplyOutcome::Applied)
-    );
-    let close_rpc = rpc_with_owner_edges(response_from_index(&index, fixture.maker, finalization));
-    let close_response = LightClientHandler::get_edges_by_owner(&close_rpc, request)
-        .await
-        .expect("closed owner listing");
-    let close_snapshot = close_response.snapshot.expect("indexed snapshot");
-    assert_eq!(close_snapshot.finalization, vec![0xfa, 0xce]);
-    assert_eq!(close_snapshot.payload, close_block.digest().to_vec());
-    assert!(close_response.edges.is_empty());
-}
-
-#[test]
-fn owner_query_accepts_raw_non_p256_settlement_key() {
-    let raw = vec![0xa5; SettlementKey::LENGTH];
-    let key = settlement_key_from_bytes(raw.clone(), "owner").expect("raw settlement key");
-    assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
-    assert!(p256::PublicKey::from_sec1_bytes(key.as_bytes()).is_err());
-}
-
-#[test]
-fn owner_query_rejects_wrong_settlement_key_length() {
-    let err = settlement_key_from_bytes(vec![0; SettlementKey::LENGTH - 1], "owner")
-        .expect_err("short settlement key");
-    assert_eq!(err.code(), WireCode::InvalidArgument);
 }
 
 #[test]

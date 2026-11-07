@@ -1,22 +1,19 @@
-use crate::domain::{Coin, Digest, SettlementKey, Transaction};
+use crate::domain::{Digest, Transaction};
 use crate::{
-    ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
-    LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
-    ProposalInfo,
+    ConsensusActivity, ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
+    LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, ProposalInfo,
 };
 use futures_util::StreamExt as _;
 use hellas_auth::authority::UnixMillis;
 use hellas_kernel::{Decode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
-        self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
-        FinalizationEvent, FinalizedBlock as ProtoFinalizedBlock, FinalizedSnapshot,
-        GetCoinResponse, GetCoinsResponse, GetConsensusInfoResponse, GetEdgeResponse,
-        GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
-        GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, KernelFees, NotarizationEvent, NotarizeEvent, NullificationEvent,
-        NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse,
-        SubmitWorkResponseRequest, activity_event, submit_tx_request,
+        self as pb, ActivityEvent, FinalizationEvent, FinalizedBlock as ProtoFinalizedBlock,
+        FinalizedSnapshot, GetConsensusInfoResponse, GetFinalizationResponse,
+        GetFinalizedBlockResponse, GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse,
+        GetStateRootResponse, GetValidatorsResponse, NotarizationEvent, NotarizeEvent,
+        NullificationEvent, NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome,
+        SubmitTxResponse, SubmitWorkResponseRequest, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -355,38 +352,6 @@ where
         }
     }
 
-    fn get_coin(
-        &self,
-        request: pb::GetCoinRequest,
-    ) -> impl Future<Output = Result<GetCoinResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let payload = digest_from_bytes(request.payload, "payload")?;
-            let object_id = digest_from_bytes(request.object_id, "object_id")?;
-            let coin = client
-                .get_coin(payload, object_id)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(coin_response(coin))
-        }
-    }
-
-    fn get_edge(
-        &self,
-        request: pb::GetEdgeRequest,
-    ) -> impl Future<Output = Result<GetEdgeResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let payload = digest_from_bytes(request.payload, "payload")?;
-            let object_id = digest_from_bytes(request.object_id, "object_id")?;
-            let edge = client
-                .get_edge(payload, object_id)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(edge_response(edge))
-        }
-    }
-
     fn get_finalization(
         &self,
         request: pb::GetFinalizationRequest,
@@ -558,51 +523,6 @@ where
         }
     }
 
-    fn get_coins_by_owner(
-        &self,
-        request: pb::GetCoinsByOwnerRequest,
-    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let owner = settlement_key_from_bytes(request.owner, "owner")?;
-            let response = client
-                .get_coins_by_owner(owner)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(coin_listing_response(response))
-        }
-    }
-
-    fn get_coins_by_delegate(
-        &self,
-        request: pb::GetCoinsByDelegateRequest,
-    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let delegate = settlement_key_from_bytes(request.delegate, "delegate")?;
-            let response = client
-                .get_coins_by_delegate(delegate)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(coin_listing_response(response))
-        }
-    }
-
-    fn get_edges_by_owner(
-        &self,
-        request: pb::GetEdgesByOwnerRequest,
-    ) -> impl Future<Output = Result<GetEdgesByOwnerResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let owner = settlement_key_from_bytes(request.owner, "owner")?;
-            let response = client
-                .get_edges_by_owner(owner)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(edges_by_owner_response(response))
-        }
-    }
-
     async fn get_relay_info(
         &self,
         _request: pb::GetRelayInfoRequest,
@@ -649,20 +569,6 @@ fn digest_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Digest, Wire
     Ok(Digest::from(raw))
 }
 
-fn settlement_key_from_bytes(
-    bytes: Vec<u8>,
-    field: &'static str,
-) -> Result<SettlementKey, WireStatus> {
-    let len = bytes.len();
-    let raw: [u8; SettlementKey::LENGTH] = bytes.try_into().map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            format!("{field} must be {} bytes, got {len}", SettlementKey::LENGTH),
-        )
-    })?;
-    Ok(SettlementKey::from_bytes(raw))
-}
-
 fn submit_tx_outcome_to_proto(outcome: SubmitTxOutcome) -> ProtoSubmitTxOutcome {
     match outcome {
         SubmitTxOutcome::Enqueued => ProtoSubmitTxOutcome::Enqueued,
@@ -700,76 +606,6 @@ fn kernel_from_proto(bytes: &[u8]) -> Result<Transaction, WireStatus> {
                 "invalid canonical kernel transaction",
             )
         })
-}
-
-fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
-    match coin {
-        Some(Coin {
-            owner,
-            delegate,
-            value,
-        }) => GetCoinResponse {
-            owner: Some(owner.to_bytes().to_vec()),
-            value: Some(value),
-            delegate: delegate.map(|delegate| delegate.to_bytes().to_vec()),
-        },
-        None => GetCoinResponse {
-            owner: None,
-            value: None,
-            delegate: None,
-        },
-    }
-}
-
-fn edge_response(lookup: Option<EdgeLookup>) -> GetEdgeResponse {
-    match lookup {
-        Some(EdgeLookup { state_root, edge }) => GetEdgeResponse {
-            edge: edge.map(edge_state_to_proto),
-            state_root: Some(state_root.to_vec()),
-        },
-        None => GetEdgeResponse {
-            edge: None,
-            state_root: None,
-        },
-    }
-}
-
-fn edge_state_to_proto(edge: EdgeState) -> ProtoEdgeState {
-    ProtoEdgeState {
-        value: edge.value,
-        reserve: edge.reserve,
-        close_fees: Some(KernelFees {
-            base: edge.close_fees.base(),
-            slot: edge.close_fees.slot(),
-            proof: edge.close_fees.proof(),
-            lifetime: edge.close_fees.lifetime(),
-        }),
-        timeout: edge.timeout.get(),
-        maker: edge.maker.to_bytes().to_vec(),
-        taker: edge.taker.to_bytes().to_vec(),
-        terms_hash: edge.terms_hash.to_bytes().to_vec(),
-    }
-}
-
-fn edges_by_owner_response(edges: Option<OwnerEdges>) -> GetEdgesByOwnerResponse {
-    match edges {
-        Some(owner_edges) => GetEdgesByOwnerResponse {
-            snapshot: Some(latest_block_to_proto(owner_edges.snapshot)),
-            edges: owner_edges
-                .edges
-                .into_iter()
-                .map(|edge| EdgeEntry {
-                    object_id: edge.object_id.to_vec(),
-                    maker: edge.maker.to_bytes().to_vec(),
-                    taker: edge.taker.to_bytes().to_vec(),
-                })
-                .collect(),
-        },
-        None => GetEdgesByOwnerResponse {
-            snapshot: None,
-            edges: Vec::new(),
-        },
-    }
 }
 
 fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse {
@@ -934,24 +770,4 @@ where
     Ok(GetFinalizationResponse {
         certificate: read(digest_from_bytes(request.payload, "payload")?).await?,
     })
-}
-
-fn coin_listing_response(response: Option<crate::CoinListing>) -> GetCoinsResponse {
-    match response {
-        Some(listing) => GetCoinsResponse {
-            snapshot: Some(latest_block_to_proto(listing.snapshot)),
-            coins: listing
-                .coins
-                .into_iter()
-                .map(|(object_id, value)| CoinEntry {
-                    object_id: object_id.to_vec(),
-                    value,
-                })
-                .collect(),
-        },
-        None => GetCoinsResponse {
-            snapshot: None,
-            coins: Vec::new(),
-        },
-    }
 }
