@@ -488,7 +488,6 @@ impl PaidWorkSession {
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
-        config.clone().validate()?;
         if owner.chain().as_path() != config.chain.as_path() {
             return Err(PaidClientError::InvalidOptions(
                 "funding owner belongs to another chain directory",

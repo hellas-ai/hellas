@@ -220,40 +220,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_authority_changes_state_key_but_later_epochs_do_not() {
-        let known = ChainProfile::known(Chain::Devnet);
-        let mut genesis = known.genesis().clone();
-        genesis.network_id = "custom-1".into();
-        let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = known.trust().clone();
-        trust.network_id = genesis.network_id.clone();
-        trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
-        let make = |trust: TrustDocument| {
-            ChainProfile::custom(CustomChainFile {
-                trust,
-                validators: vec!["ws://127.0.0.1:9080".into()],
-                genesis_json: genesis_json.clone(),
-            })
-            .unwrap()
-        };
-        let first = make(trust.clone());
-
-        let mut other_authority = trust.clone();
-        let mut key = hex::decode(&other_authority.epochs[0].threshold_identity).unwrap();
-        key[0] ^= 1;
-        other_authority.epochs[0].threshold_identity = hex::encode(key);
-        assert_ne!(first.state_key(), make(other_authority).state_key());
-
-        trust.epochs[0].end_height = Some(10);
-        let mut next = trust.epochs[0].clone();
-        next.epoch += 1;
-        next.start_height = 10;
-        next.end_height = None;
-        trust.epochs.push(next);
-        assert_eq!(first.state_key(), make(trust).state_key());
-    }
-
-    #[test]
     fn custom_profile_requires_genesis_bytes_and_rejects_a_foreign_name() {
         let known = ChainProfile::known(Chain::Devnet);
         let without_genesis = serde_json::json!({

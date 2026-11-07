@@ -68,11 +68,11 @@ pub enum Error {
 
 impl Config {
     pub fn genesis(&self) -> &hellas_genesis::Genesis {
-        self.chain.profile().genesis()
+        self.chain.genesis()
     }
 
     pub fn threshold_identity(&self) -> Vec<u8> {
-        hex::decode(&self.chain.profile().trust().epochs[0].threshold_identity)
+        hex::decode(&self.chain.trust().epochs[0].threshold_identity)
             .expect("validated trust identity")
     }
 
@@ -86,7 +86,6 @@ impl Config {
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
         chain
-            .profile()
             .static_threshold_identity()
             .map_err(|error| Error::Config(error.to_string()))?;
         Ok(Self::from_profile(chain, peers, archive_blocks, false))
@@ -107,7 +106,7 @@ impl Config {
         archive_blocks: Option<NonZeroU64>,
         indexed: bool,
     ) -> Self {
-        let validators = chain.profile().validators().to_vec();
+        let validators = chain.validators().to_vec();
         Self {
             chain,
             indexed,
@@ -461,7 +460,6 @@ impl Core {
         let genesis = application.genesis_block();
         if config
             .chain
-            .profile()
             .known_genesis_payload_pin()
             .is_some_and(|pin| genesis.digest().0 != pin)
         {
@@ -503,7 +501,7 @@ impl Core {
                 };
                 let scope = crate::edge_index::query::cursor_scope(
                     &config.genesis().network_id,
-                    &config.chain.profile().trust().genesis_sha256,
+                    &config.chain.trust().genesis_sha256,
                     verifier.trust_sha256(),
                 );
                 let index = crate::edge_index::EdgeIndex::open(
@@ -512,7 +510,7 @@ impl Core {
                         crate::edge_index::SCHEMA_VERSION
                     )),
                     config.genesis().network_id.clone(),
-                    config.chain.profile().trust().genesis_sha256.clone(),
+                    config.chain.trust().genesis_sha256.clone(),
                     verifier.trust_sha256().into(),
                 )
                 .map_err(storage)?;
@@ -710,8 +708,8 @@ impl Core {
             config.validators.clone(),
             Arc::new(
                 crate::proof_verify::ProofVerifier::with_genesis(
-                    config.chain.profile().trust().clone(),
-                    config.chain.profile().genesis_json().as_bytes(),
+                    config.chain.trust().clone(),
+                    config.chain.genesis_json().as_bytes(),
                 )
                 .map_err(|error| Error::Config(error.to_string()))?,
             ),

@@ -348,7 +348,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
             &hellas_private::StoreLocation::from_home(&directory.path().join("relay"), Crash),
-            config.chain.profile(),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![seed.endpoint_addr()];
@@ -367,7 +367,7 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
             &hellas_private::StoreLocation::from_home(&directory.path().join("b"), Crash),
-            config.chain.profile(),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![a.endpoint_addr()];
@@ -717,7 +717,7 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
                     }),
                     Crash,
                 ),
-                fixture.config.chain.profile(),
+                &fixture.config.chain,
             )
             .unwrap();
             fixture.config.peers = vec![endpoint.addr()];
@@ -991,7 +991,7 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
             &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
-            config.chain.profile(),
+            &config.chain,
         )
         .unwrap();
         config.peers = endpoints.iter().map(|e| e.addr()).collect();
@@ -1280,7 +1280,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         let mut config = fixture.config.clone();
         config.chain = crate::chain_dir::ChainDir::open(
             &hellas_private::StoreLocation::from_home(&directory.path().join("replica"), Crash),
-            config.chain.profile(),
+            &config.chain,
         )
         .unwrap();
         config.peers = vec![endpoint.addr()];

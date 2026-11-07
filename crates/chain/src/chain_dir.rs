@@ -30,8 +30,8 @@ impl ChainDir {
     pub fn home(&self) -> &StoreLocation {
         &self.home
     }
-    pub fn profile(&self) -> &ChainProfile {
-        &self.profile
+    pub fn network(&self) -> hellas_kernel::NetworkId {
+        hellas_kernel::NetworkId::new(self.profile.network_id()).expect("validated chain profile")
     }
     pub fn with_validators(mut self, validators: Vec<String>) -> Result<Self, ChainProfileError> {
         self.profile = self.profile.with_validators(validators)?;

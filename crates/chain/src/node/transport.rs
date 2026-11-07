@@ -68,9 +68,8 @@ impl FullNode {
                             Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(config.genesis())).map_err(invalid)?)),
                             #[cfg(feature = "indexer-api")]
                             Indexing::On { .. } => {
-                                let profile = config.chain.profile();
-                                let trust = profile.trust().clone();
-                                let genesis_json = profile.genesis_json().as_bytes();
+                                let trust = config.chain.trust().clone();
+                                let genesis_json = config.chain.genesis_json().as_bytes();
                                 Trust::Schedule(crate::indexer::trusted_epochs::TrustedEpochs::with_genesis(trust.clone(), genesis_json).map_err(invalid)?, Arc::new(crate::proof_verify::ProofVerifier::with_genesis(trust, genesis_json).map_err(invalid)?))
                             }
                         };

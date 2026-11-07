@@ -65,7 +65,6 @@ impl PaidGatewayOptions {
                 "max_pending_requests must be a positive supported semaphore capacity",
             ));
         }
-        self.config.clone().validate()?;
         let mut endpoints = BTreeSet::new();
         for provider in &self.providers {
             provider

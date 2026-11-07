@@ -689,7 +689,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let mut missing = case.options.clone();
             missing.config.chain = hellas_chain::chain_dir::ChainDir::open(
                 &StoreLocation::from_home(&case.root.path().join("missing-journals"), Crash),
-                missing.config.chain.profile(),
+                &missing.config.chain,
             )
             .unwrap();
             assert!(
@@ -836,7 +836,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             let state = root.join("cli-state");
             let cli_chain = hellas_chain::chain_dir::ChainDir::open(
                 &StoreLocation::from_home(&state, Crash),
-                case.options.config.chain.profile(),
+                &case.options.config.chain,
             )
             .unwrap();
             let journals = cli_chain.client_journals(&case.options.provider.to_string());
