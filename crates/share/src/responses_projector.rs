@@ -52,7 +52,7 @@ struct PreparedResponsesRequest {
     max_output_tokens: Option<u32>,
 }
 
-/// Strictly decodes the signed v0.0.1 request into closed typed shapes, then
+/// Strictly decodes the signed v0.0.3 request into closed typed shapes, then
 /// serializes a fresh provider request. Only function arguments and JSON Schema
 /// values are intentionally opaque after their enclosing shape is accepted.
 fn prepare_streaming_request(
@@ -61,12 +61,12 @@ fn prepare_streaming_request(
     let body = request.body.as_bytes();
     if body.len() > MAX_FETCH_REQUEST_BODY_BYTES {
         return Err(fetch_failed(
-            "signed Fetch request body exceeds the v0.0.1 limit",
+            "signed Fetch request body exceeds the v0.0.3 limit",
         ));
     }
 
     let mut trusted: TrustedResponsesRequest = serde_json::from_slice(body)
-        .map_err(|_| fetch_failed("invalid v0.0.1 Responses request"))?;
+        .map_err(|_| fetch_failed("invalid v0.0.3 Responses request"))?;
     trusted.validate_and_force_transport()?;
     let model = trusted.model.clone();
     let max_output_tokens = trusted.max_output_tokens;
@@ -74,7 +74,7 @@ fn prepare_streaming_request(
         .map_err(|_| fetch_failed("failed to rebuild Responses request"))?;
     if rebuilt.len() > MAX_FETCH_REQUEST_BODY_BYTES {
         return Err(fetch_failed(
-            "rebuilt upstream Responses body exceeds the v0.0.1 limit",
+            "rebuilt upstream Responses body exceeds the v0.0.3 limit",
         ));
     }
 
@@ -127,12 +127,12 @@ impl TrustedResponsesRequest {
         }
         if self.stream == Some(false) {
             return Err(fetch_failed(
-                "v0.0.1 Fetch does not accept stream=false; upstream streaming is mandatory",
+                "v0.0.3 Fetch does not accept stream=false; upstream streaming is mandatory",
             ));
         }
         if self.store == Some(true) {
             return Err(fetch_failed(
-                "v0.0.1 Fetch does not accept store=true; upstream storage is forbidden",
+                "v0.0.3 Fetch does not accept store=true; upstream storage is forbidden",
             ));
         }
         validate_request_input(&self.input)?;
@@ -185,7 +185,7 @@ impl TrustedResponsesRequest {
         )?;
         if self.top_logprobs.is_some_and(|value| value != 0) {
             return Err(fetch_failed(
-                "v0.0.1 only accepts top_logprobs=0 because logprobs are not projected",
+                "v0.0.3 only accepts top_logprobs=0 because logprobs are not projected",
             ));
         }
         if let Some(TrustedTextOptions {
@@ -204,7 +204,7 @@ impl TrustedResponsesRequest {
             .is_some_and(|options| options.include_obfuscation)
         {
             return Err(fetch_failed(
-                "v0.0.1 Fetch does not accept stream obfuscation",
+                "v0.0.3 Fetch does not accept stream obfuscation",
             ));
         }
         self.stream_options = Some(TrustedStreamOptions {
@@ -499,12 +499,12 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
         } => {
             if role != "assistant" {
                 return Err(fetch_failed(
-                    "v0.0.1 output messages require role=assistant",
+                    "v0.0.3 output messages require role=assistant",
                 ));
             }
             if content.len() > 1 {
                 return Err(fetch_failed(
-                    "v0.0.1 output messages support one text content part",
+                    "v0.0.3 output messages support one text content part",
                 ));
             }
             let text = content
@@ -515,7 +515,7 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
                         Ok(text)
                     }
                     WireOutputText::Text { .. } => Err(fetch_failed(
-                        "v0.0.1 does not support output-text annotations",
+                        "v0.0.3 does not support output-text annotations",
                     )),
                 })
                 .transpose()?
@@ -533,7 +533,7 @@ fn item_snapshot(value: &JsonValue) -> Result<ItemSnapshot, FetchAdaptorError> {
         } => {
             if summary.len() > 1 {
                 return Err(fetch_failed(
-                    "v0.0.1 reasoning supports one summary text part",
+                    "v0.0.3 reasoning supports one summary text part",
                 ));
             }
             let text = summary
@@ -744,7 +744,7 @@ impl ResponsesFetchProjector {
             "response.failed" => self.failed(event),
             "error" => self.error(event),
             _ => Err(fetch_failed(
-                "unsupported Responses SSE event type in v0.0.1",
+                "unsupported Responses SSE event type in v0.0.3",
             )),
         }
     }
@@ -887,7 +887,7 @@ impl ResponsesFetchProjector {
             }
             _ => {
                 return Err(fetch_failed(
-                    "added output item must have an empty v0.0.1 body",
+                    "added output item must have an empty v0.0.3 body",
                 ));
             }
         };
@@ -1374,7 +1374,7 @@ impl FetchProjector for ResponsesFetchProjector {
             Ok(Vec::new())
         } else {
             Err(fetch_failed(
-                "public OpenAI Responses v0.0.1 has no response-head model contract",
+                "public OpenAI Responses v0.0.3 has no response-head model contract",
             ))
         }
     }
@@ -1495,7 +1495,7 @@ fn require_zero_index(
     if event.get(field).and_then(JsonValue::as_u64) == Some(0) {
         Ok(())
     } else {
-        Err(fetch_failed("v0.0.1 requires a zero part index"))
+        Err(fetch_failed("v0.0.3 requires a zero part index"))
     }
 }
 
@@ -1655,7 +1655,7 @@ fn validate_empty_logprobs(event: &JsonMap<String, JsonValue>) -> Result<(), Fet
         .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
     {
         return Err(fetch_failed(
-            "v0.0.1 does not project non-empty output logprobs",
+            "v0.0.3 does not project non-empty output logprobs",
         ));
     }
     Ok(())
@@ -1961,7 +1961,7 @@ mod tests {
             br#"{"model":"m","input":"hi","text":{"format":{"type":"json_schema","name":"x","schema":{},"surprise":1}}}"#.as_slice(),
         ];
         for body in rejected {
-            assert_rejected(body, "invalid v0.0.1 Responses request");
+            assert_rejected(body, "invalid v0.0.3 Responses request");
         }
     }
 
@@ -1970,24 +1970,24 @@ mod tests {
         let rejected = [
             (
                 br#"{"model":"m","input":"hi","metadata":null}"#.as_slice(),
-                "invalid v0.0.1 Responses request",
+                "invalid v0.0.3 Responses request",
             ),
             (
                 br#"{"model":"m","input":"hi","reasoning":"raw"}"#.as_slice(),
-                "invalid v0.0.1 Responses request",
+                "invalid v0.0.3 Responses request",
             ),
             (
                 br#"{"model":"m","input":"hi","response_format":{"type":"text"}}"#.as_slice(),
-                "invalid v0.0.1 Responses request",
+                "invalid v0.0.3 Responses request",
             ),
             (
                 br#"{"model":"m","input":"hi","text":{"format":{"type":"grammar","grammar":"x"}}}"#
                     .as_slice(),
-                "invalid v0.0.1 Responses request",
+                "invalid v0.0.3 Responses request",
             ),
             (
                 br#"{"model":"m","input":"hi","tools":[{"type":"web_search"}]}"#.as_slice(),
-                "invalid v0.0.1 Responses request",
+                "invalid v0.0.3 Responses request",
             ),
         ];
         for (body, expected) in rejected {
