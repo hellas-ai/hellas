@@ -150,11 +150,7 @@ pub async fn transact(
             requested: job.price(),
         });
     }
-    let resume = !options.new_purchase
-        && !options
-            .purchase
-            .as_deref()
-            .is_some_and(Purchase::buys_again);
+    let resume = !options.new_purchase;
     let (nonce, prepared) = prepare(session, job, key, resume, options.purchase.as_deref()).await?;
     if let Some(purchase) = options.purchase.as_deref_mut() {
         purchase.begin(
