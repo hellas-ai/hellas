@@ -538,8 +538,8 @@ impl FileObject {
         if self.object.bytes() > MAX_TREE_BYTES as u64 {
             return Err(Error::Invalid("tree byte limit"));
         }
-        let charge = self.disk.ram.reserve(self.object.bytes())?;
         let (file, entry) = self.open_location()?;
+        let charge = self.disk.ram.reserve(self.object.bytes())?;
         self.load_opened(file, entry, charge)
     }
     pub(crate) fn invalidate(&self, entry: &Entry) -> Result<()> {

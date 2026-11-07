@@ -217,6 +217,16 @@ pub fn check_paid_input(
     Ok(facts)
 }
 
+pub(crate) fn job_facts(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV2,
+    input: &PreparedInvocation,
+) -> Result<(InvocationPolicy, AdmissionFacts), PaidWorkError> {
+    let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
+    let facts = check_paid_input(channel, authorization, &policy, input)?;
+    Ok((policy, facts))
+}
+
 /// The only invocation-to-receipt conversion, used for both funding models.
 pub fn terminal_result(
     context: &WorkContext,

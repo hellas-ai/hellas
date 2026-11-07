@@ -394,56 +394,27 @@ impl ChannelStore {
                 continue;
             }
             let store = LocalStore::Disk(self.content.clone());
-            let input = read(
-                &store,
-                &Scope::Owner,
-                authorization.input_content,
-                crate::content::MAX_CONTENT_BYTES as u64,
-            )
-            .await?;
-            let prepared =
-                PreparedInvocation::from_canonical_bytes(&input, crate::content::MAX_CONTENT_BYTES)
-                    .map_err(PaidWorkError::from)
-                    .map_err(ChannelStateError::from)?;
-            let policy =
-                InvocationPolicy::from_canonical_bytes(prepared.application_policy.as_bytes())
-                    .map_err(PaidWorkError::from)
-                    .map_err(ChannelStateError::from)?;
-            let leaves = self
+            let (policy, facts) = {
+                let input = read(
+                    &store,
+                    &Scope::Owner,
+                    authorization.input_content,
+                    crate::content::MAX_CONTENT_BYTES as u64,
+                )
+                .await?;
+                let prepared = PreparedInvocation::from_canonical_bytes(
+                    &input,
+                    crate::content::MAX_CONTENT_BYTES,
+                )
+                .map_err(PaidWorkError::from)
+                .map_err(ChannelStateError::from)?;
+                crate::job::job_facts(self.state().channel(), &authorization, &prepared)
+                    .map_err(ChannelStateError::from)
+            }?;
+            // Unfinished retained roots contain exactly the admitted input leaves.
+            let closure = self
                 .tree_objects(self.state().retained_roots()[&work])
                 .await?;
-            let closure = if self.state().role() == Role::Client {
-                leaves
-            } else {
-                let manifest = prepared
-                    .manifest()
-                    .map_err(PaidWorkError::from)
-                    .map_err(ChannelStateError::from)?;
-                let root = if policy.content_closure(&manifest, &[]).is_ok() {
-                    bytes::Bytes::new()
-                } else {
-                    let object = leaves
-                        .iter()
-                        .find(|object| object.id() == manifest.root())
-                        .ok_or(Error::Missing)?;
-                    read(
-                        &store,
-                        &Scope::Owner,
-                        *object,
-                        crate::content::MAX_PROGRAM_ROOT_BYTES as u64,
-                    )
-                    .await?
-                };
-                crate::job::content_closure(&policy, &manifest, &root, authorization.input_content)
-                    .map_err(ChannelStateError::from)?
-            };
-            let facts = crate::job::check_paid_input(
-                self.state().channel(),
-                &authorization,
-                &policy,
-                &prepared,
-            )
-            .map_err(ChannelStateError::from)?;
             let (_, scope) = self
                 .open_content(
                     work,
@@ -523,17 +494,8 @@ impl ChannelStore {
             )
             .map_err(PaidWorkError::from)
             .map_err(ChannelStateError::from)?;
-            let policy =
-                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-                    .map_err(PaidWorkError::from)
-                    .map_err(ChannelStateError::from)?;
-            let facts = crate::job::check_paid_input(
-                self.state().channel(),
-                &authorization,
-                &policy,
-                &input,
-            )
-            .map_err(ChannelStateError::from)?;
+            let (_, facts) = crate::job::job_facts(self.state().channel(), &authorization, &input)
+                .map_err(ChannelStateError::from)?;
             self.load_retained_transcript(work, facts.max_spool_bytes, true)
                 .await?;
         }

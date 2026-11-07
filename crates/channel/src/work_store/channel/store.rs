@@ -230,7 +230,6 @@ impl ChannelStore {
         }
         store.restore_content().await?;
         store.release_unresumable_proposal(verifier).await?;
-        store.reconcile_content(false).await?;
         Ok(Some(store))
     }
 
@@ -341,17 +340,9 @@ impl ChannelStore {
                         .state()
                         .job_by_id(*work_id)
                         .ok_or(ChannelStateError::Malformed)?;
-                    let policy =
-                        InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-                            .map_err(PaidWorkError::from)
+                    let (_, facts) =
+                        crate::job::job_facts(self.state().channel(), job.authorization(), input)
                             .map_err(ChannelStateError::from)?;
-                    let facts = crate::job::check_paid_input(
-                        self.state().channel(),
-                        job.authorization(),
-                        &policy,
-                        input,
-                    )
-                    .map_err(ChannelStateError::from)?;
                     if self.state().retained_roots().contains_key(work_id)
                         && let Some(job) = self.state.book.jobs.get_mut(work_id)
                     {
@@ -403,7 +394,6 @@ impl ChannelStore {
                     self.rotate().await?;
                 }
             }
-            self.reconcile_content(false).await?;
             Ok(&self.state)
         })
     }

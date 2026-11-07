@@ -49,14 +49,8 @@ impl Channel<PaymentFunding> {
                 &decoded
             }
         };
-        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-            .map_err(PaidWorkError::from)?;
-        let facts = crate::job::check_paid_input(
-            &self.funding.channel,
-            &job.authorization,
-            &policy,
-            input,
-        )?;
+        let (policy, facts) =
+            crate::job::job_facts(&self.funding.channel, &job.authorization, input)?;
         let events = decode_transcript(
             transcript,
             usize::try_from(facts.max_spool_bytes).unwrap_or(usize::MAX),
@@ -1229,9 +1223,7 @@ impl Channel<PaymentFunding> {
             crate::content::MAX_CONTENT_BYTES,
         )
         .map_err(PaidWorkError::from)?;
-        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-            .map_err(PaidWorkError::from)?;
-        crate::job::check_paid_input(&self.funding.channel, authorization, &policy, &input)?;
+        crate::job::job_facts(&self.funding.channel, authorization, &input)?;
         Ok(())
     }
 

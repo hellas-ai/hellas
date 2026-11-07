@@ -767,8 +767,8 @@ impl ProviderEndpoint {
 
     async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
-        self.close.store.reconcile_content(false).await?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
+            self.close.store.reconcile_content(false).await?;
             return Ok((work_id, retained));
         }
         let ready = self

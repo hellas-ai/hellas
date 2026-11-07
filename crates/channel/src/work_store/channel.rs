@@ -30,7 +30,7 @@ use crate::work_store::{
 };
 use hellas_auth::Digest;
 use hellas_rpc::ContentRef;
-use hellas_rpc::protocol::invocation::{InvocationPolicy, PreparedInvocation};
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 
 mod book;
 pub mod funding;
