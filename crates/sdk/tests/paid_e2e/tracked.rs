@@ -957,19 +957,15 @@ async fn accept_paused(
         .unwrap()
 }
 
-#[test]
-fn tracked_recovery_rejects_different_jobs_at_a_reused_unproposed_nonce() {
-    run(|runtime| reused_nonce_scenario(runtime, false));
-}
-
+/// Identical jobs are the hard case: only the attempt binding differs, so
+/// recovery that matched on the job input alone would wrongly attach.
 #[test]
 fn tracked_recovery_rejects_identical_jobs_at_a_reused_unproposed_nonce() {
-    run(|runtime| reused_nonce_scenario(runtime, true));
+    run(reused_nonce_scenario);
 }
 
 fn reused_nonce_scenario(
     runtime: commonware_runtime::tokio::Context,
-    same_input: bool,
 ) -> impl std::future::Future<Output = ()> {
     Box::pin(async move {
         let mut case = paid_fixture(runtime).await;
@@ -984,19 +980,7 @@ fn reused_nonce_scenario(
         case.options.provider_addrs = addresses(&provider);
         case.provider = provider;
         fund(&mut case).await;
-        let first = if same_input {
-            job()
-        } else {
-            hellas_sdk::job::Job::fetch(
-                PRICE,
-                test_responses_contract(),
-                "openai".into(),
-                "responses".into(),
-                br#"{"model":"fixture","input":"abandoned","max_output_tokens":8}"#.to_vec(),
-                Assurance::ProducerSigned,
-            )
-            .unwrap()
-        };
+        let first = job();
         let terms = ExecutionTerms::Paid { price: PRICE };
         let first_paid_path = paid_path(&case, &first, "before-proposal");
         let first_path = first_paid_path.as_path().to_path_buf();

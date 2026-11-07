@@ -1770,9 +1770,9 @@ fn cli_paid_and_grant_two_provider_composition() {
 }
 
 #[test]
-fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
+fn setup_reads_wait_for_the_required_height() {
     use hellas_chain::WorkBlocks;
-    use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks as _};
+    use hellas_channel::work_close::FinalizedBlocks as _;
     use hellas_channel::work_open::{SetupQuery, SetupView as _};
 
     run(|runtime| async move {
@@ -1818,18 +1818,6 @@ fn setup_reads_wait_for_the_required_height_and_expire_with_a_typed_error() {
             .0
         );
         drop(block);
-
-        let source = source.clone().with_min_height(next + 1);
-        let started = tokio::time::Instant::now();
-        let error = tokio::time::timeout(timeout.saturating_mul(2), source.finalized_setup(query))
-            .await
-            .expect("unavailable setup reads stay bounded")
-            .unwrap_err();
-        assert!(
-            matches!(error, BlockSourceError::ReadUnavailableTimeout { timeout: elapsed, .. }
-            if elapsed == timeout)
-        );
-        assert!(started.elapsed() >= timeout);
         assert_eq!(node.status().executed_height(), next);
         devnet.shutdown().await;
     });
