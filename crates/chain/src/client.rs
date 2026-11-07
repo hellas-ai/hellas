@@ -3,7 +3,6 @@ use crate::{
     CoinListing, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
 };
-use commonware_cryptography::{Hasher, Sha256};
 use hellas_kernel::{Encode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::{
     SubmitTxOutcome as DomainSubmitTxOutcome,
@@ -294,7 +293,6 @@ impl RemoteLightClient {
                 object_ids: Vec::new(),
                 payload: None,
                 owner: Some(owner.to_bytes().to_vec()),
-                owner_limit: crate::owner_proof::OWNER_PAGE_LIMIT,
                 owner_after_key: after.map(|key| key.to_vec()),
             })
             .await
@@ -308,7 +306,7 @@ impl RemoteLightClient {
                 response,
                 &BTreeSet::new(),
                 FinalizedBlockQuery::Latest,
-                Some((owner, after, crate::owner_proof::OWNER_PAGE_LIMIT)),
+                Some((owner, after)),
             )
             .map_err(|error| QueryError::Remote(error.to_string()))?;
         record_progress(
@@ -358,15 +356,7 @@ impl LightClient for RemoteLightClient {
         &self,
         keys: Vec<crate::domain::ObjectId>,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        Box::pin(objects::read(self, keys, None)).await
-    }
-
-    async fn get_objects_at(
-        &self,
-        keys: Vec<ObjectId>,
-        payload: Digest,
-    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        Box::pin(objects::read(self, keys, Some(payload))).await
+        Box::pin(objects::read(self, keys)).await
     }
 
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
@@ -692,14 +682,8 @@ pub(crate) fn finalized_block_from_proto(
     let snapshot = block
         .snapshot
         .ok_or_else(|| QueryError::Remote("FinalizedBlock had no snapshot".into()))?;
-    let snapshot = latest_block_from_proto(snapshot)?;
-    if Sha256::hash(&block.block) != snapshot.payload {
-        return Err(QueryError::Remote(
-            "block bytes did not match finalized payload".into(),
-        ));
-    }
     Ok(FinalizedBlock {
-        snapshot,
+        snapshot: latest_block_from_proto(snapshot)?,
         block: block.block,
     })
 }

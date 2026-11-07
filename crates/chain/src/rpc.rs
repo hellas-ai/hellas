@@ -138,24 +138,6 @@ impl LocalLightClient {
         Ok(())
     }
 
-    async fn objects(
-        &self,
-        keys: Vec<ObjectId>,
-        payload: Option<Digest>,
-    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        self.require_ready()?;
-        objects_at(
-            &self.databases,
-            &self.owner_index,
-            &self.chain_indexer,
-            keys,
-            NetworkId::new(&self.consensus_info.network_id)
-                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
-            payload,
-        )
-        .await
-    }
-
     #[cfg(feature = "validator")]
     fn mempool(&self) -> &Mempool {
         match &self.ingress {
@@ -563,7 +545,7 @@ async fn work_channel_snapshot_at(
     query: WorkChannelQuery,
 ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
     let keys = query.object_keys(network);
-    objects_at(databases, owner_index, chain_indexer, keys, network, None)
+    objects_at(databases, owner_index, chain_indexer, keys, network)
         .await?
         .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
         .transpose()
@@ -575,7 +557,6 @@ async fn objects_at(
     chain_indexer: &ChainIndexer,
     keys: Vec<ObjectId>,
     network: NetworkId,
-    payload: Option<Digest>,
 ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
         return Err(QueryError::InvalidTransaction(
@@ -586,11 +567,6 @@ async fn objects_at(
         return Ok(None);
     }
     let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
-    if payload.is_some_and(|payload| payload != cursor.payload) {
-        return Err(QueryError::StateUnavailable(
-            "requested current-state snapshot is unavailable".into(),
-        ));
-    }
     let finalization = chain_indexer
         .get_finalization(cursor.payload)
         .await?
@@ -663,11 +639,7 @@ impl LightClient for LocalLightClient {
             .owner_after_key
             .map(|key| digest_from_proto(key, "owner cursor").map(|key| key.0))
             .transpose()?;
-        if owner.is_some()
-            && (request.owner_limit == 0
-                || request.owner_limit > crate::owner_proof::OWNER_PAGE_LIMIT)
-            || owner.is_none() && (request.owner_limit != 0 || after.is_some())
-        {
+        if owner.is_none() && after.is_some() {
             return Err(QueryError::InvalidTransaction(
                 "invalid owner page request".into(),
             ));
@@ -709,7 +681,7 @@ impl LightClient for LocalLightClient {
                 &reader,
                 owner,
                 after,
-                request.owner_limit,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
             )
             .await
             .map_err(|error| QueryError::StateUnavailable(format!("owner page: {error}")))?;
@@ -767,15 +739,16 @@ impl LightClient for LocalLightClient {
         &self,
         keys: Vec<ObjectId>,
     ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        self.objects(keys, None).await
-    }
-
-    async fn get_objects_at(
-        &self,
-        keys: Vec<ObjectId>,
-        payload: Digest,
-    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-        self.objects(keys, Some(payload)).await
+        self.require_ready()?;
+        objects_at(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            keys,
+            NetworkId::new(&self.consensus_info.network_id)
+                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
+        )
+        .await
     }
 
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {

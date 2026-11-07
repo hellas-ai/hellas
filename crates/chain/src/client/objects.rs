@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 pub(super) async fn read(
     client: &RemoteLightClient,
     keys: Vec<ObjectId>,
-    payload: Option<Digest>,
 ) -> Result<Option<ObjectSnapshot>, QueryError> {
     let verifier = &client.proof_verifier;
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
@@ -18,9 +17,8 @@ pub(super) async fn read(
         .rpc_client()
         .get_object_proofs(GetObjectProofsRequest {
             object_ids: keys.iter().map(|key| key.to_vec()).collect(),
-            payload: payload.map(|digest| digest.to_vec()),
+            payload: None,
             owner: None,
-            owner_limit: 0,
             owner_after_key: None,
         })
         .await
@@ -28,16 +26,13 @@ pub(super) async fn read(
     if response.block.is_none() {
         return Ok(None);
     }
-    let expected = payload.map_or(FinalizedBlockQuery::Latest, FinalizedBlockQuery::Payload);
     let verified = verifier
-        .verify_objects(response, &keys, expected, None)
+        .verify_objects(response, &keys, FinalizedBlockQuery::Latest, None)
         .map_err(|error| QueryError::Remote(error.to_string()))?;
-    if payload.is_none() {
-        record_progress(
-            &client.applied_progress,
-            verified.block().view().height(),
-            true,
-        )?;
-    }
+    record_progress(
+        &client.applied_progress,
+        verified.block().view().height(),
+        true,
+    )?;
     Ok(Some(verified.into_snapshot()))
 }

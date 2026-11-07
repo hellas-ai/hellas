@@ -285,8 +285,10 @@ pub(super) enum Trust {
 }
 impl Trust {
     fn verify(&self, incoming: &FinalizedBlock) -> Result<HellasBlock, Error> {
-        FinalizedBlockView::decode(incoming).map_err(invalid)?;
-        let block = HellasBlock::decode(incoming.block.as_slice()).map_err(invalid)?;
+        let block = FinalizedBlockView::decode(incoming)
+            .map_err(invalid)?
+            .block()
+            .clone();
         let proof = crate::finality_proof::FinalityProof::decode(&incoming.snapshot.finalization)
             .map_err(invalid)?;
         proof

@@ -16,7 +16,6 @@ pub(super) struct Source {
     pub attempts: Arc<AtomicUsize>,
     pub replay: Arc<AtomicU64>,
     pub forged: Arc<AtomicBool>,
-    pub stale: Arc<std::sync::Mutex<Option<hellas_rpc::pb::chain::GetObjectProofsResponse>>>,
     pub connections: Arc<AtomicUsize>,
     /// Latency injected into source selection only.
     pub delay: std::time::Duration,
@@ -102,9 +101,6 @@ impl hellas_chain::LightClient for Source {
                 "injected transient proof read".into(),
             ));
         }
-        if let Some(stale) = self.stale.lock().unwrap().clone() {
-            return Ok(stale);
-        }
         let mut response = self.local.get_object_proofs(request).await?;
         if self.forged.load(Ordering::SeqCst) {
             response
@@ -143,7 +139,6 @@ impl Relays {
             attempts: Arc::new(AtomicUsize::new(0)),
             replay: Arc::new(AtomicU64::new(replay)),
             forged: Arc::new(AtomicBool::new(false)),
-            stale: Arc::new(std::sync::Mutex::new(None)),
             connections: Arc::new(AtomicUsize::new(0)),
             delay,
         };
@@ -396,25 +391,6 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     let first = client.get_objects(keys.clone()).await.unwrap().unwrap();
     assert!(first.objects.contains_key(&coin_object_id(genesis)));
     assert!(!first.objects.contains_key(&coin_object_id(missing)));
-    let old = relays
-        .source
-        .local
-        .get_finalized_block(FinalizedBlockQuery::Latest)
-        .await
-        .unwrap()
-        .unwrap();
-    let stale = relays
-        .source
-        .local
-        .get_object_proofs(hellas_rpc::pb::chain::GetObjectProofsRequest {
-            object_ids: keys.iter().map(|key| key.to_vec()).collect(),
-            payload: Some(old.snapshot.payload.to_vec()),
-            owner: None,
-            owner_limit: 0,
-            owner_after_key: None,
-        })
-        .await
-        .unwrap();
     let proof_reads_before_split = relays.source.attempts.load(Ordering::SeqCst);
     let plan = hellas_sdk::coin_owner::OwnerReshape::split(
         &client,
@@ -477,20 +453,6 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         *block.sync_target().range.start() > 0,
         "exercise a real nonzero inactivity floor"
     );
-    let fresh = hellas_sdk::client_chain::connect(&config, Duration::from_secs(5))
-        .await
-        .unwrap();
-    *relays.source.stale.lock().unwrap() = Some(stale);
-    assert!(
-        matches!(
-            fresh
-                .get_objects_at(keys.clone(), latest.snapshot.payload)
-                .await,
-            Err(QueryError::Remote(_))
-        ),
-        "a genuine old proof cannot answer a pinned current payload"
-    );
-    *relays.source.stale.lock().unwrap() = None;
     relays.source.forged.store(true, Ordering::SeqCst);
     assert!(
         matches!(

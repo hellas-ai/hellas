@@ -805,7 +805,6 @@ mod tests {
                 object_ids: vec![Digest::from([1; 32]).to_vec()],
                 payload: None,
                 owner: None,
-                owner_limit: 0,
                 owner_after_key: None,
             };
             let response = app
@@ -872,7 +871,6 @@ mod tests {
                 object_ids: Vec::new(),
                 payload: Some(first_block.digest().to_vec()),
                 owner: Some(owner.to_bytes().to_vec()),
-                owner_limit: 1,
                 owner_after_key: None,
             };
             let response = app
@@ -925,7 +923,7 @@ mod tests {
                     FinalizedBlockQuery::Payload(Digest::from(
                         <[u8; 32]>::try_from(hex::decode(&latest.payload).unwrap()).unwrap(),
                     )),
-                    Some((owner, None, 1)),
+                    Some((owner, None)),
                 )
                 .unwrap();
             assert_eq!(verified_objects.owner_page().unwrap().1.count, 1);

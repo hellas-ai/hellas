@@ -306,28 +306,28 @@ impl ProofVerifier {
     }
 
     /// Verify an exact key set at one certified Current-QMDB root, plus the
-    /// owner page of at most `limit` holdings after the `(owner, after, limit)`
-    /// key cursor.
+    /// owner page of at most `OWNER_PAGE_LIMIT` holdings after the
+    /// `(owner, after)` key cursor.
     pub fn verify_objects(
         &self,
         response: hellas_rpc::pb::chain::GetObjectProofsResponse,
         requested: &BTreeSet<ObjectId>,
         query: FinalizedBlockQuery,
-        owner: Option<(crate::domain::SettlementKey, Option<[u8; 32]>, u32)>,
+        owner: Option<(crate::domain::SettlementKey, Option<[u8; 32]>)>,
     ) -> Result<VerifiedObjects, VerificationError> {
         let block = response.block.ok_or(VerificationError::Query)?;
         let finalized = crate::client::finalized_block_from_proto(block)
             .map_err(|_| VerificationError::Query)?;
         let verified = self.verify_finalized(finalized, ProofQuery::Block(query))?;
         let owner_page = match (owner, response.owner_page) {
-            (Some((owner, after, limit)), Some(page)) => {
+            (Some((owner, after)), Some(page)) => {
                 let page = crate::owner_proof::OwnerPageProof::from_proto(page)
                     .map_err(|_| VerificationError::Query)?;
                 let summary = crate::owner_proof::verify_owner_page_after(
                     verified.view().owner_root(),
                     owner,
                     after,
-                    limit,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
                     &page,
                 )
                 .map_err(|_| VerificationError::Query)?;

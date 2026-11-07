@@ -101,6 +101,25 @@ impl LightClient for ObservedClient {
         Ok(response)
     }
 
+    /// `replay_old` also answers `Latest` with the block of the first proof response.
+    async fn get_finalized_block(
+        &self,
+        query: FinalizedBlockQuery,
+    ) -> Result<Option<FinalizedBlock>, QueryError> {
+        let old = {
+            let operations = self.operations.lock().unwrap();
+            (operations.replay_old && matches!(query, FinalizedBlockQuery::Latest))
+                .then(|| operations.old_response.clone().expect("prior response"))
+        };
+        match old {
+            Some(old) => old
+                .block
+                .map(crate::client::finalized_block_from_proto)
+                .transpose(),
+            None => self.local.get_finalized_block(query).await,
+        }
+    }
+
     forward! {
         get_state_root() -> Option<Digest>;
         get_proof(object_id: ObjectId) -> Option<Vec<u8>>;
@@ -108,7 +127,6 @@ impl LightClient for ObservedClient {
         get_edge(payload: Digest, object_id: ObjectId) -> Option<crate::EdgeLookup>;
         get_finalization(payload: Digest) -> Option<Vec<u8>>;
         get_latest_block() -> Option<LatestBlock>;
-        get_finalized_block(query: FinalizedBlockQuery) -> Option<FinalizedBlock>;
         get_applied_finalized_block(query: FinalizedBlockQuery) -> Option<FinalizedBlock>;
         submit_tx(tx: Transaction) -> hellas_rpc::SubmitTxOutcome;
         get_validators() -> Vec<String>;
@@ -134,8 +152,6 @@ struct Fixture {
     archive: Handle<()>,
     operations: Arc<Mutex<Operations>>,
     verifier: Arc<crate::proof_verify::ProofVerifier>,
-    trust: hellas_genesis::TrustDocument,
-    genesis_json: Vec<u8>,
     committee: crate::execution::test_support::ConsensusFixture,
 }
 
@@ -229,9 +245,8 @@ async fn fixture_with_allocations(
             threshold_identity: hex::encode(committee.assembler.identity().encode()),
         }],
     };
-    let proof_verifier = Arc::new(
-        crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), &genesis_json).unwrap(),
-    );
+    let proof_verifier =
+        Arc::new(crate::proof_verify::ProofVerifier::with_genesis(trust, &genesis_json).unwrap());
     let owner = owner_key(41);
     let allocations = vec![(owner, 100); count];
     let (root, target) =
@@ -321,8 +336,6 @@ async fn fixture_with_allocations(
         archive: archive_task,
         operations,
         verifier: proof_verifier,
-        trust,
-        genesis_json,
         committee,
     }
 }
@@ -338,7 +351,6 @@ fn empty_current_database_absence_is_verified_by_hellas() {
                 object_ids: vec![missing.to_vec()],
                 payload: None,
                 owner: None,
-                owner_limit: 0,
                 owner_after_key: None,
             })
             .await
@@ -507,21 +519,36 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
             ),
             "a genuine certified older latest response must not lower the applied floor"
         );
-        fixture.operations.lock().unwrap().replay_old = false;
-        assert!(matches!(
-            fixture
-                .remote
-                .get_objects_at(keys.clone(), fixture.applied.digest())
-                .await,
-            Err(QueryError::StateUnavailable(_))
-        ));
-        let pinned = fixture
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn certified_finalized_block_cannot_roll_back_below_a_verified_height() {
+    run_qmdb(|runtime| async move {
+        let mut fixture = fixture(runtime).await;
+        let keys = vec![fixture.old_coin];
+        let first = fixture.remote.get_objects(keys).await.unwrap().unwrap();
+        assert_eq!(first.block.payload, fixture.applied.digest());
+        fixture
+            .database
+            .finalize(fixture.pending.take().unwrap())
+            .await;
+        let newer = fixture
             .remote
-            .get_objects_at(keys, fixture.archived.digest())
+            .get_finalized_block(FinalizedBlockQuery::Latest)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pinned.block.payload, fixture.archived.digest());
+        assert!(newer.snapshot.height > first.block.height);
+        fixture.operations.lock().unwrap().replay_old = true;
+        assert!(matches!(
+            fixture
+                .remote
+                .get_finalized_block(FinalizedBlockQuery::Latest)
+                .await,
+            Err(QueryError::StateUnavailable(_))
+        ));
         fixture.stop().await;
     });
 }
@@ -607,13 +634,6 @@ fn remote_point_reads_use_a_finalized_floor_after_the_current_root_advances() {
             .unwrap();
         assert_eq!(edge.state_root, fixture.archived.state_root());
         assert!(edge.edge.is_none(), "edge absence is proved at the H2 root");
-        assert!(matches!(
-            fixture
-                .remote
-                .get_objects_at(vec![fixture.new_coin], floor)
-                .await,
-            Err(QueryError::StateUnavailable(_))
-        ));
 
         fixture.stop().await;
     });

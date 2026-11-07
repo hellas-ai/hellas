@@ -303,20 +303,6 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Read the exact current root of a finalized payload. An older root is
-    /// unavailable after execution advances; point reads use a floor.
-    fn get_objects_at(
-        &self,
-        _keys: Vec<ObjectId>,
-        _payload: Digest,
-    ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
-        async {
-            Err(QueryError::StateUnavailable(
-                "pinned object reads are unavailable".into(),
-            ))
-        }
-    }
-
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send;
 
     fn get_proof(

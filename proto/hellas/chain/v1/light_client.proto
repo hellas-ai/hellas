@@ -51,9 +51,8 @@ message GetObjectProofsRequest {
   repeated bytes object_ids = 1;
   optional bytes payload = 2;
   optional bytes owner = 3;
-  reserved 4;
-  reserved "owner_offset";
-  uint32 owner_limit = 5;
+  reserved 4, 5;
+  reserved "owner_offset", "owner_limit";
   optional bytes owner_after_key = 6;
 }
 
@@ -108,7 +107,8 @@ message OwnerPageProof {
   uint64 offset = 3;
   uint32 limit = 4;
   repeated HoldingProof holdings = 5;
-  optional bytes after_key = 6;
+  reserved 6;
+  reserved "after_key";
   OwnerPathProof after_path = 7;
 }
 
