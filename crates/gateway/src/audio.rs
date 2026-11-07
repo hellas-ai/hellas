@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use hellas_adaptors::openai::audio_transcriptions::{self, TranscriptionError, TranscriptionForm};
+use hellas_adaptors::openai::audio_transcriptions::{TranscriptionError, TranscriptionForm};
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
@@ -48,9 +48,6 @@ pub(super) async fn router(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state))
 }
-fn bad(message: impl Into<String>) -> Response {
-    json_error(StatusCode::BAD_REQUEST, message)
-}
 fn transcription_error(error: TranscriptionError) -> Response {
     let status = StatusCode::from_u16(error.status).expect("a transcription status is valid");
     json_error(status, error.message)
@@ -60,29 +57,19 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response 
 }
 
 pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Response>> {
-    let mut form = Multipart::from_request(request, &())
+    let mut multipart = Multipart::from_request(request, &())
         .await
         .map_err(IntoResponse::into_response)?;
-    let mut model = None;
-    while let Some(field) = form.next_field().await.map_err(multipart_error)? {
+    let mut form = TranscriptionForm::default();
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         if field.name() == Some("model") {
-            if model.is_some() {
-                return Err(bad("duplicate model field").into());
-            }
+            form.admit("model").map_err(transcription_error)?;
             let bytes = field.bytes().await.map_err(multipart_error)?;
-            if bytes.len() > audio_transcriptions::MAX_FIELD_BYTES {
-                return Err(bad("model name too long").into());
-            }
-            model = Some(
-                std::str::from_utf8(&bytes)
-                    .map_err(|_| bad("invalid model name"))?
-                    .to_owned(),
-            );
+            form.insert("model", bytes.into())
+                .map_err(transcription_error)?;
         }
     }
-    model
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| bad("model field is required").into())
+    Ok(form.model().map_err(transcription_error)?.to_owned())
 }
 
 async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Response {
@@ -130,7 +117,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     .await
     {
         Ok(Ok(Ok(job))) => job,
-        Ok(Ok(Err(error))) => return bad(error.to_string()),
+        Ok(Ok(Err(error))) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
         Ok(Err(error)) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         Err(_) => {
             return json_error(
@@ -163,7 +150,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
             }
             Ok(ModelResponse::Transcription(result)) => json_response(
                 StatusCode::OK,
-                audio_transcriptions::json_body(&result.text),
+                serde_json::json!({"text":result.text}),
                 accepted.as_ref(),
                 transcript.as_deref(),
             ),

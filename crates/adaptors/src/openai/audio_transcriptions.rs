@@ -1,6 +1,6 @@
-//! OpenAI `/v1/audio/transcriptions`: multipart form fields in, a `json`
-//! or `text` body out. Multipart framing and the audio payload limit are
-//! the HTTP server's; this module interprets the fields it extracts.
+//! OpenAI `/v1/audio/transcriptions`: the multipart form fields a server
+//! extracts, interpreted. Multipart framing, the audio payload limit and
+//! the response bodies are the HTTP server's.
 
 /// The longest non-file form field accepted, in bytes.
 pub const MAX_FIELD_BYTES: usize = 256;
@@ -67,13 +67,20 @@ impl TranscriptionForm {
         Ok(())
     }
 
+    /// The requested model name.
+    pub fn model(&self) -> Result<&str, TranscriptionError> {
+        (self.model.as_deref())
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| bad("model field is required"))
+    }
+
     /// The audio file, its language, and whether the response is `text`
     /// rather than `json`, if the form names `served_model` and is complete.
     pub fn finish(
         self,
         served_model: &str,
     ) -> Result<(Vec<u8>, Option<String>, bool), TranscriptionError> {
-        if self.model.as_deref() != Some(served_model) {
+        if self.model()? != served_model {
             return Err(TranscriptionError {
                 status: 404,
                 message: "unknown model".into(),
@@ -87,11 +94,6 @@ impl TranscriptionForm {
         let file = self.file.ok_or_else(|| bad("file field is required"))?;
         Ok((file, self.language, text))
     }
-}
-
-/// The `json` response body for a transcript.
-pub fn json_body(text: &str) -> serde_json::Value {
-    serde_json::json!({ "text": text })
 }
 
 #[cfg(test)]
