@@ -37,6 +37,8 @@ enum Destination {
 pub struct UploadSession {
     destination: Destination,
     copy_charge: Option<std::sync::Arc<super::reservation::Reservation>>,
+    ram: Option<super::Reservations>,
+    descriptor_charge: Option<std::sync::Arc<super::reservation::Reservation>>,
     object: ContentRef,
     chunks: Vec<Chunk>,
     declared_bytes: u64,
@@ -51,6 +53,8 @@ impl UploadSession {
         Self {
             destination: Destination::Verify,
             copy_charge: None,
+            ram: None,
+            descriptor_charge: None,
             object,
             chunks: Vec::new(),
             declared_bytes: 0,
@@ -82,15 +86,22 @@ impl UploadSession {
         self.previous = Vec::new();
         self.chunks = Vec::new();
         self.copy_charge = None;
+        self.descriptor_charge = None;
         self.destination = Destination::Verify;
     }
     pub(crate) fn local(object: ContentRef, destination: LocalSession) -> Self {
         let mut session = Self::new(object);
+        session.ram = Some(destination.store.pool.clone());
         session.destination = Destination::Local(Box::new(destination));
         session
     }
-    pub(crate) fn remote(object: ContentRef, destination: super::remote::RemoteSession) -> Self {
+    pub(crate) fn remote(
+        object: ContentRef,
+        destination: super::remote::RemoteSession,
+        ram: super::Reservations,
+    ) -> Self {
         let mut session = Self::new(object);
+        session.ram = Some(ram);
         session.destination = Destination::Remote(destination);
         session
     }
@@ -250,6 +261,20 @@ impl UploadSession {
         if tag_size + prost::length_delimiter_len(list_size) + list_size > super::body_limit() {
             return Err(Error::Invalid("chunk page body"));
         }
+        if self.copy_charge.is_none()
+            && let Some(ram) = &self.ram
+            && !chunks.is_empty()
+        {
+            let bytes = std::mem::size_of_val(chunks) as u64;
+            if let Some(charge) = &self.descriptor_charge {
+                charge.extend(bytes)?;
+            } else {
+                self.descriptor_charge = Some(ram.reserve(bytes)?);
+            }
+        }
+        self.chunks
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| Error::Capacity)?;
         self.chunks.extend_from_slice(chunks);
         self.declared_bytes = total;
         if complete {
@@ -332,13 +357,22 @@ impl UploadSession {
             else {
                 unreachable!()
             };
+            let copy_charge = if self.copy_charge.is_none() {
+                self.ram
+                    .as_ref()
+                    .map(|ram| ram.reserve(std::mem::size_of_val(self.chunks.as_slice()) as u64))
+                    .transpose()?
+            } else {
+                self.copy_charge.clone()
+            };
             let chunks = self.chunks.clone();
             self.failed = true;
             local
                 .store
                 .clone()
                 .effect(&local.scope.clone(), move |core| {
-                    core.publish(&mut local, chunks)
+                    core.publish(&mut local, chunks)?;
+                    Ok(copy_charge)
                 })
                 .await?;
             self.failed = false;

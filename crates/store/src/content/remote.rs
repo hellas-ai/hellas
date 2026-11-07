@@ -417,7 +417,7 @@ where
         if progress.next_chunk != 0 || progress.complete {
             return Err(Error::Invalid("invalid initial upload progress"));
         }
-        Ok(UploadSession::remote(object, remote))
+        Ok(UploadSession::remote(object, remote, self.pool.clone()))
     }
 
     async fn acquire(

@@ -318,6 +318,7 @@ impl Core {
         scope: &Scope,
         object: ContentRef,
         pin: Option<PinTarget>,
+        missing: u64,
     ) -> Result<super::upload::LocalSession> {
         state.check(scope)?;
         let (reservation, charge) = match &scope.kind {
@@ -338,7 +339,6 @@ impl Core {
                 if pin.is_some() || !closure.contains(&object) {
                     return Err(Error::Denied);
                 }
-                let missing = self.missing(state, scope, closure)?;
                 let work = state.work.get_mut(reservation).ok_or(Error::Denied)?;
                 if missing > work.upload_limit {
                     return Err(Error::Capacity);
@@ -511,35 +511,70 @@ impl State {
             target.object(),
         )
     }
-    /// ID-deduplicated traversal propagates the longest prefix of each shared
-    /// subtree, so aliases cannot hide a path overflow or cause exponential walks.
+    /// Postorder computes each tree's longest suffix once, including shared DAGs.
     fn walk(&self, roots: impl IntoIterator<Item = Target>) -> Result<BTreeSet<ContentRef>> {
         let mut reached = BTreeSet::new();
-        let mut longest = BTreeMap::new();
+        let mut depths = BTreeMap::<ContentId, (ContentRef, usize)>::new();
+        let mut active = BTreeSet::new();
         let mut pending = roots
             .into_iter()
-            .map(|root| (root, 0usize))
+            .map(|root| (root, 0usize, None::<Tree>))
             .collect::<Vec<_>>();
-        while let Some((target, path_len)) = pending.pop() {
+        while let Some((target, prefix, tree)) = pending.pop() {
+            let check_path = |suffix: usize| {
+                if prefix + suffix + usize::from(prefix != 0 && suffix != 0) > MAX_PATH_BYTES {
+                    Err(Error::Invalid("tree path length"))
+                } else {
+                    Ok(())
+                }
+            };
+            check_path(0)?;
             reached.insert(target.object());
-            if let Target::Tree(object) = target {
-                if let Some((previous, length)) = longest.get(&object.id()) {
-                    if *previous != object {
-                        return Err(Error::Invalid("conflicting tree lengths"));
-                    }
-                    if *length >= path_len {
-                        continue;
-                    }
-                }
-                longest.insert(object.id(), (object, path_len));
-                for (name, child) in Tree::decode(&self.load(target)?)?.entries() {
-                    let length = path_len + usize::from(path_len != 0) + name.len();
-                    if length > MAX_PATH_BYTES {
-                        return Err(Error::Invalid("tree path length"));
-                    }
-                    pending.push((*child, length));
-                }
+            let Target::Tree(object) = target else {
+                continue;
+            };
+            if let Some(tree) = tree {
+                let depth = tree
+                    .entries()
+                    .iter()
+                    .try_fold(0usize, |depth, (name, child)| {
+                        let suffix = match child {
+                            Target::Tree(object) => {
+                                depths
+                                    .get(&object.id())
+                                    .ok_or(Error::Invalid("tree dependency"))?
+                                    .1
+                            }
+                            Target::Object(_) => 0,
+                        };
+                        Ok::<_, Error>(depth.max(name.len() + suffix + usize::from(suffix != 0)))
+                    })?;
+                check_path(depth)?;
+                active.remove(&object.id());
+                depths.insert(object.id(), (object, depth));
+                continue;
             }
+            if let Some((previous, depth)) = depths.get(&object.id()) {
+                if *previous != object {
+                    return Err(Error::Invalid("conflicting tree lengths"));
+                }
+                check_path(*depth)?;
+                continue;
+            }
+            if !active.insert(object.id()) {
+                return Err(Error::Invalid("tree cycle"));
+            }
+            let tree = Tree::decode(&self.load(target)?)?;
+            let children = tree
+                .entries()
+                .iter()
+                .map(|(name, child)| {
+                    check_path(name.len())?;
+                    Ok((*child, prefix + usize::from(prefix != 0) + name.len(), None))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            pending.push((target, prefix, Some(tree)));
+            pending.extend(children);
         }
         Ok(reached)
     }
@@ -640,8 +675,8 @@ impl State {
         scope: &Scope,
         closure: &[ContentRef],
         lower: &BTreeSet<ContentId>,
+        held: &BTreeSet<ContentId>,
     ) -> Result<u64> {
-        let held = self.held(scope, closure)?;
         closure
             .iter()
             .filter(|object| {
@@ -822,10 +857,16 @@ impl Core {
                     .unwrap_or(false),
                 _ => false,
             };
-            if own
-                || state.present(scope, object)?
-                || self.held_lower(scope, &[object])?.contains(&object.id())
-            {
+            if own {
+                return Ok(UploadSession::present(object));
+            }
+            let closure = match &scope.kind {
+                ScopeKind::Work { closure, .. } => closure.as_slice(),
+                _ => std::slice::from_ref(&object),
+            };
+            let held = state.held(scope, closure)?;
+            let lower = self.held_lower(scope, closure)?;
+            if held.contains(&object.id()) || lower.contains(&object.id()) {
                 if let Some(pin) = pin {
                     state.change_pin(
                         pin.name,
@@ -841,7 +882,8 @@ impl Core {
             }
             // Keep the progress check and reservation/allocation in one critical
             // section: a completed concurrent upload must not allocate twice.
-            self.session(&mut state, scope, object, pin)?
+            let missing = state.missing(scope, closure, &lower, &held)?;
+            self.session(&mut state, scope, object, pin, missing)?
         };
         Ok(UploadSession::local(object, local))
     }
@@ -1559,7 +1601,12 @@ impl Core {
 
 impl Core {
     fn missing(&self, state: &State, scope: &Scope, closure: &[ContentRef]) -> Result<u64> {
-        state.missing(scope, closure, &self.held_lower(scope, closure)?)
+        state.missing(
+            scope,
+            closure,
+            &self.held_lower(scope, closure)?,
+            &state.held(scope, closure)?,
+        )
     }
     fn held_lower(&self, scope: &Scope, closure: &[ContentRef]) -> Result<BTreeSet<ContentId>> {
         match &self.lower {
