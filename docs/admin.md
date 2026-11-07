@@ -596,9 +596,9 @@ Share execution through a signed allowance offer, import it, then select
 ## Embedded host lifecycle
 
 `sdk::node_control::host::HostHandle::start` owns an existing `NodeCoordinator`,
-an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. Supply `OpenAiProviderOptions::into_factory()` from
-`hellas-share` for Gate's vendor relay, preserving its injected App Attest
-prover and enrollment. Other providers prepare the shared SDK provider options
+an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. `hellas-share`'s `OpenAiProviderOptions::into_factory()` returns a provider
+factory for the OpenAI Responses adapter that keeps the caller's root prover and
+enrollment as supplied. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
 it cannot open a second journal. A gateway over a grant uses the same writer and
 `grant_gateway::GrantServeOptions::into_factory`.

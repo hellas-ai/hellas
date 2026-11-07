@@ -102,8 +102,9 @@ where
 }
 
 impl<R: RootProver + Send + Sync + 'static> OpenAiProviderOptions<R> {
-    /// Gate supplies its App Attest prover and vendor configuration here; SDK
-    /// owns the shared writer, control listener and serialized service lifetime.
+    /// Wraps these options as a host provider factory. The caller's root prover
+    /// and enrollment are kept as supplied; SDK owns the shared writer, control
+    /// listener and serialized service lifetime.
     pub fn into_factory(self) -> hellas_sdk::node_control::host::ProviderFactory {
         let options = Arc::new(self);
         hellas_sdk::node_control::host::ProviderFactory {
