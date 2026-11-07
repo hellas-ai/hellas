@@ -29,11 +29,9 @@ let
   isCross = crossSystem != null;
   targetTriple = pkgs.stdenv.hostPlatform.rust.rustcTarget;
 
-  rustToolchain =
-    (pkgs.buildPackages.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml).override
-      {
-        targets = lib.optional isCross targetTriple;
-      };
+  rustToolchain = (self.lib.rustToolchain pkgs.buildPackages).override {
+    targets = lib.optional isCross targetTriple;
+  };
 
   # clangStdenv avoids the GCC 15 ICE in zstd-sys (gimple_lower_bitint crash).
   # Under pkgsCross this is the *target* stdenv.
