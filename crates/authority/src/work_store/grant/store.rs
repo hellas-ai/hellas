@@ -44,6 +44,10 @@ pub struct NodeStore {
     journal: Journal,
     _identity_lock: Option<bootstrap::IdentityLock>,
     pub(super) state: State,
+    /// At least the encoded checkpoint of `state` plus its clock headroom:
+    /// exact when last measured, plus [`growth`] for every frame since.
+    /// `usize::MAX` until first measured.
+    checkpoint_bound: usize,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
     pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
 }
@@ -461,9 +465,11 @@ impl NodeStore {
     }
     pub(crate) async fn rotate(&mut self) -> Result<(), NodeStoreError> {
         let mut cancellation = self.cancel_on_failure();
-        self.journal
-            .rotate(&encode(&self.state.snapshot()?)?)
-            .await?;
+        let checkpoint = encode(&self.state.snapshot()?)?;
+        let cost = checkpoint.len() + self.state.ledger.clock_headroom();
+        debug_assert!(cost <= self.checkpoint_bound, "checkpoint growth bound");
+        self.journal.rotate(&checkpoint).await?;
+        self.checkpoint_bound = cost;
         cancellation.0.clear();
         Ok(())
     }
@@ -491,22 +497,24 @@ impl NodeStore {
         if candidate.apply(&frame)? == Applied::Redundant {
             return Ok(());
         }
-        // Terminal pruning is reproducible from the frame cursor. Nonce high
-        // water and old generations remain, so pruning cannot permit replay.
-        candidate.prune();
-        let checkpoint = encode(&candidate.snapshot()?)?;
+        let record = encode(&frame);
         let open = candidate
             .channels
             .values()
             .map(|c| c.book.jobs().len())
             .sum::<usize>();
-        if open > MAX_OPEN_JOBS
-            || checkpoint
-                .len()
-                .saturating_add(candidate.ledger.clock_headroom())
-                .saturating_add(open.saturating_mul(TERMINAL_HEADROOM))
-                > MAX_CHECKPOINT_BYTES
-        {
+        // Every committed state must still fit a rotation after its open jobs
+        // finish. Serializing the whole state to prove it would make each
+        // commit O(state), so that runs only when the bound cannot.
+        let reserve = open.saturating_mul(TERMINAL_HEADROOM);
+        let len = record.as_ref().map_or(usize::MAX, Vec::len);
+        let mut bound = self.checkpoint_bound.saturating_add(growth(&frame, len));
+        if bound.saturating_add(reserve) > MAX_CHECKPOINT_BYTES {
+            let cost = encode(&candidate.snapshot()?)?.len() + candidate.ledger.clock_headroom();
+            debug_assert!(cost <= bound, "checkpoint growth bound");
+            bound = cost;
+        }
+        if open > MAX_OPEN_JOBS || bound.saturating_add(reserve) > MAX_CHECKPOINT_BYTES {
             return Err(GrantError::StateCapacity.into());
         }
         // Observe elapsed deadlines against the old state before an extension
@@ -523,15 +531,43 @@ impl NodeStore {
             // A rotation refused before writing leaves the reserved tail usable.
             // A failed write poisons the journal, so append still refuses that case.
         }
-        self.journal.append(&encode(&frame)?).await?;
+        self.journal.append(&record?).await?;
         self.state = candidate;
+        self.checkpoint_bound = bound;
         self.refresh_executions(frame.now);
         self.refresh_deliveries(frame.now);
         cancellation.0.clear();
         Ok(())
     }
 }
+/// Most `frame` can add to a checkpoint plus its clock headroom, or
+/// `usize::MAX` for a change only exact measurement bounds (configuration,
+/// authority: rare, and able to end every queued job).
+///
+/// Admission, dispatch and settlement copy values from their frame at most
+/// twice (a charge is held by the admission and its reservation). Structure
+/// the frame does not carry is fixed: a work id per map, the reservation's
+/// budget path, a mounted channel's identity, and settlement widening every
+/// counter on that path (11 nodes x 20 counters x 8 bytes). Each fits in
+/// TERMINAL_HEADROOM. Advancing the clock only widens the window ids and high
+/// water that `clock_headroom` already counts; pruning only shrinks.
+fn growth(frame: &Frame, len: usize) -> usize {
+    use Change::{Accepted, Clock, Dispatched, Terminal};
+    let bounded = |c: &Change| {
+        matches!(
+            c,
+            Clock | Accepted { .. } | Dispatched { .. } | Terminal { .. }
+        )
+    };
+    if !frame.changes.iter().all(bounded) {
+        return usize::MAX;
+    }
+    len.saturating_mul(2)
+        .saturating_add(frame.changes.len().saturating_mul(TERMINAL_HEADROOM))
+}
 impl State {
+    /// Terminal pruning is reproducible from the frame cursor. Nonce high
+    /// water and old generations remain, so pruning cannot permit replay.
     pub(super) fn prune(&mut self) {
         let now = self.now();
         for c in self.channels.values_mut() {
