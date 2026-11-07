@@ -370,7 +370,7 @@ impl ProviderHandle {
         };
         result = result.and(joined);
         if self.owns_endpoint {
-            self.endpoint.close().await;
+            hellas_wire::iroh::close(&self.endpoint).await;
         }
         if let Some(node) = self.owned_authority.take() {
             node.close().await;

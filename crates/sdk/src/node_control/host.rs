@@ -262,7 +262,7 @@ impl HostHandle {
         let mut result = listener.and(stopped);
         // Accepted remote Work drains while the host-owned endpoint is alive.
         if let Some((endpoint, task)) = self.transport.take() {
-            endpoint.close().await;
+            hellas_wire::iroh::close(&endpoint).await;
             result = result.and(task.await.map_err(HostError::from));
         }
         if let Some(node) = self.node.take() {
