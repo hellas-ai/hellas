@@ -221,6 +221,39 @@ impl Reconstruction {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut allowed: std::collections::BTreeMap<XetHash, Vec<std::ops::Range<u64>>> =
+            std::collections::BTreeMap::new();
+        for term in &terms {
+            allowed
+                .entry(term.xorb)
+                .or_default()
+                .push(term.chunks.clone());
+        }
+        for ranges in allowed.values_mut() {
+            ranges.sort_by_key(|range| range.start);
+            let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+            for range in ranges.drain(..) {
+                if let Some(previous) = merged.last_mut()
+                    && range.start <= previous.end
+                {
+                    previous.end = previous.end.max(range.end);
+                } else {
+                    merged.push(range);
+                }
+            }
+            *ranges = merged;
+        }
+        for (xorb, ranges) in &fetches {
+            for range in ranges {
+                let covered = allowed.get(xorb).is_some_and(|allowed| {
+                    let index = allowed.partition_point(|term| term.start <= range.chunks.start);
+                    index != 0 && allowed[index - 1].end >= range.chunks.end
+                });
+                if !covered {
+                    return Err(bad("fetch chunk range exceeds requested term union"));
+                }
+            }
+        }
         Ok(Self {
             offset_into_first_range: value
                 .get("offset_into_first_range")
@@ -441,11 +474,20 @@ fn token_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String
     let token = String::from_utf8(bytes).ok()?;
     (!token.trim().is_empty()).then(|| token.trim().to_owned())
 }
+pub(crate) fn http() -> &'static ureq::Agent {
+    static HTTP: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .https_only(!cfg!(test))
+            .build()
+            .into()
+    })
+}
 fn authenticated_get(
     url: &str,
     bearer: Option<&str>,
 ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    let request = ureq::get(url);
+    let request = http().get(url);
     if let Some(token) = bearer.filter(|_| hf_origin(url)) {
         request.header("Authorization", &format!("Bearer {token}"))
     } else {
@@ -693,7 +735,8 @@ impl HfCas {
                 if count > length / crate::xorb::HEADER as u64 {
                     return Err(FetchError::Malformed("reconstruction framing count".into()));
                 }
-                let mut response = ureq::get(&range.url)
+                let mut response = http()
+                    .get(&range.url)
                     .header(
                         "Range",
                         &format!("bytes={}-{}", range.bytes.start(), range.bytes.end()),

@@ -74,7 +74,7 @@ impl Core {
             disk: None,
             gate: Arc::new(tokio::sync::Mutex::new(())),
             lower: None,
-            http: ureq::Agent::new_with_defaults(),
+            http: crate::hf::http().clone(),
             #[cfg(test)]
             hf_hub: None,
             changed: Arc::new(tokio::sync::Notify::new()),

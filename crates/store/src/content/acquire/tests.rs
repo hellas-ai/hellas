@@ -298,20 +298,18 @@ fn hf_git_paths_are_encoded_and_dataset_files_use_the_dataset_endpoint() {
 }
 
 #[test]
-fn new_hf_reconstruction_streams_multiterm_overfetch_and_nonzero_offset() {
-    let a = framed(b"unused");
+fn new_hf_reconstruction_streams_multiterm_and_nonzero_offset() {
     let mut first = vec![b'x'; hellas_xet::MIN_CHUNK_SIZE];
     first[..12].copy_from_slice(b"prefixhello ");
     let expected = [&first[6..], b"world"].concat();
     let id = hellas_xet::XetHash::hash(&expected);
     let b = framed(&first);
     let c = framed(b"world");
-    let d = framed(b"unused too");
-    let one = [a, b].concat();
-    let two = [c, d].concat();
+    let one = b;
+    let two = c;
     let xorb = hellas_xet::XetHash::ZERO;
     let (base, serving) = hub(|base| {
-        let plan=serde_json::json!({"offset_into_first_range":6,"terms":[{"hash":xorb.to_string(),"range":{"start":1,"end":2},"unpacked_length":first.len()},{"hash":xorb.to_string(),"range":{"start":2,"end":3},"unpacked_length":5}],"xorbs":{xorb.to_string():[{"url":format!("{base}/one"),"ranges":[{"chunks":{"start":0,"end":2},"bytes":{"start":0,"end":one.len()-1}}]},{"url":format!("{base}/two"),"ranges":[{"chunks":{"start":2,"end":4},"bytes":{"start":0,"end":two.len()-1}}]}]}}).to_string().into_bytes();
+        let plan=serde_json::json!({"offset_into_first_range":6,"terms":[{"hash":xorb.to_string(),"range":{"start":1,"end":2},"unpacked_length":first.len()},{"hash":xorb.to_string(),"range":{"start":2,"end":3},"unpacked_length":5}],"xorbs":{xorb.to_string():[{"url":format!("{base}/one"),"ranges":[{"chunks":{"start":1,"end":2},"bytes":{"start":0,"end":one.len()-1}}]},{"url":format!("{base}/two"),"ranges":[{"chunks":{"start":2,"end":3},"bytes":{"start":0,"end":two.len()-1}}]}]}}).to_string().into_bytes();
         vec![
             (
                 format!("/api/models/org/repo/xet-read-token/{}", "a".repeat(40)),

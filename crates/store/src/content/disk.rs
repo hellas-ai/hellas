@@ -1080,7 +1080,16 @@ impl Disk {
             let (indexed, location) = self.index(&entry.path(), IndexMode::Resume)?;
             let id = ContentId::from_bytes(indexed.id.into_bytes());
             if entry.file_name().to_str() != Some(id.to_string().as_str()) {
-                return Err(Error::Invalid("corrupt private staged object"));
+                let path = entry.path();
+                let shared =
+                    Self::same_file(&path, &self.root.join("objects").join(entry.file_name()));
+                fs::remove_file(&path)?;
+                if !shared {
+                    self.quota.remove_owned(indexed.len);
+                }
+                self.records.forget(location.identity);
+                tracing::error!(id = %entry.file_name().to_string_lossy(), path = %path.display(), "discarded corrupt private staged object");
+                continue;
             }
             staged.insert(
                 id,
