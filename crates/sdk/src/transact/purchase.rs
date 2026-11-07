@@ -4,6 +4,7 @@ use hellas_auth::Digest;
 use hellas_auth::authority::PrincipalId;
 use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
 use hellas_kernel::{EdgeId, Secp256k1Verifier};
+use hellas_private::Durability;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -14,6 +15,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct PaidAttemptPath {
     path: PathBuf,
+    durability: Durability,
     state_key: String,
 }
 
@@ -24,13 +26,14 @@ impl PaidAttemptPath {
         owner: PrincipalId,
         job: Digest,
     ) -> Self {
+        let client = chain.client();
         Self {
-            path: chain
-                .client()
+            path: client
                 .join("purchases")
                 .join(provider.to_string())
                 .join(hex::encode(owner.as_bytes()))
                 .join(format!("{job}.json")),
+            durability: client.durability(),
             state_key: chain.state_key(),
         }
     }
@@ -44,12 +47,18 @@ impl PaidAttemptPath {
         ));
         Self {
             path,
+            durability: self.durability,
             state_key: self.state_key.clone(),
         }
     }
 
     pub fn as_path(&self) -> &Path {
         &self.path
+    }
+
+    /// The selected store's policy for this attempt's records.
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
     pub(crate) fn state_key(&self) -> &str {
@@ -62,6 +71,7 @@ impl PaidAttemptPath {
     fn test(path: PathBuf) -> Self {
         Self {
             path,
+            durability: Durability::default(),
             state_key: String::new(),
         }
     }
@@ -148,6 +158,7 @@ impl Drop for PurchaseLock {
 /// The lock serializes invocations of the same job, including --buy-again.
 pub struct Purchase {
     path: PathBuf,
+    durability: Durability,
     state_key: String,
     _lock: PurchaseLock,
     job: [u8; 32],
@@ -206,9 +217,10 @@ impl Purchase {
 
     fn open_identity(path: &PaidAttemptPath, job: Digest, price: u64) -> Result<Self> {
         let state_key = path.state_key().to_owned();
+        let durability = path.durability();
         let path = path.as_path();
         let parent = path.parent().ok_or(PurchaseError::Identity)?;
-        hellas_private::create_dir_all_durable(parent)?;
+        durability.create_dir_all(parent)?;
         let lock = hellas_private::open_lock_beside(path)?;
         lock.try_lock().map_err(|_| PurchaseError::Busy)?;
         let lock = PurchaseLock(lock);
@@ -234,6 +246,7 @@ impl Purchase {
         }
         Ok(Self {
             path: path.to_owned(),
+            durability,
             state_key,
             _lock: lock,
             job: *job.as_bytes(),
@@ -650,8 +663,13 @@ impl Purchase {
         })
     }
 
+    /// The selected store's policy, shared by this attempt's sidecars.
+    pub(crate) fn durability(&self) -> Durability {
+        self.durability
+    }
+
     fn persist(&self) -> Result<()> {
-        hellas_private::write_atomically(
+        self.durability.write_atomically(
             &self.path,
             ".writing",
             &serde_json::to_vec(self.record.as_ref().ok_or(PurchaseError::Identity)?)?,
@@ -878,6 +896,33 @@ mod tests {
         assert_eq!(reopened.request_nonce(channel, 1), nonce);
         let second = Purchase::open_tracked(&tracked(&root.path().join("second")), &job).unwrap();
         assert_ne!(second.request_nonce(channel, 1), nonce);
+    }
+
+    #[test]
+    fn markers_follow_the_selected_store_durability() {
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();
+        let owner = PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+            passkey.party_key().to_bytes(),
+        ))
+        .unwrap();
+        let provider = hellas_client::ProviderAddress {
+            enrollment: hellas_rpc::ContentId::hash(b"provider"),
+            node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        };
+        let job = job();
+        for durability in [Durability::Crash, Durability::Power] {
+            let root = tempfile::tempdir().unwrap();
+            let chain = hellas_chain::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(root.path(), durability),
+                &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            )
+            .unwrap();
+            let path =
+                PaidAttemptPath::new(&chain, provider, owner, job.digest()).with_nonce([1; 16]);
+            let purchase = Purchase::open_tracked(&path, &job).unwrap();
+            assert_eq!(purchase.durability(), durability);
+            assert!(path.as_path().is_file());
+        }
     }
 
     fn job() -> Job {
