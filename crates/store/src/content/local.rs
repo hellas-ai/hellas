@@ -225,6 +225,24 @@ impl LocalStore {
         Ok(acquired)
     }
 
+    /// Check the complete declared closure in one readable-pin walk.
+    pub async fn missing_refs(&self, scope: &Scope, closure: Closure) -> Result<Vec<ContentRef>> {
+        let closure = canonical_closure(closure)?;
+        let ScopeKind::Work {
+            closure: admitted, ..
+        } = &scope.kind
+        else {
+            return Err(Error::Denied);
+        };
+        if &closure != admitted {
+            return Err(Error::Denied);
+        }
+        let checking = scope.clone();
+        self.core()
+            .access(scope, move |core| core.missing_refs(&checking, &closure))
+            .await
+    }
+
     pub async fn open_verified(
         &self,
         scope: &Scope,

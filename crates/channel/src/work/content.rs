@@ -728,11 +728,9 @@ impl WorkService {
             }
             {
                 let endpoint = host.endpoint().await.map_err(status)?;
-                let (_, scope) = endpoint.close.store.invocation_content(id).map_err(status)?;
+                let (local, scope) = endpoint.close.store.invocation_content(id).map_err(status)?;
                 let ScopeKind::Work { closure, .. } = &scope.kind else { Err(status(Error::Denied))?; unreachable!() };
-                for object in closure {
-                    if endpoint.close.store.open_content_reader(id, *object).await.map_err(status)?.is_none() { Err(status(Error::Missing))?; }
-                }
+                if !local.missing_refs(&scope, closure.clone()).await.map_err(status)?.is_empty() { Err(status(Error::Missing))?; }
             }
             host.complete_content_upload(id, reservation)?;
             cleanup.0.clear();

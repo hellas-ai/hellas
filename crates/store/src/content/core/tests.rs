@@ -160,6 +160,62 @@ async fn lower_admission_walks_a_shared_large_tree_once_for_the_whole_closure() 
         .tree_reads
         .load(Ordering::Relaxed);
     assert_eq!(after - before, 1);
+    let ScopeKind::Work { closure, .. } = &scope.kind else {
+        unreachable!()
+    };
+    assert!(
+        LocalStore::Memory(MemoryStore {
+            core: upper.clone()
+        })
+        .missing_refs(&scope, closure.clone())
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    let batched = provider
+        .core
+        .state
+        .lock()
+        .unwrap()
+        .tree_reads
+        .load(Ordering::Relaxed);
+    assert_eq!(batched - after, 1);
+    let mut undeclared = closure.clone();
+    undeclared.push(ContentRef::for_bytes(b"outside the admitted closure"));
+    assert!(matches!(
+        LocalStore::Memory(MemoryStore {
+            core: upper.clone()
+        })
+        .missing_refs(&scope, undeclared)
+        .await,
+        Err(Error::Denied)
+    ));
+    let ScopeKind::Work { reservation, .. } = scope.kind else {
+        unreachable!()
+    };
+    upper
+        .state
+        .lock()
+        .unwrap()
+        .work
+        .get_mut(&reservation)
+        .unwrap()
+        .staged
+        .insert(
+            closure[0].id(),
+            Arc::new(Stored::new(
+                super::super::storage::Data::Ram(Bytes::new()),
+                vec![],
+            )),
+        );
+    assert!(matches!(
+        LocalStore::Memory(MemoryStore {
+            core: upper.clone()
+        })
+        .missing_refs(&scope, closure.clone())
+        .await,
+        Err(Error::Invalid("content length contract"))
+    ));
     upper
         .access(&Scope::Owner, move |core| core.end_work(&scope))
         .await

@@ -526,15 +526,13 @@ impl GrantService {
                     a.input_content,
                 )
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                for object in &objects {
-                    if local
-                        .open_verified(&scope, *object, None)
-                        .await
-                        .map_err(|_| refused(GrantRefusalCode::Malformed))?
-                        .is_none()
-                    {
-                        return Err(refused(GrantRefusalCode::Malformed));
-                    }
+                if !local
+                    .missing_refs(&scope, objects)
+                    .await
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?
+                    .is_empty()
+                {
+                    return Err(refused(GrantRefusalCode::Malformed));
                 }
                 let ephemeral_bytes = local
                     .ephemeral_bytes(&scope)

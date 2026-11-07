@@ -1428,15 +1428,16 @@ impl Core {
         let held = state.held(scope, closure)?;
         let lower = self.held_lower(scope, closure)?;
         let work = state.work.get(reservation).ok_or(Error::Denied)?;
-        Ok(closure
-            .iter()
-            .filter(|object| {
-                !work.staged.contains_key(&object.id())
-                    && !held.contains(&object.id())
-                    && !lower.contains(&object.id())
-            })
-            .copied()
-            .collect())
+        closure.iter().try_fold(Vec::new(), |mut missing, object| {
+            let present = match work.staged.get(&object.id()) {
+                Some(stored) => available(stored, *object)?,
+                None => held.contains(&object.id()) || lower.contains(&object.id()),
+            };
+            if !present {
+                missing.push(*object);
+            }
+            Ok(missing)
+        })
     }
 
     fn protect_acquired(&self, requester: &Core, scope: &Scope, names: Vec<PinName>) -> Result<()> {

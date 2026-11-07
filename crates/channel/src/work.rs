@@ -828,16 +828,13 @@ impl ProviderEndpoint {
         };
         let objects =
             crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
-        for object in &objects {
-            if self
-                .close
-                .store
-                .open_content_reader(work_id, *object)
-                .await?
-                .is_none()
-            {
-                return Err(content_refusal(hellas_store::content::Error::Missing));
-            }
+        if !store
+            .missing_refs(&scope, objects.clone())
+            .await
+            .map_err(content_refusal)?
+            .is_empty()
+        {
+            return Err(content_refusal(hellas_store::content::Error::Missing));
         }
         if authorization.retention == hellas_rpc::Retention::Retain {
             let facts =

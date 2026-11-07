@@ -390,7 +390,7 @@ impl GrantWork {
                 let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
                 let local = LocalStore::Job(job.clone());
                 let ScopeKind::Work { closure, .. } = &job.scope().kind else { Err(status("invalid Work scope"))?; unreachable!() };
-                for object in closure { if local.open_verified(job.scope(), *object, None).await.map_err(status)?.is_none() { Err(status("incomplete Work closure"))?; } }
+                if !local.missing_refs(job.scope(), closure.clone()).await.map_err(status)?.is_empty() { Err(status("incomplete Work closure"))?; }
             }
             work.service.complete_content_upload(authorization.channel_id, reservation)?;
             cleanup.0.clear();
