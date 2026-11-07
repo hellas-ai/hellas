@@ -2411,17 +2411,10 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     );
 }
 
-/// Inputs swapped on the disk fault the journal rather than becoming a
-/// job to execute.
-///
-/// The other half of the property above, and the one that matters to a
-/// dispatch: an accepted job is executed from bytes nobody re-verifies
-/// at dispatch time, so what makes them the right bytes is that opening
-/// the file re-runs the same digest check that admitted them. A store
-/// that only checked on commit would hand a restarted provider a job
-/// its client never signed, and ask for no new signature to do it.
+/// Recovery discards a substituted input without executing its accepted job.
 #[tokio::test]
 async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
+    use hellas_store::content::{ContentStore as _, Cursor, Scope, Target};
     let channel = channel();
     let job = job_at(&channel, 1, 0);
 
@@ -2435,7 +2428,8 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             .path()
             .join("content/objects")
             .join(job.authorization.input_content.id().to_string());
-        hellas_private::write_atomically(&path, ".tamper", &bundle_bytes(bundle_nonce)).unwrap();
+        // Corrupt the private staged hard link too; a valid original must be recoverable.
+        std::fs::write(&path, bundle_bytes(bundle_nonce)).unwrap();
         let content = hellas_store::content::DiskStore::open(
             dir.path().join("content"),
             vec![],
@@ -2447,15 +2441,13 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             false,
             Default::default(),
         )
-        .await;
-        if !readable {
-            assert!(
-                content.is_err(),
-                "a substituted upper object prevents node startup"
-            );
-            continue;
-        }
-        let content = content.unwrap();
+        .await
+        .unwrap();
+        assert_eq!(
+            path.exists(),
+            readable,
+            "the substituted input is discarded"
+        );
         let opened = ChannelStore::open(
             dir.path(),
             channel.clone(),
@@ -2468,9 +2460,30 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
         .await
         .unwrap();
         content.finish_recovery().await.unwrap();
+        assert_eq!(
+            opened.state().job_by_id(job.work_id).unwrap().phase(),
+            JobPhase::Accepted
+        );
+        assert!(opened.state().terminal_by_id(job.work_id).is_none());
+        let root = opened.state().retained_roots()[&job.work_id];
         assert!(
-            opened.state().job_by_id(job.work_id).is_some(),
-            "the accepted input reopens"
+            content
+                .pins(&Scope::Owner, "channel/", Cursor::default())
+                .await
+                .unwrap()
+                .pins
+                .iter()
+                .any(|(_, pin)| pin.target == Target::Tree(root))
+        );
+        if !readable {
+            assert_eq!(content.stats().unwrap().outstanding, 0);
+        }
+        let service = hellas_channel::work::WorkService::close_only(
+            hellas_channel::work::CloseEndpoint::new(opened, provider()).unwrap(),
+        );
+        assert_eq!(
+            service.accepted_work_ids().await.unwrap(),
+            if readable { vec![job.work_id] } else { vec![] }
         );
     }
 }

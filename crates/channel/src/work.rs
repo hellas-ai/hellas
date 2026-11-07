@@ -2691,6 +2691,21 @@ impl WorkService {
         Ok(read(self.endpoint().await?.state()))
     }
 
+    /// Accepted jobs, excluding retained work whose input could not be restored.
+    pub async fn accepted_work_ids(&self) -> Result<Vec<Digest>, EndpointError> {
+        let endpoint = self.endpoint().await?;
+        Ok(endpoint
+            .state()
+            .jobs()
+            .filter(|job| {
+                job.phase() == JobPhase::Accepted
+                    && (job.authorization().retention != hellas_rpc::Retention::Retain
+                        || endpoint.close.store.contents.contains_key(&job.work_id()))
+            })
+            .map(|job| job.work_id())
+            .collect())
+    }
+
     /// Takes this channel's one cursor-driving authority, or says it is
     /// already taken.
     ///

@@ -404,13 +404,40 @@ impl ChannelStore {
             }
             let store = LocalStore::Disk(self.content.clone());
             let (policy, facts) = {
-                let input = read(
+                let input = match read(
                     &store,
                     &Scope::Owner,
                     authorization.input_content,
                     crate::content::MAX_CONTENT_BYTES as u64,
                 )
-                .await?;
+                .await
+                {
+                    Ok(input) => input,
+                    Err(Error::Missing)
+                        if self.state().role() == Role::Provider
+                            && self
+                                .state()
+                                .job_by_id(work)
+                                .is_some_and(|job| job.provider_signature().is_some()) =>
+                    {
+                        tracing::error!(channel = %self.state().channel().id(), job = %work, content_id = %authorization.input_content.id(),
+                            "accepted retained input is missing; keeping the job undispatched with no output allowance");
+                        let scope = self
+                            .content
+                            .open_work(
+                                JobId {
+                                    channel: self.state().channel().id(),
+                                    id: work,
+                                },
+                                vec![],
+                                0,
+                            )
+                            .await?;
+                        self.content.end_work(&scope).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let prepared = PreparedInvocation::from_canonical_bytes(
                     &input,
                     crate::content::MAX_CONTENT_BYTES,

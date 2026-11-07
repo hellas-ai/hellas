@@ -18,7 +18,7 @@ use hellas_channel::work::{
 use hellas_channel::work_close::{FinalizedBlocks, TxSink};
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_channel::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
-use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
+use hellas_channel::work_store::{ChannelStore, Role, SetupStore, discover_setups};
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
@@ -807,19 +807,6 @@ impl DrivenChannel {
         Ok(())
     }
 
-    async fn accepted_work_ids(&self) -> Result<Vec<Digest>, PaidProviderError> {
-        self.service
-            .with_state(|state| {
-                state
-                    .jobs()
-                    .filter(|job| job.phase() == JobPhase::Accepted)
-                    .map(|job| job.work_id())
-                    .collect()
-            })
-            .await
-            .map_err(PaidProviderError::from)
-    }
-
     /// Resumes every accepted job after a fresh readiness check. Overlapping
     /// accepted executions are each dispatched; the durable `JobRunning`
     /// record admits one invocation per job even when a live request races
@@ -828,7 +815,7 @@ impl DrivenChannel {
         if !self.node.ready() {
             return Ok(false);
         }
-        let work_ids = self.accepted_work_ids().await?;
+        let work_ids = self.service.accepted_work_ids().await?;
         if work_ids.is_empty() {
             return Ok(false);
         }
@@ -1356,6 +1343,7 @@ impl NodeWorkRunner {
 mod tests {
     use super::*;
     use crate::test_support::{PaidFixture, accept_uploaded};
+    use hellas_channel::work_store::JobPhase;
 
     /// Every durable acceptance is dispatched after a restart, not only
     /// a lone one. The running gate is the duplicate-execution barrier;
