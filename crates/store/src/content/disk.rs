@@ -230,10 +230,43 @@ impl Disk {
     fn index(&self, path: &FsPath, mode: IndexMode) -> Result<(Indexed, Entry)> {
         self.records.index_entry(path, mode, &self.ram)
     }
+    fn discard_corrupt_upper(&self, path: &FsPath, accounted: u64) -> Result<()> {
+        if path.parent() != Some(self.root.join("objects").as_path()) {
+            return Err(Error::Invalid("conflicting owned backing"));
+        }
+        let identity = match fs::symlink_metadata(path) {
+            Ok(metadata) => FileIdentity::of(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let name = path
+            .file_name()
+            .ok_or(Error::Invalid("upper object path"))?;
+        let mut shared = false;
+        for entry in fs::read_dir(self.root.join("staging"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && Self::same_file(path, &entry.path().join(name)) {
+                shared = true;
+                break;
+            }
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        tracing::error!(id = %name.to_string_lossy(), path = %path.display(), "discarded corrupt upper object");
+        self.records.forget(identity);
+        if !shared {
+            self.quota.remove_owned(accounted);
+        }
+        Ok(())
+    }
     pub(crate) fn scan(
         self: &Arc<Self>,
         lowers: &[PathBuf],
         mode: IndexMode,
+        known: Option<&BTreeMap<ContentId, Arc<Stored>>>,
     ) -> Result<BTreeMap<ContentId, Arc<Stored>>> {
         // Load local index changes only at the explicit rescan boundary.
         let _ = self.records.load(&self.root.join("fastresume.bin"));
@@ -252,6 +285,30 @@ impl Disk {
                 if !kind.is_file() || crate::fastresume::is_cache_debris(&path) {
                     continue;
                 }
+                let length = if lower {
+                    0
+                } else if let Some(known) = known {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.parse::<ContentId>().ok())
+                        .and_then(|id| known.get(&id))
+                        .and_then(|stored| match &stored.data {
+                            Data::File(file)
+                                if file
+                                    .entries
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|entry| entry.path == path) =>
+                            {
+                                Some(file.object.bytes())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                } else {
+                    entry.metadata()?.len()
+                };
                 let (indexed, location) =
                     self.index(&path, if lower { mode } else { IndexMode::Resume })?;
                 let id = ContentId::from_bytes(indexed.id.into_bytes());
@@ -259,7 +316,9 @@ impl Disk {
                     && path.file_name().and_then(|name| name.to_str())
                         != Some(id.to_string().as_str())
                 {
-                    return Err(Error::Invalid("corrupt upper object"));
+                    self.records.forget(location.identity);
+                    self.discard_corrupt_upper(&path, length)?;
+                    continue;
                 }
                 if let Some(stored) = objects.get(&id) {
                     if let Data::File(file) = &stored.data {
@@ -332,6 +391,7 @@ impl FileObject {
             .lock()
             .map_err(|_| Error::Invalid("file index lock"))?;
         let mut chosen = None;
+        let mut failure = None;
         let before = entries.len();
         entries.retain_mut(|entry| {
             let mut opened =
@@ -339,15 +399,40 @@ impl FileObject {
             // Store-owned hard-link publication/removal changes ctime. Reverify
             // that upper backing before refreshing its identity; changed lowers
             // are still marked bad and require an explicit rescan.
-            if !matches!(opened, Ok(Some(_)))
-                && entry.path.parent() == Some(self.disk.root.join("objects").as_path())
-                && let Ok((indexed, refreshed)) = self.disk.index(&entry.path, IndexMode::Resume)
-                && indexed.id == self.object.id().digest()
-                && indexed.len == self.object.bytes()
-            {
-                *entry = refreshed;
-                opened =
-                    crate::open_indexed_file(self.object.id().digest(), self.object.bytes(), entry);
+            let upper = entry.path.parent() == Some(self.disk.root.join("objects").as_path());
+            if !matches!(opened, Ok(Some(_))) && upper {
+                match self.disk.index(&entry.path, IndexMode::Resume) {
+                    Ok((indexed, refreshed))
+                        if indexed.id == self.object.id().digest()
+                            && indexed.len == self.object.bytes() =>
+                    {
+                        *entry = refreshed;
+                        opened = crate::open_indexed_file(
+                            self.object.id().digest(),
+                            self.object.bytes(),
+                            entry,
+                        );
+                    }
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.disk.records.forget(entry.identity);
+                        return false;
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        return true;
+                    }
+                    Ok(_) => {
+                        if let Err(error) = self
+                            .disk
+                            .discard_corrupt_upper(&entry.path, self.object.bytes())
+                        {
+                            failure = Some(error);
+                            return true;
+                        }
+                        self.disk.records.forget(entry.identity);
+                        return false;
+                    }
+                }
             }
             match opened {
                 Ok(Some(file)) => {
@@ -356,6 +441,11 @@ impl FileObject {
                     }
                     true
                 }
+                Err(error) if upper => {
+                    failure = Some(std::io::Error::other(error).into());
+                    true
+                }
+                Ok(None) if upper => true,
                 _ => {
                     self.disk.records.forget(entry.identity);
                     false
@@ -367,6 +457,9 @@ impl FileObject {
                 .records
                 .save(&self.disk.root.join("fastresume.bin"))?;
         }
+        if let Some(error) = failure {
+            return Err(error);
+        }
         chosen.ok_or(Error::Missing)
     }
     pub(crate) fn stream(
@@ -374,7 +467,7 @@ impl FileObject {
         chunks: &[hellas_xet::Chunk],
         range: std::ops::Range<u64>,
     ) -> Result<std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Bytes>> + Send>>> {
-        let (file, entry) = self.open_location()?;
+        let (file, _) = self.open_location()?;
         let file = file.into_file();
         let mut selected = Vec::new();
         let mut offset = 0;
@@ -392,29 +485,20 @@ impl FileObject {
         let ram = self.disk.ram.clone();
         let backing = self.clone();
         Ok(Box::pin(futures::stream::try_unfold(
-            (
-                file,
-                selected.into_iter(),
-                ram,
-                range,
-                descriptors,
-                backing,
-                entry,
-            ),
-            |(mut file, mut chunks, ram, range, descriptors, backing, entry)| async move {
+            (file, selected.into_iter(), ram, range, descriptors, backing),
+            |(mut file, mut chunks, ram, range, descriptors, backing)| async move {
                 let Some((offset, chunk)) = chunks.next() else {
                     return Ok(None);
                 };
                 let charge = ram.reserve(chunk.data_len)?;
-                let invalidator = backing.clone();
-                let read_entry = entry.clone();
+                let reader = backing.clone();
                 let (file, bytes) = tokio::task::spawn_blocking(move || {
+                    let _reader = reader;
                     file.seek(std::io::SeekFrom::Start(offset))?;
                     let mut bytes = vec![0; chunk.data_len as usize];
                     if file.read_exact(&mut bytes).is_err()
                         || hellas_xet::chunk(&bytes).as_slice() != [chunk]
                     {
-                        invalidator.invalidate(&read_entry)?;
                         return Err(Error::Invalid("backing chunk changed"));
                     }
                     Ok::<_, Error>((file, charged(Bytes::from(bytes), charge)))
@@ -425,7 +509,7 @@ impl FileObject {
                 let end = (range.end - offset).min(chunk.data_len) as usize;
                 Ok(Some((
                     bytes.slice(start..end),
-                    (file, chunks, ram, range, descriptors, backing, entry),
+                    (file, chunks, ram, range, descriptors, backing),
                 )))
             },
         )))
@@ -439,10 +523,33 @@ impl FileObject {
         self.load_opened(file, entry, charge)
     }
     fn invalidate(&self, entry: &Entry) -> Result<()> {
-        self.entries
-            .lock()
-            .unwrap()
-            .retain(|other| other.path != entry.path || other.identity != entry.identity);
+        let upper = entry.path.parent() == Some(self.disk.root.join("objects").as_path());
+        let refreshed = if upper {
+            match self.disk.index(&entry.path, IndexMode::Resume) {
+                Ok((indexed, refreshed))
+                    if indexed.id == self.object.id().digest()
+                        && indexed.len == self.object.bytes() =>
+                {
+                    Some(refreshed)
+                }
+                Ok(_) => {
+                    self.disk
+                        .discard_corrupt_upper(&entry.path, self.object.bytes())?;
+                    None
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|other| {
+            other.path != entry.path || (!upper && other.identity != entry.identity)
+        });
+        if let Some(refreshed) = refreshed {
+            entries.push(refreshed);
+        }
         self.disk.records.forget(entry.identity);
         self.disk
             .records
@@ -501,14 +608,35 @@ impl FileObject {
         self.link_temp(destination.parent().unwrap())
     }
     fn existing(&self, path: &FsPath) -> Result<Option<Entry>> {
-        if path.symlink_metadata().is_err() {
-            return Ok(None);
+        match path.symlink_metadata() {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
-        let (indexed, entry) = self.disk.index(path, IndexMode::Resume)?;
-        if indexed.id != self.object.id().digest() || indexed.len != self.object.bytes() {
-            return Err(Error::Invalid("conflicting owned backing"));
+        match self.disk.index(path, IndexMode::Resume) {
+            Ok((indexed, entry))
+                if indexed.id == self.object.id().digest()
+                    && indexed.len == self.object.bytes() =>
+            {
+                Ok(Some(entry))
+            }
+            Err(error) => Err(error),
+            _ => {
+                let accounted = if self
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.path == path)
+                {
+                    self.object.bytes()
+                } else {
+                    0
+                };
+                self.disk.discard_corrupt_upper(path, accounted)?;
+                Ok(None)
+            }
         }
-        Ok(Some(entry))
     }
     fn link_temp(&self, directory: &FsPath) -> Result<()> {
         self.disk.durability.create_dir_all(directory)?;
@@ -630,7 +758,7 @@ impl DiskStore {
             let core = Core::new(ram);
             let (generation, pins) = disk.pins().await?;
             let scanning = disk.clone();
-            let objects = tokio::task::spawn_blocking(move || scanning.scan(&lower, mode))
+            let objects = tokio::task::spawn_blocking(move || scanning.scan(&lower, mode, None))
                 .await
                 .map_err(|_| Error::Invalid("lower scan worker"))??;
             {
@@ -752,8 +880,13 @@ impl DiskStore {
     pub async fn rescan(&self, lower: Vec<PathBuf>, mode: IndexMode) -> Result<()> {
         self.core
             .access(&Scope::Owner, move |core| {
-                let objects = core.disk.as_ref().unwrap().scan(&lower, mode)?;
-                core.state.lock().unwrap().reload(objects);
+                let mut state = core.state.lock().unwrap();
+                let objects =
+                    core.disk
+                        .as_ref()
+                        .unwrap()
+                        .scan(&lower, mode, Some(&state.objects))?;
+                state.reload(objects);
                 Ok(())
             })
             .await

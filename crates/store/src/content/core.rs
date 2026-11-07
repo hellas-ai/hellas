@@ -699,11 +699,32 @@ impl Core {
         let pin = at.pin.clone();
         let store = self.clone();
         let stream = futures::stream::try_unfold(
-            (chunks, store, scope, pin),
-            |(mut chunks, store, scope, pin)| async move {
+            (chunks, store, scope, pin, object),
+            |(mut chunks, store, scope, pin, object)| async move {
                 use futures::StreamExt;
                 let Some(bytes) = chunks.next().await else {
                     return Ok(None);
+                };
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        // Recheck the current backing under the owned effect gate;
+                        // a failed old reader must not unlink a healthy replacement.
+                        store
+                            .effect(&scope, move |core| {
+                                if let Some(stored) = core.state()?.objects.get(&object.id())
+                                    && let super::storage::Data::File(file) = &stored.data
+                                {
+                                    match file.open() {
+                                        Ok(_) | Err(Error::Missing) => {}
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                        return Err(error);
+                    }
                 };
                 {
                     let _gate = store.effect_gate(&scope).await?;
@@ -717,7 +738,7 @@ impl Core {
                         return Err(Error::Denied);
                     }
                 }
-                Ok(Some((bytes?, (chunks, store, scope, pin))))
+                Ok(Some((bytes, (chunks, store, scope, pin, object))))
             },
         );
         Ok(ByteStream {

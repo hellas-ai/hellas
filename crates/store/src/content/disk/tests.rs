@@ -440,7 +440,7 @@ async fn jobs_wait_for_provider_pin_commit_and_ignore_failed_pending_policy() {
     job.end().await.unwrap();
 }
 #[tokio::test]
-async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() {
+async fn corrupt_existing_destination_is_replaced_from_verified_private_staging() {
     let root = tempfile::tempdir().unwrap();
     let store = open(root.path()).await;
     let object = ContentRef::for_bytes(b"private bytes");
@@ -461,30 +461,25 @@ async fn corrupt_existing_destination_cannot_destroy_verified_private_staging() 
     drop(session);
     let destination = root.path().join("objects").join(object.id().to_string());
     fs::write(&destination, b"corrupt bytes").unwrap();
-    assert!(
-        store
-            .restore_root(job, Target::Object(object), pin("retained"), None)
-            .await
-            .is_err()
-    );
+    store
+        .restore_root(job, Target::Object(object), pin("retained"), None)
+        .await
+        .unwrap();
+    assert_eq!(store.stats().unwrap().used, object.bytes());
     let mut reader = store.open_staged(&scope, object).await.unwrap().unwrap();
     let mut data = Vec::new();
     reader.read_to_end(&mut data).unwrap();
     assert_eq!(data, b"private bytes");
     drop(reader);
-    assert!(matches!(
-        LocalStore::Disk(store.clone())
-            .open_verified(&scope, object, None)
-            .await,
-        Ok(None)
-    ));
-    // The owner removes the deliberately corrupt foreign destination; retry
-    // must use the original verified staging rather than downloading again.
-    fs::remove_file(destination).unwrap();
-    store
-        .restore_root(job, Target::Object(object), pin("retained"), None)
+    let mut read = store
+        .read(&Scope::Owner, &at("retained"), 0..object.bytes())
         .await
         .unwrap();
+    assert_eq!(
+        read.bytes.next().await.unwrap().unwrap().as_ref(),
+        b"private bytes"
+    );
+    drop(read);
     store.close().await;
     drop(store);
     let store = DiskStore::open(
@@ -1013,4 +1008,83 @@ async fn failed_lower_initialization_releases_the_writer_before_returning() {
     .await
     .unwrap();
     reopened.close().await;
+}
+
+#[tokio::test]
+async fn corrupt_upper_is_removed_without_losing_pins_and_can_be_uploaded_again() {
+    for repair in ["read", "startup", "rescan-grow", "rescan-shrink"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = open(root.path()).await;
+        let content = b"verified owned bytes";
+        let object = put(&store, "kept", content).await;
+        let path = root.path().join("objects").join(object.id().to_string());
+        let mut reading = if repair == "read" {
+            Some(
+                store
+                    .read(&Scope::Owner, &at("kept"), 0..object.bytes())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        fs::write(
+            &path,
+            if repair == "rescan-shrink" {
+                b"x".to_vec()
+            } else {
+                vec![0xff; content.len() * 2]
+            },
+        )
+        .unwrap();
+        match repair {
+            "read" => {
+                assert!(
+                    reading
+                        .as_mut()
+                        .unwrap()
+                        .bytes
+                        .next()
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+                drop(reading);
+            }
+            "startup" => {
+                store.close().await;
+                drop(store);
+                store = open(root.path()).await;
+            }
+            _ => store.rescan(vec![], IndexMode::Resume).await.unwrap(),
+        }
+        assert!(!path.exists(), "{repair}");
+        assert_eq!(store.stats().unwrap().used, 0, "{repair}");
+        let pins = store
+            .pins(&Scope::Owner, "", Cursor::default())
+            .await
+            .unwrap();
+        assert_eq!(pins.pins.len(), 1, "{repair}");
+        assert_eq!(pins.pins[0].1.target.object(), object, "{repair}");
+        assert!(
+            matches!(
+                store.stat(&Scope::Owner, &at("kept")).await,
+                Err(Error::Missing)
+            ),
+            "{repair}"
+        );
+        assert_eq!(put(&store, "kept", content).await, object);
+        let mut read = store
+            .read(&Scope::Owner, &at("kept"), 0..object.bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read.bytes.next().await.unwrap().unwrap().as_ref(),
+            content,
+            "{repair}"
+        );
+        assert_eq!(store.stats().unwrap().used, object.bytes(), "{repair}");
+        drop(read);
+        store.close().await;
+    }
 }

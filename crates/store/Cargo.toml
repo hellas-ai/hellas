@@ -33,6 +33,7 @@ serde_ipld_dagcbor.workspace = true
 serde_json = { workspace = true }
 tempfile.workspace = true
 thiserror = { workspace = true }
+tracing.workspace = true
 # Bundled Mozilla roots, matching the workspace `reqwest`. Deliberately
 # NOT `platform-verifier`: two HTTP clients in one binary trusting two
 # different sets of certificate authorities is a silent policy split,
