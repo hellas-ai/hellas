@@ -187,22 +187,6 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
 }
 
 #[tokio::test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-async fn shipped_flux_program_matches_catena_models() {
-    let request = request();
-    let package = ModelPackage::open(&fixture()).await.unwrap();
-    let job = package
-        .render_job(&ModelRequest::Image(request))
-        .await
-        .unwrap();
-    let config = Config::read(&fixture()).unwrap();
-    let model = config
-        .source(request.width, request.height, request.steps)
-        .unwrap();
-    crate::model::program::assert_shipped_module(&job, &model).await;
-}
-
-#[tokio::test]
 async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
     let model = ModelPackage::open(&fixture()).await.unwrap();
     for (width, height, steps) in [

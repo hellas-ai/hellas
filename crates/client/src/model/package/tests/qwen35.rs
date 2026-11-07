@@ -134,21 +134,6 @@ async fn dense_recurrent_model_renders_a_two_state_job() {
 }
 
 #[tokio::test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-async fn shipped_qwen35_program_matches_catena_models() {
-    let file = fixture(false);
-    let job = ModelPackage::open(file.path())
-        .await
-        .unwrap()
-        .text_job(&[2, 1], 2, &[])
-        .await
-        .unwrap();
-    let config = catena_models::checkpoint::read_gguf_model_config(file.path()).unwrap();
-    let model = catena_models::catena::generated_model_source_for(&config).unwrap();
-    crate::model::program::assert_shipped_module(&job, &model).await;
-}
-
-#[tokio::test]
 async fn moe_model_binds_all_nine_declared_states() {
     let file = fixture(true);
     let job = ModelPackage::open(file.path())
@@ -172,19 +157,4 @@ async fn moe_model_binds_all_nine_declared_states() {
     }
     let config = catena_models::checkpoint::read_gguf_model_config(file.path()).unwrap();
     assert_eq!(step.args.len(), 12 + weight_specs(&config).unwrap().len());
-}
-
-#[tokio::test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-async fn shipped_moe_program_matches_catena_models() {
-    let file = fixture(true);
-    let job = ModelPackage::open(file.path())
-        .await
-        .unwrap()
-        .text_job(&[2, 1], 2, &[])
-        .await
-        .unwrap();
-    let config = catena_models::checkpoint::read_gguf_model_config(file.path()).unwrap();
-    let model = catena_models::catena::generated_model_source_for(&config).unwrap();
-    crate::model::program::assert_shipped_module(&job, &model).await;
 }

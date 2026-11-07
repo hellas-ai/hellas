@@ -37,7 +37,7 @@ async fn canonical_qwen3_job_bytes_are_stable() {
 }
 
 #[tokio::test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
+#[ignore = "compiles the representative Qwen3 program for CUDA and HIP; run check-model-programs"]
 async fn shipped_qwen3_program_matches_catena_models() {
     let package = ModelPackage::open(&fixture()).await.unwrap();
     let job = package.text_job(&[2, 1], 2, &[0, 0]).await.unwrap();

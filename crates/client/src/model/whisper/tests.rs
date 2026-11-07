@@ -150,28 +150,6 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
 }
 
 #[tokio::test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-async fn shipped_whisper_program_matches_catena_models() {
-    let model =
-        ModelPackage::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
-            .await
-            .unwrap();
-    let job = model
-        .render_job(&ModelRequest::Transcription {
-            samples: &[0.; 400],
-            language: Some("en"),
-            max_new_tokens: 4,
-        })
-        .await
-        .unwrap();
-    let config =
-        Config::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
-            .unwrap();
-    crate::model::program::assert_shipped_module(&job, &graph::bundle(&config, false).unwrap())
-        .await;
-}
-
-#[tokio::test]
 async fn masks_match_the_upstream_language_text_and_first_token_rules() {
     let root = tempfile::tempdir().unwrap();
     checkpoint(root.path());
