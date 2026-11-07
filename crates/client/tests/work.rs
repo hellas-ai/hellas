@@ -269,7 +269,7 @@ async fn model_job_restart_inner(provider_held: bool) {
     use futures::StreamExt as _;
     use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
     use hellas_channel::test_support::channel::{advance, deadlines, origin, settlement};
-    use hellas_channel::work::{JobProposal, propose_work, resume_work_proposal};
+    use hellas_channel::work::{ClientChannel as _, JobProposal, propose_work, resume_work_proposal};
     use hellas_channel::work_store::ChannelStore;
     use hellas_client::model::{ModelPackage, ModelRequest};
     use hellas_kernel::Secp256k1Verifier;
