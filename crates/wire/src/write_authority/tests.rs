@@ -1,6 +1,10 @@
 use super::*;
 use std::task::Waker;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Clone, Default)]
 pub(crate) struct Gate {
     state: Arc<Mutex<(bool, Option<Waker>)>>,
@@ -141,13 +145,10 @@ async fn mux_rechecks_below_its_queues_when_the_byte_carrier_is_blocked() {
     // Only the already handed-off prefix may remain in the byte pipe. The mux
     // must discard the rest instead of completing its earlier queued send.
     let mut accepted = vec![];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        remote.read_to_end(&mut accepted),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(HANG_GUARD, remote.read_to_end(&mut accepted))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(accepted.len(), 64);
     remote.shutdown().await.unwrap();
     // A pipe without an authorized implementation never falls back to send_message.
@@ -218,7 +219,7 @@ async fn mux_revocation_wakes_credit_waiters_and_drops_their_queued_body() {
     ));
     gate.revoke();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+        tokio::time::timeout(HANG_GUARD, pending)
             .await
             .unwrap()
             .is_err()

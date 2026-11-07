@@ -11,7 +11,7 @@ use hellas_wire::{MethodMarker, ServiceMarker, StreamTransport};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use {
-    hellas_authority::test_support::WAIT, hellas_authority::test_support::definition,
+    hellas_authority::test_support::HANG_GUARD, hellas_authority::test_support::definition,
     hellas_authority::test_support::policy, hellas_channel::test_support::assert_err,
     hellas_channel::test_support::network,
 };
@@ -666,7 +666,8 @@ async fn failed_open_never_discloses_standing_or_creates_a_client_journal() {
                 "unexpected Open response failure: {response:?}",
             );
             tokio::time::pause();
-            if let Ok(Ok(_)) = tokio::time::timeout(WAIT, transport.connection().accept_bi()).await
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(HANG_GUARD, transport.connection().accept_bi()).await
             {
                 panic!("client sent another request after failed Open");
             }
@@ -744,7 +745,7 @@ async fn stalled_transport_setup_keeps_its_control_timeout() {
     // Keep Open unanswered: timing out job execution is not needed to bound setup.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), opening)
+    let result = tokio::time::timeout(HANG_GUARD, opening)
         .await
         .expect("control deadline must end stalled setup")
         .unwrap();

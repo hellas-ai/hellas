@@ -501,7 +501,7 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let mut stream = response.bytes_stream();
-    let first = tokio::time::timeout(hellas_authority::test_support::WAIT, stream.next())
+    let first = tokio::time::timeout(hellas_authority::test_support::HANG_GUARD, stream.next())
         .await
         .unwrap()
         .unwrap()

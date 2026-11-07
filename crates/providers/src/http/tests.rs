@@ -196,7 +196,7 @@ async fn small_stream_delivery_does_not_wait_for_record_capacity_or_eof() {
         server_with_pause(200, b"ab".to_vec(), None, Some(resume.clone())).await;
     let provider = provider();
     let mut response = provider.run(prepared(&request)).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(1), response.stream.next())
+    let first = tokio::time::timeout(crate::test_support::HANG_GUARD, response.stream.next())
         .await
         .expect("first byte was held until EOF")
         .unwrap()

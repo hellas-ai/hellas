@@ -137,7 +137,7 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
         } else {
             revoke_access(&service, &secret, &credential, target).await;
         }
-        tokio::time::timeout(WAIT, backend.cancelled.notified())
+        tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
             .await
             .expect("revocation must signal idle execution without delivery polling");
         assert_eq!(backend.slots.available_permits(), 0);
@@ -227,7 +227,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 delivery.cancellation().is_cancelled(),
                 "interrupted persistence invalidates delivery before another poll"
             );
-            tokio::time::timeout(WAIT, backend.cancelled.notified())
+            tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                 .await
                 .expect("an uncertain append must invalidate execution");
             assert_eq!(backend.slots.available_permits(), 0);
@@ -302,12 +302,13 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             assert!(futures::poll!(&mut next).is_pending());
         }
         revoke_access(&service, &secret, &_credential, target).await;
-        let Some(work_stream_event::Outcome::Refused(refusal)) = tokio::time::timeout(WAIT, next)
-            .await
-            .expect("committed revocation wakes delivery")
-            .unwrap()
-            .unwrap()
-            .outcome
+        let Some(work_stream_event::Outcome::Refused(refusal)) =
+            tokio::time::timeout(HANG_GUARD, next)
+                .await
+                .expect("committed revocation wakes delivery")
+                .unwrap()
+                .unwrap()
+                .outcome
         else {
             panic!("revoked stream must refuse");
         };
@@ -331,7 +332,7 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             Some(accept_work_response::Outcome::Refused(_))
         ));
         backend.finish.release();
-        tokio::time::timeout(std::time::Duration::from_secs(3), service.drain())
+        tokio::time::timeout(HANG_GUARD, service.drain())
             .await
             .unwrap()
             .unwrap();

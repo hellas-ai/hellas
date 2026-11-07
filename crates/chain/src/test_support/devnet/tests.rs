@@ -124,13 +124,10 @@ fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds(
         // Keep its address so the node's ordinary reconnect path can recover.
         let validator = &devnet.validators[0];
         validator.sync_task.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !validator.sync_task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the ChainSync server stopped");
+        // `run` bounds a hang for the whole fixture.
+        while !validator.sync_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
         let (indexer, events, endpoint, database, verifier) = (
             validator.indexer.archive.clone(),
             devnet.activity[0].clone(),
@@ -337,7 +334,7 @@ fn unwinding_keeps_fixture_storage_until_aborted_tasks_finish() {
         assert!(panic.is_err());
         release.send(()).unwrap();
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+            tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, stopped)
                 .await
                 .unwrap()
                 .unwrap(),

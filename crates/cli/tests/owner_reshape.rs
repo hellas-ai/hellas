@@ -13,6 +13,7 @@ use hellas_chain::{
     config::ValidatorConfig,
     domain::{SettlementKey, Transaction},
 };
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::SoftPasskey;
 use hellas_kernel::{Auth, CoinId, Secp256k1Signer};
 use hellas_sdk::coin_owner::OwnerReshape;
@@ -58,7 +59,7 @@ impl Drop for Validator {
     }
 }
 async fn coin(client: &RemoteLightClient, id: CoinId) -> hellas_chain::domain::Coin {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Ok(Some(block)) = client.get_latest_block().await
                 && let Ok(Some(coin)) = client.get_coin(block.payload, id.to_bytes().into()).await
@@ -174,7 +175,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         )
         .unwrap(),
     );
-    let client = tokio::time::timeout(Duration::from_secs(30), async {
+    let client = tokio::time::timeout(HANG_GUARD, async {
         loop {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone(), verifier.clone()).await
                 && let Ok(info) = client.get_consensus_info().await

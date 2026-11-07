@@ -130,7 +130,7 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                 cache::discarded(&cache);
             }
             let Some(work_stream_event::Outcome::Refused(refusal)) =
-                tokio::time::timeout(WAIT, next)
+                tokio::time::timeout(HANG_GUARD, next)
                     .await
                     .expect("allowance expiry must wake an idle stream")
                     .unwrap()
@@ -149,12 +149,12 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                 "{expires:?}"
             );
             assert!(stream.next().await.is_none());
-            tokio::time::timeout(WAIT, cache.cancellation().cancelled())
+            tokio::time::timeout(HANG_GUARD, cache.cancellation().cancelled())
                 .await
                 .unwrap();
             cache::discarded(&cache);
             if !completed {
-                tokio::time::timeout(WAIT, backend.cancelled.notified())
+                tokio::time::timeout(HANG_GUARD, backend.cancelled.notified())
                     .await
                     .expect("expiry wakes the execution without a mutation or output");
             }

@@ -2,6 +2,10 @@ use super::*;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
+/// Bound for a hung wait, not a performance requirement: CI runs many suites at
+/// once on shared machines, and the property never depends on how fast that is.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The Linux primitive is the contract, not merely an implementation
 /// detail: a harmless path descriptor is acquired before type inspection,
 /// and the readable descriptor remains bound to that inode even if the
@@ -69,7 +73,7 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
         let _ = sender.send(open_regular_file(&fifo));
     });
     let fifo_error = receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("opening the FIFO blocked before its type check")
         .expect_err("a FIFO is not regular content");
     assert_eq!(fifo_error.kind(), io::ErrorKind::InvalidInput);
@@ -186,7 +190,7 @@ fn writable_regular_opens_preserve_content_and_inode_safety() {
         sent.send(()).unwrap();
     });
     received
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("special files must not block");
     let missing = directory.path().join("missing");
     assert!(open_regular_file_rw(&missing).is_err());

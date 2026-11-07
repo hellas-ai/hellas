@@ -628,22 +628,23 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         .await
         .unwrap();
     devnet.seal().await;
+    let short = hellas_sdk::coin_owner::OwnerReshape::split(
+        &client,
+        devnet.network(),
+        CLIENT_OWNER.key().into_kernel(),
+        504,
+        client_settlement().party_key(),
+    )
+    .await;
     assert!(
         matches!(
-            hellas_sdk::coin_owner::OwnerReshape::split(
-                &client,
-                devnet.network(),
-                CLIENT_OWNER.key().into_kernel(),
-                504,
-                client_settlement().party_key()
-            )
-            .await,
+            short,
             Err(hellas_sdk::coin_owner::CoinOwnerError::Insufficient {
                 required: 504,
                 available: 503
             })
         ),
-        "five otherwise eligible inputs cannot fund a four-input channel reshape"
+        "five otherwise eligible inputs cannot fund a four-input channel reshape: {short:?}"
     );
     relays.shutdown().await;
     devnet.shutdown().await;

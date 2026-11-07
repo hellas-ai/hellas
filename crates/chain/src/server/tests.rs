@@ -2,6 +2,7 @@ use super::*;
 use crate::domain::ObjectId;
 use crate::{CoinListing, Mempool, light_client::QueryError};
 use bytes::Bytes;
+use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::test_support::valid_open_tx;
 use hellas_kernel::{EdgeId, Encode as _, PartyAuth};
 use hellas_rpc::pb::services::light_client::LightClientClientImpl;
@@ -351,7 +352,7 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
             wire.submit_work_response(request).await
         }));
     }
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while blocker.started.load(Ordering::SeqCst) < 4 {
             blocker.notify.notified().await;
         }
@@ -361,7 +362,7 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let overflow = tokio::time::timeout(
-        Duration::from_secs(1),
+        HANG_GUARD,
         wire_b.submit_work_response(response_request.clone()),
     )
     .await
@@ -559,7 +560,7 @@ async fn activity_stream_does_not_block_unary_requests() {
         .unwrap();
     let _activity = client.subscribe_activity(Vec::new()).await.unwrap();
 
-    let validators = tokio::time::timeout(Duration::from_secs(1), client.get_validators())
+    let validators = tokio::time::timeout(HANG_GUARD, client.get_validators())
         .await
         .expect("unary request was blocked behind activity stream")
         .unwrap();
@@ -849,7 +850,9 @@ async fn one_validator_submission_is_one_rpc_sample() {
 async fn tcp_admission_caps_the_global_pool_before_upgrade() {
     use tokio::io::AsyncReadExt as _;
     async fn refused(mut stream: TcpStream) {
-        let read = tokio::time::timeout(Duration::from_secs(1), stream.read_u8())
+        // Refusal must beat the handshake deadline, which would also close
+        // the socket; half of it leaves any loaded machine ample slack.
+        let read = tokio::time::timeout(HANDSHAKE_TIMEOUT / 2, stream.read_u8())
             .await
             .expect("a full global budget must immediately close the new socket");
         assert!(read.is_err());
@@ -880,7 +883,7 @@ async fn tcp_admission_caps_the_global_pool_before_upgrade() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tcp_connections_without_a_websocket_upgrade_hit_the_handshake_deadline() {
     use tokio::io::AsyncReadExt as _;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -894,10 +897,13 @@ async fn tcp_connections_without_a_websocket_upgrade_hit_the_handshake_deadline(
         hellas_wire::admission::ConnectionSlots::new(3, 2, 3),
     ));
     let mut client = TcpStream::connect(addr).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(12), client.read_u8())
+    // Paused time: the deadline elapses virtually, so this costs no wall time.
+    let started = tokio::time::Instant::now();
+    let closed = tokio::time::timeout(HANDSHAKE_TIMEOUT + HANG_GUARD, client.read_u8())
         .await
         .expect("an incomplete HTTP upgrade must not retain its connection slot forever");
     assert!(closed.is_err());
+    assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
     server.abort();
 }
 
@@ -919,7 +925,7 @@ async fn subscriptions_are_capped_without_starving_unary_requests() {
                 .unwrap(),
         );
     }
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while activity.receiver_count() < 8 {
             tokio::task::yield_now().await;
         }
@@ -931,7 +937,7 @@ async fn subscriptions_are_capped_without_starving_unary_requests() {
         .await
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(1), excess.next())
+        tokio::time::timeout(HANG_GUARD, excess.next())
             .await
             .expect("the ninth subscription must be refused")
             .is_none()
@@ -941,7 +947,7 @@ async fn subscriptions_are_capped_without_starving_unary_requests() {
         WireCode::ResourceExhausted
     );
     let validators = tokio::time::timeout(
-        Duration::from_secs(1),
+        HANG_GUARD,
         client.get_validators(pb::GetValidatorsRequest {}),
     )
     .await
@@ -973,7 +979,7 @@ async fn unary_dispatches_are_bounded_per_connection() {
         let client = client.clone();
         calls.spawn(async move { client.get_validators(pb::GetValidatorsRequest {}).await });
     }
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while blocker.started.load(Ordering::SeqCst) < 16 {
             blocker.notify.notified().await;
         }

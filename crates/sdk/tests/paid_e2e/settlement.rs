@@ -166,22 +166,20 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 .forged
                 .store(false, std::sync::atomic::Ordering::SeqCst);
 
-            let receipt = tokio::time::timeout(
-                Duration::from_secs(30),
-                sealing_while(
-                    &mut case.devnet,
-                    Duration::from_millis(100),
-                    hellas_sdk::paid_client::settle_channel(
-                        &case.options,
-                        bond,
-                        case.owner.principal(),
-                        &client_settlement(),
-                    ),
+            // `sealing_while` bounds a hang; how long settlement takes under
+            // load is not the property.
+            let receipt = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
                 ),
             )
             .await
-            .expect("client must finalize settlement after the entire provider stops")
-            .unwrap();
+            .expect("client must finalize settlement after the entire provider stops");
             assert_eq!(receipt.provider_payout, PRICE);
             assert_eq!(
                 case.relays

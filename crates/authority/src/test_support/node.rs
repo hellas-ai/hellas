@@ -17,11 +17,11 @@ use std::{
     },
 };
 
-pub const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub use hellas_channel::test_support::HANG_GUARD;
 pub async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(WAIT, future)
+    tokio::time::timeout(HANG_GUARD, future)
         .await
-        .expect("test operation exceeded WAIT")
+        .expect("test operation hung")
 }
 
 #[derive(Clone)]

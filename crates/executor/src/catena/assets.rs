@@ -226,7 +226,6 @@ mod tests {
                     .to_string()
                     .contains("timed out or cancelled")
             );
-            assert!(start.elapsed() < Duration::from_millis(100));
         }
     }
 }

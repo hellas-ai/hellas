@@ -4,7 +4,7 @@ use crate::identity::LocalIdentity;
 use hellas_auth::{Digest, authority as auth};
 use hellas_authority::{
     node::{HOST_STATUS, host_resource},
-    test_support::{WAIT, common_node, ids},
+    test_support::{HANG_GUARD, common_node, ids},
 };
 use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
@@ -356,7 +356,7 @@ impl Daemon {
     }
     async fn stop(&mut self) {
         assert!(self.socket.exists());
-        tokio::time::timeout(WAIT, self.handle.take().unwrap().shutdown())
+        tokio::time::timeout(HANG_GUARD, self.handle.take().unwrap().shutdown())
             .await
             .unwrap()
             .unwrap();
