@@ -167,11 +167,8 @@ async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
         }
         let cost = encode(&store.state.snapshot().unwrap()).unwrap().len()
             + store.state.ledger.clock_headroom();
-        assert!(
-            cost <= store.checkpoint_bound,
-            "{cost} > {}",
-            store.checkpoint_bound
-        );
+        let bound = store.checkpoint_bound.get();
+        assert!(cost <= bound, "{cost} > {bound}");
         if step == 7 || next(16) == 0 {
             let live = store.state.clone();
             store.close().await;

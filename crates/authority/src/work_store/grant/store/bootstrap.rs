@@ -266,7 +266,7 @@ impl NodeStore {
             _identity_lock: Some(identity_lock),
             journal,
             state,
-            checkpoint_bound: usize::MAX,
+            checkpoint_bound: CheckpointBound::UNMEASURED,
             executions: Default::default(),
             deliveries: Default::default(),
         })
@@ -309,7 +309,7 @@ impl NodeStore {
             _identity_lock: Some(identity_lock),
             journal,
             state,
-            checkpoint_bound: usize::MAX,
+            checkpoint_bound: CheckpointBound::UNMEASURED,
             executions: Default::default(),
             deliveries: Default::default(),
         })

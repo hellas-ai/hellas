@@ -1,6 +1,7 @@
 //! Node authority and Work accounting share one durable writer. Every exported
 //! acceptance is backed by one committed frame covering its entire budget path;
 //! power mode also flushes that commit before export.
+use super::checkpoint::CheckpointBound;
 use super::state::{Change, Frame, JOURNAL_NAMESPACE, Snapshot, State};
 use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
@@ -17,9 +18,7 @@ use crate::model::grant::{
 use hellas_auth::authority::{Revision, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
 use hellas_channel::job::WorkContext;
-use hellas_channel::work_store::journal::{
-    Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
-};
+use hellas_channel::work_store::journal::{Journal, JournalId, JournalKind, MAX_RECORD_BYTES};
 use hellas_channel::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
 use hellas_private::StoreLocation;
@@ -44,10 +43,8 @@ pub struct NodeStore {
     journal: Journal,
     _identity_lock: Option<bootstrap::IdentityLock>,
     pub(super) state: State,
-    /// At least the encoded checkpoint of `state` plus its clock headroom:
-    /// exact when last measured, plus [`growth`] for every frame since.
-    /// `usize::MAX` until first measured.
-    checkpoint_bound: usize,
+    /// Covers the encoded checkpoint of `state` plus its clock headroom.
+    checkpoint_bound: CheckpointBound,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
     pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
 }
@@ -466,10 +463,9 @@ impl NodeStore {
     pub(crate) async fn rotate(&mut self) -> Result<(), NodeStoreError> {
         let mut cancellation = self.cancel_on_failure();
         let checkpoint = encode(&self.state.snapshot()?)?;
-        let cost = checkpoint.len() + self.state.ledger.clock_headroom();
-        debug_assert!(cost <= self.checkpoint_bound, "checkpoint growth bound");
         self.journal.rotate(&checkpoint).await?;
-        self.checkpoint_bound = cost;
+        self.checkpoint_bound
+            .measured(checkpoint.len() + self.state.ledger.clock_headroom());
         cancellation.0.clear();
         Ok(())
     }
@@ -506,15 +502,13 @@ impl NodeStore {
         // Every committed state must still fit a rotation after its open jobs
         // finish. Serializing the whole state to prove it would make each
         // commit O(state), so that runs only when the bound cannot.
-        let reserve = open.saturating_mul(TERMINAL_HEADROOM);
         let len = record.as_ref().map_or(usize::MAX, Vec::len);
-        let mut bound = self.checkpoint_bound.saturating_add(growth(&frame, len));
-        if bound.saturating_add(reserve) > MAX_CHECKPOINT_BYTES {
-            let cost = encode(&candidate.snapshot()?)?.len() + candidate.ledger.clock_headroom();
-            debug_assert!(cost <= bound, "checkpoint growth bound");
-            bound = cost;
-        }
-        if open > MAX_OPEN_JOBS || bound.saturating_add(reserve) > MAX_CHECKPOINT_BYTES {
+        let bound = self.checkpoint_bound.admit(
+            growth(&frame, len),
+            open.saturating_mul(TERMINAL_HEADROOM),
+            || Ok(encode(&candidate.snapshot()?)?.len() + candidate.ledger.clock_headroom()),
+        )?;
+        if open > MAX_OPEN_JOBS {
             return Err(GrantError::StateCapacity.into());
         }
         // Observe elapsed deadlines against the old state before an extension
@@ -533,7 +527,7 @@ impl NodeStore {
         }
         self.journal.append(&record?).await?;
         self.state = candidate;
-        self.checkpoint_bound = bound;
+        self.checkpoint_bound.commit(bound);
         self.refresh_executions(frame.now);
         self.refresh_deliveries(frame.now);
         cancellation.0.clear();
