@@ -117,9 +117,6 @@ impl JobContent {
         closure: Closure,
         max_upload_bytes: u64,
     ) -> Result<Self> {
-        if !node.core.disk.as_ref().unwrap().ready() {
-            return Err(Error::Denied);
-        }
         let mut core = Core::new(node.core.pool.clone());
         core.lower = Some(Box::new(node.core.clone()));
         let scope = core
@@ -289,32 +286,15 @@ impl LocalStore {
         object: ContentRef,
         at: Option<&Path>,
     ) -> Result<Option<VerifiedReader>> {
-        let (core, job) = match self {
-            Self::Disk(store) => (store.core.clone(), false),
-            Self::Memory(store) => (store.core.clone(), false),
-            Self::Job(job) => {
-                if let (
-                    ScopeKind::Work {
-                        job: a,
-                        reservation: ar,
-                        ..
-                    },
-                    ScopeKind::Work {
-                        job: b,
-                        reservation: br,
-                        ..
-                    },
-                ) = (&scope.kind, &job.scope.kind)
-                {
-                    if a != b || ar != br {
-                        return Err(Error::Denied);
-                    }
-                } else {
-                    return Err(Error::Denied);
-                }
-                (job.upper.core.clone(), true)
-            }
-        };
+        if let Self::Job(job) = self
+            && !matches!((&scope.kind, &job.scope.kind),
+                (ScopeKind::Work {job:a, reservation:ar, ..}, ScopeKind::Work {job:b, reservation:br, ..})
+                    if a == b && ar == br)
+        {
+            return Err(Error::Denied);
+        }
+        let core = self.core();
+        let job = matches!(self, Self::Job(_));
         let (scope, at) = (scope.clone(), at.cloned());
         core.access(&scope.clone(), move |core| {
             core.verified(&scope, object, at.as_ref(), job)

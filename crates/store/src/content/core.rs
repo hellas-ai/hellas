@@ -167,7 +167,7 @@ impl Core {
         self.lower
             .as_deref()
             .unwrap_or(self)
-            .protect_acquired(self, &scope, acquired)?;
+            .protect_acquired(self, reservation, acquired)?;
         self.state()?.work.insert(
             reservation,
             Work {
@@ -240,7 +240,7 @@ impl Core {
         self.lower
             .as_deref()
             .unwrap_or(self)
-            .protect_acquired(self, &new_scope, acquired)?;
+            .protect_acquired(self, *reservation, acquired)?;
         self.state()?
             .work
             .get_mut(reservation)
@@ -322,7 +322,6 @@ impl Core {
         pin: Option<PinTarget>,
         missing: u64,
     ) -> Result<super::upload::LocalSession> {
-        state.check(scope)?;
         let (reservation, charge) = match &scope.kind {
             ScopeKind::Owner => {
                 if pin.is_none() {
@@ -354,9 +353,7 @@ impl Core {
             return Err(Error::Conflict);
         }
         let bytes = super::storage::Buffer::new(self, object.bytes(), charge.clone())?;
-        if !state.active.insert((reservation, object.id())) {
-            return Err(Error::Conflict);
-        }
+        state.active.insert((reservation, object.id()));
         Ok(super::upload::LocalSession {
             store: self.clone(),
             scope: scope.clone(),
@@ -387,7 +384,6 @@ impl Core {
             chunks,
         ));
         if let Some(pin) = &session.pin {
-            PinName::new(pin.name.as_str().to_owned())?;
             state.publish(
                 BTreeMap::from([(session.object.id(), stored)]),
                 Target::Object(session.object),
@@ -438,17 +434,13 @@ pub(super) fn canonical_closure(closure: Closure) -> Result<Closure> {
     }
     Ok(objects.into_values().collect())
 }
-fn available(stored: &Stored, object: ContentRef) -> Result<bool> {
-    if stored.data.len() != object.bytes() {
-        return Err(Error::Invalid("content length contract"));
+impl Stored {
+    fn usable(&self, object: ContentRef) -> Result<bool> {
+        if self.data.len() != object.bytes() {
+            return Err(Error::Invalid("content length contract"));
+        }
+        Ok(self.data.available())
     }
-    Ok(stored.data.available())
-}
-fn checked_bytes(stored: &Stored, object: ContentRef) -> Result<Bytes> {
-    if stored.data.len() != object.bytes() || !stored.data.available() {
-        return Err(Error::Invalid("content length contract"));
-    }
-    stored.data.load(object)
 }
 fn live(pin: &PinValue) -> bool {
     pin.expires
@@ -503,12 +495,11 @@ impl State {
         #[cfg(test)]
         self.tree_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        checked_bytes(
-            self.objects
-                .get(&target.object().id())
-                .ok_or(Error::Missing)?,
-            target.object(),
-        )
+        self.objects
+            .get(&target.object().id())
+            .ok_or(Error::Missing)?
+            .data
+            .load(target.object())
     }
     /// Postorder computes each tree's longest suffix once, including shared DAGs.
     fn walk(&self, roots: impl IntoIterator<Item = Target>) -> Result<BTreeSet<ContentRef>> {
@@ -637,7 +628,7 @@ impl State {
             && self
                 .objects
                 .get(&object.id())
-                .map(|stored| available(stored, object))
+                .map(|stored| stored.usable(object))
                 .transpose()?
                 .unwrap_or(false))
     }
@@ -652,7 +643,7 @@ impl State {
         }
         self.objects
             .get(&object.id())
-            .map(|stored| available(stored, object))
+            .map(|stored| stored.usable(object))
             .transpose()
             .map(|present| present.unwrap_or(false))
     }
@@ -662,9 +653,10 @@ impl State {
             .iter()
             .filter(|object| {
                 reachable.contains(object)
-                    && self.objects.get(&object.id()).is_some_and(|stored| {
-                        stored.data.len() == object.bytes() && stored.data.available()
-                    })
+                    && self
+                        .objects
+                        .get(&object.id())
+                        .is_some_and(|stored| stored.usable(**object).unwrap_or(false))
             })
             .map(|object| object.id())
             .collect())
@@ -698,7 +690,6 @@ impl State {
         self.resolve_path(scope, at)
     }
     fn resolve_path(&self, scope: &Scope, at: &Path) -> Result<Option<Target>> {
-        PinName::new(at.pin.as_str().to_owned())?;
         super::tree::validate_path(&at.path, true)?;
         let Some(pin) = self
             .pins
@@ -792,8 +783,8 @@ impl Core {
         let pin = at.pin.clone();
         let store = self.clone();
         let stream = futures::stream::try_unfold(
-            (chunks, store, scope, pin, object),
-            |(mut chunks, store, scope, pin, object)| async move {
+            (chunks, store, scope, pin),
+            |(mut chunks, store, scope, pin)| async move {
                 use futures::StreamExt;
                 let Some(bytes) = chunks.next().await else {
                     return Ok(None);
@@ -823,7 +814,7 @@ impl Core {
                             .await?;
                     }
                 }
-                Ok(Some((bytes?, (chunks, store, scope, pin, object))))
+                Ok(Some((bytes?, (chunks, store, scope, pin))))
             },
         );
         Ok(ByteStream {
@@ -851,7 +842,7 @@ impl Core {
                     .work
                     .get(reservation)
                     .and_then(|work| work.staged.get(&object.id()))
-                    .map(|stored| available(stored, object))
+                    .map(|stored| stored.usable(object))
                     .transpose()?
                     .unwrap_or(false),
                 _ => false,
@@ -896,7 +887,6 @@ impl Core {
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
-        PinName::new(name.as_str().to_owned())?;
         let mut state = self.state()?;
         if state.pins.get(name).filter(|pin| live(pin)) != expected {
             return Err(Error::Conflict);
@@ -1412,9 +1402,10 @@ impl Core {
             Err(error) => return Err(error),
         };
         Ok(objects.into_iter().all(|object| {
-            state.objects.get(&object.id()).is_some_and(|stored| {
-                stored.data.len() == object.bytes() && stored.data.available()
-            })
+            state
+                .objects
+                .get(&object.id())
+                .is_some_and(|stored| stored.usable(object).unwrap_or(false))
         }))
     }
     pub(crate) fn check_acquisition(
@@ -1493,7 +1484,7 @@ impl Core {
         let work = state.work.get(reservation).ok_or(Error::Denied)?;
         closure.iter().try_fold(Vec::new(), |mut missing, object| {
             let present = match work.staged.get(&object.id()) {
-                Some(stored) => available(stored, *object)?,
+                Some(stored) => stored.usable(*object)?,
                 None => held.contains(&object.id()) || lower.contains(&object.id()),
             };
             if !present {
@@ -1503,13 +1494,15 @@ impl Core {
         })
     }
 
-    fn protect_acquired(&self, requester: &Core, scope: &Scope, names: Vec<PinName>) -> Result<()> {
-        let ScopeKind::Work { reservation, .. } = &scope.kind else {
-            return Err(Error::Denied);
-        };
+    fn protect_acquired(
+        &self,
+        requester: &Core,
+        reservation: ReservationId,
+        names: Vec<PinName>,
+    ) -> Result<()> {
         let mut state = self.state()?;
         for name in names {
-            state.add_acquired(name, (Arc::downgrade(&requester.state), *reservation));
+            state.add_acquired(name, (Arc::downgrade(&requester.state), reservation));
         }
         Ok(())
     }

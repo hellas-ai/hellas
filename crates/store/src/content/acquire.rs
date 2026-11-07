@@ -72,7 +72,6 @@ pub(crate) async fn memory(
     pin: PinTarget,
     requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
-    PinName::new(pin.name.as_str().to_owned())?;
     match source {
         Source::Https { url, sha256, bytes } => {
             if url.scheme() != "https"

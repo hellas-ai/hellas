@@ -1010,11 +1010,7 @@ impl Disk {
         }
     }
     fn owned_bytes(root: &FsPath) -> Result<u64> {
-        let mut pending = if root.join("objects").is_dir() {
-            vec![root.join("objects"), root.join("staging")]
-        } else {
-            vec![root.to_owned()]
-        };
+        let mut pending = vec![root.join("objects"), root.join("staging")];
         let mut seen = std::collections::HashSet::new();
         let mut total = 0u64;
         while let Some(path) = pending.pop() {
