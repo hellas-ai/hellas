@@ -968,7 +968,7 @@ fn reset_validator_generation(
     if current == Some(generation) {
         return Ok(());
     }
-    fs::create_dir_all(&state)?;
+    hellas_private::create_dir_all_durable(&state)?;
     for entry in fs::read_dir(&state)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -977,7 +977,8 @@ fn reset_validator_generation(
             fs::remove_file(entry.path())?;
         }
     }
-    fs::write(stamp, generation.to_string())?;
+    // Durable regardless of --durability: losing the stamp would wipe again.
+    hellas_private::write_atomically(&stamp, ".new", generation.to_string().as_bytes())?;
     Ok(())
 }
 
