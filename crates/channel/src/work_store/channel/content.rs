@@ -1,8 +1,8 @@
 use super::*;
 use crate::content::{channel_pin, job_tree, read, stage, tree_reservation};
 use hellas_store::content::{
-    ContentStore, Cursor, DiskStore, Error, JobContent, JobId, LocalStore, PinValue, Scope,
-    ScopeKind, Target, Tree,
+    ContentStore, DiskStore, Error, JobContent, JobId, LocalStore, PinValue, Scope, ScopeKind,
+    Target, Tree,
 };
 
 impl ChannelStore {
@@ -305,19 +305,9 @@ impl ChannelStore {
     pub(crate) async fn reconcile_content(&mut self) -> Result<(), WorkStoreError> {
         self.check_authority()?;
         let channel = self.state().channel().id();
-        let mut cursor = Cursor::default();
-        let mut existing = BTreeMap::new();
-        loop {
-            let page = self
-                .content
-                .pins(&Scope::Owner, &format!("channel/{channel}/"), cursor)
+        let existing =
+            hellas_store::content::owner_pins(&self.content, &format!("channel/{channel}/"))
                 .await?;
-            existing.extend(page.pins);
-            match page.next {
-                Some(next) => cursor = next,
-                None => break,
-            }
-        }
         let mut desired = BTreeMap::new();
         for (work, root) in self.state().retained_roots() {
             let mut pin = channel_pin(channel, *work, self.proposal_pin(*work))?;

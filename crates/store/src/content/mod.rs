@@ -17,7 +17,7 @@ mod tree;
 mod upload;
 mod wire;
 
-use std::{ops::Range, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -383,5 +383,34 @@ impl_local_content!(MemoryStore);
 
 impl_local_content!(DiskStore);
 
+pub async fn owner_pin(store: &dyn ContentStore, name: &PinName) -> Result<Option<PinValue>> {
+    let mut cursor = Cursor::default();
+    loop {
+        let page = store.pins(&Scope::Owner, name.as_str(), cursor).await?;
+        if let Some((_, value)) = page.pins.into_iter().find(|(key, _)| key == name) {
+            return Ok(Some(value));
+        }
+        match page.next {
+            Some(next) => cursor = next,
+            None => return Ok(None),
+        }
+    }
+}
+
+pub async fn owner_pins(
+    store: &dyn ContentStore,
+    prefix: &str,
+) -> Result<BTreeMap<PinName, PinValue>> {
+    let mut cursor = Cursor::default();
+    let mut pins = BTreeMap::new();
+    loop {
+        let page = store.pins(&Scope::Owner, prefix, cursor).await?;
+        pins.extend(page.pins);
+        match page.next {
+            Some(next) => cursor = next,
+            None => return Ok(pins),
+        }
+    }
+}
 #[cfg(test)]
 mod conformance;

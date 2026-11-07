@@ -6,7 +6,7 @@ use futures::StreamExt as _;
 use hellas_authority::{authenticator::Authenticator, node::SessionKey};
 use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
 use hellas_sdk::node_control::profile::ClientProfile;
-use hellas_store::content::{self, config::Reconciler, *};
+use hellas_store::content::{self, config::Reconciler, owner_pin as find_pin, *};
 use hellas_wire::StreamTransport;
 use std::{future::Future, io::Write as _, net::SocketAddr, path::PathBuf};
 
@@ -240,20 +240,6 @@ where
     .await
 }
 
-async fn find_pin(store: &impl ContentStore, name: &PinName) -> CliResult<Option<PinValue>> {
-    let mut cursor = Cursor::default();
-    loop {
-        let page = store.pins(&Scope::Owner, name.as_str(), cursor).await?;
-        if let Some((_, value)) = page.pins.into_iter().find(|(key, _)| key == name) {
-            return Ok(Some(value));
-        }
-        match page.next {
-            Some(next) => cursor = next,
-            None => return Ok(None),
-        }
-    }
-}
-
 async fn execute<S, F, R>(store: &S, command: StoreCommand, resolve: F) -> CliResult<()>
 where
     S: ContentStore,
@@ -331,8 +317,7 @@ where
                 );
                 let repo = hellas_store::hf::Repo::from_uri(&source)?;
                 ensure!(
-                    repo.revision.len() == 40
-                        && repo.revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    hellas_store::hf::immutable_sha(&repo.revision),
                     "acquire requires hf://repo@sha; run hellas store resolve first to print the immutable SHA"
                 );
                 eprintln!("commit: {}", repo.revision);

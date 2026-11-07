@@ -1,5 +1,5 @@
 //! Declared node content, reconciled through the ordinary scoped store operations.
-use super::*;
+use super::{owner_pin as pin, owner_pins as snapshot, *};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -136,9 +136,7 @@ impl Declaration {
                 }
                 let repo = crate::hf::Repo::from_uri(uri)
                     .map_err(|_| Error::Invalid("HF repository URI"))?;
-                if repo.revision.len() != 40
-                    || !repo.revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-                {
+                if !crate::hf::immutable_sha(&repo.revision) {
                     return Err(Error::Invalid(
                         "configured HF source requires an immutable commit SHA",
                     ));
@@ -441,27 +439,6 @@ impl Reconciler {
         })
         .await
         .map_err(|_| Error::Invalid("content reconciler task"))?
-    }
-}
-async fn pin(store: &DiskStore, name: &PinName) -> Result<Option<PinValue>> {
-    Ok(store
-        .pins(&Scope::Owner, name.as_str(), Cursor::default())
-        .await?
-        .pins
-        .into_iter()
-        .find(|(candidate, _)| candidate == name)
-        .map(|(_, value)| value))
-}
-async fn snapshot(store: &DiskStore, prefix: &str) -> Result<BTreeMap<PinName, PinValue>> {
-    let mut cursor = Cursor::default();
-    let mut pins = BTreeMap::new();
-    loop {
-        let page = store.pins(&Scope::Owner, prefix, cursor).await?;
-        pins.extend(page.pins);
-        match page.next {
-            Some(next) => cursor = next,
-            None => return Ok(pins),
-        }
     }
 }
 async fn remove(store: &DiskStore, pins: BTreeMap<PinName, PinValue>) -> Result<()> {

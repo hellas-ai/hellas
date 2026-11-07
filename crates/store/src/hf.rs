@@ -798,7 +798,7 @@ impl HfCas {
         Ok(())
     }
 }
-pub(crate) fn immutable_sha(sha: &str) -> bool {
+pub fn immutable_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
