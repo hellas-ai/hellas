@@ -431,9 +431,10 @@ encoding, consensus rule, or response deadline. Live object-proof RPCs are not
 required. Funding is returned to application accounting only after verification
 of the finalized close receipt.
 
-For older journals, contest reconstruction covers the accepted start through
-the response deadline, or stops sooner after an accepted response. Each verified
-block advances durable `CloseHistoryAdvanced` journal progress. Cancellation,
+Contest history is retained as the channel is observed, from the start's
+inclusion block through the response deadline; adjudication can use it as soon
+as it holds an accepted response. Each verified block advances durable
+`CloseHistoryAdvanced` journal progress. Cancellation,
 restart, and checkpoint rotation preserve that progress, so repeated bounded
 attempts resume at the next unread block even with the maximum legal response
 window. Missing or inconsistent evidence remains an error. A source used as

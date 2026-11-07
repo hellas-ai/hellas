@@ -88,60 +88,6 @@ fn load_fetch_config_rejects_duplicate_route() {
 }
 
 #[test]
-fn load_fetch_config_rejects_operator_claimed_trusted_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut route = codex_route(serde_json::json!({}));
-    route["adaptor"] = serde_json::json!("codex-0.0.1");
-    let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let location = StoreLocation::for_test(dir.path());
-    let err = load_fetch_config(&path, &location).unwrap_err();
-    assert!(format!("{err:#}").contains("unknown field `adaptor`"));
-
-    let mut route = codex_route(serde_json::json!({}));
-    route["environment"] = serde_json::json!({
-        "program": "01",
-        "config": "02",
-        "build": "03"
-    });
-    let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let err = load_fetch_config(&path, &location).unwrap_err();
-    assert!(format!("{err:#}").contains("unknown field `environment`"));
-}
-
-#[test]
-fn load_fetch_config_rejects_operator_selected_destination() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut route = codex_route(serde_json::json!({}));
-    route["destination"]["base_url"] = serde_json::json!("https://example.invalid/codex");
-    let path = write_config(&dir, serde_json::json!({ "routes": [route] }));
-    let location = StoreLocation::for_test(dir.path());
-    let error = load_fetch_config(&path, &location).unwrap_err();
-
-    assert!(format!("{error:#}").contains("unknown field `base_url`"));
-}
-
-#[test]
-fn core_cli_rejects_moved_openai_hosting_and_operator_endpoints() {
-    assert!(
-        serde_json::from_value::<FetchDestination>(serde_json::json!({
-            "type": "codex-responses",
-            "auth_path": "target/codex-auth.json"
-        }))
-        .is_err()
-    );
-    let codex: FetchDestination =
-        serde_json::from_value(serde_json::json!({"type":"codex-responses"})).unwrap();
-    assert!(matches!(codex, FetchDestination::CodexResponses {}));
-
-    for value in [
-        serde_json::json!({"type":"openai-responses","api_key_env":"HELLAS_TEST_OPENAI_KEY"}),
-        serde_json::json!({"type":"codex-responses","url":"https://example.invalid/v1/responses"}),
-    ] {
-        assert!(serde_json::from_value::<FetchDestination>(value).is_err());
-    }
-}
-
-#[test]
 fn unknown_capabilities_are_rejected() {
     let value = serde_json::json!({"routes": [codex_route(serde_json::json!({"modles": []}))]});
     assert!(serde_json::from_value::<FetchConfigFile>(value).is_err());

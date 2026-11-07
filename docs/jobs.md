@@ -302,15 +302,10 @@ caller marker update. It preserves the original nonce and does not execute or
 fetch the job again. A missing acceptance or a proposal without the provider's
 signature leaves acceptance unknown and payment pending.
 
-Legacy markers with a recorded work ID keep exact-work recovery. A legacy
-`Running` marker with `work: null` and no per-attempt binding cannot identify
-which purchase owns a reused channel nonce: another deliberate attempt may
-have submitted identical input after the first stopped before proposing.
-Even retained request bytes cannot distinguish those histories. If recovery
-finds an acceptance at that nonce, it returns `PurchaseError::Unfinished` and
-leaves the legacy marker unchanged; it does not claim that acceptance or buy
-again. New tracked markers prevent this ambiguity by including their distinct
-attempt nonce in the signed request commitment.
+The attempt nonce is part of the signed request commitment, so an acceptance
+at a reused channel nonce for identical input is not mistaken for this
+attempt's. A marker without its attempt nonce, or a proposed marker without its
+request commitment, is refused rather than recovered.
 
 The executable [native grant example](../crates/sdk/tests/native_execution/grant.rs)
 and [paid tracked regressions](../crates/sdk/tests/paid_e2e/tracked.rs)

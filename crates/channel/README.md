@@ -4,16 +4,15 @@ Paid Fetch shares the existing channel authorization, execution gate, delivery,
 payment certificate, and settlement flow with Compute. A Fetch channel's
 `InvocationPolicy` admits Fetch; the admission commits to its route, contract and
 resource limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
-Both profiles use version-3 close descriptors and journal format 7.
+Both profiles use version-4 close descriptors and SQLite channel journals.
 
 Canonical paid-work and grant records, prepared inputs, and usage accounting live in
 `hellas_channel::model` and `hellas_authority::model`. RPC owns generated messages and signed-transcript codecs.
 
 ## Provider storage
 
-The Fetch profile requires `Retention::Ephemeral` and a metadata-only provider
-journal. Channel mounting selects that journal automatically; binding a Fetch
-provider to an ordinary payload journal fails. Live requests and responses are
+The Fetch profile requires `Retention::Ephemeral`. Every channel journal is
+metadata-only; content is retained separately per job. Live requests and responses are
 fully verified before their accounting records are committed.
 
 The journal persists authorizations, signatures, request/result digests, running
@@ -46,8 +45,8 @@ Existing deadline and close rules still apply to jobs whose bodies were lost.
 Provider failure is not turned into a paid result. The client must not assume
 that retrying delivery after a provider restart can recover its response.
 
-The journal header distinguishes payload journals from metadata-only journals.
-Opening one as the other fails.
+The journal records its kind (setup, channel or grant) and role. Opening a
+journal as another kind fails.
 
 ## CLI
 
@@ -159,6 +158,6 @@ wrong hostnames, redirects, address restrictions and response bounds. Portable
 App Attest tests cover connection/service binding and replay counters. They do
 not contact a paid upstream or enroll a real Apple device.
 
-Work uses journal format 7 and close descriptor v3. Each request selects its
+Each request selects its
 funding kind and channel ID; setup requests select their bond. One peer may own
 several bonds.
