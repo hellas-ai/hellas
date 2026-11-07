@@ -300,28 +300,25 @@ fn hf_git_paths_are_encoded_and_dataset_files_use_the_dataset_endpoint() {
 #[test]
 fn new_hf_reconstruction_streams_multiterm_overfetch_and_nonzero_offset() {
     let a = framed(b"unused");
-    let b = framed(b"prefixhello ");
+    let mut first = vec![b'x'; hellas_xet::MIN_CHUNK_SIZE];
+    first[..12].copy_from_slice(b"prefixhello ");
+    let expected = [&first[6..], b"world"].concat();
+    let id = hellas_xet::XetHash::hash(&expected);
+    let b = framed(&first);
     let c = framed(b"world");
     let d = framed(b"unused too");
     let one = [a, b].concat();
     let two = [c, d].concat();
     let xorb = hellas_xet::XetHash::ZERO;
     let (base, serving) = hub(|base| {
-        let plan=serde_json::json!({"offset_into_first_range":6,"terms":[{"hash":xorb.to_string(),"range":{"start":1,"end":2},"unpacked_length":12},{"hash":xorb.to_string(),"range":{"start":2,"end":3},"unpacked_length":5}],"xorbs":{xorb.to_string():[{"url":format!("{base}/one"),"ranges":[{"chunks":{"start":0,"end":2},"bytes":{"start":0,"end":one.len()-1}}]},{"url":format!("{base}/two"),"ranges":[{"chunks":{"start":2,"end":4},"bytes":{"start":0,"end":two.len()-1}}]}]}}).to_string().into_bytes();
+        let plan=serde_json::json!({"offset_into_first_range":6,"terms":[{"hash":xorb.to_string(),"range":{"start":1,"end":2},"unpacked_length":first.len()},{"hash":xorb.to_string(),"range":{"start":2,"end":3},"unpacked_length":5}],"xorbs":{xorb.to_string():[{"url":format!("{base}/one"),"ranges":[{"chunks":{"start":0,"end":2},"bytes":{"start":0,"end":one.len()-1}}]},{"url":format!("{base}/two"),"ranges":[{"chunks":{"start":2,"end":4},"bytes":{"start":0,"end":two.len()-1}}]}]}}).to_string().into_bytes();
         vec![
             (
                 format!("/api/models/org/repo/xet-read-token/{}", "a".repeat(40)),
                 200,
                 format!("{{\"accessToken\":\"t\",\"casUrl\":\"{base}\"}}").into_bytes(),
             ),
-            (
-                format!(
-                    "/v2/reconstructions/{}",
-                    hellas_xet::XetHash::hash(b"hello world")
-                ),
-                200,
-                plan,
-            ),
+            (format!("/v2/reconstructions/{id}"), 200, plan),
             ("/one".into(), 206, one),
             ("/two".into(), 206, two),
         ]
@@ -329,16 +326,48 @@ fn new_hf_reconstruction_streams_multiterm_overfetch_and_nonzero_offset() {
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
     let mut bytes = Vec::new();
-    cas.write_xet(
-        hellas_xet::XetHash::hash(b"hello world"),
-        11,
-        None,
-        &mut bytes,
-        &pool,
-    )
-    .unwrap();
+    cas.write_xet(id, expected.len() as u64, None, &mut bytes, &pool)
+        .unwrap();
     serving.join().unwrap();
-    assert_eq!(bytes, b"hello world");
+    assert_eq!(bytes, expected);
+    assert_eq!(pool.held(), 0);
+}
+
+#[test]
+fn legacy_hf_chunking_is_refused_before_writing_with_a_specific_store_error() {
+    let short = vec![b'x'; hellas_xet::MIN_CHUNK_SIZE - 64];
+    let last = vec![b'y'; hellas_xet::MIN_CHUNK_SIZE];
+    let body = [framed(&short), framed(&last)].concat();
+    let content = [short, last].concat();
+    let id = hellas_xet::XetHash::hash(&content);
+    let xorb = hellas_xet::XetHash::ZERO;
+    let (base, serving) = hub(|base| {
+        vec![
+            (format!("/api/models/org/repo/xet-read-token/{}", "a".repeat(40)), 200,
+                format!("{{\"accessToken\":\"t\",\"casUrl\":\"{base}\"}}").into_bytes()),
+            (format!("/v2/reconstructions/{id}"), 200, serde_json::json!({
+                "terms":[{"hash":xorb.to_string(),"range":{"start":0,"end":2},"unpacked_length":content.len()}],
+                "xorbs":{xorb.to_string():[{"url":format!("{base}/xorb"),"ranges":[{"chunks":{"start":0,"end":2},"bytes":{"start":0,"end":body.len()-1}}]}]}
+            }).to_string().into_bytes()),
+            ("/xorb".into(), 206, body),
+        ]
+    });
+    let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
+    let pool = Reservations::ram(16 << 20);
+    let mut bytes = Vec::new();
+    let error = cas
+        .write_xet(id, content.len() as u64, None, &mut bytes, &pool)
+        .unwrap_err();
+    serving.join().unwrap();
+    assert!(
+        matches!(hf_error(error), Error::Invalid(reason) if reason == crate::hf::LEGACY_CHUNKING)
+    );
+    assert!(
+        matches!(super::super::wire::error(hellas_wire::WireStatus::new(
+        hellas_wire::WireCode::InvalidArgument, crate::hf::LEGACY_CHUNKING
+    )), Error::Invalid(reason) if reason == crate::hf::LEGACY_CHUNKING)
+    );
+    assert!(bytes.is_empty());
     assert_eq!(pool.held(), 0);
 }
 

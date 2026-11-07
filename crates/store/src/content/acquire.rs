@@ -30,10 +30,12 @@ fn finish(mut bytes: Buffer, expected: Option<ContentRef>) -> Result<Staged> {
     })
 }
 fn hf_error(error: crate::hf::FetchError) -> Error {
-    if matches!(error, crate::hf::FetchError::Capacity) {
-        Error::Capacity
-    } else {
-        Error::Invalid("HF acquisition failed")
+    match error {
+        crate::hf::FetchError::Capacity => Error::Capacity,
+        crate::hf::FetchError::Malformed(reason) if reason == crate::hf::LEGACY_CHUNKING => {
+            Error::Invalid(crate::hf::LEGACY_CHUNKING)
+        }
+        _ => Error::Invalid("HF acquisition failed"),
     }
 }
 async fn publish(

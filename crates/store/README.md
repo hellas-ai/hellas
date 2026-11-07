@@ -43,6 +43,8 @@ declared closure through Jobs or its own Channel pins. Public visibility alone
 does not grant job access. Configuration changes reconcile managed pins; Owner
 CAS commands can override their policy or expiry without a reload erasing it.
 
+HF files using legacy (pre-2026) Xet chunking are refused; content identity stays canonical CDC.
+
 Immutable HF declarations use `hf://org/repo@COMMIT_SHA`. Object declarations
 can use `url`, optional HF `path`, `expect`, `bytes`, HTTPS `sha256`, and
 `policy`. HTTPS declarations require both `expect` and the exact `bytes`

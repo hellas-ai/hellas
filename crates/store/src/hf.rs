@@ -112,6 +112,9 @@ pub enum FetchError {
     TooLarge { context: String, limit: u64 },
 }
 
+pub(crate) const LEGACY_CHUNKING: &str =
+    "HF file uses legacy (pre-2026) Xet chunking; not supported";
+
 type Result<T> = std::result::Result<T, FetchError>;
 
 /// A CAS read token and where to spend it.
@@ -770,6 +773,9 @@ impl HfCas {
                         .ok_or_else(|| {
                             FetchError::Malformed("reconstruction exceeds reservation".into())
                         })?;
+                    if written < len && decoded.data.len() < hellas_xet::MIN_CHUNK_SIZE {
+                        return Err(FetchError::Malformed(LEGACY_CHUNKING.into()));
+                    }
                     writer
                         .write_all(bytes)
                         .map_err(|_| FetchError::Malformed("staging reconstructed bytes".into()))?;
