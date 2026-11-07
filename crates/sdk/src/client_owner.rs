@@ -523,6 +523,10 @@ impl ClientOwner {
                 )
                 .await
                 {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class B: remote readiness; rollout 3"
+                    )]
                     Err(CoinOwnerError::Query(
                         QueryError::StateUnavailable(_) | QueryError::ChannelClosed,
                     )) => tokio::time::sleep(poll).await,
@@ -606,6 +610,10 @@ impl ClientOwner {
                 .collect();
             let snapshot = match chain.get_objects(keys).await {
                 Err(QueryError::StateUnavailable(_) | QueryError::ChannelClosed) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class B: remote readiness; rollout 3"
+                    )]
                     tokio::time::sleep(poll).await;
                     continue;
                 }
@@ -615,6 +623,10 @@ impl ClientOwner {
                 return Err(CoinOwnerError::Network.into());
             }
             if snapshot.block.height < floor.0 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: finalized floor; rollout 3"
+                )]
                 tokio::time::sleep(poll).await;
                 continue;
             }
@@ -652,6 +664,10 @@ impl ClientOwner {
                 }
                 submitted = true;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: finalized reshape; rollout 3"
+            )]
             tokio::time::sleep(poll).await;
         }
     }
@@ -665,4 +681,8 @@ fn one_coin(coin: CoinId) -> Funding {
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;

@@ -321,17 +321,29 @@ fn spawn_observer(
                     Ok(next) => remote = next,
                     Err(error) => {
                         tracing::debug!(%error, "waiting for a verified remote chain source");
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class B: remote source recovery"
+                        )]
                         tokio::time::sleep(config.poll).await;
                         continue;
                     }
                 }
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B/C: finalized/freshness; rollout 2/3"
+            )]
             if let Some(stream) = &mut finalized {
                 tokio::select! {
                     item = stream.next() => if !matches!(item, Some(Ok(_))) { finalized = None; },
                     _ = tokio::time::sleep(config.poll) => {},
                 }
             } else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: remote subscription retry"
+                )]
                 tokio::time::sleep(config.poll).await;
                 finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
                     .await
@@ -697,6 +709,10 @@ impl PaidWorkSession {
                         .with_state(|state| state.is_closing())
                         .await?
                 {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class A: channel readiness; rollout 2"
+                    )]
                     tokio::time::sleep(session.args.config.poll).await;
                 }
                 Ok(())
@@ -808,6 +824,10 @@ impl PaidWorkSession {
                     Ok(remote) => remote,
                     Err(error) => {
                         tracing::debug!(%error, "paid settlement is waiting for a chain source");
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class C: chain connection backoff"
+                        )]
                         tokio::time::sleep(poll).await;
                         continue;
                     }
@@ -821,6 +841,10 @@ impl PaidWorkSession {
                 )) => {
                     // The observer may still reach finality through another
                     // source; reconnect and let the shared loop observe it.
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class B: chain catch-up; rollout 3"
+                    )]
                     tokio::time::sleep(poll).await;
                 }
                 Err(error) => return Err(error),
@@ -1169,6 +1193,10 @@ async fn propose_when_ready(
         let remaining = deadline.map_or(delay, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class C: proposal backoff"
+        )]
         tokio::time::sleep(delay.min(remaining)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(10));
     }
@@ -1194,6 +1222,10 @@ async fn pay_when_ready(
                     if status.code() == hellas_wire::WireCode::Unavailable => {}
                 Err(error) => return Err(error.into()),
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: payment backoff"
+            )]
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(Duration::from_secs(10));
         }
@@ -1369,6 +1401,10 @@ async fn execute_paid_job(
             }
             check_payment_window(client, work_id).await?;
             tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: result-stream retry"
+            )]
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
         check_payment_window(client, work_id).await?;
@@ -1486,6 +1522,10 @@ async fn drive_setup(
             end @ (SetupProgress::Aborted(_)
             | SetupProgress::Faulted(_)
             | SetupProgress::TimeoutBond) => return Err(PaidClientError::SetupEnded(end)),
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: setup finalization; rollout 3"
+            )]
             _ => tokio::time::sleep(poll).await,
         }
     }
@@ -1562,6 +1602,10 @@ async fn exchange_setup(
         loop {
             let response = send_setup_exchange(dialer.setup().await?, request.clone()).await?;
             match apply_setup_exchange(setup, response).await {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: retryable setup refusal"
+                )]
                 Err(hellas_channel::work_handshake::SetupExchangeError::Refused {
                     refusal,
                     ..

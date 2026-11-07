@@ -981,6 +981,7 @@ fn run(
         );
         let boot = Instant::now();
         ::tokio::spawn(async move {
+            #[expect(clippy::disallowed_methods, reason = "inventory class C: deliberate uptime metric timer")]
             let mut tick = ::tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
@@ -1075,12 +1076,10 @@ fn run(
         let marshal_mailbox = chain_indexer.marshal.clone();
         let archive_blocks = validator_config.archive_blocks;
         if archive_blocks.is_some() {
-            let (progress, _) = ::tokio::sync::watch::channel(0);
             application.publication = Some(crate::execution::pipeline::Publication {
                 archive: chain_indexer.clone(),
                 retention: archive_blocks,
                 readiness: std::sync::Arc::default(),
-                progress,
                 #[cfg(feature = "indexer-api")]
                 index: None,
             });
@@ -1286,6 +1285,7 @@ fn run(
                         } else {
                             retry.saturating_mul(2).min(Duration::from_secs(30))
                         };
+                        #[expect(clippy::disallowed_methods, reason = "inventory class C: exponential backoff after relay disconnect or failure")]
                         ::tokio::time::sleep(retry).await;
                         retry = next_retry;
                     }

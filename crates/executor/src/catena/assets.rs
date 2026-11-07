@@ -83,6 +83,10 @@ impl Assets {
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err("resident cache poisoned".into());
                 }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class A: cache mutex; rollout 4"
+                )]
                 Err(std::sync::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(2))
                 }

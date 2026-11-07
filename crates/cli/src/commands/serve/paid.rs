@@ -3,7 +3,7 @@
 use super::*;
 use anyhow::ensure;
 use hellas_auth::{Digest, authority::*};
-use hellas_chain::{LightClient as _, domain::Transaction};
+use hellas_chain::{LightClient as _, QueryError, domain::Transaction};
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
 use hellas_rpc::protocol::invocation::{
     Admission, ComputePrograms, InvocationPolicy, Limits,
@@ -294,10 +294,11 @@ impl PaidWork {
         if receipt.unit <= cap {
             return Ok(());
         }
-        tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, async {
+        let deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
+        tokio::time::timeout_at(deadline, async {
             loop {
+                let client = chain.wait_ready().await?.client();
                 let check = async {
-                    let client = chain.view()?.client();
                     let mut after = None;
                     loop {
                         let Some(page) = client.get_coins_by_delegate_page(key.party_key().into(), after).await? else { break; };
@@ -314,7 +315,7 @@ impl PaidWork {
                     Ok(false)
                 }.await;
                 match check {
-                    Err(error) if error.chain().any(|cause| matches!(cause.downcast_ref::<hellas_chain::QueryError>(), Some(hellas_chain::QueryError::StateUnavailable(_)))) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    Err(error) if error.chain().any(|cause| matches!(cause.downcast_ref::<QueryError>(), Some(QueryError::StateUnavailable(_)))) => {},
                     result => return result,
                 }
             }
@@ -568,17 +569,15 @@ impl PaidWork {
         let deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
         tokio::time::timeout_at(deadline, async {
             loop {
+                chain.wait_ready().await?;
                 match self.delegate_once(chain, key, policy).await {
                     Err(error)
                         if error.chain().any(|cause| {
                             matches!(
-                                cause.downcast_ref::<hellas_chain::QueryError>(),
-                                Some(hellas_chain::QueryError::StateUnavailable(_))
+                                cause.downcast_ref::<QueryError>(),
+                                Some(QueryError::StateUnavailable(_))
                             )
-                        }) =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(100)).await
-                    }
+                        }) => {}
                     result => return result,
                 }
             }
@@ -638,6 +637,10 @@ impl PaidWork {
                     };
                     after = Some(next);
                 }
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: finalized coin search; rollout 3"
+                )]
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
             let input = CoinId::from_bytes(input.0);
@@ -690,6 +693,10 @@ impl PaidWork {
         let mut submitted = false;
         loop {
             let Some(tip) = client.get_latest_block().await? else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class B: first finalized block; rollout 3"
+                )]
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
@@ -722,6 +729,10 @@ impl PaidWork {
                 client.submit_tx(tx.clone()).await?;
                 submitted = true;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: finalized delegation; rollout 3"
+            )]
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }

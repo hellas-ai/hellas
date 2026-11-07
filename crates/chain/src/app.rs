@@ -916,12 +916,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let (progress, mut receiver) = ::tokio::sync::watch::channel(0);
+            let readiness = Arc::new(crate::node::Readiness::default());
+            let mut receiver = readiness.state.subscribe();
             app.publication = Some(crate::execution::pipeline::Publication {
                 archive: archive.archive,
                 retention: None,
-                readiness: Arc::default(),
-                progress,
+                readiness,
                 #[cfg(feature = "indexer-api")]
                 index: None,
             });

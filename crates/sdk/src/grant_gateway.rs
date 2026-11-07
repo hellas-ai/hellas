@@ -753,6 +753,10 @@ impl GrantSource {
             match session.recover().await {
                 Ok(_) => break,
                 Err(GrantClientError::RecoveryTooEarly) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class B: remote recovery refusal"
+                    )]
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(e) => {
@@ -912,4 +916,8 @@ impl GrantSource {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;

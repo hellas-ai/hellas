@@ -25,27 +25,18 @@ pub(super) struct Lease {
     config: Config,
     network: Network,
     endpoint: iroh::Endpoint,
-    stop: StdMutex<Option<oneshot::Sender<()>>>,
     thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
     runtime: Arc<RuntimeGuard>,
 }
 struct HaltOnExit(Arc<Readiness>);
 impl Drop for HaltOnExit {
     fn drop(&mut self) {
-        self.0.halted.store(true, Ordering::Release);
+        self.0.halt("chain thread exited");
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.core.readiness.halted.store(true, Ordering::Release);
-        if let Some(stop) = self
-            .stop
-            .lock()
-            .expect("chain shutdown lock poisoned")
-            .take()
-        {
-            let _ = stop.send(());
-        }
+        self.core.readiness.halt("chain node lease dropped");
     }
 }
 impl FullNode {
@@ -60,7 +51,8 @@ impl FullNode {
     async fn start_inner(config: Config, indexing: Indexing) -> Result<Self, Error> {
         config.info()?;
         let (started, ready) = oneshot::channel();
-        let (stop, mut stopped) = oneshot::channel();
+        let stopped = CancellationToken::new();
+        let starting = stopped.clone().drop_guard();
         let retained_config = config.clone();
         let thread = std::thread::Builder::new()
             .name("hellas-chain".into())
@@ -91,7 +83,7 @@ impl FullNode {
                         }
                         let discovery = network.clone();
                         serving.spawn(async move { discovery.discover_periodically().await });
-                        let core = Core::open(context.child("node"), &config, indexing, &network, &mut stopped).await?;
+                        let core = Core::open(context.child("node"), &config, indexing, &network, &stopped).await?;
                         Ok::<_, Error>((core, network))
                     };
                     let result = opened.await;
@@ -108,12 +100,12 @@ impl FullNode {
                     let mut tasks = std::mem::take(&mut *core.tasks.lock().unwrap());
                     serving.spawn(serve(SyncService::new(&core, network.clone()), network.clone()));
                     let done = futures_util::future::select_all(tasks.0.iter_mut());
-                    tokio::select! {
-                        _ = &mut stopped => {},
-                        result = done => { tracing::error!(result = ?result.0, "chain execution stopped"); },
-                        _ = serving.join_next() => {},
-                    }
-                    core.readiness.halted.store(true, Ordering::Release);
+                    let reason = tokio::select! {
+                        _ = stopped.cancelled() => "chain node shutdown",
+                        result = done => { tracing::error!(result = ?result.0, "chain execution stopped"); "chain execution stopped" },
+                        _ = serving.join_next() => "chain serving stopped",
+                    };
+                    core.readiness.halt(reason);
                     serving.shutdown().await;
                     tasks.stop(&context).await;
                     network.endpoint.close().await;
@@ -123,16 +115,17 @@ impl FullNode {
         let (core, network, runtime) = ready
             .await
             .map_err(|_| storage("chain startup task stopped"))??;
-        Ok(Self(Arc::new(Lease {
+        let node = Self(Arc::new(Lease {
             core,
             manager: network.manager(),
             endpoint: network.endpoint.clone(),
             network,
             config: retained_config,
-            stop: StdMutex::new(Some(stop)),
             thread: StdMutex::new(Some(thread)),
             runtime,
-        })))
+        }));
+        starting.disarm();
+        Ok(node)
     }
     #[cfg(feature = "indexer-api")]
     pub(crate) fn publication(&self) -> Option<crate::edge_index::Publication> {
@@ -195,15 +188,7 @@ impl FullNode {
         }
     }
     pub async fn shutdown(self) -> Result<(), Error> {
-        if let Some(stop) = self
-            .0
-            .stop
-            .lock()
-            .expect("chain shutdown lock poisoned")
-            .take()
-        {
-            let _ = stop.send(());
-        }
+        self.0.core.readiness.halt("chain node shutdown");
         let thread = self
             .0
             .thread
@@ -220,11 +205,13 @@ impl FullNode {
     }
     pub fn view(&self) -> Result<ChainView, QueryError> {
         self.0.core.readiness.check()?;
-        Ok(ChainView(self.0.core.client.clone().retain_node(
-            self.0.runtime.clone(),
-            self.0.network.clone(),
-        )))
+        Ok(self.read_view())
     }
+    fn read_view(&self) -> ChainView {
+        let client = self.0.core.client.clone();
+        ChainView(client.retain_node(self.0.runtime.clone(), self.0.network.clone()))
+    }
+
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
         self.0.endpoint.addr()
     }
@@ -236,44 +223,36 @@ impl FullNode {
     }
 
     /// Snapshot of execution readiness. Retained read handles still recheck it.
-    pub fn status(&self) -> NodeStatus {
+    pub fn status(&self) -> NodeState {
         self.0.core.readiness.status()
     }
 
-    /// The last executed and published finalized height, including later updates.
-    pub fn finalized(&self) -> watch::Receiver<u64> {
-        self.0.core.progress.subscribe()
+    /// Published execution state; `executed_height()` is the finalized height.
+    /// Observation and halt transitions also wake subscribers.
+    pub fn finalized(&self) -> watch::Receiver<NodeState> {
+        self.0.core.readiness.state.subscribe()
     }
     pub async fn wait_ready(&self) -> Result<ChainView, QueryError> {
-        let mut progress = self.finalized();
-        loop {
-            if let Ok(view) = self.view() {
-                return Ok(view);
-            }
-            if self.0.core.readiness.halted.load(Ordering::Acquire) {
-                return Err(QueryError::StateUnavailable("chain node halted".into()));
-            }
-            tokio::select! {
-                result = progress.changed() => { result.map_err(|_| QueryError::ChannelClosed)?; },
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-            }
-        }
+        self.finalized()
+            .wait_for(|state| !matches!(state, NodeState::CatchingUp { .. }))
+            .await
+            .map_err(|_| QueryError::ChannelClosed)?
+            .check()?;
+        Ok(self.read_view())
     }
 }
 
 #[derive(Clone)]
 struct SyncService {
     indexer: ChainIndexer,
-    progress: watch::Sender<u64>,
-    readiness: Option<Arc<Readiness>>,
+    progress: watch::Receiver<NodeState>,
     network: Network,
 }
 impl SyncService {
     fn new(core: &Core, network: Network) -> Self {
         Self {
             indexer: core.indexer.clone(),
-            progress: core.progress.clone(),
-            readiness: Some(core.readiness.clone()),
+            progress: core.readiness.state.subscribe(),
             network,
         }
     }
@@ -291,9 +270,7 @@ impl ChainSyncHandler for SyncService {
         &self,
         request: pb::GetFinalizedBlockRequest,
     ) -> Result<pb::GetFinalizedBlockResponse, WireStatus> {
-        if let Some(readiness) = &self.readiness {
-            readiness.running()?;
-        }
+        self.progress.borrow().running()?;
         crate::server::read_finalized_block(request, |query| {
             self.indexer.get_finalized_block(query)
         })
@@ -318,17 +295,12 @@ impl ChainSyncHandler for SyncService {
     ) -> Result<ResponseStream<pb::GetFinalizedBlockResponse>, WireStatus> {
         let source = self.clone();
         let stream = futures_util::stream::unfold(
-            (source.progress.subscribe(), source),
+            (source.progress.clone(), source),
             |(mut progress, source)| async move {
                 let wake = tokio::time::timeout(Duration::from_secs(5), progress.changed()).await;
                 match wake {
                     Ok(Ok(())) | Err(_) => {
-                        let response = source
-                            .indexer
-                            .get_finalized_block(FinalizedBlockQuery::Latest)
-                            .await
-                            .map(crate::server::finalized_block_response)
-                            .map_err(WireStatus::from);
+                        let response = source.get_latest_block(pb::GetLatestBlockRequest {}).await;
                         Some((response, (progress, source)))
                     }
                     Ok(Err(_)) => None,
@@ -531,17 +503,20 @@ pub(crate) async fn serve_validator_endpoint(
 ) {
     let network = Network::new(endpoint.clone(), Trust::Genesis(Arc::new(verifier)));
     commonware_glue::stateful::db::AttachableResolver::attach_database(&network, database).await;
-    let (progress, _) = watch::channel(0);
+    let (progress, receiver) = watch::channel(NodeState::Ready { height: 0 });
     let service = SyncService {
         indexer,
-        progress: progress.clone(),
-        readiness: None,
+        progress: receiver,
         network: network.clone(),
     };
     let mut activity = activity.subscribe();
     let notify = async move {
         // Marshal persistence may finish after consensus reports finalization.
         // A bounded periodic wake also catches that publication and lagged events.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class B: marshal persistence"
+        )]
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -553,7 +528,7 @@ pub(crate) async fn serve_validator_endpoint(
                 },
                 _ = tick.tick() => {},
             }
-            progress.send_modify(|value| *value = value.wrapping_add(1));
+            progress.send_modify(|_| {});
         }
     };
     tokio::select! {

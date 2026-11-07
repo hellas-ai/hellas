@@ -197,6 +197,10 @@ impl GrantWork {
                                 .0
                                 .saturating_sub(clock().0)
                                 .saturating_add(1);
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "inventory class C: upload expiry"
+                            )]
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             let now = clock().0;
                             {

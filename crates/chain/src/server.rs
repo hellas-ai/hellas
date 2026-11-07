@@ -904,6 +904,10 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
 }
 
 #[cfg(all(test, feature = "validator"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 mod tests;
 
 /// Shared finalized read semantics for LightClient and ChainSync.

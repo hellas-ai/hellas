@@ -1,3 +1,10 @@
+#![cfg_attr(
+    feature = "validator",
+    expect(
+        clippy::disallowed_methods,
+        reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+    )
+)]
 #![cfg(feature = "validator")]
 
 use hellas_chain::{

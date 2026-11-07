@@ -736,6 +736,10 @@ async fn get_live_edge(
             Err(error) => return Err(error.into()),
         }
         if attempt + 1 < SNAPSHOT_RETRIES {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: remote index; rollout 3"
+            )]
             tokio::time::sleep(SNAPSHOT_RETRY_DELAY).await;
         }
     }

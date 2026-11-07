@@ -694,7 +694,7 @@ impl Devnet {
             for node in &self.full_nodes {
                 let mut progress = node.finalized();
                 tokio::time::timeout(crate::node::RECOVERY_TIMEOUT, async {
-                    while *progress.borrow_and_update() < self.height {
+                    while progress.borrow_and_update().executed_height() < self.height {
                         progress.changed().await.unwrap();
                     }
                     node.wait_ready().await.unwrap();

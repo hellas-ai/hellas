@@ -12,15 +12,9 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio as runtime};
-use std::{
-    num::NonZeroU64,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-};
+use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 mod input;
 pub(crate) mod replication;
@@ -155,7 +149,7 @@ impl Config {
 
 /// Execution readiness relative to verified observations, never untrusted peer claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeStatus {
+pub enum NodeState {
     CatchingUp {
         observed: Option<u64>,
         executed: u64,
@@ -163,62 +157,98 @@ pub enum NodeStatus {
     Ready {
         height: u64,
     },
-    Stopped {
-        observed: Option<u64>,
+    Halted {
+        reason: &'static str,
         executed: u64,
     },
 }
 
-impl NodeStatus {
+impl NodeState {
     pub fn executed_height(self) -> u64 {
         match self {
-            Self::CatchingUp { executed, .. } | Self::Stopped { executed, .. } => executed,
+            Self::CatchingUp { executed, .. } | Self::Halted { executed, .. } => executed,
             Self::Ready { height } => height,
         }
     }
-}
-
-#[derive(Default)]
-pub(crate) struct Readiness {
-    seen: AtomicU64,
-    pub(crate) applied: AtomicU64,
-    observed: AtomicBool,
-    halted: AtomicBool,
-}
-impl Readiness {
-    fn status(&self) -> NodeStatus {
-        let executed = self.applied.load(Ordering::Acquire);
-        let observed = self
-            .observed
-            .load(Ordering::Acquire)
-            .then(|| self.seen.load(Ordering::Acquire));
-        if self.halted.load(Ordering::Acquire) {
-            NodeStatus::Stopped { observed, executed }
-        } else if observed.is_some_and(|height| executed >= height) {
-            NodeStatus::Ready { height: executed }
-        } else {
-            NodeStatus::CatchingUp { observed, executed }
+    fn running(self) -> Result<(), QueryError> {
+        match self {
+            Self::Halted { reason, .. } => Err(QueryError::StateUnavailable(reason.into())),
+            _ => Ok(()),
         }
     }
-
-    pub(crate) fn running(&self) -> Result<(), QueryError> {
-        if self.halted.load(Ordering::Acquire) {
-            return Err(QueryError::StateUnavailable(
-                "chain execution halted".into(),
-            ));
-        }
-        Ok(())
-    }
-    pub(crate) fn check(&self) -> Result<(), QueryError> {
-        match self.status() {
-            NodeStatus::Ready { .. } => Ok(()),
-            NodeStatus::CatchingUp { .. } => Err(QueryError::StateUnavailable(
+    fn check(self) -> Result<(), QueryError> {
+        self.running()?;
+        match self {
+            Self::Ready { .. } => Ok(()),
+            _ => Err(QueryError::StateUnavailable(
                 "chain node is catching up".into(),
             )),
-            NodeStatus::Stopped { .. } => Err(QueryError::StateUnavailable(
-                "chain execution halted".into(),
-            )),
         }
+    }
+}
+
+pub(crate) struct Readiness {
+    pub(crate) state: watch::Sender<NodeState>,
+    cancel: CancellationToken,
+}
+impl Default for Readiness {
+    fn default() -> Self {
+        Self::new(CancellationToken::new())
+    }
+}
+impl Readiness {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            state: watch::channel(NodeState::CatchingUp {
+                observed: None,
+                executed: 0,
+            })
+            .0,
+            cancel,
+        }
+    }
+    fn status(&self) -> NodeState {
+        *self.state.borrow()
+    }
+    pub(crate) fn running(&self) -> Result<(), QueryError> {
+        self.status().running()
+    }
+    pub(crate) fn check(&self) -> Result<(), QueryError> {
+        self.status().check()
+    }
+    pub(crate) fn advance(&self, observation: Option<u64>, executed: u64) {
+        self.state.send_if_modified(|state| {
+            let previous = *state;
+            let executed = executed.max(state.executed_height());
+            let observed = match *state {
+                NodeState::CatchingUp { observed, .. } => observed,
+                NodeState::Ready { height } => Some(height),
+                NodeState::Halted { reason, .. } => {
+                    *state = NodeState::Halted { reason, executed };
+                    return *state != previous;
+                }
+            }
+            .max(observation);
+            *state = if observed.is_some_and(|height| executed >= height) {
+                NodeState::Ready { height: executed }
+            } else {
+                NodeState::CatchingUp { observed, executed }
+            };
+            *state != previous
+        });
+    }
+    fn halt(&self, reason: &'static str) {
+        self.state.send_if_modified(|state| {
+            if matches!(state, NodeState::Halted { .. }) {
+                return false;
+            }
+            *state = NodeState::Halted {
+                reason,
+                executed: state.executed_height(),
+            };
+            true
+        });
+        self.cancel.cancel();
     }
 }
 
@@ -381,7 +411,6 @@ pub(crate) struct Core {
     #[cfg(feature = "indexer-api")]
     publication: Option<crate::edge_index::Publication>,
     readiness: Arc<Readiness>,
-    progress: watch::Sender<u64>,
     tasks: std::sync::Mutex<Tasks>,
 }
 fn storage(error: impl std::fmt::Display) -> Error {
@@ -397,7 +426,7 @@ impl Core {
         config: &Config,
         indexing: Indexing,
         network: &replication::Network,
-        stopped: &mut tokio::sync::oneshot::Receiver<()>,
+        stopped: &CancellationToken,
     ) -> Result<Arc<Self>, Error> {
         use commonware_consensus::marshal::{resolver::handler, standard::Standard};
         use commonware_glue::stateful::SyncPlan;
@@ -500,13 +529,11 @@ impl Core {
                 })
             }
         };
-        let readiness = Arc::new(Readiness::default());
-        let (progress, _) = watch::channel(0);
+        let readiness = Arc::new(Readiness::new(stopped.clone()));
         application.publication = Some(crate::execution::pipeline::Publication {
             archive: indexer.clone(),
             retention: config.archive_blocks,
             readiness: readiness.clone(),
-            progress: progress.clone(),
             #[cfg(feature = "indexer-api")]
             index: publication.clone(),
         });
@@ -580,7 +607,7 @@ impl Core {
         }
         let database = tokio::select! {
             database = mailbox.subscribe_databases() => database,
-            _ = &mut *stopped => { tasks.stop(&context).await; return Err(Error::Query(QueryError::ChannelClosed)); }
+            _ = stopped.cancelled() => { tasks.stop(&context).await; return Err(Error::Query(QueryError::ChannelClosed)); }
         };
         let restore = || {
             crate::execution::pipeline::restore(
@@ -594,7 +621,7 @@ impl Core {
         #[cfg(feature = "indexer-api")]
         if let Some(target) = recovery_target {
             let recovery = async {
-                let mut changes = progress.subscribe();
+                let mut changes = readiness.state.subscribe();
                 let initial = restore().await?;
                 if initial < target {
                     if indexer
@@ -607,18 +634,16 @@ impl Core {
                             "published checkpoint is absent from the archive".into(),
                         ));
                     }
-                    while *changes.borrow_and_update() < target {
-                        changes
-                            .changed()
-                            .await
-                            .map_err(|_| QueryError::ChannelClosed)?;
-                    }
+                    changes
+                        .wait_for(|state| state.executed_height() >= target)
+                        .await
+                        .map_err(|_| QueryError::ChannelClosed)?;
                 }
                 Ok::<_, QueryError>(())
             };
             let result = tokio::select! {
                 result = tokio::time::timeout(RECOVERY_TIMEOUT, recovery) => result.map_err(storage).and_then(|result| result.map_err(Error::from)),
-                _ = &mut *stopped => Err(Error::Query(QueryError::ChannelClosed)),
+                _ = stopped.cancelled() => Err(Error::Query(QueryError::ChannelClosed)),
             };
             if let Err(error) = result {
                 tasks.stop(&context).await;
@@ -670,14 +695,9 @@ impl Core {
                     network.feed(input).await;
                 }));
         }
-        readiness.applied.fetch_max(restored, Ordering::AcqRel);
-        progress.send_if_modified(|height| {
-            let advanced = *height < restored;
-            *height = (*height).max(restored);
-            advanced
-        });
+        readiness.advance(None, restored);
         if let Some(retain) = config.archive_blocks {
-            let height = readiness.applied.load(Ordering::Acquire);
+            let height = readiness.status().executed_height();
             indexer.retain_from(
                 height.saturating_sub(retain.get() - 1),
                 height.saturating_sub(retain.get().max(2) - 1),
@@ -707,7 +727,6 @@ impl Core {
             database,
             input,
             readiness,
-            progress,
             #[cfg(feature = "indexer-api")]
             publication,
             tasks: std::sync::Mutex::new(tasks),
@@ -719,13 +738,10 @@ impl Readiness {
         let block = trust.verify(incoming)?;
         let proof = crate::finality_proof::FinalityProof::decode(&incoming.snapshot.finalization)
             .map_err(invalid)?;
-        self.seen.fetch_max(
-            proof
-                .certified_height(incoming.snapshot.height)
-                .map_err(invalid)?,
-            Ordering::AcqRel,
-        );
-        self.observed.store(true, Ordering::Release);
+        let height = proof
+            .certified_height(incoming.snapshot.height)
+            .map_err(invalid)?;
+        self.advance(Some(height), 0);
         Ok(block)
     }
 }

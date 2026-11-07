@@ -12,9 +12,8 @@ use commonware_runtime::{Spawner, Supervisor as _, tokio::Context};
 use commonware_utils::{NZU64, NZUsize};
 use std::{
     num::{NonZeroU64, NonZeroUsize},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
 };
-use tokio::sync::watch;
 
 /// Finalized blocks of QMDB history kept behind the active range (decision 51).
 const RETAINED_QMDB_BLOCKS: usize = 256;
@@ -84,7 +83,6 @@ pub(crate) struct Publication {
     pub(crate) archive: ChainIndexer,
     pub(crate) retention: Option<NonZeroU64>,
     pub(crate) readiness: Arc<crate::node::Readiness>,
-    pub(crate) progress: watch::Sender<u64>,
     #[cfg(feature = "indexer-api")]
     pub(crate) index: Option<crate::edge_index::Publication>,
 }
@@ -107,14 +105,7 @@ impl Publication {
                 block.height().get().saturating_sub(retain.get().max(2) - 1),
             );
         }
-        self.readiness
-            .applied
-            .fetch_max(block.height().get(), Ordering::AcqRel);
-        self.progress.send_if_modified(|height| {
-            let advanced = *height < block.height().get();
-            *height = (*height).max(block.height().get());
-            advanced
-        });
+        self.readiness.advance(None, block.height().get());
         let _ = database;
     }
 }

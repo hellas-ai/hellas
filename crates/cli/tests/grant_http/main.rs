@@ -1,3 +1,7 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
+)]
 #![cfg(unix)]
 mod contact;
 mod local_compute;

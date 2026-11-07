@@ -39,6 +39,10 @@ where
                 endpoint.prepare_close().await?;
             }
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "inventory class B: finalized close; rollout 3"
+        )]
         tokio::time::sleep(poll).await;
     }
 }

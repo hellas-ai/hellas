@@ -316,6 +316,10 @@ impl FuturesStream for IrohRecvHalf {
             }
             // Try to decode a frame from the buffer.
             match try_pop_frame(&mut this.read_buf) {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "inventory class C: partial frame deadline"
+                )]
                 Ok(Some(frame)) => {
                     // Only an accepted stream has the first-frame deadline.
                     // Once a complete frame arrives, handler time and idle
@@ -412,6 +416,10 @@ impl FuturesStream for IrohRecvHalf {
                 }
             };
             this.read_buf.extend_from_slice(&tmp_box[..n]);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: partial frame deadline"
+            )]
             if this.partial_frame_deadline.is_none() {
                 this.partial_frame_deadline =
                     Some(Box::pin(n0_future::time::sleep(this.partial_frame_timeout)));

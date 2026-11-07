@@ -374,6 +374,10 @@ impl CodexAuthClient {
     ) -> Result<DeviceExchange, CodexAuthError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
         while tokio::time::Instant::now() < deadline {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class C: OAuth-mandated interval"
+            )]
             tokio::time::sleep(Duration::from_secs(device.interval)).await;
             let response = self
                 .http
@@ -742,6 +746,10 @@ impl FileLock {
                     ),
                 )));
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "inventory class B: OS advisory file lock"
+            )]
             std::thread::sleep(Duration::from_millis(25));
         }
     }
