@@ -1,7 +1,7 @@
 use super::fixtures::spawn_archive;
 use super::*;
 use crate::domain::PublicKey;
-use crate::execution::test_support::{ConsensusFixture, consensus_fixture, finalization};
+use crate::execution::test_support::{ConsensusFixture, consensus_fixture, finality_envelope};
 use crate::{Application, ApplicationConfig};
 use commonware_consensus::{
     simplex::types::Context,
@@ -87,11 +87,7 @@ fn pruning_reclaims_old_marshal_sections() {
         for height in 1..=260 {
             let next = block(&parent, fixture.leaders[0].clone(), height, 1);
             indexer
-                .publish_proof(
-                    next.clone(),
-                    &crate::finality_proof::encode(&finalization(&fixture, &next).encode(), &[])
-                        .unwrap(),
-                )
+                .publish_proof(next.clone(), &finality_envelope(&fixture, &next))
                 .await
                 .unwrap();
             parent = next;

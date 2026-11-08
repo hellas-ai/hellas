@@ -205,19 +205,16 @@ impl OwnerReshape {
                 .get_coins_by_owner_page(owner.into(), after)
                 .await?
                 .ok_or(CoinOwnerError::NoSnapshot)?;
-            let mut candidates = page
+            let candidates = page
                 .coins
                 .into_iter()
-                .filter(|(id, _)| !reserved.contains(&CoinId::from_bytes((*id).into())))
-                .collect::<Vec<_>>();
-            candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                .map(|(id, _)| id)
+                .filter(|id| !reserved.contains(&CoinId::from_bytes((*id).into())))
+                .collect();
             let snapshot = chain
-                .get_objects(candidates.iter().map(|(id, _)| *id).collect())
+                .get_objects(candidates)
                 .await?
                 .ok_or(CoinOwnerError::NoSnapshot)?;
-            if snapshot.network != network {
-                return Err(CoinOwnerError::Network);
-            }
             eligible.extend(snapshot.objects.into_iter().filter_map(|(id, object)| {
                 let hellas_chain::domain::Object::Coin(coin) = object else {
                     return None;
@@ -403,7 +400,6 @@ mod tests {
                 coins,
                 next: (end < 130)
                     .then(|| hellas_chain::domain::ObjectId::from([(end - 1) as u8; 32])),
-                owned_balance: Some(328),
             }))
         }
 

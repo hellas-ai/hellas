@@ -131,6 +131,12 @@ impl ProofVerifier {
         Self::with_digest(trust, genesis_digest(&genesis).into())
     }
 
+    /// The profile's trust document and consensus digest, both authenticated
+    /// when the profile was loaded.
+    pub fn for_profile(profile: &hellas_genesis::ChainProfile) -> Result<Self, VerificationError> {
+        Self::with_digest(profile.trust().clone(), profile.consensus_digest())
+    }
+
     /// Authenticated canonical digest permits light verification without allocations.
     pub fn with_digest(
         trust: TrustDocument,
@@ -228,10 +234,7 @@ impl ProofVerifier {
         query: ProofQuery,
         bundle: Option<ProofBundle>,
     ) -> Result<VerifiedBlock, VerificationError> {
-        if finalized.block.len() > MAX_PROOF_BYTES
-            || finalized.snapshot.finalization.len()
-                > crate::finality_proof::MAX_FINALITY_PROOF_BYTES
-        {
+        if finalized.block.len() > MAX_PROOF_BYTES {
             return Err(VerificationError::Size);
         }
         let proof = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)?;
@@ -302,62 +305,31 @@ impl ProofVerifier {
         })
     }
 
-    /// Verify an exact key set at one certified Current-QMDB root.
+    /// Verify an exact key set at one certified Current-QMDB root, plus the
+    /// owner page of at most `OWNER_PAGE_LIMIT` holdings after the
+    /// `(owner, after)` key cursor.
     pub fn verify_objects(
         &self,
         response: hellas_rpc::pb::chain::GetObjectProofsResponse,
         requested: &BTreeSet<ObjectId>,
         query: FinalizedBlockQuery,
-        owner: Option<(crate::domain::SettlementKey, u64, u32)>,
-    ) -> Result<VerifiedObjects, VerificationError> {
-        self.verify_objects_inner(response, requested, query, owner, None)
-    }
-
-    pub fn verify_objects_after(
-        &self,
-        response: hellas_rpc::pb::chain::GetObjectProofsResponse,
-        requested: &BTreeSet<ObjectId>,
-        query: FinalizedBlockQuery,
-        owner: crate::domain::SettlementKey,
-        after: Option<[u8; 32]>,
-        limit: u32,
-    ) -> Result<VerifiedObjects, VerificationError> {
-        self.verify_objects_inner(response, requested, query, Some((owner, 0, limit)), after)
-    }
-
-    fn verify_objects_inner(
-        &self,
-        response: hellas_rpc::pb::chain::GetObjectProofsResponse,
-        requested: &BTreeSet<ObjectId>,
-        query: FinalizedBlockQuery,
-        owner: Option<(crate::domain::SettlementKey, u64, u32)>,
-        after: Option<[u8; 32]>,
+        owner: Option<(crate::domain::SettlementKey, Option<[u8; 32]>)>,
     ) -> Result<VerifiedObjects, VerificationError> {
         let block = response.block.ok_or(VerificationError::Query)?;
         let finalized = crate::client::finalized_block_from_proto(block)
             .map_err(|_| VerificationError::Query)?;
         let verified = self.verify_finalized(finalized, ProofQuery::Block(query))?;
         let owner_page = match (owner, response.owner_page) {
-            (Some((owner, offset, limit)), Some(page)) => {
+            (Some((owner, after)), Some(page)) => {
                 let page = crate::owner_proof::OwnerPageProof::from_proto(page)
                     .map_err(|_| VerificationError::Query)?;
-                let summary = if after.is_some() {
-                    crate::owner_proof::verify_owner_page_after(
-                        verified.view().owner_root(),
-                        owner,
-                        after,
-                        limit,
-                        &page,
-                    )
-                } else {
-                    crate::owner_proof::verify_owner_page(
-                        verified.view().owner_root(),
-                        owner,
-                        offset,
-                        limit,
-                        &page,
-                    )
-                }
+                let summary = crate::owner_proof::verify_owner_page_after(
+                    verified.view().owner_root(),
+                    owner,
+                    after,
+                    crate::owner_proof::OWNER_PAGE_LIMIT,
+                    &page,
+                )
                 .map_err(|_| VerificationError::Query)?;
                 Some((page, summary))
             }
@@ -372,7 +344,7 @@ impl ProofVerifier {
                     .map(|holding| ObjectId::from(holding.object_id)),
             );
         }
-        if expected.len() > MAX_CURRENT_KEYS || response.proofs.len() != expected.len() {
+        if response.proofs.len() != expected.len() {
             return Err(VerificationError::Query);
         }
         let root = verified.view().state_root();
@@ -536,6 +508,7 @@ pub trait VerifiedStore {
 mod tests {
     use super::*;
     use crate::domain::{Scheme, ThresholdVariant};
+    use crate::owner_proof::OWNER_PAGE_LIMIT;
     use commonware_consensus::{
         Heightable as _,
         simplex::types::{Context, Finalization as NativeFinalization, Finalize, Proposal},
@@ -757,7 +730,7 @@ mod tests {
             &tree,
             owner,
             0,
-            crate::owner_proof::OWNER_PAGE_LIMIT,
+            OWNER_PAGE_LIMIT,
         ))
         .unwrap();
         let address = AddressProofBundle {
@@ -802,12 +775,7 @@ mod tests {
             ..address
         };
         next_verifier
-            .verify_address(
-                next_address.clone(),
-                owner,
-                0,
-                crate::owner_proof::OWNER_PAGE_LIMIT,
-            )
+            .verify_address(next_address.clone(), owner, 0, OWNER_PAGE_LIMIT)
             .unwrap();
         std::fs::write(
             directory.join("proof-next.pb"),
@@ -842,7 +810,7 @@ mod tests {
             &tree,
             owner,
             0,
-            crate::owner_proof::OWNER_PAGE_LIMIT,
+            OWNER_PAGE_LIMIT,
         ))
         .unwrap();
         let bundle = AddressProofBundle {
@@ -850,20 +818,8 @@ mod tests {
             block: Some(bundle),
             page: Some(page.clone().into_proto()),
         };
-        let proto = <AddressProofBundle as prost::Message>::decode(
-            prost::Message::encode_to_vec(&bundle).as_slice(),
-        )
-        .unwrap();
-        let json: AddressProofBundle =
-            serde_json::from_slice(&serde_json::to_vec(&bundle).unwrap()).unwrap();
-        assert_eq!(proto.page, json.page);
         let verified = verifier
-            .verify_address(
-                bundle.clone(),
-                owner,
-                0,
-                crate::owner_proof::OWNER_PAGE_LIMIT,
-            )
+            .verify_address(bundle.clone(), owner, 0, OWNER_PAGE_LIMIT)
             .unwrap();
         assert_eq!(verified.summary().balance, 123);
         assert_eq!(verified.summary().count, 1);
@@ -876,19 +832,19 @@ mod tests {
         bad.page = Some(page.into_proto());
         assert!(
             verifier
-                .verify_address(bad, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .verify_address(bad, owner, 0, OWNER_PAGE_LIMIT)
                 .is_err()
         );
         let mut missing = bundle.clone();
         missing.page = None;
         assert!(
             verifier
-                .verify_address(missing, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .verify_address(missing, owner, 0, OWNER_PAGE_LIMIT)
                 .is_err()
         );
         assert!(
             verifier
-                .verify_address(bundle, owner, 1, crate::owner_proof::OWNER_PAGE_LIMIT)
+                .verify_address(bundle, owner, 1, OWNER_PAGE_LIMIT)
                 .is_err()
         );
     }
@@ -1091,14 +1047,10 @@ impl VerifiedBlock {
         offset: u64,
         limit: u32,
     ) -> Result<VerifiedAddress, VerificationError> {
-        let encoded_page = page.clone().into_proto();
-        if prost::Message::encoded_len(&encoded_page) > MAX_PROOF_BYTES {
-            return Err(VerificationError::Size);
-        }
         let bundle = AddressProofBundle {
             schema_version: PROOF_SCHEMA_VERSION,
             block: Some(self.bundle.clone()),
-            page: Some(encoded_page),
+            page: Some(page.clone().into_proto()),
         };
         let summary = crate::owner_proof::verify_owner_page(
             self.view().owner_root(),

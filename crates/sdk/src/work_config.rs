@@ -44,13 +44,11 @@ impl WorkConfig {
     }
 
     fn validate(self) -> Result<Self> {
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            self.chain.trust().clone(),
-            self.chain.consensus_digest(),
-        )
-        .map_err(|_| WorkConfigError::Invalid {
-            field: "chain.trust",
-            reason: "trusted epoch schedule and consensus digest must be usable",
+        hellas_chain::proof_verify::ProofVerifier::for_profile(&self.chain).map_err(|_| {
+            WorkConfigError::Invalid {
+                field: "chain.trust",
+                reason: "trusted epoch schedule and consensus digest must be usable",
+            }
         })?;
         Ok(self)
     }
