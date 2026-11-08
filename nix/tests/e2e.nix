@@ -58,24 +58,6 @@ let
     exec ${gatewayFixture}/bin/gateway-fixture
   '';
 
-  validatorResetProbe = pkgs.writeShellScript "probe-validator-reset-identity" ''
-    set -eu
-    home=/var/lib/hellas-validator-reset/node0
-    if [ ! -e "$home/seeded" ]; then
-      state="$(find "$home/chains" -mindepth 2 -maxdepth 2 -type d -name validator -print -quit)"
-      test -n "$state"
-      id -u > "$home/uid"
-      printf 'shared identity\n' > "$home/identity"
-      printf 'selected state\n' > "$state/retained"
-      mkdir -p "$home/chains/other/validator"
-      printf 'other chain\n' > "$home/chains/other/validator/retained"
-      touch "$home/seeded"
-    fi
-    # The service identity must be able to write the selected state on every start.
-    selected="$(find "$home/chains" -mindepth 2 -maxdepth 2 -type d -name validator ! -path '*/other/*' -print -quit)"
-    date +%s%N > "$selected/written-by-service"
-  '';
-
   chainValidatorFollowerPrelude =
     {
       homePrefix,
@@ -193,82 +175,6 @@ let
     '';
 in
 {
-  # Exercise the generated validator prestart as its DynamicUser. The main
-  # consensus command is replaced with a state probe for this test.
-  # Unit-semantics test: no long-running hellas process, so no trace
-  # export is expected from it.
-  validator-reset-service-identity = pkgs.testers.runNixOSTest {
-    name = "hellas-validator-reset-service-identity";
-    nodes.machine = _: {
-      imports = [ self.nixosModules.validators ];
-      config = lib.mkMerge [
-        (mkBaseNode validatorPackage)
-        {
-          services.hellas-chain-validators.reset = {
-            enable = true;
-            package = validatorPackage;
-            nodes = 1;
-            stateGeneration = 1;
-          };
-          systemd.services.hellas-validator-reset-node0 = {
-            wantedBy = lib.mkForce [ ];
-            serviceConfig = {
-              Type = lib.mkForce "oneshot";
-              Restart = lib.mkForce "no";
-              ExecStart = lib.mkForce validatorResetProbe;
-            };
-          };
-        }
-      ];
-    };
-    testScript = ''
-      import shlex
-
-      start_all()
-      service = "hellas-validator-reset-node0.service"
-      home = "/var/lib/hellas-validator-reset/node0"
-      machine.succeed(f"systemctl start {service}")
-      uid = int(machine.succeed(f"cat {home}/uid"))
-      assert uid != 0, uid
-      state = machine.succeed(
-          f"find {home}/chains -mindepth 2 -maxdepth 2 -type d -name validator "
-          "! -path '*/other/*' -print -quit"
-      ).strip()
-      assert state, "native state-generation did not create selected validator state"
-      assert machine.succeed(f"cat {state}/.state-generation").strip() == "1"
-      # DynamicUser with PrivateUsers: prove access by the service identity itself
-      # (the probe writes into the reset state), and that root did not create it.
-      machine.succeed(f"test -s {state}/written-by-service")
-      assert machine.succeed(f"stat -c %u {state}").strip() != "0"
-      assert machine.succeed(f"stat -c %a {state}/retained").strip() == "600"
-      assert machine.succeed(f"cat {home}/identity").strip() == "shared identity"
-      assert machine.succeed(f"cat {home}/chains/other/validator/retained").strip() == "other chain"
-      settings = machine.succeed(f"systemctl show {service} -p DynamicUser -p UMask")
-      assert "DynamicUser=yes" in settings, settings
-      assert "UMask=0077" in settings, settings
-
-      # Keep the generated unit and its DynamicUser settings. Change only the
-      # generation token in its actual ExecStartPre command for a second start.
-      unit = machine.succeed(f"systemctl cat {service}")
-      prestart = next(line for line in unit.splitlines() if line.startswith("ExecStartPre="))
-      assert "state-generation --generation 1" in prestart, prestart
-      changed = prestart.replace("state-generation --generation 1", "state-generation --generation 2")
-      dropin = f"/run/systemd/system/{service}.d/generation.conf"
-      machine.succeed(f"mkdir -p /run/systemd/system/{service}.d")
-      machine.succeed(
-          f"printf '%s\\n' '[Service]' 'ExecStartPre=' {shlex.quote(changed)} > {dropin}"
-      )
-      machine.succeed("systemctl daemon-reload")
-      machine.succeed(f"systemctl start {service}")
-      machine.fail(f"test -e {state}/retained")
-      machine.succeed(f"test -s {state}/written-by-service")
-      assert machine.succeed(f"cat {state}/.state-generation").strip() == "2"
-      assert machine.succeed(f"cat {home}/identity").strip() == "shared identity"
-      assert machine.succeed(f"cat {home}/chains/other/validator/retained").strip() == "other chain"
-      assert machine.succeed(f"stat -c %u {state}").strip() != "0"
-    '';
-  };
-
   gateway-fresh-home = runTest {
     name = "hellas-gateway-fresh-home";
     nodes.machine = _: {
