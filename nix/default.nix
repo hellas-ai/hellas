@@ -16,14 +16,10 @@ let
   inherit (nativePkg)
     pkgs
     lib
+    cargoLlvmCov
     rustToolchain
     workspaceNativeBuildInputs
     ;
-
-  # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
-  # (format 11) its paired llvm-profdata (format 10) cannot read. At run
-  # time the tool uses our toolchain's llvm-tools-preview instead.
-  cargoLlvmCov = pkgs.cargo-llvm-cov.overrideAttrs { doCheck = false; };
 
   cargoToolPackages = with pkgs; [
     cargo-audit
@@ -152,7 +148,6 @@ let
     inherit (nativePkg) clippyArgs;
     inherit
       bufLintCommand
-      cargoLlvmCov
       denyCommand
       pkgs
       lib
@@ -434,11 +429,6 @@ in
       program = lib.getExe ci.checkRelease;
       meta.description = "Run the full release test and feature-check suite";
     };
-    check-coverage = {
-      type = "app";
-      program = lib.getExe ci.coverage;
-      meta.description = "Measure line coverage and enforce the per-crate floors";
-    };
     fix = {
       type = "app";
       program = lib.getExe ci.fixAll;
@@ -475,7 +465,6 @@ in
 
   checks = hydraLints // {
     unit = hydraUnit;
-    inherit (nativePkg.craneChecks) regressions;
     # Published so later builds substitute compiled dependencies.
     cargo-deps = nativePkg.cargoDeps;
   };

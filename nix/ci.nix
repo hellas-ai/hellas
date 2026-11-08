@@ -1,6 +1,5 @@
 {
   bufLintCommand,
-  cargoLlvmCov,
   clippyArgs,
   denyCommand,
   cargoDeps,
@@ -91,12 +90,15 @@ let
           pkgs.actionlint
           pkgs.shellcheck
         ];
-    unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
-    # Tests wait on events and fail only on a documented hang guard, so they
-    # run with libtest's default parallelism rather than one at a time.
-    regressions = mkCargo "check-regressions" ''
-      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api
-    '' (cargoEnv rustToolchain);
+    # The same suite as `checks.<system>.unit`, uninstrumented: the regression
+    # feature set on the validator host, the default set elsewhere. Coverage
+    # and its floors are enforced only by that derivation.
+    unit = mkCargo "check-unit" (
+      if isValidatorHost then
+        "cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api"
+      else
+        "cargo test --locked --workspace"
+    ) (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
@@ -316,31 +318,6 @@ let
     );
   };
 
-  # Line coverage of the regression feature set, with a per-crate ratchet.
-  # Deliberately not a check: it is in neither `nix run .#check` nor any
-  # release validation, so it adds no time to either. Writes lcov.info,
-  # summary.json and summary.txt to $COVERAGE_DIR (default
-  # $CARGO_TARGET_DIR/coverage); pass --update to rewrite the floors.
-  coverage =
-    mkCargo "check-coverage"
-      ''
-        out="''${COVERAGE_DIR:-$CARGO_TARGET_DIR/coverage}"
-        mkdir -p "$out"
-        cargo llvm-cov nextest --locked --workspace --features integration-tests,hellas-chain/indexer-api --no-report
-        cargo llvm-cov report --lcov --output-path "$out/lcov.info"
-        cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
-        cargo llvm-cov report --summary-only | tee "$out/summary.txt"
-        python3 ${./coverage-ratchet.py} "$out/summary.json" nix/coverage-floor.json "$@"
-      ''
-      (
-        cargoEnv rustToolchain
-        ++ [
-          cargoLlvmCov
-          pkgs.cargo-nextest
-          pkgs.python3
-        ]
-      );
-
   checks =
     (
       if isValidatorHost then
@@ -348,7 +325,6 @@ let
       else
         builtins.removeAttrs baseChecks [
           "validator"
-          "regressions"
           "chain-setup"
           # Same reason as `validator` above: validators are deployed on x86
           # only, so the feature set is not built on other hosts. Linting it
@@ -375,12 +351,9 @@ let
     "xet-no-alloc"
   ];
   lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;
-  mergeChecks =
-    lintChecks
-    // {
-      inherit (checks) unit;
-    }
-    // lib.optionalAttrs isValidatorHost { inherit (checks) regressions; };
+  mergeChecks = lintChecks // {
+    inherit (checks) unit;
+  };
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {
@@ -422,7 +395,6 @@ in
 {
   inherit
     checks
-    coverage
     fixes
     mergeChecks
     ;

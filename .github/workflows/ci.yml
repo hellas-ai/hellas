@@ -48,6 +48,9 @@ jobs:
             nix run --accept-flake-config ".#check-$check"
           done
 
+  # One instrumented run of the regression feature set: it fails on a failing
+  # test and on a crate falling below its floor in nix/coverage-floor.json.
+  # The job name is a required status check; keep it.
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-24.04
@@ -55,5 +58,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - name: Unit tests
+      - name: Unit tests + coverage
         run: nix build --accept-flake-config --print-build-logs --no-link .#checks.x86_64-linux.unit

@@ -128,8 +128,7 @@ let
         "kernel-model-run"
         "kernel-model-verify"
         "kernel-fixture-freshness"
-      ]
-      ++ lib.optionals x86 [ "regressions" ];
+      ];
       artifacts = {
         validator = archive "consensus-${system}" nativePackages.cli-validator;
       };
