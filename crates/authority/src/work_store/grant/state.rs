@@ -902,8 +902,8 @@ fn verify(
 }
 
 /// Snapshots retain health decisions made under the frame accounting semantics.
-/// Refuse older state even when rotation removed every old frame.
-pub(super) const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v4";
+/// Refuse pre-v4 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v4";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {

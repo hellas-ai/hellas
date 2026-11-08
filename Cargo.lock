@@ -3064,7 +3064,6 @@ dependencies = [
  "hellas-wire",
  "hellas-xet",
  "hex",
- "ipld-core",
  "k256",
  "proptest",
  "prost",

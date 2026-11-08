@@ -27,7 +27,6 @@ use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
-mod v3;
 pub use bootstrap::{OwnerApproval, PreparedBootstrap};
 #[cfg(test)]
 mod tests;

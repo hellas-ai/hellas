@@ -36,7 +36,6 @@ hellas-webauthn.workspace = true
 hellas-wire.workspace = true
 hellas-xet.workspace = true
 hex.workspace = true
-ipld-core = { version = "0.4", features = ["serde"] }
 k256.workspace = true
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde.workspace = true

@@ -69,7 +69,7 @@ async fn old_checkpoint_cannot_bypass_the_journal_format_boundary() {
     let directory = tempfile::tempdir().unwrap();
     let (mut store, _) = setup(directory.path()).await;
     let mut snapshot = serde_json::to_value(store.state.snapshot().unwrap()).unwrap();
-    snapshot["namespace"] = serde_json::json!("hellas.node.checkpoint.v2");
+    snapshot["namespace"] = serde_json::json!("hellas.node.checkpoint.v3");
     let snapshot: Snapshot = serde_json::from_value(snapshot).unwrap();
     store
         .journal
