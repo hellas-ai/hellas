@@ -334,6 +334,9 @@ in
             ];
             services.hellas-monitor = {
               environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
+              # Each step from a received mDNS response to a discovery event,
+              # so a missed discovery names the step that lost it.
+              environment.RUST_LOG = "warn,swarm_discovery::receiver=debug,iroh_mdns_address_lookup=trace,hellas_wire::iroh::swarm::mdns=debug";
               serviceConfig = {
                 ExecStart = "${package}/bin/hellas --home /tmp/hellas-monitor monitor";
                 KillSignal = "SIGINT";
@@ -347,7 +350,7 @@ in
           services.hellas = {
             enable = true;
             inherit package;
-            environment.RUST_LOG = "hellas_executor=info";
+            environment.RUST_LOG = "hellas_executor=info,swarm_discovery=debug";
             environment.OTEL_SERVICE_NAME = "hellas-test-provider";
             port = executorPort;
             openFirewall = true;

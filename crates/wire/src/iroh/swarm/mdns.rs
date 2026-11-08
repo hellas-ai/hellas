@@ -14,7 +14,7 @@ use std::sync::Arc;
 use data_encoding::BASE64URL_NOPAD;
 use futures::stream::{Stream, StreamExt};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use super::discovery::{DiscoveredPeer, Discovery};
 use super::peers::{FeedResult, PeerFeedSpec, Scope};
@@ -87,11 +87,11 @@ fn mdns_feed(
                 match classify_user_data_alpn(user_data_str.as_deref(), &alpn) {
                     UserDataAlpnMatch::Match => {}
                     UserDataAlpnMatch::Mismatch => {
-                        trace!(alpn = %String::from_utf8_lossy(&alpn), "mdns: ALPN mismatch, skipping");
+                        debug!(%endpoint_id, alpn = %String::from_utf8_lossy(&alpn), "mdns: ALPN mismatch, skipping");
                         continue;
                     }
                     UserDataAlpnMatch::Missing => {
-                        trace!(alpn = %String::from_utf8_lossy(&alpn), "mdns: missing service metadata, skipping");
+                        debug!(%endpoint_id, alpn = %String::from_utf8_lossy(&alpn), "mdns: missing service metadata, skipping");
                         continue;
                     }
                 }
