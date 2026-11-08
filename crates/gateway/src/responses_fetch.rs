@@ -5,7 +5,7 @@ use axum::{Router, body::Bytes, extract::State, response::Response, routing::pos
 use futures::StreamExt;
 use hellas_adaptors::{
     BackendError, BackendEvent, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
-    RenderContext, openai::responses::OpenAiResponsesAdaptor,
+    openai::responses::OpenAiResponsesAdaptor,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -29,24 +29,15 @@ struct FetchBackend {
 }
 
 async fn handle(State(backend): State<Arc<FetchBackend>>, body: Bytes) -> Response {
-    let adaptor = OpenAiResponsesAdaptor;
-    let (parsed, request) =
-        match super::dispatch::parse_backend_request(&adaptor, &body, "OpenAI Responses") {
-            Ok(value) => value,
-            Err(response) => return *response,
-        };
-    super::dispatch::backend_wire_response(
-        parsed.stream.unwrap_or(false),
-        adaptor,
-        parsed,
-        backend.as_ref().clone(),
-        request,
-        RenderContext::new(
-            super::next_id("resp"),
-            super::next_id("msg"),
-            super::now_unix(),
-        ),
+    let context = super::dispatch::render_context("resp");
+    let backend = backend.as_ref().clone();
+    super::dispatch::serve(
+        OpenAiResponsesAdaptor,
         "OpenAI Responses",
+        context,
+        backend,
+        None,
+        &body,
     )
     .await
 }

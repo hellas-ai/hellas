@@ -1,4 +1,6 @@
-//! Multipart audio is prepared and decoded on the gateway, through one Compute job.
+//! Multipart audio is extracted here, interpreted by
+//! `hellas_adaptors::openai::audio_transcriptions`, and decoded through one
+//! Compute job.
 use super::backend::provenance::json_response;
 use super::{AudioOptions, GatewayError, GatewayResult, WorkExecutionBackend, json_error};
 use axum::{
@@ -8,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use hellas_adaptors::openai::audio_transcriptions::TranscriptionForm;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
@@ -45,89 +48,50 @@ pub(super) async fn router(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state))
 }
-fn bad(message: impl Into<String>) -> Response {
-    json_error(StatusCode::BAD_REQUEST, message)
-}
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response {
     json_error(error.status(), error.body_text())
 }
 
 pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Response>> {
-    let mut form = Multipart::from_request(request, &())
+    let mut multipart = Multipart::from_request(request, &())
         .await
         .map_err(IntoResponse::into_response)?;
-    let mut model = None;
-    while let Some(field) = form.next_field().await.map_err(multipart_error)? {
+    let mut form = TranscriptionForm::default();
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         if field.name() == Some("model") {
-            if model.is_some() {
-                return Err(bad("duplicate model field").into());
-            }
+            form.admit("model").map_err(crate::request_error)?;
             let bytes = field.bytes().await.map_err(multipart_error)?;
-            if bytes.len() > 256 {
-                return Err(bad("model name too long").into());
-            }
-            model = Some(
-                std::str::from_utf8(&bytes)
-                    .map_err(|_| bad("invalid model name"))?
-                    .to_owned(),
-            );
+            form.insert("model", bytes.into())
+                .map_err(crate::request_error)?;
         }
     }
-    model
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| bad("model field is required").into())
+    Ok(form.model().map_err(crate::request_error)?.to_owned())
 }
 
 async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Response {
-    let mut fields = std::collections::BTreeSet::new();
-    let (mut model, mut file, mut language, mut format) = (None, None, None, String::from("json"));
+    let mut fields = TranscriptionForm::default();
     while let Some(field) = match form.next_field().await {
         Ok(field) => field,
         Err(error) => return multipart_error(error),
     } {
         let name = field.name().unwrap_or_default().to_owned();
-        if !fields.insert(name.clone()) {
-            return bad(format!("duplicate {name} field"));
-        }
-        if !matches!(
-            name.as_str(),
-            "model" | "file" | "language" | "response_format"
-        ) {
-            return bad(format!("unsupported field {name}"));
+        if let Err(error) = fields.admit(&name) {
+            return crate::request_error(error);
         }
         let bytes = match field.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => return multipart_error(error),
         };
-        if name == "file" {
-            if bytes.len() > wav::MAX_WAV_BYTES {
-                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-            }
-            file = Some(bytes);
-            continue;
+        if name == "file" && bytes.len() > wav::MAX_WAV_BYTES {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
         }
-        if bytes.len() > 256 {
-            return bad("form field too long");
-        }
-        let value = match std::str::from_utf8(&bytes) {
-            Ok(value) => value.to_owned(),
-            Err(_) => return bad("invalid UTF-8 form field"),
-        };
-        match name.as_str() {
-            "model" => model = Some(value),
-            "language" => language = Some(value),
-            "response_format" => format = value,
-            _ => unreachable!(),
+        if let Err(error) = fields.insert(&name, bytes.into()) {
+            return crate::request_error(error);
         }
     }
-    if model.as_deref() != Some(state.options.model_name.as_str()) {
-        return json_error(StatusCode::NOT_FOUND, "unknown model");
-    }
-    if !matches!(format.as_str(), "json" | "text") {
-        return bad("response_format must be json or text");
-    }
-    let Some(file) = file else {
-        return bad("file field is required");
+    let (file, language, text) = match fields.finish(&state.options.model_name) {
+        Ok(fields) => fields,
+        Err(error) => return crate::request_error(error),
     };
     let deadline = state
         .work
@@ -149,7 +113,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     .await
     {
         Ok(Ok(Ok(job))) => job,
-        Ok(Ok(Err(error))) => return bad(error.to_string()),
+        Ok(Ok(Err(error))) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
         Ok(Err(error)) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         Err(_) => {
             return json_error(
@@ -177,7 +141,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     .await;
     let mut response = match output {
         Ok(output) => match state.package.decode(&output) {
-            Ok(ModelResponse::Transcription(result)) if format == "text" => {
+            Ok(ModelResponse::Transcription(result)) if text => {
                 text_response(result.text, transcript.as_deref())
             }
             Ok(ModelResponse::Transcription(result)) => json_response(
@@ -217,7 +181,7 @@ fn audio_error(
 ) -> Response {
     json_response(
         status,
-        serde_json::json!({"error": {"message": message.into()}}),
+        hellas_adaptors::openai::error_json(message),
         accepted,
         transcript,
     )

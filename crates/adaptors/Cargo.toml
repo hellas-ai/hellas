@@ -8,6 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+base64.workspace = true
 futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-rpc = { workspace = true, default-features = false, features = [

@@ -1,7 +1,7 @@
 //! One router over every presentation. A path served by several of them is
 //! split by the request's model.
 use super::{
-    GatewayConfigError, GatewayResult, Presentations, WorkExecutionBackend, http_fetch, json_error,
+    GatewayConfigError, GatewayResult, Presentations, WorkExecutionBackend, http_fetch, path_error,
     responses_fetch, state,
 };
 use axum::{
@@ -116,6 +116,7 @@ pub(crate) async fn router(
 async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Response {
     let limit = request_limit(request.uri().path());
     let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_owned();
     let Ok(body) = axum::body::to_bytes(body, limit).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -140,12 +141,13 @@ async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Respo
     } else {
         let decoded = match http_fetch::affinity::decoded_body(&parts.headers, &body) {
             Ok(decoded) => decoded,
-            Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return path_error(&path, StatusCode::BAD_REQUEST, message),
         };
         let value = match hellas_authority::model::http_usage::unique_json(&decoded) {
             Ok(value) => value,
             Err(_) => {
-                return json_error(
+                return path_error(
+                    &path,
                     StatusCode::BAD_REQUEST,
                     "model routing requires a JSON request",
                 );
@@ -153,11 +155,12 @@ async fn split(models: Arc<BTreeMap<String, Router>>, request: Request) -> Respo
         };
         match hellas_authority::model::http_usage::request_model(&value) {
             Ok(model) => model.map(str::to_owned),
-            Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return path_error(&path, StatusCode::BAD_REQUEST, message),
         }
     };
     let Some(router) = model.and_then(|model| models.get(&model).cloned()) else {
-        return json_error(
+        return path_error(
+            &path,
             StatusCode::NOT_FOUND,
             "no presentation on this path serves the requested model",
         );

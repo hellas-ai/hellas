@@ -54,6 +54,24 @@ struct AnthropicToolCallState {
     block_index: usize,
 }
 
+/// A refusal or failure as the Anthropic Messages API reports it.
+pub fn render_error(status: u16, message: String) -> WireResponse {
+    let kind = match status {
+        400 | 409 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        _ => "api_error",
+    };
+    WireResponse::json(
+        status,
+        json!({ "type": "error", "error": { "type": kind, "message": message } }),
+    )
+}
+
 impl WireAdaptor for AnthropicMessagesAdaptor {
     type ParsedRequest = ParsedAnthropicMessageRequest;
     type StreamState = AnthropicMessagesStreamState;
@@ -154,6 +172,10 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
                 state.provenance.as_ref(),
             ),
         )])
+    }
+
+    fn render_error(&self, status: u16, message: String) -> WireResponse {
+        render_error(status, message)
     }
 
     fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {

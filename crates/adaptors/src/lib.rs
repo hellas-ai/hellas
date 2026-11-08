@@ -29,7 +29,7 @@ pub mod openai;
 pub mod request;
 pub mod wire;
 
-pub use adaptor::{WireAdaptor, WireIngress};
+pub use adaptor::WireAdaptor;
 pub use backend::{
     BackendError, BackendEvent, BackendEventStream, BackendFuture, BackendRequest, BackendResult,
     BackendStream, ExecutionBackend,

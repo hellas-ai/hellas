@@ -22,7 +22,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures::StreamExt;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
@@ -31,7 +31,7 @@ use http_body::Frame;
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
+use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest, json_error};
 use crate::backend::provenance::transcript_header;
 use hellas_adaptors::BackendError;
 
@@ -162,14 +162,6 @@ fn fetch_route(
     }
 }
 
-fn error(status: StatusCode, message: &'static str) -> Response {
-    (
-        status,
-        axum::Json(serde_json::json!({"error": {"message": message}})),
-    )
-        .into_response()
-}
-
 async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Response {
     let mut observed = observation::Observation::new(&state.metrics, request.uri().path());
     let (parts, body) = request.into_parts();
@@ -180,7 +172,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         Err(_) => {
             observed.status(413);
             observed.complete();
-            return error(
+            return json_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "HTTP request exceeds Fetch limit",
             );
@@ -201,7 +193,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         Err(failure) => {
             observed.status(failure.status.as_u16());
             observed.complete();
-            let mut response = error(failure.status, failure.message);
+            let mut response = json_error(failure.status, failure.message);
             if let Some(seconds) = failure.retry {
                 response
                     .headers_mut()
@@ -230,7 +222,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         Err(_) => {
             observed.status(400);
             observed.complete();
-            return error(StatusCode::BAD_REQUEST, "unsupported HTTP header encoding");
+            return json_error(StatusCode::BAD_REQUEST, "unsupported HTTP header encoding");
         }
     };
     if let Some(query) = parts.uri.query() {
@@ -244,7 +236,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         _ => {
             observed.status(400);
             observed.complete();
-            return error(StatusCode::BAD_REQUEST, "invalid HTTP request");
+            return json_error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
     let result = open(&state, selected.backend, backend.provider, payload)
@@ -277,7 +269,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             }
             let status = super::backend_status(&error);
             observed.status(status.as_u16());
-            return attributed(self::error(status, message), &backend.name);
+            return attributed(json_error(status, message), &backend.name);
         }
     };
     observed.status(status);
@@ -317,7 +309,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             })))
         ) {
             observed.status(502);
-            return error(StatusCode::BAD_GATEWAY, "invalid bodyless HTTP completion");
+            return json_error(StatusCode::BAD_GATEWAY, "invalid bodyless HTTP completion");
         }
         observed.complete();
         // Without a body there is nowhere to trail it; the head waited for it.
