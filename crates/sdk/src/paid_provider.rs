@@ -1383,7 +1383,7 @@ impl<S: FinalizedWorkView> FinalizedWorkView for UntilStop<S> {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<hellas_chain::WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<hellas_chain::Verified<hellas_chain::WorkChannelSnapshot>>, QueryError> {
         let stopped = QueryError::StateUnavailable("the paid-work clock is stopping".into());
         self.read(self.source.work_channel_snapshot(query), stopped)
             .await
