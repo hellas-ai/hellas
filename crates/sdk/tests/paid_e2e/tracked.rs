@@ -329,13 +329,13 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
             let completed = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
-                executor(attempt, None, false).run(
+                Box::pin(executor(attempt, None, false).run(
                     &job,
                     &signer,
                     None,
                     stop_on(std::future::pending()),
                     deliver(),
-                ),
+                )),
             )
             .await
             .unwrap();
