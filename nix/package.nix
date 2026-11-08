@@ -11,10 +11,7 @@ let
   overlays = [
     (import rust-overlay)
     (final: _prev: {
-      hellasLib = import ./lib {
-        pkgs = final;
-        inherit (self.inputs) nix-strix-halo;
-      };
+      hellasLib = import ./lib { pkgs = final; };
     })
   ];
   pkgs = import nixpkgs (

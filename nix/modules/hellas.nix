@@ -347,10 +347,7 @@ rec {
     { lib, pkgs }:
     let
       inherit (lib) mkOption types;
-      hellasLib = import ../lib {
-        inherit pkgs;
-        inherit (self.inputs) nix-strix-halo;
-      };
+      hellasLib = import ../lib { inherit pkgs; };
       runtimePath = types.strMatching "/.*";
       catenaMaxResidentAssetBytes = 4 * 1024 * 1024 * 1024 * 1024;
       positiveLimitOption =
