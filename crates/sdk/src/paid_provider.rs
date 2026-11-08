@@ -7,7 +7,9 @@ use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
 use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
-use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery, node::NodeState};
+use hellas_chain::{
+    FinalizedWorkView, WorkBlocks, WorkChannelQuery, light_client::QueryError, node::NodeState,
+};
 use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
 use hellas_channel::model::work::{
@@ -16,9 +18,11 @@ use hellas_channel::model::work::{
 use hellas_channel::work::{
     CloseEndpoint, RunError, RunOutcome, WorkBackend, WorkService, run_accepted_work,
 };
-use hellas_channel::work_close::{FinalizedBlocks, TxSink};
+use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_channel::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
+use hellas_channel::work_open::{
+    FinalizedSetup, SetupAdvance, SetupDriveError, SetupProgress, SetupQuery, SetupView,
+};
 use hellas_channel::work_store::{ChannelStore, Role, SetupStore, discover_setups};
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
@@ -1220,7 +1224,7 @@ impl WorkRunner {
     {
         {
             use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
-            let stop = stop.map(|_| ()).shared();
+            let stop: Stop = stop.map(|_| ()).boxed().shared();
             let signer = &self.signer;
             let work_mount = &self.work_mount;
             let setup_mount = &self.setup_mount;
@@ -1246,7 +1250,14 @@ impl WorkRunner {
                         }
                         let budget = clock.max_observation_age;
                         if chain.is_none() {
-                            chain = tokio::time::timeout(budget, dial()).await.ok().flatten();
+                            chain = tokio::select! {
+                                biased;
+                                () = stop.clone() => break,
+                                dialed = tokio::time::timeout(budget, dial()) => dialed
+                                    .ok()
+                                    .flatten()
+                                    .map(|source| UntilStop { source, stop: stop.clone() }),
+                            };
                         }
                         if let Some(source) = chain.as_ref() {
                             match tokio::time::timeout(
@@ -1306,6 +1317,76 @@ impl WorkRunner {
         let result = self.unmount_all().await;
         info!("the paid-work clock stopped, and its journals are closed");
         result
+    }
+}
+
+/// Fires once when the runner stops.
+type Stop = futures::future::Shared<BoxFuture<'static, ()>>;
+
+/// A chain source whose reads fail once the runner stops. Shutdown lets
+/// in-flight ticks finish so their journal writes complete; their chain
+/// reads must not hold it open.
+#[derive(Clone)]
+struct UntilStop<S> {
+    source: S,
+    stop: Stop,
+}
+
+impl<S> UntilStop<S> {
+    async fn read<V, E>(
+        &self,
+        read: impl core::future::Future<Output = Result<V, E>>,
+        stopped: E,
+    ) -> Result<V, E> {
+        tokio::select! {
+            biased;
+            () = self.stop.clone() => Err(stopped),
+            result = read => result,
+        }
+    }
+}
+
+fn stopping() -> BlockSourceError {
+    BlockSourceError::Failed("the paid-work clock is stopping".into())
+}
+
+impl<S: SetupView + Sync> SetupView for UntilStop<S> {
+    async fn finalized_setup(
+        &self,
+        query: SetupQuery,
+    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+        self.read(self.source.finalized_setup(query), stopping())
+            .await
+    }
+}
+
+impl<S: FinalizedBlocks + Sync> FinalizedBlocks for UntilStop<S> {
+    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+        self.read(self.source.latest_height(), stopping()).await
+    }
+
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        self.read(self.source.block_at(height), stopping()).await
+    }
+}
+
+impl<S: TxSink + Sync> TxSink for UntilStop<S> {
+    async fn submit(
+        &self,
+        tx: hellas_kernel::Tx,
+    ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
+        self.read(self.source.submit(tx), stopping()).await
+    }
+}
+
+impl<S: FinalizedWorkView> FinalizedWorkView for UntilStop<S> {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<hellas_chain::WorkChannelSnapshot>, QueryError> {
+        let stopped = QueryError::StateUnavailable("the paid-work clock is stopping".into());
+        self.read(self.source.work_channel_snapshot(query), stopped)
+            .await
     }
 }
 
