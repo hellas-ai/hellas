@@ -176,11 +176,7 @@ impl ManagedWorker {
         let mut commands: Vec<_> = common_node::budgets(
             common_node::POOL,
             subject,
-            vec![Limit {
-                meter: Meter::OutputTokens,
-                window: Window::Total,
-                amount: 10,
-            }],
+            vec![Limit::new(Meter::OutputTokens, Window::Total, 10)],
             1,
         )
         .into_iter()

@@ -234,7 +234,7 @@ where
         let revision = match current {
             Ok(WorkControlReply::Budget { definition, .. }) => {
                 ensure!(
-                    definition.parent == parent,
+                    definition.parent == Some(parent),
                     "share budget has a different parent"
                 );
                 if definition.limits == limits && definition.max_in_flight == NonZeroU16::MIN {
@@ -257,7 +257,7 @@ where
         };
         let definition = BudgetDef {
             node,
-            parent,
+            parent: Some(parent),
             revision,
             limits,
             max_in_flight: NonZeroU16::MIN,

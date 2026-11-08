@@ -82,7 +82,7 @@ impl Operation {
                 state.provider().is_ok()
                     || state
                         .ledger()
-                        .node(crate::model::grant::budget::BudgetNode::Machine)
+                        .node(hellas_admission::Key::Machine)
                         .is_some()
             }
             Mount::Work => state.provider().is_ok(),

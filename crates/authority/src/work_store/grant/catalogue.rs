@@ -20,7 +20,7 @@ impl State {
         policy.validate()?;
         if self
             .ledger
-            .node(BudgetNode::Account(policy.account))
+            .node(BudgetNode::Account(policy.account).key())
             .is_none()
             || self
                 .catalogue
@@ -60,15 +60,13 @@ impl State {
         let BudgetNode::Subject { pool, .. } = grant.budget else {
             return Err(GrantError::OutOfScope.into());
         };
-        let pool = self
-            .ledger
-            .definition(BudgetNode::Pool(pool))
+        let pool = super::ledger::definition(&self.ledger, BudgetNode::Pool(pool))
             .ok_or(GrantError::OutOfScope)?;
         for policy in &grant.policies {
             let configured = self
                 .resource(policy.resource)
                 .ok_or(GrantError::OutOfScope)?;
-            if pool.parent != BudgetNode::Account(policy.account)
+            if pool.parent != Some(BudgetNode::Account(policy.account))
                 || policy.account != configured.account
                 || policy.revision > configured.revision
                 || policy.pricing.revision > configured.pricing.revision

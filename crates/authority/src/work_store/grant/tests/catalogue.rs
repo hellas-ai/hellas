@@ -92,7 +92,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         store
             .state()
             .ledger()
-            .reserved(BudgetNode::Machine, Meter::Requests),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         1
     );
 
@@ -111,7 +111,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         store
             .state()
             .ledger()
-            .reserved(BudgetNode::Machine, Meter::Requests),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         0
     );
     assert_eq!(store.state().policy_for(&template).unwrap(), &policy());
@@ -183,7 +183,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
     let pool = PoolId([2; 16]);
     let mut budgets = common_node::budgets(pool, principal(1).0, vec![], 2);
     budgets[0].node = BudgetNode::Account(second.account);
-    budgets[1].parent = budgets[0].node;
+    budgets[1].parent = Some(budgets[0].node);
     for budget in budgets {
         store.configure_budget(budget, now).await.unwrap();
     }
@@ -222,7 +222,13 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
     ] {
         assert_err!(accept(&mut store, &one, (wrong, signature, &input), now.0)
                 .await, NodeStoreError::Grant(error) if error == expected);
-        assert_eq!(store.state().ledger().active_count(BudgetNode::Machine), 0);
+        assert_eq!(
+            store
+                .state()
+                .ledger()
+                .reserved(BudgetNode::Machine.key(), Meter::Requests),
+            0
+        );
     }
     for (caller, id) in [(&one, GrantId([1; 16])), (&two, GrantId([2; 16]))] {
         let (a, signature, input) = proposal_for(&store, id, 1, principal(1).1);
@@ -235,7 +241,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
             store
                 .state()
                 .ledger()
-                .reserved(BudgetNode::Account(resource.account), Meter::Requests),
+                .reserved(BudgetNode::Account(resource.account).key(), Meter::Requests),
             1
         );
     }
@@ -243,7 +249,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
         store
             .state()
             .ledger()
-            .reserved(BudgetNode::Machine, Meter::Requests),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         2
     );
     store.rotate().await.unwrap();
@@ -266,7 +272,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
             store
                 .state()
                 .ledger()
-                .reserved(BudgetNode::Account(resource.account), Meter::Requests),
+                .reserved(BudgetNode::Account(resource.account).key(), Meter::Requests),
             0
         );
     }
@@ -321,7 +327,13 @@ async fn same_work_policy_uses_the_selected_resources_https_bounds() {
         .await,
         NodeStoreError::Resource(TemplateError::GenerationCap)
     );
-    assert_eq!(store.state().ledger().active_count(BudgetNode::Machine), 0);
+    assert_eq!(
+        store
+            .state()
+            .ledger()
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
+        0
+    );
     accept(&mut store, &application, (a, signature, &input), now.0)
         .await
         .unwrap();
@@ -359,7 +371,7 @@ async fn resource_revision_releases_queued_work() {
         node.store
             .state()
             .ledger()
-            .active_count(BudgetNode::Machine),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         0
     );
     assert_eq!(

@@ -2992,6 +2992,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-admission"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hellas-attestation"
 version = "0.1.0"
 dependencies = [
@@ -3043,6 +3052,7 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.4.3",
+ "hellas-admission",
  "hellas-attestation",
  "hellas-auth",
  "hellas-authority",

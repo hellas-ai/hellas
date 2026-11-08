@@ -161,11 +161,16 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
             backend.finish.release();
             within(service.drain()).await.unwrap();
             let state = snapshot(&service).await;
-            assert_eq!(state.ledger().active_count(BudgetNode::Machine), 0);
             assert_eq!(
                 state
                     .ledger()
-                    .node(budget())
+                    .reserved(BudgetNode::Machine.key(), Meter::Requests),
+                0
+            );
+            assert_eq!(
+                state
+                    .ledger()
+                    .node(budget().key())
                     .unwrap()
                     .counter(Meter::Requests, Window::Total)
                     .used,

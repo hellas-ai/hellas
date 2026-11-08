@@ -673,7 +673,7 @@ async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
         1,
     );
     let mut machine = account.clone();
-    (machine.node, machine.parent) = (BudgetNode::Machine, BudgetNode::Machine);
+    (machine.node, machine.parent) = (BudgetNode::Machine, None);
     for definition in [machine, account] {
         assert_err!(
             admin
