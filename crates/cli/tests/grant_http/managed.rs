@@ -73,12 +73,16 @@ impl ManagedWorker {
         );
         let invitation = invitation(&mut node).await;
         let pin = invitation.node.to_string();
-        let address = invitation
+        // The CLI runs on the node's machine, so it dials loopback: the node
+        // rate-limits handshakes per remote IP, and this fixture's back-to-back
+        // admin commands would exhaust that budget on a LAN address.
+        let port = invitation
             .addresses
             .iter()
             .find(|address| address.is_ipv4())
             .unwrap()
-            .to_string();
+            .port();
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)).to_string();
         let invitation_file = root.join("invitation.json");
         std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
         let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
