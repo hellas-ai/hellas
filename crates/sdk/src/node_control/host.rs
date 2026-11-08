@@ -904,9 +904,7 @@ pub async fn bind_transport(
         .hooks(admission)
         .alpns(transport_alpns());
     if let Some(port) = port {
-        builder = builder
-            .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
-            .map_err(ProviderError::from)?;
+        builder = crate::provider::bind_port(builder, port).map_err(ProviderError::from)?;
     }
     Ok(builder.bind().await.map_err(ProviderError::from)?)
 }

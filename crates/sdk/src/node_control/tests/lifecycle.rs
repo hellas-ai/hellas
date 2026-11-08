@@ -1165,3 +1165,33 @@ async fn a_failed_commit_exposes_rollback_failure_instead_of_claiming_recovery()
     );
     host.shutdown().await.unwrap();
 }
+
+/// A configured port holds in both address families. An IPv6 socket on a port
+/// of its own changes at every restart, and leaves peers an old address that
+/// another endpoint can take.
+#[tokio::test]
+async fn configured_port_binds_both_address_families() {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    // A dual-stack socket finds a port free in both families.
+    let port = std::net::UdpSocket::bind("[::]:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let endpoint = host::bind_transport(
+        SecretKey::from_bytes(&[9; 32]),
+        Some(port),
+        RemoteControlAdmission::default(),
+    )
+    .await
+    .unwrap();
+    let sockets = endpoint.bound_sockets();
+    endpoint.close().await;
+    assert_eq!(
+        sockets,
+        [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ]
+    );
+}

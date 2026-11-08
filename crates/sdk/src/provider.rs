@@ -278,6 +278,29 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
+
+/// Binds both IP sockets of an endpoint to `port`.
+///
+/// An iroh bind address replaces the default socket of its own address family
+/// only, so binding just `0.0.0.0:port` left IPv6 on a port chosen anew at each
+/// start. Peers keep every address they learned for an endpoint id and send a
+/// new dial to all of them; once another endpoint holds the old IPv6 port, its
+/// handshake answer fails the dial. On one port, a restarted node has the
+/// addresses its peers already know.
+pub(crate) fn bind_port(
+    builder: iroh::endpoint::Builder,
+    port: u16,
+) -> Result<iroh::endpoint::Builder, iroh::endpoint::InvalidSocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    builder
+        .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?
+        .bind_addr_with_opts(
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            // As for iroh's default IPv6 socket, a host without IPv6 still starts.
+            iroh::endpoint::BindOpts::default().set_is_required(false),
+        )
+}
+
 mod discovery;
 mod node;
 use node::NodeHandlerImpl;
@@ -523,7 +546,7 @@ where
                 .hooks(remote_control.clone())
                 .alpns(alpns.clone());
             if let Some(port) = config.port {
-                builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+                builder = bind_port(builder, port)?;
             }
             (builder.bind().await?, None, true)
         }
