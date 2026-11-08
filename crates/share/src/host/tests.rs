@@ -34,7 +34,9 @@ struct TlsResponses {
 }
 impl FetchProvider for TlsResponses {
     fn execution_environment(&self) -> hellas_rpc::ContentId {
-        crate::responses_contract().unwrap().manifest_id()
+        hellas_adaptors::openai::responses::fetch::responses_contract()
+            .unwrap()
+            .manifest_id()
     }
     fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
         Box::pin(async move {
@@ -202,7 +204,7 @@ impl ShareFixtureBuilder {
                     FetchRoute::new("openai", "responses"),
                     FetchRouteEntry::new(
                         upstream.provider.clone(),
-                        Arc::new(crate::OpenAiResponsesAdaptorFactory::new().unwrap()),
+                        Arc::new(hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new().unwrap()),
                         FetchRoutePolicy::default(),
                     )
                     .unwrap(),

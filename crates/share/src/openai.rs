@@ -1,4 +1,4 @@
-use crate::OPENAI_RESPONSES_ENDPOINT;
+use hellas_adaptors::openai::responses::fetch::{OPENAI_RESPONSES_ENDPOINT, responses_contract};
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
     PreparedFetchRequest,
@@ -50,7 +50,7 @@ impl OpenAiResponsesFetchProvider {
         bearer_token: String,
     ) -> Result<Self, OpenAiConfigError> {
         Ok(Self {
-            environment: crate::responses_contract()?.manifest_id(),
+            environment: responses_contract()?.manifest_id(),
             client,
             endpoint,
             bearer_token,

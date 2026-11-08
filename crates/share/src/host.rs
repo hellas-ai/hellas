@@ -66,7 +66,8 @@ where
         options.bearer_token.clone(),
     )?);
     let adaptor = Arc::new(
-        crate::OpenAiResponsesAdaptorFactory::new().map_err(crate::OpenAiConfigError::from)?,
+        hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new()
+            .map_err(crate::OpenAiConfigError::from)?,
     );
     let mut routes = FetchRouteRegistry::new();
     routes.register(

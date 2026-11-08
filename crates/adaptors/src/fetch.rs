@@ -1,6 +1,6 @@
-//! Shared framing and payload encoding for sealed Responses streams.
+//! Shared framing and payload encoding for sealed Fetch projectors.
 
-use hellas_adaptors::{OutputEvent, SseDecoder, WireStreamEvent};
+use crate::{OutputEvent, SseDecoder, WireStreamEvent};
 use hellas_executor::{FetchAdaptorError, ProjectedFetch};
 use hellas_rpc::fetch::{FetchPayloadError, encode_fetch_event_payload};
 

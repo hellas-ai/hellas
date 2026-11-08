@@ -4,7 +4,6 @@
 mod codex_responses;
 mod http;
 mod responses_fetch;
-pub mod stream;
 pub use http::{
     CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
     HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret, HttpSecretConfig,

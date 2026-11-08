@@ -2,7 +2,7 @@
 //! environment. This is intentionally separate from the OpenAI Responses
 //! projector: the two endpoints expose different lifecycle contracts.
 
-use super::stream::{project_events, push_sse};
+use hellas_adaptors::fetch::{project_events, push_sse};
 
 use std::collections::{BTreeMap, BTreeSet};
 

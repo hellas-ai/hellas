@@ -1,3 +1,5 @@
+pub mod fetch;
+
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use super::project_response_format;
