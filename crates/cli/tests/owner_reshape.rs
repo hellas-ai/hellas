@@ -11,7 +11,7 @@ use hellas_chain::{
     LightClient as _,
     client::RemoteLightClient,
     config::ValidatorConfig,
-    domain::{SettlementKey, Transaction},
+    domain::{ObjectKey, SettlementKey, Transaction},
 };
 use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::SoftPasskey;
@@ -61,8 +61,8 @@ impl Drop for Validator {
 async fn coin(client: &RemoteLightClient, id: CoinId) -> hellas_chain::domain::Coin {
     tokio::time::timeout(HANG_GUARD, async {
         loop {
-            if let Ok(Some(block)) = client.get_latest_block().await
-                && let Ok(Some(coin)) = client.get_coin(block.payload, id.to_bytes().into()).await
+            if let Ok(Some(snapshot)) = client.get_objects(vec![ObjectKey::Coin(id)]).await
+                && let Some(coin) = snapshot.coin(id).unwrap()
             {
                 return coin;
             }

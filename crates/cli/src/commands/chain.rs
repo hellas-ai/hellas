@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
-use hellas_chain::domain::{Digest, Object, SettlementKey, Transaction};
+use hellas_chain::domain::{Digest, ObjectKey, SettlementKey, Transaction};
 use hellas_chain::genesis::ChainProfile;
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
@@ -434,7 +434,7 @@ enum ObjectReader {
 }
 
 impl ObjectReader {
-    async fn objects(&self, key: Digest) -> CliResult<Option<hellas_chain::ObjectSnapshot>> {
+    async fn objects(&self, key: ObjectKey) -> CliResult<Option<hellas_chain::ObjectSnapshot>> {
         Ok(match self {
             Self::Proven(client) => client
                 .get_objects(vec![key])
@@ -569,27 +569,27 @@ async fn run_object_query(reader: ObjectReader, query: QueryCommand) -> CliResul
     };
     match query {
         QueryCommand::Coin { object_id } => {
-            let object_id = parse_hex_digest(&object_id, "object_id")?;
-            let found = reader.objects(object_id).await?;
+            let id = CoinId::from_bytes(parse_hex_32(&object_id, "object_id")?);
+            let found = reader.objects(ObjectKey::Coin(id)).await?;
             match found
-                .as_ref()
-                .and_then(|snapshot| snapshot.objects.get(&object_id))
+                .map(|snapshot| snapshot.coin(id))
+                .transpose()?
+                .flatten()
             {
-                Some(Object::Coin(coin)) => println!("{} {}", coin.owner, coin.value),
-                Some(other) => anyhow::bail!("object is a {}, not a coin", other.kind()),
+                Some(coin) => println!("{} {}", coin.owner, coin.value),
                 None => println!("none"),
             }
         }
         QueryCommand::Edge { object_id } => {
-            let object_id = parse_hex_digest(&object_id, "object_id")?;
-            let Some(snapshot) = reader.objects(object_id).await? else {
+            let id = EdgeId::from_bytes(parse_hex_32(&object_id, "object_id")?);
+            let Some(snapshot) = reader.objects(ObjectKey::Edge(id)).await? else {
                 println!("none");
                 return Ok(());
             };
             println!("state_root {}", hex::encode(snapshot.block.state_root));
-            match snapshot.objects.get(&object_id) {
-                Some(Object::Edge(edge)) => {
-                    let edge = hellas_chain::EdgeState::from(*edge);
+            match snapshot.edge(id)? {
+                Some(edge) => {
+                    let edge = hellas_chain::EdgeState::from(edge);
                     println!("value {}", edge.value);
                     println!("reserve {}", edge.reserve);
                     println!("close_fee_base {}", edge.close_fees.base());
@@ -601,7 +601,6 @@ async fn run_object_query(reader: ObjectReader, query: QueryCommand) -> CliResul
                     println!("taker {}", edge.taker);
                     println!("terms_hash {}", hex::encode(edge.terms_hash.to_bytes()));
                 }
-                Some(other) => anyhow::bail!("object is a {}, not an edge", other.kind()),
                 None => println!("none"),
             }
         }
@@ -794,18 +793,14 @@ async fn get_live_edge(
             .get_latest_block()
             .await?
             .ok_or_else(|| anyhow::anyhow!("chain has no finalized block"))?;
-        let key = Digest::from(edge_id.to_bytes());
-        match client.get_objects(vec![key]).await {
+        match client.get_objects(vec![ObjectKey::Edge(edge_id)]).await {
             // The close is decided at state at least as new as the latest
             // finalized block seen above.
             Ok(Some(snapshot)) if snapshot.block.height >= latest.height => {
-                return match snapshot.objects.get(&key) {
-                    Some(Object::Edge(edge)) => Ok(hellas_chain::EdgeState::from(*edge)),
-                    Some(other) => {
-                        Err(anyhow::anyhow!("object is a {}, not an edge", other.kind()))
-                    }
-                    None => Err(anyhow::anyhow!("edge does not exist")),
-                };
+                return snapshot
+                    .edge(edge_id)?
+                    .map(hellas_chain::EdgeState::from)
+                    .ok_or_else(|| anyhow::anyhow!("edge does not exist"));
             }
             Ok(_) | Err(QueryError::StateUnavailable(_)) => {}
             Err(error) => return Err(error.into()),

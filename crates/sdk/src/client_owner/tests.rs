@@ -245,12 +245,12 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                 devnet.seal().await;
                 let snapshot = devnet
                     .validator_light_client(0)
-                    .get_objects(vec![coin_object_id(output)])
+                    .get_objects(vec![ObjectKey::Coin(output)])
                     .await
                     .unwrap()
                     .unwrap();
                 assert!(
-                    snapshot.objects.contains_key(&coin_object_id(output)),
+                    snapshot.coin(output).unwrap().is_some(),
                     "original funding was finalized before the response was lost"
                 );
             }
@@ -374,15 +374,12 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             );
             assert_eq!(approval.count.load(Ordering::SeqCst), 4);
             let snapshot = chain
-                .get_objects(coins.into_iter().map(coin_object_id).collect())
+                .get_objects(coins.iter().copied().map(ObjectKey::Coin).collect())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(snapshot.objects.len(), 3);
-            for object in snapshot.objects.values() {
-                let Object::Coin(coin) = object else {
-                    panic!("coin")
-                };
+            for id in coins {
+                let coin = snapshot.coin(id).unwrap().expect("coin");
                 assert_eq!(coin.value, 200);
                 assert_eq!(coin.delegate, Some(delegate().into()));
             }
@@ -493,7 +490,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             assert_eq!(approval.count.load(Ordering::SeqCst), 2);
             assert_eq!(
                 chain
-                    .get_objects(other.maker().iter().copied().map(coin_object_id).collect())
+                    .get_objects(other.maker().iter().copied().map(ObjectKey::Coin).collect())
                     .await
                     .unwrap()
                     .unwrap()

@@ -113,7 +113,7 @@ impl OwnerReshape {
                 selected
                     .iter()
                     .copied()
-                    .map(hellas_chain::domain::coin_object_id)
+                    .map(hellas_chain::domain::ObjectKey::Coin)
                     .collect(),
             )
             .await?
@@ -124,10 +124,7 @@ impl OwnerReshape {
         let mut value = 0_u64;
         let mut inputs = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_INPUTS];
         for (slot, id) in inputs.iter_mut().zip(selected) {
-            let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot
-                .objects
-                .get(&hellas_chain::domain::coin_object_id(*id))
-            else {
+            let Some(coin) = snapshot.coin(*id)? else {
                 return Err(CoinOwnerError::Missing(*id));
             };
             if coin.owner != owner.into() {
@@ -258,7 +255,7 @@ impl OwnerReshape {
                 selected
                     .iter()
                     .copied()
-                    .map(hellas_chain::domain::coin_object_id)
+                    .map(hellas_chain::domain::ObjectKey::Coin)
                     .collect(),
             )
             .await?
@@ -268,10 +265,7 @@ impl OwnerReshape {
         }
         let mut total = 0_u64;
         for id in &selected {
-            let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot
-                .objects
-                .get(&hellas_chain::domain::coin_object_id(*id))
-            else {
+            let Some(coin) = snapshot.coin(*id)? else {
                 return Err(CoinOwnerError::Missing(*id));
             };
             if coin.owner != owner.into()
@@ -360,7 +354,7 @@ mod tests {
         owner: hellas_chain::domain::SettlementKey,
         network: NetworkId,
         pages: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        reads: std::sync::Arc<std::sync::Mutex<Vec<Vec<hellas_chain::domain::ObjectId>>>>,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<Vec<hellas_chain::domain::ObjectKey>>>>,
     }
 
     impl PagedFunding {
@@ -406,7 +400,7 @@ mod tests {
 
         async fn get_objects(
             &self,
-            keys: Vec<hellas_chain::domain::ObjectId>,
+            keys: Vec<hellas_chain::domain::ObjectKey>,
         ) -> Result<
             Option<hellas_chain::Verified<hellas_chain::ObjectSnapshot>>,
             hellas_chain::QueryError,
@@ -422,7 +416,10 @@ mod tests {
                         state_root: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
                         finalization: Vec::new(),
                     },
-                    objects: keys.into_iter().map(|id| (id, self.coin(id))).collect(),
+                    objects: keys
+                        .into_iter()
+                        .map(|key| (key.id(), self.coin(key.id())))
+                        .collect(),
                     holdings: None,
                 },
             )))
@@ -497,7 +494,9 @@ mod tests {
         let reads = source.reads.lock().unwrap();
         assert_eq!(
             reads.last().unwrap(),
-            &vec![hellas_chain::domain::ObjectId::from([129; 32])]
+            &vec![hellas_chain::domain::ObjectKey::Coin(CoinId::from_bytes(
+                [129; 32]
+            ))]
         );
         assert!(reads.iter().all(|batch| batch.len() <= 32));
         assert_eq!(plan.floor(), Some((7, [6; 32])));

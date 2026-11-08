@@ -281,13 +281,14 @@ pub fn genesis_object_id(validator_index: u16) -> ObjectId {
 
 /// Returns the chain object id for a kernel coin id.
 #[must_use]
-pub fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
+#[cfg(any(feature = "client-core", feature = "server"))]
+pub(crate) fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
 
 /// Returns the chain object id for a kernel edge id.
 #[must_use]
-#[cfg(feature = "client-core")]
+#[cfg(any(feature = "client-core", feature = "server"))]
 pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
@@ -298,9 +299,41 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
 /// already domain-separates the three derivations, so the chain does not
 /// separate them a second time.
 #[must_use]
-#[cfg(feature = "client-core")]
+#[cfg(any(feature = "client-core", feature = "server"))]
 pub(crate) fn registry_chunk_object_id(id: hellas_kernel::RegistryChunkId) -> ObjectId {
     ObjectId::from(id.to_bytes())
+}
+
+/// One object a read names, by its kernel id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "client-core", feature = "server"))]
+pub enum ObjectKey {
+    Coin(hellas_kernel::CoinId),
+    Edge(hellas_kernel::EdgeId),
+    RegistryChunk(hellas_kernel::RegistryChunkId),
+}
+
+#[cfg(any(feature = "client-core", feature = "server"))]
+impl ObjectKey {
+    /// The chain object id this key is stored under.
+    #[must_use]
+    pub fn id(self) -> ObjectId {
+        match self {
+            Self::Coin(id) => coin_object_id(id),
+            Self::Edge(id) => edge_object_id(id),
+            Self::RegistryChunk(id) => registry_chunk_object_id(id),
+        }
+    }
+
+    /// The kind of object the key names.
+    #[must_use]
+    pub const fn kind(self) -> ObjectKind {
+        match self {
+            Self::Coin(_) => ObjectKind::Coin,
+            Self::Edge(_) => ObjectKind::Edge,
+            Self::RegistryChunk(_) => ObjectKind::RegistryChunk,
+        }
+    }
 }
 
 /// A genesis document names a network id the kernel cannot carry.

@@ -707,9 +707,8 @@ impl PaidWork {
                 }
                 scan = scan.checked_add(1).context("delegation height overflow")?;
             }
-            let input_id = hellas_chain::domain::coin_object_id(input);
             let inputs = client
-                .get_objects(vec![input_id])
+                .get_objects(vec![hellas_chain::domain::ObjectKey::Coin(input)])
                 .await?
                 .context("no applied chain state")?;
             ensure!(
@@ -717,7 +716,7 @@ impl PaidWork {
                 "applied chain state is behind the delegation scan"
             );
             ensure!(
-                inputs.objects.contains_key(&input_id),
+                inputs.coin(input)?.is_some(),
                 "another spend consumed the delegation input before it finalized"
             );
             if !submitted {

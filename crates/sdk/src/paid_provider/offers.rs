@@ -323,7 +323,7 @@ impl OfferAllocator {
                 coins
                     .iter()
                     .copied()
-                    .map(hellas_chain::domain::coin_object_id)
+                    .map(hellas_chain::domain::ObjectKey::Coin)
                     .collect(),
             )
             .await
@@ -331,10 +331,7 @@ impl OfferAllocator {
             .ok_or_else(|| unavailable("client funding unavailable"))?;
         let mut total = 0_u64;
         for coin in &coins {
-            let Some(hellas_chain::domain::Object::Coin(state)) = funding
-                .objects
-                .get(&hellas_chain::domain::coin_object_id(*coin))
-            else {
+            let Some(state) = funding.coin(*coin).map_err(WireStatus::from)? else {
                 return Ok(refused(OfferRefusalCode::NeedsFunding, required));
             };
             if state.owner != Key::from_bytes(principal).into()

@@ -77,18 +77,18 @@ impl WorkChannelQuery {
     pub(crate) fn object_keys(
         &self,
         network: hellas_kernel::NetworkId,
-    ) -> Vec<crate::domain::ObjectId> {
-        use crate::domain::{coin_object_id, edge_object_id, registry_chunk_object_id};
+    ) -> Vec<crate::domain::ObjectKey> {
+        use crate::domain::ObjectKey;
         use hellas_kernel::{bond_lease_slots, pending_payment_close_slot};
-        let mut keys = vec![edge_object_id(self.bond_edge)];
-        keys.extend(bond_lease_slots(network, self.bond_edge).map(registry_chunk_object_id));
+        let mut keys = vec![ObjectKey::Edge(self.bond_edge)];
+        keys.extend(bond_lease_slots(network, self.bond_edge).map(ObjectKey::RegistryChunk));
         if let Some(payment) = self.payment_edge {
-            keys.push(edge_object_id(payment));
-            keys.push(registry_chunk_object_id(pending_payment_close_slot(
+            keys.push(ObjectKey::Edge(payment));
+            keys.push(ObjectKey::RegistryChunk(pending_payment_close_slot(
                 network, payment,
             )));
         }
-        keys.extend(self.funding.iter().copied().map(coin_object_id));
+        keys.extend(self.funding.iter().copied().map(ObjectKey::Coin));
         keys
     }
 }
@@ -122,48 +122,27 @@ impl WorkChannelSnapshot {
         if snapshot.network != network {
             return Err(QueryError::Remote("object witness network differs".into()));
         }
-        use crate::domain::{
-            Object, ObjectKind, coin_object_id, edge_object_id, registry_chunk_object_id,
-        };
         use hellas_kernel::{bond_lease_slots, pending_payment_close_slot};
-        let edge = |id| match snapshot.objects.get(&edge_object_id(id)).copied() {
-            Some(Object::Edge(edge)) => Ok(Some(edge)),
-            None => Ok(None),
-            Some(object) => Err(QueryError::WrongObjectKind {
-                expected: ObjectKind::Edge,
-                actual: object.kind(),
-            }),
-        };
-        let bond = edge(query.bond_edge)?;
-        let payment = query.payment_edge.map(edge).transpose()?.flatten();
+        let bond = snapshot.edge(query.bond_edge)?;
+        let payment = query
+            .payment_edge
+            .map(|id| snapshot.edge(id))
+            .transpose()?
+            .flatten();
         let [first, second] = bond_lease_slots(network, query.bond_edge);
-        let registry = |id| match snapshot.objects.get(&registry_chunk_object_id(id)).copied() {
-            Some(Object::RegistryChunk(chunk)) => Ok(Some(chunk)),
-            None => Ok(None),
-            Some(object) => Err(QueryError::WrongObjectKind {
-                expected: ObjectKind::RegistryChunk,
-                actual: object.kind(),
-            }),
-        };
-        let leases = [registry(first)?, registry(second)?];
+        let leases = [
+            snapshot.registry_chunk(first)?,
+            snapshot.registry_chunk(second)?,
+        ];
         let pending = query
             .payment_edge
-            .map(|id| registry(pending_payment_close_slot(network, id)))
+            .map(|id| snapshot.registry_chunk(pending_payment_close_slot(network, id)))
             .transpose()?
             .flatten();
         let mut live = BTreeSet::new();
         for id in &query.funding {
-            match snapshot.objects.get(&coin_object_id(*id)) {
-                Some(Object::Coin(_)) => {
-                    live.insert(*id);
-                }
-                None => {}
-                Some(object) => {
-                    return Err(QueryError::WrongObjectKind {
-                        expected: ObjectKind::Coin,
-                        actual: object.kind(),
-                    });
-                }
+            if snapshot.coin(*id)?.is_some() {
+                live.insert(*id);
             }
         }
         Ok(Self::new(

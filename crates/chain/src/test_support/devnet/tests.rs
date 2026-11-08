@@ -2,13 +2,10 @@ use super::*;
 use crate::client::RemoteLightClient;
 use crate::light_client::FinalizedBlockQuery;
 
-async fn coin(client: &impl crate::LightClient, id: crate::domain::ObjectId) -> Option<Coin> {
-    let snapshot = client.get_objects(vec![id]).await.unwrap().unwrap();
-    match snapshot.objects.get(&id) {
-        Some(crate::domain::Object::Coin(coin)) => Some(*coin),
-        None => None,
-        Some(other) => panic!("expected a coin, found {other:?}"),
-    }
+async fn coin(client: &impl crate::LightClient, id: CoinId) -> Option<Coin> {
+    let key = crate::domain::ObjectKey::Coin(id);
+    let snapshot = client.get_objects(vec![key]).await.unwrap().unwrap();
+    snapshot.coin(id).unwrap()
 }
 
 #[test]
@@ -47,12 +44,12 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
         assert_eq!(block.txs().len(), 1);
         for validator in 0..VALIDATORS {
             let client = devnet.validator_light_client(validator);
-            assert!(coin(&client, input.to_bytes().into()).await.is_none());
+            assert!(coin(&client, input).await.is_none());
             for (output, owner, value) in [
                 (outputs[0], recipient.key(), 42),
                 (outputs[1], sender.key(), 931_103),
             ] {
-                let coin = coin(&client, output).await.unwrap();
+                let coin = coin(&client, CoinId::from_bytes(output.0)).await.unwrap();
                 assert_eq!(
                     (coin.owner, coin.value, coin.delegate),
                     (owner, value, None)
