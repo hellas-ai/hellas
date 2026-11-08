@@ -302,15 +302,12 @@ impl PaidWork {
                 let check = async {
                     let mut after = None;
                     loop {
-                        let Some(page) = client.get_coins_by_delegate_page(key.party_key().into(), after).await? else { break; };
-                        for (id, value) in page.coins {
-                            if value > 0 && value <= cap
-                                && let Some(coin) = client.get_coin(page.snapshot.payload, id).await?
-                                && coin.owner.into_kernel() == owner.party_key()
-                                && coin.delegate == Some(key.party_key().into())
-                            { return Ok::<_, anyhow::Error>(true); }
-                        }
-                        let Some(next) = page.next else { break; };
+                        let delegate = key.party_key().into();
+                        let Some(page) = client.get_holdings(delegate, after).await? else { break; };
+                        if page.delegated_coins(delegate).iter().any(|(_, coin)| {
+                            coin.value > 0 && coin.value <= cap && coin.owner.into_kernel() == owner.party_key()
+                        }) { return Ok::<_, anyhow::Error>(true); }
+                        let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else { break; };
                         after = Some(next);
                     }
                     Ok(false)
@@ -612,27 +609,19 @@ impl PaidWork {
         } else {
             let (input, height) = 'search: loop {
                 let mut after = None;
-                while let Some(page) = client.get_coins_by_owner_page(owner.into(), after).await? {
-                    let mut selected = None;
-                    let mut coins = page.coins;
-                    coins.sort_by_key(|(id, value)| (*value, *id));
-                    for (id, value) in coins {
-                        if value < policy.offers.max_stake_per_client {
-                            continue;
-                        }
-                        if let Some(coin) = client.get_coin(page.snapshot.payload, id).await?
-                            && coin.owner.into_kernel() == owner
-                            && coin.delegate.is_none()
-                            && coin.value == value
-                        {
-                            selected = Some((id, page.snapshot.height));
-                            break;
-                        }
+                while let Some(page) = client.get_holdings(owner.into(), after).await? {
+                    let selected = page
+                        .owned_coins(owner.into())
+                        .into_iter()
+                        .filter(|(_, coin)| {
+                            coin.delegate.is_none()
+                                && coin.value >= policy.offers.max_stake_per_client
+                        })
+                        .min_by_key(|(id, coin)| (coin.value, *id));
+                    if let Some((id, _)) = selected {
+                        break 'search (id, page.block.height);
                     }
-                    if let Some(selected) = selected {
-                        break 'search selected;
-                    }
-                    let Some(next) = page.next else {
+                    let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else {
                         break;
                     };
                     after = Some(next);
@@ -718,11 +707,17 @@ impl PaidWork {
                 }
                 scan = scan.checked_add(1).context("delegation height overflow")?;
             }
+            let input_id = hellas_chain::domain::coin_object_id(input);
+            let inputs = client
+                .get_objects(vec![input_id])
+                .await?
+                .context("no applied chain state")?;
             ensure!(
-                client
-                    .get_coin(tip.payload, input.to_bytes().into())
-                    .await?
-                    .is_some(),
+                inputs.block.height >= tip.height,
+                "applied chain state is behind the delegation scan"
+            );
+            ensure!(
+                inputs.objects.contains_key(&input_id),
                 "another spend consumed the delegation input before it finalized"
             );
             if !submitted {

@@ -2002,7 +2002,7 @@ impl FinalizedWorkView for Chain {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<hellas_chain::Verified<WorkChannelSnapshot>>, QueryError> {
         let gate = {
             let mut held = self.held();
             held.snapshot_reads += 1;
@@ -2028,7 +2028,7 @@ impl FinalizedWorkView for Chain {
             .iter()
             .find(|snapshot| snapshot.query() == &query)
             .cloned()
-            .map(Some)
+            .map(|snapshot| Some(hellas_chain::Verified::assume_for_tests(snapshot)))
             .ok_or_else(|| {
                 QueryError::StateUnavailable(
                     "the fixture source was asked for another channel".to_string(),
@@ -2213,9 +2213,11 @@ impl FinalizedWorkView for NodeChain {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<hellas_chain::Verified<WorkChannelSnapshot>>, QueryError> {
         match self.0.lock() {
-            Ok(held) if held.snapshot.query() == &query => Ok(Some(held.snapshot.clone())),
+            Ok(held) if held.snapshot.query() == &query => Ok(Some(
+                hellas_chain::Verified::assume_for_tests(held.snapshot.clone()),
+            )),
             Ok(_) => Err(QueryError::StateUnavailable(
                 "the fixture was asked for another work channel".to_string(),
             )),

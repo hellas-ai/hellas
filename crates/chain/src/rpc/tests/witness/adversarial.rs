@@ -13,7 +13,7 @@ fn verify(
     fixture: &Fixture,
     response: GetObjectProofsResponse,
     owner: bool,
-) -> Result<crate::proof_verify::VerifiedObjects, crate::proof_verify::VerificationError> {
+) -> Result<crate::Verified<crate::ObjectSnapshot>, crate::proof_verify::VerificationError> {
     let keys = BTreeSet::from([fixture.old_coin, fixture.new_coin]);
     fixture.verifier.verify_objects(
         response,

@@ -365,7 +365,9 @@ pub trait FinalizedWorkView: Clone + Send + Sync + 'static {
     fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send;
+    ) -> impl Future<
+        Output = Result<Option<crate::light_client::Verified<WorkChannelSnapshot>>, QueryError>,
+    > + Send;
 }
 
 #[cfg(feature = "client-core")]
@@ -373,13 +375,14 @@ impl FinalizedWorkView for crate::client::RemoteLightClient {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<crate::light_client::Verified<WorkChannelSnapshot>>, QueryError> {
         use crate::LightClient as _;
         let network = self.pinned_network();
-        self.get_objects(query.object_keys(network))
-            .await?
-            .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
-            .transpose()
+        let Some(snapshot) = self.get_objects(query.object_keys(network)).await? else {
+            return Ok(None);
+        };
+        let snapshot = WorkChannelSnapshot::from_objects(network, query, snapshot.into_inner())?;
+        Ok(Some(crate::light_client::Verified::new(snapshot)))
     }
 }
 

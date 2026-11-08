@@ -234,12 +234,13 @@ mod id_pins {
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{
-            GetAppliedFinalizedBlock, GetStateRoot, LightClient, SubmitWorkResponse,
-            SubscribeFinalized,
+            GetAppliedFinalizedBlock, GetObjectProofs, GetObjects, GetStateRoot, LightClient,
+            SubmitWorkResponse, SubscribeFinalized,
         };
-        // Removing the unverified coin and edge reads, which GetObjectProofs
-        // replaces, deliberately rotates the LightClient service.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x6a5a_dd5a);
+        // Adding GetObjects rotates the service digest. SERVICE_ID is never
+        // sent: a call opens by METHOD_ID alone, and every existing method
+        // keeps its id, so 0x6a5a_dd5a peers interoperate.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x34db_04b6);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974
@@ -247,5 +248,7 @@ mod id_pins {
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
         assert_eq!(<SubscribeFinalized as MethodMarker>::METHOD_ID, 0xc0ccad00);
+        assert_eq!(<GetObjectProofs as MethodMarker>::METHOD_ID, 0x3ee7_8a2f);
+        assert_eq!(<GetObjects as MethodMarker>::METHOD_ID, 0x1723_3c96);
     }
 }

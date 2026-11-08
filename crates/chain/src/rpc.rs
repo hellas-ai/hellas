@@ -3,21 +3,19 @@
 #[cfg(feature = "validator")]
 use crate::app::{Mempool, MempoolEntry, RESPONSE_MEMPOOL_CAPACITY};
 #[cfg(feature = "validator")]
-use crate::domain::{edge_object_id, registry_chunk_object_id};
-#[cfg(all(test, feature = "validator"))]
-use crate::owner_index::OwnerIndexError;
+use crate::domain::{ObjectKind, edge_object_id, registry_chunk_object_id};
 #[cfg(feature = "validator")]
 use hellas_kernel::pending_payment_close_slot;
 #[cfg(feature = "validator")]
 use std::collections::{BTreeMap, btree_map::Entry};
 
-use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
+use crate::domain::{Object, ObjectId, SettlementKey, Transaction};
 use crate::{
     execution::store::{UtxoDatabase, UtxoDb},
     indexer::ChainIndexer,
     light_client::{
-        CoinListing, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
-        FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
+        ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, Holdings, LatestBlock, LightClient,
+        ObjectSnapshot, QueryError, Verified,
     },
     owner_index::{OwnerCursor, OwnerIndex},
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
@@ -398,40 +396,6 @@ impl KernelBatch for ResponseAdmissionBatch {
     fn commit(self) {}
 }
 
-#[cfg(all(test, feature = "validator"))]
-fn owner_lookup_error(error: OwnerIndexError) -> QueryError {
-    match error {
-        OwnerIndexError::WrongObjectKind {
-            expected, actual, ..
-        } => QueryError::WrongObjectKind { expected, actual },
-        error => QueryError::StateUnavailable(format!("owner index lookup failed: {error}")),
-    }
-}
-
-async fn finalized_floor_height(
-    chain_indexer: &ChainIndexer,
-    payload: Digest,
-) -> Result<u64, QueryError> {
-    let Some(finalized) = chain_indexer
-        .get_finalized_block(FinalizedBlockQuery::Payload(payload))
-        .await?
-    else {
-        return Err(QueryError::StateUnavailable(
-            "requested payload is not finalized".to_string(),
-        ));
-    };
-    Ok(finalized.snapshot.height)
-}
-
-fn require_finalized_floor(floor_height: u64, cursor_height: u64) -> Result<(), QueryError> {
-    if floor_height > cursor_height {
-        return Err(QueryError::StateUnavailable(
-            "requested payload is newer than the application state".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// The finalized block whose state `reader` holds. Glue commits a finalized
 /// block, then calls `App::finalized`, which publishes its owner cursor, and
 /// commits nothing else until that returns. Under the read guard the state is
@@ -472,53 +436,133 @@ async fn coherent_reader<'a>(
     ))
 }
 
-async fn get_edge_at(
-    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
+/// One object request read under one database snapshot: the keys, plus one
+/// holdings page of an owner. Both routes answer from it; the proven route
+/// adds proofs at the same reader and root.
+struct Lookup<'a> {
+    reader:
+        commonware_glue::stateful::db::ReadGuard<'a, UtxoDb<commonware_runtime::tokio::Context>>,
+    cursor: OwnerCursor,
+    objects: Vec<(ObjectId, Option<Object>)>,
+    page: Option<crate::owner_proof::OwnerPageProof>,
+}
+
+/// `Ok(None)` means there is no applied finalized state to answer from yet.
+async fn lookup<'a>(
+    databases: &'a UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
     chain_indexer: &ChainIndexer,
-    payload: Digest,
-    object_id: ObjectId,
-) -> Result<Option<EdgeLookup>, QueryError> {
-    let cursor = owner_index.cursor();
-    if cursor.height == 0 {
+    mut keys: std::collections::BTreeSet<ObjectId>,
+    owner: Option<(SettlementKey, Option<[u8; 32]>)>,
+    wanted: Option<Digest>,
+) -> Result<Option<Lookup<'a>>, QueryError> {
+    if owner_index.cursor().height == 0 {
+        if wanted.is_some() {
+            return Err(QueryError::StateUnavailable(
+                "requested current-state snapshot is unavailable".into(),
+            ));
+        }
         return Ok(None);
     }
-    let floor_height = finalized_floor_height(chain_indexer, payload).await?;
-
     let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
-    let state_root = reader.root();
-    require_finalized_floor(floor_height, cursor.height)?;
-    let edge = match reader
-        .get(&object_id)
-        .await
-        .map_err(|error| QueryError::StateUnavailable(format!("edge read failed: {error:?}")))?
-    {
-        Some(Object::Edge(edge)) => Some(EdgeState::from(edge)),
-        Some(object) => {
-            return Err(QueryError::WrongObjectKind {
-                expected: ObjectKind::Edge,
-                actual: object.kind(),
-            });
+    if wanted.is_some_and(|wanted| wanted != cursor.payload) {
+        return Err(QueryError::StateUnavailable(
+            "requested current-state snapshot is unavailable".into(),
+        ));
+    }
+    let page = match owner {
+        Some((owner, after)) => {
+            let page = crate::execution::owner_tree::prove_stored_owner_page_after(
+                &reader,
+                owner,
+                after,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
+            .await
+            .map_err(|error| QueryError::StateUnavailable(format!("owner page: {error}")))?;
+            keys.extend(
+                page.holdings
+                    .iter()
+                    .map(|holding| ObjectId::from(holding.object_id)),
+            );
+            Some(page)
         }
         None => None,
     };
-    Ok(Some(EdgeLookup { state_root, edge }))
+    if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
+        return Err(QueryError::InvalidTransaction(
+            "owner page and object keys exceed 32".into(),
+        ));
+    }
+    let mut objects = Vec::with_capacity(keys.len());
+    for key in keys {
+        let object = reader
+            .get(&key)
+            .await
+            .map_err(|error| QueryError::StateUnavailable(format!("object read: {error:?}")))?;
+        objects.push((key, object));
+    }
+    Ok(Some(Lookup {
+        reader,
+        cursor,
+        objects,
+        page,
+    }))
 }
 
-#[cfg(all(test, feature = "validator"))]
-async fn get_coin_at(
+impl Lookup<'_> {
+    async fn snapshot(&self, chain_indexer: &ChainIndexer) -> Result<LatestBlock, QueryError> {
+        let finalization = chain_indexer
+            .get_finalization(self.cursor.payload)
+            .await?
+            .ok_or_else(|| QueryError::StateUnavailable("finalization is unavailable".into()))?;
+        Ok(LatestBlock {
+            height: self.cursor.height,
+            payload: self.cursor.payload,
+            state_root: self.reader.root(),
+            finalization,
+        })
+    }
+
+    fn holdings(&self) -> Option<Holdings> {
+        self.page.as_ref().map(|page| {
+            let keys = page
+                .holdings
+                .iter()
+                .map(|holding| ObjectId::from(holding.object_id))
+                .collect();
+            Holdings::new(keys, page.offset, page.summary().count)
+        })
+    }
+}
+
+/// This node's own read: it executed the state, so the snapshot is verified
+/// without a proof.
+async fn read_objects(
+    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
     chain_indexer: &ChainIndexer,
-    payload: Digest,
-    object_id: ObjectId,
-) -> Result<Option<Coin>, QueryError> {
-    let (cursor, coin) = owner_index.get_coin_snapshot(&object_id);
-    if cursor.height == 0 {
+    network: NetworkId,
+    keys: std::collections::BTreeSet<ObjectId>,
+    owner: Option<(SettlementKey, Option<ObjectId>)>,
+) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
+    let owner = owner.map(|(owner, after)| (owner, after.map(|key| key.0)));
+    let Some(found) = lookup(databases, owner_index, chain_indexer, keys, owner, None).await?
+    else {
         return Ok(None);
-    }
-    let floor_height = finalized_floor_height(chain_indexer, payload).await?;
-    require_finalized_floor(floor_height, cursor.height)?;
-    coin.map_err(owner_lookup_error)
+    };
+    let block = found.snapshot(chain_indexer).await?;
+    let holdings = found.holdings();
+    Ok(Some(Verified::new(ObjectSnapshot {
+        network,
+        block,
+        objects: found
+            .objects
+            .into_iter()
+            .filter_map(|(key, object)| object.map(|object| (key, object)))
+            .collect(),
+        holdings,
+    })))
 }
 
 /// Reads every object of one work channel under one database snapshot.
@@ -533,73 +577,28 @@ async fn get_coin_at(
 /// a provider's stake on the premise that the client's funding is still
 /// live, and a coin read at any other state is a premise about a state
 /// the decision is not being made at.
-///
-/// The finalized block reported beside the objects is the block whose state
-/// the reader holds, so a snapshot is never reported at a block it was not
-/// read at.
 async fn work_channel_snapshot_at(
     databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
     chain_indexer: &ChainIndexer,
     network: NetworkId,
     query: WorkChannelQuery,
-) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-    let keys = query.object_keys(network);
-    objects_at(databases, owner_index, chain_indexer, keys, network)
-        .await?
-        .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
-        .transpose()
-}
-
-async fn objects_at(
-    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
-    owner_index: &OwnerIndex,
-    chain_indexer: &ChainIndexer,
-    keys: Vec<ObjectId>,
-    network: NetworkId,
-) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
-    if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
-        return Err(QueryError::InvalidTransaction(
-            "at most 32 object keys are allowed".into(),
-        ));
-    }
-    if owner_index.cursor().height == 0 {
+) -> Result<Option<Verified<WorkChannelSnapshot>>, QueryError> {
+    let keys = query.object_keys(network).into_iter().collect();
+    let Some(snapshot) =
+        read_objects(databases, owner_index, chain_indexer, network, keys, None).await?
+    else {
         return Ok(None);
-    }
-    let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
-    let finalization = chain_indexer
-        .get_finalization(cursor.payload)
-        .await?
-        .ok_or_else(|| {
-            QueryError::StateUnavailable("finalized object certificate is unavailable".into())
-        })?;
-    let mut objects = std::collections::BTreeMap::new();
-    for key in keys {
-        if let Some(object) = reader
-            .get(&key)
-            .await
-            .map_err(|error| QueryError::StateUnavailable(format!("object read: {error:?}")))?
-        {
-            objects.insert(key, object);
-        }
-    }
-    Ok(Some(crate::light_client::ObjectSnapshot {
-        network,
-        block: LatestBlock {
-            height: cursor.height,
-            payload: cursor.payload,
-            state_root: reader.root(),
-            finalization,
-        },
-        objects,
-    }))
+    };
+    let snapshot = WorkChannelSnapshot::from_objects(network, query, snapshot.into_inner())?;
+    Ok(Some(Verified::new(snapshot)))
 }
 
 impl FinalizedWorkView for LocalLightClient {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<Verified<WorkChannelSnapshot>>, QueryError> {
         self.require_ready()?;
         // The registry slots are keyed by network, so a node whose
         // genesis names an id the kernel cannot carry cannot derive
@@ -622,14 +621,19 @@ impl FinalizedWorkView for LocalLightClient {
     }
 }
 
-impl LightClient for LocalLightClient {
-    async fn get_object_proofs(
+impl LocalLightClient {
+    fn network(&self) -> Result<NetworkId, QueryError> {
+        NetworkId::new(&self.consensus_info.network_id)
+            .ok_or_else(|| QueryError::Remote("invalid chain network".into()))
+    }
+
+    /// The lookup a wire request names. `Ok(None)` before any applied state.
+    async fn lookup_request(
         &self,
         request: hellas_rpc::pb::chain::GetObjectProofsRequest,
-    ) -> Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError> {
-        use commonware_codec::Encode as _;
+    ) -> Result<Option<Lookup<'_>>, QueryError> {
         self.require_ready()?;
-        let mut keys = request
+        let keys = request
             .object_ids
             .into_iter()
             .map(|id| digest_from_proto(id, "object_id"))
@@ -648,63 +652,39 @@ impl LightClient for LocalLightClient {
             .payload
             .map(|payload| digest_from_proto(payload, "payload"))
             .transpose()?;
-        if self.owner_index.cursor().height == 0 {
-            if wanted.is_some() {
-                return Err(QueryError::StateUnavailable(
-                    "requested current-state snapshot is unavailable".into(),
-                ));
-            }
-            return Ok(hellas_rpc::pb::chain::GetObjectProofsResponse {
-                block: None,
-                proofs: Vec::new(),
-                owner_page: None,
-            });
-        }
-        let (reader, cursor) =
-            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
-        if let Some(wanted) = wanted
-            && wanted != cursor.payload
-        {
-            return Err(QueryError::StateUnavailable(
-                "requested current-state snapshot is unavailable".into(),
-            ));
-        }
+        lookup(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            keys,
+            owner.map(|owner| (owner, after)),
+            wanted,
+        )
+        .await
+    }
+}
+
+impl LightClient for LocalLightClient {
+    async fn get_object_proofs(
+        &self,
+        request: hellas_rpc::pb::chain::GetObjectProofsRequest,
+    ) -> Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError> {
+        use commonware_codec::Encode as _;
+        let Some(found) = self.lookup_request(request).await? else {
+            return Ok(hellas_rpc::pb::chain::GetObjectProofsResponse::default());
+        };
         let finalized = self
             .chain_indexer
-            .get_finalized_block(FinalizedBlockQuery::Payload(cursor.payload))
+            .get_finalized_block(FinalizedBlockQuery::Payload(found.cursor.payload))
             .await?
             .ok_or_else(|| {
                 QueryError::StateUnavailable("applied finalized block is unavailable".into())
             })?;
-        let owner_page = if let Some(owner) = owner {
-            let page = crate::execution::owner_tree::prove_stored_owner_page_after(
-                &reader,
-                owner,
-                after,
-                crate::owner_proof::OWNER_PAGE_LIMIT,
-            )
-            .await
-            .map_err(|error| QueryError::StateUnavailable(format!("owner page: {error}")))?;
-            for holding in &page.holdings {
-                keys.insert(ObjectId::from(holding.object_id));
-            }
-            Some(page.into_proto())
-        } else {
-            None
-        };
-        if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
-            return Err(QueryError::InvalidTransaction(
-                "owner page and object keys exceed 32".into(),
-            ));
-        }
-        let mut proofs = Vec::with_capacity(keys.len());
-        for key in keys {
-            let object = reader
-                .get(&key)
-                .await
-                .map_err(|error| QueryError::StateUnavailable(format!("object read: {error:?}")))?;
+        let mut proofs = Vec::with_capacity(found.objects.len());
+        for (key, object) in found.objects {
             let proof = if object.is_some() {
-                reader
+                found
+                    .reader
                     .key_value_proof(key)
                     .await
                     .map_err(|error| {
@@ -713,7 +693,8 @@ impl LightClient for LocalLightClient {
                     .encode()
                     .to_vec()
             } else {
-                reader
+                found
+                    .reader
                     .exclusion_proof(&key)
                     .await
                     .map_err(|error| {
@@ -731,22 +712,72 @@ impl LightClient for LocalLightClient {
         Ok(hellas_rpc::pb::chain::GetObjectProofsResponse {
             block: Some(crate::server::finalized_block_to_proto(finalized)),
             proofs,
-            owner_page,
+            owner_page: found
+                .page
+                .map(crate::owner_proof::OwnerPageProof::into_proto),
+        })
+    }
+
+    async fn get_plain_objects(
+        &self,
+        request: hellas_rpc::pb::chain::GetObjectProofsRequest,
+    ) -> Result<hellas_rpc::pb::chain::GetObjectsResponse, QueryError> {
+        use commonware_codec::Encode as _;
+        let Some(found) = self.lookup_request(request).await? else {
+            return Ok(hellas_rpc::pb::chain::GetObjectsResponse::default());
+        };
+        let snapshot = found.snapshot(&self.chain_indexer).await?;
+        Ok(hellas_rpc::pb::chain::GetObjectsResponse {
+            snapshot: Some(crate::server::latest_block_to_proto(snapshot)),
+            objects: found
+                .objects
+                .into_iter()
+                .map(|(key, object)| hellas_rpc::pb::chain::ObjectEntry {
+                    object_id: key.to_vec(),
+                    object: object.map(|value| value.encode().to_vec()),
+                })
+                .collect(),
+            owner_page: found.page.map(|page| hellas_rpc::pb::chain::OwnerPage {
+                summary: Some(page.summary().into_proto()),
+                offset: page.offset,
+                holdings: page
+                    .holdings
+                    .iter()
+                    .map(|holding| holding.object_id.to_vec())
+                    .collect(),
+            }),
         })
     }
 
     async fn get_objects(
         &self,
         keys: Vec<ObjectId>,
-    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+    ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
         self.require_ready()?;
-        objects_at(
+        read_objects(
             &self.databases,
             &self.owner_index,
             &self.chain_indexer,
-            keys,
-            NetworkId::new(&self.consensus_info.network_id)
-                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
+            self.network()?,
+            keys.into_iter().collect(),
+            None,
+        )
+        .await
+    }
+
+    async fn get_holdings(
+        &self,
+        owner: SettlementKey,
+        after: Option<ObjectId>,
+    ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
+        self.require_ready()?;
+        read_objects(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            self.network()?,
+            Default::default(),
+            Some((owner, after)),
         )
         .await
     }
@@ -761,46 +792,6 @@ impl LightClient for LocalLightClient {
         Err(QueryError::StateUnavailable(
             "key proofs are not available".to_string(),
         ))
-    }
-
-    async fn get_coin(
-        &self,
-        payload: Digest,
-        object_id: ObjectId,
-    ) -> Result<Option<Coin>, QueryError> {
-        self.require_ready()?;
-        let floor = finalized_floor_height(&self.chain_indexer, payload).await?;
-        let (reader, cursor) =
-            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
-        require_finalized_floor(floor, cursor.height)?;
-        match reader
-            .get(&object_id)
-            .await
-            .map_err(|e| QueryError::StateUnavailable(format!("{e:?}")))?
-        {
-            Some(Object::Coin(coin)) => Ok(Some(coin)),
-            None => Ok(None),
-            Some(object) => Err(QueryError::WrongObjectKind {
-                expected: ObjectKind::Coin,
-                actual: object.kind(),
-            }),
-        }
-    }
-
-    async fn get_edge(
-        &self,
-        payload: Digest,
-        object_id: ObjectId,
-    ) -> Result<Option<EdgeLookup>, QueryError> {
-        self.require_ready()?;
-        get_edge_at(
-            &self.databases,
-            &self.owner_index,
-            &self.chain_indexer,
-            payload,
-            object_id,
-        )
-        .await
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -932,117 +923,7 @@ impl LightClient for LocalLightClient {
     async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
         Ok(self.consensus_info.clone())
     }
-
-    async fn get_coins_by_owner(
-        &self,
-        owner: SettlementKey,
-    ) -> Result<Option<CoinListing>, QueryError> {
-        let (snapshot, holdings) = self.owner_objects(owner).await?;
-        Ok(snapshot.map(|snapshot| CoinListing {
-            snapshot,
-            coins: holdings
-                .into_iter()
-                .filter_map(|(id, object)| match object {
-                    Object::Coin(coin) if coin.owner == owner => Some((id, coin.value)),
-                    _ => None,
-                })
-                .collect(),
-        }))
-    }
-
-    async fn get_coins_by_delegate(
-        &self,
-        delegate: SettlementKey,
-    ) -> Result<Option<CoinListing>, QueryError> {
-        let (snapshot, holdings) = self.owner_objects(delegate).await?;
-        Ok(snapshot.map(|snapshot| CoinListing {
-            snapshot,
-            coins: holdings
-                .into_iter()
-                .filter_map(|(id, object)| match object {
-                    Object::Coin(coin) if coin.delegate == Some(delegate) => Some((id, coin.value)),
-                    _ => None,
-                })
-                .collect(),
-        }))
-    }
-
-    async fn get_edges_by_owner(
-        &self,
-        owner: SettlementKey,
-    ) -> Result<Option<OwnerEdges>, QueryError> {
-        let (snapshot, holdings) = self.owner_objects(owner).await?;
-        Ok(snapshot.map(|snapshot| OwnerEdges {
-            snapshot,
-            edges: holdings
-                .into_iter()
-                .filter_map(|(object_id, object)| match object {
-                    Object::Edge(edge) => Some(EdgeRecord {
-                        object_id,
-                        maker: edge.parties().maker().owner().into(),
-                        taker: edge.parties().taker().owner().into(),
-                    }),
-                    _ => None,
-                })
-                .collect(),
-        }))
-    }
 }
 
 #[cfg(all(test, feature = "validator"))]
 mod tests;
-
-impl LocalLightClient {
-    async fn owner_objects(
-        &self,
-        owner: SettlementKey,
-    ) -> Result<(Option<LatestBlock>, Vec<(ObjectId, Object)>), QueryError> {
-        self.require_ready()?;
-        if self.owner_index.cursor().height == 0 {
-            return Ok((None, vec![]));
-        }
-        let (reader, cursor) =
-            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
-        let finalization = self
-            .chain_indexer
-            .get_finalization(cursor.payload)
-            .await?
-            .ok_or_else(|| QueryError::StateUnavailable("finalization is unavailable".into()))?;
-        let mut objects = Vec::new();
-        let mut offset = 0;
-        loop {
-            let page = crate::execution::owner_tree::prove_stored_owner_page(
-                &reader,
-                owner,
-                offset,
-                crate::owner_proof::OWNER_PAGE_LIMIT,
-            )
-            .await
-            .map_err(|e| QueryError::StateUnavailable(e.to_string()))?;
-            for holding in &page.holdings {
-                let id = Digest::from(holding.object_id);
-                let object = reader
-                    .get(&id)
-                    .await
-                    .map_err(|e| QueryError::StateUnavailable(format!("{e:?}")))?
-                    .ok_or_else(|| {
-                        QueryError::StateUnavailable("owner holding has no object".into())
-                    })?;
-                objects.push((id, object));
-            }
-            if page.holdings.len() < crate::owner_proof::OWNER_PAGE_LIMIT as usize {
-                break;
-            }
-            offset += page.holdings.len() as u64;
-        }
-        Ok((
-            Some(LatestBlock {
-                height: cursor.height,
-                payload: cursor.payload,
-                state_root: cursor.state_root,
-                finalization,
-            }),
-            objects,
-        ))
-    }
-}

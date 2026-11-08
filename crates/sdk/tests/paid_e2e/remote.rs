@@ -1,10 +1,7 @@
 //! Untrusted WebSocket transport around the harness's real finalized state.
 use super::*;
-use hellas_chain::domain::{Coin, ObjectId, Transaction};
-use hellas_chain::{
-    CoinListing, ConsensusInfo, EdgeLookup, FinalizedBlock, FinalizedBlockQuery, LatestBlock,
-    OwnerEdges, QueryError,
-};
+use hellas_chain::domain::{ObjectId, Transaction};
+use hellas_chain::{ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock, QueryError};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone)]
@@ -29,17 +26,10 @@ macro_rules! forward {
 impl hellas_chain::LightClient for Source {
     forward!(get_state_root() -> Option<hellas_chain::domain::Digest>);
     forward!(get_proof(object_id: ObjectId) -> Option<Vec<u8>>);
-    forward!(get_coin(payload: hellas_chain::domain::Digest, object_id: ObjectId) -> Option<Coin>);
-    forward!(
-        get_edge(payload: hellas_chain::domain::Digest, object_id: ObjectId) -> Option<EdgeLookup>
-    );
     forward!(get_finalization(payload: hellas_chain::domain::Digest) -> Option<Vec<u8>>);
     forward!(submit_tx(tx: Transaction) -> hellas_chain::SubmitTxOutcome);
     forward!(get_validators() -> Vec<String>);
     forward!(get_consensus_info() -> ConsensusInfo);
-    forward!(get_coins_by_owner(owner: SettlementKey) -> Option<CoinListing>);
-    forward!(get_coins_by_delegate(delegate: SettlementKey) -> Option<CoinListing>);
-    forward!(get_edges_by_owner(owner: SettlementKey) -> Option<OwnerEdges>);
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
         tokio::time::sleep(self.delay).await;
         Ok(self

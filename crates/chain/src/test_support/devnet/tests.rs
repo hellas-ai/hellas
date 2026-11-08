@@ -2,6 +2,15 @@ use super::*;
 use crate::client::RemoteLightClient;
 use crate::light_client::FinalizedBlockQuery;
 
+async fn coin(client: &impl crate::LightClient, id: crate::domain::ObjectId) -> Option<Coin> {
+    let snapshot = client.get_objects(vec![id]).await.unwrap().unwrap();
+    match snapshot.objects.get(&id) {
+        Some(crate::domain::Object::Coin(coin)) => Some(*coin),
+        None => None,
+        Some(other) => panic!("expected a coin, found {other:?}"),
+    }
+}
+
 #[test]
 fn a_public_faucet_passkey_spends_on_all_six_validators() {
     run(|runtime| async move {
@@ -38,22 +47,12 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
         assert_eq!(block.txs().len(), 1);
         for validator in 0..VALIDATORS {
             let client = devnet.validator_light_client(validator);
-            assert!(
-                client
-                    .get_coin(block.digest(), input.to_bytes().into())
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(coin(&client, input.to_bytes().into()).await.is_none());
             for (output, owner, value) in [
                 (outputs[0], recipient.key(), 42),
                 (outputs[1], sender.key(), 931_103),
             ] {
-                let coin = client
-                    .get_coin(block.digest(), output)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let coin = coin(&client, output).await.unwrap();
                 assert_eq!(
                     (coin.owner, coin.value, coin.delegate),
                     (owner, value, None)
@@ -246,12 +245,15 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
                 "{url}",
             );
             let held = remote
-                .get_coins_by_owner(owner.key())
+                .get_holdings(owner.key(), None)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                held.coins,
+                held.owned_coins(owner.key())
+                    .into_iter()
+                    .map(|(id, coin)| (id, coin.value))
+                    .collect::<Vec<_>>(),
                 vec![(coin_object_id(delegated), owner.balance)],
                 "{url}",
             );

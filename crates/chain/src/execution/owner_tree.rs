@@ -65,7 +65,11 @@ where
     crate::owner_proof::owner_root(&StoredOwnerTree(database)).await
 }
 
-#[cfg(any(feature = "validator", feature = "full-node"))]
+// The indexer's offset-paged address API is the one remaining user.
+#[cfg(all(
+    any(feature = "validator", feature = "full-node"),
+    any(feature = "indexer-api", test)
+))]
 /// Prove holdings directly from finalized owner metadata without replaying it.
 /// The caller must hold one database read guard across the entire proof and its
 /// checkpoint/root checks, including any call to `stored_root`.

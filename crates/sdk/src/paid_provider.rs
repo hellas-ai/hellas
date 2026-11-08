@@ -710,7 +710,7 @@ impl DrivenChannel {
         &self,
         source: &S,
         started: hellas_channel::work::ObservationTime,
-        snapshot: Option<hellas_chain::WorkChannelSnapshot>,
+        snapshot: Option<hellas_chain::Verified<hellas_chain::WorkChannelSnapshot>>,
     ) -> Result<(), PaidProviderError>
     where
         S: FinalizedBlocks + FinalizedWorkView + Sync,

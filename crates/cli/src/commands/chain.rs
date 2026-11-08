@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
-use hellas_chain::domain::{Digest, SettlementKey, Transaction};
+use hellas_chain::domain::{Digest, Object, SettlementKey, Transaction};
 use hellas_chain::genesis::ChainProfile;
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
@@ -24,6 +24,10 @@ pub enum ChainCommand {
         /// RPC endpoint; defaults to the selected chain's first validator.
         #[arg(long)]
         rpc: Option<String>,
+        /// Read coins and edges without proofs from this endpoint, which you
+        /// trust to answer honestly (such as your own node).
+        #[arg(long, conflicts_with = "rpc")]
+        trusted_rpc: Option<String>,
         #[command(subcommand)]
         query: QueryCommand,
     },
@@ -172,23 +176,17 @@ pub enum QueryCommand {
         #[arg(long)]
         payload: Option<String>,
     },
-    /// Look up a coin by object ID at an indexed payload
+    /// Look up a coin by object ID at the latest applied state
     Coin {
         /// Hex-encoded 32-byte object ID
         #[arg(long)]
         object_id: String,
-        /// Hex-encoded finalized payload to query
-        #[arg(long)]
-        payload: String,
     },
-    /// Look up a kernel edge by object ID at an indexed payload
+    /// Look up a kernel edge by object ID at the latest applied state
     Edge {
         /// Hex-encoded 32-byte object ID
         #[arg(long)]
         object_id: String,
-        /// Hex-encoded finalized payload to query
-        #[arg(long)]
-        payload: String,
     },
     /// List all known validators
     Validators,
@@ -363,7 +361,11 @@ pub async fn run(
             )
             .await
         }
-        ChainCommand::Query { rpc, query } => run_query(rpc, profile, query).await,
+        ChainCommand::Query {
+            rpc,
+            trusted_rpc,
+            query,
+        } => run_query(rpc, trusted_rpc, profile, query).await,
         ChainCommand::Open(args) => run_open(args, profile).await,
         ChainCommand::Close(args) => run_close(args, profile).await,
         #[cfg(feature = "indexer")]
@@ -425,8 +427,87 @@ async fn run_owner_coins(
     Ok(())
 }
 
-async fn run_query(rpc: Option<String>, profile: &ChainProfile, query: QueryCommand) -> CliResult {
+/// Object reads for display: proven by default, plain from a trusted peer.
+enum ObjectReader {
+    Proven(RemoteLightClient),
+    Trusted(hellas_chain::client::TrustedReader),
+}
+
+impl ObjectReader {
+    async fn objects(&self, key: Digest) -> CliResult<Option<hellas_chain::ObjectSnapshot>> {
+        Ok(match self {
+            Self::Proven(client) => client
+                .get_objects(vec![key])
+                .await?
+                .map(hellas_chain::Verified::into_inner),
+            Self::Trusted(reader) => reader.get_objects(vec![key]).await?,
+        })
+    }
+
+    /// Every holdings page of `owner`. Pages are read at successive roots, so
+    /// a listing that crosses a state change is refused rather than mixed.
+    async fn holdings(&self, owner: SettlementKey) -> CliResult<Vec<hellas_chain::ObjectSnapshot>> {
+        let mut pages: Vec<hellas_chain::ObjectSnapshot> = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match self {
+                Self::Proven(client) => client
+                    .get_holdings(owner, after)
+                    .await?
+                    .map(hellas_chain::Verified::into_inner),
+                Self::Trusted(reader) => reader.get_holdings(owner, after).await?,
+            };
+            let Some(page) = page else {
+                return Ok(pages);
+            };
+            if pages
+                .first()
+                .is_some_and(|first| first.block.payload != page.block.payload)
+            {
+                anyhow::bail!("owner state changed during the listing; retry");
+            }
+            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
+            pages.push(page);
+            if after.is_none() {
+                return Ok(pages);
+            }
+        }
+    }
+}
+
+fn print_snapshot(block: &hellas_chain::LatestBlock) {
+    println!("height {}", block.height);
+    println!("payload {}", hex::encode(block.payload));
+    println!("state_root {}", hex::encode(block.state_root));
+    println!("finalization {}", hex::encode(&block.finalization));
+}
+
+async fn run_query(
+    rpc: Option<String>,
+    trusted_rpc: Option<String>,
+    profile: &ChainProfile,
+    query: QueryCommand,
+) -> CliResult {
+    let objects = matches!(
+        query,
+        QueryCommand::Coin { .. }
+            | QueryCommand::Edge { .. }
+            | QueryCommand::CoinsByOwner { .. }
+            | QueryCommand::EdgesByOwner { .. }
+    );
+    if let Some(trusted_rpc) = trusted_rpc {
+        anyhow::ensure!(objects, "--trusted-rpc serves only coin and edge queries");
+        let reader = hellas_chain::client::TrustedReader::connect(
+            trusted_rpc,
+            hellas_kernel::NetworkId::new(profile.network_id()).context("invalid chain network")?,
+        )
+        .await?;
+        return run_object_query(ObjectReader::Trusted(reader), query).await;
+    }
     let client = connect_with_verified_snapshots(rpc, profile).await?;
+    if objects {
+        return run_object_query(ObjectReader::Proven(client), query).await;
+    }
     if matches!(
         query,
         QueryCommand::Validators | QueryCommand::Finalization { .. }
@@ -467,95 +548,92 @@ async fn run_query(rpc: Option<String>, profile: &ChainProfile, query: QueryComm
                 None => println!("none"),
             }
         }
-        QueryCommand::Coin { object_id, payload } => {
-            let object_id = parse_hex_digest(&object_id, "object_id")?;
-            let payload = parse_hex_digest(&payload, "payload")?;
-            match client.get_coin(payload, object_id).await? {
-                Some(coin) => println!("{} {}", coin.owner, coin.value),
-                None => println!("none"),
-            }
-        }
-        QueryCommand::Edge { object_id, payload } => {
-            let object_id = parse_hex_digest(&object_id, "object_id")?;
-            let payload = parse_hex_digest(&payload, "payload")?;
-            match client.get_edge(payload, object_id).await? {
-                Some(lookup) => {
-                    println!("state_root {}", hex::encode(lookup.state_root));
-                    match lookup.edge {
-                        Some(edge) => {
-                            println!("value {}", edge.value);
-                            println!("reserve {}", edge.reserve);
-                            println!("close_fee_base {}", edge.close_fees.base());
-                            println!("close_fee_slot {}", edge.close_fees.slot());
-                            println!("close_fee_proof {}", edge.close_fees.proof());
-                            println!("close_fee_lifetime {}", edge.close_fees.lifetime());
-                            println!("timeout {}", edge.timeout.get());
-                            println!("maker {}", edge.maker);
-                            println!("taker {}", edge.taker);
-                            println!("terms_hash {}", hex::encode(edge.terms_hash.to_bytes()));
-                        }
-                        None => println!("none"),
-                    }
-                }
-                None => println!("none"),
-            }
-        }
         QueryCommand::Validators => {
             for validator in client.get_validators().await? {
                 println!("{validator}");
             }
         }
-        QueryCommand::CoinsByOwner { owner } => {
-            let owner = owner
-                .parse::<SettlementKey>()
-                .map_err(|err| anyhow::anyhow!("invalid owner settlement key: {err}"))?;
-            match client.get_coins_by_owner(owner).await? {
-                Some(owner_coins) => {
-                    println!("height {}", owner_coins.snapshot.height);
-                    println!("payload {}", hex::encode(owner_coins.snapshot.payload));
-                    println!(
-                        "state_root {}",
-                        hex::encode(owner_coins.snapshot.state_root)
-                    );
-                    println!(
-                        "finalization {}",
-                        hex::encode(owner_coins.snapshot.finalization)
-                    );
-                    for (object_id, value) in owner_coins.coins {
-                        println!("{} {}", hex::encode(object_id), value);
-                    }
-                }
+        QueryCommand::Coin { .. }
+        | QueryCommand::Edge { .. }
+        | QueryCommand::CoinsByOwner { .. }
+        | QueryCommand::EdgesByOwner { .. } => unreachable!("object queries returned above"),
+    }
+    Ok(())
+}
+
+async fn run_object_query(reader: ObjectReader, query: QueryCommand) -> CliResult {
+    let parse_owner = |owner: String| {
+        owner
+            .parse::<SettlementKey>()
+            .map_err(|err| anyhow::anyhow!("invalid owner settlement key: {err}"))
+    };
+    match query {
+        QueryCommand::Coin { object_id } => {
+            let object_id = parse_hex_digest(&object_id, "object_id")?;
+            let found = reader.objects(object_id).await?;
+            match found
+                .as_ref()
+                .and_then(|snapshot| snapshot.objects.get(&object_id))
+            {
+                Some(Object::Coin(coin)) => println!("{} {}", coin.owner, coin.value),
+                Some(other) => anyhow::bail!("object is a {}, not a coin", other.kind()),
                 None => println!("none"),
+            }
+        }
+        QueryCommand::Edge { object_id } => {
+            let object_id = parse_hex_digest(&object_id, "object_id")?;
+            let Some(snapshot) = reader.objects(object_id).await? else {
+                println!("none");
+                return Ok(());
+            };
+            println!("state_root {}", hex::encode(snapshot.block.state_root));
+            match snapshot.objects.get(&object_id) {
+                Some(Object::Edge(edge)) => {
+                    let edge = hellas_chain::EdgeState::from(*edge);
+                    println!("value {}", edge.value);
+                    println!("reserve {}", edge.reserve);
+                    println!("close_fee_base {}", edge.close_fees.base());
+                    println!("close_fee_slot {}", edge.close_fees.slot());
+                    println!("close_fee_proof {}", edge.close_fees.proof());
+                    println!("close_fee_lifetime {}", edge.close_fees.lifetime());
+                    println!("timeout {}", edge.timeout.get());
+                    println!("maker {}", edge.maker);
+                    println!("taker {}", edge.taker);
+                    println!("terms_hash {}", hex::encode(edge.terms_hash.to_bytes()));
+                }
+                Some(other) => anyhow::bail!("object is a {}, not an edge", other.kind()),
+                None => println!("none"),
+            }
+        }
+        QueryCommand::CoinsByOwner { owner } => {
+            let owner = parse_owner(owner)?;
+            let pages = reader.holdings(owner).await?;
+            let Some(first) = pages.first() else {
+                println!("none");
+                return Ok(());
+            };
+            print_snapshot(&first.block);
+            for page in &pages {
+                for (object_id, coin) in page.owned_coins(owner) {
+                    println!("{} {}", hex::encode(object_id), coin.value);
+                }
             }
         }
         QueryCommand::EdgesByOwner { owner } => {
-            let owner = owner
-                .parse::<SettlementKey>()
-                .map_err(|err| anyhow::anyhow!("invalid owner settlement key: {err}"))?;
-            match client.get_edges_by_owner(owner).await? {
-                Some(owner_edges) => {
-                    println!("height {}", owner_edges.snapshot.height);
-                    println!("payload {}", hex::encode(owner_edges.snapshot.payload));
-                    println!(
-                        "state_root {}",
-                        hex::encode(owner_edges.snapshot.state_root)
-                    );
-                    println!(
-                        "finalization {}",
-                        hex::encode(owner_edges.snapshot.finalization)
-                    );
-                    for edge in owner_edges.edges {
-                        println!(
-                            "{} {} {}",
-                            hex::encode(edge.object_id),
-                            edge.maker,
-                            edge.taker
-                        );
-                    }
+            let owner = parse_owner(owner)?;
+            let pages = reader.holdings(owner).await?;
+            let Some(first) = pages.first() else {
+                println!("none");
+                return Ok(());
+            };
+            print_snapshot(&first.block);
+            for page in &pages {
+                for (object_id, edge) in page.edges() {
+                    println!("{} {} {}", hex::encode(object_id), edge.maker, edge.taker);
                 }
-                None => println!("none"),
             }
         }
+        _ => unreachable!("only object queries reach here"),
     }
     Ok(())
 }
@@ -716,17 +794,20 @@ async fn get_live_edge(
             .get_latest_block()
             .await?
             .ok_or_else(|| anyhow::anyhow!("chain has no finalized block"))?;
-        match client
-            .get_edge(latest.payload, Digest::from(edge_id.to_bytes()))
-            .await
-        {
-            Ok(Some(lookup)) => {
-                return lookup
-                    .edge
-                    .ok_or_else(|| anyhow::anyhow!("edge does not exist"));
+        let key = Digest::from(edge_id.to_bytes());
+        match client.get_objects(vec![key]).await {
+            // The close is decided at state at least as new as the latest
+            // finalized block seen above.
+            Ok(Some(snapshot)) if snapshot.block.height >= latest.height => {
+                return match snapshot.objects.get(&key) {
+                    Some(Object::Edge(edge)) => Ok(hellas_chain::EdgeState::from(*edge)),
+                    Some(other) => {
+                        Err(anyhow::anyhow!("object is a {}, not an edge", other.kind()))
+                    }
+                    None => Err(anyhow::anyhow!("edge does not exist")),
+                };
             }
-            Ok(None) => {}
-            Err(QueryError::StateUnavailable(_)) => {}
+            Ok(_) | Err(QueryError::StateUnavailable(_)) => {}
             Err(error) => return Err(error.into()),
         }
         if attempt + 1 < SNAPSHOT_RETRIES {

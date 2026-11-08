@@ -95,9 +95,8 @@ pub use hellas_rpc::{
 pub use indexer::ChainIndexer;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
-    CoinListing, ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState,
-    FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, ProposalInfo,
-    QueryError,
+    ConsensusActivity, ConsensusInfo, EdgeState, FinalizedBlock, FinalizedBlockQuery, Holdings,
+    LatestBlock, LightClient, ObjectSnapshot, ProposalInfo, QueryError, Verified,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use owner_index::{ApplyOutcome, OwnerCursor, OwnerIndex, OwnerIndexError};

@@ -480,9 +480,8 @@ in
       def edge_output(edge_id):
           deadline = time.time() + 30
           while time.time() < deadline:
-              payload = latest_block()["payload"]
               status, output = machine.execute(
-                  f"{home} {cli} chain query --rpc {rpc} {trust_args} edge --object-id {edge_id} --payload {payload}"
+                  f"{home} {cli} chain query --rpc {rpc} {trust_args} edge --object-id {edge_id}"
               )
               if status == 0:
                   return output

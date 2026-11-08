@@ -353,43 +353,27 @@ impl OfferAllocator {
         let owner = self.authority.owner().await.map_err(unavailable)?;
         let mut after = None;
         let stake = loop {
+            let delegate = self.config.settlement_key.party_key().into();
             let page = chain
-                .get_coins_by_delegate_page(self.config.settlement_key.party_key().into(), after)
+                .get_holdings(delegate, after)
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| unavailable("delegated stake unavailable"))?;
-            let candidates: Vec<_> = page
-                .coins
+            let found = page
+                .delegated_coins(delegate)
                 .into_iter()
-                .map(|(id, _)| id)
-                .filter(|id| !reserved.contains(&CoinId::from_bytes(id.0)))
-                .collect();
-            let mut found = None;
-            if !candidates.is_empty() {
-                let snapshot = chain
-                    .get_objects(candidates.clone())
-                    .await
-                    .map_err(unavailable)?
-                    .ok_or_else(|| unavailable("stake object unavailable"))?;
-                found = candidates
-                    .iter()
-                    .find_map(|id| match snapshot.objects.get(id) {
-                        Some(hellas_chain::domain::Object::Coin(coin))
-                            if coin.owner == Key::from_bytes(*owner.as_bytes()).into()
-                                && coin.delegate
-                                    == Some(self.config.settlement_key.party_key().into())
-                                && coin.value > 0
-                                && coin.value <= current.policy.offers.max_stake_per_client =>
-                        {
-                            Some((CoinId::from_bytes(id.0), coin.value))
-                        }
-                        _ => None,
-                    });
-            }
-            if found.is_some() || page.next.is_none() {
+                .find_map(|(id, coin)| {
+                    let id = CoinId::from_bytes(id.0);
+                    (!reserved.contains(&id)
+                        && coin.owner == Key::from_bytes(*owner.as_bytes()).into()
+                        && coin.value > 0
+                        && coin.value <= current.policy.offers.max_stake_per_client)
+                        .then_some((id, coin.value))
+                });
+            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
+            if found.is_some() || after.is_none() {
                 break found;
             }
-            after = page.next;
         };
         let Some((stake, stake_value)) = stake else {
             return Ok(refused(OfferRefusalCode::NoStakeAvailable, 0));
