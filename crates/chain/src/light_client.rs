@@ -1,4 +1,6 @@
-use crate::domain::{Coin, Digest, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
+use crate::domain::{
+    Coin, Digest, Object, ObjectId, ObjectKey, ObjectKind, SettlementKey, Transaction,
+};
 use hellas_kernel::Encode as _;
 use hellas_rpc::SubmitTxOutcome;
 use hellas_wire::{WireCode, WireStatus};
@@ -165,6 +167,54 @@ impl Holdings {
 }
 
 impl ObjectSnapshot {
+    /// The object at `key`, as the kind `key` names. Kernel derivations are
+    /// domain separated per kind, but ids also cross boundaries as bytes, so
+    /// an id rebuilt as the wrong kind finds another kind's object: that is
+    /// [`QueryError::WrongObjectKind`], not an absent object.
+    fn lookup<T>(
+        &self,
+        key: ObjectKey,
+        pick: fn(Object) -> Option<T>,
+    ) -> Result<Option<T>, QueryError> {
+        let Some(object) = self.objects.get(&key.id()).copied() else {
+            return Ok(None);
+        };
+        pick(object).map(Some).ok_or(QueryError::WrongObjectKind {
+            expected: key.kind(),
+            actual: object.kind(),
+        })
+    }
+
+    /// The live coin `id`.
+    pub fn coin(&self, id: hellas_kernel::CoinId) -> Result<Option<Coin>, QueryError> {
+        self.lookup(ObjectKey::Coin(id), |object| match object {
+            Object::Coin(coin) => Some(coin),
+            _ => None,
+        })
+    }
+
+    /// The live edge `id`.
+    pub fn edge(
+        &self,
+        id: hellas_kernel::EdgeId,
+    ) -> Result<Option<hellas_kernel::Edge>, QueryError> {
+        self.lookup(ObjectKey::Edge(id), |object| match object {
+            Object::Edge(edge) => Some(edge),
+            _ => None,
+        })
+    }
+
+    /// The registry chunk in slot `id`.
+    pub fn registry_chunk(
+        &self,
+        id: hellas_kernel::RegistryChunkId,
+    ) -> Result<Option<hellas_kernel::RegistryChunk>, QueryError> {
+        self.lookup(ObjectKey::RegistryChunk(id), |object| match object {
+            Object::RegistryChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+    }
+
     fn listed(&self) -> impl Iterator<Item = (ObjectId, &Object)> {
         self.holdings
             .iter()
@@ -349,7 +399,7 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     /// At most [`crate::proof_verify::MAX_CURRENT_KEYS`] objects at the latest root.
     fn get_objects(
         &self,
-        _keys: Vec<ObjectId>,
+        _keys: Vec<ObjectKey>,
     ) -> impl Future<Output = Result<Option<Verified<ObjectSnapshot>>, QueryError>> + Send {
         async {
             Err(QueryError::StateUnavailable(

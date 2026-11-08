@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     config::Config,
-    domain::{KERNEL_FEES, ObjectKind, Transaction, edge_object_id, genesis_object_id},
+    domain::{KERNEL_FEES, ObjectKey, ObjectKind, Transaction, genesis_object_id},
     execution::{
         ChainVerifier, execute_all,
         store::utxo_db_config,
@@ -1103,11 +1103,14 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         };
         // Every read resolves at once against the committed block; none waits
         // for the cursor, and nothing is published below.
-        let edge = edge_object_id(query.bond_edge);
+        let coin = hellas_kernel::CoinId::from_bytes(ids[0].0);
         let (objects, held, snapshot) =
             tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
                 tokio::join!(
-                    local.get_objects(vec![ids[0], edge]),
+                    local.get_objects(vec![
+                        ObjectKey::Coin(coin),
+                        ObjectKey::Edge(query.bond_edge)
+                    ]),
                     local.get_holdings(owner, None),
                     local.work_channel_snapshot(query.clone()),
                 )
@@ -1117,10 +1120,8 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         assert_eq!(index.cursor().payload, floor.digest());
         let objects = objects.unwrap().unwrap();
         assert_eq!(objects.block.state_root, root);
-        assert!(
-            matches!(objects.objects.get(&ids[0]), Some(Object::Coin(coin)) if coin.value == 100)
-        );
-        assert!(!objects.objects.contains_key(&edge));
+        assert_eq!(objects.coin(coin).unwrap().unwrap().value, 100);
+        assert_eq!(objects.edge(query.bond_edge).unwrap(), None);
         let held = held.unwrap().unwrap();
         assert_eq!(held.block.payload, next.digest());
         assert_eq!(held.block.state_root, root);

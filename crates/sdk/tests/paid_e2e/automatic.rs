@@ -1577,18 +1577,14 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap();
     devnet.seal().await;
     let coin_at = async |id: CoinId| {
-        let key = hellas_chain::domain::coin_object_id(id);
-        match chain
-            .get_objects(vec![key])
+        chain
+            .get_objects(vec![hellas_chain::domain::ObjectKey::Coin(id)])
             .await
             .unwrap()
             .unwrap()
-            .objects
-            .get(&key)
-        {
-            Some(hellas_chain::domain::Object::Coin(coin)) => *coin,
-            other => panic!("expected a live coin, found {other:?}"),
-        }
+            .coin(id)
+            .unwrap()
+            .expect("a live coin")
     };
     for (index, id) in &alternate_coins {
         let coin = coin_at(*id).await;

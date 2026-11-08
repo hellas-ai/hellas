@@ -145,7 +145,7 @@ let
   };
 
   ci = import ./ci.nix {
-    inherit (nativePkg) clippyArgs;
+    inherit (nativePkg) clippyArgs cargoSelections;
     inherit
       bufLintCommand
       denyCommand
@@ -465,7 +465,7 @@ in
 
   checks = hydraLints // {
     unit = hydraUnit;
-    inherit (nativePkg.craneChecks) regressions;
+    inherit (nativePkg.craneChecks) regressions feature-targets;
     # Published so later builds substitute compiled dependencies.
     cargo-deps = nativePkg.cargoDeps;
   };

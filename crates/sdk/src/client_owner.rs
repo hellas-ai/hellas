@@ -8,7 +8,7 @@ use hellas_authority::authenticator::{Authenticator, PublicKey, kernel_auth};
 use hellas_chain::{
     LightClient as _, QueryError,
     client::RemoteLightClient,
-    domain::{Object, Transaction, coin_object_id},
+    domain::{ObjectKey, Transaction},
 };
 use hellas_kernel::{
     CoinId, Decode as _, Encode as _, Funding, Key, List, NetworkId, Reshape, Secp256k1Verifier,
@@ -605,7 +605,7 @@ impl ClientOwner {
         loop {
             let keys = std::iter::once(coin)
                 .chain(reshape.inputs().iter().copied())
-                .map(coin_object_id)
+                .map(ObjectKey::Coin)
                 .collect();
             let snapshot = match chain.get_objects(keys).await {
                 Err(QueryError::StateUnavailable(_) | QueryError::ChannelClosed) => {
@@ -634,7 +634,7 @@ impl ClientOwner {
                     "planning root differs at its finalized height",
                 ));
             }
-            if let Some(Object::Coin(actual)) = snapshot.objects.get(&coin_object_id(coin)) {
+            if let Some(actual) = snapshot.coin(coin)? {
                 let expected = reshape.outputs().as_slice()[0];
                 if actual.owner != self.owner.into()
                     || actual.delegate != Some(self.delegate.into())
@@ -644,12 +644,10 @@ impl ClientOwner {
                 }
                 return Ok(one_coin(coin));
             }
-            if reshape
-                .inputs()
-                .iter()
-                .any(|input| !snapshot.objects.contains_key(&coin_object_id(*input)))
-            {
-                return Err(ClientOwnerError::InputsSpent);
+            for input in reshape.inputs().iter() {
+                if snapshot.coin(*input)?.is_none() {
+                    return Err(ClientOwnerError::InputsSpent);
+                }
             }
             if !submitted {
                 let outcome = chain

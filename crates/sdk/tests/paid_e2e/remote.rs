@@ -387,7 +387,7 @@ pub(super) async fn paid_startup_uses_the_retained_floor(
 
 pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     use commonware_codec::DecodeExt as _;
-    use hellas_chain::{FinalizedBlockView, domain::coin_object_id};
+    use hellas_chain::{FinalizedBlockView, domain::ObjectKey};
     let root = tempfile::tempdir().unwrap();
     let foreign_runtime = commonware_runtime::Supervisor::child(&runtime, "foreign");
     let mut devnet = Devnet::start(
@@ -409,10 +409,10 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     let genesis =
         hellas_chain::test_support::devnet::genesis_coin(devnet.allocations(), CLIENT_OWNER.key());
     let missing = CoinId::from_bytes([0x65; 32]);
-    let keys = vec![coin_object_id(genesis), coin_object_id(missing)];
+    let keys = vec![ObjectKey::Coin(genesis), ObjectKey::Coin(missing)];
     let first = client.get_objects(keys.clone()).await.unwrap().unwrap();
-    assert!(first.objects.contains_key(&coin_object_id(genesis)));
-    assert!(!first.objects.contains_key(&coin_object_id(missing)));
+    assert!(first.coin(genesis).unwrap().is_some());
+    assert!(first.coin(missing).unwrap().is_none());
     let proof_reads_before_split = relays.source.attempts.load(Ordering::SeqCst);
     let plan = hellas_sdk::coin_owner::OwnerReshape::split(
         &client,
@@ -448,21 +448,17 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     devnet.seal().await;
     devnet.seal().await;
     let keys = vec![
-        coin_object_id(genesis),
-        coin_object_id(outputs.as_slice()[0]),
-        coin_object_id(missing),
+        ObjectKey::Coin(genesis),
+        ObjectKey::Coin(outputs.as_slice()[0]),
+        ObjectKey::Coin(missing),
     ];
     let current = client.get_objects(keys.clone()).await.unwrap().unwrap();
     assert!(
-        !current.objects.contains_key(&coin_object_id(genesis)),
+        current.coin(genesis).unwrap().is_none(),
         "deleted input cannot be proved live by its old update"
     );
-    assert!(
-        current
-            .objects
-            .contains_key(&coin_object_id(outputs.as_slice()[0]))
-    );
-    assert!(!current.objects.contains_key(&coin_object_id(missing)));
+    assert!(current.coin(outputs.as_slice()[0]).unwrap().is_some());
+    assert!(current.coin(missing).unwrap().is_none());
     let latest = relays
         .source
         .local
@@ -486,7 +482,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     relays.source.forged.store(false, Ordering::SeqCst);
     assert!(client.get_objects(keys.clone()).await.unwrap().is_some());
     assert!(matches!(
-        client.get_objects(vec![coin_object_id(missing); 33]).await,
+        client.get_objects(vec![ObjectKey::Coin(missing); 33]).await,
         Err(QueryError::InvalidTransaction(_))
     ));
     let mut foreign = Devnet::start(

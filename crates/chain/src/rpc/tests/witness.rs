@@ -11,6 +11,11 @@ use std::sync::{Arc, Mutex};
 
 type Pending = crate::execution::finalized::Executed<commonware_runtime::tokio::Context>;
 
+/// The fixture names its coins by object id, as the execution helpers do.
+fn coin_key(id: ObjectId) -> crate::domain::ObjectKey {
+    crate::domain::ObjectKey::Coin(hellas_kernel::CoinId::from_bytes(id.0))
+}
+
 mod adversarial;
 
 #[derive(Default)]
@@ -477,7 +482,7 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
 fn current_proofs_bind_inclusion_absence_and_requested_root() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;
-        let keys = vec![fixture.old_coin, fixture.new_coin];
+        let keys = vec![coin_key(fixture.old_coin), coin_key(fixture.new_coin)];
         let first = fixture
             .remote
             .get_objects(keys.clone())
@@ -539,7 +544,7 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
 fn certified_finalized_block_cannot_roll_back_below_a_verified_height() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;
-        let keys = vec![fixture.old_coin];
+        let keys = vec![coin_key(fixture.old_coin)];
         let first = fixture.remote.get_objects(keys).await.unwrap().unwrap();
         assert_eq!(first.block.payload, fixture.applied.digest());
         fixture
@@ -573,7 +578,7 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
         assert!(
             fixture
                 .remote
-                .get_objects(vec![key])
+                .get_objects(vec![coin_key(key)])
                 .await
                 .unwrap()
                 .unwrap()
@@ -586,14 +591,18 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
             .await;
         fixture.operations.lock().unwrap().corrupt = 4;
         assert!(
-            fixture.remote.get_objects(vec![key]).await.is_err(),
+            fixture
+                .remote
+                .get_objects(vec![coin_key(key)])
+                .await
+                .is_err(),
             "old proof cannot authenticate new root"
         );
         fixture.operations.lock().unwrap().corrupt = 0;
         assert!(
             !fixture
                 .remote
-                .get_objects(vec![key])
+                .get_objects(vec![coin_key(key)])
                 .await
                 .unwrap()
                 .unwrap()
@@ -711,7 +720,7 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
 fn trusted_reads_answer_the_proven_read_without_proofs() {
     run_qmdb(|runtime| async move {
         let fixture = fixture_with_allocations(runtime, 33).await;
-        let keys = vec![fixture.old_coin, fixture.new_coin];
+        let keys = vec![coin_key(fixture.old_coin), coin_key(fixture.new_coin)];
         let proven = fixture
             .remote
             .get_objects(keys.clone())

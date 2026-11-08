@@ -147,6 +147,55 @@ let
   # Shared with the `check-clippy` app in ci.nix.
   clippyArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames";
 
+  # Every package and feature selection a release validation compiles, as
+  # Cargo arguments. The ci.nix checks run their tests and lints under these;
+  # `cargoDeps` compiles each one's dependencies, and `feature-targets`
+  # type-checks every target of each, so a pull request compiles what Hydra
+  # later tests. Validators ship on x86_64 Linux only, so the validator
+  # selections exist only there.
+  cargoSelections =
+    let
+      chain = features: "-p hellas-chain --no-default-features --features ${features}";
+      cliOnly = features: "-p hellas-cli --no-default-features --features ${features}";
+    in
+    {
+      workspace = "--workspace --features ${integrationFeatures}";
+      cli = "-p hellas-cli";
+      cli-integration = "-p hellas-cli --features integration-tests";
+      cli-otel-integration = "-p hellas-cli --features otel,integration-tests";
+      cli-only-integration = cliOnly "integration-tests";
+      cli-only-indexer = cliOnly "indexer";
+      cli-only-otel = cliOnly "otel";
+      cloud = "-p hellas-cloud";
+      client-work = "-p hellas-client --features work";
+      http = "-p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store";
+      rpc = "-p hellas-rpc --no-default-features";
+      rpc-work = "-p hellas-rpc --features work";
+      rpc-chain = "-p hellas-rpc --features chain";
+      channel-authority = "-p hellas-channel -p hellas-authority";
+      sdk-integration = "-p hellas-sdk --features integration-tests";
+      sdk-all = "-p hellas-sdk --all-features";
+      executor = "-p hellas-executor";
+      kernel = "-p hellas-kernel --all-features";
+      chain-client-core = chain "client-core";
+      chain-proof-verify = chain "proof-verify";
+      chain-full-node = chain "full-node";
+      chain-test-support = chain "test-support,indexer-api";
+      chain-block-view = chain "block-view";
+      chain-indexer = chain "indexer";
+      chain-indexer-api = chain "indexer-api,integration-tests";
+      chain-work-watcher = chain "work-watcher";
+    }
+    // lib.optionalAttrs (system == "x86_64-linux") {
+      cli-only-validator = cliOnly "validator";
+      chain-validator = chain "validator";
+      chain-validator-integration = chain "validator,integration-tests";
+      chain-setup = chain "validator,work-watcher,indexer-api,integration-tests";
+    };
+  checkSelections = lib.concatMapStrings (
+    selection: "cargo check --locked ${selection} --all-targets\n"
+  ) (lib.attrValues cargoSelections);
+
   # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
   # (format 11) its paired llvm-profdata (format 10) cannot read. At run
   # time the tool uses our toolchain's llvm-tools-preview instead.
@@ -185,6 +234,7 @@ let
         cargo check --locked --workspace --all-targets --features ${integrationFeatures}
         cargo test --locked --workspace --no-run
         cargo test --locked --workspace --features ${integrationFeatures} --no-run
+        ${checkSelections}
       '';
       doCheck = false;
     }
@@ -252,6 +302,19 @@ let
             RUST_TEST_THREADS = "1";
           }
         );
+    # Type-checks every target of every release selection: what Hydra's
+    # validation compiles, without running it.
+    feature-targets = craneLib.mkCargoDerivation (
+      craneArgs
+      // {
+        pname = "hellas-feature-targets";
+        cargoArtifacts = cargoDeps;
+        # Terminal check: nothing consumes its target directory.
+        doInstallCargoArtifacts = false;
+        buildPhaseCargoCommand = checkSelections;
+        installPhaseCommand = "mkdir -p $out";
+      }
+    );
     regressions = craneLib.cargoTest (
       craneArgs
       // {
@@ -282,5 +345,6 @@ in
     cargoLlvmCov
     craneChecks
     clippyArgs
+    cargoSelections
     ;
 }

@@ -584,7 +584,11 @@ async fn work_channel_snapshot_at(
     network: NetworkId,
     query: WorkChannelQuery,
 ) -> Result<Option<Verified<WorkChannelSnapshot>>, QueryError> {
-    let keys = query.object_keys(network).into_iter().collect();
+    let keys = query
+        .object_keys(network)
+        .into_iter()
+        .map(crate::domain::ObjectKey::id)
+        .collect();
     let Some(snapshot) =
         read_objects(databases, owner_index, chain_indexer, network, keys, None).await?
     else {
@@ -751,7 +755,7 @@ impl LightClient for LocalLightClient {
 
     async fn get_objects(
         &self,
-        keys: Vec<ObjectId>,
+        keys: Vec<crate::domain::ObjectKey>,
     ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
         self.require_ready()?;
         read_objects(
@@ -759,7 +763,7 @@ impl LightClient for LocalLightClient {
             &self.owner_index,
             &self.chain_indexer,
             self.network()?,
-            keys.into_iter().collect(),
+            keys.into_iter().map(crate::domain::ObjectKey::id).collect(),
             None,
         )
         .await

@@ -173,7 +173,7 @@ impl LightClient for RemoteLightClient {
 
     async fn get_objects(
         &self,
-        keys: Vec<ObjectId>,
+        keys: Vec<crate::domain::ObjectKey>,
     ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
         Box::pin(objects::read(self, keys, None)).await
     }

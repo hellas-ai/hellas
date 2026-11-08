@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::Object;
+use crate::domain::{Object, ObjectKey};
 use crate::light_client::Holdings;
 use commonware_codec::DecodeExt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,13 +8,13 @@ type OwnerCursor = Option<(SettlementKey, Option<ObjectId>)>;
 
 /// The caller's keys as one set, refusing more than the limit as given,
 /// before duplicates collapse.
-fn key_set(keys: Vec<ObjectId>) -> Result<BTreeSet<ObjectId>, QueryError> {
+fn key_set(keys: Vec<ObjectKey>) -> Result<BTreeSet<ObjectId>, QueryError> {
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
         return Err(QueryError::InvalidTransaction(
             "at most 32 object keys are allowed".into(),
         ));
     }
-    Ok(keys.into_iter().collect())
+    Ok(keys.into_iter().map(ObjectKey::id).collect())
 }
 
 /// The one object request both routes share: `keys`, plus one holdings page
@@ -30,7 +30,7 @@ fn request(keys: &BTreeSet<ObjectId>, owner: OwnerCursor) -> GetObjectProofsRequ
 
 pub(super) async fn read(
     client: &RemoteLightClient,
-    keys: Vec<ObjectId>,
+    keys: Vec<ObjectKey>,
     owner: OwnerCursor,
 ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
     let keys = key_set(keys)?;
@@ -81,7 +81,7 @@ impl TrustedReader {
 
     pub async fn get_objects(
         &self,
-        keys: Vec<ObjectId>,
+        keys: Vec<ObjectKey>,
     ) -> Result<Option<ObjectSnapshot>, QueryError> {
         self.read(key_set(keys)?, None).await
     }

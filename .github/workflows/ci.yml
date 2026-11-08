@@ -26,7 +26,7 @@ jobs:
       - name: Lints
         run: >-
           nix build --accept-flake-config --print-build-logs --no-link
-          .#checks.x86_64-linux.{actions,buf,clippy,deadnix,fmt,nixfmt,no-catgrad-lock,sort,statix,taplo}
+          .#checks.x86_64-linux.{actions,buf,clippy,deadnix,feature-targets,fmt,nixfmt,no-catgrad-lock,sort,statix,taplo}
       # Hydra only reports evaluation errors after merge, on a tab nobody
       # watches; evaluate every job here so a broken one fails the PR.
       - name: Nix job evaluation
