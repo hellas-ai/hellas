@@ -559,18 +559,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
-            case.provider.shutdown().await.unwrap();
-            case.provider_content.close().await;
-            let (provider, upstream, provider_content) = start_provider(
-                case.root.path(),
-                work_config(&case.devnet, case.root.path().join("provider-journal")),
-                case.provider_node.clone(),
-                &case.identity,
-            )
-            .await;
-            case.options.provider_addrs = addresses(&provider);
-            case.provider = provider;
-            case.provider_content = provider_content;
+            let upstream = case.upstream.clone();
             fund(&mut case).await;
             let job = job();
             let terms = ExecutionTerms::Paid { price: PRICE };
@@ -975,18 +964,7 @@ fn reused_nonce_scenario(
 ) -> impl std::future::Future<Output = ()> {
     Box::pin(async move {
         let mut case = paid_fixture(runtime).await;
-        case.provider.shutdown().await.unwrap();
-        case.provider_content.close().await;
-        let (provider, upstream, provider_content) = start_provider(
-            case.root.path(),
-            work_config(&case.devnet, case.root.path().join("provider-journal")),
-            case.provider_node.clone(),
-            &case.identity,
-        )
-        .await;
-        case.options.provider_addrs = addresses(&provider);
-        case.provider = provider;
-        case.provider_content = provider_content;
+        let upstream = case.upstream.clone();
         fund(&mut case).await;
         let first = job();
         let terms = ExecutionTerms::Paid { price: PRICE };
