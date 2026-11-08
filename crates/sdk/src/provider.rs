@@ -369,8 +369,12 @@ impl ProviderHandle {
             Err(error) => Err(ProviderError::Task(error)),
         };
         result = result.and(joined);
+        // Wait for the close itself, not `hellas_wire::iroh::close`'s grace: a
+        // restart starts its successor with this identity and port as soon as
+        // this returns. Until the close completes, the old socket stays bound
+        // and refuses every new handshake addressed to this identity.
         if self.owns_endpoint {
-            hellas_wire::iroh::close(&self.endpoint).await;
+            self.endpoint.close().await;
         }
         if let Some(node) = self.owned_authority.take() {
             node.close().await;
