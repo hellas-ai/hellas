@@ -117,14 +117,14 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 catena-lang.workspace = true
-# Tests check rendered Catena programs against the compiler.
-hellas-executor = { workspace = true, features = ["compute"] }
 ciborium.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["client", "test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
+# Tests check rendered Catena programs against the compiler.
+hellas-executor = { workspace = true, features = ["compute"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 reqwest = { workspace = true, features = ["json"] }
