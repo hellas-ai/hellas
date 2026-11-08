@@ -124,9 +124,9 @@ mod genesis_reexport {
     #[test]
     fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
         let selector = "devnet";
-        let id = crate::genesis::HELLAS_DEVNET_2_ID;
-        let json = crate::genesis::HELLAS_DEVNET_2_JSON;
-        let expected = "35b2444df762b668cc66df28e784348ff9019d1dc0ee16ec2bea3949b4828c75";
+        let id = crate::genesis::HELLAS_DEVNET_3_ID;
+        let json = crate::genesis::HELLAS_DEVNET_3_JSON;
+        let expected = "e7d27dbc4744f08b3e8ca3c0656b698ca3bcaa0f1d184cacce8cb8af2711c3d1";
         let hex: String = Sha256::digest(json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))

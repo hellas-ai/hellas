@@ -174,7 +174,6 @@ mod tests {
                 max_job_price: u64::MAX,
             },
             private_policy_commitment: [4; 32],
-            omit_response_blocks: 64,
             start_validity_blocks: 8,
             omission_bond: 5,
         })
@@ -639,7 +638,6 @@ pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, Project
             admission_horizon: payment.admission_horizon().get(),
             private_policy_commitment: hex::encode(payment.private_policy_commitment),
             omission_bond: payment.omission_bond,
-            omit_response_blocks: payment.omit_response_blocks,
             start_validity_blocks: payment.start_validity_blocks,
             allowed_close_kinds: close_kinds(terms.allowed_closes()),
         }),
@@ -783,7 +781,7 @@ pub(crate) fn pending_projection(
             }
             .into(),
             start_id: hex::encode(pending.start_id().to_bytes()),
-            response_deadline: pending.response_deadline(),
+            response_deadline_ms: pending.response_deadline_ms(),
             start_cumulative: pending.start_cumulative(),
             final_cumulative: pending.final_cumulative(),
             responded: pending.responded(),

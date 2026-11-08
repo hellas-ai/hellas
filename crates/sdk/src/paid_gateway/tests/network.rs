@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
+fn retained_gateway_policy_refuses_a_source_behind_its_journal() {
     use crate::test_support::{PaidFixture, signer};
     use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, OwnerKind, run};
     use hellas_channel::model::offer::{PaidOffer, SignedPaidOffer};
@@ -66,7 +66,6 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 .commit(
                     SetupRecord::Offer {
                         peer: *args.provider.node.as_bytes(),
-                        floor: None,
                         offer: Box::new(signed),
                     },
                     &hellas_kernel::Secp256k1Verifier::new(),
@@ -81,60 +80,43 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
                 .unwrap();
             let owner = hellas_auth::test_support::actors::FRIEND.principal();
             let key = signer(1);
+            // A source behind the journal's own height is refused at once:
+            // absence at an older root says nothing, and nothing waits on it.
             let chain = chain.with_min_height(devnet.height() + 1);
-            let policy = {
-                let read = provider_policy(
-                    &args,
-                    crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root(),
-                        args.config.network(),
-                        args.provider,
-                    )
-                    .await
-                    .unwrap(),
-                    chain.clone(),
-                    &endpoint,
-                    &key,
-                    owner,
-                );
-                tokio::pin!(read);
-                assert!(
-                    tokio::time::timeout(args.config.poll, &mut read)
+            let read = |chain| {
+                let args = args.clone();
+                let endpoint = endpoint.clone();
+                let key = key.clone();
+                async move {
+                    provider_policy(
+                        &args,
+                        crate::paid_client::offer::RetainedSetups::discover(
+                            &args.journal_root(),
+                            args.config.network(),
+                            args.provider,
+                        )
                         .await
-                        .is_err()
-                );
-                let (policy, _) = tokio::join!(read, devnet.seal());
-                policy.unwrap()
-            };
-            assert_eq!(policy, fixture.policy);
-            args.timeout = Some(Duration::from_millis(100));
-            let chain = chain.with_min_height(devnet.height() + 1);
-            let started = tokio::time::Instant::now();
-            let error = tokio::time::timeout(
-                Duration::from_secs(5),
-                provider_policy(
-                    &args,
-                    crate::paid_client::offer::RetainedSetups::discover(
-                        &args.journal_root(),
-                        args.config.network(),
-                        args.provider,
+                        .unwrap(),
+                        chain,
+                        &endpoint,
+                        &key,
+                        owner,
                     )
                     .await
-                    .unwrap(),
-                    chain,
-                    &endpoint,
-                    &key,
-                    owner,
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap_err();
+                }
+            };
+            let error = read(chain.clone()).await.unwrap_err();
             assert!(
-                matches!(error, PoolError::Client(PaidClientError::Query(hellas_chain::QueryError::ReadUnavailableTimeout { timeout, .. })) if Some(timeout) == args.timeout),
-                "bounded gateway policy expiry: {error}"
+                matches!(
+                    error,
+                    PoolError::Client(PaidClientError::Query(
+                        hellas_chain::QueryError::StateUnavailable(_)
+                    ))
+                ),
+                "a source behind the journal is refused: {error}"
             );
-            assert!(started.elapsed() >= args.timeout.unwrap());
+            devnet.seal().await;
+            assert_eq!(read(chain).await.unwrap(), fixture.policy);
             endpoint.close().await;
             devnet.shutdown().await;
         })

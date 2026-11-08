@@ -81,10 +81,10 @@ impl Channel<PaymentFunding> {
                 channel,
                 settlement,
                 cursor: (origin.height, origin.payload),
-                origin_observed: false,
+                certified_at_ms: 0,
+                pending: None,
                 close_prepared: None,
                 close_opened: None,
-                close_history: None,
                 close_responded: None,
                 close_settled: None,
                 retained_roots: BTreeMap::new(),
@@ -141,8 +141,8 @@ impl Channel<PaymentFunding> {
         metadata_only: bool,
     ) -> Result<(), ChannelStateError> {
         self.book.revalidate_exchange(self.role)?;
-        if let Some(history) = self.funding.close_history {
-            self.check_close_history(history)?;
+        if let Some(pending) = self.funding.pending {
+            self.check_pending(&pending)?;
         }
         // The one number consensus sees, against the one terminal that
         // could have moved it. A ledger the terminal does not produce is
@@ -474,28 +474,30 @@ impl Channel<PaymentFunding> {
             .map_or(0, |payment| payment.certificate.earned_cumulative())
     }
 
-    /// Returns the finalized block this endpoint has processed through.
+    /// Returns the certified block this endpoint last read its channel
+    /// at.
     ///
-    /// Contiguous by construction, and contiguous all the way back to
-    /// the block that opened the channel: the store is anchored at that
-    /// origin when it is opened, and every record since named the block
-    /// before it as its parent. That is what makes it usable as a clock
-    /// — a height reached by skipping is a height at which this
-    /// endpoint does not know what happened, and there is no height
-    /// here that was reached by skipping.
-    ///
-    /// There is no "before the first block" case, and that is the whole
-    /// point of the origin: an endpoint whose clock could be absent is
-    /// Whether the opening block's same-block close effects were journaled.
-    #[must_use]
-    pub const fn origin_observed(&self) -> bool {
-        self.funding.origin_observed
-    }
-
-    /// an endpoint every deadline rule passes for.
+    /// It only moves forward. The store starts at the block the channel
+    /// was first seen live in, so there is no "before the first block"
+    /// case: an endpoint whose clock could be absent is an endpoint
+    /// every deadline rule passes for.
     #[must_use]
     pub const fn cursor(&self) -> (u64, [u8; 32]) {
         self.funding.cursor
+    }
+
+    /// Returns the timestamp of the cursor's block, in milliseconds:
+    /// the clock close deadlines are measured on. Zero before the first
+    /// read.
+    #[must_use]
+    pub const fn certified_at_ms(&self) -> u64 {
+        self.funding.certified_at_ms
+    }
+
+    /// Returns the pending-close slot as the cursor's block held it.
+    #[must_use]
+    pub const fn pending(&self) -> Option<PendingPaymentClose> {
+        self.funding.pending
     }
 
     /// Returns the close start this endpoint signed and retains.
@@ -539,15 +541,10 @@ impl Channel<PaymentFunding> {
         }
     }
 
-    /// Finalized start metadata used to recover its full contest from history.
-    pub(crate) const fn open_contest(&self) -> Option<OpenContest> {
-        self.funding.close_opened
-    }
-
-    /// Verified historical replay progress, including accepted responses.
+    /// The journaled contest on this edge.
     #[must_use]
-    pub const fn close_history(&self) -> Option<CloseHistory> {
-        self.funding.close_history
+    pub const fn open_contest(&self) -> Option<OpenContest> {
+        self.funding.close_opened
     }
 
     /// Returns the answer this endpoint has already fixed for the
@@ -577,8 +574,9 @@ impl Channel<PaymentFunding> {
     /// - the edge has not already settled;
     /// - the opener is the client, since a contest this endpoint opened
     ///   is one it already put its own evidence into;
-    /// - the cursor is strictly inside the response window, the kernel's
-    ///   own rule for a late answer;
+    /// - no answer has landed, and the cursor's block time is strictly
+    ///   inside the response window, the kernel's own rule for a late
+    ///   answer;
     /// - and the certificate on this disk strictly exceeds what the
     ///   contest claims, or the one answer the window admits would buy
     ///   nothing.
@@ -592,13 +590,15 @@ impl Channel<PaymentFunding> {
             || self.funding.close_settled.is_some()
             || self
                 .funding
-                .close_history
-                .is_some_and(|history| history.pending.responded())
+                .pending
+                .is_some_and(|pending| pending.responded())
         {
             return None;
         }
         let contest = self.funding.close_opened?;
-        if contest.opener != Party::Maker || self.funding.cursor.0 >= contest.response_deadline {
+        if contest.opener != Party::Maker
+            || self.funding.certified_at_ms >= contest.response_deadline_ms
+        {
             return None;
         }
         let certificate = self
@@ -727,22 +727,16 @@ impl Channel<PaymentFunding> {
         supplied: Option<&PreparedInvocation>,
     ) -> Result<Applied, ChannelStateError> {
         match record {
-            ChannelRecord::OriginObserved => {
-                if self.funding.origin_observed {
-                    return Ok(Applied::Redundant);
-                }
-                self.funding.origin_observed = true;
-                Ok(Applied::Changed)
-            }
             ChannelRecord::ProposalExchange { work_id, pending } => {
                 self.require_role("recording proposal exchange", Role::Client)?;
                 self.book.proposal_exchange(*work_id, *pending)
             }
-            ChannelRecord::CursorAdvanced {
+            ChannelRecord::Anchored {
                 height,
-                parent,
                 payload,
-            } => self.apply_cursor(*height, parent, payload),
+                certified_at_ms,
+                pending,
+            } => self.apply_anchored(*height, payload, *certified_at_ms, pending.as_ref()),
             ChannelRecord::JobProposed {
                 authorization,
                 client_signature,
@@ -839,19 +833,16 @@ impl Channel<PaymentFunding> {
                 }
                 Ok(applied)
             }
-            ChannelRecord::CloseHistoryAdvanced { parent, history } => {
-                self.apply_close_history(*parent, *history)
-            }
             ChannelRecord::ClosePrepared { start } => self.apply_close_prepared(start),
             ChannelRecord::CloseOpened {
                 start_id,
                 opener,
-                response_deadline,
+                response_deadline_ms,
                 claimed,
             } => self.apply_close_opened(OpenContest {
                 start_id: *start_id,
                 opener: *opener,
-                response_deadline: *response_deadline,
+                response_deadline_ms: *response_deadline_ms,
                 claimed: *claimed,
             }),
             ChannelRecord::CloseResponded {
@@ -861,153 +852,123 @@ impl Channel<PaymentFunding> {
                 start_id: *start_id,
                 response_digest: *response_digest,
             }),
-            ChannelRecord::CloseSettled {
-                height,
-                payload,
-                provider_payout,
-            } => self.apply_close_settled(CloseSettlement {
-                height: *height,
-                payload: *payload,
-                provider_payout: *provider_payout,
-            }),
+            ChannelRecord::CloseSettled { height, payload } => {
+                self.apply_close_settled(CloseSettlement {
+                    height: *height,
+                    payload: *payload,
+                })
+            }
         }
     }
 
-    fn check_close_history(&self, history: CloseHistory) -> Result<(), ChannelStateError> {
+    /// The pending slot a read reports must be the journaled contest's,
+    /// as consensus advances it: same contest, same deadline and claim,
+    /// within this edge's capacity.
+    fn check_pending(&self, pending: &PendingPaymentClose) -> Result<(), ChannelStateError> {
         let contest = self
             .funding
             .close_opened
             .ok_or(ChannelStateError::Malformed)?;
-        let pending = history.pending;
-        let inclusion = contest
-            .response_deadline
-            .checked_sub(self.channel().payment_terms().omit_response_blocks)
-            .ok_or(ChannelStateError::Malformed)?;
-        if history.height < inclusion
-            || history.height > contest.response_deadline
-            || history.height > self.cursor().0.saturating_add(1)
-            || pending.payment_edge() != self.channel().payment_edge()
+        if pending.payment_edge() != self.channel().payment_edge()
             || pending.start_id() != contest.start_id
             || pending.opener_role() != contest.opener
-            || pending.response_deadline() != contest.response_deadline
+            || pending.response_deadline_ms() != contest.response_deadline_ms
             || pending.start_cumulative() != contest.claimed
             || pending.final_cumulative() < contest.claimed
             || pending.final_cumulative() > self.settlement().capacity()
             || pending.penalty_amount() != self.channel().payment_terms().omission_bond
-            || (!pending.responded()
-                && (pending.final_cumulative() != contest.claimed || pending.penalty_due()))
-            || (pending.responded()
-                && (pending.final_cumulative() <= contest.claimed
-                    || pending.penalty_due() != (contest.opener == Party::Maker)))
         {
             return Err(ChannelStateError::Malformed);
         }
         Ok(())
     }
 
-    fn apply_close_history(
+    /// Moves the cursor forward to a certified read of this channel.
+    ///
+    /// The rule is [`Self::anchoring`]. The slot it carries must be the
+    /// journaled contest, and it can only advance: an answer once seen
+    /// stays answered, the settled amount never falls, and an owner
+    /// action once taken is not undone. A slot that has gone while the
+    /// edge stands is a contest consensus never closes that way.
+    fn apply_anchored(
         &mut self,
-        parent: [u8; 32],
-        history: CloseHistory,
+        height: u64,
+        payload: &[u8; 32],
+        certified_at_ms: u64,
+        pending: Option<&PendingPaymentClose>,
     ) -> Result<Applied, ChannelStateError> {
-        self.check_close_history(history)?;
-        if self.funding.close_history == Some(history) {
-            return Ok(Applied::Redundant);
-        }
-        if let Some(previous) = self.funding.close_history {
-            if history.height
-                != previous
-                    .height
-                    .checked_add(1)
-                    .ok_or(ChannelStateError::Malformed)?
-                || parent != previous.payload
-                || (history.pending.responded()
-                    && !previous.pending.responded()
-                    && history.height >= history.pending.response_deadline())
-                || history.pending.owner_signed()[0] != previous.pending.owner_signed()[0]
-                || ((previous.pending.responded() || !history.pending.responded())
-                    && history.pending != previous.pending)
-                || history.pending.final_cumulative() < previous.pending.final_cumulative()
-                || previous
-                    .pending
-                    .owner_signed()
-                    .iter()
-                    .zip(history.pending.owner_signed())
-                    .any(|(before, after)| *before && !after)
-            {
-                return Err(ChannelStateError::Malformed);
+        let applied = self.anchoring(height, payload)?;
+        match (pending, self.funding.pending) {
+            (Some(next), previous) => {
+                self.check_pending(next)?;
+                if previous.is_some_and(|held| {
+                    (held.responded() && !next.responded())
+                        || next.final_cumulative() < held.final_cumulative()
+                        || held
+                            .owner_signed()
+                            .iter()
+                            .zip(next.owner_signed())
+                            .any(|(before, after)| *before && !after)
+                }) {
+                    return Err(ChannelStateError::Malformed);
+                }
             }
-        } else if history.height
-            != history
-                .pending
-                .response_deadline()
-                .checked_sub(self.channel().payment_terms().omit_response_blocks)
-                .ok_or(ChannelStateError::Malformed)?
+            (None, _) => {
+                if self.funding.close_opened.is_some() && self.funding.close_settled.is_none() {
+                    return Err(ChannelStateError::Malformed);
+                }
+            }
+        }
+        if applied == Applied::Redundant
+            && (certified_at_ms != self.funding.certified_at_ms
+                || pending.copied() != self.funding.pending)
         {
             return Err(ChannelStateError::Malformed);
         }
-        self.funding.close_history = Some(history);
-        Ok(Applied::Changed)
-    }
-
-    /// Moves the cursor on by exactly one contiguous block.
-    ///
-    /// The rule itself is [`Self::reading`], which is asked twice about
-    /// every block: once by the watcher before it records anything the
-    /// block *means*, and once here when the cursor itself is written.
-    /// One function, so the two askings cannot disagree about which
-    /// block this journal may read next.
-    fn apply_cursor(
-        &mut self,
-        height: u64,
-        parent: &[u8; 32],
-        payload: &[u8; 32],
-    ) -> Result<Applied, ChannelStateError> {
-        match self.reading(height, parent, payload)? {
-            Applied::Redundant => Ok(Applied::Redundant),
-            Applied::Changed => {
-                self.funding.cursor = (height, *payload);
-                Ok(Applied::Changed)
-            }
+        if certified_at_ms < self.funding.certified_at_ms {
+            return Err(ChannelStateError::Malformed);
         }
+        self.funding.cursor = (height, *payload);
+        self.funding.certified_at_ms = certified_at_ms;
+        self.funding.pending = pending.copied();
+        Ok(applied)
     }
 
-    /// Whether this journal may read `height`, and whether reading it
-    /// moves the cursor.
+    /// Whether a certified read at `height` may move this journal's
+    /// cursor.
     ///
-    /// Two rules, and they are the whole of what a cursor means here.
-    /// The height must be the next one, so nothing is skipped; and the
-    /// block must name the held block as its parent, so the chain that
-    /// was read is one chain. A watcher that fetched heights alone
-    /// would accept a block from a history this endpoint never saw.
-    ///
-    /// The block already held is [`Applied::Redundant`] rather than a
-    /// refusal: a watcher that died after recording what a block meant
-    /// and before recording that it read it re-reads that same block,
-    /// and every record it re-offers is the retry it is.
+    /// Forward only, and to any later height: a certified read is a fact
+    /// about the chain's state, so nothing between the cursor and it has
+    /// to be replayed. The block already held is
+    /// [`Applied::Redundant`], so a read of the same state again is the
+    /// retry it is.
     ///
     /// # Errors
     ///
-    /// [`ChannelStateError::CursorNotNext`] for any other height and
-    /// [`ChannelStateError::CursorNotContiguous`] for the next height
-    /// on another chain.
-    pub(crate) fn reading(
+    /// [`ChannelStateError::CursorBehind`] for a lower height and
+    /// [`ChannelStateError::CursorNotContiguous`] for the same height
+    /// with another payload.
+    pub(crate) fn anchoring(
         &self,
         height: u64,
-        parent: &[u8; 32],
         payload: &[u8; 32],
     ) -> Result<Applied, ChannelStateError> {
         let (held_height, held_payload) = self.funding.cursor;
         if (height, *payload) == (held_height, held_payload) {
-            return Ok(Applied::Redundant);
+            // The origin block itself, before any read was recorded at it.
+            return Ok(if self.funding.certified_at_ms == 0 {
+                Applied::Changed
+            } else {
+                Applied::Redundant
+            });
         }
-        if height != held_height.saturating_add(1) {
-            return Err(ChannelStateError::CursorNotNext {
+        if height < held_height {
+            return Err(ChannelStateError::CursorBehind {
                 held: held_height,
                 actual: height,
             });
         }
-        if *parent != held_payload {
+        if height == held_height {
             return Err(ChannelStateError::CursorNotContiguous { height });
         }
         Ok(Applied::Changed)
@@ -2073,7 +2034,6 @@ mod retained_tests {
                 .apply_close_settled(CloseSettlement {
                     height: fixture::CURSOR,
                     payload: fixture::payload_at(fixture::CURSOR),
-                    provider_payout: 0,
                 })
                 .unwrap();
             assert!(reopened.retained_roots().is_empty());

@@ -392,6 +392,7 @@ impl ProofVerifier {
             crate::light_client::ObjectSnapshot {
                 network: self.network(),
                 block: verified.view.snapshot().clone(),
+                certified_at_ms: verified.view.timestamp(),
                 objects,
                 holdings,
             },
@@ -513,7 +514,7 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_storage::{merkle::Location, mmr};
     use commonware_utils::{N3f1, non_empty_range, ordered::Set};
-    use hellas_genesis::{HELLAS_DEVNET_2_ID, HELLAS_DEVNET_2_JSON, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_3_ID, HELLAS_DEVNET_3_JSON, TrustEpoch};
     use rand::{SeedableRng, rngs::StdRng};
 
     fn immediate<F: std::future::Future>(future: F) -> F::Output {
@@ -547,13 +548,13 @@ mod tests {
         let (verifier, _) = fixture();
         let mut trust = verifier.trust.clone();
         let mut genesis: hellas_genesis::Genesis =
-            serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
+            serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap();
         genesis.validators[0].label = "disposable-demo".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
         assert!(ProofVerifier::with_genesis(trust.clone(), &document).is_ok());
         assert!(matches!(
-            ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_2_JSON.as_bytes()),
+            ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_3_JSON.as_bytes()),
             Err(VerificationError::Genesis)
         ));
         let mut changed = document.clone();
@@ -575,7 +576,7 @@ mod tests {
     fn shared_threshold_proof_cannot_cross_genesis() {
         let (source, mut bundle) = fixture();
         let mut genesis: hellas_genesis::Genesis =
-            serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
+            serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap();
         genesis.validators[0].label = "different-generation".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         let mut trust = source.trust.clone();
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn digest_only_light_pin_verifies_the_same_certificate_and_rejects_another_digest() {
         let (full, bundle) = fixture();
-        let genesis: hellas_genesis::Genesis = serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap();
+        let genesis: hellas_genesis::Genesis = serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap();
         let digest_only =
             ProofVerifier::with_digest(full.trust.clone(), genesis_digest(&genesis).0).unwrap();
         assert!(
@@ -633,8 +634,8 @@ mod tests {
             .map(|key| {
                 Scheme::signer(
                     &crate::consensus_namespace(
-                        hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
-                        crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
+                        hellas_kernel::NetworkId::new(HELLAS_DEVNET_3_ID).unwrap(),
+                        crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap()),
                     ),
                     participants.clone(),
                     polynomial.clone(),
@@ -645,16 +646,16 @@ mod tests {
             .collect::<Vec<_>>();
         let assembler = Scheme::verifier(
             &crate::consensus_namespace(
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_3_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap()),
             ),
             participants,
             polynomial,
         );
         let trust = TrustDocument {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_2_ID.into(),
-            genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_2_JSON.as_bytes())),
+            network_id: HELLAS_DEVNET_3_ID.into(),
+            genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_3_JSON.as_bytes())),
             epochs: vec![TrustEpoch {
                 epoch: 0,
                 start_height: 0,
@@ -662,7 +663,7 @@ mod tests {
                 threshold_identity: hex::encode(assembler.identity().encode()),
             }],
         };
-        let verifier = ProofVerifier::with_genesis(trust, HELLAS_DEVNET_2_JSON.as_bytes()).unwrap();
+        let verifier = ProofVerifier::with_genesis(trust, HELLAS_DEVNET_3_JSON.as_bytes()).unwrap();
         let block = crate::HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -696,7 +697,7 @@ mod tests {
             NativeFinalization::from_finalizes(&assembler, &votes, &Sequential).unwrap();
         let bundle = ProofBundle {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_2_ID.into(),
+            network_id: HELLAS_DEVNET_3_ID.into(),
             trust_sha256: verifier.trust_sha256().into(),
             height: block.height().get(),
             payload: hex::encode(block.digest()),
@@ -716,7 +717,7 @@ mod tests {
             std::env::var("HELLAS_EXPLORER_FIXTURE_DIR").expect("set fixture output directory");
         let directory = std::path::Path::new(&directory);
         std::fs::create_dir_all(directory).unwrap();
-        std::fs::write(directory.join("genesis.json"), HELLAS_DEVNET_2_JSON).unwrap();
+        std::fs::write(directory.join("genesis.json"), HELLAS_DEVNET_3_JSON).unwrap();
         let (verifier, bundle) = fixture();
         let (owner, tree) = owner_fixture();
         let page = immediate(crate::owner_proof::prove_owner_page(

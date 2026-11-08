@@ -64,18 +64,14 @@ pub enum ProviderError {
     Paid(#[from] crate::paid_provider::PaidProviderError),
 }
 
-/// Paid policy and its process-owned executing chain node.
+/// The chain paid work is sold on, read by proof from its validators.
 pub struct PaidProviderOptions {
     config: crate::work_config::WorkConfig,
-    node: crate::FullNode,
 }
 impl PaidProviderOptions {
-    pub fn new(
-        config: crate::work_config::WorkConfig,
-        node: crate::FullNode,
-    ) -> Result<Self, crate::work_config::WorkConfigError> {
-        config.check_node(&node)?;
-        Ok(Self { config, node })
+    #[must_use]
+    pub const fn new(config: crate::work_config::WorkConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -114,19 +110,16 @@ impl<R> FetchProviderOptions<R> {
         }
         let work_config = options
             .paid_work
-            .map(|PaidProviderOptions { config, node }| {
+            .map(|PaidProviderOptions { config }| {
                 let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
                     options.identity.node_secret_bytes(),
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
                     chain: config.chain.clone(),
-                    poll: config.poll,
-                    max_observation_age: config.max_observation_age,
                     settlement_key,
                 };
-                runner_config.validate()?;
-                Ok::<_, ProviderError>((runner_config, node))
+                Ok::<_, ProviderError>((runner_config, config))
             })
             .transpose()?;
         let producer_key = Arc::new(options.identity.node_key().clone());
@@ -227,7 +220,7 @@ pub struct ProviderOptions<R> {
     pub build: String,
     pub graffiti: Vec<u8>,
     pub discovery: bool,
-    pub work: Option<(WorkRunnerConfig, crate::FullNode)>,
+    pub work: Option<(WorkRunnerConfig, crate::work_config::WorkConfig)>,
     pub secret_key: iroh::SecretKey,
     pub open_identity: Arc<ProviderOpen<R>>,
 }
@@ -433,9 +426,6 @@ fn served_alpns(
     ];
     if work_configured {
         alpns.extend([
-            hellas_rpc::services::chain_sync::ChainSync::ALPN
-                .as_bytes()
-                .to_vec(),
             WorkSetup::ALPN.as_bytes().to_vec(),
             Work::ALPN.as_bytes().to_vec(),
         ]);
@@ -459,13 +449,12 @@ pub async fn start_fetch_provider<R>(
 where
     R: RootProver + Send + Sync + 'static,
 {
-    if let Some((work, _)) = &config.work {
-        work.validate()?;
-        if work.chain.home().durability() == hellas_private::Durability::Crash {
-            tracing::warn!(
-                r#"paid channel state may be lost on power failure; set durability = "power""#
-            );
-        }
+    if let Some((work, _)) = &config.work
+        && work.chain.home().durability() == hellas_private::Durability::Crash
+    {
+        tracing::warn!(
+            r#"paid channel state may be lost on power failure; set durability = "power""#
+        );
     }
     let enrollment = &config.open_identity.enrollment;
     check_grant_provider(enrollment)?;
@@ -506,12 +495,11 @@ where
     );
     let work_mount = MountedWork::with_backend(handle.clone());
     let setup_mount = MountedSetup::with_content_store(content.clone());
-    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
     let runner = match config.work {
         Some((work, chain)) => Some(
             WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
                 .await?
-                .on_node(
+                .on_chain(
                     chain,
                     prepared_grants
                         .as_ref()
@@ -573,7 +561,6 @@ where
         .iter()
         .map(|alpn| String::from_utf8_lossy(alpn).into_owned())
         .collect();
-    node_handler.chain = chain.clone();
 
     let open_identity = config.open_identity;
     let setup = async {
@@ -769,22 +756,6 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
-        let _ = serve_loop(
-            transport,
-            server,
-            quiesce,
-            RPC_CONNECTION_IDLE_TIMEOUT,
-            tokio::time::Instant::now() + MAX_LIFETIME,
-        )
-        .await;
-        Ok(())
-    } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
-        && let Some(chain) = node_handler.chain
-    {
-        let server = AccountingDispatcher::new(
-            hellas_rpc::services::chain_sync::ChainSyncServer(chain),
-            manager,
-        );
         let _ = serve_loop(
             transport,
             server,

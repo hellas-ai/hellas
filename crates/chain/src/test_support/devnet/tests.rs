@@ -13,7 +13,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
     run(|runtime| async move {
         let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
         let published: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
         for (owner, account) in owners.iter().zip(&published) {
             assert_eq!(owner.key().to_string(), account.address);
         }

@@ -21,14 +21,11 @@ use hellas_auth::Digest;
 use hellas_channel::model::work::{
     PaymentBindingV1, PrivateRecord as _, payment_binding_digest, signing_hash,
 };
-use hellas_channel::test_support::channel::{
-    CURSOR, PRICE, client, deadlines, payload_at, provider, store_at,
-};
+use hellas_channel::test_support::channel::{CURSOR, PRICE, client, deadlines, provider, store_at};
 use hellas_channel::work::{
     ClientEndpoint, PaymentError, ProviderEndpoint, RunError, WorkRefusal, WorkService,
     admit_payment,
 };
-use hellas_channel::work_close::FinalizedWork;
 use hellas_channel::work_store::{JobPhase, JobState, Role};
 use hellas_kernel::{
     Decode as _, EarnedCertificate, EdgeId, Encode as _, Secp256k1Signer, TermsHash,
@@ -592,29 +589,12 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         // The default is the watcher's, reached the only way it can
         // be: finalized blocks past the height this client signed to
         // pay by. No local call can ask for it.
-        let Ok(mut driver) = provider.drive() else {
-            panic!("this channel's cursor driver is free");
-        };
-        let mut next = provider
-            .with_state(|state| state.cursor().0)
-            .await
-            .expect("the endpoint is reachable")
-            .saturating_add(1);
-        while next <= deadlines().payment + 1 {
-            if let Err(error) = driver
-                .observe_finalized(&FinalizedWork {
-                    height: next,
-                    parent: payload_at(next.saturating_sub(1)),
-                    payload: payload_at(next),
-                    txs: Vec::new(),
-                })
-                .await
-            {
-                panic!("the fixture block applies: {error}");
-            }
-            next += 1;
-        }
-        drop(driver);
+        hellas_channel::test_support::channel::observe_service(
+            provider,
+            deadlines().payment + 1,
+            hellas_kernel::PendingSlot::Absent,
+        )
+        .await;
         let (open_job, expired) = provider
             .with_state(|state| {
                 (
@@ -696,11 +676,7 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
     );
     client
         .observer()
-        .observe_ready(
-            fixture.ready.clone(),
-            hellas_channel::work::ObservationTime::now(),
-            std::time::Duration::from_secs(30),
-        )
+        .observe_ready(fixture.ready.clone())
         .await
         .unwrap();
     let request = client.client().await.unwrap().pay(id).await.unwrap();
@@ -714,15 +690,7 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
     let refused = admit_response(&fixture.service, request.clone()).await;
     assert_eq!(refusal_of(&refused), WorkRefusalCode::NotReady);
     assert_nothing_credited(&fixture.service, "observer has not initialized").await;
-    fixture
-        .service
-        .observe_ready(
-            fixture.ready,
-            hellas_channel::work::ObservationTime::now(),
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
+    fixture.service.observe_ready(fixture.ready).await.unwrap();
     let accepted = admit_response(&fixture.service, request.clone()).await;
     assert!(matches!(accepted.outcome, Some(AdmitOutcome::Paid(_))));
     fixture.service.suspend().await.unwrap();
@@ -743,11 +711,7 @@ async fn stopped_observer_blocks_new_money_but_preserves_retransmission() {
         let mut fixture = checked_job().await;
         fixture
             .service
-            .observe_ready(
-                fixture.ready.clone(),
-                hellas_channel::work::ObservationTime::now(),
-                std::time::Duration::from_secs(30),
-            )
+            .observe_ready(fixture.ready.clone())
             .await
             .unwrap();
         let request = fixture.client.pay(fixture.id).await.unwrap();
@@ -790,20 +754,13 @@ async fn client_close_recovery_does_not_require_new_work_readiness() {
 
 #[tokio::test]
 async fn observed_close_and_payment_have_one_journal_order() {
-    use hellas_channel::work::{ClientChannel as _, ClientService, ObservationTime};
+    use hellas_channel::work::{ClientChannel as _, ClientService};
     use hellas_channel::work_close::close_start;
     for payment_first in [false, true] {
         let fixture = checked_job().await;
         let mut client = ClientService::new(fixture.client);
         let observer = client.observer();
-        observer
-            .observe_ready(
-                fixture.ready.clone(),
-                ObservationTime::now(),
-                std::time::Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
+        observer.observe_ready(fixture.ready.clone()).await.unwrap();
         let start = close_start(
             fixture.ready.channel(),
             hellas_kernel::Party::Maker,
@@ -812,14 +769,25 @@ async fn observed_close_and_payment_have_one_journal_order() {
             &self::client(),
         )
         .unwrap();
-        let block = FinalizedWork {
-            height: CURSOR + 1,
-            parent: payload_at(CURSOR),
-            payload: payload_at(CURSOR + 1),
-            txs: vec![hellas_kernel::Tx::move_action(
-                hellas_kernel::Move::StartPaymentClose(start),
-            )],
-        };
+        let pending = hellas_kernel::PendingSlot::Present(
+            hellas_kernel::PendingPaymentClose::from_accepted_start(
+                fixture.ready.channel().network(),
+                CURSOR + 1,
+                hellas_channel::test_support::channel::now_ms(),
+                &start,
+            )
+            .unwrap(),
+        );
+        let (bond, payment) = (
+            hellas_channel::test_support::channel::bond_object(),
+            hellas_channel::test_support::channel::payment_object(),
+        );
+        let observed = hellas_channel::test_support::channel::observed_at(
+            CURSOR + 1,
+            &bond,
+            &payment,
+            pending,
+        );
         if payment_first {
             let request = client
                 .client()
@@ -831,19 +799,13 @@ async fn observed_close_and_payment_have_one_journal_order() {
             let credited = admit_response(&fixture.service, request).await;
             assert!(matches!(credited.outcome, Some(AdmitOutcome::Paid(_))));
         }
-        observer
-            .drive()
-            .unwrap()
-            .observe_finalized(&block)
-            .await
-            .unwrap();
-        fixture
-            .service
-            .drive()
-            .unwrap()
-            .observe_finalized(&block)
-            .await
-            .unwrap();
+        observer.drive().unwrap().observe(&observed).await.unwrap();
+        hellas_channel::test_support::channel::observe_service(
+            &fixture.service,
+            CURSOR + 1,
+            pending,
+        )
+        .await;
         assert!(
             observer
                 .with_state(|state| state.is_closing())

@@ -24,7 +24,6 @@ fn paid() -> PaidPolicy {
             oracle_grace_blocks: 6,
         },
         expected_payment_values: EdgeValues::new(201, 0, Fees::ZERO),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         jobs_per_channel: 10,
         offers: OfferPolicy {
             max_stake_per_client: 12,
@@ -48,7 +47,7 @@ fn default_ten_jobs_and_offer_bounds_are_checked_before_storage() {
     let decoded: PaidPolicy = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, original);
     decoded.check().unwrap();
-    for mutation in [0, 1, 2, 3, 4, 5, 6, 7] {
+    for mutation in [0, 1, 2, 3, 4, 5, 6] {
         let mut invalid = original.clone();
         match mutation {
             0 => invalid.jobs_per_channel = 0,
@@ -57,7 +56,6 @@ fn default_ten_jobs_and_offer_bounds_are_checked_before_storage() {
             3 => invalid.offers.max_stake_per_client = 0,
             4 => invalid.offers.max_open_offers = 0,
             5 => invalid.offers.bond_lifetime_blocks = 0,
-            6 => invalid.min_omit_response_blocks = hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS + 1,
             _ => invalid.expected_payment_values = EdgeValues::new(202, 0, Fees::ZERO),
         }
         assert!(

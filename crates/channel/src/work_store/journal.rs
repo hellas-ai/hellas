@@ -28,7 +28,11 @@ const SQLITE_BUSY: i32 = 5;
 const SQLITE_LOCKED: i32 = 6;
 const SQLITE_NOTADB: i32 = 26;
 
-const SCHEMA_VERSION: i64 = 1;
+/// Version 2 carries certified-state observations rather than a
+/// contiguous block cursor. Journals live under their chain's own
+/// directory, so a version-1 file belongs to a chain this binary no
+/// longer follows and is refused, not read.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Largest metadata/result record this journal writes or reads back.
 /// Compute input bodies live in verified payload objects referenced by the
@@ -320,7 +324,9 @@ impl Journal {
                     .execute(&mut *transaction)
                     .await
                     .map_err(sqlx_error)?;
-                sqlx::raw_sql("PRAGMA user_version = 1")
+                // Spelled out because SQLite takes no parameter here.
+                const _: () = assert!(SCHEMA_VERSION == 2);
+                sqlx::raw_sql("PRAGMA user_version = 2")
                     .execute(&mut *transaction)
                     .await
                     .map_err(sqlx_error)?;

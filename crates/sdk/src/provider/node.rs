@@ -30,7 +30,6 @@ pub struct NodeHandlerImpl {
     pub graffiti: Arc<[u8]>,
     pub directory: Arc<PeerDirectory>,
     pub service_alpns: Vec<String>,
-    pub chain: Option<crate::FullNode>,
 }
 
 impl NodeHandlerImpl {
@@ -53,7 +52,6 @@ impl NodeHandlerImpl {
             graffiti: Arc::from(graffiti),
             directory,
             service_alpns: vec![hellas_rpc::services::node::Node::ALPN.into()],
-            chain: None,
         }
     }
 }
@@ -83,17 +81,6 @@ impl NodeHandler for NodeHandlerImpl {
         // disclosure policy remains the gate for anonymous requesters.
         let requester = PeerId::default();
         const DISCLOSURE_LIMIT: usize = 64;
-        if request.service_alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN
-            && let Some(chain) = &self.chain
-        {
-            return Ok(WithTrailer::new(GetKnownPeersResponse {
-                peer_ids: chain
-                    .peer_ids()
-                    .iter()
-                    .map(|id| id.as_bytes().to_vec())
-                    .collect(),
-            }));
-        }
         let peers = self
             .directory
             .known_peers(requester, &request.service_alpn, DISCLOSURE_LIMIT)

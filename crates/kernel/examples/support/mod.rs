@@ -172,6 +172,7 @@ pub(crate) const fn context(height: u64, hash_byte: u8, fees: Fees) -> Context {
     Context::with_fees(
         NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([hash_byte; BlockHash::LENGTH]),
         fees,
     )

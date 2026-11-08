@@ -3,7 +3,7 @@
 use super::*;
 use anyhow::ensure;
 use hellas_auth::{Digest, authority::*};
-use hellas_chain::{LightClient as _, QueryError, domain::Transaction};
+use hellas_chain::{LightClient as _, client::RemoteLightClient, domain::Transaction};
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
 use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
@@ -29,7 +29,6 @@ use {
 #[serde(deny_unknown_fields)]
 struct PaidWorkFile {
     jobs_per_channel: u64,
-    min_omit_response_blocks: u64,
     payment: JobPaymentPolicyV2,
     channel: PaidChannelPolicyV1,
     offers: OfferPolicy,
@@ -128,7 +127,6 @@ impl PaidWorkFile {
             },
             payment_policy: self.payment,
             expected_payment_values: EdgeValues::new(value, 0, Fees::ZERO),
-            min_omit_response_blocks: self.min_omit_response_blocks,
             jobs_per_channel: self.jobs_per_channel,
             offers: self.offers,
         };
@@ -185,11 +183,10 @@ impl PaidWork {
             provider.executor.assurance == Assurance::ProducerSigned,
             "paid startup requires producer-signed assurance"
         );
-        let (work, chain) = provider
+        let (work, _) = provider
             .work
             .as_ref()
-            .context("paid startup requires a chain node")?;
-        let chain = chain.clone();
+            .context("paid startup requires a paid-work chain")?;
         let key = work.settlement_key.clone();
         let grants = grants.unwrap_or_else(|| {
             hellas_sdk::grant_config::GrantConfig::unconfigured(self.chain.chain.home())
@@ -224,12 +221,12 @@ impl PaidWork {
         )
         .await?;
         let ready = async {
-            self.preflight_stake(&chain, &key).await?;
+            self.preflight_stake(&key).await?;
             let admin = host
                 .administration()?
                 .context("paid administration is unavailable")?;
             let policy = self.configure(&admin, credential.as_ref()).await?;
-            self.delegate(&chain, &key, &policy).await
+            self.delegate(&key, &policy).await
         }
         .await;
         if let Err(error) = ready {
@@ -275,12 +272,18 @@ impl PaidWork {
         Ok(())
     }
 
+    /// A verified source for this provider's own delegation reads.
+    async fn chain(&self) -> CliResult<RemoteLightClient> {
+        Ok(hellas_sdk::client_chain::connect_at(
+            &self.chain,
+            hellas_channel::work::MAX_CERTIFIED_AGE,
+            0,
+        )
+        .await?)
+    }
+
     /// A lowered stake cap needs an already delegated coin that fits it.
-    async fn preflight_stake(
-        &self,
-        chain: &hellas_sdk::FullNode,
-        key: &Secp256k1Signer,
-    ) -> CliResult<()> {
+    async fn preflight_stake(&self, key: &Secp256k1Signer) -> CliResult<()> {
         let Some(owner) = &self.owner else {
             return Ok(());
         };
@@ -295,29 +298,26 @@ impl PaidWork {
         if receipt.unit <= cap {
             return Ok(());
         }
-        let deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let client = chain.wait_ready().await?.client();
-                let check = async {
-                    let mut after = None;
-                    loop {
-                        let delegate = key.party_key().into();
-                        let Some(page) = client.get_holdings(delegate, after).await? else { break; };
-                        if page.delegated_coins(delegate).iter().any(|(_, coin)| {
-                            coin.value > 0 && coin.value <= cap && coin.owner.into_kernel() == owner.party_key()
-                        }) { return Ok::<_, anyhow::Error>(true); }
-                        let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else { break; };
-                        after = Some(next);
-                    }
-                    Ok(false)
-                }.await;
-                match check {
-                    Err(error) if error.chain().any(|cause| matches!(cause.downcast_ref::<QueryError>(), Some(QueryError::StateUnavailable(_)))) => {},
-                    result => return result,
-                }
+        let client = self.chain().await?;
+        let delegate = key.party_key().into();
+        let mut after = None;
+        loop {
+            let Some(page) = client.get_holdings(delegate, after).await? else {
+                break;
+            };
+            if page.delegated_coins(delegate).iter().any(|(_, coin)| {
+                coin.value > 0 && coin.value <= cap && coin.owner.into_kernel() == owner.party_key()
+            }) {
+                return Ok(());
             }
-        }).await.context("stake-cap preflight exceeded chain recovery bound")??.then_some(()).context("lower stake cap has no eligible delegated coin; reshape unused stake with chain delegate --split before changing the policy")
+            let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else {
+                break;
+            };
+            after = Some(next);
+        }
+        anyhow::bail!(
+            "lower stake cap has no eligible delegated coin; reshape unused stake with chain delegate --split before changing the policy"
+        )
     }
 
     pub(super) async fn prepare(
@@ -554,7 +554,6 @@ impl PaidWork {
 
     pub(super) async fn delegate(
         &self,
-        chain: &hellas_sdk::FullNode,
         key: &Secp256k1Signer,
         policy: &PaidPolicy,
     ) -> CliResult<()> {
@@ -563,51 +562,33 @@ impl PaidWork {
             // runner admits only live stake belonging to the authority owner.
             return Ok(());
         }
-        let deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                chain.wait_ready().await?;
-                match self.delegate_once(chain, key, policy).await {
-                    Err(error)
-                        if error.chain().any(|cause| {
-                            matches!(
-                                cause.downcast_ref::<QueryError>(),
-                                Some(QueryError::StateUnavailable(_))
-                            )
-                        }) => {}
-                    result => return result,
-                }
-            }
-        })
-        .await
-        .context("stake delegation exceeded chain recovery bound")?
+        let client = self.chain().await?;
+        self.delegate_once(&client, key, policy).await
     }
 
     async fn delegate_once(
         &self,
-        chain: &hellas_sdk::FullNode,
+        client: &RemoteLightClient,
         key: &Secp256k1Signer,
         policy: &PaidPolicy,
     ) -> CliResult<()> {
         use hellas_chain::domain::{DecodeExt as _, Encode as _};
-        let client = chain.view()?.client();
         let signer = self
             .owner
             .as_ref()
             .context("stake delegation requires an owner passkey")?;
         let owner = signer.party_key();
         let path = self.chain.chain.provider().join("delegation.json");
-        let mut pins = Vec::from(hellas_chain::genesis_digest(chain.config().genesis()).as_ref());
-        pins.extend_from_slice(chain.genesis_payload().as_ref());
-        pins.extend_from_slice(&chain.config().threshold_identity());
-        let genesis = hex::encode(Digest::hash(&pins).as_bytes());
-        let mut receipt: Delegation = if path.try_exists()? {
+        // The chain this delegation was made on: its consensus identity.
+        let genesis = hex::encode(self.chain.chain.consensus_digest());
+        let network = self.chain.network();
+        let receipt: Delegation = if path.try_exists()? {
             serde_json::from_slice(&hellas_private::read_bounded_regular_file(
                 &path,
                 64 * 1024,
             )?)?
         } else {
-            let (input, height) = 'search: loop {
+            let input = 'search: loop {
                 let mut after = None;
                 while let Some(page) = client.get_holdings(owner.into(), after).await? {
                     let selected = page
@@ -619,7 +600,7 @@ impl PaidWork {
                         })
                         .min_by_key(|(id, coin)| (coin.value, *id));
                     if let Some((id, _)) = selected {
-                        break 'search (id, page.block.height);
+                        break 'search id;
                     }
                     let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else {
                         break;
@@ -628,15 +609,13 @@ impl PaidWork {
                 }
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "inventory class B: finalized coin search; rollout 3"
+                    reason = "inventory class B: certified coin search; rollout 3"
                 )]
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
             let input = CoinId::from_bytes(input.0);
-            let network = hellas_kernel::NetworkId::new(&chain.config().genesis().network_id)
-                .context("invalid chain network")?;
             let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
-                &client,
+                client,
                 network,
                 owner,
                 &[input],
@@ -657,7 +636,6 @@ impl PaidWork {
                 input: hex::encode(input.to_bytes()),
                 unit: policy.offers.max_stake_per_client,
                 transaction: tx.encode().to_vec(),
-                scan_from: height,
                 confirmed: false,
             };
             publish(&path, &serde_json::to_vec(&receipt)?)?;
@@ -678,46 +656,44 @@ impl PaidWork {
                 .map_err(|_| anyhow::anyhow!("invalid delegation input"))?,
         );
         let tx = Transaction::decode(receipt.transaction.as_slice())?;
-        let mut scan = receipt.scan_from;
+        let Transaction::Kernel(hellas_kernel::Tx::Owner(reshape)) = &tx else {
+            anyhow::bail!("stake delegation receipt is not an owner reshape");
+        };
+        // Included means the input is gone and the coins the reshape issues
+        // exist, at one certified state.
+        let issued: Vec<CoinId> =
+            hellas_kernel::Reshape::output_ids(network, reshape.inputs(), reshape.outputs())
+                .as_slice()
+                .to_vec();
+        let keys: Vec<_> = issued
+            .iter()
+            .chain([&input])
+            .map(|id| hellas_chain::domain::ObjectKey::Coin(*id))
+            .collect();
         let mut submitted = false;
         loop {
-            let Some(tip) = client.get_latest_block().await? else {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class B: first finalized block; rollout 3"
-                )]
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            };
-            while scan <= tip.height {
-                let finalized = client
-                    .get_finalized_block(hellas_chain::FinalizedBlockQuery::Height(scan))
-                    .await?
-                    .context("delegation history is unavailable")?;
-                let block = hellas_chain::block_view::FinalizedBlockView::decode(&finalized)?;
-                ensure!(block.height() == scan, "delegation history height mismatch");
-                if block.position_of(&tx).is_some() {
-                    receipt.confirmed = true;
-                    hellas_private::write_atomically(
-                        &path,
-                        ".confirmed",
-                        &serde_json::to_vec(&receipt)?,
-                    )?;
-                    return Ok(());
-                }
-                scan = scan.checked_add(1).context("delegation height overflow")?;
-            }
-            let inputs = client
-                .get_objects(vec![hellas_chain::domain::ObjectKey::Coin(input)])
+            let read = client
+                .get_objects(keys.clone())
                 .await?
-                .context("no applied chain state")?;
+                .context("no certified chain state")?;
+            let input_live = read.coin(input)?.is_some();
+            let mut outputs_live = true;
+            for id in &issued {
+                outputs_live &= read.coin(*id)?.is_some();
+            }
+            if !input_live && outputs_live {
+                let mut receipt = receipt;
+                receipt.confirmed = true;
+                hellas_private::write_atomically(
+                    &path,
+                    ".confirmed",
+                    &serde_json::to_vec(&receipt)?,
+                )?;
+                return Ok(());
+            }
             ensure!(
-                inputs.block.height >= tip.height,
-                "applied chain state is behind the delegation scan"
-            );
-            ensure!(
-                inputs.coin(input)?.is_some(),
-                "another spend consumed the delegation input before it finalized"
+                input_live,
+                "another spend consumed the delegation input before it was included"
             );
             if !submitted {
                 client.submit_tx(tx.clone()).await?;
@@ -725,7 +701,7 @@ impl PaidWork {
             }
             #[expect(
                 clippy::disallowed_methods,
-                reason = "inventory class B: finalized delegation; rollout 3"
+                reason = "inventory class B: certified delegation; rollout 3"
             )]
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -741,7 +717,6 @@ struct Delegation {
     input: String,
     unit: u64,
     transaction: Vec<u8>,
-    scan_from: u64,
     confirmed: bool,
 }
 

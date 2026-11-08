@@ -62,7 +62,6 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         bond_edge,
         bond_terms(),
         [0x25; 32],
-        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         8,
         4,
     )

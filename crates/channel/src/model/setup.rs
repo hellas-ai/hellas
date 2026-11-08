@@ -152,15 +152,6 @@ pub enum WorkSetupError {
         /// [`MAX_START_VALIDITY_BLOCKS`], the profile's fixed span.
         fixed: u64,
     },
-    /// The proposed terms give the watcher fewer blocks to answer a
-    /// contest in than this provider is configured to accept.
-    #[error("the terms admit {window} blocks to answer a contest, under the configured {minimum}")]
-    ResponseWindowBelowMinimum {
-        /// `omit_response_blocks`, as the terms fix it.
-        window: u64,
-        /// The provider's configured minimum.
-        minimum: u64,
-    },
 }
 
 /// What the bond's two lease slots held, without the record itself.
@@ -263,18 +254,6 @@ pub struct ProviderChannelPolicy {
     /// requires them to be funded.
     #[serde(with = "crate::model::paid_policy::edge_values")]
     pub expected_payment_values: EdgeValues,
-    /// The shortest response window this provider will sign terms over.
-    ///
-    /// Here and not in [`WorkChannelConfig`] because it is a statement
-    /// about the *node*, not about the channel: how many blocks this
-    /// deployment needs to notice a contest and answer it is the
-    /// operator's to say, and the same number governs every channel this
-    /// provider admits. The kernel enforces its own floor,
-    /// [`MIN_OMIT_RESPONSE_BLOCKS`], at every payment open; this is the
-    /// provider's, and it is checked at admission.
-    ///
-    /// [`MIN_OMIT_RESPONSE_BLOCKS`]: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS
-    pub min_omit_response_blocks: u64,
 }
 
 impl ProviderChannelPolicy {
@@ -332,18 +311,15 @@ impl ProviderChannelPolicy {
     /// against *this* provider's salt and credit policy, so terms
     /// committing to any other policy are refused rather than signed.
     ///
-    /// Two of the terms are the provider's judgement about its own
-    /// deployment and are checked here and nowhere below: the signed
-    /// `start_validity_blocks` must be exactly the profile's fixed 64,
-    /// and the proposed `omit_response_blocks` must reach the configured
-    /// [`Self::min_omit_response_blocks`].
+    /// One term is the provider's judgement about its own deployment and
+    /// is checked here and nowhere below: the signed
+    /// `start_validity_blocks` must be exactly the profile's fixed 64.
     ///
     /// # Errors
     ///
     /// [`WorkSetupError::StartSpanNotFixed`] when the signed terms do
-    /// not carry the fixed span, [`WorkSetupError::ResponseWindowBelowMinimum`]
-    /// when the terms leave less time to answer than this provider
-    /// accepts, and then whatever [`WorkChannelDescriptor::open`] raises:
+    /// not carry the fixed span, and then whatever
+    /// [`WorkChannelDescriptor::open`] raises:
     /// the commitment, the execution policy, the settleability of the
     /// expected funding, and the collateral rule.
     pub fn admit(
@@ -358,12 +334,6 @@ impl ProviderChannelPolicy {
             return Err(WorkSetupError::StartSpanNotFixed {
                 span: payment_terms.start_validity_blocks,
                 fixed: MAX_START_VALIDITY_BLOCKS,
-            });
-        }
-        if payment_terms.omit_response_blocks < self.min_omit_response_blocks {
-            return Err(WorkSetupError::ResponseWindowBelowMinimum {
-                window: payment_terms.omit_response_blocks,
-                minimum: self.min_omit_response_blocks,
             });
         }
         WorkChannelDescriptor::open(WorkChannelConfig {
@@ -838,6 +808,10 @@ fn push_kernel<E: Encode>(out: &mut Vec<u8>, value: &E) {
 pub struct ObservedChannel<'a> {
     /// Finalized height every field below was read at.
     pub height: u64,
+    /// That block's payload digest.
+    pub payload: [u8; 32],
+    /// That block's timestamp, in milliseconds.
+    pub certified_at_ms: u64,
     /// The bond edge, or its absence.
     pub bond: Option<&'a Edge>,
     /// The payment edge, or its absence.

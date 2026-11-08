@@ -84,13 +84,18 @@ impl OfferConnection {
         // before the provider's local finalized view catches up. Reuse the
         // exact signed request; this cannot create another funding signature
         // or a work proposal.
-        retry_offer(timeout, args.config.poll, funding.is_some(), || {
-            hellas_rpc::call::unary::<_, hellas_rpc::services::work_setup::RequestOffer>(
-                &self.transport,
-                request.clone(),
-                Metadata::new(),
-            )
-        })
+        retry_offer(
+            timeout,
+            hellas_channel::work::SETUP_POLL,
+            funding.is_some(),
+            || {
+                hellas_rpc::call::unary::<_, hellas_rpc::services::work_setup::RequestOffer>(
+                    &self.transport,
+                    request.clone(),
+                    Metadata::new(),
+                )
+            },
+        )
         .await
     }
 }
@@ -255,17 +260,12 @@ pub(super) async fn fund_offer(
     Ok(offer)
 }
 
-/// The finalized height one retained setup journal already relies on.
+/// The certified height one retained setup journal already relies on.
 ///
 /// A source below this height cannot answer the journal's own reads, so
 /// source selection has to meet the same floor before it is asked.
 fn journal_floor(store: &SetupStore) -> u64 {
-    store
-        .state()
-        .origin()
-        .map_or(0, |origin| origin.height)
-        .max(store.state().scan_cursor().map_or(0, |scan| scan.height))
-        .max(store.state().scan_armed().map_or(0, |scan| scan.height))
+    store.state().observed_height().unwrap_or(0)
 }
 
 /// One retained client setup addressed to the requested provider, opened

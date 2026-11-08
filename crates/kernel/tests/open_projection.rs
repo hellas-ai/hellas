@@ -60,10 +60,8 @@ const TAKER_COINS: [CoinId; 2] = [coin_id(0x21), coin_id(0x22)];
 const BOND_COIN: CoinId = coin_id(0x31);
 const BOND_FUNDING: u64 = 900;
 
-/// Inside `[MIN_OMIT_RESPONSE_BLOCKS, MAX_OMIT_RESPONSE_BLOCKS]` and
-/// `(0, MAX_START_VALIDITY_BLOCKS]`: this suite is about arithmetic, and
-/// a window rejection would hide it.
-const OMIT_RESPONSE_BLOCKS: u64 = 64;
+/// Inside `(0, MAX_START_VALIDITY_BLOCKS]`: this suite is about
+/// arithmetic, and a window rejection would hide it.
 const START_VALIDITY_BLOCKS: u64 = 8;
 const OMISSION_BOND: u64 = 2;
 
@@ -436,6 +434,7 @@ const fn context(fees: Fees) -> Context {
     Context::with_fees(
         NETWORK,
         HEIGHT,
+        HEIGHT.get() * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         fees,
     )
@@ -503,7 +502,6 @@ fn payment_terms(bond_edge: EdgeId, bond: &Terms) -> Terms {
         bond_edge,
         bond_terms: body.clone(),
         private_policy_commitment: [4; 32],
-        omit_response_blocks: OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: START_VALIDITY_BLOCKS,
         omission_bond: OMISSION_BOND,
     })

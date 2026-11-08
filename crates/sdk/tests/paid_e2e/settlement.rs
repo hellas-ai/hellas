@@ -5,7 +5,7 @@ use hellas_private::StoreLocation;
 use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
 
 #[test]
-fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs() {
+fn paid_settlement_finishes_after_full_provider_shutdown() {
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
@@ -143,10 +143,6 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
                 .unwrap();
             case.relays
                 .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            case.relays
-                .source
                 .forged
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
@@ -180,12 +176,13 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             .await
             .expect("client must finalize settlement after the entire provider stops");
             assert_eq!(receipt.provider_payout, PRICE);
-            assert_eq!(
+            assert!(
                 case.relays
                     .source
                     .attempts
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "settlement reads the channel by proof"
             );
             assert_eq!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
@@ -537,10 +534,6 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .chain
                 .with_validators(case.relays.urls.clone())
                 .unwrap();
-            case.relays
-                .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
                     SETTLE_CANCEL_AFTER,
@@ -582,13 +575,13 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             .unwrap();
             assert_eq!(closed.client_returned, CLIENT_FUNDING);
             assert_eq!(closed.provider_payout, 0);
-            assert_eq!(
+            assert!(
                 case.relays
                     .source
                     .attempts
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "close and restart require no live object witness"
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "settlement reads the channel by proof"
             );
             let receipt = hellas_sdk::paid_client::finalized_channel_settlement(
                 &case.options,
@@ -793,7 +786,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
 /// the SDK tests. The Nix CLI gate builds and supplies the executable.
 #[test]
 #[ignore = "requires the CLI executable supplied by the CLI integration gate"]
-fn cli_settles_paid_channel_without_provider_or_object_proofs() {
+fn cli_settles_paid_channel_without_provider() {
     use commonware_cryptography::{Hasher as _, Sha256};
     let binary =
         std::env::var_os("HELLAS_CLI_TEST_BINARY").expect("CLI integration gate supplies binary");
@@ -897,10 +890,6 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .chain
                 .with_validators(case.relays.urls.clone())
                 .unwrap();
-            case.relays
-                .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
                     SETTLE_CANCEL_AFTER,
@@ -974,12 +963,13 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 stdout.contains(&format!("provider payout {PRICE}")),
                 "{stdout}"
             );
-            assert_eq!(
+            assert!(
                 case.relays
                     .source
                     .attempts
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "settlement reads the channel by proof"
             );
             // A different owner must not close this channel, even when the
             // journal is present and the provider cannot be contacted.
@@ -1079,10 +1069,6 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                 .chain
                 .with_validators(case.relays.urls.clone())
                 .unwrap();
-            case.relays
-                .source
-                .unavailable
-                .store(true, std::sync::atomic::Ordering::SeqCst);
 
             // A client-signed understatement is answered by the certificate actually
             // earned above. Both moves pass through the real consensus kernel.
@@ -1113,6 +1099,7 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
             let pending = hellas_kernel::PendingPaymentClose::from_accepted_start(
                 case.options.config.network(),
                 case.devnet.height(),
+                block.timestamp(),
                 &start,
             )
             .unwrap();
@@ -1138,7 +1125,7 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                     .iter()
                     .any(|found| matches!(found, hellas_chain::domain::Transaction::Kernel(found) if *found == tx))
             );
-            assert!(case.devnet.height() < pending.response_deadline());
+            assert!(block.timestamp() < pending.response_deadline_ms());
 
             let receipt = sealing_while(
                 &mut case.devnet,
@@ -1160,12 +1147,13 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
                 receipt.client_returned + receipt.provider_payout,
                 CLIENT_FUNDING
             );
-            assert_eq!(
+            assert!(
                 case.relays
                     .source
                     .attempts
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "settlement reads the channel by proof"
             );
             assert_eq!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
@@ -1187,6 +1175,134 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
 
 /// When the settlement-cancellation tests drop an in-flight settlement. It
 /// journals its prepared close within about a second on an idle machine and
-/// cannot finish with its object-proof source down (its read timeout is 60 s);
-/// 20 s falls between the two even on a loaded machine.
+/// cannot finish while no block is sealed to include it; 20 s falls between
+/// the two even on a loaded machine.
 const SETTLE_CANCEL_AFTER: Duration = Duration::from_secs(20);
+
+/// A client that opens a close below what it already signed for is answered
+/// by the running provider's own clock, inside the response window: the
+/// provider follows the channel by proof reads alone, sees the contest in
+/// the pending-close slot, and its answer lands before the deadline's block
+/// time. Settlement then pays the earned amount and the omission penalty,
+/// read back from the two payout coins.
+#[test]
+fn a_client_understatement_is_answered_by_the_provider_clock_within_the_window() {
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            let mut session = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                PaidWorkSession::open(
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionOpenMode::Any,
+                    SessionFundingOptions::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let result = session
+                .run(
+                    Some(case.prepared_input.clone()),
+                    &empty_content(),
+                    false,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.credited_cumulative, PRICE);
+            let channel = session.descriptor().channel().clone();
+            let bond = session.descriptor().bond_edge();
+            session.shutdown().await;
+            drop(session);
+
+            // The client claims nothing, although it signed for PRICE.
+            let start = hellas_channel::work_close::close_start(
+                &channel,
+                hellas_kernel::Party::Maker,
+                case.devnet.height(),
+                None,
+                &client_settlement(),
+            )
+            .unwrap();
+            let tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
+            case.devnet
+                .validator_light_client(0)
+                .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
+                .await
+                .unwrap();
+            let opened = case.devnet.seal().await;
+            let deadline = opened.timestamp() + hellas_kernel::RESPONSE_WINDOW_MS;
+
+            // Blocks keep coming, one second of block time apiece, until the
+            // provider's answer is in the slot. Nothing here answers for it.
+            let query = hellas_chain::work_view::WorkChannelQuery {
+                bond_edge: channel.payment_terms().bond_edge,
+                payment_edge: Some(channel.payment_edge()),
+                funding: Default::default(),
+            };
+            let local = hellas_chain::WorkBlocks::new(case.devnet.validator_light_client(0));
+            let answered = sealing_while(&mut case.devnet, Duration::from_millis(500), async {
+                loop {
+                    let snapshot = local
+                        .work_channel_snapshot(query.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let hellas_kernel::PendingSlot::Present(pending) = snapshot.pending()
+                        && pending.responded()
+                    {
+                        return (pending, snapshot.certified_at_ms());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            let (pending, seen_at) = answered;
+            assert_eq!(pending.response_deadline_ms(), deadline);
+            assert!(
+                seen_at < deadline,
+                "the answer is in a block stamped before the deadline"
+            );
+            assert_eq!(
+                pending.final_cumulative(),
+                PRICE,
+                "the answer spends the certificate the client left out"
+            );
+            assert!(
+                pending.penalty_due(),
+                "the understatement forfeits the bond"
+            );
+
+            let receipt = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                receipt.provider_payout,
+                PRICE + channel.payment_terms().omission_bond,
+                "the provider's payout coin holds the earned amount and the penalty"
+            );
+            assert_eq!(
+                receipt.client_returned + receipt.provider_payout,
+                CLIENT_FUNDING
+            );
+            case.provider.shutdown().await.unwrap();
+            case.endpoint.close().await;
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}

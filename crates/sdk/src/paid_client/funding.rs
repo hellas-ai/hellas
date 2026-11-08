@@ -28,7 +28,7 @@ pub async fn recover_funding_intent(
             args.provider.node,
             reservation,
             crate::client_owner::FundingControls {
-                poll: args.config.poll,
+                poll: hellas_channel::work::SETUP_POLL,
                 timeout,
                 approval,
                 before_sign: None,

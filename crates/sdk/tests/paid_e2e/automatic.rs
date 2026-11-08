@@ -267,8 +267,8 @@ fn composition_policies() -> Vec<hellas_authority::model::grant::records::GrantP
 
 struct Provider {
     enrollment: hellas_rpc::ProviderEnrollmentBundle,
-    funded_height: Arc<std::sync::atomic::AtomicU64>,
-    offer_height: Arc<std::sync::atomic::AtomicU64>,
+    funded_held: Arc<std::sync::atomic::AtomicBool>,
+    offer_held: Arc<std::sync::atomic::AtomicBool>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
     funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
     funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
@@ -285,9 +285,8 @@ struct Provider {
 #[derive(Clone)]
 struct RecoveringSetup {
     inner: MountedSetup,
-    node: hellas_sdk::FullNode,
-    funded_height: Arc<std::sync::atomic::AtomicU64>,
-    offer_height: Arc<std::sync::atomic::AtomicU64>,
+    funded_held: Arc<std::sync::atomic::AtomicBool>,
+    offer_held: Arc<std::sync::atomic::AtomicBool>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
     funding_refusal: Arc<std::sync::atomic::AtomicUsize>,
     funding_requests: Arc<std::sync::Mutex<Vec<RequestOfferRequest>>>,
@@ -300,15 +299,14 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
         context: hellas_wire::TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
     {
-        let height = self.node.status().executed_height();
-        if height < self.offer_height.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.offer_held.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(WireStatus::new(
                 hellas_wire::WireCode::Unavailable,
                 "held offer response",
             ));
         }
         if !request.funding_coins.is_empty() {
-            if height < self.funded_height.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.funded_held.load(std::sync::atomic::Ordering::SeqCst) {
                 self.unavailable
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return Err(WireStatus::new(
@@ -366,20 +364,16 @@ impl Provider {
     fn start<'a>(
         root: &'a std::path::Path,
         config: WorkConfig,
-        node: hellas_sdk::FullNode,
         compute: HostCompute,
         identity: NodeIdentity,
         port: u16,
     ) -> impl std::future::Future<Output = Self> + 'a {
-        Box::pin(Self::start_inner(
-            root, config, node, compute, identity, port,
-        ))
+        Box::pin(Self::start_inner(root, config, compute, identity, port))
     }
 
     async fn start_inner(
         root: &std::path::Path,
         config: WorkConfig,
-        node: hellas_sdk::FullNode,
         compute: HostCompute,
         identity: NodeIdentity,
         port: u16,
@@ -446,8 +440,6 @@ impl Provider {
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
                 chain: config.chain.clone(),
-                poll: config.poll(),
-                max_observation_age: config.max_observation_age(),
                 settlement_key: provider_settlement(),
             },
             work.clone(),
@@ -455,8 +447,8 @@ impl Provider {
         )
         .await
         .unwrap()
-        .on_node(
-            node.clone(),
+        .on_chain(
+            config.clone(),
             authority,
             enrollment.clone(),
             endpoint
@@ -467,16 +459,15 @@ impl Provider {
         );
         content.finish_recovery().await.unwrap();
         let clock = WorkWatcher::spawn(runner);
-        let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let offer_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let funded_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let offer_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let unavailable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let funding_refusal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let funding_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let setup = RecoveringSetup {
             inner: setup,
-            node: node.clone(),
-            funded_height: funded_height.clone(),
-            offer_height: offer_height.clone(),
+            funded_held: funded_held.clone(),
+            offer_held: offer_held.clone(),
             unavailable: unavailable.clone(),
             funding_refusal: funding_refusal.clone(),
             funding_requests: funding_requests.clone(),
@@ -529,8 +520,8 @@ impl Provider {
         });
         Self {
             enrollment,
-            funded_height,
-            offer_height,
+            funded_held,
+            offer_held,
             unavailable,
             funding_refusal,
             funding_requests,
@@ -692,7 +683,6 @@ fn revision_two(
             &policy.policy_salt,
             &policy.channel_policy,
         ),
-        omit_response_blocks: policy.min_omit_response_blocks,
         start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
     };
     let payment = hellas_kernel::Tx::open_hash(
@@ -775,8 +765,8 @@ async fn compute_and_settle_inner(
         .copied()
         .unwrap();
     provider
-        .offer_height
-        .store(devnet.height() + 1, std::sync::atomic::Ordering::SeqCst);
+        .offer_held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut unavailable_args = options.clone();
     unavailable_args.timeout = Some(Duration::from_millis(100));
     let started = tokio::time::Instant::now();
@@ -802,11 +792,14 @@ async fn compute_and_settle_inner(
         "bounded quote expiry: {error}"
     );
     assert!(started.elapsed() >= unavailable_args.timeout.unwrap());
+    provider
+        .offer_held
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     devnet.seal().await;
 
     provider
-        .funded_height
-        .store(devnet.height() + 1, std::sync::atomic::Ordering::SeqCst);
+        .funded_held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let attempts = provider
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -828,6 +821,9 @@ async fn compute_and_settle_inner(
             .load(std::sync::atomic::Ordering::SeqCst)
             > attempts
     );
+    provider
+        .funded_held
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     devnet.seal().await;
     let open = PaidWorkSession::open(
         options.clone(),
@@ -1619,7 +1615,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let mut provider = Provider::start(
         root.path(),
         config.clone(),
-        devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
         0,
@@ -1809,7 +1804,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     provider = Provider::start(
         root.path(),
         config.clone(),
-        devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
         port,
@@ -2019,7 +2013,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .commit(
             hellas_channel::work_store::SetupRecord::Offer {
                 peer: *provider.endpoint.id().as_bytes(),
-                floor: None,
                 offer: third.clone(),
             },
             &hellas_kernel::Secp256k1Verifier::new(),
@@ -2072,7 +2065,6 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     provider = Provider::start(
         root.path(),
         config.clone(),
-        devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
         port,
@@ -2474,7 +2466,7 @@ async fn finish(case: Box<Case>) {
                 &transport, ExchangeSetupRequest { bond_edge: third.offer().proposal.bond_edge().to_bytes().to_vec(), bundle: vec![] }, Metadata::new(),
             ).await.unwrap();
             if matches!(response.outcome, Some(exchange_setup_response::Outcome::Refused(ref r)) if r.code == hellas_channel::work::WorkRefusal::Expired.code() as i32) { break; }
-            tokio::time::sleep(config.poll()).await;
+            tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
         }
     }).await.expect("the unanswered offer durably expires at its horizon");
     drop(transport);
@@ -2498,7 +2490,6 @@ async fn finish(case: Box<Case>) {
     provider = Provider::start(
         root.path(),
         config.clone(),
-        devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
         port,
@@ -2534,8 +2525,8 @@ async fn finish(case: Box<Case>) {
         .unwrap(),
     );
     provider
-        .funded_height
-        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        .funded_held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let attempts = provider
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -2556,7 +2547,7 @@ async fn finish(case: Box<Case>) {
             }
         }).await.expect("one session retries its funded offer while the provider source is unavailable");
         provider.funding_refusal.store(1, std::sync::atomic::Ordering::SeqCst);
-        provider.funded_height.store(0, std::sync::atomic::Ordering::SeqCst);
+        provider.funded_held.store(false, std::sync::atomic::Ordering::SeqCst);
         open.await
     }).await.unwrap();
     {

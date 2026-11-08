@@ -31,7 +31,6 @@ pub struct ServeOptions {
     /// The loaded paid-work configuration, not the path it came from.
     /// Only its presence serves the two work ALPNs and sells paid work.
     pub paid: Option<paid::PaidWork>,
-    pub chain_node: super::chain_node::ChainNodeArgs,
     #[cfg(feature = "otel")]
     pub metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     pub graffiti: String,
@@ -121,22 +120,19 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         info!(
             network = %work.network(),
             validators = work.chain.validators().len(),
-            poll_ms = work.poll().as_millis(),
+            poll_ms = hellas_channel::work::POLL.as_millis(),
             // Said back because it is the party the chain will see: an
             // operator who funded a different one has configured a node
             // that can settle nothing, and this is where they find out.
             settlement_party = %hex::encode(options.settlement_key.party_key().to_bytes()),
             "loaded the paid-work configuration; paid admission is on",
         );
-        let chain = options.chain_node.start(work).await?;
         work_runner = Some((
             hellas_sdk::paid_provider::WorkRunnerConfig {
                 chain: work.chain.clone(),
-                poll: work.poll(),
-                max_observation_age: work.max_observation_age(),
                 settlement_key: options.settlement_key.clone(),
             },
-            chain,
+            work.clone(),
         ));
     }
 
@@ -151,7 +147,6 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     };
     // Install signal handlers before publishing a ready local control socket.
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
-    let chain = work_runner.as_ref().map(|(_, chain)| chain.clone());
     let node_id = options.secret_key.public();
     let address = hellas_sdk::client::ProviderAddress::of(options.open_identity.enrollment())?;
     anyhow::ensure!(
@@ -198,9 +193,6 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         Ok(reload) => reload,
         Err(error) => {
             let _ = node.shutdown().await;
-            if let Some(chain) = chain {
-                let _ = chain.shutdown().await;
-            }
             content.close().await;
             return Err(error.context("failed to reconcile declared content"));
         }
@@ -224,11 +216,9 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
 
     println!("Shutting down...");
     // Return failures through the CLI so its telemetry guard still flushes.
-    let mut result = shutdown_content(node, content_reload, content).await;
-    if let Some(chain) = chain {
-        result = result.and(chain.shutdown().await.map_err(anyhow::Error::from));
-    }
-    result.context("failed to drain and shut down RPC server")?;
+    shutdown_content(node, content_reload, content)
+        .await
+        .context("failed to drain and shut down RPC server")?;
 
     Ok(())
 }

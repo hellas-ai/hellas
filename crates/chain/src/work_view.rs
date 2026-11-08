@@ -105,6 +105,7 @@ impl WorkChannelQuery {
 pub struct WorkChannelSnapshot {
     query: WorkChannelQuery,
     block: LatestBlock,
+    certified_at_ms: u64,
     bond: Option<Edge>,
     payment: Option<Edge>,
     lease_slots: [Option<RegistryChunk>; BOND_LEASE_CHUNKS as usize],
@@ -148,6 +149,7 @@ impl WorkChannelSnapshot {
         Ok(Self::new(
             query,
             snapshot.block,
+            snapshot.certified_at_ms,
             bond,
             payment,
             leases,
@@ -165,9 +167,11 @@ impl WorkChannelSnapshot {
     /// that, and this constructor does not pretend to check it — the two
     /// implementations that call it are the ones that hold the reader.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         query: WorkChannelQuery,
         block: LatestBlock,
+        certified_at_ms: u64,
         bond: Option<Edge>,
         payment: Option<Edge>,
         lease_slots: [Option<RegistryChunk>; BOND_LEASE_CHUNKS as usize],
@@ -177,6 +181,7 @@ impl WorkChannelSnapshot {
         Self {
             query,
             block,
+            certified_at_ms,
             bond,
             payment,
             lease_slots,
@@ -195,6 +200,12 @@ impl WorkChannelSnapshot {
     #[must_use]
     pub const fn block(&self) -> &LatestBlock {
         &self.block
+    }
+
+    /// Returns the certified block's own timestamp, in milliseconds.
+    #[must_use]
+    pub const fn certified_at_ms(&self) -> u64 {
+        self.certified_at_ms
     }
 
     /// Returns the bond edge, or its absence.
@@ -283,17 +294,19 @@ impl WorkChannelSnapshot {
 /// make the coherent way the short way.
 #[cfg(feature = "work-watcher")]
 impl WorkChannelSnapshot {
-    /// Returns this read as a readiness decision's input.
+    /// Returns this read as a channel observation: the input to the
+    /// journal's cursor, its close duties and its readiness decision.
     ///
     /// The height carried is the block the objects were read at, which
     /// is the height `check_ready` measures the admission horizon
-    /// against. It is not the height an endpoint has *processed* — that
-    /// is the cursor, and `ReadyChannel::check_caught_up` is where the
-    /// two are compared.
+    /// against, and the timestamp is that block's own, which close
+    /// deadlines and admission freshness are measured on.
     #[must_use]
     pub fn observed_channel(&self) -> hellas_channel::model::setup::ObservedChannel<'_> {
         hellas_channel::model::setup::ObservedChannel {
             height: self.block.height,
+            payload: self.block.payload.0,
+            certified_at_ms: self.certified_at_ms,
             bond: self.bond(),
             payment: self.payment(),
             lease: self.lease(),
@@ -302,25 +315,33 @@ impl WorkChannelSnapshot {
     }
 
     /// Returns this read as a setup decision's input, or `None` if this
-    /// snapshot did not ask about exactly `funding`.
+    /// snapshot did not ask exactly `query`.
     ///
-    /// The coin set is passed in rather than taken from the query so
-    /// that the caller's own answer — the coins its retained
-    /// transactions name — is what the snapshot is checked against.
-    /// A snapshot read for another transaction's coins reports survivors
+    /// The query is passed in rather than taken from the snapshot so
+    /// that the caller's own question — the coins its retained
+    /// transactions name — is what the snapshot is checked against. A
+    /// snapshot read for another transaction's coins reports survivors
     /// of a question this decision is not asking, and an empty set of
     /// those reads as "every coin is spent".
     #[must_use]
     pub fn finalized_setup(
         &self,
-        funding: &BTreeSet<CoinId>,
+        query: &hellas_channel::work_open::SetupQuery,
     ) -> Option<hellas_channel::work_open::FinalizedSetup> {
+        if self.query.bond_edge != query.bond_edge || self.query.payment_edge != query.payment_edge
+        {
+            return None;
+        }
         Some(hellas_channel::work_open::FinalizedSetup {
+            query: query.clone(),
             height: self.block.height,
+            payload: self.block.payload.0,
+            certified_at_ms: self.certified_at_ms,
             bond: self.bond,
             payment: self.payment,
             lease: self.lease(),
-            live_funding: self.live_funding_of(funding)?.clone(),
+            pending: self.pending(),
+            live_funding: self.live_funding_of(&query.funding)?.clone(),
         })
     }
 }
@@ -347,6 +368,26 @@ pub trait FinalizedWorkView: Clone + Send + Sync + 'static {
     ) -> impl Future<
         Output = Result<Option<crate::light_client::Verified<WorkChannelSnapshot>>, QueryError>,
     > + Send;
+
+    /// Returns one snapshot per query, in order. Each is coherent at its
+    /// own block; different channels may be read at different blocks.
+    fn work_channel_snapshots(
+        &self,
+        queries: Vec<WorkChannelQuery>,
+    ) -> impl Future<
+        Output = Result<
+            Vec<Option<crate::light_client::Verified<WorkChannelSnapshot>>>,
+            QueryError,
+        >,
+    > + Send {
+        async move {
+            let mut snapshots = Vec::with_capacity(queries.len());
+            for query in queries {
+                snapshots.push(self.work_channel_snapshot(query).await?);
+            }
+            Ok(snapshots)
+        }
+    }
 }
 
 #[cfg(feature = "client-core")]
@@ -362,6 +403,40 @@ impl FinalizedWorkView for crate::client::RemoteLightClient {
         };
         let snapshot = WorkChannelSnapshot::from_objects(network, query, snapshot.into_inner())?;
         Ok(Some(crate::light_client::Verified::new(snapshot)))
+    }
+
+    /// One proof read per chunk of whole channels: as many channels'
+    /// keys as fit the read's key limit share one certified root.
+    async fn work_channel_snapshots(
+        &self,
+        queries: Vec<WorkChannelQuery>,
+    ) -> Result<Vec<Option<crate::light_client::Verified<WorkChannelSnapshot>>>, QueryError> {
+        use crate::LightClient as _;
+        let network = self.pinned_network();
+        let mut snapshots = Vec::with_capacity(queries.len());
+        let mut chunk: Vec<WorkChannelQuery> = Vec::new();
+        let mut keys = Vec::new();
+        let mut queries = queries.into_iter().peekable();
+        while let Some(query) = queries.next() {
+            keys.extend(query.object_keys(network));
+            chunk.push(query);
+            let full = queries.peek().is_none_or(|next| {
+                keys.len() + next.object_keys(network).len() > crate::proof_verify::MAX_CURRENT_KEYS
+            });
+            if !full {
+                continue;
+            }
+            let read = self.get_objects(std::mem::take(&mut keys)).await?;
+            for query in chunk.drain(..) {
+                snapshots.push(match &read {
+                    Some(objects) => Some(crate::light_client::Verified::new(
+                        WorkChannelSnapshot::from_objects(network, query, (**objects).clone())?,
+                    )),
+                    None => None,
+                });
+            }
+        }
+        Ok(snapshots)
     }
 }
 
@@ -403,6 +478,7 @@ mod tests {
         WorkChannelSnapshot::new(
             query,
             block(),
+            0,
             None,
             None,
             [None, None],
@@ -454,8 +530,16 @@ mod tests {
         let value = lease_value();
         let slots = lease_slots(&value);
 
-        let held =
-            WorkChannelSnapshot::new(query(), block(), None, None, slots, None, BTreeSet::new());
+        let held = WorkChannelSnapshot::new(
+            query(),
+            block(),
+            0,
+            None,
+            None,
+            slots,
+            None,
+            BTreeSet::new(),
+        );
         let LeaseSlots::Present(lease) = held.lease() else {
             panic!(
                 "the canonical bytes are a readable lease, got {:?}",
@@ -476,7 +560,7 @@ mod tests {
             funding: BTreeSet::new(),
         };
         let elsewhere =
-            WorkChannelSnapshot::new(other, block(), None, None, slots, None, BTreeSet::new());
+            WorkChannelSnapshot::new(other, block(), 0, None, None, slots, None, BTreeSet::new());
         assert!(matches!(elsewhere.lease(), LeaseSlots::Faulty(_)));
 
         assert_eq!(empty(query()).lease(), LeaseSlots::Absent);

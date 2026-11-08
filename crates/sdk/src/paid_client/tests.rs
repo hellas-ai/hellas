@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::enrollment;
+use futures::StreamExt as _;
 use hellas_private::StoreLocation;
 mod offer;
 mod recovery;
@@ -442,7 +443,6 @@ fn fetch_request(assurance: Assurance) -> (ProviderChannelPolicy, PreparedInvoca
             200,
             hellas_kernel::Fees::ZERO,
         ),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     };
     let caller = ProducerSigningKey::from_secret_bytes([7; 32])
         .unwrap()
@@ -511,7 +511,6 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
     use crate::test_support::{PaidFixture, signer};
     use hellas_auth::test_support::actors::{FRIEND, ROOT};
     use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
-    use hellas_channel::work_store::SetupScan;
     use hellas_kernel::{Auth, Key, Parties, PartyAuth, PartyKeys, Terms, Tx};
 
     let root = tempfile::tempdir().unwrap();
@@ -580,13 +579,6 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
             PaymentAdmission::Proposes(Box::new(policy.clone())),
         );
         setup.import(&proposal.encode()).await.unwrap();
-        setup
-            .arm_scan(SetupScan {
-                height: 0,
-                payload: [0; 32],
-            })
-            .await
-            .unwrap();
         let terms = payment_terms(&fixture.config, &policy, &proposal, 601);
         let payment_funding = Funding::new(
             hellas_kernel::List::take(

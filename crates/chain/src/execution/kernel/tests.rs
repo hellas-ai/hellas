@@ -18,6 +18,7 @@ fn context(height: u64) -> KernelContext {
     KernelContext::with_fees(
         crate::domain::TEST_NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([height.saturating_sub(1) as u8; BlockHash::LENGTH]),
         KERNEL_FEES,
     )
@@ -539,7 +540,6 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
         bond_edge: EdgeId::from_bytes([6; EdgeId::LENGTH]),
         bond_terms: bond.clone(),
         private_policy_commitment: [7; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: 8,
         omission_bond: 1,
     });
@@ -655,7 +655,6 @@ fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: [0x45; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: 8,
         omission_bond: 2,
     });
@@ -771,7 +770,9 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
     /// the open checks the two are equal.
     const STAKE: u64 = 12;
     const OMISSION_BOND: u64 = 2;
-    const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
+    // `context` stamps each block one second after the last, so the
+    // window spans this many blocks.
+    const WINDOW: u64 = hellas_kernel::RESPONSE_WINDOW_MS / 1_000;
     /// The bond's timeout, and so the channel's admission horizon.
     const HORIZON: u64 = 500;
     // The client opens at 30; the provider answers with the client's
@@ -819,7 +820,6 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: [0x25; 32],
-        omit_response_blocks: WINDOW,
         start_validity_blocks: 8,
         omission_bond: OMISSION_BOND,
     });
@@ -1247,7 +1247,9 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;
     const OMISSION_BOND: u64 = 2;
-    const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
+    // `context` stamps each block one second after the last, so the
+    // window spans this many blocks.
+    const WINDOW: u64 = hellas_kernel::RESPONSE_WINDOW_MS / 1_000;
     const START_VALIDITY: u64 = 8;
     const HORIZON: u64 = 500;
     /// What the client signed for its one job.
@@ -1298,7 +1300,6 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: private_policy_commitment(network, &SALT, &policy),
-        omit_response_blocks: WINDOW,
         start_validity_blocks: START_VALIDITY,
         omission_bond: OMISSION_BOND,
     };
@@ -1393,7 +1394,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
         assert_eq!(record.start_cumulative(), EARNED);
         assert!(!record.responded());
         assert!(!record.penalty_due());
-        assert_eq!(record.response_deadline(), CURSOR + 1 + WINDOW);
+        assert_eq!(record.response_deadline_ms(), (CURSOR + 1 + WINDOW) * 1_000);
 
         // The client never answers. At the deadline the endpoint
         // builds its close out of the record the chain holds.
@@ -1413,7 +1414,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
 
         apply_and_finalize(
             &database,
-            context(record.response_deadline()),
+            context(record.response_deadline_ms() / 1_000),
             &[Transaction::Kernel(close.clone())],
             &allocations,
         )
@@ -1472,7 +1473,6 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
     const FUNDING: u64 = 100;
     const STAKE: u64 = 12;
     const OMISSION_BOND: u64 = 2;
-    const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
     const HORIZON: u64 = 500;
     /// What the client signed for, and left out of its own start.
     const EARNED: u64 = 60;
@@ -1520,7 +1520,6 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: private_policy_commitment(network, &SALT, &policy),
-        omit_response_blocks: WINDOW,
         start_validity_blocks: 8,
         omission_bond: OMISSION_BOND,
     };
@@ -1634,7 +1633,7 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
 
         apply_and_finalize(
             &database,
-            context(answered.response_deadline()),
+            context(answered.response_deadline_ms() / 1_000),
             &[Transaction::Kernel(close)],
             &allocations,
         )

@@ -638,7 +638,6 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let (provider, upstream, provider_content) = start_provider(
                 case.root.path(),
                 work_config(&case.devnet, case.root.path().join("provider-journal")),
-                case.provider_node.clone(),
                 &case.identity,
             )
             .await;
@@ -1047,7 +1046,6 @@ fn reused_nonce_scenario(
         let (provider, upstream, provider_content) = start_provider(
             case.root.path(),
             work_config(&case.devnet, case.root.path().join("provider-journal")),
-            case.provider_node.clone(),
             &case.identity,
         )
         .await;

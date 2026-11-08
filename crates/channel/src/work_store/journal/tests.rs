@@ -250,6 +250,27 @@ async fn pre_cutover_journals_are_refused_without_migration_or_legacy_replay() {
     connection.close().await.unwrap();
 }
 
+/// A version-1 journal recorded a contiguous block cursor. It belongs to a
+/// chain this binary no longer follows, so it is refused, not read.
+#[tokio::test]
+async fn a_block_cursor_journal_is_refused_without_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let (journal, _) = Journal::open_latest(&location, "v1", id()).await.unwrap();
+    drop(journal);
+    let options = SqliteConnectOptions::new().filename(Journal::path(&location, "v1"));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql("PRAGMA user_version = 1")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    assert!(matches!(
+        Journal::open_latest(&location, "v1", id()).await,
+        Err(JournalError::Version { found: 1 })
+    ));
+}
+
 #[tokio::test]
 async fn failed_header_validation_releases_the_writer_before_returning() {
     let root = tempfile::tempdir().unwrap();

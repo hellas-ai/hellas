@@ -76,67 +76,26 @@ pub const MAX_BLOCK_TIME_LEAD_MS: u64 = 5_000;
 
 // ── Work-channel bounds ───────────────────────────────────────────────
 
-/// Largest response window a work-payment channel may commit.
-pub const MAX_OMIT_RESPONSE_BLOCKS: u64 = 4096;
-
-// The response-window floor is a *derived* deployment bound, not a
-// preference. The omission theorem pays the provider its greatest
-// admitted certificate only if the provider can (a) observe the client's
-// close start from a finalized view, (b) notice it within its own poll
-// interval, (c) get its answer onto the wire, and (d) have that answer
-// included. A window shorter than that sum leaves the client an
-// understatement it can win by construction, so consensus refuses to
-// open the channel at all rather than opening one whose safety argument
-// cannot hold.
-//
-// Each term below is a measurement of *this* deployment, taken at the
-// upper end of its observed range. A deployment with slower finality,
-// lazier endpoints, or a longer censorship tail does not get a shorter
-// window by leaving these alone: it must re-measure and raise them,
-// which moves `MIN_OMIT_RESPONSE_BLOCKS` and is therefore a
-// chain-version change. If inclusion delay is unbounded — a censoring
-// proposer majority — no finite floor restores the theorem, and this
-// bound does not pretend otherwise.
-
-/// `F`: blocks between inclusion and a finalized view.
+/// The close response window, in certified block time.
 ///
-/// Threshold-simplex finalizes the block it notarizes, so this is the
-/// notarize/finalize round trip plus one block of slack.
-pub const RESPONSE_FINALIZATION_BLOCKS: u64 = 2;
-
-/// `POLL`: longest interval an endpoint may leave between finalized-view
-/// reads.
+/// A start accepted in a block stamped `t` opens a contest whose answer
+/// must land in a block stamped before `t + RESPONSE_WINDOW_MS`, and
+/// whose adjudicated close is admissible from that time on. Time, not
+/// blocks: a remote watcher polls on a clock, and a block count says
+/// nothing about how long a block takes.
 ///
-/// Endpoints poll for the terminal window rather than performing a
-/// finalized read before every off-chain acknowledgement.
-pub const RESPONSE_POLL_BLOCKS: u64 = 4;
-
-/// `G`: blocks a submitted response may spend propagating to a proposer.
-pub const RESPONSE_PROPAGATION_BLOCKS: u64 = 1;
-
-/// `I`: blocks a fee-paying response may wait for inclusion.
-///
-/// At the deployment's measured censorship quantile.
-pub const RESPONSE_INCLUSION_BLOCKS: u64 = 8;
-
-/// Smallest response window a work-payment channel may commit.
-///
-/// `F + POLL + G + I + 1`. The trailing block is the response's own
-/// inclusion block: the deadline is exclusive, so a response landing
-/// exactly at it is too late.
-pub const MIN_OMIT_RESPONSE_BLOCKS: u64 = RESPONSE_FINALIZATION_BLOCKS
-    + RESPONSE_POLL_BLOCKS
-    + RESPONSE_PROPAGATION_BLOCKS
-    + RESPONSE_INCLUSION_BLOCKS
-    + 1;
-
-// A floor above the ceiling would admit no window at all, which reads at
-// the call site as "every payment open is rejected" rather than as the
-// constant mistake it is.
-const _: () = assert!(
-    MIN_OMIT_RESPONSE_BLOCKS <= MAX_OMIT_RESPONSE_BLOCKS,
-    "the derived response-window floor must leave a committable range"
-);
+/// The omission theorem pays the provider its greatest admitted
+/// certificate only if it can notice the start and get its answer
+/// included inside this window. A watcher spends at most a poll interval
+/// plus a certified-age bound noticing (both derived from this const by
+/// the channel crate), a certified block's timestamp leads real time by
+/// at most [`MAX_BLOCK_TIME_LEAD_MS`] — validators wait out a later
+/// stamp — and at least half the window is left for submission and
+/// inclusion through leader timeouts.
+/// Two minutes also lets the chain halt for about a minute without
+/// costing an honest responder its answer: a halt consumes the window,
+/// because the first block after it carries the time it was made.
+pub const RESPONSE_WINDOW_MS: u64 = 120_000;
 
 /// Largest inclusion window a signed work-payment close start may claim.
 ///

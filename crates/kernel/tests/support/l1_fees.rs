@@ -96,6 +96,7 @@ pub(crate) fn context(height: i64, fees: Fees) -> Context {
     Context::with_fees(
         super::NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         fees,
     )

@@ -301,6 +301,7 @@ impl itf::Runner for Runner {
         let context = Context::new(
             NETWORK,
             BlockHeight::new(expected.height),
+            expected.height * 1_000,
             BlockHash::from_bytes([0; 32]),
         );
         let result = actual.kernel.apply(context, &FAKE_VERIFIER, &tx);

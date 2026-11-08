@@ -49,6 +49,18 @@ async fn response_fixture_with_contests(
     partition: &'static str,
     contest_count: usize,
 ) -> Box<ResponseFixture> {
+    response_fixture_at(runtime, partition, contest_count, None).await
+}
+
+/// The fixture, optionally with one more empty block after the contests,
+/// stamped at `cursor_stamp`: the block the response pre-admission reads
+/// its clock from.
+async fn response_fixture_at(
+    runtime: commonware_runtime::tokio::Context,
+    partition: &'static str,
+    contest_count: usize,
+    cursor_stamp: Option<u64>,
+) -> Box<ResponseFixture> {
     use hellas_kernel::{
         Auth, EarnedCertificate, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties,
         Party, PaymentCloseStart, Payout, Secp256k1Signer, Terms, WorkPaymentTerms,
@@ -107,7 +119,6 @@ async fn response_fixture_with_contests(
             bond_edge,
             bond_terms: bond,
             private_policy_commitment: [0x25; 32],
-            omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
             start_validity_blocks: 64,
             omission_bond: 2,
         });
@@ -217,6 +228,16 @@ async fn response_fixture_with_contests(
     let floor = index_block(&genesis, floor_root, Vec::new());
     let contest_root = apply(&database, &allocations, 2, &transactions).await;
     let contest = index_block(&floor, contest_root, transactions);
+    let mut finalized = vec![floor, contest.clone()];
+    if let Some(stamp) = cursor_stamp {
+        let root = apply(&database, &allocations, 3, &[]).await;
+        finalized.push(crate::execution::test_support::index_block_at(
+            &contest,
+            root,
+            Vec::new(),
+            stamp,
+        ));
+    }
 
     let consensus = consensus_fixture(95);
     let (chain_indexer, handle) = spawn_archive(
@@ -235,21 +256,19 @@ async fn response_fixture_with_contests(
     )
     .await
     .expect("chain indexer");
-    for block in [&floor, &contest] {
+    for block in &finalized {
         chain_indexer
             .publish_proof(block.clone(), &finality_envelope(&consensus, block))
             .await
             .expect("finalized ingest");
     }
     let owner_index = OwnerIndex::new(network, &genesis, allocations.clone());
-    assert_eq!(
-        owner_index.apply_finalized(&floor),
-        Ok(ApplyOutcome::Applied)
-    );
-    assert_eq!(
-        owner_index.apply_finalized(&contest),
-        Ok(ApplyOutcome::Applied)
-    );
+    for block in &finalized {
+        assert_eq!(
+            owner_index.apply_finalized(block),
+            Ok(ApplyOutcome::Applied)
+        );
+    }
     let client = LocalLightClient::new(
         database.clone(),
         owner_index.clone(),
@@ -275,6 +294,56 @@ async fn response_fixture_with_contests(
         valid_responses,
         _indexer: handle,
     })
+}
+
+/// The pre-admission clock is the cursor block's own stamp: a response
+/// already at its deadline there is refused before it reaches a mempool,
+/// and one stamp earlier is admitted. The contest is accepted at block
+/// time 2 000 ms, so its window shuts at 2 000 + `RESPONSE_WINDOW_MS`.
+#[test]
+fn a_response_at_its_deadline_by_block_time_is_refused_before_the_mempool() {
+    use hellas_kernel::Encode as _;
+    use hellas_rpc::pb::{
+        chain::{SubmitTxOutcome as ProtoOutcome, SubmitWorkResponseRequest},
+        services::light_client::LightClientHandler,
+    };
+    let deadline = 2_000 + hellas_kernel::RESPONSE_WINDOW_MS;
+    for (stamp, admitted) in [(deadline - 1, true), (deadline, false)] {
+        run_qmdb(move |runtime| async move {
+            let fixture = response_fixture_at(runtime, "response_block_time", 1, Some(stamp)).await;
+            let (activity_tx, _activity_rx) = tokio::sync::broadcast::channel(1);
+            let rpc = crate::server::LightClientRpc::new(fixture.client.clone(), activity_tx);
+            let mut bytes = vec![0; hellas_kernel::PaymentCloseResponse::MAX_ENCODED_SIZE];
+            let written = fixture.valid.write_to(&mut bytes);
+            bytes.truncate(written);
+            let outcome = LightClientHandler::submit_work_response(
+                &rpc,
+                SubmitWorkResponseRequest { response: bytes },
+                hellas_wire::TransportContext::default(),
+            )
+            .await
+            .map(|response| response.outcome);
+            if admitted {
+                assert_eq!(outcome.ok(), Some(ProtoOutcome::Enqueued as i32));
+            } else {
+                assert_ne!(
+                    outcome.ok(),
+                    Some(ProtoOutcome::Enqueued as i32),
+                    "a response stamped at its deadline is late",
+                );
+                assert!(
+                    fixture
+                        .client
+                        .mempool()
+                        .inner
+                        .lock()
+                        .await
+                        .responses
+                        .is_empty()
+                );
+            }
+        });
+    }
 }
 
 fn response_transaction(response: &PaymentCloseResponse) -> Transaction {
@@ -699,7 +768,6 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: [0x25; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: 8,
         omission_bond: 2,
     });
@@ -969,6 +1037,7 @@ async fn apply(
         KernelContext::with_fees(
             crate::domain::TEST_NETWORK,
             BlockHeight::new(height),
+            height * 1_000,
             BlockHash::from_bytes([0; BlockHash::LENGTH]),
             KERNEL_FEES,
         ),

@@ -18,12 +18,14 @@ use hellas_kernel::{
 pub(crate) const CONTEXT: Context = Context::new(
     super::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
 pub(crate) const TIMEOUT_CONTEXT: Context = Context::new(
     super::NETWORK,
     TIMEOUT,
+    TIMEOUT.get() * 1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 pub(crate) const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);

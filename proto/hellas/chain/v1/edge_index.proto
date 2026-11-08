@@ -184,7 +184,7 @@ message EdgeIndexWorkPaymentTerms {
  uint64 admission_horizon = 7;
  string private_policy_commitment = 8;
  uint64 omission_bond = 9;
- uint64 omit_response_blocks = 10;
+ reserved 10; // The response window is the kernel const RESPONSE_WINDOW_MS.
  uint64 start_validity_blocks = 11;
  repeated string allowed_close_kinds = 12;
 }
@@ -246,7 +246,8 @@ message EdgeIndexPendingProjection {
  string payment_edge_id = 1;
  string opener_role = 2;
  string start_id = 3;
- uint64 response_deadline = 4;
+ reserved 4; // Was a block height; the deadline is block time now.
+ uint64 response_deadline_ms = 10;
  uint64 start_cumulative = 5;
  uint64 final_cumulative = 6;
  bool responded = 7;

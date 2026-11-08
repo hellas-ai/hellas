@@ -21,15 +21,16 @@ use hellas_channel::work::{
 };
 use hellas_channel::work_close::{CloseProgress, TxSink, close_start};
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
-use hellas_channel::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
+use hellas_channel::work_open::{
+    FinalizedSetup, SetupAdvance, SetupProgress, SetupStep, advance_setup, setup_query,
+};
+use hellas_channel::work_store::{Role, SetupOrigin, SetupStore};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::{CollectResultOutcome, CollectedResult, collect_result};
 use hellas_kernel::{
-    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS,
-    MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, PartyKeys, Payout, PendingSlot,
-    Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
-    WorkStakeBondTerms,
+    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS, Move, Parties,
+    Party, PartyKeys, Payout, PendingSlot, Secp256k1Signer, Secp256k1Verifier,
+    Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_store::content::DiskStore;
 use hellas_wire::TransportContext;
@@ -61,10 +62,9 @@ const OMISSION_BOND: u64 = 51;
 /// The sole job's price, fixed by the execution policy both parties
 /// signed.
 const PRICE: u64 = 10;
-/// The bond's timeout, and so the channel's admission horizon.
-const HORIZON: u64 = 64;
-/// The response window the terms commit and the measurements claim.
-const WINDOW: u64 = MIN_OMIT_RESPONSE_BLOCKS + 4;
+/// The bond's timeout, and so the channel's admission horizon. Past a
+/// whole response window: the devnet stamps at least a second per block.
+const HORIZON: u64 = 400;
 const SALT: [u8; 32] = [0x5a; 32];
 const CREDIT_LIMIT: u64 = 40;
 /// Which node the provider reads and submits at.
@@ -214,7 +214,6 @@ fn payment_terms(allocations: &Allocations) -> WorkPaymentTerms {
         bond_edge(allocations),
         bond_terms(allocations),
         private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
-        WINDOW,
         64,
         OMISSION_BOND,
     )
@@ -234,7 +233,6 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         invocation_policy: work_policy(),
         expected_payment_values: expected_values(),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 
@@ -407,13 +405,6 @@ async fn open_setup(
     store
 }
 
-fn scan_at(block: &HellasBlock) -> SetupScan {
-    SetupScan {
-        height: commonware_consensus::Heightable::height(block).get(),
-        payload: block.digest().into(),
-    }
-}
-
 /// The provider's live setup service after a real three-revision
 /// handshake.
 ///
@@ -432,7 +423,6 @@ async fn shake_hands(
     client_root: &std::path::Path,
     client_content: &DiskStore,
     allocations: &Allocations,
-    scan: SetupScan,
 ) -> Handshake {
     let bond = bond_edge(allocations);
     let mut proposer = SetupEndpoint::new(
@@ -446,10 +436,6 @@ async fn shake_hands(
         provider(),
         PaymentAdmission::Admits(Box::new(provider_policy())),
     );
-    proposer
-        .arm_scan(scan)
-        .await
-        .expect("the provider arms its scan");
     if let Err(error) = proposer
         .propose_bond(
             TEST_NETWORK,
@@ -471,7 +457,6 @@ async fn shake_hands(
         &service,
         &mut caller,
         bond_edge(allocations),
-        scan,
         payment_funding(allocations),
         payment_terms(allocations),
     )
@@ -485,22 +470,40 @@ async fn shake_hands(
     Handshake { provider: service }
 }
 
+/// One certified read of what a setup journal asks now.
+async fn setup_read(
+    source: &WorkBlocks<LocalLightClient>,
+    query: &hellas_channel::work_open::SetupQuery,
+) -> FinalizedSetup {
+    source
+        .work_channel_snapshot(WorkChannelQuery {
+            bond_edge: query.bond_edge,
+            payment_edge: query.payment_edge,
+            funding: query.funding.clone(),
+        })
+        .await
+        .expect("the setup state reads")
+        .expect("certified state exists")
+        .finalized_setup(query)
+        .expect("the read answers the setup's query")
+}
+
 /// One step of the provider's setup, driven the way `serve`'s clock
 /// drives it: through the same [`SetupService`] that answered the
-/// handshake, over one source that is both view, blocks and sink.
+/// handshake, from one certified read, submitting to the same source.
 async fn provider_step(
     service: &SetupService,
     source: &WorkBlocks<LocalLightClient>,
 ) -> SetupAdvance {
-    loop {
-        match service.advance_setup(source, source, source).await {
-            Ok(SetupAdvance {
-                progress: SetupProgress::HistoryAdvanced { .. },
-                ..
-            }) => continue,
-            Ok(advance) => return advance,
-            Err(error) => panic!("the provider's setup takes a step: {error}"),
-        }
+    let query = service
+        .query()
+        .await
+        .expect("the setup is reachable")
+        .expect("the handshake names a payment edge");
+    let read = setup_read(source, &query).await;
+    match service.advance_setup(&read, source).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("the provider's setup takes a step: {error}"),
     }
 }
 
@@ -509,15 +512,11 @@ async fn client_step(
     store: &mut SetupStore,
     source: &WorkBlocks<LocalLightClient>,
 ) -> SetupAdvance {
-    loop {
-        match advance_setup(source, source, source, store, &Secp256k1Verifier::new()).await {
-            Ok(SetupAdvance {
-                progress: SetupProgress::HistoryAdvanced { .. },
-                ..
-            }) => continue,
-            Ok(advance) => return advance,
-            Err(error) => panic!("the client's setup takes a step: {error}"),
-        }
+    let query = setup_query(store.state()).expect("the handshake names a payment edge");
+    let read = setup_read(source, &query).await;
+    match advance_setup(&read, source, store, &Secp256k1Verifier::new()).await {
+        Ok(advance) => advance,
+        Err(error) => panic!("the client's setup takes a step: {error}"),
     }
 }
 
@@ -602,16 +601,9 @@ async fn open_channel(
             crate::SubmitTxOutcome::Enqueued
         );
     }
-    let floor = devnet.seal().await;
+    devnet.seal().await;
     let client_content = content(client_root).await;
-    let handshake = shake_hands(
-        provider_root,
-        client_root,
-        &client_content,
-        &allocations,
-        scan_at(&floor),
-    )
-    .await;
+    let handshake = shake_hands(provider_root, client_root, &client_content, &allocations).await;
 
     // The bond, submitted by the driver and finalized by consensus.
     assert_eq!(
@@ -649,15 +641,16 @@ async fn open_channel(
             payment_edge: payment_edge(&allocations),
             height: commonware_consensus::Heightable::height(&origin_block).get(),
             payload: origin_block.digest().into(),
-            parent: bond_block.digest().into(),
         },
+        "the provider's channel begins at its first sighting of the payment edge",
     );
+    let _ = bond_block;
     let Some(provider_store) = advance.mounted else {
         panic!("a completed setup hands back the channel it mounted");
     };
 
-    // The client reaches the same origin from its own journal, reading a
-    // different validator. The journal is reopened from the disk, so
+    // The client records its own first sighting, reading a different
+    // validator at the same height, so the origin is the same block. The journal is reopened from the disk, so
     // nothing this process held in memory carries the client's half.
     let mut client_setup = open_setup(
         client_root,
@@ -738,7 +731,7 @@ async fn open_channel(
 /// Step 3: one paid job, with both invocation counts asserted.
 ///
 /// Returns the price the provider acknowledged crediting.
-async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
+async fn run_one_paid_job(opened: &mut Opened) -> u64 {
     let backend = AnsweringBackend::new();
     let provider_calls = Arc::clone(&backend.calls);
     let proposal = JobProposal {
@@ -785,14 +778,7 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
 
     let (transport, server) = transport_pair();
     let serving = serve(server, opened.service.clone());
-    let collected = collect_result(
-        transport,
-        &mut opened.client,
-        &opened.ready,
-        &devnet.blocks(CLIENT_NODE),
-        work_id,
-    )
-    .await;
+    let collected = collect_result(transport, &mut opened.client, &opened.ready, work_id).await;
     serving.abort();
     let Ok(CollectResultOutcome::Collected(CollectedResult { result, transcript })) = collected
     else {
@@ -833,12 +819,22 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
     credited
 }
 
-/// One tick through the same per-channel entry `serve` puts on its timer.
+/// One tick through the same per-channel entry `serve` puts on its timer:
+/// one certified read of the channel, then the step decided from it.
 async fn provider_clock(devnet: &WorkDevnet, service: &WorkService) -> PaidWorkClockAdvance {
     let blocks = devnet.blocks(PROVIDER_NODE);
-    advance_paid_work_clock(service, &blocks)
+    let snapshot = devnet.snapshot(PROVIDER_NODE, &devnet.allocations).await;
+    advance_paid_work_clock(service, &snapshot, &blocks)
         .await
         .expect("the provider's production clock advances")
+}
+
+/// What the clock handed consensus as the contest's final close, if anything.
+const fn adjudication(advance: &PaidWorkClockAdvance) -> Option<crate::SubmitTxOutcome> {
+    match advance.close {
+        CloseProgress::AdjudicationSubmitted { outcome, .. } => Some(outcome),
+        _ => None,
+    }
 }
 
 /// Drives the provider's close until the contest it opened is on chain.
@@ -848,7 +844,7 @@ async fn drive_close_onto_chain(devnet: &mut WorkDevnet, service: &WorkService) 
         matches!(advance.close, CloseProgress::Submitted { .. }),
         "the production clock submits a start: {advance:?}",
     );
-    assert_eq!(advance.adjudication, None, "no contest is finalized yet");
+    assert_eq!(adjudication(&advance), None, "no contest is finalized yet");
     assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
     devnet.seal().await;
 
@@ -857,7 +853,8 @@ async fn drive_close_onto_chain(devnet: &mut WorkDevnet, service: &WorkService) 
         panic!("the start opened a contest: {advance:?}");
     };
     assert_eq!(
-        advance.adjudication, None,
+        adjudication(&advance),
+        None,
         "an unresponded contest below its deadline is not final",
     );
     assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
@@ -867,7 +864,7 @@ async fn drive_close_onto_chain(devnet: &mut WorkDevnet, service: &WorkService) 
 async fn settle_on_the_clock(devnet: &mut WorkDevnet, service: &WorkService) -> HellasBlock {
     let allocations = devnet.allocations.clone();
     assert_eq!(
-        provider_clock(devnet, service).await.adjudication,
+        adjudication(&provider_clock(devnet, service).await),
         Some(crate::SubmitTxOutcome::Enqueued),
         "the production clock submits the due adjudicated close",
     );
@@ -987,7 +984,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
                 "the provider holds no coin at all while its stake is bonded",
             );
 
-            let credited = run_one_paid_job(&devnet, &mut opened).await;
+            let credited = run_one_paid_job(&mut opened).await;
             assert_eq!(credited, PRICE);
 
             // Nothing has moved on chain yet: an admitted certificate is not
@@ -1015,23 +1012,18 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
                         PRICE,
                         "the contest consensus holds settles at the certificate the client signed",
                     );
-                    pending.response_deadline()
+                    pending.response_deadline_ms()
                 }
                 other => panic!("the start opened a contest on chain: {other:?}"),
             };
-            devnet.seal_through(deadline).await;
+            devnet.seal_past(deadline).await;
             settle_on_the_clock(&mut devnet, &opened.service).await;
 
             // The provider's own journal, caught up past its close, agrees
             // about what it was paid.
             let advance = provider_clock(&devnet, &opened.service).await;
-            assert_eq!(
-                advance.close,
-                CloseProgress::Settled {
-                    provider_payout: PRICE
-                },
-            );
-            assert_eq!(advance.adjudication, None, "the payment edge is gone");
+            assert_eq!(advance.close, CloseProgress::Settled);
+            assert_eq!(adjudication(&advance), None, "the payment edge is gone");
             assert_eq!(
                 advance.bond_timeout,
                 Some(crate::SubmitTxOutcome::Enqueued),
@@ -1150,7 +1142,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
 
             let mut opened =
                 open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
-            assert_eq!(run_one_paid_job(&devnet, &mut opened).await, PRICE);
+            assert_eq!(run_one_paid_job(&mut opened).await, PRICE);
 
             // The client opens a close claiming the provider earned nothing.
             // Its own signature, on the real start builder, at the height
@@ -1194,7 +1186,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
             );
             devnet.seal().await;
 
-            let opened_at = devnet.height();
+            let opened_at = devnet.head().timestamp();
             let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
                 PendingSlot::Present(pending) => {
                     assert_eq!(
@@ -1202,7 +1194,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                         0,
                         "the understated claim is on chain"
                     );
-                    pending.response_deadline()
+                    pending.response_deadline_ms()
                 }
                 other => panic!("the client's start opened a contest: {other:?}"),
             };
@@ -1218,7 +1210,8 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 panic!("the drive saw the contest: {advance:?}");
             };
             assert_eq!(
-                advance.adjudication, None,
+                adjudication(&advance),
+                None,
                 "the response is not consensus evidence before it lands",
             );
             assert_eq!(advance.bond_timeout, None, "the bond horizon is ahead");
@@ -1233,9 +1226,9 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 "the response is in finalized history",
             );
             assert!(
-                devnet.height() < deadline,
-                "and it landed at {} — before the deadline at {deadline}",
-                devnet.height(),
+                answer_block.timestamp() < deadline,
+                "and it landed at block time {} — before the deadline at {deadline}",
+                answer_block.timestamp(),
             );
 
             let settled = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {

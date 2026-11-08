@@ -181,7 +181,7 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
         hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
-    assert_eq!(paid.chain.network().as_str(), "hellas-devnet-2");
+    assert_eq!(paid.chain.network().as_str(), "hellas-devnet-3");
     assert_eq!(paid.policy.payment_policy.fixed_price, 20);
     assert_eq!(paid.policy.expected_payment_values.value(), 401);
     let config = hellas_sdk::grant_config::GrantConfig::unconfigured(&paid.root);

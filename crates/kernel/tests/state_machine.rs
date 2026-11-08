@@ -91,6 +91,7 @@ const fn context_at(height: u64) -> Context {
     Context::new(
         support::NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     )
 }

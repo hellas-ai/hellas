@@ -1,4 +1,4 @@
-//! Spending the certificate: the finalized cursor, and the two
+//! Spending the certificate: the certified cursor, and the two
 //! transactions that turn a signed scalar into coins.
 //!
 //! # Why the cursor is the load-bearing part
@@ -6,42 +6,26 @@
 //! Five rules elsewhere in this crate are decided against a height —
 //! whether a receipt is timely, whether a payment is timely, whether a
 //! job's deadlines are still reachable, whether plaintext released now
-//! can still arrive, and whether a readiness decision may be acted on.
+//! can still arrive, and whether a readiness decision may be acted on —
+//! and the close response window against the block time beside it.
 //! Every one of them reads
-//! [`Channel::cursor`](crate::work_store::Channel::cursor). Until this module
-//! there was no writer for it outside tests, and a cursor that never
-//! moves makes every one of those rules pass: a receipt three hundred
-//! blocks late reads as timely against a height that stopped.
+//! [`Channel::cursor`](crate::work_store::Channel::cursor), and a cursor
+//! that never moves makes every one of those rules pass: a receipt three
+//! hundred blocks late reads as timely against a height that stopped.
+//! [`observe`] is the only thing that moves it.
 //!
-//! So the cursor is not the plumbing around the close. It is what makes
-//! the deadlines mean anything, and [`observe`] is the only thing that
-//! moves it.
+//! # A certified state, not a replay
 //!
-//! # Contiguous, or not at all
-//!
-//! [`observe`] takes one block and commits one
-//! [`ChannelRecord::CursorAdvanced`], and that record refuses anything
-//! but the next height whose parent is the block already held. A
-//! notification that the chain has reached height 900 is a wake-up; it
-//! is not evidence that this endpoint read 880 through 899, and the
-//! close and the deadline those blocks may have carried are exactly
-//! what it would be missing.
-//!
-//! [`catch_up`] is therefore a loop and not a jump. A block the source
-//! cannot supply stops it, and the cursor stays where it was — which
-//! makes every gate above fail closed rather than pass on a stale
-//! height.
-//!
-//! # What a watcher looks for
-//!
-//! Two things, both on this channel's own payment edge. An accepted
-//! [`Move::StartPaymentClose`](hellas_kernel::Move::StartPaymentClose) means a contest is live, and the height
-//! that accepted it is the only place the contest's identifier can come
-//! from — the kernel derives [`StartId`] from the start
-//! digest *and*
-//! the inclusion height, so no retained signature determines it. An
-//! accepted [`Tx::Close`] means the edge is gone, and what it paid is
-//! read out of the transaction consensus admitted.
+//! [`observe`] takes one proof-checked read of this channel's objects at
+//! one certified block — the payment edge and its pending-close slot —
+//! and moves the cursor forward to that block, however far it is. What
+//! happened in between is not replayed because it does not need to be:
+//! consensus holds the one live contest on an edge in that slot until
+//! the edge is closed, so the read either shows the contest, shows the
+//! edge gone, or shows neither. A watcher that reads often enough —
+//! inside the response window, which is what the channel crate's poll
+//! interval and certified-age bound are derived to guarantee — sees
+//! every contest while it can still be answered.
 //!
 //! # Non-destructive broadcast
 //!
@@ -58,11 +42,9 @@
 //!   admitted into. The start holds a copy; it never becomes the only
 //!   copy.
 //! - [`adjudicated_close`] is derived, not retained: its payouts come
-//!   from the contest record consensus itself holds, so it can be
-//!   rebuilt after any crash from a fresh finalized read. What cannot be
-//!   rebuilt after the edge is consumed is the exact close *bytes* — and
-//!   nothing needs them, because [`observe`] recognises settlement by
-//!   the edge being closed rather than by matching bytes it kept.
+//!   from the contest record consensus itself holds, read in the same
+//!   certified state that shows the duty, so it is rebuilt after any
+//!   crash and it is the same transaction.
 //!
 //! # What this module does not do
 //!
@@ -73,50 +55,24 @@
 
 use hellas_kernel::{
     EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PayloadHash, PaymentCloseResponse,
-    PaymentCloseStart, Payout, PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier,
-    StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts,
+    PaymentCloseStart, Payout, PendingPaymentClose, PendingSlot, Proof, Secp256k1Signer, Sig,
+    SigVerifier, StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts,
 };
 use hex::encode as hex;
 
+use crate::model::setup::ObservedChannel;
 use crate::model::work::PaidChannel;
-use crate::work::{EndpointError, Handoff};
+use crate::work::EndpointError;
 use crate::work_store::{
-    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
+    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 
-/// One finalized block, as a watcher must see it.
-///
-/// The transactions are this block's accepted kernel transactions in
-/// consensus order — the order `HellasBlock::txs()` exposes, not a set
-/// and not a key-sorted projection. Two transactions in one block can
-/// be a start and the close that ends it, and reversing them is two
-/// different histories.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FinalizedWork {
-    /// Finalized height of this block.
-    pub height: u64,
-    /// Payload digest this block names as its parent.
-    pub parent: [u8; 32],
-    /// This block's own payload digest.
-    pub payload: [u8; 32],
-    /// The kernel transactions this block accepted, in block order.
-    pub txs: Vec<Tx>,
-}
-
-/// Why a finalized block could not be read.
-///
-/// A watcher stops and leaves its cursor where it was. Setup callers can
-/// distinguish a bounded wait for an unavailable read from other failures.
+/// Why the chain could not be read or would not take a transaction.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum BlockSourceError {
-    #[error("the finalized block source failed: {0}")]
+    #[error("the chain source failed: {0}")]
     Failed(String),
-    #[error("chain read remained unavailable for {timeout:?}: {reason}")]
-    ReadUnavailableTimeout {
-        timeout: std::time::Duration,
-        reason: String,
-    },
 }
 
 impl BlockSourceError {
@@ -131,10 +87,8 @@ impl BlockSourceError {
 ///
 /// One method, and it is deliberately not a query: submitting says
 /// nothing about inclusion, and an endpoint learns whether its start
-/// landed from the blocks it reads, never from the answer to this. It
-/// is in this crate rather than in the chain crate for
-/// [`FinalizedBlocks`]'s reason — both endpoints need exactly this and
-/// neither needs a mempool.
+/// landed from the state it reads, never from the answer to this. Both
+/// endpoints need exactly this and neither needs a mempool.
 pub trait TxSink {
     /// Hands one transaction to consensus.
     ///
@@ -145,36 +99,6 @@ pub trait TxSink {
         &self,
         tx: Tx,
     ) -> impl core::future::Future<Output = Result<hellas_rpc::SubmitTxOutcome, BlockSourceError>> + Send;
-}
-
-/// Where a watcher gets its finalized blocks.
-///
-/// Narrow on purpose, and in this crate rather than in the chain crate,
-/// because both endpoints need exactly this and neither needs a
-/// mempool, a coin query, or an activity stream to get it. It is also
-/// what lets the loop below be tested against a history a test writes
-/// down rather than a validator it runs.
-///
-/// This is a trusted evidence boundary: every returned block must be
-/// authenticated as finalized on the same pinned consensus chain. An
-/// unauthenticated RPC response is not an implementation of this contract.
-/// Historical queries retain this guarantee independently of query order.
-pub trait FinalizedBlocks {
-    /// Returns the highest finalized height, or `None` before anything
-    /// is finalized.
-    fn latest_height(
-        &self,
-    ) -> impl core::future::Future<Output = Result<Option<u64>, BlockSourceError>> + Send;
-
-    /// Returns the finalized block at `height`.
-    ///
-    /// `Ok(None)` means this source cannot supply that height — it is
-    /// not finalized, or it has been pruned. Both stop a scan; neither
-    /// is a reason to skip it.
-    fn block_at(
-        &self,
-        height: u64,
-    ) -> impl core::future::Future<Output = Result<Option<FinalizedWork>, BlockSourceError>> + Send;
 }
 
 /// Why a close could not be built.
@@ -202,24 +126,26 @@ pub enum CloseError {
     NoContest,
     /// The provider's response window has not run out, so consensus
     /// would refuse this close.
-    #[error("the response window is open until height {deadline}, and the cursor is at {height}")]
+    #[error(
+        "the response window is open until block time {deadline_ms}, and the read is at {at_ms}"
+    )]
     ResponseWindowOpen {
-        /// Finalized height the endpoint has reached.
-        height: u64,
-        /// Height at which the window shuts.
-        deadline: u64,
+        /// Block time of the read, in milliseconds.
+        at_ms: u64,
+        /// Block time at which the window shuts.
+        deadline_ms: u64,
     },
     /// The contest has already been answered, and there is one answer.
     #[error("this contest has already been answered")]
     AlreadyResponded,
     /// The response window has shut, so consensus would refuse an
     /// answer.
-    #[error("the response window shut at height {deadline}, and the read is at {height}")]
+    #[error("the response window shut at block time {deadline_ms}, and the read is at {at_ms}")]
     ResponseWindowClosed {
-        /// Finalized height the read was taken at.
-        height: u64,
-        /// Height at which the window shut.
-        deadline: u64,
+        /// Block time of the read, in milliseconds.
+        at_ms: u64,
+        /// Block time at which the window shut.
+        deadline_ms: u64,
     },
     /// This endpoint holds nothing the contest does not already settle.
     ///
@@ -250,11 +176,8 @@ pub enum CloseError {
 /// How far this channel's close has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseProgress {
-    /// The edge is gone, and this is what the close paid the provider.
-    Settled {
-        /// What the finalized close paid the provider.
-        provider_payout: u64,
-    },
+    /// The edge is gone. What it paid is the two payout coins.
+    Settled,
     /// A contest is finalized on this edge.
     Opened {
         /// The contest a response or a close must name.
@@ -281,7 +204,7 @@ pub enum CloseProgress {
     Nothing,
 }
 
-/// Why a catch-up did not finish.
+/// Why one certified read could not be applied, or its duty not served.
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
     /// This channel already has a cursor driver; ordinary brief journal
@@ -292,30 +215,13 @@ pub enum CatchUpError {
     /// holds, so this channel's cursor is not that driver's to advance.
     #[error("this channel's job is not the one the driver named")]
     OtherJob,
-    /// A close duty stops the read at the cursor, which is §5's
-    /// stop-before-successor rule refusing it: an answer owed and not
-    /// yet taken by a sink, or a settlement after which there is nothing
-    /// left to read. A backlog read past either is how a response
-    /// deadline is lost.
-    #[error("a close duty stops this read at height {height}, and no successor block is read")]
-    CloseDuty {
-        /// Cursor height the duty was found at.
-        height: u64,
-    },
-    /// The block source failed.
+    /// The read or the transaction sink failed.
     #[error(transparent)]
     Source(#[from] BlockSourceError),
-    /// A block inside the range this endpoint must read is not
-    /// available. The cursor stays where it was.
-    #[error("finalized block {height} is not available, so the cursor stays behind")]
-    Missing {
-        /// Height that could not be read.
-        height: u64,
-    },
-    /// A block was refused by the journal.
+    /// A read was refused by the journal.
     #[error(transparent)]
     Store(#[from] WorkStoreError),
-    /// The finalized contest cannot be distributed by the funded edge.
+    /// The certified contest cannot be distributed by the funded edge.
     #[error(transparent)]
     Close(#[from] CloseError),
 }
@@ -544,195 +450,92 @@ pub fn adjudicated_close(
     ))
 }
 
-/// Applies accepted contest moves through the kernel's canonical transitions.
-/// The caller supplies an authenticated finalized block; journaled summaries
-/// cannot manufacture a response or replace an already accepted one.
-fn contest_after_block(
-    channel: &PaidChannel,
-    previous: Option<PendingPaymentClose>,
-    block: &FinalizedWork,
-    contest: crate::work_store::OpenContest,
-) -> Result<PendingPaymentClose, crate::work_store::ChannelStateError> {
-    use crate::work_store::ChannelStateError::Malformed;
-    let mut pending = previous;
-    for tx in &block.txs {
-        match tx {
-            Tx::Move {
-                action: hellas_kernel::Move::StartPaymentClose(start),
-            } if start.payment_edge() == channel.payment_edge() => {
-                if pending.is_some() || start.terms().hash() != channel.payment_terms_hash() {
-                    return Err(Malformed);
-                }
-                let opened = PendingPaymentClose::from_accepted_start(
-                    channel.network(),
-                    block.height,
-                    start,
-                )
-                .ok_or(Malformed)?;
-                if opened.start_id() != contest.start_id
-                    || opened.opener_role() != contest.opener
-                    || opened.response_deadline() != contest.response_deadline
-                    || opened.start_cumulative() != contest.claimed
-                {
-                    return Err(Malformed);
-                }
-                pending = Some(opened);
-            }
-            Tx::Move {
-                action: hellas_kernel::Move::RespondPaymentClose(response),
-            } if response.payment_edge() == channel.payment_edge() => {
-                let opened = pending.ok_or(Malformed)?;
-                if opened.start_id() != response.start_id()
-                    || opened.responded()
-                    || block.height >= opened.response_deadline()
-                {
-                    return Err(Malformed);
-                }
-                pending = Some(opened.with_accepted_response(response));
-            }
-            Tx::Close { input, .. } if *input == channel.payment_edge() => return Err(Malformed),
-            _ => {}
-        }
-    }
-    pending.ok_or(Malformed)
-}
-
-/// The ordinary contiguous observer has already retained the contest through its
-/// latest relevant block. A gap cannot be repaired after archive pruning.
-async fn finalized_contest<C>(channel: &mut C) -> Result<PendingPaymentClose, CatchUpError>
-where
-    C: CloseChannel,
-{
-    let (cursor, contest, history) = {
-        let store = channel.store().await?;
-        let state = store.state();
-        (
-            state.cursor(),
-            state.open_contest().ok_or(CloseError::NoContest)?,
-            state.close_history(),
-        )
-    };
-    let end = cursor.0.min(contest.response_deadline);
-    match history {
-        Some(held) if held.height >= end || held.pending.responded() => Ok(held.pending),
-        _ => Err(BlockSourceError::new(
-            "finalized contest history disagrees with the retained cursor",
-        )
-        .into()),
-    }
-}
-
-/// Reads the finalized tip, and samples what asking for it cost.
+/// Applies one certified read of this channel to its journal.
 ///
-/// `fresh_tip_ms`, as §4's `Wstart` names it: the read a close start is
-/// signed against, and the first thing an endpoint waits for before it
-/// can put a signature on a chain. One sample per ask, whether or not
-/// anything is finalized yet.
-async fn fresh_tip<S>(source: &S) -> Result<Option<u64>, BlockSourceError>
-where
-    S: FinalizedBlocks + ?Sized,
-{
-    let asked = Timing::start();
-    let latest = source.latest_height().await?;
-    if let Some(ms) = asked.ms() {
-        tracing::event!(
-            name: "fresh_tip_ms",
-            target: TARGET,
-            LEVEL,
-            height = latest.unwrap_or_default(),
-            finalized = latest.is_some(),
-            ms,
-        );
-    }
-    Ok(latest)
-}
-
-/// Fetches one finalized block, and samples what fetching it cost.
+/// Refused before anything is written when the read is behind the
+/// cursor: absence at an older root says nothing about the chain now.
+/// Otherwise everything the read *means* is committed before the cursor
+/// that says it was read, so a process that dies between them reads
+/// again and re-commits the same records — which the journal answers as
+/// the retries they are.
 ///
-/// `one_block_fetch_ms`, as §4's `Wresp` names it. One block and one
-/// sample, because §5 makes the catch-up loop apply one block before it
-/// asks for another: the wait a response deadline is spent against is
-/// the cost of *one* fetch, never of a backlog.
-async fn one_block_fetch<S>(
-    source: &S,
-    height: u64,
-) -> Result<Option<FinalizedWork>, BlockSourceError>
-where
-    S: FinalizedBlocks + ?Sized,
-{
-    let asked = Timing::start();
-    let block = source.block_at(height).await?;
-    if let Some(ms) = asked.ms() {
-        tracing::event!(
-            name: "one_block_fetch_ms",
-            target: TARGET,
-            LEVEL,
-            height,
-            available = block.is_some(),
-            ms,
-        );
-    }
-    Ok(block)
-}
-
-/// Applies one finalized block to one channel's journal.
-///
-/// # Nothing is written for a block this journal may not read
-///
-/// The height and the parent are checked first, against
-/// [`Channel::reading`](crate::work_store::Channel) — the
-/// same rule the cursor record itself applies, asked before any of the
-/// block's meaning reaches the disk. It has to be first. The
-/// transitions below move money and shut the channel, and a block that
-/// is not this journal's next one is a block whose contents are not
-/// facts: a forged or merely out-of-order `h + 2` would otherwise end a
-/// job, record a contest, and only then be refused by the cursor.
-///
-/// A block this journal has already read is `Applied::Redundant` and
-/// returns here, having written nothing. Everything it meant is already
-/// on the disk.
-///
-/// # Then the order a crash must be able to stop in
-///
-/// Everything the block *means* is committed before the cursor that
-/// says the block was read, so a process that dies between them
-/// re-reads the same block and re-commits the same records — which the
-/// journal answers as the retries they are. The other order would
-/// advance past a block whose close it had not recorded, and no later
-/// scan would go back for it.
+/// - Every open job whose deadline the read's height has passed rests at
+///   its expired terminal ([`expiry_at`]).
+/// - A pending-close slot the journal has not recorded is the contest:
+///   the open job does not survive it, and [`ChannelRecord::CloseOpened`]
+///   copies what consensus fixed — the identifier, the opener, the
+///   deadline and the claim.
+/// - A payment edge that is gone is the close.
 ///
 /// # Errors
 ///
-/// [`WorkStoreError`] when the block is not the contiguous next one —
-/// before anything is written — and when a record is refused or cannot
-/// be made durable. The cursor is the last thing written, so a refusal
-/// anywhere leaves this endpoint still behind this block.
+/// [`WorkStoreError`] when the read is behind the cursor, its slot is
+/// not this edge's contest, or a record is refused.
 pub async fn observe<V: SigVerifier>(
     store: &mut ChannelStore,
-    block: &FinalizedWork,
+    observed: &ObservedChannel<'_>,
     verifier: &V,
 ) -> Result<(), WorkStoreError> {
-    if store
+    let (height, payload) = (observed.height, observed.payload);
+    store
         .state()
-        .reading(block.height, &block.parent, &block.payload)?
-        == Applied::Redundant
-    {
-        return Ok(());
+        .anchoring(height, &payload)
+        .map_err(WorkStoreError::from)?;
+    let pending = match observed.pending {
+        PendingSlot::Absent => None,
+        PendingSlot::Present(record) => Some(record),
+        PendingSlot::Faulty(_) => {
+            return Err(WorkStoreError::from(ChannelStateError::Malformed));
+        }
+    };
+    let window = hellas_kernel::RESPONSE_WINDOW_MS;
+    let previous = store.state().certified_at_ms();
+    if previous != 0 && observed.certified_at_ms.saturating_sub(previous) >= window {
+        tracing::warn!(
+            target: TARGET,
+            edge = %hex(store.state().channel().payment_edge().to_bytes()),
+            gap_ms = observed.certified_at_ms - previous,
+            window_ms = window,
+            "monitoring gap exceeded the response window",
+        );
     }
-    for (work_id, outcome) in expiry_at(store.state(), block.height, block.payload) {
+    for (work_id, outcome) in expiry_at(store.state(), height, payload) {
         store
             .commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)
             .await?;
     }
-
-    apply_finalized_txs(store, block, verifier).await?;
-
+    let contest = pending.filter(|_| {
+        store.state().close_opened().is_none() && store.state().close_settled().is_none()
+    });
+    let settled = observed.payment.is_none() && store.state().close_settled().is_none();
+    if contest.is_some() || settled {
+        end_open_jobs(store, height, payload, verifier).await?;
+    }
+    if let Some(record) = contest {
+        store
+            .commit(
+                ChannelRecord::CloseOpened {
+                    start_id: record.start_id(),
+                    opener: record.opener_role(),
+                    response_deadline_ms: record.response_deadline_ms(),
+                    claimed: record.start_cumulative(),
+                },
+                verifier,
+            )
+            .await?;
+    }
+    if settled {
+        store
+            .commit(ChannelRecord::CloseSettled { height, payload }, verifier)
+            .await?;
+    }
     store
         .commit(
-            ChannelRecord::CursorAdvanced {
-                height: block.height,
-                parent: block.parent,
-                payload: block.payload,
+            ChannelRecord::Anchored {
+                height,
+                payload,
+                certified_at_ms: observed.certified_at_ms,
+                pending,
             },
             verifier,
         )
@@ -740,166 +543,38 @@ pub async fn observe<V: SigVerifier>(
     Ok(())
 }
 
-/// Records every contest and settlement a finalized block carries on this
-/// channel's payment edge, in block order.
+/// Ends every open job at an expired terminal, at the read that closed
+/// the channel to it.
 ///
-/// Split out of [`observe`] because one block is read twice by two
-/// different rules. [`observe`] reads a *new* block, after checking the
-/// cursor may advance onto it. Mounting a close-only channel replays the
-/// origin block's own post-Open moves — the cursor already sits on that
-/// block, so it is not a new one, but a `StartPaymentClose` ordered after
-/// the Open in it is still a contest this endpoint must see. Both go
-/// through here, so a same-block contest is recognised exactly as a
-/// later-block one is. The Open itself matches neither arm and is ignored.
-pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
+/// A contest or a close is the cutoff: no payment is credited after it,
+/// so a job still in flight is one that can no longer be paid for, and
+/// the provider bears whatever compute or delivery it already spent.
+async fn end_open_jobs<V: SigVerifier>(
     store: &mut ChannelStore,
-    block: &FinalizedWork,
+    height: u64,
+    payload: [u8; 32],
     verifier: &V,
 ) -> Result<(), WorkStoreError> {
-    let FinalizedWork {
-        height,
-        payload,
-        txs,
-        ..
-    } = block;
-    let (height, payload) = (*height, *payload);
-    let channel = store.state().channel().clone();
-    let edge = channel.payment_edge();
-    for tx in txs {
-        match tx {
-            Tx::Move {
-                action: hellas_kernel::Move::StartPaymentClose(start),
-            } if start.payment_edge() == edge => {
-                // A contest on this edge is the cutoff, and the open job
-                // does not survive it: no payment will be credited after
-                // this record, so a job still in flight is a job that can
-                // no longer be paid for. It rests at an expired terminal,
-                // and the provider bears whatever compute or delivery it
-                // already spent on it.
-                let open: Vec<_> = store
-                    .state()
-                    .jobs()
-                    .map(|job| (job.work_id(), job.authorization().payment_deadline))
-                    .collect();
-                for (work_id, deadline) in open {
-                    store
-                        .commit(
-                            ChannelRecord::JobTerminated {
-                                work_id,
-                                outcome: TerminalOutcome::Expired {
-                                    deadline,
-                                    height,
-                                    payload,
-                                },
-                            },
-                            verifier,
-                        )
-                        .await?;
-                }
-                // The window and the claimed floor are fixed by the block
-                // that accepted this start, exactly as the kernel fixed
-                // them: the response deadline is the inclusion height plus
-                // the terms' omission window, and the claim is what the
-                // start's own certificate carried. Journaled here, a
-                // provider that restarts holding only this record can
-                // still decide whether an answer is open and what it must
-                // beat — without a second finalized snapshot.
-                let response_deadline =
-                    height.saturating_add(channel.payment_terms().omit_response_blocks);
-                let claimed = start
-                    .certificate()
-                    .map_or(0, |(certificate, _)| certificate.earned_cumulative());
-                store
-                    .commit(
-                        ChannelRecord::CloseOpened {
-                            start_id: hellas_kernel::start_id(
-                                start_body_digest(&channel, start),
-                                height,
-                            ),
-                            opener: start.opener_role(),
-                            response_deadline,
-                            claimed,
-                        },
-                        verifier,
-                    )
-                    .await?;
-            }
-            Tx::Close { input, outputs, .. } if *input == edge => {
-                let provider_payout = outputs
-                    .as_slice()
-                    .iter()
-                    .find(|payout| {
-                        payout.owner() == channel.payment_terms().parties().taker().owner()
-                    })
-                    .map_or(0, |payout| payout.value());
-                let open: Vec<_> = store
-                    .state()
-                    .jobs()
-                    .map(|job| (job.work_id(), job.authorization().payment_deadline))
-                    .collect();
-                for (work_id, deadline) in open {
-                    store
-                        .commit(
-                            ChannelRecord::JobTerminated {
-                                work_id,
-                                outcome: TerminalOutcome::Expired {
-                                    deadline,
-                                    height,
-                                    payload,
-                                },
-                            },
-                            verifier,
-                        )
-                        .await?;
-                }
-                store
-                    .commit(
-                        ChannelRecord::CloseSettled {
-                            height,
-                            payload,
-                            provider_payout,
-                        },
-                        verifier,
-                    )
-                    .await?;
-            }
-            _ => {}
-        }
-    }
-    // Retain each canonical contest block before the cursor advances. Adjudication
-    // can then use this journal even after the origin prunes old blocks.
-    if store.state().close_settled().is_none()
-        && let Some(contest) = store.state().open_contest()
-        && height <= contest.response_deadline
-    {
-        let previous = store.state().close_history();
-        let next = previous.map_or_else(
-            || {
-                contest
-                    .response_deadline
-                    .checked_sub(channel.payment_terms().omit_response_blocks)
-            },
-            |history| history.height.checked_add(1),
-        );
-        if next == Some(height) {
-            let pending =
-                contest_after_block(&channel, previous.map(|held| held.pending), block, contest)?;
-            store
-                .commit(
-                    ChannelRecord::CloseHistoryAdvanced {
-                        parent: block.parent,
-                        history: crate::work_store::CloseHistory {
-                            height,
-                            payload,
-                            pending,
-                        },
+    let open: Vec<_> = store
+        .state()
+        .jobs()
+        .map(|job| (job.work_id(), job.authorization().payment_deadline))
+        .collect();
+    for (work_id, deadline) in open {
+        store
+            .commit(
+                ChannelRecord::JobTerminated {
+                    work_id,
+                    outcome: TerminalOutcome::Expired {
+                        deadline,
+                        height,
+                        payload,
                     },
-                    verifier,
-                )
-                .await?;
-        }
+                },
+                verifier,
+            )
+            .await?;
     }
-
     Ok(())
 }
 
@@ -1010,96 +685,68 @@ pub(crate) fn expiry_at(
         .collect()
 }
 
-/// Reads every finalized block this journal has not seen, in order.
-///
-/// There is no anchoring step and no height this may start at other
-/// than the one after the cursor: the store was opened at the block
-/// that opened the channel, so "everything this journal has not seen"
-/// is everything that has ever happened to this edge. A scan that
-/// chose its own starting height would skip the blocks between the
-/// channel opening and the first catch-up, and a close settled in one
-/// of them is a close this endpoint would never learn about.
-///
-/// Returns the height the cursor reached.
-///
-/// # Errors
-///
-/// [`CatchUpError::Missing`] when a block inside the range cannot be
-/// read — the scan stops there and the cursor keeps the last height it
-/// did read — plus the source's own failures and the journal's.
-/// Reads to the tip, then resubmits this endpoint's retained close
-/// start if it has not landed yet.
+/// Applies one certified read, then serves the close duty it shows.
 ///
 /// One step, not a loop, and that is what a caller with a clock is
-/// for: nothing in this crate has one, and a loop written here would
-/// spin against a chain that finalizes at its own rate. What the step
-/// gives that caller is the whole answer — [`CloseProgress`] says
-/// whether to call again, and the two terminal answers are the two
-/// ways a close ends.
+/// for: nothing in this crate has one. What the step gives that caller
+/// is the whole answer — [`CloseProgress`] says whether to call again,
+/// and the two terminal answers are the two ways a close ends.
 ///
-/// The reading comes first, and it has to: the retained bytes are
-/// resubmitted only while the journal still shows no contest, and the
-/// journal only shows one after the block that opened it has been
-/// read. The other order resubmits a start that is already a contest.
+/// The duty is re-derived from the journal and this read every time:
 ///
-/// Nothing about a *start* is journaled here. A submission is not a
-/// decision — the signature was journaled before it left
-/// [`crate::work::ProviderEndpoint::prepare_close`], and these are those
-/// same bytes. The contest answer is fixed through
-/// [`CloseChannel::fix_answer`] before it is offered. Verified historical
-/// reconstruction is also journaled incrementally; its accepted response state
-/// is distinct from that local answer intent. The final adjudicated transaction
-/// uses only this verified state and remains pending until a finalized close
-/// is observed.
+/// - a contest the provider can still answer gets its answer, fixed on
+///   the disk through [`CloseChannel::fix_answer`] and offered to the
+///   sink — again on every step until a read shows it landed or the
+///   window shut, since submitting the same bytes twice is the same
+///   answer;
+/// - a contest that is answered, or whose window has shut at this read's
+///   block time, gets the adjudicated close built from the slot this
+///   read carries, which is the record consensus checks it against;
+/// - a retained start that can still be included is offered again.
 ///
 /// # Errors
 ///
-/// [`CatchUpError`] for the read, and [`BlockSourceError`] wrapped in
-/// it when the sink will not take the transaction.
-pub fn advance_close<'a, C, S, T, V>(
-    source: &'a S,
+/// [`CatchUpError`] when the journal refuses the read, and
+/// [`BlockSourceError`] wrapped in it when the sink will not take the
+/// transaction.
+pub fn advance_close<'a, C, T, V>(
+    observed: &'a ObservedChannel<'a>,
     sink: &'a T,
     channel: &'a mut C,
     verifier: &'a V,
 ) -> impl Future<Output = Result<CloseProgress, CatchUpError>> + 'a
 where
     C: CloseChannel + 'a,
-    S: FinalizedBlocks + ?Sized + 'a,
     T: TxSink + ?Sized + 'a,
     V: SigVerifier + 'a,
 {
-    // Construct the driver outside its caller's poll frame. Contest history
-    // replay carries bounded kernel witnesses and journal futures that are too
-    // large to compose inline at every call site.
-    Box::pin(advance_close_inner(source, sink, channel, verifier))
+    // Construct the driver outside its caller's poll frame. Its journal
+    // futures are too large to compose inline at every call site.
+    Box::pin(advance_close_inner(observed, sink, channel, verifier))
 }
 
-async fn advance_close_inner<C, S, T, V>(
-    source: &S,
+async fn advance_close_inner<C, T, V>(
+    observed: &ObservedChannel<'_>,
     sink: &T,
     channel: &mut C,
     verifier: &V,
 ) -> Result<CloseProgress, CatchUpError>
 where
     C: CloseChannel,
-    S: FinalizedBlocks + ?Sized,
     T: TxSink + ?Sized,
     V: SigVerifier,
 {
-    let handoff = channel.handoff().await?;
-    let height = catch_up_until_duty(source, channel, verifier, handoff).await?;
     let step = 'borrow: {
-        let store = channel.store().await?;
+        let mut store = channel.store().await?;
+        observe(&mut store, observed, verifier).await?;
         let state = store.state();
-        if let Some(settled) = state.close_settled() {
-            break 'borrow CloseStep::Reached(CloseProgress::Settled {
-                provider_payout: settled.provider_payout,
-            });
+        if state.close_settled().is_some() {
+            break 'borrow CloseStep::Reached(CloseProgress::Settled);
         }
         if let Some((start_id, _)) = state.close_opened() {
             break 'borrow CloseStep::Reached(CloseProgress::Opened { start_id });
         }
-        let Some(start) = state.includable_close_start(height) else {
+        let Some(start) = state.includable_close_start(state.cursor().0) else {
             break 'borrow CloseStep::Reached(CloseProgress::Nothing);
         };
         CloseStep::Start {
@@ -1111,46 +758,25 @@ where
     };
     match step {
         // The answer, in the order a crash has to survive: the record
-        // is fixed under one borrow, the bytes are offered while
-        // nothing is borrowed, and what the sink did is recorded under
-        // another. Nothing waits on a sink holding this journal.
+        // is fixed under one borrow, and the bytes are offered while
+        // nothing is borrowed.
         CloseStep::Reached(CloseProgress::Opened { start_id }) => {
             if let Some(response) = channel.fix_answer(start_id).await? {
-                let outcome = sink.submit(response).await?;
-                channel.record_handoff(start_id, outcome).await?;
-                // A still-owed answer takes priority over historical recovery,
-                // including when admission rejected the last attempt.
+                sink.submit(response).await?;
                 return Ok(CloseProgress::Opened { start_id });
             }
-            {
-                let (descriptor, settlement, cursor, contest) = {
-                    let store = channel.store().await?;
-                    let state = store.state();
-                    (
-                        state.channel().clone(),
-                        state.settlement(),
-                        state.cursor(),
-                        state.open_contest(),
-                    )
-                };
-                let contest = contest.ok_or(CloseError::NoContest)?;
-                if contest
-                    .response_deadline
-                    .checked_sub(descriptor.payment_terms().omit_response_blocks)
-                    .is_some_and(|inclusion| Some(inclusion) == cursor.0.checked_add(1))
-                {
-                    // CloseOpened is durable before CursorAdvanced. A provider
-                    // may have serviced that duty first after a crash; the next
-                    // catch-up rereads the opening block before adjudication.
-                    return Ok(CloseProgress::Opened { start_id });
-                }
-                let pending = finalized_contest(channel).await?;
-                if pending.responded() || cursor.0 >= pending.response_deadline() {
-                    let outcome = sink
-                        .submit(adjudicated_close(&descriptor, settlement, &pending)?)
-                        .await?;
-                    return Ok(CloseProgress::AdjudicationSubmitted { start_id, outcome });
-                }
+            let (descriptor, settlement) = {
+                let store = channel.store().await?;
+                (store.state().channel().clone(), store.state().settlement())
+            };
+            let PendingSlot::Present(pending) = observed.pending else {
+                return Err(CloseError::NoContest.into());
+            };
+            if pending.responded() || observed.certified_at_ms >= pending.response_deadline_ms() {
+                let outcome = sink
+                    .submit(adjudicated_close(&descriptor, settlement, &pending)?)
+                    .await?;
+                return Ok(CloseProgress::AdjudicationSubmitted { start_id, outcome });
             }
             Ok(CloseProgress::Opened { start_id })
         }
@@ -1184,9 +810,9 @@ enum CloseStep {
 /// Where a close step reaches one channel's journal, and the answer it
 /// may owe.
 ///
-/// Journal borrows may span storage I/O, but must end before chain or sink
-/// waits. The sequence — read to the duty, fix the answer, offer it, record
-/// the handoff — remains shared by owned endpoints and service drivers.
+/// Journal borrows may span storage I/O, but must end before sink waits.
+/// The sequence — apply the read, fix the answer, offer it — is shared by
+/// owned endpoints and service drivers.
 pub trait CloseChannel: Send {
     /// Borrows the journal until the returned guard is dropped.
     ///
@@ -1199,17 +825,6 @@ pub trait CloseChannel: Send {
         Output = Result<impl core::ops::DerefMut<Target = ChannelStore> + Send, CatchUpError>,
     > + Send;
 
-    /// What the last answer submission got back. Clients hold no answer.
-    ///
-    /// # Errors
-    /// [`CatchUpError::Busy`] when the channel cannot be reached.
-    fn handoff(
-        &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<(StartId, Handoff)>, CatchUpError>> + Send
-    {
-        core::future::ready(Ok(None))
-    }
-
     /// Durably fixes an answer before returning its transaction, if one is owed.
     ///
     /// # Errors
@@ -1221,18 +836,6 @@ pub trait CloseChannel: Send {
     ) -> impl core::future::Future<Output = Result<Option<Tx>, CatchUpError>> + Send {
         core::future::ready(Ok(None))
     }
-
-    /// Records what the sink did with the answer.
-    ///
-    /// # Errors
-    /// [`CatchUpError::Busy`] when the channel cannot be reached.
-    fn record_handoff(
-        &mut self,
-        _start_id: StartId,
-        _outcome: hellas_rpc::SubmitTxOutcome,
-    ) -> impl core::future::Future<Output = Result<(), CatchUpError>> + Send {
-        core::future::ready(Ok(()))
-    }
 }
 
 impl CloseChannel for ChannelStore {
@@ -1241,143 +844,4 @@ impl CloseChannel for ChannelStore {
     ) -> Result<impl core::ops::DerefMut<Target = Self> + Send, CatchUpError> {
         Ok(self)
     }
-}
-
-/// Reads contiguously only until one newly observed block creates a duty.
-///
-/// `advance_close` services the returned duty before it can ask the source
-/// for another block. This is the backlog rule: a restart ten thousand
-/// blocks behind cannot discover a response, close, or reclaim obligation in
-/// block one and postpone it behind the remaining 9,999 fetches.
-///
-/// A duty already on the disk when this is entered is returned before
-/// [`FinalizedBlocks::latest_height`] is even called, which is the case
-/// a restart is: the answer a dead process fixed and never sent is
-/// offered again before one successor block is read, so a backlog that
-/// runs past the response deadline cannot be what loses it.
-///
-/// `handoff` is what this caller's last send got back, and its two
-/// answers buy different amounts of reading. [`Handoff::Accepted`]
-/// suppresses the duty for as long as the contest lasts: a sink holds
-/// the answer, and there is nothing left to do but watch.
-/// [`Handoff::Offered`] suppresses it for **one** block and then lets it
-/// reappear, which is the same backlog rule one step weaker — an answer
-/// nobody took must be offered again before the block after next, or a
-/// backlog longer than the window swallows every retry and the contest
-/// ends unanswered on the claim this endpoint could have beaten.
-async fn catch_up_until_duty<C, S, V>(
-    source: &S,
-    channel: &mut C,
-    verifier: &V,
-    handoff: Option<(StartId, Handoff)>,
-) -> Result<u64, CatchUpError>
-where
-    C: CloseChannel,
-    S: FinalizedBlocks + ?Sized,
-    V: SigVerifier,
-{
-    let mut suppressed = handoff.map(|(start_id, _)| start_id);
-    {
-        let store = channel.store().await?;
-        let state = store.state();
-        if close_duty_present(state, suppressed) {
-            return Ok(state.cursor().0);
-        }
-    }
-    let Some(latest) = fresh_tip(source).await? else {
-        return Ok(channel.store().await?.state().cursor().0);
-    };
-    let mut next = channel.store().await?.state().cursor().0.saturating_add(1);
-    while next <= latest {
-        let block = one_block_fetch(source, next)
-            .await?
-            .ok_or(CatchUpError::Missing { height: next })?;
-        let mut store = channel.store().await?;
-        observe(&mut store, &block, verifier).await?;
-        if handoff.is_some_and(|(_, state)| state == Handoff::Offered) {
-            // The one block a still-owed answer paid for is spent.
-            suppressed = None;
-        }
-        let state = store.state();
-        if close_duty_present(state, suppressed) {
-            return Ok(state.cursor().0);
-        }
-        next = next.saturating_add(1);
-    }
-    Ok(channel.store().await?.state().cursor().0)
-}
-
-/// Whether this journal holds a close duty its caller must service
-/// before another block is fetched.
-///
-/// A finalized close is one: it is terminal, and there is nothing after
-/// it to read.
-///
-/// A contest is one while
-/// [`Channel::answerable_contest`](crate::work_store::Channel::answerable_contest)
-/// says an answer is owed and `suppressed` is not that contest. Two things
-/// are deliberately not consulted here.
-///
-/// The journal's own
-/// [`ChannelRecord::CloseResponded`](crate::work_store::ChannelRecord::CloseResponded)
-/// is not, because it is committed *before* the submission it authorises:
-/// a crash between the two leaves a record saying "answered" over a
-/// consensus that received nothing, and a scan floor built on it would
-/// read the whole successor backlog past the deadline with the answer
-/// still on the disk.
-///
-/// Eligibility is, because an unanswerable contest is not a duty
-/// deferred, it is a duty that does not exist — the opener, the role and
-/// the held certificate are frozen at the block that recorded the
-/// contest, so an endpoint that cannot answer now can never answer, and
-/// stopping for it would freeze the cursor on the contest block forever.
-///
-/// `suppressed` is the contest whose answer the caller's hand-off state
-/// currently excuses it from — for good when a sink took the answer, for
-/// one block when a sink did not. It is what lets the cursor move on: a
-/// sink that refused the answer may have refused it because the answer
-/// is already on chain, and only reading further blocks can tell.
-/// Retrying is a separate question, and its answer is in
-/// [`crate::work::ProviderEndpoint::advance_close`].
-pub(crate) fn close_duty_present(
-    state: &crate::work_store::Channel,
-    suppressed: Option<StartId>,
-) -> bool {
-    state.close_settled().is_some()
-        || state
-            .answerable_contest()
-            .is_some_and(|(contest, _)| Some(contest.start_id) != suppressed)
-}
-
-pub async fn catch_up<S, V>(
-    source: &S,
-    store: &mut ChannelStore,
-    verifier: &V,
-) -> Result<u64, CatchUpError>
-where
-    S: FinalizedBlocks + ?Sized,
-    V: SigVerifier,
-{
-    let Some(latest) = fresh_tip(source).await? else {
-        return Ok(store.state().cursor().0);
-    };
-    use futures::{StreamExt as _, stream};
-
-    let next = store.state().cursor().0.saturating_add(1);
-    // Fetch ahead without changing the journal's ordered, one-block commits.
-    // An idle gateway may have thousands of finalized blocks to read before
-    // its next request; serial network round trips can exceed that request.
-    let pending = stream::iter(next..=latest)
-        .map(|height| async move {
-            one_block_fetch(source, height)
-                .await?
-                .ok_or(CatchUpError::Missing { height })
-        })
-        .buffered(16);
-    futures::pin_mut!(pending);
-    while let Some(block) = pending.next().await {
-        let block = block?;
-        observe(store, &block, verifier).await?;
-    }
-    Ok(store.state().cursor().0)
 }

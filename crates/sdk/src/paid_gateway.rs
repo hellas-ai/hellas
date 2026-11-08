@@ -136,10 +136,6 @@ async fn provider_policy<
     settlement_key: &Secp256k1Signer,
     owner: hellas_auth::authority::PrincipalId,
 ) -> Result<ProviderChannelPolicy> {
-    let chain = chain.with_read_retry(
-        args.config.poll,
-        crate::paid_client::read_timeout(args.timeout),
-    );
     Ok(match setups.select(&chain).await? {
         Some((_, signed)) => signed.offer().policy.clone(),
         None => {

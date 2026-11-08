@@ -29,9 +29,6 @@ const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 const STAKE: u64 = 64;
 const SALT: [u8; 32] = [0x5a; 32];
-/// The response window the fixture's terms admit.
-const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
-
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-test") else {
         panic!("a short ascii id is a legal network id");
@@ -76,7 +73,6 @@ fn payment_terms() -> WorkPaymentTerms {
         bond_edge(),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
-        WINDOW,
         8,
         OMISSION_BOND,
     )
@@ -289,6 +285,8 @@ fn faulty_pending() -> PendingSlot {
 fn observed<'a>(bond: &'a Edge, payment: &'a Edge) -> ObservedChannel<'a> {
     ObservedChannel {
         height: HORIZON - 1,
+        payload: [0; 32],
+        certified_at_ms: 0,
         bond: Some(bond),
         payment: Some(payment),
         lease: lease_over(bond_edge(), payment_edge()),

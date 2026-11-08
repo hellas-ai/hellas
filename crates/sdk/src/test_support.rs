@@ -118,6 +118,11 @@ const OMISSION_BOND: u64 = 601;
 pub(crate) struct PaidFixture {
     pub root: tempfile::TempDir,
     pub ready: ReadyChannel,
+    /// The fixture's live bond, payment edge and lease, as a certified
+    /// read shows them.
+    pub bond: Edge,
+    pub payment: Edge,
+    pub lease: LeaseSlots,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
     pub policy: hellas_channel::model::setup::ProviderChannelPolicy,
@@ -129,33 +134,6 @@ pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
 }
 
 impl PaidFixture {
-    /// A real idle node for SDK startup/admission tests. The fixture supplies
-    /// genesis itself; no network endpoint is trusted to choose its execution inputs.
-    pub async fn node(&mut self) -> crate::FullNode {
-        let mut genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
-        genesis.network_id = self.config.network().as_str().into();
-        genesis.allocations.clear();
-        use commonware_cryptography::{Hasher as _, Sha256};
-        let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = self.config.chain.trust().clone();
-        trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
-        let profile = ChainProfile::custom(CustomChainFile {
-            trust,
-            validators: self.config.chain.validators().to_vec(),
-            genesis_json,
-        })
-        .unwrap();
-        self.config.chain = hellas_chain::chain_dir::ChainDir::open(
-            &StoreLocation::from_home(self.root.path(), Crash),
-            &profile,
-        )
-        .unwrap();
-        let mut config = self.config.node_config(None).unwrap();
-        config.validators.clear();
-        crate::FullNode::start(config).await.unwrap()
-    }
-
     pub fn new() -> Self {
         Self::on_network(NetworkId::new("sdk-paid-test").unwrap())
     }
@@ -209,7 +187,6 @@ impl PaidFixture {
                 &[9; 32],
                 &channel_policy,
             ),
-            omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
             start_validity_blocks: 8,
             omission_bond: OMISSION_BOND,
         };
@@ -259,13 +236,7 @@ impl PaidFixture {
         );
         assert!(matches!(lease, LeaseSlots::Present(_)));
         let ready = descriptor
-            .check_ready(&ObservedChannel {
-                height: 1,
-                bond: Some(&bond),
-                payment: Some(&payment),
-                lease,
-                pending: PendingSlot::Absent,
-            })
+            .check_ready(&observed(1, &bond, &payment, lease, PendingSlot::Absent))
             .unwrap();
         let policy = hellas_channel::model::setup::ProviderChannelPolicy {
             payment_policy: payment_policy(),
@@ -274,16 +245,16 @@ impl PaidFixture {
             channel_policy,
             invocation_policy: work_policy,
             expected_payment_values: values,
-            min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         let config = WorkConfig {
             chain: chain_dir(root.path(), network),
-            poll: std::time::Duration::from_millis(10),
-            max_observation_age: std::time::Duration::from_secs(60),
         };
         Self {
             root,
             ready,
+            bond,
+            payment,
+            lease,
             descriptor,
             config,
             policy,
@@ -308,16 +279,30 @@ impl PaidFixture {
             SetupOrigin {
                 payment_edge: self.ready.channel().payment_edge(),
                 height: 1,
-                payload: [1; 32],
-                parent: [0; 32],
+                payload: hellas_channel::test_support::channel::payload_at(1),
             },
             content.clone(),
             &Secp256k1Verifier::new(),
         )
         .await
         .unwrap();
+        let mut store = store;
+        if store.state().certified_at_ms() == 0 {
+            hellas_channel::work_close::observe(
+                &mut store,
+                &self.observed(1, PendingSlot::Absent),
+                &Secp256k1Verifier::new(),
+            )
+            .await
+            .unwrap();
+        }
         content.finish_recovery().await.unwrap();
         store
+    }
+
+    /// One fresh certified read of the fixture channel at `height`.
+    pub fn observed(&self, height: u64, pending: PendingSlot) -> ObservedChannel<'_> {
+        observed(height, &self.bond, &self.payment, self.lease, pending)
     }
 
     pub async fn client(&self) -> ClientService {
@@ -372,6 +357,24 @@ impl PaidFixture {
                 payment: 200,
             },
         }
+    }
+}
+
+fn observed<'a>(
+    height: u64,
+    bond: &'a Edge,
+    payment: &'a Edge,
+    lease: LeaseSlots,
+    pending: PendingSlot,
+) -> ObservedChannel<'a> {
+    ObservedChannel {
+        height,
+        payload: hellas_channel::test_support::channel::payload_at(height),
+        certified_at_ms: hellas_channel::test_support::channel::now_ms(),
+        bond: Some(bond),
+        payment: Some(payment),
+        lease,
+        pending,
     }
 }
 

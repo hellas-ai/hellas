@@ -159,21 +159,17 @@ pub enum ChannelStateError {
         /// Deadline the authorization carries.
         deadline: u64,
     },
-    /// The finalized cursor did not move on by exactly one block.
-    ///
-    /// A skipped height is a block this endpoint never read, and every
-    /// close and every certificate it would have carried is a fact this
-    /// journal would then be missing.
-    #[error("cursor height {actual} is not the block after {held}")]
-    CursorNotNext {
+    /// A read older than the one this journal already holds. Absence at
+    /// an older root says nothing about the chain now.
+    #[error("a read at height {actual} is behind the cursor at {held}")]
+    CursorBehind {
         /// Height already recorded.
         held: u64,
-        /// Height the record carried.
+        /// Height the read carried.
         actual: u64,
     },
-    /// The next block does not name the block the cursor holds as its
-    /// parent.
-    #[error("the block at height {height} is not a child of the cursor's block")]
+    /// Another block at the height the cursor already holds.
+    #[error("the block at height {height} is not the cursor's block")]
     CursorNotContiguous {
         /// Height the record carried.
         height: u64,
@@ -380,8 +376,6 @@ mod outcome_code {
 // These short-lived canonical append records keep their fixed-width fields inline.
 #[allow(clippy::large_enum_variant)]
 pub enum ChannelRecord {
-    /// The origin block's own close transactions are durable.
-    OriginObserved,
     /// Client-side exchange state, committed before a retry leaves or a known
     /// refusal permits another nonce. This never releases funding obligations.
     ProposalExchange {
@@ -390,20 +384,24 @@ pub enum ChannelRecord {
         /// True before sending; false after receiving a well-formed refusal.
         pending: bool,
     },
-    /// Finalized blocks have been processed through this block.
+    /// The channel's state was read by proof at this certified block.
     ///
-    /// The parent rides with the payload because a cursor is only worth
-    /// something if it is contiguous: a height alone would let a
-    /// watcher skip from block 7 to block 20 and still report that it
-    /// had processed everything through 20. What it would have skipped
-    /// is every close and every deadline those thirteen blocks crossed.
-    CursorAdvanced {
-        /// Height processed through.
+    /// The cursor moves forward to it, and it need not be the next
+    /// block: what happened in between is not replayed, it is what this
+    /// state already shows. The edge either still stands or it does not,
+    /// and the pending-close slot holds the contest consensus itself is
+    /// deciding — the records that read it implies (`CloseOpened`,
+    /// `CloseSettled`, expired jobs) are committed before this one.
+    Anchored {
+        /// Certified height the state was read at.
         height: u64,
-        /// The payload digest that block names as its parent.
-        parent: [u8; 32],
-        /// That block's own payload digest.
+        /// That block's payload digest.
         payload: [u8; 32],
+        /// That block's timestamp, in milliseconds. The clock every close
+        /// deadline is measured on, and the age admission is judged by.
+        certified_at_ms: u64,
+        /// The payment edge's pending-close slot at that block.
+        pending: Option<PendingPaymentClose>,
     },
     /// The client's signed authorization, and the inputs it commits to.
     ///
@@ -509,12 +507,11 @@ pub enum ChannelRecord {
         start_id: StartId,
         /// Which party opened it.
         opener: Party,
-        /// Height at which the response window shuts. The block that
-        /// accepted the start fixed it, and recovery reads it here rather
-        /// than from a second finalized snapshot: a provider that
+        /// Block time at which the response window shuts. Consensus fixed
+        /// it from the block that accepted the start, and a provider that
         /// restarts with this record must know whether the window it may
         /// answer in is still open.
-        response_deadline: u64,
+        response_deadline_ms: u64,
         /// The cumulative amount the opener's own start claimed. A
         /// provider answers only a contest opened below what it already
         /// holds, so this is the floor its own certificate must strictly
@@ -547,33 +544,18 @@ pub enum ChannelRecord {
         /// Digest the responder signed, over the answer's own body.
         response_digest: PayloadHash,
     },
-    /// A close consuming this channel's payment edge was finalized.
+    /// The payment edge was gone at a certified read.
     CloseSettled {
-        /// Height of the block that carried it.
+        /// Height of the first read that found the edge consumed.
         height: u64,
         /// That block's payload digest.
         payload: [u8; 32],
-        /// What the close paid the provider.
-        provider_payout: u64,
-    },
-    /// Durable progress through authenticated contest history. Historical replay
-    /// is independent of the ordinary cursor and survives cancellation. Like
-    /// CursorAdvanced and CloseOpened, this is a trusted journal observation,
-    /// emitted only after authenticated finalized-block validation; an RPC's
-    /// claimed pending state is never sufficient to create this record.
-    CloseHistoryAdvanced {
-        /// Parent of this verified historical block.
-        parent: [u8; 32],
-        /// Verified state after this block.
-        history: CloseHistory,
     },
 }
 
 mod tag {
-    pub(super) const CLOSE_HISTORY: u8 = 14;
-    pub(super) const ORIGIN_OBSERVED: u8 = 13;
     pub(super) const PROPOSAL_EXCHANGE: u8 = 12;
-    pub(super) const CURSOR: u8 = 0;
+    pub(super) const ANCHORED: u8 = 0;
     pub(super) const PROPOSED: u8 = 1;
     pub(super) const ACCEPTED: u8 = 2;
     pub(super) const RUNNING: u8 = 3;
@@ -724,11 +706,11 @@ pub struct PaymentState {
     channel: PaidChannel,
     settlement: WorkPaymentSettlement,
     cursor: (u64, [u8; 32]),
-    origin_observed: bool,
+    certified_at_ms: u64,
+    pending: Option<PendingPaymentClose>,
     // Retain the large no-alloc kernel witness behind the journal state's heap boundary.
     close_prepared: Option<Box<PaymentCloseStart>>,
     close_opened: Option<OpenContest>,
-    close_history: Option<CloseHistory>,
     close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,
     retained_roots: BTreeMap<Digest, ContentRef>,
@@ -750,21 +732,10 @@ pub struct OpenContest {
     pub start_id: StartId,
     /// Which party opened it.
     pub opener: Party,
-    /// Height at which the response window shuts.
-    pub response_deadline: u64,
+    /// Block time at which the response window shuts.
+    pub response_deadline_ms: u64,
     /// Cumulative amount the opener's own start claimed.
     pub claimed: u64,
-}
-
-/// Verified contest state and its own contiguous historical replay cursor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CloseHistory {
-    /// Last historical block applied.
-    pub height: u64,
-    /// That block's authenticated payload.
-    pub payload: [u8; 32],
-    /// Canonical kernel state after its accepted start and responses.
-    pub pending: PendingPaymentClose,
 }
 
 /// The one answer this endpoint has chosen for the contest on its
@@ -787,19 +758,15 @@ pub struct RespondedContest {
     pub response_digest: PayloadHash,
 }
 
-/// What a finalized close of this channel's payment edge paid, and
-/// where it was.
+/// Where this channel's payment edge was first seen consumed.
 ///
-/// Retained because a payout is a coin, and a coin can be spent. The
-/// block that carried the close is the durable answer to "was this
-/// channel settled"; a later lookup that finds no coin is not evidence
-/// that it was not.
+/// The durable answer to "was this channel settled". What it paid is
+/// the two payout coins the kernel issues at fixed ids, read by whoever
+/// needs the amounts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloseSettlement {
-    /// Height of the block that carried the close.
+    /// Height of the first read that found the edge consumed.
     pub height: u64,
     /// That block's payload digest.
     pub payload: [u8; 32],
-    /// What the close paid the provider.
-    pub provider_payout: u64,
 }

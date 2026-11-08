@@ -282,23 +282,21 @@ an application completion event therefore holds that channel until EOF. The
 generic HTTP route preserves those trailing bytes. Separate funded channels
 execute independently; `paid.queue` measures time waiting for a channel.
 
-The work configuration accepts `max_observation_age_ms` (default 5000), which
-must exceed `poll_ms`. Admission, delivery and new certificates stop when the
-observer fails or no new verified finalized height arrives within that age.
-Repeated reads of an old tip do not renew it. The bound starts before the chain
-read, not after it finishes, and readiness is published only after all intervening
-blocks have been applied. Results may still be retained during an observation
-outage; existing payment certificates remain safe to retransmit. Because renewal
-requires an *advancing* finalized height, this age should also exceed the
-deployment's block interval by a comfortable margin: a chain finalizing slower
-than the age spends every gap stale, and admission flaps on each block.
+Both endpoints follow a channel by proof-checked reads of its current state:
+the payment edge, the bond and its lease, and the pending-close slot, at one
+certified block. Each read moves the channel journal's cursor to that block;
+nothing between reads is replayed. Admission, delivery and new certificates
+stop when the latest read is older than the certified-age bound, measured from
+the block's own timestamp. Results may still be retained during an observation
+outage; existing payment certificates remain safe to retransmit.
 
-This is an online channel: its observer must detect unilateral closes and submit
-any response within `omit_response_blocks`. Configure observation age, network
-recovery and submission latency to fit that window at the deployment's block
-rate. The local age limit cannot guarantee recovery through a partition longer
-than the on-chain response window. Setup and restart catch-up may wait on
-validators; ordinary requests do not perform that work.
+This is an online channel: its observer must detect unilateral closes and
+answer them before the response deadline, which is the inclusion block's time
+plus `RESPONSE_WINDOW_MS` (two minutes). The provider reads every channel at an
+interval derived from that window, and faster while a contest is live or a
+transaction it sent is waiting to land. The certified-age bound is derived from
+the same window, so a reachable watcher answers in time; an observer cut off
+from every validator for longer than the window can lose an answer.
 
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
@@ -431,25 +429,10 @@ the fixed per-job price. Tracking and recovery behavior is described in
 
 `hellas transact --settle` and the SDK's `settle_channel` close an existing
 funded channel after the entire provider has stopped, including its background
-clock. The shared channel driver submits the close start and final adjudicated
-transaction, using authenticated finalized blocks from the pinned consensus
-chain. It recovers accepted responses, omission penalties, and owner-authority
-flags through the same pending-close transitions and payout builder used by the
-kernel. This factors existing consensus behavior; it changes no transaction
-encoding, consensus rule, or response deadline. Live object-proof RPCs are not
-required. Funding is returned to application accounting only after verification
-of the finalized close receipt.
-
-Contest history is retained as the channel is observed, from the start's
-inclusion block through the response deadline; adjudication can use it as soon
-as it holds an accepted response. Each verified block advances durable
-`CloseHistoryAdvanced` journal progress. Cancellation,
-restart, and checkpoint rotation preserve that progress, so repeated bounded
-attempts resume at the next unread block even with the maximum legal response
-window. Missing or inconsistent evidence remains an error. A source used as
-`FinalizedBlocks` must independently authenticate every historical block on the
-same pinned consensus chain; an unverified remote RPC connection does not meet
-that contract.
-
-The channel journal records verified contest history under record tag **14**
-and in an optional checkpoint tail.
+clock. The shared channel driver submits the close start as soon as it is
+signed, and the final adjudicated transaction once the read shows the contest
+answered or its deadline passed, built from the pending-close record that
+read carries. A source that fails is replaced by the next configured
+validator. Funding is returned to application accounting only after a read
+shows the payment edge consumed; the receipt's amounts are the two payout
+coins the close issues at fixed ids.

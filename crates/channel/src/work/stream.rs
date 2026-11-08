@@ -1093,19 +1093,17 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_during_plaintext_append_cannot_poison_the_provider_journal() {
-        use crate::model::setup::ObservedChannel;
         use crate::test_support::channel as fixture;
         use hellas_kernel::PendingSlot;
         let provider_root = tempfile::tempdir().unwrap();
         let client_root = tempfile::tempdir().unwrap();
         let ready = fixture::descriptor()
-            .check_ready(&ObservedChannel {
-                height: fixture::CURSOR,
-                bond: Some(&fixture::bond_object()),
-                payment: Some(&fixture::payment_object()),
-                lease: fixture::lease_over(fixture::bond_edge(), fixture::payment_edge()),
-                pending: PendingSlot::Absent,
-            })
+            .check_ready(&fixture::observed_at(
+                fixture::CURSOR,
+                &fixture::bond_object(),
+                &fixture::payment_object(),
+                PendingSlot::Absent,
+            ))
             .unwrap();
         let mut provider = ProviderEndpoint::new(
             ready.clone(),
@@ -1163,10 +1161,11 @@ mod tests {
                 .close
                 .store
                 .commit(
-                    ChannelRecord::CursorAdvanced {
+                    ChannelRecord::Anchored {
                         height: fixture::CURSOR + 1,
-                        parent: fixture::payload_at(fixture::CURSOR),
                         payload: fixture::payload_at(fixture::CURSOR + 1),
+                        certified_at_ms: fixture::now_ms(),
+                        pending: None,
                     },
                     &Secp256k1Verifier::new(),
                 )
@@ -1279,14 +1278,7 @@ mod tests {
             .unwrap();
         service.begin_run(work, &ready).await.unwrap();
         let facts = service.endpoint().await.unwrap().job_facts(work).unwrap();
-        service
-            .observe_ready(
-                ready.clone(),
-                ObservationTime::now(),
-                Duration::from_secs(60),
-            )
-            .await
-            .unwrap();
+        service.observe_ready(ready.clone()).await.unwrap();
         let payloads = [
             OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
                 status: 200,
@@ -1358,19 +1350,15 @@ mod tests {
                 .is_err(),
             "stale observation must expose neither plaintext nor a terminal refusal"
         );
-        service
-            .observe_ready(
-                ready.clone(),
-                ObservationTime::now(),
-                Duration::from_secs(60),
-            )
-            .await
-            .unwrap();
+        assert!(
+            service.observe_ready(ready.clone()).await.is_err(),
+            "rereading the old certified height must not restore freshness"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut next)
                 .await
                 .is_err(),
-            "rereading the old finalized height must not restore freshness"
+            "rereading the old certified height must not restore freshness"
         );
 
         let height = if matches!(after, AfterPause::Expire) {
@@ -1378,41 +1366,32 @@ mod tests {
         } else {
             fixture::CURSOR + 1
         };
-        let mut driver = service.drive().unwrap();
-        for height in fixture::CURSOR + 1..=height {
-            driver
-                .observe_finalized(&FinalizedWork {
+        use hellas_kernel::PendingSlot;
+        let pending = if matches!(after, AfterPause::Close) {
+            let start = crate::work_close::close_start(
+                ready.channel(),
+                hellas_kernel::Party::Maker,
+                fixture::CURSOR,
+                None,
+                &fixture::client(),
+            )
+            .unwrap();
+            PendingSlot::Present(
+                hellas_kernel::PendingPaymentClose::from_accepted_start(
+                    ready.channel().network(),
                     height,
-                    parent: fixture::payload_at(height - 1),
-                    payload: fixture::payload_at(height),
-                    txs: if matches!(after, AfterPause::Close) {
-                        vec![hellas_kernel::Tx::move_action(
-                            hellas_kernel::Move::StartPaymentClose(
-                                crate::work_close::close_start(
-                                    ready.channel(),
-                                    hellas_kernel::Party::Maker,
-                                    fixture::CURSOR,
-                                    None,
-                                    &fixture::client(),
-                                )
-                                .unwrap(),
-                            ),
-                        )]
-                    } else {
-                        vec![]
-                    },
-                })
-                .await
-                .unwrap();
-        }
-        drop(driver);
+                    fixture::now_ms(),
+                    &start,
+                )
+                .unwrap(),
+            )
+        } else {
+            PendingSlot::Absent
+        };
+        fixture::observe_service(&service, height, pending).await;
         if matches!(after, AfterPause::Resume) {
             service
-                .observe_ready(
-                    fixture::ready_of(&descriptor, height),
-                    ObservationTime::now(),
-                    Duration::from_secs(60),
-                )
+                .observe_ready(fixture::ready_of(&descriptor, height))
                 .await
                 .unwrap();
         }

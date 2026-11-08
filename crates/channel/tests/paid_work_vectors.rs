@@ -38,7 +38,7 @@ use hellas_rpc::{
 // ── Fixtures ──────────────────────────────────────────────────────────
 
 const NETWORK: &str = "hellas-devnet-1";
-const OTHER_NETWORK: &str = "hellas-devnet-22";
+const OTHER_NETWORK: &str = "hellas-devnet-32";
 /// The channel's certificate capacity, from the kernel's own settlement
 /// arithmetic over an edge that locks a million and reserves nothing.
 fn capacity() -> WorkPaymentSettlement {
@@ -102,7 +102,6 @@ fn payment_terms() -> WorkPaymentTerms {
         bond_edge: EdgeId::from_bytes([0xb0; 32]),
         bond_terms: bond,
         private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: 32,
         start_validity_blocks: 16,
         omission_bond: 100,
     }
@@ -406,11 +405,11 @@ fn golden_digests_bind_the_encoded_network() {
     let channel = channel();
     assert_eq!(
         hex(channel.id().as_bytes()),
-        "a5f19693d012ce8a1b6aa6094ecc34e9bbe005587825bc4e193a484f0ab60251"
+        "9d96e55495d4871c2c41139dffb26ee19364cfde5a69e085bcf80d2138bea37d"
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "0a9d2901fc51dfc4873ac13148369a8bd833af007dca7c43d24b5be00764b98e"
+        "2cc33c7a67bcd98f892941f78fe0338f6f83c5206de39f8fa37e13a6024c5137"
     );
 
     let other = channel_on(
@@ -431,7 +430,7 @@ fn golden_digests_bind_the_encoded_network() {
     assert_eq!(Digest::hash(&preimage), other.id());
     assert_eq!(
         hex(other.id().as_bytes()),
-        "eb36293e12b4cd91c64c361051d23af77f51734fab4085f215be10af3c8d98c0"
+        "6cc62d6826231ad924b0268ce0d5e01e7981183d267a1da9a915a6bc9a5d6e0b"
     );
 }
 
@@ -1352,7 +1351,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 139);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "d3b4b99a2766f0cc48dc31917a9b252f85315178fe780ef34b3344f39b4a9a66"
+        "976d5872843d37dbc1d0876b93f5972fb16d49821b4510504c67c078fd3b3f83"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -1378,7 +1377,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&payment_binding_digest(&channel, &binding).into_bytes()),
-        "715c9a47cd79490b150f871960e472254962b87c28d3b0fdb65edfa11fc06531"
+        "74c3f2b7ea983ffdad0847d8e556b4ac574b66853f98ad12be327bd8c64a76dc"
     );
 }
 

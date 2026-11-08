@@ -9,15 +9,12 @@ impl SetupState {
             role,
             bundle: None,
             bundle_bytes: Vec::new(),
-            scan_armed: None,
             close_descriptor: None,
             unresolved_bond_open: false,
             unresolved_payment_open: false,
-            scan_cursor: None,
+            observed_height: None,
             bond_finalized: false,
             payment_finalized: false,
-            bond_closed: false,
-            payment_closed: false,
             bond_timeout_submitted: false,
             origin: None,
             end: None,
@@ -77,27 +74,13 @@ impl SetupState {
                 (None, false) => {}
                 _ => return Err(SetupStateError::DescriptorMismatch),
             }
-            let armed_stage = executable || (self.role == Role::Provider && bundle.revision() == 1);
-            if armed_stage && self.scan_armed.is_none() {
-                return Err(SetupStateError::WrongStage {
-                    step: "holding a revision this endpoint armed",
-                    revision: self.revision(),
-                });
-            }
         } else if self.close_descriptor.is_some() {
             return Err(SetupStateError::DescriptorMismatch);
         }
 
-        match (self.scan_armed, self.scan_cursor) {
-            (None, None) if !self.bond_finalized && !self.payment_finalized => {}
-            (Some(floor), Some(cursor))
-                if cursor.height >= floor.height
-                    && (cursor.height != floor.height || cursor.payload == floor.payload) => {}
-            _ => return Err(SetupStateError::Malformed),
-        }
-        if (self.bond_closed && (!self.bond_finalized || self.role != Role::Provider))
-            || (self.payment_closed && !self.payment_finalized)
-            || (self.payment_finalized != self.origin.is_some())
+        if (self.observed_height.is_none() && (self.bond_finalized || self.payment_finalized))
+            || (self.origin.is_some() != (self.end == Some(SetupEnd::Complete)))
+            || (self.origin.is_some() && !self.payment_finalized)
             || (self.role == Role::Client
                 && (self.unresolved_bond_open
                     || self.unresolved_payment_open
@@ -105,16 +88,13 @@ impl SetupState {
         {
             return Err(SetupStateError::Malformed);
         }
-        if let Some(origin) = self.origin {
-            let floor = self.scan_armed.ok_or(SetupStateError::Malformed)?;
-            let cursor = self.scan_cursor.ok_or(SetupStateError::Malformed)?;
-            if Some(origin.payment_edge) != self.payment_edge()
-                || origin.height <= floor.height
-                || (self.end != Some(SetupEnd::Complete) && origin.height > cursor.height)
-                || (origin.height == cursor.height && origin.payload != cursor.payload)
-            {
-                return Err(SetupStateError::Malformed);
-            }
+        if let Some(origin) = self.origin
+            && (Some(origin.payment_edge) != self.payment_edge()
+                || self
+                    .observed_height
+                    .is_none_or(|height| origin.height > height))
+        {
+            return Err(SetupStateError::Malformed);
         }
         Ok(())
     }
@@ -171,12 +151,6 @@ impl SetupState {
         self.bundle.as_ref().map(|_| self.bundle_bytes.as_slice())
     }
 
-    /// Returns the immutable observation floor once this endpoint is armed.
-    #[must_use]
-    pub const fn scan_armed(&self) -> Option<SetupScan> {
-        self.scan_armed
-    }
-
     /// Returns the close-only descriptor retained beside this role's
     /// executable setup revision.
     #[must_use]
@@ -212,18 +186,11 @@ impl SetupState {
         self.unresolved_payment_open
     }
 
-    /// Returns the last contiguous finalized setup header held.
+    /// Returns the highest certified height this journal has recorded a
+    /// read at. A read below it is a read of a state already passed.
     #[must_use]
-    pub const fn scan_cursor(&self) -> Option<SetupScan> {
-        self.scan_cursor
-    }
-
-    /// Returns whether finalized history proves that a once-funded payment
-    /// channel can no longer be admitted as a live leased channel but still
-    /// needs its close history mounted.
-    #[must_use]
-    pub const fn close_only_recovery(&self) -> bool {
-        self.origin.is_some() && (self.bond_closed || self.payment_closed)
+    pub const fn observed_height(&self) -> Option<u64> {
+        self.observed_height
     }
 
     /// Returns whether any submitted Open remains unresolved.
@@ -329,7 +296,7 @@ impl SetupState {
                     LeaseSlots::Faulty(_) => SetupDecision::Fault(SetupFault::LeaseMalformed),
                 };
             }
-            if self.bond_closed {
+            if self.bond_reclaimed() {
                 return SetupDecision::Abort(SetupAbort::BondReclaimed);
             }
             if self.bond_timeout_submitted {
@@ -411,6 +378,12 @@ impl SetupState {
         SetupDecision::SubmitPayment
     }
 
+    /// The bond was seen live by a provider's read and is gone now.
+    /// Called only where the read shows no bond.
+    const fn bond_reclaimed(&self) -> bool {
+        matches!(self.role, Role::Provider) && self.bond_finalized
+    }
+
     /// Neither edge exists: submit, abort, or reconcile.
     fn decide_absent_bond(&self, observed: &ObservedSetup<'_>) -> SetupDecision {
         let (Some(bond), Some(payment)) = (self.bond_open(), self.payment_open()) else {
@@ -420,19 +393,16 @@ impl SetupState {
             return SetupDecision::AwaitingCounterparty;
         }
         if !funding_live(&bond, observed.live_funding) {
-            if self.bond_closed {
-                // The bond finalized and contiguous history holds the
-                // Close that spent it. For a provider that is the only
-                // party to record bond Close evidence, that Close is its
-                // own Timeout: the stake input is gone because the stake
-                // came back, and the reclaim is clean rather than a fault.
+            if self.bond_reclaimed() {
+                // A bond this provider saw live is gone, and a bond's
+                // only exit is its Timeout, which pays the stake back:
+                // the reclaim is clean rather than a fault.
                 return SetupDecision::Abort(SetupAbort::BondReclaimed);
             }
             if self.bond_timeout_submitted {
                 // This endpoint submitted the deterministic Timeout that
-                // is spending the stake. History has not yet caught the
-                // finalized Close, so its own reclaim in flight must not
-                // be journaled as a theft: it waits for the Close.
+                // is spending the stake, and no read has shown the bond
+                // live: wait rather than journal its own reclaim as theft.
                 return SetupDecision::AwaitingCounterparty;
             }
             // The stake input is gone and no bond exists to explain it.
@@ -469,7 +439,6 @@ impl SetupState {
                     payment_edge,
                     origin_height,
                     origin_payload,
-                    origin_parent,
                 },
             ) = (end, record)
             {
@@ -477,7 +446,6 @@ impl SetupState {
                     origin.payment_edge == *payment_edge
                         && origin.height == *origin_height
                         && origin.payload == *origin_payload
-                        && origin.parent == *origin_parent
                 });
                 return if same {
                     Ok(Applied::Redundant)
@@ -491,21 +459,8 @@ impl SetupState {
             return Err(SetupStateError::Ended(end));
         }
         match record {
-            SetupRecord::Offer { peer, floor, offer } => {
+            SetupRecord::Offer { peer, offer } => {
                 offer.check().map_err(|_| SetupStateError::Malformed)?;
-                if self.role == Role::Provider {
-                    let floor = floor.ok_or(SetupStateError::Malformed)?;
-                    if self.scan_armed.is_none() {
-                        self.apply(&SetupRecord::ScanArmed {
-                            height: floor.height,
-                            payload: floor.payload,
-                        })?;
-                    } else if self.scan_armed != Some(floor) {
-                        return Err(SetupStateError::Malformed);
-                    }
-                } else if floor.is_some() {
-                    return Err(SetupStateError::Malformed);
-                }
                 if let Some(held) = &self.offer {
                     return if held == &(*peer, offer.as_ref().clone()) {
                         Ok(Applied::Redundant)
@@ -518,34 +473,6 @@ impl SetupState {
                 Ok(Applied::Changed)
             }
             SetupRecord::Bundle { bundle } => self.apply_bundle(bundle),
-            SetupRecord::ScanArmed { height, payload } => {
-                let scan = SetupScan {
-                    height: *height,
-                    payload: *payload,
-                };
-                if self.scan_armed == Some(scan) {
-                    return Ok(Applied::Redundant);
-                }
-                if self.scan_armed.is_some() {
-                    return Err(SetupStateError::WrongStage {
-                        step: "arming a second scan floor",
-                        revision: self.revision(),
-                    });
-                }
-                let stage_is_right = match self.role {
-                    Role::Provider => self.revision().is_none(),
-                    Role::Client => self.revision() == Some(1),
-                };
-                if !stage_is_right {
-                    return Err(SetupStateError::WrongStage {
-                        step: "arming the history scan",
-                        revision: self.revision(),
-                    });
-                }
-                self.scan_armed = Some(scan);
-                self.scan_cursor = Some(scan);
-                Ok(Applied::Changed)
-            }
             SetupRecord::ArmedBundle {
                 bundle,
                 close_descriptor,
@@ -590,7 +517,6 @@ impl SetupState {
                 payment_edge,
                 origin_height,
                 origin_payload,
-                origin_parent,
             } => {
                 let retained = self.payment_edge();
                 if retained != Some(*payment_edge) {
@@ -603,12 +529,16 @@ impl SetupState {
                     payment_edge: *payment_edge,
                     height: *origin_height,
                     payload: *origin_payload,
-                    parent: *origin_parent,
                 };
-                if self.origin.is_some_and(|retained| retained != origin) {
+                if self
+                    .observed_height
+                    .is_some_and(|height| origin.height < height)
+                {
                     return Err(SetupStateError::Malformed);
                 }
+                self.observed_height = Some(origin.height);
                 self.payment_finalized = true;
+                self.unresolved_payment_open = false;
                 self.origin = Some(origin);
                 self.end = Some(SetupEnd::Complete);
                 Ok(Applied::Changed)
@@ -652,12 +582,6 @@ impl SetupState {
                 revision: self.revision(),
             });
         }
-        if self.role == Role::Provider && bundle.revision() == 1 && self.scan_armed.is_none() {
-            return Err(SetupStateError::WrongStage {
-                step: "recording revision 1 before arming its scan floor",
-                revision: self.revision(),
-            });
-        }
         self.apply_decoded_bundle(bytes, bundle)
     }
 
@@ -671,7 +595,7 @@ impl SetupState {
             Role::Client => 2,
             Role::Provider => 3,
         };
-        if bundle.revision() != expected_revision || self.scan_armed.is_none() {
+        if bundle.revision() != expected_revision {
             return Err(SetupStateError::WrongStage {
                 step: "arming an executable setup bundle",
                 revision: self.revision(),
@@ -719,100 +643,42 @@ impl SetupState {
         Ok(Applied::Changed)
     }
 
-    /// Summarizes up to 256 contiguous, executed finalized blocks. The caller
-    /// obtains these from `FinalizedBlocks`; no peer-supplied transaction is
-    /// accepted as an observation without that verified source boundary.
-    pub fn observe(
-        &self,
-        blocks: &[crate::work_close::FinalizedWork],
-    ) -> Result<SetupObservation, SetupStateError> {
-        if blocks.is_empty() || blocks.len() > 256 {
-            return Err(SetupStateError::Malformed);
-        }
-        let from = self.scan_cursor.ok_or(SetupStateError::WrongStage {
-            step: "observing before arming the scan floor",
-            revision: self.revision(),
-        })?;
-        let payment_edge = self.payment_edge();
-        let mut observed = SetupObservation {
-            from,
-            through: from,
-            bond_finalized: self.bond_finalized,
-            payment_finalized: self.payment_finalized,
-            bond_closed: self.bond_closed,
-            payment_closed: self.payment_closed,
-            origin: self.origin,
+    /// What a certified read teaches this journal, or `None` when it
+    /// teaches nothing: an edge seen live for the first time, or a
+    /// submitted Open past the horizon it could still land by.
+    #[must_use]
+    pub fn observe(&self, observed: &ObservedSetup<'_>) -> Option<SetupObservation> {
+        let observation = SetupObservation {
+            height: observed.height,
+            bond_live: observed.bond.is_some(),
+            payment_live: observed.payment.is_some(),
         };
-        for block in blocks {
-            if Some(block.height) != observed.through.height.checked_add(1)
-                || block.parent != observed.through.payload
-            {
-                return Err(SetupStateError::Malformed);
-            }
-            for tx in &block.txs {
-                match tx {
-                    Tx::Open { funding, terms, .. } => {
-                        let edge = Tx::edge_id_of(funding, terms);
-                        if edge == self.bond_edge {
-                            observed.bond_finalized = true;
-                        } else if Some(edge) == payment_edge {
-                            observed.payment_finalized = true;
-                            observed.origin.get_or_insert(SetupOrigin {
-                                payment_edge: edge,
-                                height: block.height,
-                                payload: block.payload,
-                                parent: block.parent,
-                            });
-                        }
-                    }
-                    Tx::Close { input, .. }
-                        if *input == self.bond_edge && self.role == Role::Provider =>
-                    {
-                        observed.bond_finalized = true;
-                        observed.bond_closed = true;
-                    }
-                    Tx::Close { input, .. } if Some(*input) == payment_edge => {
-                        observed.payment_closed = true;
-                    }
-                    _ => {}
-                }
-            }
-            observed.through = SetupScan {
-                height: block.height,
-                payload: block.payload,
-            };
-        }
-        Ok(observed)
+        let mut next = self.clone();
+        next.apply_observation(&observation).ok()?;
+        (next.unresolved_bond_open != self.unresolved_bond_open
+            || next.unresolved_payment_open != self.unresolved_payment_open
+            || next.bond_finalized != self.bond_finalized
+            || next.payment_finalized != self.payment_finalized)
+            .then_some(observation)
     }
 
     fn apply_observation(
         &mut self,
         observed: &SetupObservation,
     ) -> Result<Applied, SetupStateError> {
-        if self.scan_cursor != Some(observed.from)
-            || observed.through.height <= observed.from.height
-            || observed.through.height - observed.from.height > 256
-            || (self.bond_finalized && !observed.bond_finalized)
-            || (self.payment_finalized && !observed.payment_finalized)
-            || (self.bond_closed && !observed.bond_closed)
-            || (self.payment_closed && !observed.payment_closed)
-            || (self.origin.is_some() && self.origin != observed.origin)
+        if self
+            .observed_height
+            .is_some_and(|height| observed.height < height)
         {
             return Err(SetupStateError::Malformed);
         }
-        self.scan_cursor = Some(observed.through);
-        self.bond_finalized = observed.bond_finalized;
-        self.payment_finalized = observed.payment_finalized;
-        self.bond_closed = observed.bond_closed;
-        self.payment_closed = observed.payment_closed;
-        self.origin = observed.origin;
-        if self.bond_finalized
-            || observed.through.height > self.open_horizon(true).unwrap_or(u64::MAX)
-        {
+        self.observed_height = Some(observed.height);
+        self.bond_finalized |= observed.bond_live;
+        self.payment_finalized |= observed.payment_live;
+        if self.bond_finalized || observed.height > self.open_horizon(true).unwrap_or(u64::MAX) {
             self.unresolved_bond_open = false;
         }
-        if self.payment_finalized
-            || observed.through.height > self.open_horizon(false).unwrap_or(u64::MAX)
+        if self.payment_finalized || observed.height > self.open_horizon(false).unwrap_or(u64::MAX)
         {
             self.unresolved_payment_open = false;
         }

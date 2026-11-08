@@ -99,7 +99,7 @@ pub fn payment_edge() -> EdgeId {
     EdgeId::from_bytes([0x22; EdgeId::LENGTH])
 }
 
-/// Distinct digests link synthetic blocks into a contiguous chain.
+/// A distinct payload digest per synthetic block.
 pub fn payload_at(height: u64) -> [u8; 32] {
     let mut payload = [0xc0; 32];
     for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
@@ -108,23 +108,99 @@ pub fn payload_at(height: u64) -> [u8; 32] {
     payload
 }
 
-/// Advance through empty finalized blocks using the production watcher.
+/// The local clock, as a fixture block's certified timestamp.
+pub fn now_ms() -> u64 {
+    hellas_auth::authority::UnixMillis::now()
+        .expect("the local clock reads")
+        .0
+}
+
+/// One certified read of the fixture channel at `height`, stamped now:
+/// both edges live and leased, and the given pending-close slot.
+pub fn observed_at<'a>(
+    height: u64,
+    bond: &'a hellas_kernel::Edge,
+    payment: &'a hellas_kernel::Edge,
+    pending: PendingSlot,
+) -> ObservedChannel<'a> {
+    ObservedChannel {
+        height,
+        payload: payload_at(height),
+        certified_at_ms: now_ms(),
+        bond: Some(bond),
+        payment: Some(payment),
+        lease: lease_over(bond_edge(), payment_edge()),
+        pending,
+    }
+}
+
+/// A sink that takes every transaction and keeps nothing.
+pub struct NullSink;
+
+impl crate::work_close::TxSink for NullSink {
+    async fn submit(
+        &self,
+        _tx: hellas_kernel::Tx,
+    ) -> Result<hellas_rpc::SubmitTxOutcome, crate::work_close::BlockSourceError> {
+        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
+    }
+}
+
+/// One fresh certified read of the live fixture channel at `height`,
+/// applied through a service's driver.
+pub async fn observe_service(
+    service: &crate::work::WorkService,
+    height: u64,
+    pending: PendingSlot,
+) {
+    let (bond, payment) = (bond_object(), payment_object());
+    let observed = observed_at(height, &bond, &payment, pending);
+    if let Err(error) = service.advance_close(&observed, &NullSink).await {
+        panic!("the fixture read applies: {error}");
+    }
+}
+
+/// Renews both sides' admission with one fresh read at `height`, for a
+/// test that runs longer than the certified-age bound.
+pub async fn refresh(
+    client: &crate::work::ClientService,
+    service: &crate::work::WorkService,
+    ready: &ReadyChannel,
+    height: u64,
+) {
+    let (bond, payment) = (bond_object(), payment_object());
+    let observed = observed_at(height, &bond, &payment, PendingSlot::Absent);
+    client
+        .observer()
+        .drive()
+        .expect("the client's driver is free")
+        .observe(&observed)
+        .await
+        .expect("the fixture read applies");
+    client
+        .observer()
+        .observe_ready(ready.clone())
+        .await
+        .expect("a fresh read restores client admission");
+    observe_service(service, height, PendingSlot::Absent).await;
+    service
+        .observe_ready(ready.clone())
+        .await
+        .expect("a fresh read restores provider admission");
+}
+
+/// Moves the journal's cursor to `height` with one fresh certified read of
+/// the live, uncontested fixture channel, through the production observer.
 pub async fn advance(store: &mut crate::work_store::ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = crate::work_close::FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) =
-            crate::work_close::observe(store, &block, &hellas_kernel::Secp256k1Verifier::new())
-                .await
-        {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
+    if store.state().cursor().0 >= height && store.state().certified_at_ms() != 0 {
+        return;
+    }
+    let (bond, payment) = (bond_object(), payment_object());
+    let observed = observed_at(height, &bond, &payment, PendingSlot::Absent);
+    if let Err(error) =
+        crate::work_close::observe(store, &observed, &hellas_kernel::Secp256k1Verifier::new()).await
+    {
+        panic!("the fixture read applies: {error}");
     }
 }
 
@@ -149,7 +225,6 @@ pub fn payment_terms() -> WorkPaymentTerms {
         bond_edge(),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
-        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         8,
         OMISSION_BOND,
     )
@@ -164,7 +239,6 @@ pub fn origin() -> SetupOrigin {
         payment_edge: payment_edge(),
         height: 0,
         payload: payload_at(0),
-        parent: [0_u8; 32],
     }
 }
 
@@ -520,15 +594,7 @@ pub async fn client_service(
     ready: ReadyChannel,
 ) -> crate::work::ClientService {
     let service = crate::work::ClientService::new(endpoint);
-    service
-        .observer()
-        .observe_ready(
-            ready,
-            crate::work::ObservationTime::now(),
-            std::time::Duration::MAX,
-        )
-        .await
-        .unwrap();
+    service.observer().observe_ready(ready).await.unwrap();
     service
 }
 
@@ -916,7 +982,6 @@ pub fn payment_terms_for(
     bond_edge: EdgeId,
     bond_terms: WorkStakeBondTerms,
     private_policy_commitment: [u8; 32],
-    omit_response_blocks: u64,
     start_validity_blocks: u64,
     omission_bond: u64,
 ) -> WorkPaymentTerms {
@@ -924,7 +989,6 @@ pub fn payment_terms_for(
         bond_edge,
         bond_terms,
         private_policy_commitment,
-        omit_response_blocks,
         start_validity_blocks,
         omission_bond,
     }
@@ -1002,13 +1066,7 @@ pub fn transcript_chunks(
 pub fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
     let bond = bond_object();
     let payment = payment_object();
-    let observed = ObservedChannel {
-        height,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
+    let observed = observed_at(height, &bond, &payment, PendingSlot::Absent);
     match descriptor.check_ready(&observed) {
         Ok(ready) => ready,
         Err(error) => panic!("the fixture channel is ready: {error}"),
@@ -1027,12 +1085,11 @@ pub async fn open_setup_store(
         .expect("the setup journal opens")
 }
 
-/// Drive the same three signed revisions while each caller keeps its own terms and scan.
+/// Drive the same three signed revisions while each caller keeps its own terms.
 pub async fn finish_setup(
     service: &crate::work_handshake::SetupService,
     caller: &mut crate::work_handshake::SetupEndpoint,
     bond: EdgeId,
-    scan: crate::work_store::SetupScan,
     funding: hellas_kernel::Funding,
     terms: WorkPaymentTerms,
 ) {
@@ -1041,10 +1098,6 @@ pub async fn finish_setup(
         .import(&proposal)
         .await
         .expect("the client imports the bond proposal");
-    caller
-        .arm_scan(scan)
-        .await
-        .expect("the client arms its scan");
     caller
         .propose_payment(funding, terms)
         .await

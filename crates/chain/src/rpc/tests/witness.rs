@@ -163,6 +163,7 @@ async fn prepare(
         KernelContext::with_fees(
             crate::domain::TEST_NETWORK,
             BlockHeight::new(height),
+            height * 1_000,
             BlockHash::from_bytes(parent.digest().0),
             KERNEL_FEES,
         ),

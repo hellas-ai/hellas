@@ -858,7 +858,6 @@ mod tests {
             bond_edge: hellas_kernel::EdgeId::from_bytes([0x44; 32]),
             bond_terms: bond,
             private_policy_commitment: [0x55; 32],
-            omit_response_blocks: 64,
             start_validity_blocks: 8,
             omission_bond: 2,
         });
@@ -936,7 +935,7 @@ mod tests {
     #[test]
     fn the_payment_close_chain_wrapper_is_three_bytes() {
         for (kernel_tx, kernel_len, chain_len) in [
-            (payment_close_start_tx(), 703, 706),
+            (payment_close_start_tx(), 695, 698),
             (payment_close_response_tx(), 286, 289),
         ] {
             assert_eq!(kernel_tx.encoded_size(), kernel_len);
@@ -1010,7 +1009,7 @@ mod tests {
         }
 
         let genesis: crate::genesis::Genesis =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_JSON)
                 .expect("shipped document parses");
         let funded: Vec<&str> = genesis
             .allocations
@@ -1029,11 +1028,11 @@ mod tests {
         // key is generated independently, not derived from a public scalar.
         expected.push("25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV".to_string());
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
         assert_eq!(accounts.len(), 100);
         for (index, account) in accounts.iter().enumerate() {
             let mut hash = Sha256::new();
-            hash.update(b"hellas-devnet-2/faucet/v1\0");
+            hash.update(b"hellas-devnet-3/faucet/v1\0");
             hash.update((index as u32).to_be_bytes());
             let scalar: [u8; 32] = hash.finalize().into();
             let secret: String = scalar.iter().map(|b| format!("{b:02x}")).collect();

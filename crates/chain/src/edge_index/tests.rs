@@ -223,6 +223,7 @@ impl Harness {
         let context = hellas_kernel::Context::with_fees(
             self.network,
             BlockHeight::new(height),
+            height * 1_000,
             hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
             domain::KERNEL_FEES,
         );
@@ -246,7 +247,7 @@ impl Harness {
             },
             self.head.digest(),
             Height::new(height),
-            height,
+            height * 1_000,
             merkleized.root(),
             target,
             txs,
@@ -724,6 +725,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             hellas_kernel::Context::with_fees(
                 h.network,
                 BlockHeight::new(proof.height),
+                proof.height * 1_000,
                 hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
                 domain::KERNEL_FEES,
             ),
@@ -880,7 +882,6 @@ fn work_pair(
         bond_edge: bond,
         bond_terms: body,
         private_policy_commitment: [7; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         start_validity_blocks: 8,
         omission_bond: 2,
     });
@@ -1517,6 +1518,7 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             hellas_kernel::Context::with_fees(
                 h.network,
                 BlockHeight::new(proof.height),
+                proof.height * 1_000,
                 hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
                 domain::KERNEL_FEES,
             ),

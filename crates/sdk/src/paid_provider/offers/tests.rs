@@ -48,14 +48,7 @@ fn options(root: &Path) -> ProvisionOptions {
                 oracle_grace_blocks: 6,
             },
             expected_payment_values: EdgeValues::new(201, 0, Fees::ZERO),
-            min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         },
-    }
-}
-fn floor() -> SetupScan {
-    SetupScan {
-        height: 7,
-        payload: [7; 32],
     }
 }
 fn planned(options: &ProvisionOptions, held: &[SetupState]) -> Result<Offer> {
@@ -64,12 +57,12 @@ fn planned(options: &ProvisionOptions, held: &[SetupState]) -> Result<Offer> {
 }
 
 #[tokio::test]
-async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
+async fn offer_peer_policy_and_funding_are_durable_in_one_record() {
     let dir = tempfile::tempdir().unwrap();
     let options = options(&dir.path().join("journal"));
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(&std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     offered.offer.check().unwrap();
@@ -77,12 +70,7 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
         open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
             .await
             .unwrap();
-    assert_eq!(
-        store.len(),
-        1,
-        "no separately durable unsigned scan-floor stage"
-    );
-    assert_eq!(store.state().scan_armed(), Some(floor()));
+    assert_eq!(store.len(), 1, "the offer is one durable record");
     let (peer, offer) = store.state().offer().unwrap();
     assert_eq!(*peer, options.peer);
     assert_eq!(*offer, offered.offer);
@@ -119,7 +107,6 @@ async fn offer_peer_policy_funding_and_scan_floor_are_durable_in_one_record() {
         reopened.state().offer().unwrap().1.encode().unwrap(),
         offered.offer.encode().unwrap()
     );
-    assert_eq!(reopened.state().scan_armed(), Some(floor()));
     drop(reopened);
     let location = StoreLocation::for_test(&options.journal_root);
     assert_eq!(
@@ -138,7 +125,7 @@ async fn every_unanswered_offer_reserves_its_coins_before_another_offer_is_signe
     let first = options(dir.path());
     let offered = planned(&first, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(&std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     let location = StoreLocation::for_test(dir.path());
@@ -152,32 +139,6 @@ async fn every_unanswered_offer_reserves_its_coins_before_another_offer_is_signe
         matches!(planned(&second, &[held]), Err(ProvisionError::ReservedCoin { coin, .. }) if coin == first.stake_coins[0])
     );
     assert_eq!(store.len(), 1);
-}
-
-#[tokio::test]
-async fn expired_or_excessive_lifetime_offers_leave_no_journal_or_signature() {
-    let dir = tempfile::tempdir().unwrap();
-    for timeout in [
-        floor().height,
-        floor().height + MAX_EDGE_LIFETIME_BLOCKS + 1,
-    ] {
-        let root = dir.path().join(timeout.to_string());
-        let mut options = options(&root);
-        options.bond_timeout = timeout;
-        let write_started = std::sync::atomic::AtomicBool::new(false);
-        assert!(matches!(
-            planned(&options, &[])
-                .unwrap()
-                .journal(floor(), &write_started,)
-                .await,
-            Err(ProvisionError::ExpiredBond { .. } | ProvisionError::BondLifetime)
-        ));
-        assert!(
-            !write_started.load(std::sync::atomic::Ordering::Acquire),
-            "preflight failures cannot disable the allocator"
-        );
-        assert!(!root.exists());
-    }
 }
 
 #[tokio::test]
@@ -195,7 +156,7 @@ async fn a_crash_after_creating_an_unsigned_header_does_not_block_discovery_or_r
     assert!(found.setups.is_empty() && found.unidentified.is_empty());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(&std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     assert_eq!(offered.bond_edge, candidate.bond_edge);
@@ -228,7 +189,7 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
     let options = options(dir.path());
     let offered = planned(&options, &[])
         .unwrap()
-        .journal(floor(), &std::sync::atomic::AtomicBool::new(false))
+        .journal(&std::sync::atomic::AtomicBool::new(false))
         .await
         .unwrap();
     let original = serde_json::to_value(&offered.offer).unwrap();

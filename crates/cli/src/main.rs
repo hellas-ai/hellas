@@ -227,8 +227,6 @@ enum Commands {
             conflicts_with = "await_owner"
         )]
         work_config_file: Option<PathBuf>,
-        #[command(flatten)]
-        chain_node: commands::chain_node::ChainNodeArgs,
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
@@ -851,7 +849,6 @@ async fn async_main() {
             no_discovery,
             queue_size,
             work_config_file,
-            chain_node,
             grant_config_file,
             audio_model,
             await_owner,
@@ -954,7 +951,6 @@ async fn async_main() {
                             queue_size,
                             native,
                             paid,
-                            chain_node,
                             grants,
                             #[cfg(feature = "otel")]
                             metrics,

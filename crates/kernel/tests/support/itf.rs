@@ -152,6 +152,7 @@ pub(crate) fn context_for_height(height: i64) -> Result<Context, String> {
         // itself is pinned by tests/network.rs.
         super::NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     ))
 }
