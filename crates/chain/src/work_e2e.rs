@@ -31,6 +31,7 @@ use hellas_kernel::{
     Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
+use hellas_store::content::DiskStore;
 use hellas_wire::TransportContext;
 use hellas_wire::mux::MuxTransport;
 
@@ -385,8 +386,24 @@ impl WorkDevnet {
 
 // ── The handshake, and the setup drive ────────────────────────────────
 
-async fn open_setup(root: &std::path::Path, bond: EdgeId, role: Role) -> SetupStore {
-    hellas_channel::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role).await
+/// A fresh party's content store; its channel journal owns the paid content.
+async fn content(root: &std::path::Path) -> DiskStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
+    content.finish_recovery().await.unwrap();
+    content
+}
+
+async fn open_setup(
+    root: &std::path::Path,
+    content: &DiskStore,
+    bond: EdgeId,
+    role: Role,
+) -> SetupStore {
+    let mut store =
+        hellas_channel::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role)
+            .await;
+    store.set_content_store(content.clone());
+    store
 }
 
 fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -412,12 +429,19 @@ struct Handshake {
 async fn shake_hands(
     provider_root: &std::path::Path,
     client_root: &std::path::Path,
+    client_content: &DiskStore,
     allocations: &Allocations,
     scan: SetupScan,
 ) -> Handshake {
     let bond = bond_edge(allocations);
     let mut proposer = SetupEndpoint::new(
-        open_setup(provider_root, bond, Role::Provider).await,
+        open_setup(
+            provider_root,
+            &content(provider_root).await,
+            bond,
+            Role::Provider,
+        )
+        .await,
         provider(),
         PaymentAdmission::Admits(Box::new(provider_policy())),
     );
@@ -438,7 +462,7 @@ async fn shake_hands(
     let service = SetupService::new(proposer);
 
     let mut caller = SetupEndpoint::new(
-        open_setup(client_root, bond, Role::Client).await,
+        open_setup(client_root, client_content, bond, Role::Client).await,
         client(),
         PaymentAdmission::Proposes(Box::new(provider_policy())),
     );
@@ -578,7 +602,15 @@ async fn open_channel(
         );
     }
     let floor = devnet.seal().await;
-    let handshake = shake_hands(provider_root, client_root, &allocations, scan_at(&floor)).await;
+    let client_content = content(client_root).await;
+    let handshake = shake_hands(
+        provider_root,
+        client_root,
+        &client_content,
+        &allocations,
+        scan_at(&floor),
+    )
+    .await;
 
     // The bond, submitted by the driver and finalized by consensus.
     assert_eq!(
@@ -626,7 +658,13 @@ async fn open_channel(
     // The client reaches the same origin from its own journal, reading a
     // different validator. The journal is reopened from the disk, so
     // nothing this process held in memory carries the client's half.
-    let mut client_setup = open_setup(client_root, bond_edge(&allocations), Role::Client).await;
+    let mut client_setup = open_setup(
+        client_root,
+        &client_content,
+        bond_edge(&allocations),
+        Role::Client,
+    )
+    .await;
     let client_advance = client_step(&mut client_setup, &client_blocks).await;
     assert_eq!(client_advance.progress, SetupProgress::Complete(origin));
     let Some(client_store) = client_advance.mounted else {
