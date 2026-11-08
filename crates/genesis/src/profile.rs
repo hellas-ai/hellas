@@ -209,15 +209,92 @@ impl ChainProfile {
             genesis_json: file.genesis_json,
         })
     }
-
-    pub fn execution(&self) -> &Genesis {
-        &self.genesis
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A custom network whose trust document binds its genesis bytes.
+    fn custom_file(trust_edit: impl FnOnce(&mut TrustDocument)) -> CustomChainFile {
+        let known = ChainProfile::known(Chain::Devnet);
+        let mut genesis = known.genesis().clone();
+        genesis.network_id = "custom-1".into();
+        let genesis_json = serde_json::to_string(&genesis).unwrap();
+        let mut trust = known.trust().clone();
+        trust.network_id = genesis.network_id;
+        trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
+        trust_edit(&mut trust);
+        CustomChainFile {
+            trust,
+            validators: vec!["ws://127.0.0.1:9080".into()],
+            genesis_json,
+        }
+    }
+
+    #[test]
+    fn custom_trust_must_bind_the_genesis_bytes_and_name() {
+        assert!(ChainProfile::custom(custom_file(|_| {})).is_ok());
+        let mut reformatted = custom_file(|_| {});
+        reformatted.genesis_json.push('\n');
+        let renamed = custom_file(|trust| trust.network_id = "custom-2".into());
+        for file in [reformatted, renamed] {
+            assert!(matches!(
+                ChainProfile::custom(file),
+                Err(ChainProfileError::Binding)
+            ));
+        }
+    }
+
+    #[test]
+    fn routes_must_be_distinct_websocket_urls_with_a_host() {
+        let profile = ChainProfile::known(Chain::Devnet);
+        let accepted = profile
+            .clone()
+            .with_validators(vec![
+                " wss://a.example/ws ".into(),
+                "ws://b.example:9".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            accepted.validators(),
+            ["wss://a.example/ws", "ws://b.example:9/"]
+        );
+        for routes in [
+            vec![],
+            vec!["not a url"],
+            vec!["https://a.example"],
+            vec!["ws://"],
+            vec!["ws://a.example:9", "ws://a.example:9/"],
+        ] {
+            let routes: Vec<String> = routes.into_iter().map(String::from).collect();
+            assert!(
+                matches!(
+                    profile.clone().with_validators(routes.clone()),
+                    Err(ChainProfileError::Routes)
+                ),
+                "{routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_identity_needs_one_open_epoch_from_zero() {
+        let open = ChainProfile::custom(custom_file(|_| {})).unwrap();
+        assert_eq!(
+            open.static_threshold_identity().unwrap(),
+            hex::decode(&open.trust().epochs[0].threshold_identity).unwrap()
+        );
+        let closed = custom_file(|trust| trust.epochs[0].end_height = Some(10));
+        let renumbered = custom_file(|trust| trust.epochs[0].epoch = 5);
+        for file in [closed, renumbered] {
+            let profile = ChainProfile::custom(file).unwrap();
+            assert!(matches!(
+                profile.static_threshold_identity(),
+                Err(ChainProfileError::UnsupportedSchedule)
+            ));
+        }
+    }
 
     #[test]
     fn custom_profile_requires_genesis_bytes_and_rejects_a_foreign_name() {

@@ -1,13 +1,13 @@
-"""Per-crate line-coverage ratchet for `nix run .#check-coverage`.
+"""Per-crate line-coverage ratchet for the `unit` check.
 
-usage: coverage-ratchet.py SUMMARY_JSON FLOORS_JSON [--update]
+usage: coverage-ratchet.py SUMMARY_JSON FLOORS_JSON MEASURED_JSON
 
 SUMMARY_JSON is `cargo llvm-cov report --json --summary-only`. Only production
 files under `crates/<name>/` count: test files, test-support modules, benches
 and examples are left out. The check fails when a crate falls more than SLACK
-points below its floor, so a gain in one crate cannot hide a loss in another.
-`--update` rewrites FLOORS_JSON from SUMMARY_JSON; run it when a change raises
-coverage and commit the result.
+points below its floor in FLOORS_JSON, so a gain in one crate cannot hide a
+loss in another. MEASURED_JSON receives the floors this run would record; copy
+it over FLOORS_JSON when a change raises coverage and commit the result.
 """
 
 import json
@@ -36,24 +36,19 @@ def measure(summary):
     return {crate: 100 * c / n for crate, (c, n) in sorted(totals.items()) if n}
 
 
-def main(summary, floors, *flags):
+def main(summary, floors, recorded):
     measured = measure(summary)
-    if flags == ("--update",):
-        with open(floors, "w") as file:
-            rounded = {crate: math.floor(percent * 10) / 10 for crate, percent in measured.items()}
-            json.dump(rounded, file, indent=2, sort_keys=True)
-            file.write("\n")
-        print(f"wrote {len(rounded)} floors to {floors}")
-        return 0
-    if flags:
-        sys.exit(__doc__)
+    with open(recorded, "w") as file:
+        rounded = {crate: math.floor(percent * 10) / 10 for crate, percent in measured.items()}
+        json.dump(rounded, file, indent=2, sort_keys=True)
+        file.write("\n")
     with open(floors) as file:
         floor = json.load(file)
     failed = []
     for crate in sorted(floor.keys() | measured.keys()):
         got, minimum = measured.get(crate), floor.get(crate)
         if minimum is None:
-            print(f"{crate:16} {got:6.2f}%  no floor yet (run with --update)")
+            print(f"{crate:16} {got:6.2f}%  no floor yet")
         elif got is None:
             print(f"{crate:16}   gone  floor {minimum:5.1f}%")
             failed.append(crate)
@@ -69,6 +64,6 @@ def main(summary, floors, *flags):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    if len(sys.argv) != 4:
         sys.exit(__doc__)
     sys.exit(main(*sys.argv[1:]))

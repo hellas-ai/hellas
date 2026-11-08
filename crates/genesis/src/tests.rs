@@ -56,12 +56,15 @@ fn every_known_network_document_declares_the_id_the_registry_claims() {
             assert!(routes.insert(parsed.to_string()), "duplicate shipped route");
         }
         assert_eq!(network.chain.name(), network.name);
+        assert_eq!(Chain::parse(network.name), Some(network.chain));
+        assert_eq!(Chain::parse(network.id), Some(network.chain));
         assert_eq!(known_network(network.name), Some(network));
         assert_eq!(known_network(network.id), Some(network));
     }
     assert_eq!(known_network("mainnet"), None);
     assert_eq!(known_network("hellas-devnet-1"), None);
     assert_eq!(known_network(""), None);
+    assert_eq!(Chain::parse("mainnet"), None);
 }
 
 /// No two shipped networks may share a name, an id, or — the one
@@ -176,28 +179,98 @@ fn json_and_toml_round_trip_the_same_document() {
     assert_eq!(from_toml, genesis);
 }
 
-#[test]
-fn rejects_duplicate_committee_identity_or_label() {
-    let mut duplicate_key = fixture();
-    duplicate_key.validators[1].public_key = duplicate_key.validators[0].public_key.clone();
-    assert!(matches!(
-        duplicate_key.validate(),
-        Err(GenesisError::DuplicateValidatorKey(_))
-    ));
+/// A refusal case: what is wrong, how to break the fixture, the error.
+type Malformed = (&'static str, fn(&mut Genesis), GenesisError);
 
-    let mut duplicate_label = fixture();
-    duplicate_label.validators[1].label = duplicate_label.validators[0].label.clone();
-    assert!(matches!(
-        duplicate_label.validate(),
-        Err(GenesisError::DuplicateValidatorLabel(_))
-    ));
-}
-
+/// A custom chain file is untrusted input: every malformed document is
+/// refused with the error that names what is wrong with it.
 #[test]
-fn rejects_short_or_noncanonical_public_keys() {
-    for key in ["11".repeat(31), "AA".repeat(32), "gg".repeat(32)] {
+fn validate_refuses_each_malformed_document() {
+    let cases: &[Malformed] = &[
+        (
+            "future schema",
+            |g| g.schema_version = 2,
+            GenesisError::UnsupportedSchema(2),
+        ),
+        (
+            "empty network id",
+            |g| g.network_id.clear(),
+            GenesisError::InvalidNetworkId,
+        ),
+        (
+            "uppercase network id",
+            |g| g.network_id = "Hellas-1".into(),
+            GenesisError::InvalidNetworkId,
+        ),
+        (
+            "network id with a space",
+            |g| g.network_id = "hellas 1".into(),
+            GenesisError::InvalidNetworkId,
+        ),
+        (
+            "64-byte network id",
+            |g| g.network_id = "a".repeat(64),
+            GenesisError::InvalidNetworkId,
+        ),
+        (
+            "no validators",
+            |g| g.validators.clear(),
+            GenesisError::EmptyCommittee,
+        ),
+        (
+            "31-byte key",
+            |g| g.validators[0].public_key = "11".repeat(31),
+            GenesisError::InvalidValidatorKey,
+        ),
+        (
+            "uppercase key",
+            |g| g.validators[0].public_key = "AA".repeat(32),
+            GenesisError::InvalidValidatorKey,
+        ),
+        (
+            "non-hex key",
+            |g| g.validators[0].public_key = "gg".repeat(32),
+            GenesisError::InvalidValidatorKey,
+        ),
+        (
+            "duplicate key",
+            |g| g.validators[1].public_key = "11".repeat(32),
+            GenesisError::DuplicateValidatorKey("11".repeat(32)),
+        ),
+        (
+            "empty label",
+            |g| g.validators[0].label.clear(),
+            GenesisError::InvalidValidatorLabel,
+        ),
+        (
+            "uppercase label",
+            |g| g.validators[0].label = "Validator-a".into(),
+            GenesisError::InvalidValidatorLabel,
+        ),
+        (
+            "64-byte label",
+            |g| g.validators[0].label = "a".repeat(64),
+            GenesisError::InvalidValidatorLabel,
+        ),
+        (
+            "duplicate label",
+            |g| g.validators[1].label = "validator-a".into(),
+            GenesisError::DuplicateValidatorLabel("validator-a".into()),
+        ),
+        (
+            "empty allocation address",
+            |g| g.allocations[0].address.clear(),
+            GenesisError::EmptyAllocationAddress,
+        ),
+        (
+            "duplicate allocation address",
+            |g| g.allocations.push(g.allocations[0].clone()),
+            GenesisError::DuplicateAllocationAddress("example-address".into()),
+        ),
+    ];
+    for (name, corrupt, expected) in cases {
         let mut genesis = fixture();
-        genesis.validators[0].public_key = key;
-        assert_eq!(genesis.validate(), Err(GenesisError::InvalidValidatorKey));
+        corrupt(&mut genesis);
+        assert_eq!(genesis.validate().as_ref(), Err(expected), "{name}");
     }
 }

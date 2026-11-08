@@ -147,7 +147,6 @@ const MAX_LABEL_BYTES: usize = 63;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
-    #[serde(default = "default_schema_version")]
     pub schema_version: u16,
     pub network_id: String,
     pub validators: Vec<GenesisValidator>,
@@ -251,10 +250,6 @@ impl Genesis {
             .iter()
             .find(|validator| validator.public_key == public_key)
     }
-}
-
-const fn default_schema_version() -> u16 {
-    GENESIS_SCHEMA_VERSION
 }
 
 fn is_token(value: &str, max_len: usize) -> bool {

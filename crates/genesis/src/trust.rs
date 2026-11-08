@@ -144,12 +144,20 @@ mod tests {
         assert_eq!(trust.validate(), Err(TrustError::Identity));
     }
     #[test]
-    fn rejects_invalid_network_and_schema() {
+    fn rejects_invalid_network_schema_digest_and_empty_schedule() {
         let mut trust = document();
         trust.network_id = "invalid network".into();
         assert_eq!(trust.validate(), Err(TrustError::Network));
         let mut trust = document();
         trust.schema_version = 2;
         assert_eq!(trust.validate(), Err(TrustError::Schema));
+        for digest in ["ab".repeat(31), "AB".repeat(32), "gg".repeat(32)] {
+            let mut trust = document();
+            trust.genesis_sha256 = digest;
+            assert_eq!(trust.validate(), Err(TrustError::Genesis));
+        }
+        let mut trust = document();
+        trust.epochs.clear();
+        assert_eq!(trust.validate(), Err(TrustError::Schedule));
     }
 }

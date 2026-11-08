@@ -147,6 +147,11 @@ let
   # Shared with the `check-clippy` app in ci.nix.
   clippyArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames";
 
+  # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
+  # (format 11) its paired llvm-profdata (format 10) cannot read. At run
+  # time the tool uses our toolchain's llvm-tools-preview instead.
+  cargoLlvmCov = pkgs.cargo-llvm-cov.overrideAttrs { doCheck = false; };
+
   craneArgs = {
     pname = "hellas";
     version = "0.1.0";
@@ -195,19 +200,58 @@ let
         cargoClippyExtraArgs = clippyArgs;
       }
     );
-    unit = craneLib.cargoTest (
-      craneArgs
-      // {
-        pname = "hellas-unit";
-        cargoArtifacts = cargoDeps;
-        # Terminal check: nothing consumes its target directory.
-        doInstallCargoArtifacts = false;
-        cargoTestExtraArgs = "--workspace";
-      }
-      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-        RUST_TEST_THREADS = "1";
-      }
-    );
+    # The workspace tests, run once with line-coverage instrumentation. On
+    # the validator host the run fails on a failing test and on a crate below
+    # its floor in coverage-floor.json. cargo-llvm-cov instruments only
+    # workspace crates through its rustc wrapper, so the dependencies in
+    # `cargoDeps` stay valid; keeping its target directory at `target` is what
+    # lets Cargo reuse them. The output holds lcov.info, summary.json,
+    # summary.txt and the coverage-floor.json this run would record (copy it
+    # over the committed one after raising coverage). Other hosts run the same
+    # tests uninstrumented; the floors are measured on the validator host.
+    unit =
+      if pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
+        craneLib.mkCargoDerivation (
+          craneArgs
+          // {
+            pname = "hellas-unit";
+            cargoArtifacts = cargoDeps;
+            # Terminal check: nothing consumes its target directory.
+            doInstallCargoArtifacts = false;
+            nativeBuildInputs = craneArgs.nativeBuildInputs ++ [
+              cargoLlvmCov
+              pkgs.cargo-nextest
+              pkgs.python3
+            ];
+            CARGO_LLVM_COV_TARGET_DIR = "target";
+            NEXTEST_SHOW_PROGRESS = "counter";
+            buildPhaseCargoCommand = ''
+              cargo llvm-cov nextest --locked --workspace --no-report
+              # nextest does not run doctests; the compile_fail ones pin type safety.
+              cargo test --locked --workspace --doc
+              mkdir -p "$out"
+              cargo llvm-cov report --lcov --output-path "$out/lcov.info"
+              cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
+              cargo llvm-cov report --summary-only | tee "$out/summary.txt"
+              python3 ${./coverage-ratchet.py} "$out/summary.json" ${./coverage-floor.json} "$out/coverage-floor.json"
+            '';
+            installPhaseCommand = "";
+          }
+        )
+      else
+        craneLib.cargoTest (
+          craneArgs
+          // {
+            pname = "hellas-unit";
+            cargoArtifacts = cargoDeps;
+            # Terminal check: nothing consumes its target directory.
+            doInstallCargoArtifacts = false;
+            cargoTestExtraArgs = "--workspace";
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+            RUST_TEST_THREADS = "1";
+          }
+        );
     regressions = craneLib.cargoTest (
       craneArgs
       // {
@@ -235,6 +279,7 @@ in
     mkHellasPackage
     revEnv
     cargoDeps
+    cargoLlvmCov
     craneChecks
     clippyArgs
     ;
