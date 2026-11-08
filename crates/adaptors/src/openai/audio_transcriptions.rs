@@ -5,18 +5,10 @@
 /// The longest non-file form field accepted, in bytes.
 pub const MAX_FIELD_BYTES: usize = 256;
 
-/// A rejected form, with the HTTP status it is reported under.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TranscriptionError {
-    pub status: u16,
-    pub message: String,
-}
+use super::RequestError;
 
-fn bad(message: impl Into<String>) -> TranscriptionError {
-    TranscriptionError {
-        status: 400,
-        message: message.into(),
-    }
+fn bad(message: impl Into<String>) -> RequestError {
+    RequestError::new(400, message)
 }
 
 /// The form fields of one transcription request, in arrival order.
@@ -39,7 +31,7 @@ impl TranscriptionForm {
     }
 
     /// Admit a field by name, before its bytes are read.
-    pub fn admit(&mut self, name: &str) -> Result<(), TranscriptionError> {
+    pub fn admit(&mut self, name: &str) -> Result<(), RequestError> {
         let seen = match name {
             "file" => self.file.is_some(),
             _ => self
@@ -54,7 +46,7 @@ impl TranscriptionForm {
     }
 
     /// Record the bytes of a field [`Self::admit`] accepted.
-    pub fn insert(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), TranscriptionError> {
+    pub fn insert(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), RequestError> {
         if name == "file" {
             self.file = Some(bytes);
             return Ok(());
@@ -68,7 +60,7 @@ impl TranscriptionForm {
     }
 
     /// The requested model name.
-    pub fn model(&self) -> Result<&str, TranscriptionError> {
+    pub fn model(&self) -> Result<&str, RequestError> {
         (self.model.as_deref())
             .filter(|model| !model.is_empty())
             .ok_or_else(|| bad("model field is required"))
@@ -79,12 +71,9 @@ impl TranscriptionForm {
     pub fn finish(
         self,
         served_model: &str,
-    ) -> Result<(Vec<u8>, Option<String>, bool), TranscriptionError> {
+    ) -> Result<(Vec<u8>, Option<String>, bool), RequestError> {
         if self.model()? != served_model {
-            return Err(TranscriptionError {
-                status: 404,
-                message: "unknown model".into(),
-            });
+            return Err(RequestError::new(404, "unknown model"));
         }
         let text = match self.response_format.as_deref().unwrap_or("json") {
             "json" => false,

@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use hellas_adaptors::openai::audio_transcriptions::{TranscriptionError, TranscriptionForm};
+use hellas_adaptors::openai::audio_transcriptions::TranscriptionForm;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
@@ -48,10 +48,6 @@ pub(super) async fn router(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state))
 }
-fn transcription_error(error: TranscriptionError) -> Response {
-    let status = StatusCode::from_u16(error.status).expect("a transcription status is valid");
-    json_error(status, error.message)
-}
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response {
     json_error(error.status(), error.body_text())
 }
@@ -63,13 +59,13 @@ pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Resp
     let mut form = TranscriptionForm::default();
     while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         if field.name() == Some("model") {
-            form.admit("model").map_err(transcription_error)?;
+            form.admit("model").map_err(crate::request_error)?;
             let bytes = field.bytes().await.map_err(multipart_error)?;
             form.insert("model", bytes.into())
-                .map_err(transcription_error)?;
+                .map_err(crate::request_error)?;
         }
     }
-    Ok(form.model().map_err(transcription_error)?.to_owned())
+    Ok(form.model().map_err(crate::request_error)?.to_owned())
 }
 
 async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Response {
@@ -80,7 +76,7 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
     } {
         let name = field.name().unwrap_or_default().to_owned();
         if let Err(error) = fields.admit(&name) {
-            return transcription_error(error);
+            return crate::request_error(error);
         }
         let bytes = match field.bytes().await {
             Ok(bytes) => bytes,
@@ -90,12 +86,12 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
         }
         if let Err(error) = fields.insert(&name, bytes.into()) {
-            return transcription_error(error);
+            return crate::request_error(error);
         }
     }
     let (file, language, text) = match fields.finish(&state.options.model_name) {
         Ok(fields) => fields,
-        Err(error) => return transcription_error(error),
+        Err(error) => return crate::request_error(error),
     };
     let deadline = state
         .work
@@ -185,7 +181,7 @@ fn audio_error(
 ) -> Response {
     json_response(
         status,
-        serde_json::json!({"error": {"message": message.into()}}),
+        hellas_adaptors::openai::error_json(message),
         accepted,
         transcript,
     )

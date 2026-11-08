@@ -2,13 +2,35 @@ pub mod audio_transcriptions;
 pub mod chat_completions;
 pub mod codex_responses;
 pub mod completions;
+pub mod images;
 pub mod responses;
 
 use serde_json::{Value as JsonValue, json};
 
 /// A refusal or failure as the OpenAI APIs report it.
 pub fn render_error(status: u16, message: String) -> crate::WireResponse {
-    crate::WireResponse::json(status, json!({ "error": { "message": message } }))
+    crate::WireResponse::json(status, error_json(message))
+}
+
+/// The body of an OpenAI error response.
+pub fn error_json(message: impl Into<String>) -> JsonValue {
+    json!({ "error": { "message": message.into() } })
+}
+
+/// A rejected request, with the HTTP status it is reported under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl RequestError {
+    fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
 }
 
 pub(super) fn project_response_format(value: &JsonValue) -> crate::ResponseFormat {

@@ -586,6 +586,12 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     path_error("", status, message)
 }
 
+/// A request an adaptor rejected, in the OpenAI error shape.
+fn request_error(error: hellas_adaptors::openai::RequestError) -> Response {
+    let status = StatusCode::from_u16(error.status).expect("an adaptor status is valid");
+    json_error(status, error.message)
+}
+
 /// A refusal or failure on `path`, in the error shape of the wire format
 /// served there: Anthropic's on its Messages path, OpenAI's elsewhere.
 fn path_error(path: &str, status: StatusCode, message: impl Into<String>) -> Response {

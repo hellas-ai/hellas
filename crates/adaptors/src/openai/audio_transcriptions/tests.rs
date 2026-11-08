@@ -1,6 +1,6 @@
 use super::*;
 
-fn form(fields: &[(&str, &[u8])]) -> Result<(Vec<u8>, Option<String>, bool), TranscriptionError> {
+fn form(fields: &[(&str, &[u8])]) -> Result<(Vec<u8>, Option<String>, bool), RequestError> {
     let mut form = TranscriptionForm::default();
     for (name, bytes) in fields {
         form.admit(name)?;
@@ -29,6 +29,6 @@ fn transcription_forms_parse_or_reject_with_their_status() {
         (&[("model", b""), file], 400, "model field is required"),
     ] {
         let message = message.into();
-        assert_eq!(form(fields), Err(TranscriptionError { status, message }));
+        assert_eq!(form(fields), Err(RequestError { status, message }));
     }
 }
