@@ -1,9 +1,8 @@
 //! Caller purchase/report state. This contains identifiers only, never input or output.
-use super::super::{job::Job, paid_client::PaidWorkOptions};
+use super::super::job::Job;
 use hellas_auth::Digest;
 use hellas_auth::authority::PrincipalId;
-use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
-use hellas_kernel::{EdgeId, Secp256k1Verifier};
+use hellas_kernel::EdgeId;
 use hellas_private::Durability;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -101,10 +100,6 @@ pub enum PurchaseError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Store(#[from] hellas_channel::work_store::WorkStoreError),
-    #[error(transparent)]
-    Setup(#[from] hellas_channel::model::setup::WorkSetupError),
 }
 type Result<T> = std::result::Result<T, PurchaseError>;
 
@@ -414,147 +409,6 @@ impl Purchase {
                 .map_or_else(|| "not yet accepted".into(), |id| id.to_string()),
             reason,
         }
-    }
-
-    /// Resolve the crash window between payment intent and payment completion
-    /// from the existing signed channel journal, even after channel settlement.
-    pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<()> {
-        self.ensure_state_key(&options.config.chain.state_key())?;
-        let Some(record) = self.record.clone() else {
-            return Ok(());
-        };
-        if matches!(
-            record.phase,
-            Phase::InputBound | Phase::TargetBound | Phase::ChannelBound
-        ) {
-            return Err(self.unfinished("target or channel binding is incomplete"));
-        }
-        if matches!(
-            record.phase,
-            Phase::Paid | Phase::Reported | Phase::Rejected
-        ) {
-            return Ok(());
-        }
-        if !options.journal_root().exists() {
-            return Err(self.unfinished("channel journal is missing"));
-        }
-        let found = hellas_channel::work_store::discover_setups(
-            &options.journal_root(),
-            options.config.network(),
-        )
-        .await?;
-        if !found.unidentified.is_empty()
-            || !found.setups.iter().any(|setup| {
-                setup.role == Role::Client && setup.bond_edge.to_bytes() == record.bond
-            })
-        {
-            return Err(self.unfinished("its setup journal is unavailable"));
-        }
-        let setup = SetupStore::open(
-            &options.journal_root(),
-            options.config.network(),
-            EdgeId::from_bytes(record.bond),
-            Role::Client,
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
-        let setup = setup.into_state().await;
-        let descriptor = setup
-            .close_descriptor()
-            .ok_or_else(|| self.unfinished("channel descriptor is missing"))?;
-        if descriptor.channel().id().as_bytes() != &record.channel {
-            return Err(PurchaseError::Identity);
-        }
-        let origin = setup
-            .origin()
-            .ok_or_else(|| self.unfinished("channel origin is missing"))?;
-        let channel = descriptor.channel().clone();
-        let settlement = descriptor.expected_settlement()?;
-        let mut store = ChannelStore::open(
-            &options.journal_root(),
-            channel,
-            settlement,
-            Role::Client,
-            origin,
-            hellas_store::ContentStore::new(),
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
-        let result = async {
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && let Some((result, _)) =
-                    store.state().job_by_id(work).and_then(|job| job.result())
-                && result.outcome == hellas_channel::model::work::ResultOutcome::Failed
-            {
-                let outcome = TerminalOutcome::Rejected {
-                    result_digest: hellas_channel::model::work::result_digest(
-                        store.state().channel(),
-                        result,
-                    ),
-                    evidence_digest: result.transcript_content.id().digest(),
-                };
-                store
-                    .commit(
-                        ChannelRecord::JobTerminated {
-                            work_id: work,
-                            outcome,
-                        },
-                        &Secp256k1Verifier::new(),
-                    )
-                    .await?;
-            }
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && store.state().terminal_by_id(work).is_some_and(|terminal| {
-                    matches!(
-                        terminal.outcome,
-                        TerminalOutcome::Rejected { .. } | TerminalOutcome::Expired { .. }
-                    )
-                })
-            {
-                return self.unpaid(work);
-            }
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && store.state().terminal_by_id(work).is_some_and(|terminal| {
-                    matches!(terminal.outcome, TerminalOutcome::Certified { .. })
-                })
-            {
-                self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Paid;
-                self.persist()?;
-                return Err(PurchaseError::ResultLost {
-                    work,
-                    price: self.price,
-                });
-            }
-            if let Some(job) = store
-                .state()
-                .jobs()
-                .find(|job| job.authorization().proposal_nonce == record.nonce)
-            {
-                if job.authorization().payment_deadline < store.state().cursor().0
-                    || (job.phase() == hellas_channel::work_store::JobPhase::HalfSigned
-                        && job.authorization().acceptance_deadline < store.state().cursor().0)
-                {
-                    return Err(self.unfinished("its authorization expired"));
-                }
-                if record
-                    .work
-                    .is_some_and(|id| id != *job.work_id().as_bytes())
-                {
-                    return Err(PurchaseError::Identity);
-                }
-                return Ok(());
-            }
-            if record.work.is_none()
-                && record.nonce == store.state().proposal_nonce_high_water().saturating_add(1)
-                && !store.state().is_closing()
-            {
-                return Ok(());
-            }
-            Err(self.unfinished("no unfinished authorized work remains"))
-        }
-        .await;
-        store.close().await;
-        result
     }
 
     pub(super) fn nonce(&self, channel: Digest) -> Result<Option<u64>> {
