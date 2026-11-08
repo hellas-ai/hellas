@@ -5,8 +5,6 @@
 #![recursion_limit = "256"]
 
 mod host;
-mod openai;
 mod policy;
 pub use host::{OpenAiProviderError, OpenAiProviderOptions, start_openai_provider};
-pub use openai::{OpenAiConfigError, OpenAiResponsesFetchProvider};
 pub use policy::{ResponsesPolicyOptions, responses_policy};

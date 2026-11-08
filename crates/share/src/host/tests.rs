@@ -529,7 +529,7 @@ async fn openai_host_refuses_an_empty_upstream_key() {
     options.bearer_token.clear();
     hellas_auth::assert_err!(
         start_openai_provider(&options, None).await,
-        OpenAiProviderError::Config(crate::OpenAiConfigError::EmptyKey)
+        OpenAiProviderError::Config(hellas_providers::OpenAiConfigError::EmptyKey)
     );
 }
 #[tokio::test]
